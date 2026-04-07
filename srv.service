@@ -5,7 +5,7 @@ After=network.target
 [Service]
 User=exedev
 WorkingDirectory=/home/exedev/srtm-lidar
-ExecStart=/home/exedev/.local/bin/gunicorn -w 2 -b 0.0.0.0:8000 --timeout 120 app:app
+ExecStart=/home/exedev/.local/bin/gunicorn -w 2 -b 0.0.0.0:8000 --timeout 600 app:app
 Restart=on-failure
 RestartSec=5
 Environment=GDAL_HTTP_MERGE_CONSECUTIVE_RANGES=YES

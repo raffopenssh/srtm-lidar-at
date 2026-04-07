@@ -567,6 +567,408 @@ def changes_summary():
 # INFO
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# LIDAR / ORTHO OVERLAY & DOWNLOAD
+# ---------------------------------------------------------------------------
+
+def _extract_single_geom(features_or_geom):
+    """Extract a single shapely geometry from _get_geometry() output."""
+    if isinstance(features_or_geom, list):
+        if not features_or_geom:
+            raise ValueError("No geometry provided.")
+        feat = features_or_geom[0]
+        if isinstance(feat, dict) and 'geometry' in feat:
+            return feat['geometry']
+        return shape(feat) if isinstance(feat, dict) else feat
+    return features_or_geom
+
+
+def _geometry_to_3035_bbox(features_or_geom):
+    """Convert WGS84 geometry to EPSG:3035 and return (geom_3035, bbox_3035, bbox_wgs84)."""
+    geom_wgs84 = _extract_single_geom(features_or_geom)
+    geom_3035 = ti.geometry_to_3035(geom_wgs84)
+    _validate_area(geom_3035)
+    b = geom_3035.bounds  # (minx, miny, maxx, maxy)
+    bw = geom_wgs84.bounds
+    return geom_3035, b, bw
+
+
+def _hillshade(elevation, azimuth=315, altitude=45, z_factor=1.0):
+    """Compute hillshade from an elevation array."""
+    dy, dx = np.gradient(elevation, 1.0)
+    dx *= z_factor
+    dy *= z_factor
+    slope = np.arctan(np.sqrt(dx**2 + dy**2))
+    aspect = np.arctan2(-dx, dy)
+    az_rad = np.radians(azimuth)
+    alt_rad = np.radians(altitude)
+    hs = (np.sin(alt_rad) * np.cos(slope) +
+          np.cos(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
+    return np.clip(hs, 0, 1).astype(np.float32)
+
+
+def _dtm_rgba(dtm, mask):
+    """Render DTM as hillshade relief with hypsometric tinting.
+
+    Shows actual terrain: valleys, ridges, slopes — the relief you see on
+    a good topographic map.
+    """
+    import matplotlib
+    from matplotlib.colors import LinearSegmentedColormap
+
+    h, w = dtm.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # --- Multi-directional hillshade for rich relief ---
+    hs1 = _hillshade(dtm, azimuth=315, altitude=40)
+    hs2 = _hillshade(dtm, azimuth=90, altitude=55)
+    hs_combined = np.clip(0.65 * hs1 + 0.35 * hs2, 0, 1)
+
+    # --- Hypsometric tint based on DTM elevation ---
+    vmin = float(np.nanpercentile(dtm[mask], 2)) if mask.any() else 0
+    vmax = float(np.nanpercentile(dtm[mask], 98)) if mask.any() else 1000
+    if vmax - vmin < 10:
+        vmax = vmin + 10
+
+    hypso_colors = [
+        (0.0, '#2d6a2e'),   # valley: deep green
+        (0.15, '#5a9e3c'),  # lower slopes: green
+        (0.3, '#8ebb4a'),   # mid-low: yellow-green
+        (0.45, '#c4b85c'),  # mid: olive/tan
+        (0.6, '#b8956a'),   # upper mid: brown
+        (0.75, '#a08070'),  # upper slopes: grey-brown
+        (0.9, '#c8c0b8'),   # near summit: light grey
+        (1.0, '#f0ece8'),   # summit: near-white
+    ]
+    cmap_hypso = LinearSegmentedColormap.from_list('hypso', hypso_colors)
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    hypso = cmap_hypso(norm(np.clip(dtm, vmin, vmax)))[:, :, :3]  # (H,W,3) float
+
+    # Modulate by hillshade
+    for c in range(3):
+        hypso[:, :, c] = hypso[:, :, c] * (0.25 + 0.75 * hs_combined)
+
+    rgba[:, :, :3] = (np.clip(hypso, 0, 1) * 255).astype(np.uint8)
+    rgba[:, :, 3] = np.where(mask, 255, 0)
+    return rgba
+
+
+def _ndsm_rgba(ndsm, dsm, mask, vmax=35):
+    """Render nDSM as viridis height coloring with DSM hillshade for 3D effect.
+
+    Ground (ndsm < 0.3) is transparent so it can layer over the DTM relief.
+    """
+    import matplotlib
+    import matplotlib.cm as cm
+
+    h, w = ndsm.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    hs_dsm = _hillshade(dsm, azimuth=315, altitude=40)
+
+    norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
+    colormap = cm.get_cmap('viridis')
+    ndsm_clamped = np.clip(ndsm, 0, vmax)
+    rgb_float = colormap(norm(ndsm_clamped))[:, :, :3]  # (H,W,3)
+
+    # Modulate by DSM hillshade
+    for c in range(3):
+        rgb_float[:, :, c] = rgb_float[:, :, c] * (0.3 + 0.7 * hs_dsm)
+
+    elevated = mask & (ndsm > 0.3)
+    rgba[:, :, :3] = (np.clip(rgb_float, 0, 1) * 255).astype(np.uint8)
+    rgba[:, :, 3] = np.where(elevated, 220, 0)
+    return rgba
+
+
+def _reproject_rasters_to_wgs84(arrays_3035, transform_3035, shape_3035, mask_3035=None):
+    """Reproject raw float32 rasters from EPSG:3035 to EPSG:4326.
+
+    Parameters
+    ----------
+    arrays_3035 : dict[str, np.ndarray]
+        Named 2D float32 arrays in EPSG:3035 (e.g. dtm, dsm, ndsm).
+    transform_3035 : Affine
+        Source rasterio transform.
+    shape_3035 : (int, int)
+        Source (rows, cols).
+    mask_3035 : np.ndarray or None
+        Boolean mask. Reprojected as nearest-neighbour.
+
+    Returns
+    -------
+    (arrays_wgs, mask_wgs, transform_wgs, bounds_wgs)
+        arrays_wgs: dict with same keys, reprojected.
+        mask_wgs: boolean mask in WGS84 grid.
+        transform_wgs: rasterio Affine for the WGS84 grid.
+        bounds_wgs: (south, west, north, east) for Leaflet.
+    """
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    from rasterio.crs import CRS
+    from rasterio.transform import array_bounds
+
+    src_crs = CRS.from_epsg(3035)
+    dst_crs = CRS.from_epsg(4326)
+    h, w = shape_3035
+
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, dst_crs, w, h, *array_bounds(h, w, transform_3035),
+    )
+
+    arrays_wgs = {}
+    for name, src in arrays_3035.items():
+        dst = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+        reproject(
+            source=src.astype(np.float32),
+            destination=dst,
+            src_transform=transform_3035,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
+        arrays_wgs[name] = dst
+
+    # Reproject mask
+    if mask_3035 is not None:
+        mask_src = mask_3035.astype(np.uint8)
+        mask_dst = np.zeros((dst_height, dst_width), dtype=np.uint8)
+        reproject(
+            source=mask_src,
+            destination=mask_dst,
+            src_transform=transform_3035,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+        )
+        mask_wgs = mask_dst > 0
+    else:
+        # Derive mask from any reprojected array (non-NaN)
+        first = next(iter(arrays_wgs.values()))
+        mask_wgs = ~np.isnan(first)
+
+    bounds = array_bounds(dst_height, dst_width, dst_transform)
+    # (left, bottom, right, top) = (west, south, east, north)
+    bounds_wgs = (bounds[1], bounds[0], bounds[3], bounds[2])  # south, west, north, east
+
+    return arrays_wgs, mask_wgs, dst_transform, bounds_wgs
+
+
+def _reproject_rgb_to_wgs84(rgb_3035, transform_3035, shape_3035):
+    """Reproject a (3,H,W) uint8 RGB array from EPSG:3035 to EPSG:4326.
+
+    Returns (rgb_wgs, mask_wgs, bounds_wgs).
+    """
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    from rasterio.crs import CRS
+    from rasterio.transform import array_bounds
+
+    src_crs = CRS.from_epsg(3035)
+    dst_crs = CRS.from_epsg(4326)
+    h, w = shape_3035
+
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, dst_crs, w, h, *array_bounds(h, w, transform_3035),
+    )
+
+    rgb_wgs = np.zeros((3, dst_height, dst_width), dtype=np.uint8)
+    for band in range(3):
+        reproject(
+            source=rgb_3035[band],
+            destination=rgb_wgs[band],
+            src_transform=transform_3035,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+        )
+
+    mask_wgs = (rgb_wgs[0] > 0) | (rgb_wgs[1] > 0) | (rgb_wgs[2] > 0)
+
+    bounds = array_bounds(dst_height, dst_width, dst_transform)
+    bounds_wgs = (bounds[1], bounds[0], bounds[3], bounds[2])
+
+    return rgb_wgs, mask_wgs, bounds_wgs
+
+
+def _send_rgba_overlay(rgba, bounds_wgs):
+    """Encode RGBA array as PNG and return Flask response with bounds header."""
+    from PIL import Image
+    img = Image.fromarray(rgba, 'RGBA')
+    buf = io.BytesIO()
+    img.save(buf, 'PNG', optimize=True)
+    buf.seek(0)
+    resp = send_file(buf, mimetype='image/png')
+    south, west, north, east = bounds_wgs
+    resp.headers['X-Bounds'] = f'{south},{west},{north},{east}'
+    resp.headers['Access-Control-Expose-Headers'] = 'X-Bounds'
+    return resp
+
+
+@app.route('/api/v1/dtm/overlay', methods=['POST'])
+def dtm_overlay():
+    """Return DTM hillshade relief as a PNG overlay (reprojected to WGS84)."""
+    try:
+        geom_wgs84 = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+        # Reproject raw elevation to WGS84 *before* computing hillshade
+        arrays_wgs, mask_wgs, tf_wgs, bounds_wgs = _reproject_rasters_to_wgs84(
+            {'dtm': data['dtm']},
+            data['transform'], data['shape'], data['mask'],
+        )
+        dtm_wgs = arrays_wgs['dtm']
+        # Fill NaN for hillshade computation
+        dtm_wgs = np.nan_to_num(dtm_wgs, nan=float(np.nanmedian(dtm_wgs[mask_wgs])) if mask_wgs.any() else 0)
+
+        rgba = _dtm_rgba(dtm_wgs, mask_wgs)
+        return _send_rgba_overlay(rgba, bounds_wgs)
+    except Exception as e:
+        log.error("dtm overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/lidar/overlay', methods=['POST'])
+def lidar_overlay():
+    """Return nDSM as a PNG overlay (viridis + hillshade, reprojected to WGS84)."""
+    try:
+        geom_wgs84 = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+        # Reproject raw elevation to WGS84 before rendering
+        arrays_wgs, mask_wgs, tf_wgs, bounds_wgs = _reproject_rasters_to_wgs84(
+            {'ndsm': data['ndsm'], 'dsm': data['dsm']},
+            data['transform'], data['shape'], data['mask'],
+        )
+        ndsm_wgs = np.nan_to_num(arrays_wgs['ndsm'], nan=0)
+        dsm_wgs = np.nan_to_num(arrays_wgs['dsm'], nan=0)
+
+        rgba = _ndsm_rgba(ndsm_wgs, dsm_wgs, mask_wgs)
+        return _send_rgba_overlay(rgba, bounds_wgs)
+    except Exception as e:
+        log.error("lidar overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/ortho/overlay', methods=['POST'])
+def ortho_overlay():
+    """Return orthophoto as a PNG overlay (reprojected to WGS84)."""
+    try:
+        import ortho_io
+        geom_wgs84 = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        rgb, nir = ortho_io.read_ortho_for_als(data)
+
+        # Reproject RGB to WGS84
+        rgb_wgs, mask_wgs, bounds_wgs = _reproject_rgb_to_wgs84(
+            rgb, data['transform'], data['shape'],
+        )
+
+        h, w = rgb_wgs.shape[1], rgb_wgs.shape[2]
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[:, :, 0] = rgb_wgs[0]
+        rgba[:, :, 1] = rgb_wgs[1]
+        rgba[:, :, 2] = rgb_wgs[2]
+        rgba[:, :, 3] = np.where(mask_wgs, 255, 0)
+
+        return _send_rgba_overlay(rgba, bounds_wgs)
+    except Exception as e:
+        log.error("ortho overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/lidar/geotiff', methods=['POST'])
+def lidar_geotiff():
+    """Download nDSM as a georeferenced GeoTIFF."""
+    try:
+        geom_wgs84 = _extract_single_geom(_get_geometry())
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035 = ti.geometry_to_3035(geom_wgs84)
+        _validate_area(geom_3035)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        ndsm = data['ndsm']
+        dtm = data['dtm']
+        dsm = data['dsm'] if 'dsm' in data else dtm + ndsm
+        tf = data['transform']
+        h, w = data['shape']
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+        with rasterio.open(tmp.name, 'w', driver='GTiff', width=w, height=h,
+                           count=3, dtype='float32', crs='EPSG:3035',
+                           transform=tf, compress='deflate') as dst:
+            dst.write(dtm.astype(np.float32), 1)
+            dst.write(dsm.astype(np.float32), 2)
+            dst.write(ndsm.astype(np.float32), 3)
+            dst.set_band_description(1, 'DTM')
+            dst.set_band_description(2, 'DSM')
+            dst.set_band_description(3, 'nDSM')
+
+        return send_file(tmp.name, mimetype='image/tiff', as_attachment=True,
+                         download_name='lidar_dtm_dsm_ndsm.tif')
+    except Exception as e:
+        log.error("lidar geotiff: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/ortho/geotiff', methods=['POST'])
+def ortho_geotiff():
+    """Download orthophoto as a georeferenced GeoTIFF (RGB + NIR if available)."""
+    try:
+        import ortho_io
+        geom_wgs84 = _extract_single_geom(_get_geometry())
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035 = ti.geometry_to_3035(geom_wgs84)
+        _validate_area(geom_3035)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        rgb, nir = ortho_io.read_ortho_for_als(data)
+        tf = data['transform']
+        h, w = data['shape']
+
+        n_bands = 4 if nir is not None else 3
+        tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+        with rasterio.open(tmp.name, 'w', driver='GTiff', width=w, height=h,
+                           count=n_bands, dtype='uint8', crs='EPSG:3035',
+                           transform=tf, compress='deflate') as dst:
+            dst.write(rgb[0], 1)
+            dst.write(rgb[1], 2)
+            dst.write(rgb[2], 3)
+            dst.set_band_description(1, 'Red')
+            dst.set_band_description(2, 'Green')
+            dst.set_band_description(3, 'Blue')
+            if nir is not None:
+                dst.write(nir, 4)
+                dst.set_band_description(4, 'NIR')
+
+        return send_file(tmp.name, mimetype='image/tiff', as_attachment=True,
+                         download_name='orthophoto_rgbi.tif')
+    except Exception as e:
+        log.error("ortho geotiff: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# INFO & DOCS
+# ---------------------------------------------------------------------------
+
 @app.route('/api/v1/info', methods=['GET'])
 def info():
     return jsonify({

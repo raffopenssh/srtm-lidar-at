@@ -5,35 +5,55 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Austrian LIDAR Analysis</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; height: 100vh; background: #f5f5f5; }
 #sidebar { width: 420px; display: flex; flex-direction: column; background: #fff; border-right: 1px solid #ddd; overflow: hidden; }
-#sidebar h1 { font-size: 16px; padding: 12px 16px; background: #1a1a2e; color: #fff; }
+#sidebar h1 { font-size: 16px; padding: 12px 16px; background: #1a1a2e; color: #fff; flex-shrink: 0; }
 #sidebar h1 span { color: #7fdbca; }
-.controls { padding: 12px 16px; flex-shrink: 0; }
-label { display: block; font-size: 12px; font-weight: 600; color: #555; margin: 8px 0 4px; }
-select, input, textarea { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
-textarea { height: 100px; font-family: monospace; font-size: 11px; resize: vertical; }
+.controls { padding: 10px 16px; flex-shrink: 0; overflow-y: auto; }
+label { display: block; font-size: 12px; font-weight: 600; color: #555; margin: 6px 0 3px; }
+select, input[type=number], input[type=text], textarea { width: 100%; padding: 5px 7px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertical; }
 .row { display: flex; gap: 8px; }
 .row > * { flex: 1; }
-button { padding: 8px 16px; background: #0d7377; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; margin-top: 8px; }
-button:hover { background: #14a3a8; }
-button:disabled { opacity: .5; cursor: wait; }
-#result-area { flex: 1; overflow: auto; padding: 12px 16px; }
-#result { font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; background: #f9f9f9; padding: 8px; border-radius: 4px; border: 1px solid #eee; min-height: 60px; }
+.btn { padding: 7px 14px; background: #0d7377; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.btn:hover { background: #14a3a8; }
+.btn:disabled { opacity: .5; cursor: wait; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn-outline { background: transparent; color: #0d7377; border: 1px solid #0d7377; }
+.btn-outline:hover { background: #e8f7f7; }
+#result-area { flex: 1; overflow: auto; padding: 0 16px 12px; min-height: 0; }
+.dl-bar { display: flex; gap: 4px; flex-wrap: wrap; padding: 6px 0; }
+#result { font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; background: #f9f9f9; padding: 8px; border-radius: 4px; border: 1px solid #eee; min-height: 40px; max-height: 100%; overflow: auto; }
 #map-area { flex: 1; position: relative; }
 #map { height: 100%; }
-.status { padding: 4px 16px; font-size: 11px; color: #888; background: #f0f0f0; border-top: 1px solid #ddd; }
-.tab-bar { display: flex; border-bottom: 1px solid #ddd; }
-.tab { padding: 8px 16px; font-size: 12px; cursor: pointer; border-bottom: 2px solid transparent; color: #666; }
-.tab.active { border-bottom-color: #0d7377; color: #0d7377; font-weight: 600; }
+.status { padding: 4px 16px; font-size: 11px; color: #888; background: #f0f0f0; border-top: 1px solid #ddd; flex-shrink: 0; }
 .hint { font-size: 11px; color: #999; margin-top: 2px; }
+.cb-row { display: flex; gap: 12px; align-items: center; margin: 4px 0; }
+.cb-row label { margin: 0; display: flex; align-items: center; gap: 4px; font-weight: 500; cursor: pointer; }
+
+/* Layer panel */
+.layer-panel { position: absolute; top: 10px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.25); padding: 10px 14px; font-size: 12px; min-width: 180px; }
+.layer-panel h3 { font-size: 12px; margin-bottom: 6px; color: #333; }
+.lyr { display: flex; align-items: center; gap: 6px; margin: 5px 0; }
+.lyr input[type=checkbox] { margin: 0; }
+.lyr input[type=range] { width: 60px; height: 14px; }
+.lyr-label { flex: 1; font-size: 11px; }
+
+/* Legend */
+.legend { position: absolute; bottom: 24px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); padding: 10px 12px; font-size: 11px; max-width: 220px; }
+.legend h4 { font-size: 11px; margin-bottom: 6px; color: #333; }
+.legend-bar { height: 14px; border-radius: 3px; margin-bottom: 2px; }
+.legend-labels { display: flex; justify-content: space-between; font-size: 10px; color: #666; margin-bottom: 8px; }
+.legend-item { display: flex; align-items: center; gap: 5px; margin: 2px 0; font-size: 10px; }
+.legend-icon { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-size: 11px; }
 </style>
 </head>
 <body>
 <div id="sidebar">
-  <h1>🏠️ Austrian <span>LIDAR</span> Analysis</h1>
+  <h1>🏠 Austrian <span>LIDAR</span> Analysis</h1>
   <div class="controls">
     <label>Endpoint</label>
     <select id="endpoint">
@@ -42,52 +62,163 @@ button:disabled { opacity: .5; cursor: wait; }
       <option value="objects" selected>Object Detection</option>
       <option value="objects/raster">Object Raster (download)</option>
     </select>
-
     <div class="row">
       <div><label>Min Height (m)</label><input id="min_height" type="number" value="0.2" step="0.1"></div>
-      <div><label>Min Area (m²)</label><input id="min_area" type="number" value="2" step="1"></div>
+      <div><label>Min Area (m²)</label><input id="min_area" type="number" value="0" step="1"></div>
     </div>
     <div class="row">
-      <div><label>Resolution (m)</label><input id="resolution" type="number" value="1" step="0.5" min="0.2"></div>
-      <div><label>Object Types</label><input id="object_types" placeholder="all (or: tree_coniferous,building)"></div>
+      <div><label>Resolution (m)</label><input id="resolution" type="number" value="0.2" step="0.1" min="0.2"></div>
+      <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: tree_coniferous,building)"></div>
     </div>
-    <div class="row">
-      <div><label><input id="include_ortho" type="checkbox" checked> Ortho (NDVI)</label></div>
-      <div><label><input id="include_temporal" type="checkbox"> Multi-temporal (3 dates)</label></div>
+    <div class="cb-row">
+      <label><input id="include_ortho" type="checkbox" checked> Ortho (NDVI)</label>
+      <label><input id="include_temporal" type="checkbox" checked> Multi-temporal</label>
     </div>
     <label>Geometry (GeoJSON / KML / coords)</label>
     <textarea id="geometry"></textarea>
     <p class="hint">Or draw on the map. Click ▶ to load the sample polygon.</p>
-    <div class="row">
-      <button id="btn-sample">▶ Sample</button>
-      <button id="btn-run">🚀 Analyse</button>
+    <div class="row" style="margin-top:6px">
+      <button class="btn" id="btn-sample">▶ Sample</button>
+      <button class="btn" id="btn-run">🚀 Analyse</button>
     </div>
   </div>
   <div id="result-area">
-    <label>Result</label>
+    <div class="dl-bar">
+      <button class="btn btn-sm btn-outline" id="btn-copy" title="Copy JSON">📋 Copy</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-json" title="Download GeoJSON">💾 JSON</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-lidar" title="Download LIDAR GeoTIFF">🗺️ LIDAR</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-ortho" title="Download Ortho GeoTIFF">📸 Ortho</button>
+    </div>
     <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
   </div>
   <div class="status" id="status">Idle</div>
 </div>
-<div id="map-area"><div id="map"></div></div>
+<div id="map-area">
+  <div id="map"></div>
+  <div class="layer-panel" id="layer-panel">
+    <h3>Layers</h3>
+    <div class="lyr"><input type="checkbox" id="lyr-dtm"><span class="lyr-label">DTM Relief</span><input type="range" id="op-dtm" min="0" max="100" value="80"></div>
+    <div class="lyr"><input type="checkbox" id="lyr-lidar"><span class="lyr-label">nDSM Heights</span><input type="range" id="op-lidar" min="0" max="100" value="70"></div>
+    <div class="lyr"><input type="checkbox" id="lyr-ortho"><span class="lyr-label">Orthophoto</span><input type="range" id="op-ortho" min="0" max="100" value="80"></div>
+    <div class="lyr"><input type="checkbox" id="lyr-objects" checked><span class="lyr-label">Objects</span><input type="range" id="op-objects" min="0" max="100" value="90"></div>
+    <div class="lyr"><input type="checkbox" id="lyr-base" checked><span class="lyr-label">Base map</span><input type="range" id="op-base" min="0" max="100" value="100"></div>
+  </div>
+  <div class="legend" id="legend" style="display:none">
+    <h4>Height (viridis)</h4>
+    <div class="legend-bar" id="viridis-bar"></div>
+    <div class="legend-labels"><span>0 m</span><span>10</span><span>20</span><span>30+ m</span></div>
+    <h4 style="margin-top:6px">Object Types</h4>
+    <div id="legend-types"></div>
+  </div>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
-<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <script>
-const SAMPLE_KML = `<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document><Placemark><name>Kathi Beispiel</name><Polygon><outerBoundaryIs><LinearRing><coordinates>
-15.10843401000211,47.14054372430085,0 15.10891726814837,47.13722400099616,0 15.11516512477505,47.13436057677661,0 15.12224357582761,47.13301065583731,0 15.1263196986764,47.13656725625793,0 15.12607893621995,47.13979583078796,0 15.11988458347915,47.1421491232059,0 15.11618387366204,47.14216738741007,0 15.11473582645048,47.1410911798395,0 15.10843401000211,47.14054372430085,0
-</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>`;
+// ======= VIRIDIS COLORMAP =======
+const VIRIDIS = [
+  [68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],
+  [32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]
+];
+function viridis(t) {
+  t = Math.max(0, Math.min(1, t));
+  const idx = t * (VIRIDIS.length - 1);
+  const lo = Math.floor(idx), hi = Math.min(lo + 1, VIRIDIS.length - 1);
+  const f = idx - lo;
+  return [
+    Math.round(VIRIDIS[lo][0] + f * (VIRIDIS[hi][0] - VIRIDIS[lo][0])),
+    Math.round(VIRIDIS[lo][1] + f * (VIRIDIS[hi][1] - VIRIDIS[lo][1])),
+    Math.round(VIRIDIS[lo][2] + f * (VIRIDIS[hi][2] - VIRIDIS[lo][2]))
+  ];
+}
+function viridisCSS(t) { const c = viridis(t); return `rgb(${c[0]},${c[1]},${c[2]})`; }
+function viridisGradient() {
+  const stops = [];
+  for (let i = 0; i <= 10; i++) stops.push(viridisCSS(i / 10) + ` ${i * 10}%`);
+  return `linear-gradient(to right, ${stops.join(', ')})`;
+}
 
+// ======= OBJECT TYPE SHAPES (SVG) =======
+const TYPE_SHAPES = {
+  tree_coniferous:  { shape: 'triangle', label: '▲', color: '#228B22' },
+  tree_broadleaf:   { shape: 'circle',   label: '●', color: '#32CD32' },
+  tree_unclassified:{ shape: 'diamond',  label: '◆', color: '#6B8E23' },
+  building:         { shape: 'square',   label: '■', color: '#DC143C' },
+  structure:        { shape: 'square',   label: '▪', color: '#FF6347' },
+  shrub_bush:       { shape: 'circle',   label: '•', color: '#9ACD32' },
+  low_vegetation:   { shape: 'dot',      label: '·', color: '#ADFF2F' },
+  road_path:        { shape: 'dash',     label: '—', color: '#A0A0A0' },
+  bare_soil:        { shape: 'cross',    label: '×', color: '#D2B48C' },
+  rock_cliff:       { shape: 'pentagon', label: '⬟', color: '#808080' },
+  mast_pole:        { shape: 'line',     label: '│', color: '#4169E1' },
+  hedge:            { shape: 'hrect',    label: '═', color: '#6B8E23' },
+  tree_row:         { shape: 'dots',     label: '…', color: '#228B22' },
+  parking_lot:      { shape: 'square',   label: 'P',  color: '#708090' },
+  water:            { shape: 'wave',     label: '~',  color: '#1E90FF' },
+  swimming_pool:    { shape: 'wave',     label: '~',  color: '#00BFFF' },
+  dead_tree:        { shape: 'triangle', label: '△', color: '#8B4513' },
+  wall_fence:       { shape: 'dash',     label: '─', color: '#696969' },
+  power_line:       { shape: 'line',     label: '│', color: '#FFD700' },
+  solar_panel:      { shape: 'square',   label: '▣', color: '#191970' },
+  greenhouse:       { shape: 'square',   label: '□', color: '#98FB98' },
+  bridge:           { shape: 'dash',     label: '=',  color: '#A0522D' },
+  vineyard_orchard: { shape: 'dots',     label: '∷', color: '#8B008B' },
+};
+const DEFAULT_SHAPE = { shape: 'circle', label: '○', color: '#666' };
+
+function makeSVGMarker(type, heightM, areaSqm) {
+  const info = TYPE_SHAPES[type] || DEFAULT_SHAPE;
+  const t = Math.min(heightM / 35, 1);
+  const fill = viridisCSS(t);
+  const r = 5;
+  const d = 10;
+  let svg;
+  const s = info.shape;
+  if (s === 'triangle') {
+    svg = `<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  } else if (s === 'square') {
+    svg = `<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.8" rx="1"/>`;
+  } else if (s === 'diamond') {
+    svg = `<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  } else if (s === 'cross') {
+    svg = `<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
+  } else if (s === 'dash') {
+    svg = `<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
+  } else if (s === 'line') {
+    svg = `<rect x="${r-1.5}" y="1" width="3" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
+  } else if (s === 'hrect') {
+    svg = `<rect x="0" y="${r-3}" width="${d}" height="6" fill="${fill}" stroke="#000" stroke-width="0.5" rx="2"/>`;
+  } else if (s === 'wave') {
+    svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#0066AA" stroke-width="1"/>`;
+  } else if (s === 'pentagon') {
+    const pts = [0,1,2,3,4].map(i => {
+      const a = Math.PI*2*i/5 - Math.PI/2;
+      return `${r+Math.cos(a)*(r-1)},${r+Math.sin(a)*(r-1)}`;
+    }).join(' ');
+    svg = `<polygon points="${pts}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  } else if (s === 'dots') {
+    svg = `<circle cx="${r*0.3}" cy="${r}" r="2" fill="${fill}"/><circle cx="${r}" cy="${r}" r="2" fill="${fill}"/><circle cx="${r*1.7}" cy="${r}" r="2" fill="${fill}"/>`;
+  } else if (s === 'dot') {
+    svg = `<circle cx="${r}" cy="${r}" r="${Math.max(2,r*0.5)}" fill="${fill}"/>`;
+  } else {
+    svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  }
+  return L.divIcon({
+    html: `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">${svg}</svg>`,
+    iconSize: [d, d], iconAnchor: [r, r], className: ''
+  });
+}
+
+// ======= MAP SETUP =======
 const map = L.map('map').setView([47.137, 15.117], 14);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap', maxZoom: 19
+const baseLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OSM', maxZoom: 19
 }).addTo(map);
 
 const drawnItems = new L.FeatureGroup().addTo(map);
 const resultLayer = new L.FeatureGroup().addTo(map);
+let dtmOverlay = null, lidarOverlay = null, orthoOverlay = null;
+
 new L.Control.Draw({
   edit: { featureGroup: drawnItems },
   draw: { polygon: true, polyline: true, marker: true, rectangle: true, circle: false, circlemarker: false }
@@ -99,97 +230,260 @@ map.on(L.Draw.Event.CREATED, e => {
   document.getElementById('geometry').value = JSON.stringify(e.layer.toGeoJSON().geometry, null, 2);
 });
 
+// ======= LEGEND =======
+document.getElementById('viridis-bar').style.background = viridisGradient();
+const LEGEND_TYPES = ['tree_coniferous','tree_broadleaf','building','structure','shrub_bush','road_path','bare_soil','rock_cliff','water','dead_tree'];
+const ltDiv = document.getElementById('legend-types');
+LEGEND_TYPES.forEach(t => {
+  const info = TYPE_SHAPES[t] || DEFAULT_SHAPE;
+  const el = document.createElement('div');
+  el.className = 'legend-item';
+  el.innerHTML = `<span class="legend-icon" style="color:${info.color}">${info.label}</span><span>${t.replace(/_/g,' ')}</span>`;
+  ltDiv.appendChild(el);
+});
+
+// ======= LAYER CONTROLS =======
+function updateLayerOpacity(id, layer) {
+  const slider = document.getElementById('op-' + id);
+  const cb = document.getElementById('lyr-' + id);
+  if (!layer) return;
+  if (id === 'base') {
+    layer.setOpacity(cb.checked ? slider.value / 100 : 0);
+  } else if (id === 'objects') {
+    const op = cb.checked ? slider.value / 100 : 0;
+    resultLayer.eachLayer(l => { if (l.setOpacity) l.setOpacity(op); else if (l._icon) l._icon.style.opacity = op; });
+  } else {
+    if (layer.setOpacity) layer.setOpacity(cb.checked ? slider.value / 100 : 0);
+  }
+}
+function getLayerForId(id) {
+  if (id === 'base') return baseLayer;
+  if (id === 'dtm') return dtmOverlay;
+  if (id === 'lidar') return lidarOverlay;
+  if (id === 'ortho') return orthoOverlay;
+  if (id === 'objects') return resultLayer;
+  return null;
+}
+['base','dtm','lidar','ortho','objects'].forEach(id => {
+  const sl = document.getElementById('op-' + id);
+  const cb = document.getElementById('lyr-' + id);
+  sl.oninput = () => updateLayerOpacity(id, getLayerForId(id));
+  // Only wire simple opacity toggle for base/objects — overlay loading is separate
+  if (id === 'base' || id === 'objects') {
+    cb.onchange = () => updateLayerOpacity(id, getLayerForId(id));
+  }
+});
+
+// ======= SAMPLE =======
+const SAMPLE_GEOJSON = {"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
 document.getElementById('btn-sample').onclick = () => {
-  document.getElementById('geometry').value = SAMPLE_KML;
-  // Show on map
-  const coords = [[47.14054372,15.10843401],[47.13722400,15.10891727],[47.13436058,15.11516512],[47.13301066,15.12224358],[47.13656726,15.12631970],[47.13979583,15.12607894],[47.14214912,15.11988458],[47.14216739,15.11618387],[47.14109118,15.11473583],[47.14054372,15.10843401]];
+  document.getElementById('geometry').value = JSON.stringify(SAMPLE_GEOJSON, null, 2);
   drawnItems.clearLayers();
-  const poly = L.polygon(coords, {color: '#0d7377', weight: 2}).addTo(drawnItems);
-  map.fitBounds(poly.getBounds().pad(0.2));
+  const coords = SAMPLE_GEOJSON.coordinates[0].map(c => [c[1], c[0]]);
+  const poly = L.polygon(coords, {color: '#0d7377', weight: 2, fillOpacity: 0.05}).addTo(drawnItems);
+  map.fitBounds(poly.getBounds().pad(0.1));
 };
 
+// ======= CURRENT GEOMETRY =======
+function getCurrentGeometry() {
+  return document.getElementById('geometry').value.trim();
+}
+function getGeomBody() {
+  const raw = getCurrentGeometry();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return { json: true, body: JSON.stringify({geometry: parsed}) };
+  } catch(e) {
+    return { json: false, body: raw };
+  }
+}
+
+// ======= OVERLAY LOADING =======
+async function loadOverlay(type) {
+  const gb = getGeomBody();
+  if (!gb) return;
+  const status = document.getElementById('status');
+  status.textContent = `Loading ${type} overlay...`;
+  try {
+    const resp = await fetch(`/api/v1/${type}/overlay`, {
+      method: 'POST',
+      headers: { 'Content-Type': gb.json ? 'application/json' : 'text/plain' },
+      body: gb.body
+    });
+    if (!resp.ok) throw new Error((await resp.json()).error);
+    const bounds_str = resp.headers.get('X-Bounds');
+    if (!bounds_str) throw new Error('No bounds in response');
+    const [south, west, north, east] = bounds_str.split(',').map(Number);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const imageBounds = [[south, west], [north, east]];
+    const overlay = L.imageOverlay(url, imageBounds, { opacity: 0.7, interactive: false });
+    return overlay;
+  } catch(e) {
+    status.textContent = `${type} overlay failed: ${e.message}`;
+    return null;
+  }
+}
+
+// Wire up overlay checkboxes: load on first enable, toggle visibility after
+async function handleOverlayToggle(id, urlPath) {
+  const cb = document.getElementById('lyr-' + id);
+  const status = document.getElementById('status');
+  const getOvl = () => id === 'dtm' ? dtmOverlay : id === 'lidar' ? lidarOverlay : orthoOverlay;
+  const setOvl = (v) => { if (id === 'dtm') dtmOverlay = v; else if (id === 'lidar') lidarOverlay = v; else orthoOverlay = v; };
+
+  if (cb.checked && !getOvl()) {
+    const ovl = await loadOverlay(urlPath);
+    if (ovl) {
+      setOvl(ovl);
+      ovl.addTo(map);
+      // Layer order: ortho at bottom, DTM above, nDSM on top
+      if (orthoOverlay) orthoOverlay.bringToBack();
+      if (dtmOverlay) dtmOverlay.bringToFront();
+      if (lidarOverlay) lidarOverlay.bringToFront();
+      baseLayer.bringToBack();
+      updateLayerOpacity(id, ovl);
+    } else {
+      cb.checked = false;
+    }
+  }
+  if (getOvl()) updateLayerOpacity(id, getOvl());
+  status.textContent = 'Done.';
+}
+document.getElementById('lyr-dtm').onchange = () => handleOverlayToggle('dtm', 'dtm');
+document.getElementById('lyr-lidar').onchange = () => handleOverlayToggle('lidar', 'lidar');
+document.getElementById('lyr-ortho').onchange = () => handleOverlayToggle('ortho', 'ortho');
+
+// ======= ANALYSE =======
+let lastResult = null;
 document.getElementById('btn-run').onclick = async () => {
   const btn = document.getElementById('btn-run');
   const status = document.getElementById('status');
   const resultDiv = document.getElementById('result');
   const endpoint = document.getElementById('endpoint').value;
-  const geometry = document.getElementById('geometry').value.trim();
+  const geometry = getCurrentGeometry();
   if (!geometry) { resultDiv.textContent = 'Please provide geometry first.'; return; }
 
   btn.disabled = true;
   status.textContent = 'Analysing... (remote LIDAR reads may take 10-30s)';
   resultDiv.textContent = 'Loading...';
   resultLayer.clearLayers();
+  // Clear overlays so they reload with new geometry
+  if (dtmOverlay) { map.removeLayer(dtmOverlay); dtmOverlay = null; }
+  if (lidarOverlay) { map.removeLayer(lidarOverlay); lidarOverlay = null; }
+  if (orthoOverlay) { map.removeLayer(orthoOverlay); orthoOverlay = null; }
+  document.getElementById('lyr-dtm').checked = false;
+  document.getElementById('lyr-lidar').checked = false;
+  document.getElementById('lyr-ortho').checked = false;
 
   const isRaster = endpoint === 'objects/raster';
   const params = new URLSearchParams();
   params.set('min_height', parseFloat(document.getElementById('min_height').value) || 0.2);
-  params.set('min_area', parseInt(document.getElementById('min_area').value) || 2);
+  params.set('min_area', parseInt(document.getElementById('min_area').value) || 0);
   params.set('resolution', parseFloat(document.getElementById('resolution').value) || 1);
   const ot = document.getElementById('object_types').value.trim();
   if (ot) params.set('object_types', ot);
   if (document.getElementById('include_ortho').checked) params.set('include_ortho', 'true');
   if (document.getElementById('include_temporal').checked) params.set('include_temporal', 'true');
 
-  // Detect if input is JSON or KML/text
-  let contentType = 'text/plain';
-  let sendBody = geometry;
+  let contentType = 'text/plain', sendBody = geometry;
   try {
     const parsed = JSON.parse(geometry);
     contentType = 'application/json';
     sendBody = JSON.stringify({geometry: parsed});
-  } catch(e) { /* KML or coords — send as text */ }
+  } catch(e) {}
 
   try {
     const resp = await fetch(`/api/v1/${endpoint}?${params}`, {
-      method: 'POST',
-      headers: { 'Content-Type': contentType },
-      body: sendBody,
+      method: 'POST', headers: { 'Content-Type': contentType }, body: sendBody
     });
-
     if (isRaster) {
       if (!resp.ok) { const e = await resp.json(); throw new Error(e.error); }
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href = url; a.download = 'objects.tif'; a.click();
       resultDiv.textContent = 'Raster downloaded!';
+      lastResult = null;
     } else {
       const data = await resp.json();
       if (data.error) throw new Error(data.error);
+      lastResult = data;
       resultDiv.textContent = JSON.stringify(data, null, 2);
-      // Show results on map
-      if (data.features) {
-        const gj = L.geoJSON(data, {
-          pointToLayer: (f, ll) => L.circleMarker(ll, {
-            radius: Math.max(3, Math.min(10, (f.properties.height_max_m || 5) / 3)),
-            color: typeColor(f.properties.type || f.properties.obj_type || ''),
-            fillOpacity: 0.7, weight: 1
-          }),
-          onEachFeature: (f, layer) => {
-            const p = f.properties;
-            layer.bindPopup(`<b>${p.type || p.name || 'Feature'}</b><br>` +
-              Object.entries(p).filter(([k]) => k !== 'type' && k !== 'elevation_profile')
-                .map(([k,v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('<br>'));
-          }
-        }).addTo(resultLayer);
-        if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.1));
-      }
+      if (data.features) showObjectsOnMap(data);
     }
     status.textContent = 'Done.';
   } catch(e) {
     resultDiv.textContent = 'Error: ' + e.message;
     status.textContent = 'Error';
+    lastResult = null;
   } finally {
     btn.disabled = false;
   }
 };
 
-function typeColor(t) {
-  const c = { tree_coniferous: '#228B22', tree_broadleaf: '#32CD32', tree_unclassified: '#90EE90',
-    building: '#DC143C', structure: '#FF6347', shrub: '#9ACD32', low_vegetation: '#ADFF2F',
-    mast_pole: '#4169E1', wall_fence: '#808080', unclassified: '#666' };
-  return c[t] || '#0d7377';
+function showObjectsOnMap(data) {
+  document.getElementById('legend').style.display = '';
+  const gj = L.geoJSON(data, {
+    pointToLayer: (f, ll) => {
+      const p = f.properties;
+      const t = p.type || p.obj_type || '';
+      const h = p.height_max_m || p.height_max || 0;
+      const a = p.area_sqm || 4;
+      return L.marker(ll, { icon: makeSVGMarker(t, h, a) });
+    },
+    onEachFeature: (f, layer) => {
+      const p = f.properties;
+      const rows = Object.entries(p)
+        .filter(([k]) => k !== 'elevation_profile')
+        .map(([k,v]) => `<b>${k}:</b> ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+      layer.bindPopup(`<div style="max-height:300px;overflow:auto;font-size:12px">${rows.join('<br>')}</div>`);
+    }
+  }).addTo(resultLayer);
+  if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.05));
+  // Apply current opacity
+  updateLayerOpacity('objects', resultLayer);
 }
+
+// ======= DOWNLOAD / COPY =======
+document.getElementById('btn-copy').onclick = () => {
+  if (!lastResult) return;
+  navigator.clipboard.writeText(JSON.stringify(lastResult, null, 2));
+  document.getElementById('status').textContent = 'Copied to clipboard!';
+};
+document.getElementById('btn-dl-json').onclick = () => {
+  if (!lastResult) return;
+  const blob = new Blob([JSON.stringify(lastResult, null, 2)], {type: 'application/geo+json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'result.geojson'; a.click();
+};
+document.getElementById('btn-dl-lidar').onclick = async () => {
+  const gb = getGeomBody();
+  if (!gb) { alert('Provide geometry first'); return; }
+  document.getElementById('status').textContent = 'Downloading LIDAR GeoTIFF...';
+  try {
+    const resp = await fetch('/api/v1/lidar/geotiff', {
+      method: 'POST', headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'}, body: gb.body
+    });
+    if (!resp.ok) throw new Error((await resp.json()).error);
+    const blob = await resp.blob();
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'lidar_dtm_dsm_ndsm.tif'; a.click();
+    document.getElementById('status').textContent = 'LIDAR GeoTIFF downloaded!';
+  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+};
+document.getElementById('btn-dl-ortho').onclick = async () => {
+  const gb = getGeomBody();
+  if (!gb) { alert('Provide geometry first'); return; }
+  document.getElementById('status').textContent = 'Downloading Ortho GeoTIFF...';
+  try {
+    const resp = await fetch('/api/v1/ortho/geotiff', {
+      method: 'POST', headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'}, body: gb.body
+    });
+    if (!resp.ok) throw new Error((await resp.json()).error);
+    const blob = await resp.blob();
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'orthophoto_rgbi.tif'; a.click();
+    document.getElementById('status').textContent = 'Ortho GeoTIFF downloaded!';
+  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+};
 </script>
 </body>
 </html>

@@ -759,13 +759,17 @@ def _ensure_shape(arr: np.ndarray, h: int, w: int) -> np.ndarray:
 def _try_read_rgbi_for_bbox(
     min_e: float, min_n: float, max_e: float, max_n: float,
     resolution: float, h: int, w: int,
+    dst_transform=None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Try to read RGB + NIR from an RGBI operate covering the EPSG:3035 bbox.
 
     Returns (rgb, nir) or (None, None) if no operate covers the area.
-    Both arrays are aligned to the target grid (h, w) at *resolution*.
+    Both arrays are reprojected and aligned to the target EPSG:3035 grid
+    (h, w) at *resolution*.
     """
     import pyproj
+    from rasterio.warp import reproject as rio_reproject, Resampling as RioResampling
+    from rasterio.crs import CRS
 
     # Convert bbox corners to WGS84 for operate lookup
     tf_to_wgs = pyproj.Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -776,61 +780,89 @@ def _try_read_rgbi_for_bbox(
     if not operates:
         return None, None
 
+    # Build the target EPSG:3035 transform if not provided
+    dst_crs = CRS.from_epsg(3035)
+    if dst_transform is None:
+        dst_transform = transform_from_origin(min_e, max_n, resolution, resolution)
+
     for opid in operates:
         info = RGBI_OPERATES[opid]
         series = info["series"]
-        op_crs = info["crs"]
+        op_crs_str = info["crs"]
+        src_crs = CRS.from_user_input(op_crs_str)
         try:
-            # Transform bbox to the operate's native CRS
+            # Transform bbox to the operate's native CRS (with margin
+            # for the rotation between CRSes)
             tf_to_op = pyproj.Transformer.from_crs(
-                "EPSG:3035", op_crs, always_xy=True
+                "EPSG:3035", op_crs_str, always_xy=True
             )
-            oe_min, on_min = tf_to_op.transform(min_e, min_n)
-            oe_max, on_max = tf_to_op.transform(max_e, max_n)
-            # Ensure min < max
-            oe_min, oe_max = min(oe_min, oe_max), max(oe_min, oe_max)
-            on_min, on_max = min(on_min, on_max), max(on_min, on_max)
+            # Transform all 4 corners to handle rotation
+            corners_3035 = [
+                (min_e, min_n), (max_e, min_n),
+                (max_e, max_n), (min_e, max_n),
+            ]
+            corners_op = [tf_to_op.transform(e, n) for e, n in corners_3035]
+            oe_min = min(c[0] for c in corners_op) - 10  # small margin
+            oe_max = max(c[0] for c in corners_op) + 10
+            on_min = min(c[1] for c in corners_op) - 10
+            on_max = max(c[1] for c in corners_op) + 10
 
             rgb_url = get_rgbi_url(opid, "RGB", series)
             nir_url = get_rgbi_url(opid, "NIR", series)
 
-            out_cols = max(1, int(round((oe_max - oe_min) / resolution)))
-            out_rows = max(1, int(round((on_max - on_min) / resolution)))
-
+            # Read a window from the source in its native CRS
             with rasterio.open(rgb_url) as ds:
                 win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
                 win = win.intersection(Window(0, 0, ds.width, ds.height))
                 if win.width < 1 or win.height < 1:
                     continue
-                rgb = ds.read(
-                    [1, 2, 3], window=win,
-                    out_shape=(3, out_rows, out_cols),
-                    resampling=Resampling.bilinear,
+                src_data = ds.read([1, 2, 3], window=win)
+                src_transform = ds.window_transform(win)
+
+            # Reproject RGB to EPSG:3035 target grid
+            rgb = np.zeros((3, h, w), dtype=np.uint8)
+            for band in range(3):
+                rio_reproject(
+                    source=src_data[band],
+                    destination=rgb[band],
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=RioResampling.bilinear,
                 )
 
+            # Read and reproject NIR
             nir = None
             try:
                 with rasterio.open(nir_url) as ds:
                     win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
                     win = win.intersection(Window(0, 0, ds.width, ds.height))
                     if win.width >= 1 and win.height >= 1:
-                        nir = ds.read(
-                            1, window=win,
-                            out_shape=(out_rows, out_cols),
-                            resampling=Resampling.bilinear,
+                        src_nir = ds.read(1, window=win)
+                        src_nir_tf = ds.window_transform(win)
+                        nir = np.zeros((h, w), dtype=np.uint8)
+                        rio_reproject(
+                            source=src_nir,
+                            destination=nir,
+                            src_transform=src_nir_tf,
+                            src_crs=src_crs,
+                            dst_transform=dst_transform,
+                            dst_crs=dst_crs,
+                            resampling=RioResampling.bilinear,
                         )
             except Exception as e:
                 log.warning("NIR read failed for operate %s: %s", opid, e)
 
+            has_data = np.any(rgb > 0, axis=0)
+            coverage = has_data.sum() / (h * w) if h * w > 0 else 0
             log.info(
-                "Read RGBI operate %s (series %s) %dx%d @ %.1fm, NIR=%s",
-                opid, series, out_cols, out_rows, resolution,
+                "Read RGBI operate %s (series %s) reprojected to %dx%d @ %.1fm, "
+                "NIR=%s, coverage=%.0f%%",
+                opid, series, w, h, resolution,
                 "yes" if nir is not None else "no",
+                coverage * 100,
             )
-            # Reshape to target grid
-            rgb = _ensure_shape(rgb, h, w)
-            if nir is not None:
-                nir = _ensure_shape(nir, h, w)
             return rgb, nir
 
         except Exception as e:
@@ -874,7 +906,8 @@ def read_ortho_for_als(
     min_n = max_n - h * res
 
     # 1. Try RGBI operates (RGB + NIR)
-    rgb, nir = _try_read_rgbi_for_bbox(min_e, min_n, max_e, max_n, res, h, w)
+    rgb, nir = _try_read_rgbi_for_bbox(min_e, min_n, max_e, max_n, res, h, w,
+                                        dst_transform=tf)
     if rgb is not None:
         return rgb, nir
 

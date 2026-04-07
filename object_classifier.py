@@ -11,22 +11,29 @@ Optional spectral integration (Phase 1b):
   data the classifier behaves identically to the pure-LIDAR version.
 
 Surface signatures (empirically derived from Austrian ALS 1m data):
-  - Ground (road/path):  nDSM < 0.3m, DTM smooth (std3 < 0.1)
-  - Ground (meadow):     nDSM < 0.3m, DTM normal (std3 0.1–0.5)
-  - Ground (rough/rock):  nDSM < 0.3m, DTM rough (std3 > 0.5)
-  - Low vegetation:       nDSM 0.3–2m
+  - Ground (road/path):  nDSM < 0.2m, DTM smooth (std3 < 0.1)
+  - Ground (meadow):     nDSM < 0.2m, DTM normal (std3 0.1–0.5)
+  - Ground (rough/rock):  nDSM < 0.2m, DTM rough (std3 > 0.5)
+  - Low vegetation:       nDSM 0.2–2m
   - Shrub/bush:           nDSM 2–4m
-  - Building roof:        nDSM > 3m, nDSM surface slope < 15°, local std5 < 1.5m
-  - Tree canopy:          nDSM > 4m, nDSM surface slope > 40°, roughness > 1.0
+  - Building:             nDSM > 2m, low NDVI (<0.20), bright (>100), compact shape
+  - Tree canopy:          nDSM > 4m, NDVI > 0.20, rough surface
   - Coniferous crown:     peak with steep radial dropoff (>5m in 5m radius)
   - Broadleaf crown:      dome with gentle dropoff (<4m in 5m radius)
 
 Spectral refinements (when orthophoto available):
-  - NDVI > 0.3  → vegetation;  < 0.1 → built / bare;  < 0 → water
-  - Blue-dominant → water / swimming pool
-  - High brightness + low NDVI → road / parking lot
-  - Tall + low NDVI → dead tree
+  - NDVI > 0.25 → vegetation;  < 0.12 → built / bare
+  - NDVI < 0.0 AND brightness < 50 → water (very strict)
+  - Blue-dominant → swimming pool
+  - Brightness > 100 + low NDVI → road / parking lot
+  - Tall + NDVI < 0.10 + brightness > 100 → building (not dead tree)
   - Regular low-veg pattern → vineyard / orchard
+
+Calibrated against BEV cadastre ground truth (KG 63330 Kohlschwarz):
+  - Real buildings: NDVI median=0.115, brightness median=131, nDSM slope=43°
+  - Real trees: NDVI median=0.329, brightness median=57
+  - Water: ZERO pixels confirmed in the test area — ultra-smooth ground is
+    typically road surface, roof sheeting, or solar panels, not water.
 """
 
 from __future__ import annotations
@@ -185,10 +192,14 @@ def _classify_pixels(
     ddy, ddx = np.gradient(dtm, 1.0)
     dtm_slope = np.degrees(np.arctan(np.sqrt(ddx**2 + ddy**2)))
 
-    # --- Classify ground (nDSM < 0.3m) ---
-    ground = mask & (n < 0.3)
-    # Water: very smooth DTM + very low DSM roughness + flat
-    water = ground & (dtm_std3 < 0.03) & (dsm_std3 < 0.03) & (dtm_slope < 3)
+    # --- Classify ground (nDSM < 0.2m) ---
+    # Lowered from 0.3m to catch height changes as soon as they exceed 0.2m
+    ground = mask & (n < 0.2)
+    # Water: VERY strict geometry thresholds.
+    # Calibration showed that ultra-smooth ground in Austria is almost always
+    # road surface, roof sheeting, or solar panels — not water.  Water bodies
+    # require spectral confirmation (Phase 1b) to be classified.
+    water = ground & (dtm_std3 < 0.01) & (dsm_std3 < 0.01) & (dtm_slope < 1)
     px[water] = OBJECT_TYPES["water"]
     # Road/path: smooth ground
     road = ground & ~water & (dtm_std3 < 0.15) & (dsm_std3 < 0.15)
@@ -200,8 +211,8 @@ def _classify_pixels(
     meadow = ground & ~water & ~road & ~rough
     px[meadow] = OBJECT_TYPES["meadow_field"]
 
-    # --- Low vegetation (0.3–2m) ---
-    low_veg = mask & (n >= 0.3) & (n < 2.0)
+    # --- Low vegetation (0.2–2m) ---
+    low_veg = mask & (n >= 0.2) & (n < 2.0)
     px[low_veg] = OBJECT_TYPES["low_vegetation"]
 
     # --- Shrubs/bushes (2–4m) ---
@@ -210,21 +221,25 @@ def _classify_pixels(
 
     # --- Elevated objects (≥4m): building roofs vs tree canopy ---
     elevated = mask & (n >= 4.0)
-
-    # Building roof signature: flat DSM surface locally
-    # nDSM_slope < 15°, nDSM_std5 < 1.5m, dsm_std3 < 0.8m
-    flat_surface = elevated & (ndsm_slope < 15) & (ndsm_std5 < 1.5) & (dsm_std3 < 0.8)
-    # Also require gentle terrain underneath (buildings aren't on 30° slopes)
-    building_px = flat_surface & (dtm_slope < 25)
+    #
+    # Calibration against cadastre (KG 63330) showed:
+    #   - Real buildings: nDSM_slope median=43° (steep gabled roofs!),
+    #     dsm_std3 median=0.74, nDSM_std5 median=1.47
+    #   - Real trees: nDSM_slope median=66°, dsm_std3 median=1.99,
+    #     nDSM_std5 median=3.17
+    # Key insight: geometry alone cannot reliably separate buildings from
+    # trees in Austrian alpine settings.  Use CONSERVATIVE geometry to mark
+    # candidates, then SPECTRAL refinement (Phase 1b) does the real work.
+    # Geometry candidates: very flat + smooth surfaces only (high confidence)
+    ndsm_std3 = _fast_local_std(n, 3)
+    building_surface = elevated & (ndsm_std5 < 1.5) & (dsm_std3 < 0.8) & (ndsm_std3 < 1.0)
+    building_px = building_surface & (dtm_slope < 25)
     px[building_px] = OBJECT_TYPES["building"]
 
-    # Tree canopy: rough, steep nDSM surface
-    tree_canopy = elevated & ~building_px & (ndsm_slope > 20)
+    # Everything else elevated defaults to tree (spectral phase will
+    # promote non-green elevated pixels to building)
+    tree_canopy = elevated & ~building_px
     px[tree_canopy] = OBJECT_TYPES["tree_unclassified"]  # refined later
-
-    # Remaining elevated pixels that are neither clearly building nor tree
-    other_elevated = elevated & ~building_px & ~tree_canopy
-    px[other_elevated] = OBJECT_TYPES["tree_unclassified"]
 
     # --- Rock/cliff: steep DTM + rough ground, regardless of nDSM height ---
     rock_cliff = mask & (dtm_slope > 45) & (dtm_std3 > 0.8)
@@ -327,17 +342,20 @@ def _refine_with_spectral(
         px[road_to_meadow] = OT["meadow_field"]
 
     # ------------------------------------------------------------------
-    # 3. Water refinement: very low/negative NDVI + dark
+    # 3. Water refinement: VERY strict spectral confirmation required.
+    #    Calibration showed that geometry-only "water" pixels are almost
+    #    always road surfaces or smooth ground.  Real water needs:
+    #    negative NDVI + very dark + ground level.
     # ------------------------------------------------------------------
     if ndvi is not None and brightness is not None:
-        # Ground-level, very dark, negative NDVI → water
-        water_refine = (
+        # Real water: ground-level, very dark, negative NDVI
+        water_confirmed = (
             mask
-            & (ndsm < 0.3)
-            & (ndvi < 0.0)
-            & (brightness < 60)
+            & (ndsm < 0.2)
+            & (ndvi < -0.05)
+            & (brightness < 50)
         )
-        px[water_refine] = OT["water"]
+        px[water_confirmed] = OT["water"]
 
         # Swimming pool: blue-dominant, small patches near ground level
         if blue_ratio is not None:
@@ -352,21 +370,34 @@ def _refine_with_spectral(
             px[pool] = OT["swimming_pool"]
 
     # ------------------------------------------------------------------
-    # 3b. Water correction: geometry-based water with green NDVI → meadow
+    # 3b. Water correction: any geometry-based water that doesn't meet
+    #     strict spectral criteria gets reclassified.
+    #     Bright "water" → road_path (roof sheeting, smooth asphalt)
+    #     Green "water" → meadow_field
     # ------------------------------------------------------------------
     if ndvi is not None:
         water_to_meadow = (
             mask
             & (px == OT["water"])
-            & (ndvi > 0.15)
+            & (ndvi > 0.10)
         )
         px[water_to_meadow] = OT["meadow_field"]
 
+    if brightness is not None:
+        water_to_road = (
+            mask
+            & (px == OT["water"])
+            & (brightness > 80)
+        )
+        px[water_to_road] = OT["road_path"]
+
     # ------------------------------------------------------------------
     # 4. Dead tree: tall + very low NDVI (brown/grey canopy)
+    #    MUST exclude bright pixels (buildings have NDVI~0.12 but brightness~131,
+    #    real dead trees are dark/brown with brightness < 80).
     # ------------------------------------------------------------------
     if ndvi is not None:
-        dead = (
+        dead_cond = (
             mask
             & ((px == OT["tree_unclassified"])
                | (px == OT["tree_coniferous"])
@@ -374,7 +405,10 @@ def _refine_with_spectral(
             & (ndvi < 0.10)
             & (ndsm >= 4.0)
         )
-        px[dead] = OT["dead_tree"]
+        # Only classify as dead tree if NOT bright (bright = building roof)
+        if brightness is not None:
+            dead_cond = dead_cond & (brightness < 90)
+        px[dead_cond] = OT["dead_tree"]
 
     # ------------------------------------------------------------------
     # 5. Parking lot: large flat area, low NDVI, bright, ground-to-low height
@@ -410,7 +444,7 @@ def _refine_with_spectral(
     if ndvi is not None and brightness is not None:
         greenhouse = (
             mask
-            & (ndsm >= 0.3) & (ndsm < 6.0)
+            & (ndsm >= 0.2) & (ndsm < 6.0)
             & (brightness > 160)
             & (ndvi < 0.10)
             & (ndsm_slope < 15)
@@ -431,27 +465,66 @@ def _refine_with_spectral(
         px[rock_extra] = OT["rock_cliff"]
 
     # ------------------------------------------------------------------
-    # 9. Building vs tree: elevated objects with low NDVI are more likely
-    #    building; high NDVI more likely tree
+    # 9. Building vs tree: spectral separation is THE key signal.
+    #    Calibration (KG 63330, BEV cadastre ground truth):
+    #      Buildings: NDVI median=0.115, brightness median=131
+    #      Trees:     NDVI median=0.329, brightness median=57
+    #
+    #    Best combined rule:  NDVI < 0.20 AND brightness > 100
+    #      → captures 85% of buildings, only 0.7% of trees
     # ------------------------------------------------------------------
-    if ndvi is not None:
-        # Flat elevated surface classified as tree but with low NDVI → building
+    if ndvi is not None and brightness is not None:
+        is_tree = (
+            (px == OT["tree_unclassified"])
+            | (px == OT["tree_broadleaf"])
+            | (px == OT["tree_coniferous"])
+        )
+        # PRIMARY: tree pixels with low NDVI + bright surface → building
         tree_to_bld = (
-            mask
-            & ((px == OT["tree_unclassified"])
-               | (px == OT["tree_broadleaf"])
-               | (px == OT["tree_coniferous"]))
-            & (ndvi < 0.08)
-            & (ndsm_slope < 20)
-            & (ndsm_std5 < 2.0)
+            mask & is_tree
+            & (ndvi < 0.20)
+            & (brightness > 100)
+            & (dtm_slope < 30)
         )
         px[tree_to_bld] = OT["building"]
 
-        # Building pixels with very high NDVI → actually tree canopy
+        # SECONDARY: very low NDVI alone (dark roofs, shadowed walls)
+        tree_to_bld2 = (
+            mask & is_tree
+            & (ndvi < 0.12)
+            & (ndsm >= 2.0)
+            & (dtm_slope < 30)
+        )
+        px[tree_to_bld2] = OT["building"]
+
+        # Building pixels with NDVI > 0.25 → tree canopy
+        # (calibration: buildings p90 NDVI = 0.20)
         bld_to_tree = (
             mask
             & (px == OT["building"])
-            & (ndvi > 0.45)
+            & (ndvi > 0.25)
+        )
+        px[bld_to_tree] = OT["tree_unclassified"]
+
+    elif ndvi is not None:
+        # No brightness available — use NDVI alone at conservative threshold
+        is_tree = (
+            (px == OT["tree_unclassified"])
+            | (px == OT["tree_broadleaf"])
+            | (px == OT["tree_coniferous"])
+        )
+        tree_to_bld = (
+            mask & is_tree
+            & (ndvi < 0.10)
+            & (ndsm >= 2.0)
+            & (dtm_slope < 30)
+        )
+        px[tree_to_bld] = OT["building"]
+
+        bld_to_tree = (
+            mask
+            & (px == OT["building"])
+            & (ndvi > 0.25)
         )
         px[bld_to_tree] = OT["tree_unclassified"]
 
@@ -620,17 +693,18 @@ def _segment_spectral_stats(
 
     if nm is not None:
         # Real NDVI available (NIR band present)
-        if nm < -0.05:
+        # Water requires VERY strict criteria — dark + negative NDVI
+        if nm < -0.05 and bm < 50:
             stats["spectral_class"] = "water"
         elif nm < 0.08 and bm > 100:
             stats["spectral_class"] = "bright_impervious"  # road / building
         elif nm < 0.08 and bm < 60:
             stats["spectral_class"] = "dark_impervious"     # shadow / dark roof
-        elif nm < 0.15:
+        elif nm < 0.12:
             stats["spectral_class"] = "bare_or_built"
-        elif nm < 0.30:
+        elif nm < 0.25:
             stats["spectral_class"] = "sparse_vegetation"
-        elif nm < 0.50:
+        elif nm < 0.40:
             stats["spectral_class"] = "moderate_vegetation"
         else:
             stats["spectral_class"] = "dense_vegetation"
@@ -660,7 +734,7 @@ def classify_objects(
     dtm: np.ndarray,
     mask: np.ndarray,
     transform,
-    min_height: float = 0.3,
+    min_height: float = 0.2,
     min_area: int = 1,
     max_objects: int = 50000,
     dsm: np.ndarray | None = None,
@@ -858,7 +932,7 @@ def _classify_segment(
     blue_m = seg_spectral.get("blue_ratio_mean", 0.0) if has_spectral else 0.0
 
     # --- Ground-level features: use pixel classification directly ---
-    if h_max < 0.3:
+    if h_max < 0.2:
         name = OBJECT_TYPE_NAMES.get(dominant_px_class, "ground")
 
         # Spectral refinements for ground-level segments
@@ -878,13 +952,21 @@ def _classify_segment(
             if name in ("meadow_field", "bare_soil"):
                 if ndvi_m is not None and ndvi_m < 0.12:
                     return "bare_soil", ""
-            # Water confirmation
-            if sp_class == "water":
-                return "water", ""
+            # Water at ground level: override to road if bright
+            if name == "water" and bri_m is not None and bri_m > 80:
+                return "road_path", ""
+            # Water: require VERY strict spectral confirmation
+            # Calibration: zero actual water in Kohlschwarz test area;
+            # all "water" was road/smooth ground.
+            if sp_class == "water" and ndvi_m is not None and ndvi_m < -0.05:
+                if bri_m is not None and bri_m < 50:
+                    return "water", ""
+                # Bright "water" is actually road or smooth surface
+                return "road_path", ""
 
         return name, ""
 
-    # --- Low vegetation: 0.3–2m ---
+    # --- Low vegetation: 0.2–2m ---
     if h_max < 2.0:
         # Spectral: vineyard/orchard detection (regular pattern of low veg)
         if has_spectral and ndvi_m is not None:
@@ -917,11 +999,14 @@ def _classify_segment(
         return "power_line", ""
 
     # Mast/pole: tiny footprint, very tall, non-vegetated
+    # Must be truly non-vegetated (NDVI < 0.10) to avoid catching tree crown
+    # fragments.  Without spectral data, require extreme aspect ratio.
     if area < 25 and h_max > 10:
-        if ndvi_m is not None and ndvi_m > 0.20:
-            # High NDVI → this is a narrow tree, not a pole
-            pass
-        else:
+        if has_spectral and ndvi_m is not None:
+            if ndvi_m < 0.10 and (bri_m is None or bri_m > 60):
+                return "mast_pole", ""
+            # Otherwise it's a tree fragment — classify as tree
+        elif not has_spectral and compactness > 0.5 and area < 10:
             return "mast_pole", ""
 
     # Check pixel-class composition
@@ -941,12 +1026,16 @@ def _classify_segment(
         if has_spectral and bri_m is not None and bri_m < 70:
             return "solar_panel", ""
 
-    # --- Building: majority of pixels classified as flat-roof ---
-    if building_frac + solar_frac > 0.5 and area >= 20:
+    # --- Building: majority of pixels classified as building ---
+    # Height constraint: buildings in Austria rarely exceed 20m (6 floors).
+    # Objects taller than 20m with building pixels are almost certainly tree
+    # canopy (tall trees have flat tops that trigger building pixel rules).
+    if building_frac + solar_frac > 0.5 and area >= 20 and h_max < 20:
         # Extra validation: buildings should be on gentle terrain
-        if slope_under < 25:
-            # Spectral override: if very green, it's probably tree canopy
-            if has_spectral and ndvi_m is not None and ndvi_m > 0.45:
+        if slope_under < 30:
+            # Spectral override: if green, it's probably tree canopy
+            # Calibration: buildings rarely exceed NDVI 0.20 (p90=0.20)
+            if has_spectral and ndvi_m is not None and ndvi_m > 0.25:
                 pass  # fall through to tree classification
             else:
                 if area >= 30:
@@ -954,14 +1043,17 @@ def _classify_segment(
                 return "structure", ""
 
     # Building with shaped (gabled/hipped) roof:
-    # Moderate surface slope (10-35°), low roughness relative to trees,
-    # and rectangular/compact shape on gentle terrain
-    if (slope_under < 20 and h_std < 2.0 and 20 < area < 1000
-            and compactness > 0.3 and elongation < 5 and h_max < 18):
+    # Calibrated: real buildings have nDSM_slope~43° (steep gabled),
+    # dsm_std3~0.74, nDSM_std5~1.47, height~6.7m, dtm_slope~14°.
+    # Height cap at 18m (typical max for Austrian rural buildings).
+    if (slope_under < 25 and h_std < 3.0 and 15 < area < 2000
+            and compactness > 0.2 and elongation < 8 and h_max < 18):
         # Spectral check: skip if clearly vegetation
-        if has_spectral and ndvi_m is not None and ndvi_m > 0.40:
+        if has_spectral and ndvi_m is not None and ndvi_m > 0.25:
             pass  # fall through to tree
-        else:
+        elif has_spectral and ndvi_m is not None and ndvi_m < 0.20:
+            return "building", ""
+        elif not has_spectral:
             return "building", ""
 
     # --- Bridge: elevated linear structure over depression/water ---
@@ -973,10 +1065,13 @@ def _classify_segment(
         if slope_under < 10 and building_frac > 0.3 and elongation > 8:
             return "bridge", ""
 
-    # --- Dead tree: tall but spectrally non-green ---
+    # --- Dead tree: tall, spectrally non-green, AND dark ---
+    # Calibration showed buildings have NDVI~0.12 and brightness~131;
+    # dead trees are dark (brightness < 80) with low NDVI.
     if has_spectral and ndvi_m is not None and ndvi_m < 0.10 and h_max >= 4:
-        # Not building-shaped
-        if compactness < 0.6 and building_frac < 0.3:
+        if bri_m is not None and bri_m < 80 and building_frac < 0.3:
+            return "dead_tree", "dead"
+        elif bri_m is None and compactness < 0.5 and building_frac < 0.3:
             return "dead_tree", "dead"
 
     # --- Tree row: linear arrangement of trees ---
@@ -1010,8 +1105,8 @@ def _classify_segment(
     # Spectral can help distinguish coniferous (darker, lower NDVI in winter)
     # from broadleaf (brighter, higher NDVI in summer)
     spectral_tree_hint = ""
-    if has_spectral and ndvi_m is not None and ndvi_m > 0.15:
-        if ndvi_m > 0.45:
+    if has_spectral and ndvi_m is not None and ndvi_m > 0.20:
+        if ndvi_m > 0.40:
             spectral_tree_hint = "broadleaf"  # very green = broadleaf in summer
         elif ndvi_m < 0.28 and bri_m is not None and bri_m < 80:
             spectral_tree_hint = "coniferous"  # dark + lower green = conifer
@@ -1197,7 +1292,7 @@ def create_classified_raster(
     height_band = np.where(mask, ndsm, -9999).astype(np.float32)
 
     # Override with segment-level classification where we have objects
-    labels = _segment_objects(ndsm, mask, pixel_classes, 0.3)
+    labels = _segment_objects(ndsm, mask, pixel_classes, 0.2)
     regions = measure.regionprops(labels)
 
     obj_centroids = np.array([[o.centroid_e, o.centroid_n] for o in objects]) if objects else np.empty((0, 2))

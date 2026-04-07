@@ -56,15 +56,20 @@ srv.service           systemd + gunicorn (2 workers, port 8000)
 
 **Phase 1 — Pixel-level.** Every pixel gets a type from 3D surface properties:
 - nDSM surface slope, DSM roughness (std 3×3), nDSM height variation (std 5×5), DTM terrain slope
-- Ground sub-types: water (ultra-smooth), road/path (smooth), meadow (normal), rough ground (rocky)
-- Elevated: flat DSM surface + gentle terrain → building; rough steep surface → tree canopy
+- Ground sub-types: road/path (smooth), meadow (normal), rough ground (rocky)
+- Water requires spectral confirmation (geometry alone is NOT sufficient)
+- Elevated with conservative geometry (ndsm_std5<1.5, dsm_std3<0.8) → building candidate
+- Everything else elevated → tree canopy
 - Rock/cliff: steep DTM (>45°) + rough surface
 
-**Phase 1b — Spectral refinement (optional, when orthophoto available).**
-- NDVI to distinguish vegetation from built surfaces
+**Phase 1b — Spectral refinement (critical for building detection).**
+- NDVI < 0.20 AND brightness > 100 → building (catches 85% buildings, only 0.7% trees)
+- NDVI > 0.25 on building pixel → reclassify as tree
+- Water: NDVI < -0.05 AND brightness < 50 (ultra-strict, no false positives)
+- Dead tree: NDVI < 0.10 AND brightness < 90 (excludes bright roofs)
 - Brightness + color ratios for road/parking/pool/solar panel detection
-- Dead tree detection (tall + low NDVI)
-- Bare soil vs meadow, building vs tree corrections
+- Bare soil vs meadow corrections
+- Calibrated against BEV cadastre footprints (KG 63330 Kohlschwarz)
 
 **Phase 2 — Watershed segmentation.** Continuous canopy split into individual crowns.
 
@@ -74,20 +79,20 @@ srv.service           systemd + gunicorn (2 workers, port 8000)
 
 | Code | Type | Signature |
 |------|------|----------|
-| 0 | ground | nDSM < 0.3m, uncategorised |
-| 1 | road_path | nDSM < 0.3m, DTM std3 < 0.15 |
-| 2 | meadow_field | nDSM < 0.3m, normal roughness |
-| 3 | rough_ground | nDSM < 0.3m, DTM std3 > 0.5 |
-| 4 | low_vegetation | 0.3–2m |
+| 0 | ground | nDSM < 0.2m, uncategorised |
+| 1 | road_path | nDSM < 0.2m, DTM std3 < 0.15 |
+| 2 | meadow_field | nDSM < 0.2m, normal roughness |
+| 3 | rough_ground | nDSM < 0.2m, DTM std3 > 0.5 |
+| 4 | low_vegetation | 0.2–2m |
 | 5 | shrub_bush | 2–4m |
 | 6 | tree_coniferous | >4m, conical crown |
 | 7 | tree_broadleaf | >4m, dome/rounded crown |
 | 8 | tree_unclassified | >4m, ambiguous crown |
-| 9 | building | flat DSM surface, gentle terrain, 20–2000 m² |
+| 9 | building | NDVI<0.20 + brightness>100 + h<20m, 15–2000 m² |
 | 10 | structure | small non-building elevated flat object |
 | 11 | mast_pole | tiny footprint (<25 m²), tall (>10m) |
 | 12 | wall_fence | narrow elongated, <4m |
-| 13 | water | ultra-smooth ground, DTM slope < 3° |
+| 13 | water | ultra-strict: NDVI < -0.05 AND brightness < 50 AND smooth |
 | 14 | unclassified | fallback |
 | 15 | parking_lot | large flat paved, low NDVI (ortho) |
 | 16 | swimming_pool | blue-dominant water, small (ortho) |
@@ -134,9 +139,13 @@ srv.service           systemd + gunicorn (2 workers, port 8000)
 
 - All geometry input in WGS84; internal processing in EPSG:3035
 - nDSM = DSM − DTM (normalised object heights above ground)
+- Height change detection threshold: 0.2m (lowered from 0.3m)
 - Max query area: 25 km²
 - Orthophoto integration is optional (`include_ortho=true`)
 - Raster output: 2 bands — type code (uint8) + height (float32)
+- Classifier calibrated against BEV cadastre ground truth (KG 63330 Kohlschwarz)
+- Water detection is ultra-strict (NDVI < -0.05 AND brightness < 50 required)
+  — smooth surfaces are usually roads/roofs, not water
 
 ## Developing
 

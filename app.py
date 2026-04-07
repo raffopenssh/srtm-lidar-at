@@ -234,7 +234,7 @@ def objects_summary():
         features = _get_geometry()
         params = _get_params()
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        min_height = float(params.get('min_height', 0.3))
+        min_height = float(params.get('min_height', 0.2))
         min_area = int(params.get('min_area', 2))
         include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
         object_types_filter = params.get('object_types', None)
@@ -309,7 +309,7 @@ def objects_raster():
         params = _get_params()
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
         resolution = float(params.get('resolution', 1.0))
-        min_height = float(params.get('min_height', 0.3))
+        min_height = float(params.get('min_height', 0.2))
         min_area = int(params.get('min_area', 2))
         include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
 

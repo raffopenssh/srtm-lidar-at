@@ -35,8 +35,11 @@ Response: GeoJSON FeatureCollection with terrain property block.
 Detect & classify above-ground objects from normalised DSM (DSM-DTM).
 Params: min_height (float, default 0.3), min_area (int sqm, default 2),
   object_types (comma-separated filter), max_height (float), dataset (default 20240915)
-Object types: ground(0), low_vegetation(1), shrub(2), tree_coniferous(3), tree_broadleaf(4),
-  tree_unclassified(5), building(6), structure(7), mast_pole(8), wall_fence(9), unclassified(10)
+Object types: ground(0), road_path(1), meadow_field(2), rough_ground(3), low_vegetation(4),
+  shrub_bush(5), tree_coniferous(6), tree_broadleaf(7), tree_unclassified(8), building(9),
+  structure(10), mast_pole(11), wall_fence(12), water(13), unclassified(14)
+Classification method: pixel-level 3D surface analysis (DSM slope, roughness, curvature) +
+  watershed segmentation + crown shape profiling (radial height dropoff from peak)
 Response: {summary: {total_objects, by_type, by_height_class, trees}, type: "FeatureCollection", features: [...]}
 Each feature is a point (centroid) with properties: id, type, type_code, height_max_m, height_mean_m,
   height_p90_m, area_sqm, compactness, elongation, crown_shape, height_class.

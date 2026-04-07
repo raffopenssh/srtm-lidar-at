@@ -117,29 +117,28 @@ document.getElementById('btn-run').onclick = async () => {
   resultDiv.textContent = 'Loading...';
   resultLayer.clearLayers();
 
-  const body = {};
-  try { Object.assign(body, JSON.parse(geometry)); body.geometry = JSON.parse(geometry); } catch(e) { body.geometry = geometry; }
-  body.min_height = parseFloat(document.getElementById('min_height').value) || 0.3;
-  body.min_area = parseInt(document.getElementById('min_area').value) || 2;
-  body.resolution = parseFloat(document.getElementById('resolution').value) || 1;
+  const isRaster = endpoint === 'objects/raster';
+  const params = new URLSearchParams();
+  params.set('min_height', parseFloat(document.getElementById('min_height').value) || 0.3);
+  params.set('min_area', parseInt(document.getElementById('min_area').value) || 2);
+  params.set('resolution', parseFloat(document.getElementById('resolution').value) || 1);
   const ot = document.getElementById('object_types').value.trim();
-  if (ot) body.object_types = ot;
+  if (ot) params.set('object_types', ot);
+
+  // Detect if input is JSON or KML/text
+  let contentType = 'text/plain';
+  let sendBody = geometry;
+  try {
+    const parsed = JSON.parse(geometry);
+    contentType = 'application/json';
+    sendBody = JSON.stringify({geometry: parsed});
+  } catch(e) { /* KML or coords — send as text */ }
 
   try {
-    const isRaster = endpoint === 'objects/raster';
-    // For raster, we need to handle the geometry differently
-    let sendBody;
-    try {
-      const parsed = JSON.parse(geometry);
-      sendBody = { ...body, geometry: parsed };
-    } catch(e) {
-      sendBody = { ...body, geometry: geometry };
-    }
-
-    const resp = await fetch(`/api/v1/${endpoint}`, {
+    const resp = await fetch(`/api/v1/${endpoint}?${params}`, {
       method: 'POST',
-      headers: { 'Content-Type': isRaster ? 'text/plain' : 'application/json' },
-      body: isRaster ? geometry : JSON.stringify(sendBody),
+      headers: { 'Content-Type': contentType },
+      body: sendBody,
     });
 
     if (isRaster) {
@@ -170,7 +169,7 @@ document.getElementById('btn-run').onclick = async () => {
         if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.1));
       }
     }
-    status.textContent = `Done. ${data?.meta?.processing_time_s || ''}s`;
+    status.textContent = 'Done.';
   } catch(e) {
     resultDiv.textContent = 'Error: ' + e.message;
     status.textContent = 'Error';

@@ -302,6 +302,7 @@ def objects_summary():
                 data['transform'],
                 min_height=min_height,
                 min_area=min_area,
+                dsm=data['dsm'],
             )
 
             # Apply filters
@@ -397,13 +398,15 @@ def objects_raster():
             data['transform'],
             min_height=min_height,
             min_area=min_area,
+            dsm=data['dsm'],
         )
 
         if object_types_filter:
             objects = [o for o in objects if o.obj_type in object_types_filter]
 
         type_band, height_band, out_tf = oc.create_classified_raster(
-            data['ndsm'], data['mask'], data['transform'],
+            data['ndsm'], data['dtm'], data['dsm'], data['mask'],
+            data['transform'],
             objects, output_resolution=resolution,
         )
 
@@ -428,19 +431,7 @@ def objects_raster():
             dst.set_band_description(1, 'object_type_code')
             dst.set_band_description(2, 'object_height_m')
             # Write color table for object types
-            dst.update_tags(1, **{
-                'OBJECT_TYPE_0': 'ground',
-                'OBJECT_TYPE_1': 'low_vegetation',
-                'OBJECT_TYPE_2': 'shrub',
-                'OBJECT_TYPE_3': 'tree_coniferous',
-                'OBJECT_TYPE_4': 'tree_broadleaf',
-                'OBJECT_TYPE_5': 'tree_unclassified',
-                'OBJECT_TYPE_6': 'building',
-                'OBJECT_TYPE_7': 'structure',
-                'OBJECT_TYPE_8': 'mast_pole',
-                'OBJECT_TYPE_9': 'wall_fence',
-                'OBJECT_TYPE_10': 'unclassified',
-            })
+            dst.update_tags(1, **{f'OBJECT_TYPE_{v}': k for k, v in oc.OBJECT_TYPES.items()})
 
         elapsed = time.time() - t0
         mime = 'image/tiff' if suffix == '.tif' else 'application/geopackage+sqlite3'

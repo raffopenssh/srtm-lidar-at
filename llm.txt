@@ -1,0 +1,103 @@
+# Austrian LIDAR Analysis API — LLM Reference
+
+Base URL: /api/v1
+Source: BEV ALS DTM/DSM (data.bev.gv.at), 1m resolution, EPSG:3035
+Datasets: 20240915 (more dates planned for temporal comparison)
+Max area: 25 km²
+
+All POST endpoints accept geometry as:
+- GeoJSON (Feature, FeatureCollection, or bare geometry) in JSON body
+- KML string in request body (Content-Type: text/plain or application/xml)
+- Simple coordinates: "lon,lat" or "lon,lat;lon,lat;..."
+- File upload (multipart, field name: "file")
+
+JSON body format: {"geometry": <geojson>, "min_height": 0.3, "min_area": 2, ...}
+All params also accepted as query string: ?min_height=5&object_types=building
+
+## Endpoints
+
+### POST /api/v1/elevation
+Enrich features with DSM/DTM elevation.
+- Points: returns dsm_elevation_m, dtm_elevation_m, object_height_m per point
+- Lines: returns elevation_profile array with per-vertex elevations
+- Polygons: returns min/max/mean for DSM, DTM, and object heights
+Response: GeoJSON FeatureCollection with enriched properties.
+
+### POST /api/v1/terrain
+Terrain characterisation for polygons (points auto-buffered to 50m radius).
+Returns: elevation stats, slope (min/max/mean/std + classification), aspect distribution,
+  ruggedness (TRI + classification), area.
+Slope classes: flat(<2°), gentle(2-5°), moderate(5-15°), steep(15-30°), very_steep(30-45°), extreme(>45°)
+TRI classification: level, nearly_level, slightly_rugged, intermediately_rugged, moderately_rugged, highly_rugged, extremely_rugged
+Response: GeoJSON FeatureCollection with terrain property block.
+
+### POST /api/v1/objects
+Detect & classify above-ground objects from normalised DSM (DSM-DTM).
+Params: min_height (float, default 0.3), min_area (int sqm, default 2),
+  object_types (comma-separated filter), max_height (float), dataset (default 20240915)
+Object types: ground(0), low_vegetation(1), shrub(2), tree_coniferous(3), tree_broadleaf(4),
+  tree_unclassified(5), building(6), structure(7), mast_pole(8), wall_fence(9), unclassified(10)
+Response: {summary: {total_objects, by_type, by_height_class, trees}, type: "FeatureCollection", features: [...]}
+Each feature is a point (centroid) with properties: id, type, type_code, height_max_m, height_mean_m,
+  height_p90_m, area_sqm, compactness, elongation, crown_shape, height_class.
+Crown shapes: conical, rounded, columnar, irregular
+Height classes (logarithmic): 0-0.5m, 0.5-1m, 1-2m, 2-4m, 4-8m, 8-15m, 15-25m, 25-40m, 40-60m, 60-80m, >80m
+
+### POST /api/v1/objects/raster
+Generate a 2-band classified raster (GeoTIFF).
+  Band 1: object_type_code (uint8, see codes above)
+  Band 2: object_height_m (float32, -9999=nodata)
+Params: resolution (float metres, default 1.0), format (geotiff|gpkg), + same as /objects
+Response: Binary file download.
+Use in QGIS: style Band 1 as categorised (type codes), Band 2 as graduated (height).
+
+### GET /api/v1/info
+API metadata: datasets, tile count, object type codes, endpoints.
+
+### GET /api/v1/docs/llm.txt
+This document.
+
+## Examples
+
+```bash
+# Elevation for a point
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/elevation \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Point", "coordinates": [15.115, 47.137]}}'
+
+# Terrain analysis for a polygon
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/terrain \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}}'
+
+# Object detection with filters
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}, "min_height": 5, "object_types": "tree_coniferous,tree_broadleaf"}'
+
+# Download classified raster at 2m resolution
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects/raster \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}, "resolution": 2}' \
+  -o objects.tif
+
+# Send KML directly
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
+  -H 'Content-Type: text/plain' \
+  --data-binary @area.kml
+```
+
+## Integration with Cadastre API
+Combine with https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt to:
+1. Query parcels by location
+2. Use parcel geometry as input to this LIDAR API
+3. Enrich parcel data with elevation, terrain, and object information
+
+## Data Notes
+- DTM = bare earth (no vegetation/buildings)
+- DSM = surface including all objects
+- nDSM = DSM - DTM = normalised object heights above ground
+- CRS: EPSG:3035 (ETRS89-LAEA). API accepts WGS84 (EPSG:4326) input, transforms internally.
+- Resolution: 1m ground sampling. Each tile is 50km × 50km (50001×50001 pixels, ~12 GB).
+- Windowed reads via HTTP range requests — only needed pixels are downloaded.
+- 55 tiles cover all of Austria.

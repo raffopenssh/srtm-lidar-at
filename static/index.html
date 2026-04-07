@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Austrian LIDAR Analysis</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; height: 100vh; background: #f5f5f5; }
+#sidebar { width: 420px; display: flex; flex-direction: column; background: #fff; border-right: 1px solid #ddd; overflow: hidden; }
+#sidebar h1 { font-size: 16px; padding: 12px 16px; background: #1a1a2e; color: #fff; }
+#sidebar h1 span { color: #7fdbca; }
+.controls { padding: 12px 16px; flex-shrink: 0; }
+label { display: block; font-size: 12px; font-weight: 600; color: #555; margin: 8px 0 4px; }
+select, input, textarea { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+textarea { height: 100px; font-family: monospace; font-size: 11px; resize: vertical; }
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; }
+button { padding: 8px 16px; background: #0d7377; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; margin-top: 8px; }
+button:hover { background: #14a3a8; }
+button:disabled { opacity: .5; cursor: wait; }
+#result-area { flex: 1; overflow: auto; padding: 12px 16px; }
+#result { font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; background: #f9f9f9; padding: 8px; border-radius: 4px; border: 1px solid #eee; min-height: 60px; }
+#map-area { flex: 1; position: relative; }
+#map { height: 100%; }
+.status { padding: 4px 16px; font-size: 11px; color: #888; background: #f0f0f0; border-top: 1px solid #ddd; }
+.tab-bar { display: flex; border-bottom: 1px solid #ddd; }
+.tab { padding: 8px 16px; font-size: 12px; cursor: pointer; border-bottom: 2px solid transparent; color: #666; }
+.tab.active { border-bottom-color: #0d7377; color: #0d7377; font-weight: 600; }
+.hint { font-size: 11px; color: #999; margin-top: 2px; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>🏠️ Austrian <span>LIDAR</span> Analysis</h1>
+  <div class="controls">
+    <label>Endpoint</label>
+    <select id="endpoint">
+      <option value="elevation">Elevation Enrichment</option>
+      <option value="terrain">Terrain Characterisation</option>
+      <option value="objects" selected>Object Detection</option>
+      <option value="objects/raster">Object Raster (download)</option>
+    </select>
+
+    <div class="row">
+      <div><label>Min Height (m)</label><input id="min_height" type="number" value="0.3" step="0.1"></div>
+      <div><label>Min Area (m²)</label><input id="min_area" type="number" value="2" step="1"></div>
+    </div>
+    <div class="row">
+      <div><label>Resolution (m)</label><input id="resolution" type="number" value="1" step="0.5" min="0.2"></div>
+      <div><label>Object Types</label><input id="object_types" placeholder="all (or: tree_coniferous,building)"></div>
+    </div>
+    <label>Geometry (GeoJSON / KML / coords)</label>
+    <textarea id="geometry"></textarea>
+    <p class="hint">Or draw on the map. Click ▶ to load the sample polygon.</p>
+    <div class="row">
+      <button id="btn-sample">▶ Sample</button>
+      <button id="btn-run">🚀 Analyse</button>
+    </div>
+  </div>
+  <div id="result-area">
+    <label>Result</label>
+    <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
+  </div>
+  <div class="status" id="status">Idle</div>
+</div>
+<div id="map-area"><div id="map"></div></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<script>
+const SAMPLE_KML = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document><Placemark><name>Kathi Beispiel</name><Polygon><outerBoundaryIs><LinearRing><coordinates>
+15.10843401000211,47.14054372430085,0 15.10891726814837,47.13722400099616,0 15.11516512477505,47.13436057677661,0 15.12224357582761,47.13301065583731,0 15.1263196986764,47.13656725625793,0 15.12607893621995,47.13979583078796,0 15.11988458347915,47.1421491232059,0 15.11618387366204,47.14216738741007,0 15.11473582645048,47.1410911798395,0 15.10843401000211,47.14054372430085,0
+</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>`;
+
+const map = L.map('map').setView([47.137, 15.117], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap', maxZoom: 19
+}).addTo(map);
+
+const drawnItems = new L.FeatureGroup().addTo(map);
+const resultLayer = new L.FeatureGroup().addTo(map);
+new L.Control.Draw({
+  edit: { featureGroup: drawnItems },
+  draw: { polygon: true, polyline: true, marker: true, rectangle: true, circle: false, circlemarker: false }
+}).addTo(map);
+
+map.on(L.Draw.Event.CREATED, e => {
+  drawnItems.clearLayers();
+  drawnItems.addLayer(e.layer);
+  document.getElementById('geometry').value = JSON.stringify(e.layer.toGeoJSON().geometry, null, 2);
+});
+
+document.getElementById('btn-sample').onclick = () => {
+  document.getElementById('geometry').value = SAMPLE_KML;
+  // Show on map
+  const coords = [[47.14054372,15.10843401],[47.13722400,15.10891727],[47.13436058,15.11516512],[47.13301066,15.12224358],[47.13656726,15.12631970],[47.13979583,15.12607894],[47.14214912,15.11988458],[47.14216739,15.11618387],[47.14109118,15.11473583],[47.14054372,15.10843401]];
+  drawnItems.clearLayers();
+  const poly = L.polygon(coords, {color: '#0d7377', weight: 2}).addTo(drawnItems);
+  map.fitBounds(poly.getBounds().pad(0.2));
+};
+
+document.getElementById('btn-run').onclick = async () => {
+  const btn = document.getElementById('btn-run');
+  const status = document.getElementById('status');
+  const resultDiv = document.getElementById('result');
+  const endpoint = document.getElementById('endpoint').value;
+  const geometry = document.getElementById('geometry').value.trim();
+  if (!geometry) { resultDiv.textContent = 'Please provide geometry first.'; return; }
+
+  btn.disabled = true;
+  status.textContent = 'Analysing... (remote LIDAR reads may take 10-30s)';
+  resultDiv.textContent = 'Loading...';
+  resultLayer.clearLayers();
+
+  const body = {};
+  try { Object.assign(body, JSON.parse(geometry)); body.geometry = JSON.parse(geometry); } catch(e) { body.geometry = geometry; }
+  body.min_height = parseFloat(document.getElementById('min_height').value) || 0.3;
+  body.min_area = parseInt(document.getElementById('min_area').value) || 2;
+  body.resolution = parseFloat(document.getElementById('resolution').value) || 1;
+  const ot = document.getElementById('object_types').value.trim();
+  if (ot) body.object_types = ot;
+
+  try {
+    const isRaster = endpoint === 'objects/raster';
+    // For raster, we need to handle the geometry differently
+    let sendBody;
+    try {
+      const parsed = JSON.parse(geometry);
+      sendBody = { ...body, geometry: parsed };
+    } catch(e) {
+      sendBody = { ...body, geometry: geometry };
+    }
+
+    const resp = await fetch(`/api/v1/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': isRaster ? 'text/plain' : 'application/json' },
+      body: isRaster ? geometry : JSON.stringify(sendBody),
+    });
+
+    if (isRaster) {
+      if (!resp.ok) { const e = await resp.json(); throw new Error(e.error); }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'objects.tif'; a.click();
+      resultDiv.textContent = 'Raster downloaded!';
+    } else {
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      resultDiv.textContent = JSON.stringify(data, null, 2);
+      // Show results on map
+      if (data.features) {
+        const gj = L.geoJSON(data, {
+          pointToLayer: (f, ll) => L.circleMarker(ll, {
+            radius: Math.max(3, Math.min(10, (f.properties.height_max_m || 5) / 3)),
+            color: typeColor(f.properties.type || f.properties.obj_type || ''),
+            fillOpacity: 0.7, weight: 1
+          }),
+          onEachFeature: (f, layer) => {
+            const p = f.properties;
+            layer.bindPopup(`<b>${p.type || p.name || 'Feature'}</b><br>` +
+              Object.entries(p).filter(([k]) => k !== 'type' && k !== 'elevation_profile')
+                .map(([k,v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('<br>'));
+          }
+        }).addTo(resultLayer);
+        if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.1));
+      }
+    }
+    status.textContent = `Done. ${data?.meta?.processing_time_s || ''}s`;
+  } catch(e) {
+    resultDiv.textContent = 'Error: ' + e.message;
+    status.textContent = 'Error';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function typeColor(t) {
+  const c = { tree_coniferous: '#228B22', tree_broadleaf: '#32CD32', tree_unclassified: '#90EE90',
+    building: '#DC143C', structure: '#FF6347', shrub: '#9ACD32', low_vegetation: '#ADFF2F',
+    mast_pole: '#4169E1', wall_fence: '#808080', unclassified: '#666' };
+  return c[t] || '#0d7377';
+}
+</script>
+</body>
+</html>

@@ -25,6 +25,14 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 DATASETS: dict[str, dict[str, str]] = {
+    "20220915": {
+        "dtm_base": "https://data.bev.gv.at/download/ALS/DTM/20220915/",
+        "dsm_base": "https://data.bev.gv.at/download/ALS/DSM/20220915/",
+    },
+    "20230915": {
+        "dtm_base": "https://data.bev.gv.at/download/ALS/DTM/20230915/",
+        "dsm_base": "https://data.bev.gv.at/download/ALS/DSM/20230915/",
+    },
     "20240915": {
         "dtm_base": "https://data.bev.gv.at/download/ALS/DTM/20240915/",
         "dsm_base": "https://data.bev.gv.at/download/ALS/DSM/20240915/",

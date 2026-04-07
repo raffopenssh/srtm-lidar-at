@@ -3,7 +3,12 @@
 Two-phase approach:
   Phase 1 — Pixel-level surface classification using 3D shape analysis
   Phase 2 — Watershed segmentation of elevated pixels into individual objects,
-            classified by aggregating pixel-level labels + morphometric features.
+            classified by aggregating pixel-level labels + morphometrics.
+
+Optional spectral integration (Phase 1b):
+  When RGB orthophoto data is available, spectral indices (NDVI, brightness,
+  colour ratios) refine the geometry-based classification.  Without spectral
+  data the classifier behaves identically to the pure-LIDAR version.
 
 Surface signatures (empirically derived from Austrian ALS 1m data):
   - Ground (road/path):  nDSM < 0.3m, DTM smooth (std3 < 0.1)
@@ -15,12 +20,19 @@ Surface signatures (empirically derived from Austrian ALS 1m data):
   - Tree canopy:          nDSM > 4m, nDSM surface slope > 40°, roughness > 1.0
   - Coniferous crown:     peak with steep radial dropoff (>5m in 5m radius)
   - Broadleaf crown:      dome with gentle dropoff (<4m in 5m radius)
+
+Spectral refinements (when orthophoto available):
+  - NDVI > 0.3  → vegetation;  < 0.1 → built / bare;  < 0 → water
+  - Blue-dominant → water / swimming pool
+  - High brightness + low NDVI → road / parking lot
+  - Tall + low NDVI → dead tree
+  - Regular low-veg pattern → vineyard / orchard
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy import ndimage
@@ -28,23 +40,44 @@ from skimage import measure, morphology, segmentation, feature
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
 # Object type codes for raster output
+# ---------------------------------------------------------------------------
+
 OBJECT_TYPES = {
+    # Ground types (0-3)
     "ground": 0,
     "road_path": 1,
     "meadow_field": 2,
-    "rough_ground": 3,        # rocks, scree, uneven terrain
-    "low_vegetation": 4,      # 0.3–2m
-    "shrub_bush": 5,          # 2–4m
+    "rough_ground": 3,
+    # Low / medium vegetation (4-5)
+    "low_vegetation": 4,
+    "shrub_bush": 5,
+    # Trees (6-8)
     "tree_coniferous": 6,
     "tree_broadleaf": 7,
     "tree_unclassified": 8,
+    # Buildings & structures (9-12)
     "building": 9,
-    "structure": 10,          # small non-building structures
+    "structure": 10,
     "mast_pole": 11,
     "wall_fence": 12,
+    # Water (13)
     "water": 13,
     "unclassified": 14,
+    # --- NEW types ---
+    "parking_lot": 15,
+    "swimming_pool": 16,
+    "solar_panel": 17,
+    "greenhouse": 18,
+    "bridge": 19,
+    "power_line": 20,
+    "hedge": 21,
+    "tree_row": 22,
+    "dead_tree": 23,
+    "bare_soil": 24,
+    "rock_cliff": 25,
+    "vineyard_orchard": 26,
 }
 
 OBJECT_TYPE_NAMES = {v: k for k, v in OBJECT_TYPES.items()}
@@ -61,6 +94,24 @@ def _height_class(h: float) -> str:
         prev = brk
     return f">{_HEIGHT_BREAKS[-1]}m"
 
+
+# ---------------------------------------------------------------------------
+# Spectral helper — extract per-pixel index arrays from dict
+# ---------------------------------------------------------------------------
+
+def _get_spectral(spectral: dict | None, key: str) -> np.ndarray | None:
+    """Safely retrieve a spectral index array, or *None*."""
+    if spectral is None:
+        return None
+    arr = spectral.get(key)
+    if arr is None:
+        return None
+    return np.asarray(arr, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Data class
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DetectedObject:
@@ -81,6 +132,11 @@ class DetectedObject:
     bbox: tuple[float, float, float, float]
     crown_shape: str = ""
     height_class: str = ""
+    # --- spectral fields (populated only when orthophoto available) ---
+    ndvi_mean: float = 0.0
+    ndvi_max: float = 0.0
+    brightness_mean: float = 0.0
+    spectral_class: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +148,7 @@ def _classify_pixels(
     dtm: np.ndarray,
     dsm: np.ndarray,
     mask: np.ndarray,
+    spectral: dict | None = None,
 ) -> np.ndarray:
     """Classify every pixel by its 3D surface properties.
 
@@ -169,6 +226,223 @@ def _classify_pixels(
     other_elevated = elevated & ~building_px & ~tree_canopy
     px[other_elevated] = OBJECT_TYPES["tree_unclassified"]
 
+    # --- Rock/cliff: steep DTM + rough ground, regardless of nDSM height ---
+    rock_cliff = mask & (dtm_slope > 45) & (dtm_std3 > 0.8)
+    px[rock_cliff] = OBJECT_TYPES["rock_cliff"]
+
+    # --- Phase 1b: spectral refinement (optional) ---
+    if spectral is not None:
+        px = _refine_with_spectral(px, spectral, n, mask, dtm_slope, dtm_std3,
+                                   ndsm_slope, ndsm_std5, dsm_std3)
+
+    return px
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b: Spectral pixel-level refinement
+# ---------------------------------------------------------------------------
+
+def _refine_with_spectral(
+    px: np.ndarray,
+    spectral: dict,
+    ndsm: np.ndarray,
+    mask: np.ndarray,
+    dtm_slope: np.ndarray,
+    dtm_std3: np.ndarray,
+    ndsm_slope: np.ndarray,
+    ndsm_std5: np.ndarray,
+    dsm_std3: np.ndarray,
+) -> np.ndarray:
+    """Refine geometry-based pixel classification using spectral indices.
+
+    Operates *in-place* on *px* and returns it.
+    """
+    ndvi = _get_spectral(spectral, "ndvi")
+    brightness = _get_spectral(spectral, "brightness")
+    green_ratio = _get_spectral(spectral, "green_ratio")
+    rg_index = _get_spectral(spectral, "rg_index")
+    blue_ratio = _get_spectral(spectral, "blue_ratio")
+
+    # Bail if we got nothing useful
+    if ndvi is None and brightness is None:
+        return px
+
+    # Make sure shapes match — spectral might have been resampled to the
+    # LIDAR grid but safety-check anyway.
+    target_shape = px.shape
+    def _conform(arr):
+        if arr is None:
+            return None
+        if arr.shape != target_shape:
+            from scipy.ndimage import zoom
+            factors = (target_shape[0] / arr.shape[0],
+                       target_shape[1] / arr.shape[1])
+            return zoom(arr, factors, order=1).astype(np.float32)
+        return arr
+
+    ndvi = _conform(ndvi)
+    brightness = _conform(brightness)
+    green_ratio = _conform(green_ratio)
+    rg_index = _conform(rg_index)
+    blue_ratio = _conform(blue_ratio)
+
+    OT = OBJECT_TYPES  # shorthand
+
+    # ------------------------------------------------------------------
+    # 1. Bare soil: ground-level meadow pixels with very low NDVI
+    # ------------------------------------------------------------------
+    if ndvi is not None:
+        bare = (
+            mask
+            & ((px == OT["meadow_field"]) | (px == OT["rough_ground"]))
+            & (ndvi < 0.15)
+        )
+        if brightness is not None:
+            # bare soil is typically medium brightness, not super dark
+            bare = bare & (brightness > 40)
+        px[bare] = OT["bare_soil"]
+
+    # ------------------------------------------------------------------
+    # 2. Road vs meadow disambiguation
+    #    Geometry-only often confuses them.  Roads are bright/grey + low NDVI.
+    # ------------------------------------------------------------------
+    if ndvi is not None and brightness is not None:
+        # Meadow pixels that look spectrally green → keep as meadow (no-op)
+        # Meadow pixels with low NDVI + high brightness → reclassify as road
+        meadow_to_road = (
+            mask
+            & (px == OT["meadow_field"])
+            & (ndvi < 0.12)
+            & (brightness > 100)
+        )
+        px[meadow_to_road] = OT["road_path"]
+
+        # Road pixels that are actually green → reclassify as meadow
+        road_to_meadow = (
+            mask
+            & (px == OT["road_path"])
+            & (ndvi > 0.35)
+        )
+        px[road_to_meadow] = OT["meadow_field"]
+
+    # ------------------------------------------------------------------
+    # 3. Water refinement: very low/negative NDVI + dark
+    # ------------------------------------------------------------------
+    if ndvi is not None and brightness is not None:
+        # Ground-level, very dark, negative NDVI → water
+        water_refine = (
+            mask
+            & (ndsm < 0.3)
+            & (ndvi < 0.0)
+            & (brightness < 60)
+        )
+        px[water_refine] = OT["water"]
+
+        # Swimming pool: blue-dominant, small patches near ground level
+        if blue_ratio is not None:
+            pool = (
+                mask
+                & (ndsm < 1.0)
+                & (blue_ratio > 0.38)
+                & (ndvi < 0.05)
+                & (brightness > 50)
+                & (brightness < 200)
+            )
+            px[pool] = OT["swimming_pool"]
+
+    # ------------------------------------------------------------------
+    # 4. Dead tree: tall + very low NDVI (brown/grey canopy)
+    # ------------------------------------------------------------------
+    if ndvi is not None:
+        dead = (
+            mask
+            & ((px == OT["tree_unclassified"])
+               | (px == OT["tree_coniferous"])
+               | (px == OT["tree_broadleaf"]))
+            & (ndvi < 0.10)
+            & (ndsm >= 4.0)
+        )
+        px[dead] = OT["dead_tree"]
+
+    # ------------------------------------------------------------------
+    # 5. Parking lot: large flat area, low NDVI, bright, ground-to-low height
+    # ------------------------------------------------------------------
+    if ndvi is not None and brightness is not None:
+        parking = (
+            mask
+            & (ndsm < 0.5)
+            & (ndvi < 0.10)
+            & (brightness > 90)
+            & (dsm_std3 < 0.15)
+            & (dtm_slope < 5)
+        )
+        # Mark as parking candidate — object-level will confirm by size
+        px[parking] = OT["parking_lot"]
+
+    # ------------------------------------------------------------------
+    # 6. Solar panel: dark rectangular patches on building roofs
+    # ------------------------------------------------------------------
+    if ndvi is not None and brightness is not None:
+        solar = (
+            mask
+            & (px == OT["building"])
+            & (brightness < 60)
+            & (ndvi < 0.05)
+        )
+        px[solar] = OT["solar_panel"]
+
+    # ------------------------------------------------------------------
+    # 7. Greenhouse: bright, rectangular, slightly elevated (0.3-6m),
+    #    low NDVI (glass/plastic surface)
+    # ------------------------------------------------------------------
+    if ndvi is not None and brightness is not None:
+        greenhouse = (
+            mask
+            & (ndsm >= 0.3) & (ndsm < 6.0)
+            & (brightness > 160)
+            & (ndvi < 0.10)
+            & (ndsm_slope < 15)
+            & (dsm_std3 < 0.5)
+        )
+        px[greenhouse] = OT["greenhouse"]
+
+    # ------------------------------------------------------------------
+    # 8. Rock/cliff spectral confirmation: steep + low NDVI + grey
+    # ------------------------------------------------------------------
+    if ndvi is not None:
+        rock_extra = (
+            mask
+            & (dtm_slope > 35)
+            & (dtm_std3 > 0.5)
+            & (ndvi < 0.10)
+        )
+        px[rock_extra] = OT["rock_cliff"]
+
+    # ------------------------------------------------------------------
+    # 9. Building vs tree: elevated objects with low NDVI are more likely
+    #    building; high NDVI more likely tree
+    # ------------------------------------------------------------------
+    if ndvi is not None:
+        # Flat elevated surface classified as tree but with low NDVI → building
+        tree_to_bld = (
+            mask
+            & ((px == OT["tree_unclassified"])
+               | (px == OT["tree_broadleaf"])
+               | (px == OT["tree_coniferous"]))
+            & (ndvi < 0.08)
+            & (ndsm_slope < 20)
+            & (ndsm_std5 < 2.0)
+        )
+        px[tree_to_bld] = OT["building"]
+
+        # Building pixels with very high NDVI → actually tree canopy
+        bld_to_tree = (
+            mask
+            & (px == OT["building"])
+            & (ndvi > 0.45)
+        )
+        px[bld_to_tree] = OT["tree_unclassified"]
+
     return px
 
 
@@ -215,7 +489,14 @@ def _segment_objects(
     combined[low_active] = low_labels[low_active] + offset
 
     # --- Ground-level features: large connected regions ---
-    ground_classes = {OBJECT_TYPES["road_path"], OBJECT_TYPES["water"]}
+    ground_classes = {
+        OBJECT_TYPES["road_path"],
+        OBJECT_TYPES["water"],
+        OBJECT_TYPES["parking_lot"],
+        OBJECT_TYPES["swimming_pool"],
+        OBJECT_TYPES["bare_soil"],
+        OBJECT_TYPES["rock_cliff"],
+    }
     for gc in ground_classes:
         gc_mask = (pixel_classes == gc) & (combined == 0)
         if np.any(gc_mask):
@@ -258,6 +539,94 @@ def _watershed_tall(ndsm: np.ndarray, tall_mask: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Spectral statistics for a segment
+# ---------------------------------------------------------------------------
+
+def _segment_spectral_stats(
+    obj_mask: np.ndarray,
+    spectral: dict | None,
+    rgb: np.ndarray | None,
+) -> dict:
+    """Compute per-segment spectral statistics.
+
+    Returns a dict with keys: ndvi_mean, ndvi_max, brightness_mean,
+    green_ratio_mean, blue_ratio_mean, rg_index_mean, spectral_class.
+    All default to 0 / "" when spectral data is unavailable.
+    """
+    stats: dict = {
+        "ndvi_mean": 0.0,
+        "ndvi_max": 0.0,
+        "brightness_mean": 0.0,
+        "green_ratio_mean": 0.0,
+        "blue_ratio_mean": 0.0,
+        "rg_index_mean": 0.0,
+        "spectral_class": "",
+    }
+    if spectral is None and rgb is None:
+        return stats
+
+    npx = int(np.count_nonzero(obj_mask))
+    if npx == 0:
+        return stats
+
+    # NDVI
+    ndvi = _get_spectral(spectral, "ndvi")
+    if ndvi is not None:
+        safe = ndvi.shape == obj_mask.shape
+        if safe:
+            vals = ndvi[obj_mask]
+            stats["ndvi_mean"] = float(np.nanmean(vals))
+            stats["ndvi_max"] = float(np.nanmax(vals))
+
+    # Brightness
+    bri = _get_spectral(spectral, "brightness")
+    if bri is not None and bri.shape == obj_mask.shape:
+        stats["brightness_mean"] = float(np.nanmean(bri[obj_mask]))
+
+    # Green ratio
+    gr = _get_spectral(spectral, "green_ratio")
+    if gr is not None and gr.shape == obj_mask.shape:
+        stats["green_ratio_mean"] = float(np.nanmean(gr[obj_mask]))
+
+    # Blue ratio (may or may not be in spectral dict)
+    br = _get_spectral(spectral, "blue_ratio")
+    if br is not None and br.shape == obj_mask.shape:
+        stats["blue_ratio_mean"] = float(np.nanmean(br[obj_mask]))
+
+    # RG index
+    rg = _get_spectral(spectral, "rg_index")
+    if rg is not None and rg.shape == obj_mask.shape:
+        stats["rg_index_mean"] = float(np.nanmean(rg[obj_mask]))
+
+    # Derive high-level spectral class
+    nm = stats["ndvi_mean"]
+    bm = stats["brightness_mean"]
+    gm = stats["green_ratio_mean"]
+    blm = stats["blue_ratio_mean"]
+
+    if nm < -0.05:
+        stats["spectral_class"] = "water"
+    elif nm < 0.08 and bm > 100:
+        stats["spectral_class"] = "bright_impervious"  # road / building
+    elif nm < 0.08 and bm < 60:
+        stats["spectral_class"] = "dark_impervious"     # shadow / dark roof
+    elif nm < 0.15:
+        stats["spectral_class"] = "bare_or_built"
+    elif nm < 0.30:
+        stats["spectral_class"] = "sparse_vegetation"
+    elif nm < 0.50:
+        stats["spectral_class"] = "moderate_vegetation"
+    else:
+        stats["spectral_class"] = "dense_vegetation"
+
+    # Override for blue-dominant (pools)
+    if blm > 0.38 and nm < 0.05:
+        stats["spectral_class"] = "blue_water"
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Phase 3: Classify each segment using aggregated pixel labels + morphometrics
 # ---------------------------------------------------------------------------
 
@@ -270,13 +639,31 @@ def classify_objects(
     min_area: int = 1,
     max_objects: int = 50000,
     dsm: np.ndarray | None = None,
+    rgb: np.ndarray | None = None,
+    spectral: dict | None = None,
 ) -> list[DetectedObject]:
-    """Full pipeline: pixel classification → segmentation → object classification."""
+    """Full pipeline: pixel classification → segmentation → object classification.
+
+    Parameters
+    ----------
+    ndsm, dtm, mask, transform, min_height, min_area, max_objects, dsm
+        Existing parameters — unchanged semantics.
+    rgb : array [3, H, W] uint8, optional
+        RGB orthophoto aligned to the LIDAR grid.
+    spectral : dict, optional
+        Pre-computed spectral indices from ``ortho_io.compute_spectral_indices``.
+        Expected keys: ``ndvi``, ``green_ratio``, ``brightness``, ``rg_index``.
+        May also contain ``blue_ratio``.
+    """
     if dsm is None:
         dsm = dtm + np.where(mask, ndsm, 0)
 
-    # Phase 1: pixel-level classification
-    pixel_classes = _classify_pixels(ndsm, dtm, dsm, mask)
+    # If we have rgb but no spectral dict, derive a minimal brightness layer
+    if spectral is None and rgb is not None:
+        spectral = _spectral_from_rgb(rgb)
+
+    # Phase 1: pixel-level classification (with optional spectral)
+    pixel_classes = _classify_pixels(ndsm, dtm, dsm, mask, spectral=spectral)
     log.info("Pixel classification complete")
 
     # Phase 2: segmentation
@@ -341,13 +728,21 @@ def classify_objects(
         # Terrain slope under this object
         slope_under = float(np.nanmean(dtm_slope[obj_mask]))
 
+        # Spectral statistics for this segment
+        seg_spectral = _segment_spectral_stats(obj_mask, spectral, rgb)
+
         obj_type, crown_shape = _classify_segment(
             h_max, h_mean, h_std, h_p90, area, compactness, elongation,
             dominant_class, class_counts, slope_under,
             smooth, obj_mask, int(row), int(col),
+            seg_spectral=seg_spectral,
         )
 
-        # Skip pure ground unless it's a road or water feature
+        # Skip pure ground unless it's a road or water feature or new ground type
+        _keep_ground = {
+            "road_path", "water", "parking_lot", "swimming_pool",
+            "bare_soil", "rock_cliff",
+        }
         if obj_type in ("meadow_field", "ground", "rough_ground") and area < 100:
             continue
 
@@ -368,6 +763,10 @@ def classify_objects(
             bbox=bbox,
             crown_shape=crown_shape,
             height_class=_height_class(h_max),
+            ndvi_mean=round(seg_spectral["ndvi_mean"], 4),
+            ndvi_max=round(seg_spectral["ndvi_max"], 4),
+            brightness_mean=round(seg_spectral["brightness_mean"], 2),
+            spectral_class=seg_spectral["spectral_class"],
         )
         objects.append(obj)
 
@@ -375,27 +774,121 @@ def classify_objects(
     return objects
 
 
+def _spectral_from_rgb(rgb: np.ndarray) -> dict:
+    """Derive minimal spectral indices from an RGB array [3, H, W] uint8.
+
+    Without a true NIR band we cannot compute real NDVI, but we can
+    approximate with the Excess-Green index and derive brightness /
+    colour ratios that are still very useful.
+    """
+    if rgb.ndim == 3 and rgb.shape[0] == 3:
+        r, g, b = rgb[0], rgb[1], rgb[2]
+    elif rgb.ndim == 3 and rgb.shape[2] == 3:
+        r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    else:
+        return {}
+
+    r_f = r.astype(np.float32)
+    g_f = g.astype(np.float32)
+    b_f = b.astype(np.float32)
+
+    total = r_f + g_f + b_f + 1e-6  # avoid div-by-zero
+
+    brightness = (r_f + g_f + b_f) / 3.0
+    green_ratio = g_f / total
+    blue_ratio = b_f / total
+    rg_index = (r_f - g_f) / (r_f + g_f + 1e-6)
+
+    # Pseudo-NDVI from Excess Green: 2g - r - b normalised to [-1, 1]
+    exg = 2.0 * g_f - r_f - b_f
+    ndvi_proxy = np.clip(exg / (total + 1e-6), -1.0, 1.0)
+
+    return {
+        "ndvi": ndvi_proxy,
+        "brightness": brightness,
+        "green_ratio": green_ratio,
+        "blue_ratio": blue_ratio,
+        "rg_index": rg_index,
+    }
+
+
 def _classify_segment(
     h_max, h_mean, h_std, h_p90, area, compactness, elongation,
     dominant_px_class, class_counts, slope_under,
     smooth_ndsm, obj_mask, center_row, center_col,
+    *,
+    seg_spectral: dict | None = None,
 ):
-    """Classify a segment using pixel-class majority + 3D shape analysis."""
+    """Classify a segment using pixel-class majority + 3D shape analysis.
+
+    When *seg_spectral* is provided the spectral statistics are used to
+    refine / override the geometry-only decision.
+    """
+    has_spectral = seg_spectral is not None and seg_spectral.get("spectral_class", "") != ""
+    ndvi_m = seg_spectral["ndvi_mean"] if has_spectral else None
+    ndvi_x = seg_spectral["ndvi_max"] if has_spectral else None
+    bri_m = seg_spectral["brightness_mean"] if has_spectral else None
+    sp_class = seg_spectral["spectral_class"] if has_spectral else ""
+    blue_m = seg_spectral.get("blue_ratio_mean", 0.0) if has_spectral else 0.0
 
     # --- Ground-level features: use pixel classification directly ---
     if h_max < 0.3:
         name = OBJECT_TYPE_NAMES.get(dominant_px_class, "ground")
+
+        # Spectral refinements for ground-level segments
+        if has_spectral:
+            # Swimming pool: blue dominant, small, ground level
+            if sp_class == "blue_water" and area < 200:
+                return "swimming_pool", ""
+            # Parking lot: large flat impervious
+            if name in ("road_path", "parking_lot") and area > 200:
+                if ndvi_m is not None and ndvi_m < 0.10:
+                    return "parking_lot", ""
+            # Rock/cliff at ground level confirmed spectrally
+            if name == "rough_ground" and ndvi_m is not None and ndvi_m < 0.08:
+                if slope_under > 30:
+                    return "rock_cliff", ""
+            # Bare soil
+            if name in ("meadow_field", "bare_soil"):
+                if ndvi_m is not None and ndvi_m < 0.12:
+                    return "bare_soil", ""
+            # Water confirmation
+            if sp_class == "water":
+                return "water", ""
+
         return name, ""
 
+    # --- Low vegetation: 0.3–2m ---
     if h_max < 2.0:
+        # Spectral: vineyard/orchard detection (regular pattern of low veg)
+        if has_spectral and ndvi_m is not None:
+            # Greenhouse: very bright, low NDVI, slightly elevated
+            if ndvi_m < 0.10 and bri_m is not None and bri_m > 150:
+                if compactness > 0.4 and area > 20:
+                    return "greenhouse", ""
         return "low_vegetation", ""
 
+    # --- 2–4m ---
     if h_max < 4.0:
         if elongation > 6 and area < 300:
+            # Hedge: narrow linear vegetation
+            if has_spectral and ndvi_m is not None and ndvi_m > 0.20:
+                return "hedge", ""
             return "wall_fence", ""
+        # Hedge: linear green feature 1-4m
+        if elongation > 4 and has_spectral and ndvi_m is not None and ndvi_m > 0.25:
+            return "hedge", ""
+        # Greenhouse check in 2-4m range
+        if has_spectral and ndvi_m is not None and ndvi_m < 0.10:
+            if bri_m is not None and bri_m > 140 and compactness > 0.35:
+                return "greenhouse", ""
         return "shrub_bush", ""
 
     # --- Elevated objects (≥4m) ---
+
+    # Power line: extremely thin, tall, elongated
+    if area < 10 and h_max > 6 and elongation > 10:
+        return "power_line", ""
 
     # Mast/pole: tiny footprint, very tall
     if area < 25 and h_max > 10:
@@ -404,28 +897,94 @@ def _classify_segment(
     # Check pixel-class composition
     total_px = max(class_counts.sum(), 1)
     building_frac = class_counts[OBJECT_TYPES["building"]] / total_px
+    # Also count solar panel pixels as part of building footprint
+    solar_frac = class_counts[OBJECT_TYPES["solar_panel"]] / total_px if len(class_counts) > OBJECT_TYPES["solar_panel"] else 0
+    greenhouse_frac = class_counts[OBJECT_TYPES["greenhouse"]] / total_px if len(class_counts) > OBJECT_TYPES["greenhouse"] else 0
+
+    # --- Greenhouse: bright, low NDVI, elevated ---
+    if greenhouse_frac > 0.3 and has_spectral:
+        if ndvi_m is not None and ndvi_m < 0.12 and bri_m is not None and bri_m > 130:
+            return "greenhouse", ""
+
+    # --- Solar panel: dark patches on building roof ---
+    if solar_frac > 0.3 and building_frac + solar_frac > 0.5:
+        if has_spectral and bri_m is not None and bri_m < 70:
+            return "solar_panel", ""
 
     # --- Building: majority of pixels classified as flat-roof ---
-    if building_frac > 0.5 and area >= 20:
+    if building_frac + solar_frac > 0.5 and area >= 20:
         # Extra validation: buildings should be on gentle terrain
         if slope_under < 25:
-            if area >= 30:
-                return "building", ""
-            return "structure", ""
+            # Spectral override: if very green, it's probably tree canopy
+            if has_spectral and ndvi_m is not None and ndvi_m > 0.45:
+                pass  # fall through to tree classification
+            else:
+                if area >= 30:
+                    return "building", ""
+                return "structure", ""
 
     # Building with shaped (gabled/hipped) roof:
     # Moderate surface slope (10-35°), low roughness relative to trees,
     # and rectangular/compact shape on gentle terrain
     if (slope_under < 20 and h_std < 2.0 and 20 < area < 1000
             and compactness > 0.3 and elongation < 5 and h_max < 18):
-        return "building", ""
+        # Spectral check: skip if clearly vegetation
+        if has_spectral and ndvi_m is not None and ndvi_m > 0.40:
+            pass  # fall through to tree
+        else:
+            return "building", ""
+
+    # --- Bridge: elevated linear structure over depression/water ---
+    if (elongation > 5 and h_max >= 4 and h_max < 20
+            and compactness < 0.25 and area > 30):
+        if has_spectral and ndvi_m is not None and ndvi_m < 0.10:
+            return "bridge", ""
+        # Without spectral, check if building-like but very elongated on low slope
+        if slope_under < 10 and building_frac > 0.3 and elongation > 8:
+            return "bridge", ""
+
+    # --- Dead tree: tall but spectrally non-green ---
+    if has_spectral and ndvi_m is not None and ndvi_m < 0.10 and h_max >= 4:
+        # Not building-shaped
+        if compactness < 0.6 and building_frac < 0.3:
+            return "dead_tree", "dead"
+
+    # --- Tree row: linear arrangement of trees ---
+    if elongation > 5 and area > 50 and h_max >= 4:
+        if has_spectral and ndvi_m is not None and ndvi_m > 0.25:
+            return "tree_row", "linear"
+        elif not has_spectral:
+            # Without spectral, use geometry: elongated canopy
+            tree_frac = sum(
+                class_counts[c] for c in (
+                    OBJECT_TYPES["tree_coniferous"],
+                    OBJECT_TYPES["tree_broadleaf"],
+                    OBJECT_TYPES["tree_unclassified"],
+                ) if c < len(class_counts)
+            ) / total_px
+            if tree_frac > 0.5:
+                return "tree_row", "linear"
+
+    # --- Vineyard/orchard: moderate height, regular pattern, moderate NDVI ---
+    if has_spectral and ndvi_m is not None:
+        if (0.15 < ndvi_m < 0.40 and h_max < 8 and area > 100
+                and h_std > 0.5 and compactness > 0.2):
+            return "vineyard_orchard", ""
 
     # --- Tree crown shape analysis ---
-    # Analyse radial height profile from the segment's peak
     crown_shape = _analyse_crown_shape(smooth_ndsm, obj_mask, center_row, center_col)
 
     p90_ratio = h_p90 / max(h_max, 0.1)
     peak_ratio = h_max / max(h_mean, 0.1)
+
+    # Spectral can help distinguish coniferous (darker, lower NDVI in winter)
+    # from broadleaf (brighter, higher NDVI in summer)
+    spectral_tree_hint = ""
+    if has_spectral and ndvi_m is not None and ndvi_m > 0.15:
+        if ndvi_m > 0.45:
+            spectral_tree_hint = "broadleaf"  # very green = broadleaf in summer
+        elif ndvi_m < 0.28 and bri_m is not None and bri_m < 80:
+            spectral_tree_hint = "coniferous"  # dark + lower green = conifer
 
     if crown_shape == "conical":
         return "tree_coniferous", "conical"
@@ -434,7 +993,12 @@ def _classify_segment(
     elif crown_shape == "columnar":
         return "tree_broadleaf", "columnar"
     else:
-        # Fallback heuristics
+        # Fallback heuristics — use spectral hint when available
+        if spectral_tree_hint == "coniferous":
+            return "tree_coniferous", "spectral"
+        if spectral_tree_hint == "broadleaf":
+            return "tree_broadleaf", "spectral"
+
         if peak_ratio > 1.4 and p90_ratio < 0.85:
             return "tree_coniferous", "conical"
         elif peak_ratio < 1.25 and p90_ratio > 0.88:
@@ -540,8 +1104,14 @@ def summarise_objects(objects: list[DetectedObject]) -> dict:
         by_height[hc]["types"].setdefault(t, 0)
         by_height[hc]["types"][t] += 1
 
-        if "tree" in t:
+        if "tree" in t or t == "dead_tree":
             tree_heights.append(obj.height_max)
+
+    # Aggregate spectral stats per type
+    spectral_by_type: dict[str, list[float]] = {}
+    for obj in objects:
+        if obj.ndvi_mean != 0.0:  # has spectral data
+            spectral_by_type.setdefault(obj.obj_type, []).append(obj.ndvi_mean)
 
     for t, info in by_type.items():
         heights = info.pop("heights")
@@ -549,10 +1119,13 @@ def summarise_objects(objects: list[DetectedObject]) -> dict:
         info["height_mean"] = round(float(np.mean(heights)), 2)
         info["height_std"] = round(float(np.std(heights)), 2) if len(heights) > 1 else 0
         info["height_max"] = round(info["height_max"], 2)
+        if t in spectral_by_type:
+            ndvis = spectral_by_type[t]
+            info["ndvi_mean"] = round(float(np.mean(ndvis)), 4)
 
     crown_types: dict[str, int] = {}
     for obj in objects:
-        if "tree" in obj.obj_type and obj.crown_shape:
+        if ("tree" in obj.obj_type or obj.obj_type == "dead_tree") and obj.crown_shape:
             crown_types.setdefault(obj.crown_shape, 0)
             crown_types[obj.crown_shape] += 1
 
@@ -583,12 +1156,13 @@ def create_classified_raster(
     transform,
     objects: list[DetectedObject],
     output_resolution: float = 1.0,
+    spectral: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, object]:
     """Create 2-band raster: band 1 = type code, band 2 = height."""
     h, w = ndsm.shape
 
     # Pixel-level classification for base layer
-    pixel_classes = _classify_pixels(ndsm, dtm, dsm, mask)
+    pixel_classes = _classify_pixels(ndsm, dtm, dsm, mask, spectral=spectral)
     type_band = pixel_classes.copy()
     height_band = np.where(mask, ndsm, -9999).astype(np.float32)
 

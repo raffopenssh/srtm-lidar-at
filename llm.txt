@@ -1,106 +1,186 @@
-# Austrian LIDAR Analysis API — LLM Reference
+# Austrian LIDAR & Orthophoto Analysis API — v2.0
+# Base URL: https://srtm-lidar-at.exe.xyz:8000
+# All geometry input in WGS84 (lon/lat). Processing in EPSG:3035.
+# Max query area: 25 km².
 
-Base URL: /api/v1
-Source: BEV ALS DTM/DSM (data.bev.gv.at), 1m resolution, EPSG:3035
-Datasets: 20240915 (more dates planned for temporal comparison)
-Max area: 25 km²
+## Data Sources
 
-All POST endpoints accept geometry as:
-- GeoJSON (Feature, FeatureCollection, or bare geometry) in JSON body
-- KML string in request body (Content-Type: text/plain or application/xml)
-- Simple coordinates: "lon,lat" or "lon,lat;lon,lat;..."
-- File upload (multipart, field name: "file")
+BEV ALS DTM + DSM (1m resolution, EPSG:3035, 55 tiles × 50km)
+  Dates: 20220915, 20230915, 20240915  (default: 20240915)
 
-JSON body format: {"geometry": <geojson>, "min_height": 0.3, "min_area": 2, ...}
-All params also accepted as query string: ?min_height=5&object_types=building
+BEV DOP Orthophoto RGB (0.2m native, resampled to 1m for analysis)
+  Date: 20220128 (50km tiles, same grid as ALS)
 
 ## Endpoints
 
 ### POST /api/v1/elevation
-Enrich features with DSM/DTM elevation.
-- Points: returns dsm_elevation_m, dtm_elevation_m, object_height_m per point
-- Lines: returns elevation_profile array with per-vertex elevations
-- Polygons: returns min/max/mean for DSM, DTM, and object heights
-Response: GeoJSON FeatureCollection with enriched properties.
+Enrich features with DSM/DTM elevation values.
+Body: GeoJSON Feature/FeatureCollection, or {"geometry": <GeoJSON geometry>}
+Params: dataset (default 20240915)
+Returns: FeatureCollection with dsm_elevation_m, dtm_elevation_m, object_height_m
+Point → single values. Line → elevation_profile array. Polygon → min/max/mean stats.
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/elevation \
+    -H 'Content-Type: application/json' \
+    -d '{"geometry": {"type": "Point", "coordinates": [15.4, 47.07]}}'
 
 ### POST /api/v1/terrain
-Terrain characterisation for polygons (points auto-buffered to 50m radius).
-Returns: elevation stats, slope (min/max/mean/std + classification), aspect distribution,
-  ruggedness (TRI + classification), area.
-Slope classes: flat(<2°), gentle(2-5°), moderate(5-15°), steep(15-30°), very_steep(30-45°), extreme(>45°)
-TRI classification: level, nearly_level, slightly_rugged, intermediately_rugged, moderately_rugged, highly_rugged, extremely_rugged
-Response: GeoJSON FeatureCollection with terrain property block.
+Terrain characterisation: slope, aspect, ruggedness (TRI), curvature.
+Body: GeoJSON geometry
+Params: dataset
+Returns: elevation stats, slope_deg, slope_classes_pct, aspect_distribution_pct, ruggedness_tri
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/terrain \
+    -H 'Content-Type: application/json' \
+    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.075],[15.4,47.075],[15.4,47.07]]]}}'
 
 ### POST /api/v1/objects
-Detect & classify above-ground objects from normalised DSM (DSM-DTM).
-Params: min_height (float, default 0.3), min_area (int sqm, default 2),
-  object_types (comma-separated filter), max_height (float), dataset (default 20240915)
-Object types: ground(0), road_path(1), meadow_field(2), rough_ground(3), low_vegetation(4),
-  shrub_bush(5), tree_coniferous(6), tree_broadleaf(7), tree_unclassified(8), building(9),
-  structure(10), mast_pole(11), wall_fence(12), water(13), unclassified(14)
-Classification method: pixel-level 3D surface analysis (DSM slope, roughness, curvature) +
-  watershed segmentation + crown shape profiling (radial height dropoff from peak)
-Response: {summary: {total_objects, by_type, by_height_class, trees}, type: "FeatureCollection", features: [...]}
-Each feature is a point (centroid) with properties: id, type, type_code, height_max_m, height_mean_m,
-  height_p90_m, area_sqm, compactness, elongation, crown_shape, height_class.
-Crown shapes: conical, rounded, columnar, irregular
-Height classes (logarithmic): 0-0.5m, 0.5-1m, 1-2m, 2-4m, 4-8m, 8-15m, 15-25m, 25-40m, 40-60m, 60-80m, >80m
+Object detection and classification. 27 object types from LIDAR 3D analysis.
+Body: GeoJSON geometry
+Params:
+  dataset       — ALS date (default 20240915)
+  min_height    — minimum object height in metres (default 0.3)
+  min_area      — minimum object area in m² (default 2)
+  max_height    — filter: only objects shorter than this
+  object_types  — comma-separated type filter (e.g. "tree_coniferous,building")
+  include_ortho — "true" to use RGB orthophoto for spectral refinement (adds NDVI, brightness)
+Returns: summary + FeatureCollection of object centroids with properties.
+
+27 Object Types:
+  0  ground            — unclassified ground
+  1  road_path         — smooth ground (road, path, paved surface)
+  2  meadow_field      — ground with normal vegetation roughness
+  3  rough_ground      — rocky/uneven terrain
+  4  low_vegetation    — 0.3–2m height
+  5  shrub_bush        — 2–4m height
+  6  tree_coniferous   — >4m, conical crown (spruce, fir, pine)
+  7  tree_broadleaf    — >4m, dome/rounded crown (beech, oak, maple)
+  8  tree_unclassified — >4m, ambiguous crown shape
+  9  building          — flat-topped elevated structure, 20–2000 m²
+  10 structure         — small non-building elevated flat object
+  11 mast_pole         — tiny footprint (<25 m²), tall (>10m)
+  12 wall_fence        — narrow elongated feature, <4m
+  13 water             — ultra-smooth ground, low DSM roughness
+  14 unclassified      — fallback
+  15 parking_lot       — large flat paved area, low NDVI (requires ortho)
+  16 swimming_pool     — small water body, blue-dominant (requires ortho)
+  17 solar_panel       — dark rectangular roof feature (requires ortho)
+  18 greenhouse        — bright, low NDVI, slightly elevated structure
+  19 bridge            — elevated linear structure over depression
+  20 power_line        — very thin, tall, elongated
+  21 hedge             — linear vegetation 1–4m, narrow
+  22 tree_row          — linear arrangement of trees (avenue/alley)
+  23 dead_tree         — tall but very low NDVI (requires ortho)
+  24 bare_soil         — ground level, low NDVI, brownish (requires ortho)
+  25 rock_cliff        — steep terrain, very rough, no vegetation
+  26 vineyard_orchard  — regular pattern of low/medium vegetation
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
+    -H 'Content-Type: application/json' \
+    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+
+With orthophoto:
+  curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/objects?include_ortho=true' \
+    -H 'Content-Type: application/json' \
+    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
 
 ### POST /api/v1/objects/raster
-Generate a 2-band classified raster (GeoTIFF).
-  Band 1: object_type_code (uint8, see codes above)
-  Band 2: object_height_m (float32, -9999=nodata)
-Params: resolution (float metres, default 1.0), format (geotiff|gpkg), + same as /objects
-Response: Binary file download.
-Use in QGIS: style Band 1 as categorised (type codes), Band 2 as graduated (height).
+Download classified raster as GeoTIFF.
+Band 1: object type code (uint8). Band 2: object height (float32).
+Params: dataset, resolution (default 1.0), min_height, min_area, include_ortho
+
+### POST /api/v1/changes
+Temporal change detection between two ALS dates.
+Detects: tree growth/felling, new/demolished buildings, earthworks (dams, fills, cuts,
+trenches, grading, ponds), new/resurfaced/widened roads, vegetation dynamics.
+Body: GeoJSON geometry
+Params:
+  date_a     — earlier date (default 20220915)
+  date_b     — later date (default 20240915)
+  min_change — minimum height change in metres to detect (default 1.0)
+Returns: FeatureCollection of change event centroids + summary by type + comparison stats.
+
+20 Change Event Types:
+  tree_growth        — canopy height increased 0.5–5m
+  tree_felling       — canopy dropped >3m (individual trees)
+  new_tree           — rose from ground to >3m
+  forest_clearcut    — large area (>100m²) canopy removed
+  vegetation_growth  — general 0.3–2m increase
+  vegetation_loss    — general 0.3–2m decrease
+  new_building       — flat-topped rise >3m on former ground
+  demolition         — flat structure dropped to ground
+  construction       — new elevated structure
+  earthwork_fill     — terrain raised (landfill, platform, levelling)
+  earthwork_cut      — terrain lowered (excavation, quarry, grading)
+  earthwork_grading  — terrain smoothed/flattened (roughness reduced)
+  earthwork_dam      — linear raised terrain (levee, embankment)
+  earthwork_trench   — linear depression (drainage ditch, utility trench)
+  earthwork_pond     — new compact depression (retention basin, pond)
+  road_new           — new road/path constructed
+  road_resurfaced    — existing road surface changed (new tarmac layer)
+  road_widened       — road corridor expanded
+  surface_change     — DSM texture changed without significant height change
+  unclassified_change — other
+
+Each event includes: area_sqm, height_before/after, height_change_mean/max,
+dtm_change_mean/max, dsm_change_mean, confidence (0–1), detail dict with subtype info.
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes \
+    -H 'Content-Type: application/json' \
+    -d '{"date_a": "20220915", "date_b": "20240915", "min_change": 0.5, "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+
+### POST /api/v1/changes/trees
+Per-tree growth/felling analysis. Matches individual trees between dates.
+Body: GeoJSON geometry
+Params: date_a (default 20220915), date_b (default 20240915)
+Returns: FeatureCollection of trees with status (grown/new/felled/stable),
+  height_before, height_after, height_change, crown_area_before/after.
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/trees \
+    -H 'Content-Type: application/json' \
+    -d '{"date_a": "20220915", "date_b": "20240915", "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+
+### POST /api/v1/changes/summary
+Multi-epoch change summary across all consecutive date pairs (2022→2023→2024).
+Body: GeoJSON geometry
+Params: dates (comma-separated, default all: 20220915,20230915,20240915)
+Returns: per-pair stats, cumulative totals by event type, annual trends.
+
+Example:
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/summary \
+    -H 'Content-Type: application/json' \
+    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
 
 ### GET /api/v1/info
-API metadata: datasets, tile count, object type codes, endpoints.
+Dataset inventory, object types, event types, endpoint list.
 
 ### GET /api/v1/docs/llm.txt
 This document.
 
-## Examples
+## Geometry Input
 
-```bash
-# Elevation for a point
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/elevation \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Point", "coordinates": [15.115, 47.137]}}'
+All POST endpoints accept:
+- GeoJSON Feature or FeatureCollection in body
+- {"geometry": <GeoJSON geometry>, ...params} in body
+- KML string in body
+- Coordinate string: "lon,lat" or "lon,lat;lon,lat;..."
+- File upload (multipart, field name "file")
 
-# Terrain analysis for a polygon
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/terrain \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}}'
+Point inputs are automatically buffered (100m for objects, 200m for changes, 50m for terrain).
 
-# Object detection with filters
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}, "min_height": 5, "object_types": "tree_coniferous,tree_broadleaf"}'
+## Notes
 
-# Download classified raster at 2m resolution
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects/raster \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.108,47.133],[15.126,47.133],[15.126,47.142],[15.108,47.142],[15.108,47.133]]]}, "resolution": 2}' \
-  -o objects.tif
-
-# Send KML directly
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
-  -H 'Content-Type: text/plain' \
-  --data-binary @area.kml
-```
-
-## Integration with Cadastre API
-Combine with https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt to:
-1. Query parcels by location
-2. Use parcel geometry as input to this LIDAR API
-3. Enrich parcel data with elevation, terrain, and object information
-
-## Data Notes
-- DTM = bare earth (no vegetation/buildings)
-- DSM = surface including all objects
-- nDSM = DSM - DTM = normalised object heights above ground
-- CRS: EPSG:3035 (ETRS89-LAEA). API accepts WGS84 (EPSG:4326) input, transforms internally.
-- Resolution: 1m ground sampling. Each tile is 50km × 50km (50001×50001 pixels, ~12 GB).
-- Windowed reads via HTTP range requests — only needed pixels are downloaded.
-- 55 tiles cover all of Austria.
+- Response times: small areas (100×100m) ~3–10s, larger areas proportionally longer.
+  Remote LIDAR tiles are read via HTTP range requests; first request may be slower.
+- The orthophoto integration (include_ortho=true) adds ~2–5s for the DOP tile read.
+  Types 15–26 (parking_lot through vineyard_orchard) are primarily detected with ortho.
+  Without ortho, the classifier still works well for types 0–14.
+- Temporal analysis reads TWO full datasets (4 remote reads: DTM+DSM × 2 dates).
+  Expect ~10–30s for change detection on moderate areas.
+- All coordinates in responses are WGS84 (lon/lat).
+- Raster downloads are EPSG:3035 GeoTIFF.

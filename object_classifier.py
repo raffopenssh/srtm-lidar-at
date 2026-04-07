@@ -29,11 +29,19 @@ Spectral refinements (when orthophoto available):
   - Tall + NDVI < 0.10 + brightness > 100 → building (not dead tree)
   - Regular low-veg pattern → vineyard / orchard
 
-Calibrated against BEV cadastre ground truth (KG 63330 Kohlschwarz):
-  - Real buildings: NDVI median=0.115, brightness median=131, nDSM slope=43°
-  - Real trees: NDVI median=0.329, brightness median=57
-  - Water: ZERO pixels confirmed in the test area — ultra-smooth ground is
-    typically road surface, roof sheeting, or solar panels, not water.
+Calibrated against BEV cadastre ground truth from 100 sample areas across
+Austria (urban, suburban, rural, alpine, forest, water) — 2026-04 calibration.
+
+Key innovation: SCENE-ADAPTIVE THRESHOLDS.  Instead of fixed spectral
+cutoffs, we compute the scene's NDVI/brightness distribution and set
+thresholds relative to local conditions.  This handles winter orthophotos
+(low NDVI everywhere), summer alpine (high contrast), and everything between.
+
+Multi-temporal consensus (when available): objects stable across 2-3 LIDAR
+dates are almost certainly buildings; growing/shrinking objects are vegetation.
+
+  Water: ZERO pixels confirmed in Kohlschwarz — ultra-smooth ground is
+  typically road surface, roof sheeting, or solar panels, not water.
 """
 
 from __future__ import annotations
@@ -102,6 +110,24 @@ def _height_class(h: float) -> str:
     return f">{_HEIGHT_BREAKS[-1]}m"
 
 
+def _temporal_signal_label(seg_temporal: dict, h_max: float) -> str:
+    """Derive a human-readable temporal signal from segment stats."""
+    if seg_temporal is None:
+        return ""
+    t_std = seg_temporal["std_mean"]
+    t_rng = seg_temporal["range_mean"]
+    stable_frac = seg_temporal["stable_frac"]
+    if t_std < 0.5 and stable_frac > 0.7:
+        return "stable"
+    if t_std > 2.0:
+        if t_rng > 3.0:
+            return "major_change"
+        return "variable"
+    if t_std > 1.0:
+        return "moderate_change"
+    return "minor_variation"
+
+
 # ---------------------------------------------------------------------------
 # Spectral helper — extract per-pixel index arrays from dict
 # ---------------------------------------------------------------------------
@@ -114,6 +140,157 @@ def _get_spectral(spectral: dict | None, key: str) -> np.ndarray | None:
     if arr is None:
         return None
     return np.asarray(arr, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Scene context — adaptive thresholds based on local conditions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SceneContext:
+    """Scene-adaptive thresholds computed from local NDVI / brightness.
+
+    Instead of global constants (which fail across Austria's diverse
+    landscape — winter alpine vs summer lowland), every threshold is
+    derived from the statistical distribution of the query window.
+    """
+    # --- Raw scene statistics ---
+    ndvi_p10: float = -0.05
+    ndvi_p25: float = 0.05
+    ndvi_median: float = 0.15
+    ndvi_p75: float = 0.30
+    ndvi_p90: float = 0.40
+    bri_p10: float = 50.0
+    bri_p25: float = 70.0
+    bri_median: float = 90.0
+    bri_p75: float = 120.0
+    bri_p90: float = 150.0
+    altitude_median: float = 500.0
+
+    # --- Derived thresholds (set by _compute) ---
+    # Building detection: NDVI below this AND brightness above bri_building
+    ndvi_building: float = 0.15     # objects below this are non-vegetated
+    bri_building: float = 85.0      # objects above this are bright enough
+    # Tree recovery: building pixels above this NDVI → tree
+    ndvi_tree_recovery: float = 0.22
+    # Dead tree: VERY strict
+    ndvi_dead_max: float = 0.05
+    bri_dead_max: float = 65.0
+    # Water
+    ndvi_water_max: float = -0.05
+    bri_water_max: float = 50.0
+    # Scene type flag
+    is_winter: bool = False        # True if scene NDVI is anomalously low
+    is_dark: bool = False          # True if brightness is anomalously low
+    # Multi-temporal stability (set when ndsm_dates provided)
+    has_temporal: bool = False     # True if multi-date LIDAR available
+    n_dates: int = 1               # Number of LIDAR dates loaded
+
+
+def _compute_scene_context(
+    ndsm: np.ndarray,
+    dtm: np.ndarray,
+    mask: np.ndarray,
+    spectral: dict | None = None,
+) -> SceneContext:
+    """Compute scene-adaptive thresholds from the local raster window.
+
+    The key insight: a winter orthophoto over alpine forest has NDVI~0.15
+    for healthy conifers, while a summer lowland has NDVI~0.45.  Fixed
+    thresholds (NDVI < 0.20 → building) work in one but fail in the other.
+
+    Instead, we compute where buildings and trees ACTUALLY sit in this
+    scene's distribution, using the bimodal structure of the NDVI histogram
+    (built/bare vs vegetated) and the altitude to estimate season effects.
+    """
+    ctx = SceneContext()
+
+    # Altitude → season estimate
+    dtm_valid = dtm[mask]
+    if len(dtm_valid) > 0:
+        ctx.altitude_median = float(np.median(dtm_valid))
+
+    ndvi = _get_spectral(spectral, "ndvi")
+    brightness = _get_spectral(spectral, "brightness")
+
+    if ndvi is not None:
+        ndvi_valid = ndvi[mask]
+        if len(ndvi_valid) > 100:
+            ctx.ndvi_p10 = float(np.percentile(ndvi_valid, 10))
+            ctx.ndvi_p25 = float(np.percentile(ndvi_valid, 25))
+            ctx.ndvi_median = float(np.median(ndvi_valid))
+            ctx.ndvi_p75 = float(np.percentile(ndvi_valid, 75))
+            ctx.ndvi_p90 = float(np.percentile(ndvi_valid, 90))
+
+    if brightness is not None:
+        bri_valid = brightness[mask]
+        if len(bri_valid) > 100:
+            ctx.bri_p10 = float(np.percentile(bri_valid, 10))
+            ctx.bri_p25 = float(np.percentile(bri_valid, 25))
+            ctx.bri_median = float(np.median(bri_valid))
+            ctx.bri_p75 = float(np.percentile(bri_valid, 75))
+            ctx.bri_p90 = float(np.percentile(bri_valid, 90))
+
+    # --- Detect winter/dark scene ---
+    # Winter alpine: scene NDVI median < 0.20 (summer is typically 0.25-0.40)
+    ctx.is_winter = ctx.ndvi_median < 0.20
+    ctx.is_dark = ctx.bri_median < 75
+
+    # --- Compute adaptive thresholds ---
+    # The NDVI histogram of a mixed scene is bimodal:
+    #   Mode 1 (left): built/bare surfaces (roads, buildings, bare soil)
+    #   Mode 2 (right): vegetation (trees, grass, crops)
+    # The building threshold should sit between the modes.
+    #
+    # Heuristic: building threshold = midpoint of p25 and p50, clamped.
+    # In summer (median=0.35): threshold = (0.10 + 0.35)/2 = 0.22 → good
+    # In winter (median=0.15): threshold = (0.02 + 0.15)/2 = 0.09 → tight, avoids trees
+    ctx.ndvi_building = np.clip(
+        (ctx.ndvi_p25 + ctx.ndvi_median) / 2,
+        0.05,   # never below 0.05 (would miss everything)
+        0.22,   # never above 0.22 (calibrated upper bound from 100 samples)
+    )
+
+    # Brightness threshold: buildings are brighter than trees.
+    # Use scene p35 as floor (buildings should be above ~35th percentile).
+    ctx.bri_building = np.clip(
+        ctx.bri_p25 + 5,  # slightly above p25
+        70.0,   # absolute floor
+        110.0,  # cap: don't require TOO bright
+    )
+
+    # Tree recovery: building pixels with NDVI above this → reclassify as tree
+    # Set above the building threshold but below vegetation center.
+    # In winter: recovery at ~0.14.  In summer: at ~0.26.
+    ctx.ndvi_tree_recovery = np.clip(
+        ctx.ndvi_building + 0.06,
+        0.12,
+        0.28,
+    )
+
+    # Dead tree: must be well below the scene's vegetation floor AND dark.
+    # In winter (ndvi_p10 = -0.02): dead tree < -0.02 → almost nothing qualifies
+    # In summer (ndvi_p10 = 0.05): dead tree < 0.05
+    ctx.ndvi_dead_max = np.clip(
+        ctx.ndvi_p10,
+        -0.10,
+        0.08,
+    )
+    ctx.bri_dead_max = np.clip(
+        ctx.bri_p10 + 5,
+        40.0,
+        70.0,
+    )
+
+    log.info(
+        f"Scene context: alt={ctx.altitude_median:.0f}m "
+        f"ndvi=[{ctx.ndvi_p10:.2f},{ctx.ndvi_median:.2f},{ctx.ndvi_p90:.2f}] "
+        f"bri=[{ctx.bri_p10:.0f},{ctx.bri_median:.0f},{ctx.bri_p90:.0f}] "
+        f"winter={ctx.is_winter} "
+        f"thresholds: bld_ndvi<{ctx.ndvi_building:.2f} bld_bri>{ctx.bri_building:.0f} "
+        f"tree_recov>{ctx.ndvi_tree_recovery:.2f} dead<{ctx.ndvi_dead_max:.2f}"
+    )
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +321,10 @@ class DetectedObject:
     ndvi_max: float = 0.0
     brightness_mean: float = 0.0
     spectral_class: str = ""
+    # --- temporal stability fields (populated when multi-date LIDAR available) ---
+    temporal_std: float = 0.0       # mean std of nDSM across dates
+    temporal_stable: bool = False   # True if object is temporally stable
+    temporal_signal: str = ""       # "stable" / "growing" / "shrinking" / "new" / "removed"
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +426,11 @@ def _classify_pixels(
     rock_cliff = mask & (dtm_slope > 45) & (dtm_std3 > 0.8)
     px[rock_cliff] = OBJECT_TYPES["rock_cliff"]
 
-    # --- Phase 1b: spectral refinement (optional) ---
+    # --- Phase 1b: spectral refinement (optional, now scene-adaptive) ---
     if spectral is not None:
+        ctx = _compute_scene_context(n, dtm, mask, spectral)
         px = _refine_with_spectral(px, spectral, n, mask, dtm_slope, dtm_std3,
-                                   ndsm_slope, ndsm_std5, dsm_std3)
+                                   ndsm_slope, ndsm_std5, dsm_std3, ctx=ctx)
 
     return px
 
@@ -267,11 +449,16 @@ def _refine_with_spectral(
     ndsm_slope: np.ndarray,
     ndsm_std5: np.ndarray,
     dsm_std3: np.ndarray,
+    *,
+    ctx: SceneContext | None = None,
 ) -> np.ndarray:
     """Refine geometry-based pixel classification using spectral indices.
 
+    When *ctx* is provided, thresholds are scene-adaptive rather than fixed.
     Operates *in-place* on *px* and returns it.
     """
+    if ctx is None:
+        ctx = SceneContext()  # fallback to defaults
     ndvi = _get_spectral(spectral, "ndvi")
     brightness = _get_spectral(spectral, "brightness")
     green_ratio = _get_spectral(spectral, "green_ratio")
@@ -393,8 +580,9 @@ def _refine_with_spectral(
 
     # ------------------------------------------------------------------
     # 4. Dead tree: tall + very low NDVI (brown/grey canopy)
-    #    MUST exclude bright pixels (buildings have NDVI~0.12 but brightness~131,
-    #    real dead trees are dark/brown with brightness < 80).
+    #    Scene-adaptive: must be below scene ndvi_dead_max AND dark.
+    #    Calibration (100 samples): 5,321 FPs were mostly dark building
+    #    parts.  Require rough surface texture (vegetation, not smooth roof).
     # ------------------------------------------------------------------
     if ndvi is not None:
         dead_cond = (
@@ -402,76 +590,76 @@ def _refine_with_spectral(
             & ((px == OT["tree_unclassified"])
                | (px == OT["tree_coniferous"])
                | (px == OT["tree_broadleaf"]))
-            & (ndvi < 0.10)
+            & (ndvi < ctx.ndvi_dead_max)
             & (ndsm >= 4.0)
+            & (ndsm < 25.0)          # dead trees don't reach 25m+
+            & (dsm_std3 > 0.3)       # rough surface = vegetation, not smooth roof
         )
-        # Only classify as dead tree if NOT bright (bright = building roof)
         if brightness is not None:
-            dead_cond = dead_cond & (brightness < 90)
+            dead_cond = dead_cond & (brightness < ctx.bri_dead_max)
         px[dead_cond] = OT["dead_tree"]
 
     # ------------------------------------------------------------------
     # 5. Parking lot: large flat area, low NDVI, bright, ground-to-low height
+    #    Tightened: only mark very clear candidates at pixel level.
+    #    Segment level (Phase 3) confirms by size (>500m²).
     # ------------------------------------------------------------------
     if ndvi is not None and brightness is not None:
         parking = (
             mask
-            & (ndsm < 0.5)
-            & (ndvi < 0.10)
-            & (brightness > 90)
-            & (dsm_std3 < 0.15)
-            & (dtm_slope < 5)
+            & (ndsm < 0.3)
+            & (ndvi < ctx.ndvi_p25)       # below scene's 25th percentile
+            & (brightness > ctx.bri_p75)  # above scene's 75th percentile
+            & (dsm_std3 < 0.10)
+            & (dtm_slope < 3)
         )
-        # Mark as parking candidate — object-level will confirm by size
         px[parking] = OT["parking_lot"]
 
     # ------------------------------------------------------------------
     # 6. Solar panel: dark rectangular patches on building roofs
+    #    Solar panels absorb NIR → strongly negative NDVI, very dark.
     # ------------------------------------------------------------------
     if ndvi is not None and brightness is not None:
         solar = (
             mask
             & (px == OT["building"])
-            & (brightness < 60)
-            & (ndvi < 0.05)
+            & (brightness < 50)
+            & (ndvi < -0.05)  # strongly negative (absorbs NIR)
         )
         px[solar] = OT["solar_panel"]
 
     # ------------------------------------------------------------------
-    # 7. Greenhouse: bright, rectangular, slightly elevated (0.3-6m),
-    #    low NDVI (glass/plastic surface)
+    # 7. Greenhouse: DISABLED at pixel level.
+    #    Calibration: 16,183 false positives (bright roofs misclassified).
+    #    Greenhouse detection moved to segment level (Phase 3) only,
+    #    with strict shape + height + rural-context constraints.
     # ------------------------------------------------------------------
-    if ndvi is not None and brightness is not None:
-        greenhouse = (
-            mask
-            & (ndsm >= 0.2) & (ndsm < 6.0)
-            & (brightness > 160)
-            & (ndvi < 0.10)
-            & (ndsm_slope < 15)
-            & (dsm_std3 < 0.5)
-        )
-        px[greenhouse] = OT["greenhouse"]
 
     # ------------------------------------------------------------------
     # 8. Rock/cliff spectral confirmation: steep + low NDVI + grey
+    #    Only apply at ground level to avoid catching elevated objects.
     # ------------------------------------------------------------------
     if ndvi is not None:
         rock_extra = (
             mask
-            & (dtm_slope > 35)
-            & (dtm_std3 > 0.5)
-            & (ndvi < 0.10)
+            & (ndsm < 0.5)          # ground level only
+            & (dtm_slope > 40)
+            & (dtm_std3 > 0.6)
+            & (ndvi < ctx.ndvi_dead_max)  # scene-relative
         )
         px[rock_extra] = OT["rock_cliff"]
 
     # ------------------------------------------------------------------
-    # 9. Building vs tree: spectral separation is THE key signal.
-    #    Calibration (KG 63330, BEV cadastre ground truth):
-    #      Buildings: NDVI median=0.115, brightness median=131
-    #      Trees:     NDVI median=0.329, brightness median=57
+    # 9. Building vs tree: SCENE-ADAPTIVE spectral separation.
     #
-    #    Best combined rule:  NDVI < 0.20 AND brightness > 100
-    #      → captures 85% of buildings, only 0.7% of trees
+    #    The scene context provides thresholds tuned to local conditions:
+    #    - ctx.ndvi_building: derived from scene NDVI distribution
+    #      Summer lowland: ~0.22.  Winter alpine: ~0.09.
+    #    - ctx.bri_building: derived from scene brightness distribution
+    #    - ctx.ndvi_tree_recovery: building → tree correction threshold
+    #
+    #    This eliminates the core failure mode: fixed thresholds that
+    #    work in summer but misclassify winter forest as buildings.
     # ------------------------------------------------------------------
     if ndvi is not None and brightness is not None:
         is_tree = (
@@ -482,27 +670,39 @@ def _refine_with_spectral(
         # PRIMARY: tree pixels with low NDVI + bright surface → building
         tree_to_bld = (
             mask & is_tree
-            & (ndvi < 0.20)
-            & (brightness > 100)
-            & (dtm_slope < 30)
+            & (ndvi < ctx.ndvi_building)
+            & (brightness > ctx.bri_building)
+            & (dtm_slope < 35)
         )
         px[tree_to_bld] = OT["building"]
 
-        # SECONDARY: very low NDVI alone (dark roofs, shadowed walls)
+        # SECONDARY: very low NDVI + moderate brightness (dark roofs)
+        # Require brightness above scene p10+10 to avoid dark forest canopy
         tree_to_bld2 = (
             mask & is_tree
-            & (ndvi < 0.12)
+            & (ndvi < ctx.ndvi_building - 0.05)
+            & (brightness > max(ctx.bri_p10 + 10, 70))
             & (ndsm >= 2.0)
-            & (dtm_slope < 30)
+            & (dtm_slope < 35)
         )
         px[tree_to_bld2] = OT["building"]
 
-        # Building pixels with NDVI > 0.25 → tree canopy
-        # (calibration: buildings p90 NDVI = 0.20)
+        # TERTIARY: shrub-height (2-4m) clearly non-green → building
+        # Only when VERY clearly non-vegetated (below scene floor)
+        shrub_to_bld = (
+            mask
+            & (px == OT["shrub_bush"])
+            & (ndvi < ctx.ndvi_building - 0.05)
+            & (brightness > ctx.bri_building)
+            & (dsm_std3 < 0.5)
+        )
+        px[shrub_to_bld] = OT["building"]
+
+        # RECOVERY: building pixels with vegetation NDVI → tree canopy
         bld_to_tree = (
             mask
             & (px == OT["building"])
-            & (ndvi > 0.25)
+            & (ndvi > ctx.ndvi_tree_recovery)
         )
         px[bld_to_tree] = OT["tree_unclassified"]
 
@@ -515,16 +715,16 @@ def _refine_with_spectral(
         )
         tree_to_bld = (
             mask & is_tree
-            & (ndvi < 0.10)
+            & (ndvi < ctx.ndvi_building - 0.05)
             & (ndsm >= 2.0)
-            & (dtm_slope < 30)
+            & (dtm_slope < 35)
         )
         px[tree_to_bld] = OT["building"]
 
         bld_to_tree = (
             mask
             & (px == OT["building"])
-            & (ndvi > 0.25)
+            & (ndvi > ctx.ndvi_tree_recovery)
         )
         px[bld_to_tree] = OT["tree_unclassified"]
 
@@ -740,6 +940,9 @@ def classify_objects(
     dsm: np.ndarray | None = None,
     rgb: np.ndarray | None = None,
     spectral: dict | None = None,
+    temporal_std: np.ndarray | None = None,
+    temporal_range: np.ndarray | None = None,
+    n_temporal_dates: int = 1,
 ) -> list[DetectedObject]:
     """Full pipeline: pixel classification → segmentation → object classification.
 
@@ -753,6 +956,15 @@ def classify_objects(
         Pre-computed spectral indices from ``ortho_io.compute_spectral_indices``.
         Expected keys: ``ndvi``, ``green_ratio``, ``brightness``, ``rg_index``.
         May also contain ``blue_ratio``.
+    temporal_std : array [H, W] float32, optional
+        Per-pixel std of nDSM across multiple LIDAR dates.  Low values
+        (< 0.5m) indicate temporally stable structures (buildings);
+        high values (> 1.5m) indicate vegetation or change.
+    temporal_range : array [H, W] float32, optional
+        Per-pixel max−min nDSM across dates.  Complements temporal_std.
+    n_temporal_dates : int
+        Number of LIDAR dates used.  Temporal signals are more reliable
+        with 3 dates than 2.
     """
     if dsm is None:
         dsm = dtm + np.where(mask, ndsm, 0)
@@ -760,6 +972,13 @@ def classify_objects(
     # If we have rgb but no spectral dict, derive a minimal brightness layer
     if spectral is None and rgb is not None:
         spectral = _spectral_from_rgb(rgb)
+
+    # Compute scene context for adaptive thresholds
+    scene_ctx = _compute_scene_context(ndsm, dtm, mask, spectral) if spectral else SceneContext()
+    if temporal_std is not None:
+        scene_ctx.has_temporal = True
+        scene_ctx.n_dates = n_temporal_dates
+        log.info("Multi-temporal stability enabled (%d dates)", n_temporal_dates)
 
     # Phase 1: pixel-level classification (with optional spectral)
     pixel_classes = _classify_pixels(ndsm, dtm, dsm, mask, spectral=spectral)
@@ -831,11 +1050,30 @@ def classify_objects(
         # Spectral statistics for this segment
         seg_spectral = _segment_spectral_stats(obj_mask, spectral, rgb)
 
+        # Temporal stability for this segment
+        seg_temporal = None
+        if temporal_std is not None and scene_ctx.has_temporal:
+            t_std_vals = temporal_std[obj_mask]
+            t_rng_vals = temporal_range[obj_mask] if temporal_range is not None else t_std_vals * 2
+            valid_t = ~np.isnan(t_std_vals)
+            if valid_t.any():
+                seg_temporal = {
+                    "std_mean": float(np.nanmean(t_std_vals)),
+                    "std_median": float(np.nanmedian(t_std_vals)),
+                    "std_max": float(np.nanmax(t_std_vals)),
+                    "range_mean": float(np.nanmean(t_rng_vals)),
+                    "range_max": float(np.nanmax(t_rng_vals)),
+                    "stable_frac": float(np.sum(t_std_vals[valid_t] < 0.5) / valid_t.sum()),
+                    "n_dates": scene_ctx.n_dates,
+                }
+
         obj_type, crown_shape = _classify_segment(
             h_max, h_mean, h_std, h_p90, area, compactness, elongation,
             dominant_class, class_counts, slope_under,
             smooth, obj_mask, int(row), int(col),
             seg_spectral=seg_spectral,
+            scene_ctx=scene_ctx,
+            seg_temporal=seg_temporal,
         )
 
         # Skip pure ground unless it's a road or water feature or new ground type
@@ -867,6 +1105,16 @@ def classify_objects(
             ndvi_max=round(seg_spectral["ndvi_max"], 4) if seg_spectral["ndvi_max"] is not None else 0.0,
             brightness_mean=round(seg_spectral["brightness_mean"], 2),
             spectral_class=seg_spectral["spectral_class"],
+            temporal_std=round(seg_temporal["std_mean"], 3) if seg_temporal else 0.0,
+            temporal_stable=(
+                seg_temporal is not None
+                and seg_temporal["std_mean"] < 0.5
+                and seg_temporal["stable_frac"] > 0.7
+            ),
+            temporal_signal=(
+                _temporal_signal_label(seg_temporal, h_max)
+                if seg_temporal else ""
+            ),
         )
         objects.append(obj)
 
@@ -918,12 +1166,50 @@ def _classify_segment(
     smooth_ndsm, obj_mask, center_row, center_col,
     *,
     seg_spectral: dict | None = None,
+    scene_ctx: SceneContext | None = None,
+    seg_temporal: dict | None = None,
 ):
     """Classify a segment using pixel-class majority + 3D shape analysis.
 
     When *seg_spectral* is provided the spectral statistics are used to
-    refine / override the geometry-only decision.
+    refine / override the geometry-only decision.  *scene_ctx* provides
+    scene-adaptive thresholds.  *seg_temporal* provides multi-temporal
+    stability metrics from 2–3 LIDAR dates.
+
+    Temporal stability logic:
+      - std_mean < 0.5m → temporally stable (almost certainly built structure)
+      - std_mean > 1.5m → temporally unstable (vegetation or change)
+      - stable_frac > 0.8 → strong building evidence
+      - Used to resolve ambiguous spectral/geometry cases
     """
+    if scene_ctx is None:
+        scene_ctx = SceneContext()
+
+    # Extract temporal signals
+    t_stable = False          # strong evidence of built structure
+    t_unstable = False        # strong evidence of vegetation/change
+    t_signal = ""             # "stable" / "growing" / "shrinking"
+    if seg_temporal is not None:
+        t_std = seg_temporal["std_mean"]
+        t_rng = seg_temporal["range_mean"]
+        t_stable_frac = seg_temporal["stable_frac"]
+        n_dates = seg_temporal.get("n_dates", 2)
+
+        # Stability thresholds — tighter with 3 dates, looser with 2
+        stable_thr = 0.5 if n_dates >= 3 else 0.7
+        unstable_thr = 1.5 if n_dates >= 3 else 2.0
+
+        if t_std < stable_thr and t_stable_frac > 0.7:
+            t_stable = True
+            t_signal = "stable"
+        elif t_std > unstable_thr:
+            t_unstable = True
+            # Determine direction: growing vs shrinking
+            # Use range_max to detect if height increased or decreased
+            if t_rng > 2.0:
+                t_signal = "changing"
+            else:
+                t_signal = "variable"
     has_spectral = seg_spectral is not None and seg_spectral.get("spectral_class", "") != ""
     ndvi_m = seg_spectral["ndvi_mean"] if has_spectral else None
     ndvi_x = seg_spectral["ndvi_max"] if has_spectral else None
@@ -940,10 +1226,11 @@ def _classify_segment(
             # Swimming pool: blue dominant, small, ground level
             if sp_class == "blue_water" and area < 200:
                 return "swimming_pool", ""
-            # Parking lot: large flat impervious
-            if name in ("road_path", "parking_lot") and area > 200:
-                if ndvi_m is not None and ndvi_m < 0.10:
-                    return "parking_lot", ""
+            # Parking lot: large flat impervious — require >500m²
+            if name in ("road_path", "parking_lot") and area > 500:
+                if ndvi_m is not None and ndvi_m < scene_ctx.ndvi_building:
+                    if bri_m is not None and bri_m > scene_ctx.bri_building:
+                        return "parking_lot", ""
             # Rock/cliff at ground level confirmed spectrally
             if name == "rough_ground" and ndvi_m is not None and ndvi_m < 0.08:
                 if slope_under > 30:
@@ -968,12 +1255,12 @@ def _classify_segment(
 
     # --- Low vegetation: 0.2–2m ---
     if h_max < 2.0:
-        # Spectral: vineyard/orchard detection (regular pattern of low veg)
+        # Low non-green objects: small built structures
         if has_spectral and ndvi_m is not None:
-            # Greenhouse: very bright, low NDVI, slightly elevated
-            if ndvi_m < 0.10 and bri_m is not None and bri_m > 150:
-                if compactness > 0.4 and area > 20:
-                    return "greenhouse", ""
+            if (ndvi_m < scene_ctx.ndvi_building - 0.05
+                    and bri_m is not None and bri_m > scene_ctx.bri_building + 10
+                    and area > 30 and compactness > 0.3):
+                return "structure", ""
         return "low_vegetation", ""
 
     # --- 2–4m ---
@@ -986,10 +1273,11 @@ def _classify_segment(
         # Hedge: linear green feature 1-4m
         if elongation > 4 and has_spectral and ndvi_m is not None and ndvi_m > 0.25:
             return "hedge", ""
-        # Greenhouse check in 2-4m range
-        if has_spectral and ndvi_m is not None and ndvi_m < 0.10:
-            if bri_m is not None and bri_m > 140 and compactness > 0.35:
-                return "greenhouse", ""
+        # 2-4m non-green objects: built structures (walls, carports)
+        if has_spectral and ndvi_m is not None:
+            if (ndvi_m < scene_ctx.ndvi_building - 0.05
+                    and bri_m is not None and bri_m > scene_ctx.bri_building):
+                return "structure", ""
         return "shrub_bush", ""
 
     # --- Elevated objects (≥4m) ---
@@ -999,14 +1287,13 @@ def _classify_segment(
         return "power_line", ""
 
     # Mast/pole: tiny footprint, very tall, non-vegetated
-    # Must be truly non-vegetated (NDVI < 0.10) to avoid catching tree crown
-    # fragments.  Without spectral data, require extreme aspect ratio.
-    if area < 25 and h_max > 10:
+    # Calibration: 10,777 FPs — mostly building/tree edge fragments.
+    # Drastically tightened: area < 8, height > 15, compact, non-green.
+    if area < 8 and h_max > 15 and compactness > 0.4:
         if has_spectral and ndvi_m is not None:
-            if ndvi_m < 0.10 and (bri_m is None or bri_m > 60):
+            if ndvi_m < scene_ctx.ndvi_building - 0.05 and (bri_m is None or bri_m > 80):
                 return "mast_pole", ""
-            # Otherwise it's a tree fragment — classify as tree
-        elif not has_spectral and compactness > 0.5 and area < 10:
+        elif not has_spectral and compactness > 0.6 and area < 5:
             return "mast_pole", ""
 
     # Check pixel-class composition
@@ -1016,45 +1303,82 @@ def _classify_segment(
     solar_frac = class_counts[OBJECT_TYPES["solar_panel"]] / total_px if len(class_counts) > OBJECT_TYPES["solar_panel"] else 0
     greenhouse_frac = class_counts[OBJECT_TYPES["greenhouse"]] / total_px if len(class_counts) > OBJECT_TYPES["greenhouse"] else 0
 
-    # --- Greenhouse: bright, low NDVI, elevated ---
-    if greenhouse_frac > 0.3 and has_spectral:
-        if ndvi_m is not None and ndvi_m < 0.12 and bri_m is not None and bri_m > 130:
-            return "greenhouse", ""
+    # --- Greenhouse: segment-level only (pixel-level disabled).
+    #    Extremely strict: real greenhouses are rectangular, 3-6m, rural.
+    if (has_spectral and ndvi_m is not None and ndvi_m < 0.05
+            and bri_m is not None and bri_m > 150
+            and 2.0 < h_max < 8.0 and 50 < area < 2000
+            and compactness > 0.35 and elongation < 6
+            and slope_under < 5 and h_std < 1.5):
+        return "greenhouse", ""
 
     # --- Solar panel: dark patches on building roof ---
-    if solar_frac > 0.3 and building_frac + solar_frac > 0.5:
-        if has_spectral and bri_m is not None and bri_m < 70:
-            return "solar_panel", ""
+    if solar_frac > 0.5 and building_frac + solar_frac > 0.6:
+        if has_spectral and bri_m is not None and bri_m < 55:
+            if ndvi_m is not None and ndvi_m < -0.05:
+                return "solar_panel", ""
+
+    # --- TEMPORAL STABILITY: strong prior for building detection ---
+    # Objects stable across 2-3 years of LIDAR are almost certainly built.
+    # This resolves the biggest error mode: winter/alpine scenes where
+    # spectral signals are unreliable.
+    if t_stable and h_max >= 2 and area >= 15 and slope_under < 30:
+        # Temporally stable elevated object on reasonable terrain → building
+        # Still respect clear vegetation signal if available
+        if has_spectral and ndvi_m is not None and ndvi_m > scene_ctx.ndvi_tree_recovery + 0.10:
+            pass  # very green = definitely tree despite stability
+        else:
+            if area >= 25:
+                return "building", "temporal_stable"
+            return "structure", "temporal_stable"
 
     # --- Building: majority of pixels classified as building ---
-    # Height constraint: buildings in Austria rarely exceed 20m (6 floors).
-    # Objects taller than 20m with building pixels are almost certainly tree
-    # canopy (tall trees have flat tops that trigger building pixel rules).
-    if building_frac + solar_frac > 0.5 and area >= 20 and h_max < 20:
-        # Extra validation: buildings should be on gentle terrain
-        if slope_under < 30:
-            # Spectral override: if green, it's probably tree canopy
-            # Calibration: buildings rarely exceed NDVI 0.20 (p90=0.20)
-            if has_spectral and ndvi_m is not None and ndvi_m > 0.25:
+    # No height cap!  Austrian cities have buildings up to 80m.
+    # Instead, use scene-adaptive spectral + height-dependent confidence.
+    if building_frac + solar_frac > 0.5 and area >= 15:
+        height_ok = False
+        if h_max < 25:
+            # Standard buildings: just check terrain
+            height_ok = (slope_under < 30)
+        elif h_max < 80:
+            # Tall buildings: require clear non-vegetation spectral signal
+            if has_spectral and ndvi_m is not None:
+                height_ok = (ndvi_m < scene_ctx.ndvi_building) and (slope_under < 25)
+            elif t_stable:
+                # Temporal stability compensates for missing/weak spectral
+                height_ok = (slope_under < 25)
+            else:
+                height_ok = (compactness > 0.30) and (slope_under < 20)
+        if height_ok:
+            # Spectral override: if green (above tree recovery), it's canopy
+            # But temporal stability overrides spectral for ambiguous cases
+            if has_spectral and ndvi_m is not None and ndvi_m > scene_ctx.ndvi_tree_recovery:
+                if t_stable:
+                    # Stable despite green spectral — could be moss/lichen on roof
+                    # or winter-to-summer seasonal variation.  Trust temporal.
+                    if area >= 25:
+                        return "building", "temporal_override"
+                    return "structure", "temporal_override"
                 pass  # fall through to tree classification
             else:
-                if area >= 30:
+                if area >= 25:
                     return "building", ""
                 return "structure", ""
 
     # Building with shaped (gabled/hipped) roof:
-    # Calibrated: real buildings have nDSM_slope~43° (steep gabled),
-    # dsm_std3~0.74, nDSM_std5~1.47, height~6.7m, dtm_slope~14°.
-    # Height cap at 18m (typical max for Austrian rural buildings).
-    if (slope_under < 25 and h_std < 3.0 and 15 < area < 2000
-            and compactness > 0.2 and elongation < 8 and h_max < 18):
-        # Spectral check: skip if clearly vegetation
-        if has_spectral and ndvi_m is not None and ndvi_m > 0.25:
+    # Height cap raised to 50m.  Scene-adaptive NDVI thresholds.
+    if (slope_under < 25 and h_std < 3.5 and 15 < area < 3000
+            and compactness > 0.15 and elongation < 8 and h_max < 50):
+        if has_spectral and ndvi_m is not None and ndvi_m > scene_ctx.ndvi_tree_recovery:
+            if t_stable:
+                return "building", "temporal_override"
             pass  # fall through to tree
-        elif has_spectral and ndvi_m is not None and ndvi_m < 0.20:
-            return "building", ""
+        elif has_spectral and ndvi_m is not None and ndvi_m < scene_ctx.ndvi_building:
+            if bri_m is None or bri_m > scene_ctx.bri_building:
+                return "building", ""
         elif not has_spectral:
-            return "building", ""
+            if t_stable or h_max < 25:
+                return "building", "temporal_stable" if t_stable else ""
 
     # --- Bridge: elevated linear structure over depression/water ---
     if (elongation > 5 and h_max >= 4 and h_max < 20
@@ -1066,12 +1390,15 @@ def _classify_segment(
             return "bridge", ""
 
     # --- Dead tree: tall, spectrally non-green, AND dark ---
-    # Calibration showed buildings have NDVI~0.12 and brightness~131;
-    # dead trees are dark (brightness < 80) with low NDVI.
-    if has_spectral and ndvi_m is not None and ndvi_m < 0.10 and h_max >= 4:
-        if bri_m is not None and bri_m < 80 and building_frac < 0.3:
-            return "dead_tree", "dead"
-        elif bri_m is None and compactness < 0.5 and building_frac < 0.3:
+    # Scene-adaptive: must be below scene dead thresholds AND rough.
+    # Temporal stability: if stable across 2-3 years, it's NOT a dead tree
+    # (dead trees fall/decompose within ~2 years; stable dark objects are
+    # building parts, shadow artefacts, or dark roofs).
+    if has_spectral and ndvi_m is not None and ndvi_m < scene_ctx.ndvi_dead_max and h_max >= 4:
+        if (bri_m is not None and bri_m < scene_ctx.bri_dead_max
+                and building_frac < 0.2 and h_max < 25
+                and compactness < 0.6
+                and not t_stable):  # stable objects are NOT dead trees
             return "dead_tree", "dead"
 
     # --- Tree row: linear arrangement of trees ---
@@ -1095,6 +1422,20 @@ def _classify_segment(
         if (0.15 < ndvi_m < 0.40 and h_max < 8 and area > 100
                 and h_std > 0.5 and compactness > 0.2):
             return "vineyard_orchard", ""
+
+    # --- Last-resort temporal check ---
+    # If we've reached here (not matched as building/greenhouse/bridge/etc)
+    # but the object is temporally stable + compact on low slope, it's likely
+    # a building that didn't match the standard building path (e.g. unusual
+    # pixel class mix, or spectral ambiguity in winter/alpine scenes).
+    if (t_stable and h_max >= 2 and area >= 15
+            and compactness > 0.15 and slope_under < 25
+            and elongation < 10):
+        # Only override if not clearly vegetated
+        if not (has_spectral and ndvi_m is not None and ndvi_m > scene_ctx.ndvi_tree_recovery + 0.10):
+            if area >= 25:
+                return "building", "temporal_fallback"
+            return "structure", "temporal_fallback"
 
     # --- Tree crown shape analysis ---
     crown_shape = _analyse_crown_shape(smooth_ndsm, obj_mask, center_row, center_col)

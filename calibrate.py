@@ -289,7 +289,7 @@ def fetch_footprints_and_landuse(bbox: dict, kg_codes: list[str]) -> dict:
     return result
 
 
-def run_classifier(bbox: dict, retries: int = 3) -> dict:
+def run_classifier(bbox: dict, retries: int = 3, include_temporal: bool = False) -> dict:
     """Run our LIDAR+ortho classifier on a bbox with retries."""
     polygon = {
         "type": "Polygon",
@@ -305,7 +305,7 @@ def run_classifier(bbox: dict, retries: int = 3) -> dict:
         try:
             r = requests.post(
                 "http://localhost:8000/api/v1/objects",
-                json={"geometry": polygon, "include_ortho": True, "min_area": 2},
+                json={"geometry": polygon, "include_ortho": True, "include_temporal": include_temporal, "min_area": 2},
                 timeout=500,
             )
             r.raise_for_status()
@@ -319,7 +319,7 @@ def run_classifier(bbox: dict, retries: int = 3) -> dict:
     return {"features": [], "summary": {}, "meta": {}}
 
 
-def process_sample(sample: dict) -> dict:
+def process_sample(sample: dict, include_temporal: bool = False) -> dict:
     """Process one sample: classifier + cadastre comparison."""
     sid = sample["id"]
     label = sample["label"]
@@ -330,7 +330,7 @@ def process_sample(sample: dict) -> dict:
 
     # 1. Run classifier
     t0 = time.time()
-    classifier_result = run_classifier(bbox)
+    classifier_result = run_classifier(bbox, include_temporal=include_temporal)
     result["classifier_time_s"] = round(time.time() - t0, 1)
     result["classifier"] = {
         "features": classifier_result.get("features", []),
@@ -423,12 +423,18 @@ def _compare(result: dict) -> dict:
     footprint_count = result["footprints"].get("count", 0)
     footprint_area = result["footprints"].get("total_area_sqm", 0)
 
-    clf_bld_count = len(clf_buildings) + len(clf_structures)
-    clf_bld_area = sum(f.get("properties", {}).get("area_sqm", 0) for f in clf_buildings + clf_structures)
+    # Count only 'building' type for the primary ratio (not structures).
+    # Structures are built objects but don't map 1:1 to cadastre footprints.
+    clf_bld_count = len(clf_buildings)
+    clf_bld_area = sum(f.get("properties", {}).get("area_sqm", 0) for f in clf_buildings)
+    clf_str_count = len(clf_structures)
+    clf_str_area = sum(f.get("properties", {}).get("area_sqm", 0) for f in clf_structures)
 
     comp["buildings"] = {
         "classifier_count": clf_bld_count,
         "classifier_area_sqm": round(clf_bld_area, 1),
+        "structure_count": clf_str_count,
+        "structure_area_sqm": round(clf_str_area, 1),
         "cadastre_address_count": cadastre_bld_count,
         "cadastre_footprint_count": footprint_count,
         "cadastre_footprint_area_sqm": footprint_area,
@@ -642,10 +648,11 @@ def analyse_results():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: calibrate.py [sample|run|analyse|all]")
+        print("Usage: calibrate.py [sample|run|analyse|all] [--temporal]")
         sys.exit(1)
 
     cmd = sys.argv[1]
+    use_temporal = '--temporal' in sys.argv
 
     if cmd in ("sample", "all"):
         samples = generate_samples()
@@ -666,7 +673,7 @@ def main():
                 log.info(f"Skipping sample {sid} (already done)")
                 continue
             try:
-                result = process_sample(sample)
+                result = process_sample(sample, include_temporal=use_temporal)
                 with open(out_file, "w") as f:
                     json.dump(result, f, indent=2, default=str)
                 log.info(f"Sample {sid} done, saved to {out_file}")

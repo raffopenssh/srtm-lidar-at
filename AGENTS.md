@@ -20,6 +20,8 @@ ortho_io.py           Orthophoto reader (RGBI Operates preferred, DOP RGB 50km f
                       Spectral indices: NDVI, brightness, green ratio, RG index
 terrain_analysis.py   Slope, aspect, TRI, TPI, curvature
 object_classifier.py  3-phase pipeline + spectral refinement (27 object types)
+                      Scene-adaptive thresholds + multi-temporal LIDAR consensus
+                      (include_temporal=true loads 3 ALS dates for stability analysis)
 temporal_analysis.py  Multi-date comparison, change detection (20 event types)
                       Earthworks, road surfaces, tree growth, construction
 geo_parse.py          KML / GeoJSON / coordinate string parser

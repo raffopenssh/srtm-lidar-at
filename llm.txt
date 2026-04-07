@@ -45,7 +45,12 @@ Params:
   min_area      — minimum object area in m² (default 2)
   max_height    — filter: only objects shorter than this
   object_types  — comma-separated type filter (e.g. "tree_coniferous,building")
-  include_ortho — "true" to use RGB orthophoto for spectral refinement (adds NDVI, brightness)
+  include_ortho    — "true" to use RGB orthophoto for spectral refinement (adds NDVI, brightness)
+  include_temporal  — "true" to use multi-temporal LIDAR (3 dates: 2022/2023/2024) for stability
+                      analysis.  Adds temporal_std, temporal_stable, temporal_signal to each object.
+                      Stable objects (std < 0.5m across 2-3 years) are strong building evidence.
+                      Costs ~3x the LIDAR loading time but dramatically improves building detection
+                      in winter/alpine scenes where spectral signals are unreliable.
 Returns: summary + FeatureCollection of object centroids with properties.
 
 27 Object Types:
@@ -90,7 +95,7 @@ With orthophoto:
 ### POST /api/v1/objects/raster
 Download classified raster as GeoTIFF.
 Band 1: object type code (uint8). Band 2: object height (float32).
-Params: dataset, resolution (default 1.0), min_height, min_area, include_ortho
+Params: dataset, resolution (default 1.0), min_height, min_area, include_ortho, include_temporal
 
 ### POST /api/v1/changes
 Temporal change detection between two ALS dates.
@@ -178,6 +183,9 @@ Point inputs are automatically buffered (100m for objects, 200m for changes, 50m
 - Response times: small areas (100×100m) ~3–10s, larger areas proportionally longer.
   Remote LIDAR tiles are read via HTTP range requests; first request may be slower.
 - The orthophoto integration (include_ortho=true) adds ~2–5s for the DOP tile read.
+- Multi-temporal stability (include_temporal=true) loads 3 LIDAR dates (2022, 2023, 2024)
+  instead of 1, so LIDAR loading takes ~3x longer.  For a 100×100m area: ~8–15s.
+  The temporal signal dramatically improves building detection in ambiguous scenes.
   Types 15–26 (parking_lot through vineyard_orchard) are primarily detected with ortho.
   Without ortho, the classifier still works well for types 0–14.
 - Temporal analysis reads TWO full datasets (4 remote reads: DTM+DSM × 2 dates).

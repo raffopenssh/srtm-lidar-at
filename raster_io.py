@@ -198,3 +198,109 @@ def read_dtm_dsm(
         "mask": valid, "transform": tf, "crs": crs,
         "shape": (min_h, min_w),
     }
+
+
+def read_multi_date_ndsm(
+    geom_3035: shapely.geometry.base.BaseGeometry,
+    dates: list[str] | None = None,
+    pad: float = 5.0,
+) -> dict:
+    """Read nDSM for multiple ALS dates, aligned to a common grid.
+
+    Loads DTM+DSM for each date, computes nDSM, and aligns all arrays
+    to the smallest common extent.  This enables multi-temporal stability
+    analysis: pixels that maintain the same height across 2-3 years are
+    almost certainly built structures, while changing pixels are vegetation.
+
+    Parameters
+    ----------
+    geom_3035 : shapely geometry (EPSG:3035)
+        Area of interest.
+    dates : list of str, optional
+        Dataset date keys to load.  Default: all 3 available dates.
+    pad : float
+        Padding in metres around the geometry.
+
+    Returns
+    -------
+    dict with keys:
+        ndsm_by_date  – {date_str: 2D float32 array}
+        dtm           – DTM from the latest date (reference)
+        dsm           – DSM from the latest date (reference)
+        mask          – boolean valid-data mask (intersection of all dates)
+        transform     – rasterio Affine
+        crs           – rasterio CRS
+        shape         – (rows, cols)
+        temporal_std  – 2D float32: per-pixel std of nDSM across dates
+        temporal_range – 2D float32: per-pixel max-min of nDSM across dates
+        dates_loaded  – list of date strings actually loaded
+    """
+    if dates is None:
+        dates = sorted(ti.DATASETS.keys())
+    for d in dates:
+        if d not in ti.DATASETS:
+            raise ValueError(f"Unknown dataset {d!r}. Available: {sorted(ti.DATASETS)}")
+
+    # Load all dates
+    all_data = {}
+    for d in dates:
+        log.info("Reading DTM+DSM for temporal analysis, date %s", d)
+        try:
+            all_data[d] = read_dtm_dsm(geom_3035, dataset=d, pad=pad)
+        except Exception as e:
+            log.warning("Failed to load date %s: %s", d, e)
+
+    if not all_data:
+        raise ValueError("Could not load any LIDAR dates")
+    if len(all_data) < 2:
+        log.warning("Only %d date(s) loaded — temporal analysis needs ≥2", len(all_data))
+
+    # Find common shape (smallest extent)
+    loaded_dates = sorted(all_data.keys())
+    shapes = [all_data[d]["shape"] for d in loaded_dates]
+    min_h = min(s[0] for s in shapes)
+    min_w = min(s[1] for s in shapes)
+
+    # Use latest date as reference
+    ref_date = loaded_dates[-1]
+    ref = all_data[ref_date]
+
+    # Align and extract nDSM
+    ndsm_by_date = {}
+    combined_mask = np.ones((min_h, min_w), dtype=bool)
+    for d in loaded_dates:
+        dd = all_data[d]
+        ndsm_d = dd["ndsm"][:min_h, :min_w].copy()
+        mask_d = dd["mask"][:min_h, :min_w]
+        ndsm_d[~mask_d] = np.nan
+        ndsm_by_date[d] = ndsm_d
+        combined_mask &= mask_d
+
+    # Stack for temporal statistics
+    ndsm_stack = np.stack([ndsm_by_date[d] for d in loaded_dates], axis=0)  # (N, H, W)
+
+    with np.errstate(all='ignore'):
+        temporal_std = np.where(
+            combined_mask,
+            np.nanstd(ndsm_stack, axis=0),
+            np.nan
+        )
+        temporal_range = np.where(
+            combined_mask,
+            np.nanmax(ndsm_stack, axis=0) - np.nanmin(ndsm_stack, axis=0),
+            np.nan
+        )
+
+    return {
+        "ndsm_by_date": ndsm_by_date,
+        "dtm": ref["dtm"][:min_h, :min_w],
+        "dsm": ref["dsm"][:min_h, :min_w],
+        "ndsm": ref["ndsm"][:min_h, :min_w],
+        "mask": combined_mask,
+        "transform": ref["transform"],
+        "crs": ref["crs"],
+        "shape": (min_h, min_w),
+        "temporal_std": temporal_std,
+        "temporal_range": temporal_range,
+        "dates_loaded": loaded_dates,
+    }

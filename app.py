@@ -237,6 +237,7 @@ def objects_summary():
         min_height = float(params.get('min_height', 0.2))
         min_area = int(params.get('min_area', 2))
         include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
+        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
         object_types_filter = params.get('object_types', None)
         if isinstance(object_types_filter, str):
             object_types_filter = [t.strip() for t in object_types_filter.split(',')]
@@ -248,7 +249,26 @@ def objects_summary():
             if geom.geom_type == 'Point':
                 geom_3035 = geom_3035.buffer(100)
             _validate_area(geom_3035)
-            data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+            # Multi-temporal LIDAR (loads all 3 dates for stability analysis)
+            temporal_std, temporal_range, n_dates = None, None, 1
+            if include_temporal:
+                try:
+                    multi = raster_io.read_multi_date_ndsm(geom_3035)
+                    data = {
+                        'dtm': multi['dtm'], 'dsm': multi['dsm'],
+                        'ndsm': multi['ndsm'], 'mask': multi['mask'],
+                        'transform': multi['transform'], 'crs': multi['crs'],
+                        'shape': multi['shape'],
+                    }
+                    temporal_std = multi['temporal_std']
+                    temporal_range = multi['temporal_range']
+                    n_dates = len(multi['dates_loaded'])
+                except Exception as e:
+                    log.warning("Multi-temporal load failed, falling back to single date: %s", e)
+                    data = raster_io.read_dtm_dsm(geom_3035, dataset)
+            else:
+                data = raster_io.read_dtm_dsm(geom_3035, dataset)
 
             rgb, spectral = (None, None)
             if include_ortho:
@@ -258,6 +278,8 @@ def objects_summary():
                 data['ndsm'], data['dtm'], data['mask'], data['transform'],
                 min_height=min_height, min_area=min_area,
                 dsm=data['dsm'], rgb=rgb, spectral=spectral,
+                temporal_std=temporal_std, temporal_range=temporal_range,
+                n_temporal_dates=n_dates,
             )
             if object_types_filter:
                 objects = [o for o in objects if o.obj_type in object_types_filter]
@@ -281,12 +303,18 @@ def objects_summary():
                 props["ndvi_mean"] = obj.ndvi_mean
                 props["brightness_mean"] = obj.brightness_mean
                 props["spectral_class"] = obj.spectral_class
+            if include_temporal:
+                props["temporal_std"] = obj.temporal_std
+                props["temporal_stable"] = obj.temporal_stable
+                props["temporal_signal"] = obj.temporal_signal
             obj_features.append({"type": "Feature", "properties": props, "geometry": mapping(centroid_wgs)})
 
         return jsonify({
             "summary": summary, "type": "FeatureCollection", "features": obj_features,
             "meta": {"dataset": dataset, "min_height": min_height, "min_area": min_area,
                      "include_ortho": include_ortho,
+                     "include_temporal": include_temporal,
+                     "n_temporal_dates": n_dates if include_temporal else 1,
                      "object_types_filter": object_types_filter,
                      "processing_time_s": round(time.time()-t0, 2)},
         })
@@ -312,6 +340,7 @@ def objects_raster():
         min_height = float(params.get('min_height', 0.2))
         min_area = int(params.get('min_area', 2))
         include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
+        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
 
         feat = features[0]
         geom = feat['geometry']
@@ -320,7 +349,25 @@ def objects_raster():
             geom_3035 = geom_3035.buffer(100)
         _validate_area(geom_3035)
 
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        temporal_std, temporal_range, n_dates = None, None, 1
+        if include_temporal:
+            try:
+                multi = raster_io.read_multi_date_ndsm(geom_3035)
+                data = {
+                    'dtm': multi['dtm'], 'dsm': multi['dsm'],
+                    'ndsm': multi['ndsm'], 'mask': multi['mask'],
+                    'transform': multi['transform'], 'crs': multi['crs'],
+                    'shape': multi['shape'],
+                }
+                temporal_std = multi['temporal_std']
+                temporal_range = multi['temporal_range']
+                n_dates = len(multi['dates_loaded'])
+            except Exception as e:
+                log.warning("Multi-temporal load failed: %s", e)
+                data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        else:
+            data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
         rgb, spectral = (None, None)
         if include_ortho:
             rgb, spectral = _try_read_ortho(data)
@@ -329,6 +376,8 @@ def objects_raster():
             data['ndsm'], data['dtm'], data['mask'], data['transform'],
             min_height=min_height, min_area=min_area,
             dsm=data['dsm'], rgb=rgb, spectral=spectral,
+            temporal_std=temporal_std, temporal_range=temporal_range,
+            n_temporal_dates=n_dates,
         )
 
         type_band, height_band, out_tf = oc.create_classified_raster(

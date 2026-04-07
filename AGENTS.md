@@ -15,7 +15,8 @@ app.py               Flask API — 9 endpoints (4 existing + 3 temporal + info +
 tile_index.py         55-tile grid index, CRS transforms (WGS84 ↔ EPSG:3035)
                       3 ALS dates: 20220915, 20230915, 20240915
 raster_io.py          Windowed reads from remote GeoTIFFs via /vsicurl/
-ortho_io.py           Orthophoto reader (DOP RGB 50km tiles + RGBI Operate)
+ortho_io.py           Orthophoto reader (RGBI Operates preferred, DOP RGB 50km fallback)
+                      47 RGBI operates with auto-discovery for real NDVI
                       Spectral indices: NDVI, brightness, green ratio, RG index
 terrain_analysis.py   Slope, aspect, TRI, TPI, curvature
 object_classifier.py  3-phase pipeline + spectral refinement (27 object types)
@@ -40,12 +41,16 @@ srv.service           systemd + gunicorn (2 workers, port 8000)
 - **BEV DOP RGB** 50km tiles, EPSG:3035, 0.2m resolution, 3-band uint8
 - Date: `20220128`
 - URL: `https://data.bev.gv.at/download/DOP/20220128/DOP_CRS3035RES50000mN{n}E{e}_20220128.tif`
+- NOTE: These tiles have a non-standard south-up transform (positive Y). Handled in ortho_io.
 - Resampled to 1m for analysis (matching ALS grid)
 
-- **BEV DOP RGBI Operate** — separate RGB + NIR files per survey area
-  - Series: 20221027, 20240625, 20250415
-  - Various CRS (EPSG:31254/31255/31256)
+- **BEV DOP RGBI Operate** — separate RGB + NIR files per survey area (preferred for NDVI)
+  - 47 operates covering all of Austria, indexed in `ortho_io.RGBI_OPERATES`
+  - Series: 20221027 (2018-2021 flights), 20240625 (2023 flights), 20250415 (2024 flights)
+  - Various CRS (EPSG:31254/31255/31256) depending on Meridianstreifen
   - URL: `https://data.bev.gv.at/download/DOP/{series}/{operat}_Mosaik_{RGB|NIR}.tif`
+  - Auto-discovered by `ortho_io.find_rgbi_operates()` from WGS84 bbox
+  - `read_ortho_for_als()` tries RGBI first, falls back to DOP 50km tiles
 
 ## Classification Pipeline (object_classifier.py)
 

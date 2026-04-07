@@ -299,7 +299,8 @@ def _refine_with_spectral(
         )
         if brightness is not None:
             # bare soil is typically medium brightness, not super dark
-            bare = bare & (brightness > 40)
+            # Shadow zones (brightness < 60) can have low NDVI but aren't bare
+            bare = bare & (brightness > 60)
         px[bare] = OT["bare_soil"]
 
     # ------------------------------------------------------------------
@@ -349,6 +350,17 @@ def _refine_with_spectral(
                 & (brightness < 200)
             )
             px[pool] = OT["swimming_pool"]
+
+    # ------------------------------------------------------------------
+    # 3b. Water correction: geometry-based water with green NDVI → meadow
+    # ------------------------------------------------------------------
+    if ndvi is not None:
+        water_to_meadow = (
+            mask
+            & (px == OT["water"])
+            & (ndvi > 0.15)
+        )
+        px[water_to_meadow] = OT["meadow_field"]
 
     # ------------------------------------------------------------------
     # 4. Dead tree: tall + very low NDVI (brown/grey canopy)
@@ -554,8 +566,8 @@ def _segment_spectral_stats(
     All default to 0 / "" when spectral data is unavailable.
     """
     stats: dict = {
-        "ndvi_mean": 0.0,
-        "ndvi_max": 0.0,
+        "ndvi_mean": None,    # None = unavailable (no NIR band)
+        "ndvi_max": None,
         "brightness_mean": 0.0,
         "green_ratio_mean": 0.0,
         "blue_ratio_mean": 0.0,
@@ -575,8 +587,10 @@ def _segment_spectral_stats(
         safe = ndvi.shape == obj_mask.shape
         if safe:
             vals = ndvi[obj_mask]
-            stats["ndvi_mean"] = float(np.nanmean(vals))
-            stats["ndvi_max"] = float(np.nanmax(vals))
+            finite = vals[np.isfinite(vals)]
+            if len(finite) > 0:
+                stats["ndvi_mean"] = float(np.mean(finite))
+                stats["ndvi_max"] = float(np.max(finite))
 
     # Brightness
     bri = _get_spectral(spectral, "brightness")
@@ -604,24 +618,35 @@ def _segment_spectral_stats(
     gm = stats["green_ratio_mean"]
     blm = stats["blue_ratio_mean"]
 
-    if nm < -0.05:
-        stats["spectral_class"] = "water"
-    elif nm < 0.08 and bm > 100:
-        stats["spectral_class"] = "bright_impervious"  # road / building
-    elif nm < 0.08 and bm < 60:
-        stats["spectral_class"] = "dark_impervious"     # shadow / dark roof
-    elif nm < 0.15:
-        stats["spectral_class"] = "bare_or_built"
-    elif nm < 0.30:
-        stats["spectral_class"] = "sparse_vegetation"
-    elif nm < 0.50:
-        stats["spectral_class"] = "moderate_vegetation"
-    else:
-        stats["spectral_class"] = "dense_vegetation"
-
-    # Override for blue-dominant (pools)
-    if blm > 0.38 and nm < 0.05:
-        stats["spectral_class"] = "blue_water"
+    if nm is not None:
+        # Real NDVI available (NIR band present)
+        if nm < -0.05:
+            stats["spectral_class"] = "water"
+        elif nm < 0.08 and bm > 100:
+            stats["spectral_class"] = "bright_impervious"  # road / building
+        elif nm < 0.08 and bm < 60:
+            stats["spectral_class"] = "dark_impervious"     # shadow / dark roof
+        elif nm < 0.15:
+            stats["spectral_class"] = "bare_or_built"
+        elif nm < 0.30:
+            stats["spectral_class"] = "sparse_vegetation"
+        elif nm < 0.50:
+            stats["spectral_class"] = "moderate_vegetation"
+        else:
+            stats["spectral_class"] = "dense_vegetation"
+        # Override for blue-dominant (pools)
+        if blm > 0.38 and nm < 0.05:
+            stats["spectral_class"] = "blue_water"
+    elif bm > 0:
+        # RGB only (no NIR) — classify using brightness + green ratio
+        if gm > 0.38 and bm < 120:
+            stats["spectral_class"] = "rgb_vegetation"
+        elif bm > 140:
+            stats["spectral_class"] = "rgb_bright"       # road / roof / snow
+        elif bm < 45:
+            stats["spectral_class"] = "rgb_dark"          # shadow / water
+        else:
+            stats["spectral_class"] = "rgb_mixed"
 
     return stats
 
@@ -704,8 +729,9 @@ def classify_objects(
         area = float(reg.area)
         perimeter = float(reg.perimeter) if reg.perimeter > 0 else 1
         compactness = (4 * np.pi * area / perimeter**2)
-        elongation = (reg.major_axis_length / reg.minor_axis_length
-                      if reg.minor_axis_length > 0 else 999)
+        _major = getattr(reg, 'axis_major_length', None) or reg.major_axis_length
+        _minor = getattr(reg, 'axis_minor_length', None) or reg.minor_axis_length
+        elongation = (_major / _minor if _minor > 0 else 999)
 
         # Centroid in map coords
         row, col = reg.centroid
@@ -763,8 +789,8 @@ def classify_objects(
             bbox=bbox,
             crown_shape=crown_shape,
             height_class=_height_class(h_max),
-            ndvi_mean=round(seg_spectral["ndvi_mean"], 4),
-            ndvi_max=round(seg_spectral["ndvi_max"], 4),
+            ndvi_mean=round(seg_spectral["ndvi_mean"], 4) if seg_spectral["ndvi_mean"] is not None else 0.0,
+            ndvi_max=round(seg_spectral["ndvi_max"], 4) if seg_spectral["ndvi_max"] is not None else 0.0,
             brightness_mean=round(seg_spectral["brightness_mean"], 2),
             spectral_class=seg_spectral["spectral_class"],
         )
@@ -890,9 +916,13 @@ def _classify_segment(
     if area < 10 and h_max > 6 and elongation > 10:
         return "power_line", ""
 
-    # Mast/pole: tiny footprint, very tall
+    # Mast/pole: tiny footprint, very tall, non-vegetated
     if area < 25 and h_max > 10:
-        return "mast_pole", ""
+        if ndvi_m is not None and ndvi_m > 0.20:
+            # High NDVI → this is a narrow tree, not a pole
+            pass
+        else:
+            return "mast_pole", ""
 
     # Check pixel-class composition
     total_px = max(class_counts.sum(), 1)

@@ -96,6 +96,85 @@ RGBI_SERIES: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
+# RGBI operate index — bbox in WGS84 [lat_min, lon_min, lat_max, lon_max]
+# Discovered from BEV CSW catalogue + verified HTTP availability.
+# Each operate has separate RGB + NIR files.  Newest operates listed first
+# per area so ``find_rgbi_operates`` returns the most recent match first.
+# ---------------------------------------------------------------------------
+
+RGBI_OPERATES: dict[str, dict] = {
+    # --- series 20250415 (2024 flights, newest) ---
+    "2024150": {"series": "20250415", "crs": "EPSG:31256", "bbox_wgs84": [48.49597, 14.9363, 49.03636, 16.01072]},
+    "2024250": {"series": "20250415", "crs": "EPSG:31255", "bbox_wgs84": [47.51278, 13.0169, 47.66768, 14.01495]},
+    "2024260": {"series": "20250415", "crs": "EPSG:31255", "bbox_wgs84": [47.3285, 12.1186, 47.75278, 13.01837]},
+    "2024350": {"series": "20250415", "crs": "EPSG:31256", "bbox_wgs84": [46.60296, 14.99683, 47.17265, 16.05465]},
+    "2024450": {"series": "20250415", "crs": "EPSG:31256", "bbox_wgs84": [48.45779, 15.97477, 48.81885, 16.97557]},
+    "2024460": {"series": "20250415", "crs": "EPSG:31256", "bbox_wgs84": [48.09893, 15.97708, 48.47719, 16.98824]},
+    "2024470": {"series": "20250415", "crs": "EPSG:31255", "bbox_wgs84": [47.22059, 12.125, 47.35244, 13.01902]},
+    # --- series 20240625 (2023 flights) ---
+    "2023150": {"series": "20240625", "crs": "EPSG:31255", "bbox_wgs84": [48.09734, 12.72798, 48.78187, 14.07954]},
+    "2023160": {"series": "20240625", "crs": "EPSG:31254", "bbox_wgs84": [46.74871, 10.05247, 47.21787, 11.14116]},
+    "2023250": {"series": "20240625", "crs": "EPSG:31256", "bbox_wgs84": [48.00149, 14.96165, 48.52169, 16.01384]},
+    "2023260": {"series": "20240625", "crs": "EPSG:31254", "bbox_wgs84": [47.19706, 10.05199, 47.59562, 11.14475]},
+    "2023270": {"series": "20240625", "crs": "EPSG:31254", "bbox_wgs84": [46.84868, 9.50695, 47.60354, 10.25028]},
+    "2023350": {"series": "20240625", "crs": "EPSG:31256", "bbox_wgs84": [48.17708, 13.98818, 48.80079, 15.02073]},
+    "2023360": {"series": "20240625", "crs": "EPSG:31256", "bbox_wgs84": [47.50696, 14.97485, 48.02701, 16.01688]},
+    "2023370": {"series": "20240625", "crs": "EPSG:31254", "bbox_wgs84": [46.90936, 11.10419, 47.24789, 11.67044]},
+    "2023450": {"series": "20240625", "crs": "EPSG:31256", "bbox_wgs84": [47.14727, 14.98769, 47.53242, 16.01903]},
+    "2023460": {"series": "20240625", "crs": "EPSG:31255", "bbox_wgs84": [47.64769, 12.72819, 48.11736, 14.02085]},
+    "2023470": {"series": "20240625", "crs": "EPSG:31256", "bbox_wgs84": [47.60124, 13.981, 47.74681, 15.02956]},
+    # --- series 20221027 (2018-2021 flights, oldest) ---
+    "2021150": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [48.49597, 14.93629, 49.03635, 16.01071]},
+    "2021160": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [46.58761, 12.09967, 47.03762, 13.02276]},
+    "2021250": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.33291, 12.98421, 47.66768, 14.01494]},
+    "2021260": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.32849, 12.11857, 47.75278, 13.01837]},
+    "2021350": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [46.60296, 14.99683, 47.17264, 16.05465]},
+    "2021360": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.01811, 12.98517, 47.35288, 14.0109]},
+    "2021370": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.50695, 14.98423, 47.66733, 16.01687]},
+    "2021450": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [48.45779, 15.97476, 48.81885, 16.97556]},
+    "2021460": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [48.09893, 15.97707, 48.47719, 16.98823]},
+    "2021480": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.14727, 14.9877, 47.53242, 16.01904]},
+    "2020150": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [48.09734, 12.72797, 48.78187, 14.07954]},
+    "2020160": {"series": "20221027", "crs": "EPSG:31254", "bbox_wgs84": [46.74871, 10.05296, 47.1729, 11.14091]},
+    "2020250": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [48.00148, 14.96165, 48.52169, 16.01383]},
+    "2020260": {"series": "20221027", "crs": "EPSG:31254", "bbox_wgs84": [47.15208, 10.11819, 47.59561, 11.14474]},
+    "2020350": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [48.17707, 13.98818, 48.80078, 15.02073]},
+    "2020360": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.64183, 14.97485, 48.02708, 16.01605]},
+    "2020460": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.64769, 12.72818, 48.11737, 14.02084]},
+    "2020550": {"series": "20221027", "crs": "EPSG:31254", "bbox_wgs84": [46.85768, 9.52348, 47.60346, 10.25027]},
+    "2019150": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.67523, 15.97958, 48.27028, 17.16991]},
+    "2019160": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [46.47841, 12.98724, 47.03806, 14.00692]},
+    "2019250": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [46.82174, 15.98205, 47.75772, 16.73073]},
+    "2019260": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.00736, 13.97381, 47.57593, 15.05049]},
+    "2019350": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.86219, 13.98422, 48.20545, 15.03075]},
+    "2019360": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [46.69242, 13.9701, 47.03628, 15.05914]},
+    "2019370": {"series": "20221027", "crs": "EPSG:31254", "bbox_wgs84": [46.90935, 11.10419, 47.60652, 11.67955]},
+    "2019450": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [47.54729, 13.98033, 47.8907, 15.03393]},
+    "2019460": {"series": "20221027", "crs": "EPSG:31256", "bbox_wgs84": [46.36541, 13.96748, 46.72147, 15.08178]},
+    "2019470": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [46.95451, 11.61763, 47.63369, 12.16423]},
+    "2018470": {"series": "20221027", "crs": "EPSG:31255", "bbox_wgs84": [47.01357, 12.11569, 47.35244, 13.02024]},
+}
+
+
+def find_rgbi_operates(
+    lat_min: float, lon_min: float, lat_max: float, lon_max: float,
+    *, newest_first: bool = True,
+) -> list[str]:
+    """Return operate IDs whose WGS84 bbox overlaps the query bbox.
+
+    Ordered newest-first by default so callers can pick the freshest imagery.
+    """
+    hits: list[str] = []
+    for opid, info in RGBI_OPERATES.items():
+        bb = info["bbox_wgs84"]  # [lat_min, lon_min, lat_max, lon_max]
+        if bb[0] <= lat_max and bb[2] >= lat_min and bb[1] <= lon_max and bb[3] >= lon_min:
+            hits.append(opid)
+    if newest_first:
+        hits.sort(key=lambda o: int(o[:4]), reverse=True)
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
@@ -226,9 +305,25 @@ def _read_ortho_single_tile(
     with rasterio.open(url) as ds:
         native_res = abs(ds.transform.a)
         num_bands = ds.count
+        positive_y = ds.transform.e > 0  # south-up raster (BEV DOP tiles)
 
-        # Compute the pixel window at native resolution
-        window = from_bounds(min_e, min_n, max_e, max_n, ds.transform)
+        if positive_y:
+            # Non-standard south-up transform: pixel row increases = northing
+            # increases.  rasterio.from_bounds() doesn't support this, so
+            # compute the window manually.
+            origin_e = ds.transform.c
+            origin_n = ds.transform.f
+            col_off = (min_e - origin_e) / ds.transform.a
+            col_end = (max_e - origin_e) / ds.transform.a
+            row_off = (min_n - origin_n) / ds.transform.e
+            row_end = (max_n - origin_n) / ds.transform.e
+            window = Window.from_slices(
+                (int(round(row_off)), int(round(row_end))),
+                (int(round(col_off)), int(round(col_end))),
+            )
+        else:
+            window = from_bounds(min_e, min_n, max_e, max_n, ds.transform)
+
         window = window.intersection(Window(0, 0, ds.width, ds.height))
 
         if window.width < 1 or window.height < 1:
@@ -239,7 +334,6 @@ def _read_ortho_single_tile(
 
         # Compute output size at target resolution
         # Use the *actual* geographic extent of the clamped window
-        win_transform = ds.window_transform(window)
         win_width_m = window.width * native_res
         win_height_m = window.height * native_res
         out_cols = max(1, int(round(win_width_m / resolution)))
@@ -254,13 +348,28 @@ def _read_ortho_single_tile(
             resampling=resampling,
         )
 
-        # Build the output transform anchored at the window's top-left corner
-        out_transform = transform_from_origin(
-            win_transform.c,   # left  (easting)
-            win_transform.f,   # top   (northing)
-            resolution,
-            resolution,
-        )
+        if positive_y:
+            # Flip rows so the output is north-up (standard orientation)
+            data = data[:, ::-1, :].copy()
+
+        # Compute the geographic extent of the window we actually read
+        win_transform = ds.window_transform(window)
+        if positive_y:
+            # For south-up rasters the window top-left is the SW corner;
+            # after flipping, the output top-left is the NW corner.
+            actual_min_e = win_transform.c
+            actual_min_n = win_transform.f  # south edge
+            actual_max_n = actual_min_n + win_height_m
+            out_transform = transform_from_origin(
+                actual_min_e, actual_max_n, resolution, resolution,
+            )
+        else:
+            out_transform = transform_from_origin(
+                win_transform.c,   # left  (easting)
+                win_transform.f,   # top   (northing)
+                resolution,
+                resolution,
+            )
 
         return data, out_transform, ds.crs
 
@@ -627,11 +736,118 @@ def compute_spectral_indices(
 # ---------------------------------------------------------------------------
 
 
+def _ensure_shape(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Pad or crop *arr* so spatial dims match *(h, w)*."""
+    if arr.ndim == 3:
+        if arr.shape[1] == h and arr.shape[2] == w:
+            return arr
+        out = np.zeros((arr.shape[0], h, w), dtype=arr.dtype)
+        ch = min(arr.shape[1], h)
+        cw = min(arr.shape[2], w)
+        out[:, :ch, :cw] = arr[:, :ch, :cw]
+        return out
+    # 2-D (single band like NIR)
+    if arr.shape[0] == h and arr.shape[1] == w:
+        return arr
+    out = np.zeros((h, w), dtype=arr.dtype)
+    ch = min(arr.shape[0], h)
+    cw = min(arr.shape[1], w)
+    out[:ch, :cw] = arr[:ch, :cw]
+    return out
+
+
+def _try_read_rgbi_for_bbox(
+    min_e: float, min_n: float, max_e: float, max_n: float,
+    resolution: float, h: int, w: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Try to read RGB + NIR from an RGBI operate covering the EPSG:3035 bbox.
+
+    Returns (rgb, nir) or (None, None) if no operate covers the area.
+    Both arrays are aligned to the target grid (h, w) at *resolution*.
+    """
+    import pyproj
+
+    # Convert bbox corners to WGS84 for operate lookup
+    tf_to_wgs = pyproj.Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
+    lon_min, lat_min = tf_to_wgs.transform(min_e, min_n)
+    lon_max, lat_max = tf_to_wgs.transform(max_e, max_n)
+
+    operates = find_rgbi_operates(lat_min, lon_min, lat_max, lon_max)
+    if not operates:
+        return None, None
+
+    for opid in operates:
+        info = RGBI_OPERATES[opid]
+        series = info["series"]
+        op_crs = info["crs"]
+        try:
+            # Transform bbox to the operate's native CRS
+            tf_to_op = pyproj.Transformer.from_crs(
+                "EPSG:3035", op_crs, always_xy=True
+            )
+            oe_min, on_min = tf_to_op.transform(min_e, min_n)
+            oe_max, on_max = tf_to_op.transform(max_e, max_n)
+            # Ensure min < max
+            oe_min, oe_max = min(oe_min, oe_max), max(oe_min, oe_max)
+            on_min, on_max = min(on_min, on_max), max(on_min, on_max)
+
+            rgb_url = get_rgbi_url(opid, "RGB", series)
+            nir_url = get_rgbi_url(opid, "NIR", series)
+
+            out_cols = max(1, int(round((oe_max - oe_min) / resolution)))
+            out_rows = max(1, int(round((on_max - on_min) / resolution)))
+
+            with rasterio.open(rgb_url) as ds:
+                win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
+                win = win.intersection(Window(0, 0, ds.width, ds.height))
+                if win.width < 1 or win.height < 1:
+                    continue
+                rgb = ds.read(
+                    [1, 2, 3], window=win,
+                    out_shape=(3, out_rows, out_cols),
+                    resampling=Resampling.bilinear,
+                )
+
+            nir = None
+            try:
+                with rasterio.open(nir_url) as ds:
+                    win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
+                    win = win.intersection(Window(0, 0, ds.width, ds.height))
+                    if win.width >= 1 and win.height >= 1:
+                        nir = ds.read(
+                            1, window=win,
+                            out_shape=(out_rows, out_cols),
+                            resampling=Resampling.bilinear,
+                        )
+            except Exception as e:
+                log.warning("NIR read failed for operate %s: %s", opid, e)
+
+            log.info(
+                "Read RGBI operate %s (series %s) %dx%d @ %.1fm, NIR=%s",
+                opid, series, out_cols, out_rows, resolution,
+                "yes" if nir is not None else "no",
+            )
+            # Reshape to target grid
+            rgb = _ensure_shape(rgb, h, w)
+            if nir is not None:
+                nir = _ensure_shape(nir, h, w)
+            return rgb, nir
+
+        except Exception as e:
+            log.warning("RGBI operate %s failed: %s", opid, e)
+            continue
+
+    return None, None
+
+
 def read_ortho_for_als(
     als_result: dict,
     dataset: str = DEFAULT_ORTHO_DATASET,
-) -> np.ndarray:
-    """Read an RGB orthophoto aligned to an ALS raster result.
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read orthophoto aligned to an ALS raster result.
+
+    Tries RGBI operates first (RGB + NIR with real NDVI).  Falls back to
+    DOP 50 km RGB tiles if no operate covers the area.
 
     Parameters
     ----------
@@ -639,35 +855,35 @@ def read_ortho_for_als(
         Dict as returned by :func:`raster_io.read_dtm_dsm`, containing at
         least ``"transform"``, ``"crs"``, and ``"shape"`` keys.
     dataset:
-        Ortho dataset key.
+        DOP 50 km tile dataset key (used as fallback).
 
     Returns
     -------
-    rgb:
-        Shape ``(3, H, W)`` uint8, exactly matching *als_result["shape"]*.
+    (rgb, nir)
+        *rgb* has shape ``(3, H, W)`` uint8.
+        *nir* has shape ``(H, W)`` uint8, or ``None`` if only RGB available.
     """
     tf = als_result["transform"]
     h, w = als_result["shape"]
     res = abs(tf.a)
 
-    # Derive bbox from ALS transform + shape
+    # Derive EPSG:3035 bbox from ALS transform + shape
     min_e = tf.c
     max_n = tf.f
     max_e = min_e + w * res
     min_n = max_n - h * res
 
+    # 1. Try RGBI operates (RGB + NIR)
+    rgb, nir = _try_read_rgbi_for_bbox(min_e, min_n, max_e, max_n, res, h, w)
+    if rgb is not None:
+        return rgb, nir
+
+    # 2. Fallback: DOP 50 km tiles (RGB only, no NIR)
+    log.info("No RGBI operate found, falling back to DOP 50km tiles")
     rgb, _, _ = read_ortho_window(
         min_e, min_n, max_e, max_n,
         resolution=res,
         dataset=dataset,
     )
-
-    # Ensure exact shape match (rounding can cause ±1 pixel differences)
-    if rgb.shape[1] != h or rgb.shape[2] != w:
-        out = np.zeros((rgb.shape[0], h, w), dtype=rgb.dtype)
-        copy_h = min(rgb.shape[1], h)
-        copy_w = min(rgb.shape[2], w)
-        out[:, :copy_h, :copy_w] = rgb[:, :copy_h, :copy_w]
-        rgb = out
-
-    return rgb
+    rgb = _ensure_shape(rgb, h, w)
+    return rgb, None

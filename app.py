@@ -101,11 +101,15 @@ def _error(msg, code=400):
 
 
 def _try_read_ortho(data: dict) -> tuple:
-    """Attempt to read RGB ortho aligned to ALS data. Returns (rgb, spectral) or (None, None)."""
+    """Attempt to read RGB+NIR ortho aligned to ALS data.
+
+    Returns (rgb, spectral) or (None, None).  *spectral* will include
+    an ``"ndvi"`` key when NIR is available from an RGBI operate.
+    """
     try:
         import ortho_io
-        rgb = ortho_io.read_ortho_for_als(data)
-        spectral = ortho_io.compute_spectral_indices(rgb)
+        rgb, nir = ortho_io.read_ortho_for_als(data)
+        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
         return rgb, spectral
     except Exception as e:
         log.warning("Ortho read failed (non-fatal): %s", e)

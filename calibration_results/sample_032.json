@@ -1,0 +1,84 @@
+{
+  "sample": {
+    "id": 32,
+    "label": "Judenburg area",
+    "category": "rural_hilly",
+    "center_lon": 14.8,
+    "center_lat": 47.07,
+    "bbox": {
+      "west": 14.793,
+      "south": 47.065,
+      "east": 14.807,
+      "north": 47.075
+    }
+  },
+  "timestamp": 1775578736.769207,
+  "classifier_time_s": 20.0,
+  "classifier": {
+    "features": [],
+    "summary": {},
+    "meta": {}
+  },
+  "cadastre_time_s": 0.6,
+  "cadastre": {
+    "building_count": 0,
+    "parcel_count": 1,
+    "kg_codes": [
+      "65014",
+      "65405",
+      "65406"
+    ],
+    "parcels_summary": {
+      "count": 1,
+      "total_area_sqm": 956205.6,
+      "landuse_distribution": {
+        "Acker (Ackerland) - A": 4,
+        "Gr\u00fcnland (Hutweide) - LN(Hw)": 3,
+        "Gr\u00fcnland (Streuwiese) - LN(Sw)": 2,
+        "Sonstige (Sonstig) - So": 2,
+        "Wald - W": 2
+      },
+      "has_buildings_count": 0
+    }
+  },
+  "footprint_time_s": 15.1,
+  "footprints": {
+    "count": 6,
+    "total_area_sqm": 241.9
+  },
+  "landuse": {
+    "count": 54,
+    "distribution": {
+      "": {
+        "count": 54,
+        "area_sqm": 337150.5
+      }
+    }
+  },
+  "comparison": {
+    "buildings": {
+      "classifier_count": 0,
+      "classifier_area_sqm": 0,
+      "cadastre_address_count": 0,
+      "cadastre_footprint_count": 6,
+      "cadastre_footprint_area_sqm": 241.9,
+      "count_ratio": 0.0,
+      "area_ratio": 0.0
+    },
+    "classifier_types": {},
+    "type_stats": {},
+    "landuse_parcels": {
+      "Acker (Ackerland) - A": 4,
+      "Gr\u00fcnland (Hutweide) - LN(Hw)": 3,
+      "Gr\u00fcnland (Streuwiese) - LN(Sw)": 2,
+      "Sonstige (Sonstig) - So": 2,
+      "Wald - W": 2
+    },
+    "landuse_polygons": {
+      "": {
+        "count": 54,
+        "area_sqm": 337150.5
+      }
+    }
+  }
+}

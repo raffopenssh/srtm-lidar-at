@@ -1,0 +1,1302 @@
+[
+  {
+    "id": 1,
+    "label": "Vienna center",
+    "category": "urban",
+    "center_lon": 16.37,
+    "center_lat": 48.21,
+    "bbox": {
+      "west": 16.363,
+      "south": 48.205,
+      "east": 16.377,
+      "north": 48.215
+    }
+  },
+  {
+    "id": 2,
+    "label": "Vienna Schoenbrunn",
+    "category": "urban",
+    "center_lon": 16.31,
+    "center_lat": 48.18,
+    "bbox": {
+      "west": 16.303,
+      "south": 48.175,
+      "east": 16.317,
+      "north": 48.185
+    }
+  },
+  {
+    "id": 3,
+    "label": "Vienna Donaustadt",
+    "category": "suburban",
+    "center_lon": 16.43,
+    "center_lat": 48.23,
+    "bbox": {
+      "west": 16.423,
+      "south": 48.225,
+      "east": 16.437,
+      "north": 48.235
+    }
+  },
+  {
+    "id": 4,
+    "label": "Vienna Liesing",
+    "category": "suburban",
+    "center_lon": 16.26,
+    "center_lat": 48.17,
+    "bbox": {
+      "west": 16.253,
+      "south": 48.165,
+      "east": 16.267,
+      "north": 48.175
+    }
+  },
+  {
+    "id": 5,
+    "label": "Vienna Floridsdorf",
+    "category": "suburban",
+    "center_lon": 16.34,
+    "center_lat": 48.25,
+    "bbox": {
+      "west": 16.333,
+      "south": 48.245,
+      "east": 16.347,
+      "north": 48.255
+    }
+  },
+  {
+    "id": 6,
+    "label": "Gaenserndorf area",
+    "category": "rural_flat",
+    "center_lon": 16.51,
+    "center_lat": 48.29,
+    "bbox": {
+      "west": 16.503,
+      "south": 48.285,
+      "east": 16.517,
+      "north": 48.295
+    }
+  },
+  {
+    "id": 7,
+    "label": "St Poelten area",
+    "category": "suburban",
+    "center_lon": 15.62,
+    "center_lat": 48.21,
+    "bbox": {
+      "west": 15.613,
+      "south": 48.205,
+      "east": 15.627,
+      "north": 48.215
+    }
+  },
+  {
+    "id": 8,
+    "label": "Waldviertel Zwettl",
+    "category": "rural_hilly",
+    "center_lon": 15.43,
+    "center_lat": 48.51,
+    "bbox": {
+      "west": 15.423,
+      "south": 48.505,
+      "east": 15.437,
+      "north": 48.515
+    }
+  },
+  {
+    "id": 9,
+    "label": "Neunkirchen area",
+    "category": "rural_hilly",
+    "center_lon": 16.08,
+    "center_lat": 47.83,
+    "bbox": {
+      "west": 16.073,
+      "south": 47.825,
+      "east": 16.087,
+      "north": 47.835
+    }
+  },
+  {
+    "id": 10,
+    "label": "Lilienfeld area",
+    "category": "forest",
+    "center_lon": 15.77,
+    "center_lat": 48.08,
+    "bbox": {
+      "west": 15.763,
+      "south": 48.075,
+      "east": 15.777,
+      "north": 48.085
+    }
+  },
+  {
+    "id": 11,
+    "label": "Melk area",
+    "category": "rural_hilly",
+    "center_lon": 15.31,
+    "center_lat": 48.32,
+    "bbox": {
+      "west": 15.303,
+      "south": 48.315,
+      "east": 15.317,
+      "north": 48.325
+    }
+  },
+  {
+    "id": 12,
+    "label": "Weinviertel north",
+    "category": "rural_flat",
+    "center_lon": 16.87,
+    "center_lat": 48.78,
+    "bbox": {
+      "west": 16.863,
+      "south": 48.775,
+      "east": 16.877,
+      "north": 48.785
+    }
+  },
+  {
+    "id": 13,
+    "label": "Marchfeld",
+    "category": "rural_flat",
+    "center_lon": 16.64,
+    "center_lat": 48.41,
+    "bbox": {
+      "west": 16.633,
+      "south": 48.405,
+      "east": 16.647,
+      "north": 48.415
+    }
+  },
+  {
+    "id": 14,
+    "label": "Schneeberg area",
+    "category": "alpine",
+    "center_lon": 15.92,
+    "center_lat": 47.72,
+    "bbox": {
+      "west": 15.913,
+      "south": 47.715,
+      "east": 15.927,
+      "north": 47.725
+    }
+  },
+  {
+    "id": 15,
+    "label": "Baden area",
+    "category": "suburban",
+    "center_lon": 16.29,
+    "center_lat": 48.05,
+    "bbox": {
+      "west": 16.283,
+      "south": 48.045,
+      "east": 16.297,
+      "north": 48.055
+    }
+  },
+  {
+    "id": 16,
+    "label": "Eisenstadt area",
+    "category": "suburban",
+    "center_lon": 16.52,
+    "center_lat": 47.85,
+    "bbox": {
+      "west": 16.513,
+      "south": 47.845,
+      "east": 16.527,
+      "north": 47.855
+    }
+  },
+  {
+    "id": 17,
+    "label": "Neusiedlersee",
+    "category": "water",
+    "center_lon": 16.84,
+    "center_lat": 47.77,
+    "bbox": {
+      "west": 16.833,
+      "south": 47.765,
+      "east": 16.847,
+      "north": 47.775
+    }
+  },
+  {
+    "id": 18,
+    "label": "Oberwart area",
+    "category": "rural_hilly",
+    "center_lon": 16.32,
+    "center_lat": 47.45,
+    "bbox": {
+      "west": 16.313,
+      "south": 47.445,
+      "east": 16.327,
+      "north": 47.455
+    }
+  },
+  {
+    "id": 19,
+    "label": "Guessing area",
+    "category": "rural_flat",
+    "center_lon": 16.55,
+    "center_lat": 47.12,
+    "bbox": {
+      "west": 16.543,
+      "south": 47.115,
+      "east": 16.557,
+      "north": 47.125
+    }
+  },
+  {
+    "id": 20,
+    "label": "Stegersbach area",
+    "category": "rural_flat",
+    "center_lon": 16.73,
+    "center_lat": 47.5,
+    "bbox": {
+      "west": 16.723,
+      "south": 47.495,
+      "east": 16.737,
+      "north": 47.505
+    }
+  },
+  {
+    "id": 21,
+    "label": "Graz center",
+    "category": "urban",
+    "center_lon": 15.44,
+    "center_lat": 47.07,
+    "bbox": {
+      "west": 15.433,
+      "south": 47.065,
+      "east": 15.447,
+      "north": 47.075
+    }
+  },
+  {
+    "id": 22,
+    "label": "Graz west",
+    "category": "suburban",
+    "center_lon": 15.38,
+    "center_lat": 47.1,
+    "bbox": {
+      "west": 15.373,
+      "south": 47.095,
+      "east": 15.387,
+      "north": 47.105
+    }
+  },
+  {
+    "id": 23,
+    "label": "Graz south",
+    "category": "suburban",
+    "center_lon": 15.49,
+    "center_lat": 47.03,
+    "bbox": {
+      "west": 15.483,
+      "south": 47.025,
+      "east": 15.497,
+      "north": 47.035
+    }
+  },
+  {
+    "id": 24,
+    "label": "Kohlschwarz calibration",
+    "category": "rural_hilly",
+    "center_lon": 15.08,
+    "center_lat": 47.06,
+    "bbox": {
+      "west": 15.073,
+      "south": 47.055,
+      "east": 15.087,
+      "north": 47.065
+    }
+  },
+  {
+    "id": 25,
+    "label": "Bruck/Mur area",
+    "category": "mixed",
+    "center_lon": 15.27,
+    "center_lat": 47.35,
+    "bbox": {
+      "west": 15.263,
+      "south": 47.345,
+      "east": 15.277,
+      "north": 47.355
+    }
+  },
+  {
+    "id": 26,
+    "label": "Weiz area",
+    "category": "rural_hilly",
+    "center_lon": 15.68,
+    "center_lat": 47.19,
+    "bbox": {
+      "west": 15.673,
+      "south": 47.185,
+      "east": 15.687,
+      "north": 47.195
+    }
+  },
+  {
+    "id": 27,
+    "label": "Bad Radkersburg",
+    "category": "rural_flat",
+    "center_lon": 15.89,
+    "center_lat": 46.72,
+    "bbox": {
+      "west": 15.883,
+      "south": 46.715,
+      "east": 15.897,
+      "north": 46.725
+    }
+  },
+  {
+    "id": 28,
+    "label": "Liezen area",
+    "category": "mixed",
+    "center_lon": 14.47,
+    "center_lat": 47.38,
+    "bbox": {
+      "west": 14.463,
+      "south": 47.375,
+      "east": 14.477,
+      "north": 47.385
+    }
+  },
+  {
+    "id": 29,
+    "label": "Leibnitz wine",
+    "category": "rural_hilly",
+    "center_lon": 15.31,
+    "center_lat": 46.88,
+    "bbox": {
+      "west": 15.303,
+      "south": 46.875,
+      "east": 15.317,
+      "north": 46.885
+    }
+  },
+  {
+    "id": 30,
+    "label": "Ausseerland",
+    "category": "alpine",
+    "center_lon": 13.8,
+    "center_lat": 47.52,
+    "bbox": {
+      "west": 13.793,
+      "south": 47.515,
+      "east": 13.807,
+      "north": 47.525
+    }
+  },
+  {
+    "id": 31,
+    "label": "Leoben area",
+    "category": "mixed",
+    "center_lon": 15.01,
+    "center_lat": 47.23,
+    "bbox": {
+      "west": 15.003,
+      "south": 47.225,
+      "east": 15.017,
+      "north": 47.235
+    }
+  },
+  {
+    "id": 32,
+    "label": "Judenburg area",
+    "category": "rural_hilly",
+    "center_lon": 14.8,
+    "center_lat": 47.07,
+    "bbox": {
+      "west": 14.793,
+      "south": 47.065,
+      "east": 14.807,
+      "north": 47.075
+    }
+  },
+  {
+    "id": 33,
+    "label": "Muerzzuschlag",
+    "category": "forest",
+    "center_lon": 15.57,
+    "center_lat": 47.47,
+    "bbox": {
+      "west": 15.563,
+      "south": 47.465,
+      "east": 15.577,
+      "north": 47.475
+    }
+  },
+  {
+    "id": 34,
+    "label": "Klagenfurt center",
+    "category": "urban",
+    "center_lon": 14.3,
+    "center_lat": 46.62,
+    "bbox": {
+      "west": 14.293,
+      "south": 46.615,
+      "east": 14.307,
+      "north": 46.625
+    }
+  },
+  {
+    "id": 35,
+    "label": "Klagenfurt south",
+    "category": "suburban",
+    "center_lon": 14.35,
+    "center_lat": 46.6,
+    "bbox": {
+      "west": 14.343,
+      "south": 46.595,
+      "east": 14.357,
+      "north": 46.605
+    }
+  },
+  {
+    "id": 36,
+    "label": "Villach area",
+    "category": "urban",
+    "center_lon": 13.85,
+    "center_lat": 46.61,
+    "bbox": {
+      "west": 13.843,
+      "south": 46.605,
+      "east": 13.857,
+      "north": 46.615
+    }
+  },
+  {
+    "id": 37,
+    "label": "Ossiacher See",
+    "category": "water",
+    "center_lon": 14.1,
+    "center_lat": 46.76,
+    "bbox": {
+      "west": 14.093,
+      "south": 46.755,
+      "east": 14.107,
+      "north": 46.765
+    }
+  },
+  {
+    "id": 38,
+    "label": "Karawanken",
+    "category": "alpine",
+    "center_lon": 13.99,
+    "center_lat": 46.53,
+    "bbox": {
+      "west": 13.983,
+      "south": 46.525,
+      "east": 13.997,
+      "north": 46.535
+    }
+  },
+  {
+    "id": 39,
+    "label": "Voelkermarkt",
+    "category": "rural_hilly",
+    "center_lon": 14.8,
+    "center_lat": 46.7,
+    "bbox": {
+      "west": 14.793,
+      "south": 46.695,
+      "east": 14.807,
+      "north": 46.705
+    }
+  },
+  {
+    "id": 40,
+    "label": "Hermagor",
+    "category": "alpine",
+    "center_lon": 13.4,
+    "center_lat": 46.75,
+    "bbox": {
+      "west": 13.393,
+      "south": 46.745,
+      "east": 13.407,
+      "north": 46.755
+    }
+  },
+  {
+    "id": 41,
+    "label": "Spittal/Drau",
+    "category": "mixed",
+    "center_lon": 13.57,
+    "center_lat": 46.99,
+    "bbox": {
+      "west": 13.563,
+      "south": 46.985,
+      "east": 13.577,
+      "north": 46.995
+    }
+  },
+  {
+    "id": 42,
+    "label": "St Veit/Glan",
+    "category": "rural_hilly",
+    "center_lon": 14.51,
+    "center_lat": 46.83,
+    "bbox": {
+      "west": 14.503,
+      "south": 46.825,
+      "east": 14.517,
+      "north": 46.835
+    }
+  },
+  {
+    "id": 43,
+    "label": "Linz center",
+    "category": "urban",
+    "center_lon": 14.29,
+    "center_lat": 48.3,
+    "bbox": {
+      "west": 14.283,
+      "south": 48.295,
+      "east": 14.297,
+      "north": 48.305
+    }
+  },
+  {
+    "id": 44,
+    "label": "Linz south",
+    "category": "suburban",
+    "center_lon": 14.24,
+    "center_lat": 48.26,
+    "bbox": {
+      "west": 14.233,
+      "south": 48.255,
+      "east": 14.247,
+      "north": 48.265
+    }
+  },
+  {
+    "id": 45,
+    "label": "Wels area",
+    "category": "suburban",
+    "center_lon": 14.02,
+    "center_lat": 48.25,
+    "bbox": {
+      "west": 14.013,
+      "south": 48.245,
+      "east": 14.027,
+      "north": 48.255
+    }
+  },
+  {
+    "id": 46,
+    "label": "Voecklabruck",
+    "category": "rural_hilly",
+    "center_lon": 13.77,
+    "center_lat": 48.01,
+    "bbox": {
+      "west": 13.763,
+      "south": 48.005,
+      "east": 13.777,
+      "north": 48.015
+    }
+  },
+  {
+    "id": 47,
+    "label": "Braunau area",
+    "category": "rural_flat",
+    "center_lon": 13.04,
+    "center_lat": 48.23,
+    "bbox": {
+      "west": 13.033,
+      "south": 48.225,
+      "east": 13.047,
+      "north": 48.235
+    }
+  },
+  {
+    "id": 48,
+    "label": "Muehlviertel",
+    "category": "forest",
+    "center_lon": 14.26,
+    "center_lat": 48.47,
+    "bbox": {
+      "west": 14.253,
+      "south": 48.465,
+      "east": 14.267,
+      "north": 48.475
+    }
+  },
+  {
+    "id": 49,
+    "label": "Steyr area",
+    "category": "mixed",
+    "center_lon": 14.44,
+    "center_lat": 48.15,
+    "bbox": {
+      "west": 14.433,
+      "south": 48.145,
+      "east": 14.447,
+      "north": 48.155
+    }
+  },
+  {
+    "id": 50,
+    "label": "Gmunden/Traunsee",
+    "category": "water",
+    "center_lon": 13.62,
+    "center_lat": 47.8,
+    "bbox": {
+      "west": 13.613,
+      "south": 47.795,
+      "east": 13.627,
+      "north": 47.805
+    }
+  },
+  {
+    "id": 51,
+    "label": "Freistadt area",
+    "category": "rural_hilly",
+    "center_lon": 14.52,
+    "center_lat": 48.52,
+    "bbox": {
+      "west": 14.513,
+      "south": 48.515,
+      "east": 14.527,
+      "north": 48.525
+    }
+  },
+  {
+    "id": 52,
+    "label": "Voecklamarkt",
+    "category": "rural_flat",
+    "center_lon": 13.62,
+    "center_lat": 48.17,
+    "bbox": {
+      "west": 13.613,
+      "south": 48.165,
+      "east": 13.627,
+      "north": 48.175
+    }
+  },
+  {
+    "id": 53,
+    "label": "Bad Ischl",
+    "category": "alpine",
+    "center_lon": 13.8,
+    "center_lat": 47.57,
+    "bbox": {
+      "west": 13.793,
+      "south": 47.565,
+      "east": 13.807,
+      "north": 47.575
+    }
+  },
+  {
+    "id": 54,
+    "label": "Salzburg city",
+    "category": "urban",
+    "center_lon": 13.05,
+    "center_lat": 47.8,
+    "bbox": {
+      "west": 13.043,
+      "south": 47.795,
+      "east": 13.057,
+      "north": 47.805
+    }
+  },
+  {
+    "id": 55,
+    "label": "Salzburg west",
+    "category": "suburban",
+    "center_lon": 13.0,
+    "center_lat": 47.78,
+    "bbox": {
+      "west": 12.993,
+      "south": 47.775,
+      "east": 13.007,
+      "north": 47.785
+    }
+  },
+  {
+    "id": 56,
+    "label": "Salzburg north",
+    "category": "suburban",
+    "center_lon": 13.1,
+    "center_lat": 47.85,
+    "bbox": {
+      "west": 13.093,
+      "south": 47.845,
+      "east": 13.107,
+      "north": 47.855
+    }
+  },
+  {
+    "id": 57,
+    "label": "Zell am See",
+    "category": "alpine",
+    "center_lon": 12.87,
+    "center_lat": 47.32,
+    "bbox": {
+      "west": 12.863,
+      "south": 47.315,
+      "east": 12.877,
+      "north": 47.325
+    }
+  },
+  {
+    "id": 58,
+    "label": "Bischofshofen",
+    "category": "mixed",
+    "center_lon": 13.2,
+    "center_lat": 47.4,
+    "bbox": {
+      "west": 13.193,
+      "south": 47.395,
+      "east": 13.207,
+      "north": 47.405
+    }
+  },
+  {
+    "id": 59,
+    "label": "Hallein area",
+    "category": "rural_hilly",
+    "center_lon": 13.19,
+    "center_lat": 47.64,
+    "bbox": {
+      "west": 13.183,
+      "south": 47.635,
+      "east": 13.197,
+      "north": 47.645
+    }
+  },
+  {
+    "id": 60,
+    "label": "Mittersill",
+    "category": "alpine",
+    "center_lon": 12.65,
+    "center_lat": 47.1,
+    "bbox": {
+      "west": 12.643,
+      "south": 47.095,
+      "east": 12.657,
+      "north": 47.105
+    }
+  },
+  {
+    "id": 61,
+    "label": "Gastein valley",
+    "category": "alpine",
+    "center_lon": 13.02,
+    "center_lat": 47.07,
+    "bbox": {
+      "west": 13.013,
+      "south": 47.065,
+      "east": 13.027,
+      "north": 47.075
+    }
+  },
+  {
+    "id": 62,
+    "label": "Werfen",
+    "category": "alpine",
+    "center_lon": 12.99,
+    "center_lat": 47.53,
+    "bbox": {
+      "west": 12.983,
+      "south": 47.525,
+      "east": 12.997,
+      "north": 47.535
+    }
+  },
+  {
+    "id": 63,
+    "label": "Innsbruck center",
+    "category": "urban",
+    "center_lon": 11.39,
+    "center_lat": 47.26,
+    "bbox": {
+      "west": 11.383,
+      "south": 47.255,
+      "east": 11.397,
+      "north": 47.265
+    }
+  },
+  {
+    "id": 64,
+    "label": "Innsbruck west",
+    "category": "suburban",
+    "center_lon": 11.34,
+    "center_lat": 47.28,
+    "bbox": {
+      "west": 11.333,
+      "south": 47.275,
+      "east": 11.347,
+      "north": 47.285
+    }
+  },
+  {
+    "id": 65,
+    "label": "Hall in Tirol",
+    "category": "suburban",
+    "center_lon": 11.46,
+    "center_lat": 47.24,
+    "bbox": {
+      "west": 11.453,
+      "south": 47.235,
+      "east": 11.467,
+      "north": 47.245
+    }
+  },
+  {
+    "id": 66,
+    "label": "Landeck area",
+    "category": "alpine",
+    "center_lon": 10.26,
+    "center_lat": 47.27,
+    "bbox": {
+      "west": 10.253,
+      "south": 47.265,
+      "east": 10.267,
+      "north": 47.275
+    }
+  },
+  {
+    "id": 67,
+    "label": "Telfs area",
+    "category": "mixed",
+    "center_lon": 11.09,
+    "center_lat": 47.3,
+    "bbox": {
+      "west": 11.083,
+      "south": 47.295,
+      "east": 11.097,
+      "north": 47.305
+    }
+  },
+  {
+    "id": 68,
+    "label": "Woergl area",
+    "category": "suburban",
+    "center_lon": 11.87,
+    "center_lat": 47.32,
+    "bbox": {
+      "west": 11.863,
+      "south": 47.315,
+      "east": 11.877,
+      "north": 47.325
+    }
+  },
+  {
+    "id": 69,
+    "label": "Kitzbuehel",
+    "category": "alpine",
+    "center_lon": 12.17,
+    "center_lat": 47.44,
+    "bbox": {
+      "west": 12.163,
+      "south": 47.435,
+      "east": 12.177,
+      "north": 47.445
+    }
+  },
+  {
+    "id": 70,
+    "label": "Oetztal",
+    "category": "alpine",
+    "center_lon": 10.68,
+    "center_lat": 47.18,
+    "bbox": {
+      "west": 10.673,
+      "south": 47.175,
+      "east": 10.687,
+      "north": 47.185
+    }
+  },
+  {
+    "id": 71,
+    "label": "Stubai valley",
+    "category": "alpine",
+    "center_lon": 11.49,
+    "center_lat": 47.08,
+    "bbox": {
+      "west": 11.483,
+      "south": 47.075,
+      "east": 11.497,
+      "north": 47.085
+    }
+  },
+  {
+    "id": 72,
+    "label": "Lienz area",
+    "category": "mixed",
+    "center_lon": 12.43,
+    "center_lat": 46.84,
+    "bbox": {
+      "west": 12.423,
+      "south": 46.835,
+      "east": 12.437,
+      "north": 46.845
+    }
+  },
+  {
+    "id": 73,
+    "label": "Zillertal",
+    "category": "alpine",
+    "center_lon": 11.74,
+    "center_lat": 47.17,
+    "bbox": {
+      "west": 11.733,
+      "south": 47.165,
+      "east": 11.747,
+      "north": 47.175
+    }
+  },
+  {
+    "id": 74,
+    "label": "Reutte area",
+    "category": "alpine",
+    "center_lon": 10.87,
+    "center_lat": 47.51,
+    "bbox": {
+      "west": 10.863,
+      "south": 47.505,
+      "east": 10.877,
+      "north": 47.515
+    }
+  },
+  {
+    "id": 75,
+    "label": "Bregenz area",
+    "category": "urban",
+    "center_lon": 9.74,
+    "center_lat": 47.41,
+    "bbox": {
+      "west": 9.733,
+      "south": 47.405,
+      "east": 9.747,
+      "north": 47.415
+    }
+  },
+  {
+    "id": 76,
+    "label": "Feldkirch area",
+    "category": "suburban",
+    "center_lon": 9.73,
+    "center_lat": 47.24,
+    "bbox": {
+      "west": 9.723,
+      "south": 47.235,
+      "east": 9.737,
+      "north": 47.245
+    }
+  },
+  {
+    "id": 77,
+    "label": "Dornbirn area",
+    "category": "suburban",
+    "center_lon": 9.86,
+    "center_lat": 47.34,
+    "bbox": {
+      "west": 9.853,
+      "south": 47.335,
+      "east": 9.867,
+      "north": 47.345
+    }
+  },
+  {
+    "id": 78,
+    "label": "Bludenz area",
+    "category": "mixed",
+    "center_lon": 9.88,
+    "center_lat": 47.15,
+    "bbox": {
+      "west": 9.873,
+      "south": 47.145,
+      "east": 9.887,
+      "north": 47.155
+    }
+  },
+  {
+    "id": 79,
+    "label": "Montafon",
+    "category": "alpine",
+    "center_lon": 10.02,
+    "center_lat": 47.02,
+    "bbox": {
+      "west": 10.013,
+      "south": 47.015,
+      "east": 10.027,
+      "north": 47.025
+    }
+  },
+  {
+    "id": 80,
+    "label": "Hohenems",
+    "category": "suburban",
+    "center_lon": 9.65,
+    "center_lat": 47.3,
+    "bbox": {
+      "west": 9.643,
+      "south": 47.295,
+      "east": 9.657,
+      "north": 47.305
+    }
+  },
+  {
+    "id": 81,
+    "label": "Walgau",
+    "category": "rural_hilly",
+    "center_lon": 9.71,
+    "center_lat": 47.16,
+    "bbox": {
+      "west": 9.703,
+      "south": 47.155,
+      "east": 9.717,
+      "north": 47.165
+    }
+  },
+  {
+    "id": 82,
+    "label": "Graz airport",
+    "category": "mixed",
+    "center_lon": 15.42,
+    "center_lat": 47.07,
+    "bbox": {
+      "west": 15.413,
+      "south": 47.065,
+      "east": 15.427,
+      "north": 47.075
+    }
+  },
+  {
+    "id": 83,
+    "label": "Vienna airport",
+    "category": "mixed",
+    "center_lon": 16.57,
+    "center_lat": 48.13,
+    "bbox": {
+      "west": 16.563,
+      "south": 48.125,
+      "east": 16.577,
+      "north": 48.135
+    }
+  },
+  {
+    "id": 84,
+    "label": "Linz Chemiepark",
+    "category": "urban",
+    "center_lon": 14.19,
+    "center_lat": 48.32,
+    "bbox": {
+      "west": 14.183,
+      "south": 48.315,
+      "east": 14.197,
+      "north": 48.325
+    }
+  },
+  {
+    "id": 85,
+    "label": "Hallstatt",
+    "category": "alpine",
+    "center_lon": 13.6,
+    "center_lat": 47.49,
+    "bbox": {
+      "west": 13.593,
+      "south": 47.485,
+      "east": 13.607,
+      "north": 47.495
+    }
+  },
+  {
+    "id": 86,
+    "label": "Ybbstal forest",
+    "category": "forest",
+    "center_lon": 14.9,
+    "center_lat": 47.9,
+    "bbox": {
+      "west": 14.893,
+      "south": 47.895,
+      "east": 14.907,
+      "north": 47.905
+    }
+  },
+  {
+    "id": 87,
+    "label": "Gasteinertal",
+    "category": "alpine",
+    "center_lon": 13.45,
+    "center_lat": 47.17,
+    "bbox": {
+      "west": 13.443,
+      "south": 47.165,
+      "east": 13.457,
+      "north": 47.175
+    }
+  },
+  {
+    "id": 88,
+    "label": "Gleisdorf industry",
+    "category": "mixed",
+    "center_lon": 15.77,
+    "center_lat": 47.04,
+    "bbox": {
+      "west": 15.763,
+      "south": 47.035,
+      "east": 15.777,
+      "north": 47.045
+    }
+  },
+  {
+    "id": 89,
+    "label": "Suedsteiermark wine",
+    "category": "rural_hilly",
+    "center_lon": 16.02,
+    "center_lat": 46.99,
+    "bbox": {
+      "west": 16.013,
+      "south": 46.985,
+      "east": 16.027,
+      "north": 46.995
+    }
+  },
+  {
+    "id": 90,
+    "label": "Ennstal flat",
+    "category": "rural_flat",
+    "center_lon": 14.68,
+    "center_lat": 48.0,
+    "bbox": {
+      "west": 14.673,
+      "south": 47.995,
+      "east": 14.687,
+      "north": 48.005
+    }
+  },
+  {
+    "id": 91,
+    "label": "Kitzbuehel alps",
+    "category": "alpine",
+    "center_lon": 12.31,
+    "center_lat": 47.26,
+    "bbox": {
+      "west": 12.303,
+      "south": 47.255,
+      "east": 12.317,
+      "north": 47.265
+    }
+  },
+  {
+    "id": 92,
+    "label": "Ferlach Kaernten",
+    "category": "rural_hilly",
+    "center_lon": 14.64,
+    "center_lat": 46.43,
+    "bbox": {
+      "west": 14.633,
+      "south": 46.425,
+      "east": 14.647,
+      "north": 46.435
+    }
+  },
+  {
+    "id": 93,
+    "label": "Deutschlandsberg wine",
+    "category": "rural_hilly",
+    "center_lon": 15.16,
+    "center_lat": 46.64,
+    "bbox": {
+      "west": 15.153,
+      "south": 46.635,
+      "east": 15.167,
+      "north": 46.645
+    }
+  },
+  {
+    "id": 94,
+    "label": "Donauauen Vienna",
+    "category": "forest",
+    "center_lon": 16.34,
+    "center_lat": 48.32,
+    "bbox": {
+      "west": 16.333,
+      "south": 48.315,
+      "east": 16.347,
+      "north": 48.325
+    }
+  },
+  {
+    "id": 95,
+    "label": "Braunau Inn river",
+    "category": "water",
+    "center_lon": 13.35,
+    "center_lat": 48.3,
+    "bbox": {
+      "west": 13.343,
+      "south": 48.295,
+      "east": 13.357,
+      "north": 48.305
+    }
+  },
+  {
+    "id": 96,
+    "label": "Woerthersee",
+    "category": "water",
+    "center_lon": 14.81,
+    "center_lat": 46.61,
+    "bbox": {
+      "west": 14.803,
+      "south": 46.605,
+      "east": 14.817,
+      "north": 46.615
+    }
+  },
+  {
+    "id": 97,
+    "label": "Linz north forest",
+    "category": "forest",
+    "center_lon": 14.36,
+    "center_lat": 48.37,
+    "bbox": {
+      "west": 14.353,
+      "south": 48.365,
+      "east": 14.367,
+      "north": 48.375
+    }
+  },
+  {
+    "id": 98,
+    "label": "Wiener Neustadt",
+    "category": "urban",
+    "center_lon": 16.19,
+    "center_lat": 47.89,
+    "bbox": {
+      "west": 16.183,
+      "south": 47.885,
+      "east": 16.197,
+      "north": 47.895
+    }
+  },
+  {
+    "id": 99,
+    "label": "Pinzgau farm",
+    "category": "rural_flat",
+    "center_lon": 12.55,
+    "center_lat": 47.4,
+    "bbox": {
+      "west": 12.543,
+      "south": 47.395,
+      "east": 12.557,
+      "north": 47.405
+    }
+  },
+  {
+    "id": 100,
+    "label": "Salzburg airport",
+    "category": "mixed",
+    "center_lon": 13.24,
+    "center_lat": 47.8,
+    "bbox": {
+      "west": 13.233,
+      "south": 47.795,
+      "east": 13.247,
+      "north": 47.805
+    }
+  }
+]

@@ -1,0 +1,64 @@
+{
+  "sample": {
+    "id": 93,
+    "label": "Deutschlandsberg wine",
+    "category": "rural_hilly",
+    "center_lon": 15.16,
+    "center_lat": 46.64,
+    "bbox": {
+      "west": 15.153,
+      "south": 46.635,
+      "east": 15.167,
+      "north": 46.645
+    }
+  },
+  "timestamp": 1775581257.1081674,
+  "classifier_time_s": 7.5,
+  "classifier": {
+    "features": [],
+    "summary": {
+      "by_height_class": {},
+      "by_type": {},
+      "total_objects": 0
+    },
+    "meta": {
+      "dataset": "20240915",
+      "include_ortho": true,
+      "min_area": 2,
+      "min_height": 0.2,
+      "object_types_filter": null,
+      "processing_time_s": 7.53
+    }
+  },
+  "cadastre_time_s": 0.5,
+  "cadastre": {
+    "building_count": 0,
+    "parcel_count": 0,
+    "kg_codes": [],
+    "parcels_summary": {}
+  },
+  "footprint_time_s": 0.0,
+  "footprints": {
+    "count": 0,
+    "total_area_sqm": 0
+  },
+  "landuse": {
+    "count": 0,
+    "distribution": {}
+  },
+  "comparison": {
+    "buildings": {
+      "classifier_count": 0,
+      "classifier_area_sqm": 0,
+      "cadastre_address_count": 0,
+      "cadastre_footprint_count": 0,
+      "cadastre_footprint_area_sqm": 0,
+      "count_ratio": 0.0,
+      "area_ratio": 0.0
+    },
+    "classifier_types": {},
+    "type_stats": {},
+    "landuse_parcels": {},
+    "landuse_polygons": {}
+  }
+}

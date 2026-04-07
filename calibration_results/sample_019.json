@@ -1,0 +1,64 @@
+{
+  "sample": {
+    "id": 19,
+    "label": "Guessing area",
+    "category": "rural_flat",
+    "center_lon": 16.55,
+    "center_lat": 47.12,
+    "bbox": {
+      "west": 16.543,
+      "south": 47.115,
+      "east": 16.557,
+      "north": 47.125
+    }
+  },
+  "timestamp": 1775578262.0065627,
+  "classifier_time_s": 14.2,
+  "classifier": {
+    "features": [],
+    "summary": {
+      "by_height_class": {},
+      "by_type": {},
+      "total_objects": 0
+    },
+    "meta": {
+      "dataset": "20240915",
+      "include_ortho": true,
+      "min_area": 2,
+      "min_height": 0.2,
+      "object_types_filter": null,
+      "processing_time_s": 14.18
+    }
+  },
+  "cadastre_time_s": 1.7,
+  "cadastre": {
+    "building_count": 0,
+    "parcel_count": 0,
+    "kg_codes": [],
+    "parcels_summary": {}
+  },
+  "footprint_time_s": 0.0,
+  "footprints": {
+    "count": 0,
+    "total_area_sqm": 0
+  },
+  "landuse": {
+    "count": 0,
+    "distribution": {}
+  },
+  "comparison": {
+    "buildings": {
+      "classifier_count": 0,
+      "classifier_area_sqm": 0,
+      "cadastre_address_count": 0,
+      "cadastre_footprint_count": 0,
+      "cadastre_footprint_area_sqm": 0,
+      "count_ratio": 0.0,
+      "area_ratio": 0.0
+    },
+    "classifier_types": {},
+    "type_stats": {},
+    "landuse_parcels": {},
+    "landuse_polygons": {}
+  }
+}

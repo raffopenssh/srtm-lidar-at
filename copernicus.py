@@ -177,14 +177,23 @@ def _run_datacube(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Try synchronous download first (faster for small areas)
-    logger.info("Downloading datacube synchronously → %s", output_path)
-    try:
-        datacube.download(str(output_path), format=format)
-        logger.info("Synchronous download complete: %s", output_path)
-        return output_path
-    except Exception as exc:
-        # If sync fails (e.g. too large), fall back to batch
-        logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
+    # Retry once on 429 Too Many Requests
+    import time as _time
+    for attempt in range(2):
+        logger.info("Downloading datacube synchronously → %s", output_path)
+        try:
+            datacube.download(str(output_path), format=format)
+            logger.info("Synchronous download complete: %s", output_path)
+            return output_path
+        except Exception as exc:
+            exc_str = str(exc)
+            if "429" in exc_str and attempt == 0:
+                logger.warning("Rate limited (429), waiting 10s before retry...")
+                _time.sleep(10)
+                continue
+            # If sync fails (e.g. too large), fall back to batch
+            logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
+            break
 
     # Batch job fallback
     logger.info("Submitting batch job: %s", title)
@@ -340,17 +349,21 @@ def get_ndvi_timeseries(
         bbox, start_date, end_date,
     )
 
-    # Build month list
+    # Build month list — skip winter months (Nov-Feb) which often have
+    # zero cloud-free scenes in Austria, causing openEO EmptyBounds errors
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    SKIP_MONTHS = {11, 12, 1, 2}  # Nov-Feb: snow/clouds, no usable NDVI
     months = []
     current = start_dt.replace(day=1)
     while current <= end_dt:
-        months.append(current)
+        if current.month not in SKIP_MONTHS:
+            months.append(current)
         if current.month == 12:
             current = current.replace(year=current.year + 1, month=1)
         else:
             current = current.replace(month=current.month + 1)
+    logger.info("NDVI months to fetch: %s", [m.strftime('%Y-%m') for m in months])
 
     # Fetch each month as a separate NDVI composite — parallel downloads
     import concurrent.futures
@@ -379,8 +392,9 @@ def get_ndvi_timeseries(
         else:
             to_download.append((label, m_start, m_end, month_cache))
 
-    # Download missing months in parallel (3 concurrent — openEO rate limit)
+    # Download missing months in parallel (2 concurrent — openEO rate limit)
     def _download_month(args):
+        import time as _time
         label, m_start, m_end, month_cache = args
         logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
         try:
@@ -398,15 +412,19 @@ def get_ndvi_timeseries(
             ndvi_median = ndvi_cube.reduce_dimension(
                 dimension="t", reducer="median",
             )
-            _run_datacube(ndvi_median, month_cache, title=f"NDVI {label}")
+            # Use sync-only download for monthly NDVI — don't fall back to
+            # batch on EmptyBounds (no data = skip month, batch won't help)
+            month_cache.parent.mkdir(parents=True, exist_ok=True)
+            ndvi_median.download(str(month_cache), format="GTiff")
+            logger.info("NDVI %s downloaded OK", label)
             return label, None
         except Exception as exc:
             logger.warning("NDVI %s failed: %s — skipping month", label, exc)
             return label, exc
 
     if to_download:
-        logger.info("Downloading %d NDVI months (3 parallel)...", len(to_download))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        logger.info("Downloading %d NDVI months (2 parallel)...", len(to_download))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(_download_month, t): t[0] for t in to_download}
             for fut in concurrent.futures.as_completed(futures):
                 label, exc = fut.result()

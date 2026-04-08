@@ -96,7 +96,7 @@ def get_random_kgs(n: int = 100) -> list[dict]:
                 try:
                     resp2 = requests.get(
                         f"{CADASTRE_BASE}/search/kg",
-                        params={"district": d["district_name"], "limit": 200},
+                        params={"district": d["district_name"], "limit": 500},
                         timeout=30,
                     )
                     resp2.raise_for_status()
@@ -477,7 +477,7 @@ def process_one_kg(
             # Fetch NDVI, landcover, SAR with 3-min timeout each
             # Harmonics with 4-min timeout (it often needs batch jobs)
             COP_TIMEOUT = 180  # 3 min per layer
-            HARM_TIMEOUT = 240  # 4 min for harmonics
+            HARM_TIMEOUT = 900  # 15 min for harmonics (12 separate monthly fetches)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
                 for name, func, timeout in [

@@ -1181,7 +1181,7 @@ def classify_landscape(
     confidence_map = np.clip(confidence_map, 0, 1)
 
     # --- Stats ---
-    stats = _compute_stats(px, mask, objects, disturbance)
+    stats = _compute_stats(px, mask, objects, disturbance, dsm_changes)
 
     log.info(
         "Classification complete: %d objects, %d man-made, %d natural",
@@ -1202,8 +1202,8 @@ def classify_landscape(
     }
 
 
-def _compute_stats(px, mask, objects, disturbance):
-    """Compute summary statistics."""
+def _compute_stats(px, mask, objects, disturbance, dsm_changes=None):
+    """Compute summary statistics including land use change quantification."""
     total_px = int(mask.sum())
     type_counts = {}
     for name, code in LANDSCAPE_TYPES.items():
@@ -1232,13 +1232,108 @@ def _compute_stats(px, mask, objects, disturbance):
         "objects_natural": sum(1 for o in objects if not o.is_manmade),
     }
 
+    # --- Terrain disturbance quantification ---
     if disturbance is not None:
-        stats["terrain_disturbed_sqm"] = int(
-            disturbance.get("total_disturbance_mask", np.zeros(1, dtype=bool)).sum()
-        )
-        stats["disturbance_pairs"] = disturbance.get("per_pair", [])
+        dist_mask = disturbance.get("total_disturbance_mask", np.zeros(1, dtype=bool))
+        cut_mask = disturbance.get("cut_mask", np.zeros(1, dtype=bool))
+        fill_mask = disturbance.get("fill_mask", np.zeros(1, dtype=bool))
+        stats["terrain_disturbance"] = {
+            "total_disturbed_sqm": int(dist_mask.sum()),
+            "total_disturbed_ha": round(int(dist_mask.sum()) / 10000, 3),
+            "cut_area_sqm": int(cut_mask.sum()),
+            "fill_area_sqm": int(fill_mask.sum()),
+            "per_pair": disturbance.get("per_pair", []),
+            "interpretation": _interpret_disturbance(disturbance),
+        }
+
+    # --- Surface change quantification (logging, growth, etc.) ---
+    if dsm_changes is not None:
+        growing = dsm_changes.get("growing")
+        shrinking = dsm_changes.get("shrinking")
+        ndsm_latest = dsm_changes.get("ndsm_latest")
+        ndsm_stack = dsm_changes.get("ndsm_stack")
+
+        surface_stats = {}
+        if growing is not None:
+            tree_growth = growing & (ndsm_latest > 4) if ndsm_latest is not None else growing
+            surface_stats["tree_growth_sqm"] = int(tree_growth.sum())
+        if shrinking is not None:
+            # Logging/felling: was tall, now short
+            if ndsm_stack is not None and len(ndsm_stack) >= 2:
+                was_tall = ndsm_stack[0] > 4
+                now_short = ndsm_stack[-1] < 2
+                felled = mask & was_tall & now_short
+                surface_stats["tree_felling_sqm"] = int(felled.sum())
+                surface_stats["tree_felling_ha"] = round(int(felled.sum()) / 10000, 3)
+
+                # Large clearcut areas (>100m² connected)
+                if felled.any():
+                    labels, n = ndimage.label(felled)
+                    clearcuts = []
+                    for i in range(1, n + 1):
+                        area = int((labels == i).sum())
+                        if area > 100:
+                            clearcuts.append(area)
+                    surface_stats["clearcut_areas_sqm"] = sorted(clearcuts, reverse=True)
+                    surface_stats["clearcut_total_sqm"] = sum(clearcuts)
+
+            surface_stats["vegetation_loss_sqm"] = int(shrinking.sum())
+
+        # Excavation/mining from DTM (already in disturbance, but quantify volume)
+        if disturbance is not None:
+            cut = disturbance.get("cut_mask")
+            fill_m = disturbance.get("fill_mask")
+            if cut is not None and ndsm_stack is not None and len(ndsm_stack) >= 2:
+                # Volume estimation: sum of DTM differences on cut/fill pixels
+                # (rough estimate at 1m² × height change)
+                per_pair = disturbance.get("per_pair", [])
+                if per_pair:
+                    total_cut_vol = sum(p.get("pixels_cut", 0) * abs(p.get("dtm_change_mean", 0))
+                                        for p in per_pair)
+                    total_fill_vol = sum(p.get("pixels_fill", 0) * abs(p.get("dtm_change_mean", 0))
+                                         for p in per_pair)
+                    surface_stats["excavation_volume_m3_est"] = round(total_cut_vol, 0)
+                    surface_stats["fill_volume_m3_est"] = round(total_fill_vol, 0)
+
+        stats["surface_changes"] = surface_stats
 
     return stats
+
+
+def _interpret_disturbance(disturbance: dict) -> str:
+    """Generate human-readable interpretation of terrain disturbance."""
+    per_pair = disturbance.get("per_pair", [])
+    if not per_pair:
+        return "No terrain disturbance detected."
+
+    parts = []
+    for p in per_pair:
+        da, db = p.get("date_a", "?"), p.get("date_b", "?")
+        area = p.get("area_disturbed_sqm", 0)
+        cut = p.get("pixels_cut", 0)
+        fill = p.get("pixels_fill", 0)
+        smoothed = p.get("pixels_smoothed", 0)
+        paired = p.get("pixels_paired_cut_fill", 0)
+
+        if area == 0:
+            parts.append(f"{da}→{db}: no significant terrain change.")
+            continue
+
+        desc = f"{da}→{db}: {area}m² terrain modified"
+        details = []
+        if cut > 0:
+            details.append(f"{cut}m² excavated")
+        if fill > 0:
+            details.append(f"{fill}m² filled")
+        if smoothed > 0:
+            details.append(f"{smoothed}m² graded/smoothed")
+        if paired > 0:
+            details.append(f"{paired}m² paired cut+fill (earthmoving)")
+        if details:
+            desc += " (" + ", ".join(details) + ")"
+        parts.append(desc)
+
+    return " ".join(parts)
 
 
 # ===================================================================

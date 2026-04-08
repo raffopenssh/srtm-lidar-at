@@ -1,168 +1,99 @@
-# Austrian LIDAR & Orthophoto Analysis API — v2.0
+# Austrian Landscape Transformation Analysis API — v3.0
 # Base URL: https://srtm-lidar-at.exe.xyz:8000
 # All geometry input in WGS84 (lon/lat). Processing in EPSG:3035.
 # Max query area: 25 km².
 
-## Data Sources
+## Philosophy
 
-BEV ALS DTM + DSM (1m resolution, EPSG:3035, 55 tiles × 50km)
-  Dates: 20220915, 20230915, 20240915  (default: 20240915)
+This API answers: "How has man shaped this landscape?"
+Instead of 27 fragile object types, we classify 10 landscape types focused
+on distinguishing man-made from natural, and detecting terrain modification.
 
-BEV DOP Orthophoto RGB (0.2m native, resampled to 1m for analysis)
-  Date: 20220128 (50km tiles, same grid as ALS)
+## Data Sources (6 layers)
+
+1. BEV ALS DTM + DSM: 1m resolution, EPSG:3035, 3 dates (2022/2023/2024)
+2. BEV DOP RGBI Orthophoto: 0.2m resolution, 47 operates covering Austria
+3. Copernicus Sentinel-2: 10m NDVI growing-season composite (via openEO)
+4. Copernicus ESA WorldCover: 10m land cover classification
+5. Copernicus Sentinel-1 SAR: VV+VH backscatter
+6. Austrian Cadastre: mm-precision building footprint polygons (ground truth)
+
+## 10 Landscape Types
+
+| Code | Type | Description |
+|------|------|-------------|
+| 1 | engineered_surface | Roads, parking, paved — flat, smooth at 1m scale |
+| 2 | engineered_slope | Embankments, cuttings, retaining walls — linear terrain features |
+| 3 | excavation | Quarries, pits, construction sites — terrain removed |
+| 4 | fill | Landfill, raised platforms, levees — terrain added |
+| 5 | building | Structures: height + stability + spectral evidence |
+| 6 | infrastructure | Bridges, masts, fences, walls, other man-made elevated |
+| 7 | tree_canopy | All trees (no conifer/broadleaf split needed) |
+| 8 | vegetation | Low veg, shrubs, meadows, crops |
+| 9 | bare_natural | Rock, cliff, bare soil, natural water |
+| 10 | recent_disturbance | Terrain modified between LIDAR dates (machinery traces) |
+
+## Key Detection Methods
+
+- **Linear features**: Hessian eigenvalue analysis on DTM detects ridges (embankments)
+  and valleys (ditches) — identifies engineered vs natural terrain form
+- **Engineered surfaces**: Multi-scale roughness ratio (3m/15m window) detects
+  unnaturally smooth terrain (roads, parking)
+- **Machinery traces**: DTM time series differencing with spatial coherence filtering
+  detects where excavators/bulldozers reshaped terrain
+- **Buildings**: Multi-criteria score (DSM roughness + height uniformity + terrain
+  slope + NDVI + temporal stability). Calibrated against BEV cadastre footprints.
+- **Building F1=0.70** with ortho (P=0.56, R=0.92). Temporal + Copernicus improve further.
 
 ## Endpoints
 
-### POST /api/v1/elevation
-Enrich features with DSM/DTM elevation values.
-Body: GeoJSON Feature/FeatureCollection, or {"geometry": <GeoJSON geometry>}
-Params: dataset (default 20240915)
-Returns: FeatureCollection with dsm_elevation_m, dtm_elevation_m, object_height_m
-Point → single values. Line → elevation_profile array. Polygon → min/max/mean stats.
-
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/elevation \
-    -H 'Content-Type: application/json' \
-    -d '{"geometry": {"type": "Point", "coordinates": [15.4, 47.07]}}'
-
-### POST /api/v1/terrain
-Terrain characterisation: slope, aspect, ruggedness (TRI), curvature.
-Body: GeoJSON geometry
-Params: dataset
-Returns: elevation stats, slope_deg, slope_classes_pct, aspect_distribution_pct, ruggedness_tri
-
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/terrain \
-    -H 'Content-Type: application/json' \
-    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.075],[15.4,47.075],[15.4,47.07]]]}}'
-
 ### POST /api/v1/objects
-Object detection and classification. 27 object types from LIDAR 3D analysis.
+Landscape classification. 10 types from LIDAR + optional enrichment.
 Body: GeoJSON geometry
 Params:
-  dataset       — ALS date (default 20240915)
-  min_height    — minimum object height in metres (default 0.3)
-  min_area      — minimum object area in m² (default 2)
-  max_height    — filter: only objects shorter than this
-  object_types  — comma-separated type filter (e.g. "tree_coniferous,building")
-  include_ortho    — "true" to use RGB orthophoto for spectral refinement (adds NDVI, brightness)
-  include_temporal  — "true" to use multi-temporal LIDAR (3 dates: 2022/2023/2024) for stability
-                      analysis.  Adds temporal_std, temporal_stable, temporal_signal to each object.
-                      Stable objects (std < 0.5m across 2-3 years) are strong building evidence.
-                      Costs ~3x the LIDAR loading time but dramatically improves building detection
-                      in winter/alpine scenes where spectral signals are unreliable.
-Returns: summary + FeatureCollection of object centroids with properties.
+  dataset           — ALS date (default 20240915)
+  min_height        — min object height in metres (default 0.2)
+  min_area          — min object area in m² (default 2)
+  include_ortho     — "true" to use BEV RGBI orthophoto (adds NDVI, improves buildings)
+  include_temporal  — "true" to use 3-date LIDAR (2022/2023/2024).
+                      Detects machinery traces, building stability, tree growth.
+                      Costs ~3x loading time but dramatically improves accuracy.
+  include_copernicus — "true" to use Sentinel-2 NDVI + ESA land cover (10m, via openEO).
+                       Provides reliable growing-season NDVI (eliminates seasonal bias).
+  include_cadastre  — "true" to use cadastre building footprints for calibration.
+  object_types      — comma-separated type filter
+Returns: summary + FeatureCollection of objects with:
+  type, type_code, is_manmade, confidence, linear_feature, machinery_trace,
+  height_max_m, area_sqm, temporal_signal, ndvi_mean
 
-27 Object Types:
-  0  ground            — unclassified ground
-  1  road_path         — smooth ground (road, path, paved surface)
-  2  meadow_field      — ground with normal vegetation roughness
-  3  rough_ground      — rocky/uneven terrain
-  4  low_vegetation    — 0.3–2m height
-  5  shrub_bush        — 2–4m height
-  6  tree_coniferous   — >4m, conical crown (spruce, fir, pine)
-  7  tree_broadleaf    — >4m, dome/rounded crown (beech, oak, maple)
-  8  tree_unclassified — >4m, ambiguous crown shape
-  9  building          — flat-topped elevated structure, 20–2000 m²
-  10 structure         — small non-building elevated flat object
-  11 mast_pole         — tiny footprint (<25 m²), tall (>10m)
-  12 wall_fence        — narrow elongated feature, <4m
-  13 water             — ultra-smooth ground, low DSM roughness
-  14 unclassified      — fallback
-  15 parking_lot       — large flat paved area, low NDVI (requires ortho)
-  16 swimming_pool     — small water body, blue-dominant (requires ortho)
-  17 solar_panel       — dark rectangular roof feature (requires ortho)
-  18 greenhouse        — bright, low NDVI, slightly elevated structure
-  19 bridge            — elevated linear structure over depression
-  20 power_line        — very thin, tall, elongated
-  21 hedge             — linear vegetation 1–4m, narrow
-  22 tree_row          — linear arrangement of trees (avenue/alley)
-  23 dead_tree         — tall but very low NDVI (requires ortho)
-  24 bare_soil         — ground level, low NDVI, brownish (requires ortho)
-  25 rock_cliff        — steep terrain, very rough, no vegetation
-  26 vineyard_orchard  — regular pattern of low/medium vegetation
+Each object includes:
+- is_manmade (bool): the key question answered
+- confidence (0-1): how certain the classification is
+- linear_feature (bool): detected as linear man-made feature
+- machinery_trace (bool): terrain shows machinery modification
 
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
-    -H 'Content-Type: application/json' \
-    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+### POST /api/v1/elevation
+Enrich features with DSM/DTM elevation values.
 
-With orthophoto:
-  curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/objects?include_ortho=true' \
-    -H 'Content-Type: application/json' \
-    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+### POST /api/v1/terrain
+Terrain characterisation: slope, aspect, ruggedness, curvature.
 
 ### POST /api/v1/objects/raster
 Download classified raster as GeoTIFF.
-Band 1: object type code (uint8). Band 2: object height (float32).
-Params: dataset, resolution (default 1.0), min_height, min_area, include_ortho, include_temporal
+Band 1: landscape type code (uint8). Band 2: height (float32).
 
 ### POST /api/v1/changes
 Temporal change detection between two ALS dates.
-Detects: tree growth/felling, new/demolished buildings, earthworks (dams, fills, cuts,
-trenches, grading, ponds), new/resurfaced/widened roads, vegetation dynamics.
-Body: GeoJSON geometry
-Params:
-  date_a     — earlier date (default 20220915)
-  date_b     — later date (default 20240915)
-  min_change — minimum height change in metres to detect (default 1.0)
-Returns: FeatureCollection of change event centroids + summary by type + comparison stats.
-
-20 Change Event Types:
-  tree_growth        — canopy height increased 0.5–5m
-  tree_felling       — canopy dropped >3m (individual trees)
-  new_tree           — rose from ground to >3m
-  forest_clearcut    — large area (>100m²) canopy removed
-  vegetation_growth  — general 0.3–2m increase
-  vegetation_loss    — general 0.3–2m decrease
-  new_building       — flat-topped rise >3m on former ground
-  demolition         — flat structure dropped to ground
-  construction       — new elevated structure
-  earthwork_fill     — terrain raised (landfill, platform, levelling)
-  earthwork_cut      — terrain lowered (excavation, quarry, grading)
-  earthwork_grading  — terrain smoothed/flattened (roughness reduced)
-  earthwork_dam      — linear raised terrain (levee, embankment)
-  earthwork_trench   — linear depression (drainage ditch, utility trench)
-  earthwork_pond     — new compact depression (retention basin, pond)
-  road_new           — new road/path constructed
-  road_resurfaced    — existing road surface changed (new tarmac layer)
-  road_widened       — road corridor expanded
-  surface_change     — DSM texture changed without significant height change
-  unclassified_change — other
-
-Each event includes: area_sqm, height_before/after, height_change_mean/max,
-dtm_change_mean/max, dsm_change_mean, confidence (0–1), detail dict with subtype info.
-
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes \
-    -H 'Content-Type: application/json' \
-    -d '{"date_a": "20220915", "date_b": "20240915", "min_change": 0.5, "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+20 change event types including earthworks, tree felling, construction.
 
 ### POST /api/v1/changes/trees
-Per-tree growth/felling analysis. Matches individual trees between dates.
-Body: GeoJSON geometry
-Params: date_a (default 20220915), date_b (default 20240915)
-Returns: FeatureCollection of trees with status (grown/new/felled/stable),
-  height_before, height_after, height_change, crown_area_before/after.
-
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/trees \
-    -H 'Content-Type: application/json' \
-    -d '{"date_a": "20220915", "date_b": "20240915", "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+Per-tree growth/felling analysis between dates.
 
 ### POST /api/v1/changes/summary
-Multi-epoch change summary across all consecutive date pairs (2022→2023→2024).
-Body: GeoJSON geometry
-Params: dates (comma-separated, default all: 20220915,20230915,20240915)
-Returns: per-pair stats, cumulative totals by event type, annual trends.
-
-Example:
-  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/summary \
-    -H 'Content-Type: application/json' \
-    -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+Multi-epoch change summary (2022→2023→2024).
 
 ### GET /api/v1/info
-Dataset inventory, object types, event types, endpoint list.
+Dataset inventory, landscape types, data sources.
 
 ### GET /api/v1/docs/llm.txt
 This document.
@@ -174,21 +105,23 @@ All POST endpoints accept:
 - {"geometry": <GeoJSON geometry>, ...params} in body
 - KML string in body
 - Coordinate string: "lon,lat" or "lon,lat;lon,lat;..."
-- File upload (multipart, field name "file")
+- File upload (multipart)
 
-Point inputs are automatically buffered (100m for objects, 200m for changes, 50m for terrain).
+Point inputs are automatically buffered (100m for objects, 200m for changes).
 
-## Notes
+## Examples
 
-- Response times: small areas (100×100m) ~3–10s, larger areas proportionally longer.
-  Remote LIDAR tiles are read via HTTP range requests; first request may be slower.
-- The orthophoto integration (include_ortho=true) adds ~2–5s for the DOP tile read.
-- Multi-temporal stability (include_temporal=true) loads 3 LIDAR dates (2022, 2023, 2024)
-  instead of 1, so LIDAR loading takes ~3x longer.  For a 100×100m area: ~8–15s.
-  The temporal signal dramatically improves building detection in ambiguous scenes.
-  Types 15–26 (parking_lot through vineyard_orchard) are primarily detected with ortho.
-  Without ortho, the classifier still works well for types 0–14.
-- Temporal analysis reads TWO full datasets (4 remote reads: DTM+DSM × 2 dates).
-  Expect ~10–30s for change detection on moderate areas.
-- All coordinates in responses are WGS84 (lon/lat).
-- Raster downloads are EPSG:3035 GeoTIFF.
+# Basic classification (LIDAR only)
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+
+# Full analysis with all data sources
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/objects?include_ortho=true&include_temporal=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+
+# Change detection
+curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"date_a": "20220915", "date_b": "20240915", "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'

@@ -33,7 +33,7 @@ from shapely.geometry import mapping, shape, Point
 import tile_index as ti
 import raster_io
 import terrain_analysis as ta
-import object_classifier as oc
+import landscape_classifier as oc  # new landscape-focused classifier
 import temporal_analysis as tca
 import geo_parse
 
@@ -80,7 +80,9 @@ def _get_params():
                   if k not in ('geometry', 'type', 'features', 'coordinates')}
     for key in ('dataset', 'date_a', 'date_b', 'dates',
                 'min_height', 'max_height', 'min_area', 'min_change',
-                'object_types', 'resolution', 'format', 'include_ortho'):
+                'object_types', 'resolution', 'format',
+                'include_ortho', 'include_temporal',
+                'include_copernicus', 'include_cadastre'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -114,6 +116,57 @@ def _try_read_ortho(data: dict) -> tuple:
     except Exception as e:
         log.warning("Ortho read failed (non-fatal): %s", e)
         return None, None
+
+
+def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False) -> dict | None:
+    """Attempt to fetch Copernicus data for a geometry."""
+    try:
+        import copernicus
+        bbox = geom_wgs84.bounds  # (minx, miny, maxx, maxy) = (west, south, east, north)
+        bbox_dict = {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}
+        result = {}
+        if ndvi:
+            try:
+                ndvi_data = copernicus.get_ndvi_composite(bbox_dict)
+                result["ndvi"] = ndvi_data["ndvi"]
+                result["transform"] = ndvi_data["transform"]
+                result["crs"] = ndvi_data["crs"]
+            except Exception as e:
+                log.warning("Copernicus NDVI failed: %s", e)
+        if landcover:
+            try:
+                lc = copernicus.get_land_cover(bbox_dict)
+                result["landcover"] = lc
+            except Exception as e:
+                log.warning("Copernicus land cover failed: %s", e)
+        if sar:
+            try:
+                sar_data = copernicus.get_sar_backscatter(bbox_dict, "2023-06-01", "2023-09-30")
+                result["vv"] = sar_data["vv"]
+                result["vh"] = sar_data["vh"]
+            except Exception as e:
+                log.warning("Copernicus SAR failed: %s", e)
+        return result if result else None
+    except ImportError:
+        log.info("Copernicus module not available")
+        return None
+    except Exception as e:
+        log.warning("Copernicus data failed: %s", e)
+        return None
+
+
+def _try_cadastre(geom_wgs84, transform, shape) -> np.ndarray | None:
+    """Attempt to fetch building footprints from cadastre."""
+    try:
+        import cadastre
+        bbox = geom_wgs84.bounds
+        return cadastre.get_building_mask(bbox, transform, shape)
+    except ImportError:
+        log.info("Cadastre module not available")
+        return None
+    except Exception as e:
+        log.warning("Cadastre fetch failed: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +291,8 @@ def objects_summary():
         min_area = int(params.get('min_area', 2))
         include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
         include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
+        include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         object_types_filter = params.get('object_types', None)
         if isinstance(object_types_filter, str):
             object_types_filter = [t.strip() for t in object_types_filter.split(',')]
@@ -250,7 +305,8 @@ def objects_summary():
                 geom_3035 = geom_3035.buffer(100)
             _validate_area(geom_3035)
 
-            # Multi-temporal LIDAR (loads all 3 dates for stability analysis)
+            # Multi-temporal LIDAR: loads DTM+DSM for all dates
+            dtm_dates, dsm_dates = None, None
             temporal_std, temporal_range, n_dates = None, None, 1
             if include_temporal:
                 try:
@@ -264,6 +320,18 @@ def objects_summary():
                     temporal_std = multi['temporal_std']
                     temporal_range = multi['temporal_range']
                     n_dates = len(multi['dates_loaded'])
+                    # Build per-date DTM/DSM dicts for landscape classifier
+                    dtm_dates = {}
+                    dsm_dates = {}
+                    for d in multi['dates_loaded']:
+                        try:
+                            dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
+                            mh = min(dd['shape'][0], data['shape'][0])
+                            mw = min(dd['shape'][1], data['shape'][1])
+                            dtm_dates[d] = dd['dtm'][:mh, :mw]
+                            dsm_dates[d] = dd['dsm'][:mh, :mw]
+                        except Exception as e:
+                            log.warning("Failed to load date %s for time series: %s", d, e)
                 except Exception as e:
                     log.warning("Multi-temporal load failed, falling back to single date: %s", e)
                     data = raster_io.read_dtm_dsm(geom_3035, dataset)
@@ -274,13 +342,35 @@ def objects_summary():
             if include_ortho:
                 rgb, spectral = _try_read_ortho(data)
 
-            objects = oc.classify_objects(
-                data['ndsm'], data['dtm'], data['mask'], data['transform'],
-                min_height=min_height, min_area=min_area,
-                dsm=data['dsm'], rgb=rgb, spectral=spectral,
-                temporal_std=temporal_std, temporal_range=temporal_range,
+            # Copernicus data (Sentinel-2 NDVI, land cover, SAR)
+            copernicus_data = None
+            if include_copernicus:
+                copernicus_data = _try_copernicus(geom)
+
+            # Cadastre building footprints (ground truth)
+            building_footprints = None
+            if include_cadastre:
+                building_footprints = _try_cadastre(
+                    geom, data['transform'], data['shape'],
+                )
+
+            # Use new landscape classifier
+            result = oc.classify_landscape(
+                data['dtm'], data['dsm'], data['mask'], data['transform'],
+                dtm_dates=dtm_dates,
+                dsm_dates=dsm_dates,
+                copernicus=copernicus_data,
+                building_footprints=building_footprints,
+                min_height=min_height,
+                min_area=min_area,
+                spectral=spectral,
+                rgb=rgb,
+                temporal_std=temporal_std,
+                temporal_range=temporal_range,
                 n_temporal_dates=n_dates,
             )
+            objects = result['objects']
+
             if object_types_filter:
                 objects = [o for o in objects if o.obj_type in object_types_filter]
             max_height = params.get('max_height')
@@ -297,12 +387,14 @@ def objects_summary():
                 "height_max_m": obj.height_max, "height_mean_m": obj.height_mean,
                 "height_p90_m": obj.height_p90, "area_sqm": obj.area_sqm,
                 "compactness": obj.compactness, "elongation": obj.elongation,
-                "crown_shape": obj.crown_shape, "height_class": obj.height_class,
+                "height_class": obj.height_class,
+                "is_manmade": obj.is_manmade,
+                "confidence": obj.confidence,
+                "linear_feature": obj.linear_feature,
+                "machinery_trace": obj.machinery_trace,
             }
-            if include_ortho:
+            if include_ortho or include_copernicus:
                 props["ndvi_mean"] = obj.ndvi_mean
-                props["brightness_mean"] = obj.brightness_mean
-                props["spectral_class"] = obj.spectral_class
             if include_temporal:
                 props["temporal_std"] = obj.temporal_std
                 props["temporal_stable"] = obj.temporal_stable
@@ -314,7 +406,10 @@ def objects_summary():
             "meta": {"dataset": dataset, "min_height": min_height, "min_area": min_area,
                      "include_ortho": include_ortho,
                      "include_temporal": include_temporal,
+                     "include_copernicus": include_copernicus,
+                     "include_cadastre": include_cadastre,
                      "n_temporal_dates": n_dates if include_temporal else 1,
+                     "classifier": "landscape_v2",
                      "object_types_filter": object_types_filter,
                      "processing_time_s": round(time.time()-t0, 2)},
         })
@@ -973,8 +1068,9 @@ def ortho_geotiff():
 def info():
     return jsonify({
         "name": "Austrian LIDAR & Orthophoto Analysis API",
-        "version": "2.0.0",
-        "description": "Analysis of BEV ALS DTM/DSM LIDAR + DOP orthophoto data for Austria",
+        "version": "3.0.0",
+        "description": "Landscape transformation analysis: LIDAR DTM/DSM time series + Sentinel-2 + cadastre",
+        "classifier": "landscape_v2 — 10 types focused on human transformation of terrain",
         "source": "data.bev.gv.at",
         "resolution_lidar": "1m",
         "resolution_ortho": "0.2m (resampled to 1m for analysis)",
@@ -982,7 +1078,15 @@ def info():
         "datasets_als": {k: {"dtm": True, "dsm": True} for k in sorted(ti.DATASETS.keys())},
         "datasets_ortho": ["20220128 (RGB 50km tiles)"],
         "tiles": len(ti.TILE_COORDS),
-        "object_types": oc.OBJECT_TYPES,
+        "landscape_types": oc.LANDSCAPE_TYPES,
+        "data_sources": {
+            "bev_als_dtm_dsm": "1m resolution, 3 dates (2022/2023/2024)",
+            "bev_dop_rgbi": "0.2m orthophoto, 47 RGBI operates",
+            "copernicus_sentinel2": "10m NDVI growing-season composite (via openEO)",
+            "copernicus_worldcover": "10m ESA land cover classification",
+            "copernicus_sentinel1_sar": "SAR backscatter (VV+VH)",
+            "cadastre_footprints": "mm-precision building polygons (ground truth)",
+        },
         "change_event_types": tca.EVENT_TYPES,
         "endpoints": {
             "POST /api/v1/elevation": "Enrich features with DSM/DTM elevation",

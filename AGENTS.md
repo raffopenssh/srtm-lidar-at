@@ -2,152 +2,98 @@
 
 ## What this is
 
-Python/Flask API that analyses Austrian government LIDAR data (BEV ALS DTM + DSM, 1m resolution) and orthophotos (BEV DOP, 0.2m) on the fly via HTTP range requests — no local tile storage. Accepts any geometry (KML, GeoJSON, coordinates), returns elevation, terrain characterisation, object classification (27 types), temporal change detection (20 event types), and classified rasters.
+Python/Flask API that analyses Austrian landscape transformation using 6 data layers:
+1. BEV ALS DTM+DSM (1m, 3 dates: 2022/2023/2024) via HTTP range requests
+2. BEV DOP RGBI orthophotos (0.2m, 47 operates) via HTTP range requests
+3. Copernicus Sentinel-2 NDVI growing-season composite (10m, via openEO)
+4. Copernicus ESA WorldCover land cover (10m)
+5. Copernicus Sentinel-1 SAR backscatter (10m)
+6. Austrian Cadastre building footprint polygons (mm-precision, ground truth)
 
-Live: https://srtm-lidar-at.exe.xyz:8000/  
-API docs: /api/v1/docs/llm.txt  
-Cadastre integration: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
+Classifies landscape into 10 types focused on human vs natural, detects
+machinery traces from DTM time series, and identifies linear features
+via Hessian eigenvalue analysis.
+
+Live: https://srtm-lidar-at.exe.xyz:8000/
+API docs: /api/v1/docs/llm.txt
+Cadastre: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
 
 ## Architecture
 
 ```
-app.py               Flask API — 9 endpoints (4 existing + 3 temporal + info + docs)
-tile_index.py         55-tile grid index, CRS transforms (WGS84 ↔ EPSG:3035)
-                      3 ALS dates: 20220915, 20230915, 20240915
-raster_io.py          Windowed reads from remote GeoTIFFs via /vsicurl/
-ortho_io.py           Orthophoto reader (RGBI Operates preferred, DOP RGB 50km fallback)
-                      47 RGBI operates with auto-discovery for real NDVI
-                      Spectral indices: NDVI, brightness, green ratio, RG index
-terrain_analysis.py   Slope, aspect, TRI, TPI, curvature
-object_classifier.py  3-phase pipeline + spectral refinement (27 object types)
-                      Scene-adaptive thresholds + multi-temporal LIDAR consensus
-                      (include_temporal=true loads 3 ALS dates for stability analysis)
-temporal_analysis.py  Multi-date comparison, change detection (20 event types)
-                      Earthworks, road surfaces, tree growth, construction
-geo_parse.py          KML / GeoJSON / coordinate string parser
-static/index.html     Leaflet web UI
-llm.txt               Machine-readable API reference
-srv.service           systemd + gunicorn (2 workers, port 8000)
+app.py                 Flask API — all endpoints
+landscape_classifier.py  NEW: 10-type landscape classifier (replaced 27-type)
+                        Hessian linear features, multi-scale roughness,
+                        DTM time series machinery detection, building scoring
+                        Calibrated against BEV cadastre (F1=0.70 with ortho)
+copernicus.py          Sentinel-2 NDVI, ESA WorldCover, SAR via openEO
+cadastre.py            Building footprint fetcher + ground truth evaluator
+tile_index.py          55-tile grid index, CRS transforms
+raster_io.py           Windowed reads from remote GeoTIFFs via /vsicurl/
+ortho_io.py            BEV orthophoto reader (RGBI operates + DOP fallback)
+terrain_analysis.py    Slope, aspect, TRI, TPI, curvature
+temporal_analysis.py   Multi-date comparison, 20 change event types
+geo_parse.py           KML / GeoJSON / coordinate parser
+static/index.html      Leaflet web UI
+llm.txt                Machine-readable API reference
+srv.service            systemd + gunicorn (2 workers, port 8000)
+
+OLD (kept for reference):
+object_classifier.py   Original 27-type classifier (superseded by landscape_classifier)
 ```
 
-## Data Sources
+## 10 Landscape Types
 
-### ALS LIDAR (DTM + DSM)
-- **BEV ALS DTM/DSM** from data.bev.gv.at
-- 3 dates: `20220915`, `20230915`, `20240915`
-- 55 tiles, 50km×50km each, EPSG:3035, float32, ~12 GB per tile
-- HTTP range requests — we read only the window we need
-- URL: `https://data.bev.gv.at/download/ALS/{DTM|DSM}/{date}/ALS_{DTM|DSM}_CRS3035RES50000mN{n}E{e}.tif`
+| Code | Type | How detected |
+|------|------|-------------|
+| 1 | engineered_surface | DTM roughness < 0.025m at 3m scale, slope uniformity < 1° |
+| 2 | engineered_slope | Hessian ridge/valley strength + high linearity (>0.5) |
+| 3 | excavation | DTM time series: terrain lowered + spatially coherent |
+| 4 | fill | DTM time series: terrain raised + spatially coherent |
+| 5 | building | Multi-criteria score: DSM std + nDSM std + slope + NDVI + stability |
+| 6 | infrastructure | Elevated, non-building, non-tree: small/linear/irregular |
+| 7 | tree_canopy | Elevated >4m, rough DSM, high NDVI, growing over time |
+| 8 | vegetation | Low/medium height, not engineered |
+| 9 | bare_natural | Steep + rough terrain, or bare soil |
+| 10 | recent_disturbance | DTM changed >0.15m between dates + spatial coherence |
 
-### Orthophoto (DOP)
-- **BEV DOP RGB** 50km tiles, EPSG:3035, 0.2m resolution, 3-band uint8
-- Date: `20220128`
-- URL: `https://data.bev.gv.at/download/DOP/20220128/DOP_CRS3035RES50000mN{n}E{e}_20220128.tif`
-- NOTE: These tiles have a non-standard south-up transform (positive Y). Handled in ortho_io.
-- Resampled to 1m for analysis (matching ALS grid)
+## Key Detection Methods
 
-- **BEV DOP RGBI Operate** — separate RGB + NIR files per survey area (preferred for NDVI)
-  - 47 operates covering all of Austria, indexed in `ortho_io.RGBI_OPERATES`
-  - Series: 20221027 (2018-2021 flights), 20240625 (2023 flights), 20250415 (2024 flights)
-  - Various CRS (EPSG:31254/31255/31256) depending on Meridianstreifen
-  - URL: `https://data.bev.gv.at/download/DOP/{series}/{operat}_Mosaik_{RGB|NIR}.tif`
-  - Auto-discovered by `ortho_io.find_rgbi_operates()` from WGS84 bbox
-  - `read_ortho_for_als()` tries RGBI first, falls back to DOP 50km tiles
+### Linear Feature Detection (Hessian eigenvalues)
+DTM smoothed at σ=2m, Hessian matrix computed, eigenvalues λ1/λ2 extracted.
+Ridges (embankments): λ1 >> 0, |λ2| small. Valleys (ditches): λ2 << 0.
+Linearity = |λ1-λ2|/(λ1+λ2). Also applied to DSM for walls/fences.
 
-## Classification Pipeline (object_classifier.py)
+### Machinery Trace Detection (DTM time series)
+For each consecutive date pair: DTM differenced, filtered for spatial
+coherence (8-connected opening+closing), small regions removed.
+Roughness change computed (natural→smooth = machinery). Paired cut/fill
+detected via dilation overlap.
 
-**Phase 1 — Pixel-level.** Every pixel gets a type from 3D surface properties:
-- nDSM surface slope, DSM roughness (std 3×3), nDSM height variation (std 5×5), DTM terrain slope
-- Ground sub-types: road/path (smooth), meadow (normal), rough ground (rocky)
-- Water requires spectral confirmation (geometry alone is NOT sufficient)
-- Elevated with conservative geometry (ndsm_std5<1.5, dsm_std3<0.8) → building candidate
-- Everything else elevated → tree canopy
-- Rock/cliff: steep DTM (>45°) + rough surface
+### Building Detection (multi-criteria scoring)
+Pixel score from 0-10+ combining:
+- DSM roughness (std3 < 0.5: +2, < 1.0: +1, < 1.5: +0.5)
+- Height uniformity (nDSM std5 < 1.0: +1.5, < 2.0: +0.8)
+- Terrain flatness (slope < 5°: +1.5, < 10°: +0.8)
+- NDVI < 0.15: +2.0 (if ortho available)
+- Brightness > 90 + NDVI < 0.20: +1.5
+- High NDVI > 0.30: -2.0 (penalize vegetation)
+Threshold: 5.0 with ortho, 6.0 without.
 
-**Phase 1b — Spectral refinement (critical for building detection).**
-- NDVI < 0.20 AND brightness > 100 → building (catches 85% buildings, only 0.7% trees)
-- NDVI > 0.25 on building pixel → reclassify as tree
-- Water: NDVI < -0.05 AND brightness < 50 (ultra-strict, no false positives)
-- Dead tree: NDVI < 0.10 AND brightness < 90 (excludes bright roofs)
-- Brightness + color ratios for road/parking/pool/solar panel detection
-- Bare soil vs meadow corrections
-- Calibrated against BEV cadastre footprints (KG 63330 Kohlschwarz)
+## Copernicus Integration
 
-**Phase 2 — Watershed segmentation.** Continuous canopy split into individual crowns.
+OpenEO client credentials:
+- Client ID: sh-19061cbb-c6f9-4464-bba6-006e7fa17435
+- Backend: openeo.dataspace.copernicus.eu
 
-**Phase 3 — Object classification.** Each segment classified by pixel-class majority + morphometrics + crown shape + spectral stats.
+Data fetched on-demand, cached in /tmp/copernicus_cache/.
+NDVI composite uses April-September median (cloud-masked via SCL dilation).
 
-## 27 Object Types
+## Cadastre Integration
 
-| Code | Type | Signature |
-|------|------|----------|
-| 0 | ground | nDSM < 0.2m, uncategorised |
-| 1 | road_path | nDSM < 0.2m, DTM std3 < 0.15 |
-| 2 | meadow_field | nDSM < 0.2m, normal roughness |
-| 3 | rough_ground | nDSM < 0.2m, DTM std3 > 0.5 |
-| 4 | low_vegetation | 0.2–2m |
-| 5 | shrub_bush | 2–4m |
-| 6 | tree_coniferous | >4m, conical crown |
-| 7 | tree_broadleaf | >4m, dome/rounded crown |
-| 8 | tree_unclassified | >4m, ambiguous crown |
-| 9 | building | NDVI<0.20 + brightness>100 + h<20m, 15–2000 m² |
-| 10 | structure | small non-building elevated flat object |
-| 11 | mast_pole | tiny footprint (<25 m²), tall (>10m) |
-| 12 | wall_fence | narrow elongated, <4m |
-| 13 | water | ultra-strict: NDVI < -0.05 AND brightness < 50 AND smooth |
-| 14 | unclassified | fallback |
-| 15 | parking_lot | large flat paved, low NDVI (ortho) |
-| 16 | swimming_pool | blue-dominant water, small (ortho) |
-| 17 | solar_panel | dark rectangular rooftop (ortho) |
-| 18 | greenhouse | bright, low NDVI, slightly elevated |
-| 19 | bridge | elevated linear over depression |
-| 20 | power_line | very thin, tall, elongated |
-| 21 | hedge | linear vegetation 1–4m |
-| 22 | tree_row | linear tree arrangement |
-| 23 | dead_tree | tall, low NDVI (ortho) |
-| 24 | bare_soil | ground, low NDVI (ortho) |
-| 25 | rock_cliff | steep terrain, rough, no vegetation |
-| 26 | vineyard_orchard | regular low/medium vegetation pattern |
-
-## Temporal Change Detection (temporal_analysis.py)
-
-3 ALS dates enable 2022→2023→2024 comparison. Detects:
-
-### Earthworks (terrain-level DTM changes)
-- **earthwork_fill** — terrain raised: landfill, platform, levelling
-- **earthwork_cut** — terrain lowered: excavation, quarry, grading
-- **earthwork_grading** — terrain smoothed/flattened (roughness reduced)
-- **earthwork_dam** — linear raised terrain: levee, dam, embankment
-- **earthwork_trench** — linear depression: drainage ditch, utility trench
-- **earthwork_pond** — new compact depression: retention basin, pond
-
-### Roads
-- **road_new** — new road/path (terrain graded flat + elongated)
-- **road_resurfaced** — existing road with slight DTM rise + smoother surface
-- **road_widened** — road corridor expanded laterally
-
-### Vegetation
-- **tree_growth** / **tree_felling** / **new_tree** / **forest_clearcut**
-- **vegetation_growth** / **vegetation_loss**
-
-### Built environment
-- **new_building** / **demolition** / **construction**
-
-### Other
-- **surface_change** — DSM texture changed without height change
-- **unclassified_change**
-
-## Key Conventions
-
-- All geometry input in WGS84; internal processing in EPSG:3035
-- nDSM = DSM − DTM (normalised object heights above ground)
-- Height change detection threshold: 0.2m (lowered from 0.3m)
-- Max query area: 25 km²
-- Orthophoto integration is optional (`include_ortho=true`)
-- Raster output: 2 bands — type code (uint8) + height (float32)
-- Classifier calibrated against BEV cadastre ground truth (KG 63330 Kohlschwarz)
-- Water detection is ultra-strict (NDVI < -0.05 AND brightness < 50 required)
-  — smooth surfaces are usually roads/roofs, not water
+Building footprints fetched from /api/v1/export/geojson?kg=...&layers=building_footprints.
+KG codes discovered via point-in-polygon lookup on bbox corners.
+Used for calibration/validation only, NOT as direct classification input.
 
 ## Developing
 
@@ -156,15 +102,16 @@ python3 app.py                    # Flask dev server on :8000
 sudo systemctl restart srv        # gunicorn production
 journalctl -u srv -f              # logs
 
-# Test elevation
-curl -X POST http://localhost:8000/api/v1/elevation \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Point", "coordinates": [15.115, 47.137]}}'
-
-# Test change detection
-curl -X POST http://localhost:8000/api/v1/changes \
-  -H 'Content-Type: application/json' \
-  -d '{"date_a": "20220915", "date_b": "20240915", "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+# Calibrate against cadastre
+python3 -c "
+import raster_io, tile_index as ti, cadastre, landscape_classifier as lc
+from shapely.geometry import box
+data = raster_io.read_dtm_dsm(ti.geometry_to_3035(box(15.085,47.065,15.095,47.075)), '20240915')
+fps = cadastre.fetch_building_footprints((15.085,47.065,15.095,47.075))
+bldg = cadastre.rasterize_buildings(fps, data['transform'], data['shape'])
+result = lc.classify_landscape(data['dtm'], data['dsm'], data['mask'], data['transform'])
+print(cadastre.evaluate_classification(result['type_map'], bldg, building_codes={5}))
+"
 ```
 
-Dependencies: rasterio, pyproj, shapely, numpy, scipy, scikit-image, flask, geopandas, fiona, lxml.
+Dependencies: rasterio, pyproj, shapely, numpy, scipy, scikit-image, flask, openeo, requests

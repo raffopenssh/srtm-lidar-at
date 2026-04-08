@@ -141,7 +141,9 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
     <div class="lp-group">
       <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ORTHO & FOREST ▸</div>
       <div class="lp-group-body">
-        <div class="lyr"><input type="checkbox" data-lyr="ortho"><span class="lyr-label">Orthophoto</span><input type="range" data-op="ortho" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2024"><span class="lyr-label">Ortho ~2024</span><input type="range" data-op="ortho-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2023"><span class="lyr-label">Ortho ~2023</span><input type="range" data-op="ortho-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2020"><span class="lyr-label">Ortho ~2020</span><input type="range" data-op="ortho-2020" min="0" max="100" value="80"></div>
         <div class="lyr"><input type="checkbox" data-lyr="hansen"><span class="lyr-label">Hansen Forest Δ</span><input type="range" data-op="hansen" min="0" max="100" value="70"></div>
       </div>
     </div>
@@ -229,7 +231,9 @@ const LAYER_DEFS={
   'dsm-2024':{url:'/api/v1/lidar/overlay',ds:'20240915'},
   'dsm-2023':{url:'/api/v1/lidar/overlay',ds:'20230915'},
   'dsm-2022':{url:'/api/v1/lidar/overlay',ds:'20220915'},
-  'ortho':{url:'/api/v1/ortho/overlay',ds:'20240915'},
+  'ortho-2024':{url:'/api/v1/ortho/overlay',ds:'20240915',ortho_year:2024},
+  'ortho-2023':{url:'/api/v1/ortho/overlay',ds:'20230915',ortho_year:2023},
+  'ortho-2020':{url:'/api/v1/ortho/overlay',ds:'20220915',ortho_year:2020},
   'hansen':{url:'/api/v1/hansen/overlay',ds:'20240915'},
   'raster':{url:null}, // special
 };
@@ -299,7 +303,19 @@ function applyOpacity(id){
   if(id==='base'){baseLayer.setOpacity(layerOpacity('base'));return;}
   if(id==='segments'){
     const op=layerOpacity('segments');
-    resultLayer.eachLayer(l=>{if(l.setOpacity)l.setOpacity(op);else if(l._icon)l._icon.style.opacity=op;});
+    const vis=op>0;
+    // Toggle entire result layer container for reliable show/hide
+    const container=resultLayer.getPane?resultLayer.getPane():null;
+    resultLayer.eachLayer(function walk(l){
+      if(l._icon)l._icon.style.display=vis?'':'none';
+      if(l._shadow)l._shadow.style.display=vis?'':'none';
+      if(l.eachLayer)l.eachLayer(walk);
+    });
+    // Also set opacity on visible markers
+    if(vis)resultLayer.eachLayer(function walkOp(l){
+      if(l._icon)l._icon.style.opacity=op;
+      if(l.eachLayer)l.eachLayer(walkOp);
+    });
     return;
   }
   const ovl=overlays[id];
@@ -308,7 +324,7 @@ function applyOpacity(id){
 function orderLayers(){
   // bottom-to-top: base, ortho, dtms, dsms, hansen, raster, segments
   baseLayer.bringToBack();
-  ['ortho','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
+  ['ortho-2020','ortho-2023','ortho-2024','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
     if(overlays[id])overlays[id].bringToFront();
   });
 }
@@ -342,7 +358,8 @@ async function handleLayerToggle(id){
     if(id==='raster')ovl=await loadRasterOverlay(null);
     else{
       const def=LAYER_DEFS[id];
-      const url=def.url+'?dataset='+def.ds;
+      let url=def.url+'?dataset='+def.ds;
+      if(def.ortho_year)url+='&ortho_year='+def.ortho_year;
       const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
       if(!resp.ok)throw new Error((await resp.json()).error);
       const bs=resp.headers.get('X-Bounds');
@@ -382,7 +399,7 @@ async function reloadRasterOverlay(){
   try{
     const ovl=await loadRasterOverlay(filter);
     if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
-  }catch(e){/* ignore */}
+  }catch(e){console.error('reloadRasterOverlay failed:',e);}
   hideLoading();
 }
 

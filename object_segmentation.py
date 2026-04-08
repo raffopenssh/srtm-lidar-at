@@ -185,6 +185,10 @@ class SegmentedObject:
     height_change: float = 0.0  # nDSM change across dates
     dtm_change: float = 0.0    # terrain change (machinery)
     temporal_stability: float = 1.0  # 0=volatile, 1=stable
+    # Shape / boundary
+    solidity: float = 0.0  # area / convex_hull_area
+    extent: float = 0.0    # area / bbox_area
+    dsm_edge_strength: float = 0.0  # mean DSM gradient at segment boundary
     # Classification
     confidence: float = 0.5
     is_manmade: bool = False
@@ -422,6 +426,11 @@ def extract_object_features(
     dsm_rough = _local_std(dsm, 3)
     dtm_rough = _local_std(dtm, 3)
 
+    # DSM edge magnitude (Sobel gradient) — precompute once for boundary sharpness
+    dsm_grad_x = ndimage.sobel(dsm, axis=1)
+    dsm_grad_y = ndimage.sobel(dsm, axis=0)
+    dsm_edge_mag = np.sqrt(dsm_grad_x**2 + dsm_grad_y**2)
+
     # --- Pre-compute temporal data ---
     temporal_ndsm_std = None
     temporal_ndsm_change = None
@@ -522,6 +531,17 @@ def extract_object_features(
             bb = reg.bbox
             rs, cs = bb[2] - bb[0], bb[3] - bb[1]
             f["elongation"] = max(rs, cs) / max(min(rs, cs), 1)
+
+        # Solidity and extent (rectangularity indicators)
+        f["solidity"] = float(reg.solidity) if hasattr(reg, 'solidity') else 0.0
+        f["extent"] = float(reg.extent) if hasattr(reg, 'extent') else 0.0
+
+        # DSM edge strength: sharp elevation drops at segment boundary
+        boundary = ndimage.binary_dilation(seg, iterations=1) & ~seg & mask
+        if boundary.sum() > 0:
+            f["dsm_edge_strength"] = float(np.nanmean(dsm_edge_mag[boundary]))
+        else:
+            f["dsm_edge_strength"] = 0.0
 
         # Centroid in map coords
         cr, cc = reg.centroid
@@ -731,6 +751,9 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     dtm_change_abs = feat.get("dtm_change_abs", 0)
     stability = feat.get("stability", 1)
     temporal_h_std = feat.get("temporal_h_std", 0)
+    solidity = feat.get("solidity", 0)
+    extent = feat.get("extent", 0)
+    dsm_edge = feat.get("dsm_edge_strength", 0)
 
     # --- NDVI selection hierarchy ---
     #   1. Fused (BEV 1m spatial + Copernicus seasonal correction) — best
@@ -902,6 +925,42 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         # Temporal stability
         if stability > 0.8:
             bld_score += 1.0
+
+        # Rectangularity: buildings are boxy with straight edges
+        # Solidity (area/convex_area): buildings ≈0.85-0.99, trees ≈0.5-0.8
+        if solidity > 0.90:
+            bld_score += 2.0
+        elif solidity > 0.80:
+            bld_score += 1.0
+        elif solidity < 0.60:
+            bld_score -= 1.0  # very irregular = tree canopy
+
+        # Extent (area/bbox_area): rectangular buildings fill their bbox
+        if extent > 0.70:
+            bld_score += 2.0
+        elif extent > 0.55:
+            bld_score += 1.0
+        elif extent < 0.35:
+            bld_score -= 1.0  # scattered shape = tree
+
+        # DSM edge sharpness: roofs have crisp boundaries (>2.0 m/px gradient)
+        if dsm_edge > 3.0:
+            bld_score += 2.0
+        elif dsm_edge > 2.0:
+            bld_score += 1.0
+        elif dsm_edge > 1.0:
+            bld_score += 0.5
+
+        # Combined geometric signal: rectangular + smooth + stable = very likely building
+        if solidity > 0.85 and extent > 0.60 and stability > 0.7 and dsm_rough < 1.0:
+            bld_score += 2.0
+
+        # Temporal stability is the strongest building indicator
+        # Buildings don't change between dates; strengthen the existing stability signal
+        if stability > 0.9:
+            bld_score += 1.5  # very stable = strong building signal (adds to existing +1.0)
+        elif stability < 0.4 and h_mean > 3:
+            bld_score -= 1.5  # unstable + tall = swaying tree canopy
 
         # ESA built-up prior
         if esa_built > 0.3:
@@ -1405,6 +1464,9 @@ def segment_and_classify(
             height_change=round(feat.get("h_change", 0), 3),
             dtm_change=round(feat.get("dtm_change", 0), 3),
             temporal_stability=round(feat.get("stability", 1), 3),
+            solidity=round(feat.get("solidity", 0), 3),
+            extent=round(feat.get("extent", 0), 3),
+            dsm_edge_strength=round(feat.get("dsm_edge_strength", 0), 3),
             confidence=round(conf, 3),
             is_manmade=is_mm,
             features=feat,

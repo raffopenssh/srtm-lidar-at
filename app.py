@@ -84,7 +84,10 @@ def _get_params():
                 'min_height', 'max_height', 'min_area', 'min_change',
                 'object_types', 'resolution', 'format',
                 'include_ortho', 'include_temporal',
-                'include_copernicus', 'include_cadastre'):
+                'include_copernicus', 'include_cadastre',
+                'include_hansen', 'color_mode', 'types',
+                'ortho_year', 'min_object_size',
+                'felz_scale', 'rag_threshold', 'groups'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -414,6 +417,8 @@ def objects_summary():
                 "height_max_m": obj.height_max, "height_mean_m": obj.height_mean,
                 "height_p90_m": obj.height_p90, "area_sqm": obj.area_sqm,
                 "compactness": obj.compactness, "elongation": obj.elongation,
+                "solidity": obj.solidity, "extent": obj.extent,
+                "dsm_edge_strength": obj.dsm_edge_strength,
                 "height_class": obj.height_class,
                 "is_manmade": obj.is_manmade,
                 "confidence": obj.confidence,
@@ -595,6 +600,9 @@ def segment_objects():
                 "area_sqm": obj.area_sqm,
                 "compactness": obj.compactness,
                 "elongation": obj.elongation,
+                "solidity": obj.solidity,
+                "extent": obj.extent,
+                "dsm_edge_strength": obj.dsm_edge_strength,
                 "slope_mean": obj.slope_mean,
                 "roughness": obj.roughness,
                 "is_manmade": obj.is_manmade,
@@ -1546,8 +1554,11 @@ def ortho_overlay():
         dataset = params.get('dataset', '20240915')
         geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
 
+        ortho_year = params.get('ortho_year')
+        if ortho_year:
+            ortho_year = int(ortho_year)
         data = raster_io.read_dtm_dsm(geom_3035, dataset)
-        rgb, nir = ortho_io.read_ortho_for_als(data)
+        rgb, nir = ortho_io.read_ortho_for_als(data, year=ortho_year)
 
         # Reproject RGB to WGS84
         rgb_wgs, mask_wgs, bounds_wgs = _reproject_rgb_to_wgs84(

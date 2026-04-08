@@ -158,7 +158,7 @@ RGBI_OPERATES: dict[str, dict] = {
 
 def find_rgbi_operates(
     lat_min: float, lon_min: float, lat_max: float, lon_max: float,
-    *, newest_first: bool = True,
+    *, newest_first: bool = True, year: int | None = None,
 ) -> list[str]:
     """Return operate IDs whose WGS84 bbox overlaps the query bbox.
 
@@ -169,6 +169,8 @@ def find_rgbi_operates(
         bb = info["bbox_wgs84"]  # [lat_min, lon_min, lat_max, lon_max]
         if bb[0] <= lat_max and bb[2] >= lat_min and bb[1] <= lon_max and bb[3] >= lon_min:
             hits.append(opid)
+    if year is not None:
+        hits = [o for o in hits if o.startswith(str(year))]
     if newest_first:
         hits.sort(key=lambda o: int(o[:4]), reverse=True)
     return hits
@@ -760,6 +762,7 @@ def _try_read_rgbi_for_bbox(
     min_e: float, min_n: float, max_e: float, max_n: float,
     resolution: float, h: int, w: int,
     dst_transform=None,
+    year: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Try to read RGB + NIR from an RGBI operate covering the EPSG:3035 bbox.
 
@@ -776,7 +779,7 @@ def _try_read_rgbi_for_bbox(
     lon_min, lat_min = tf_to_wgs.transform(min_e, min_n)
     lon_max, lat_max = tf_to_wgs.transform(max_e, max_n)
 
-    operates = find_rgbi_operates(lat_min, lon_min, lat_max, lon_max)
+    operates = find_rgbi_operates(lat_min, lon_min, lat_max, lon_max, year=year)
     if not operates:
         return None, None
 
@@ -875,6 +878,7 @@ def _try_read_rgbi_for_bbox(
 def read_ortho_for_als(
     als_result: dict,
     dataset: str = DEFAULT_ORTHO_DATASET,
+    year: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Read orthophoto aligned to an ALS raster result.
 
@@ -907,7 +911,7 @@ def read_ortho_for_als(
 
     # 1. Try RGBI operates (RGB + NIR)
     rgb, nir = _try_read_rgbi_for_bbox(min_e, min_n, max_e, max_n, res, h, w,
-                                        dst_transform=tf)
+                                        dst_transform=tf, year=year)
     if rgb is not None:
         return rgb, nir
 

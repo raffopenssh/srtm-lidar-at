@@ -785,6 +785,12 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     # Exclude objects that look like growing vegetation.
     is_veg_like = best_ndvi > 0.35 and dsm_rough > 0.8
 
+    # NDVI veto: high NDVI means the surface is currently vegetated.
+    # Real earthworks (excavation, fill, construction) destroy vegetation,
+    # so NDVI > 0.5 at 1m resolution rules out active earthworks.
+    # Former clearings that have regrown are no longer "disturbance".
+    is_green = have_ndvi and best_ndvi > 0.5
+
     # Size gates: earthworks are spatially large; individual tree death
     # can be a single crown (~15-30m² at 1m).  Tiny slivers (<8m²) at
     # layer boundaries are always noise.
@@ -792,17 +798,17 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     big_enough_tree_loss = area >= 8   # single tree crown
 
     # --- DTM change: terrain was physically moved (excavation/fill) ---
-    # DTM noise is ±0.05-0.15m on elevated objects (tree crowns cause
-    # interpolation shifts).  Only trust DTM change on GROUND or where
-    # the signal is strong enough to exceed noise.
+    # DTM noise under forest is ±0.15-0.30m (tree removal changes
+    # ground-return interpolation).  Only trust DTM change where the
+    # signal clearly exceeds forest DTM noise AND surface is bare.
     on_ground = h_mean < 2.0
-    dtm_signal_strong = dtm_change_abs > 0.5  # unambiguous earthwork
-    dtm_signal_mod = dtm_change_abs > 0.20    # moderate, needs corroboration
+    dtm_signal_strong = dtm_change_abs > 0.8  # unambiguous earthwork
+    dtm_signal_mod = dtm_change_abs > 0.4     # moderate, needs corroboration
 
-    if big_enough_earthwork and (dtm_signal_strong or (dtm_signal_mod and on_ground)):
-        if dtm_change < -0.20:
+    if big_enough_earthwork and not is_green and (dtm_signal_strong or (dtm_signal_mod and on_ground)):
+        if dtm_change < -0.4:
             return "excavation", OBJECT_TYPES["excavation"], min(0.4 + dtm_change_abs, 0.95), True
-        if dtm_change > 0.20:
+        if dtm_change > 0.4:
             return "fill", OBJECT_TYPES["fill"], min(0.4 + dtm_change_abs, 0.95), True
 
     # --- nDSM change: something was built, removed, or felled ---
@@ -810,27 +816,24 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
 
         # Height DROPPED → clear_cut / tree death / site clearing
         if h_change < -2.0 and h_mean < 2.0:
-            if big_enough_earthwork and dtm_change_abs > 0.15:
-                # Trees removed AND terrain reshaped → site clearing
-                # (preparatory earthworks for construction)
+            if big_enough_earthwork and not is_green and dtm_change_abs > 0.4:
+                # Trees removed AND terrain significantly reshaped → site clearing
                 return "construction", OBJECT_TYPES["construction"], 0.8, True
             elif big_enough_tree_loss:
                 # Trees removed, terrain intact → logging / tree death
-                # Single trees (8-50m²) are individual felling/death;
-                # larger patches (>50m²) are timber harvest / clear-cut.
                 conf = 0.7 if area < 50 else 0.85
                 return "clear_cut", OBJECT_TYPES["clear_cut"], conf, True
 
         # Height GREW and doesn't look like vegetation → new structure
-        if h_change > 2.0 and not is_veg_like and big_enough_earthwork:
+        if h_change > 2.0 and not is_veg_like and not is_green and big_enough_earthwork:
             return "construction", OBJECT_TYPES["construction"], min(0.5 + abs(h_change) / 10, 0.9), True
 
     # Combined: moderate DTM + nDSM change on non-vegetation
-    if big_enough_earthwork and dtm_change_abs > 0.15 and abs(h_change) > 1.0 and not is_veg_like and on_ground:
+    if big_enough_earthwork and not is_green and dtm_change_abs > 0.4 and abs(h_change) > 1.0 and not is_veg_like and on_ground:
         return "construction", OBJECT_TYPES["construction"], 0.65, True
 
-    # High instability on ground with real DTM shift
-    if big_enough_earthwork and stability < 0.3 and temporal_h_std > 1.5 and dtm_change_abs > 0.15 and on_ground:
+    # High instability on ground with real DTM shift — not on vegetated areas
+    if big_enough_earthwork and not is_green and stability < 0.3 and temporal_h_std > 1.5 and dtm_change_abs > 0.4 and on_ground:
         if dtm_change < 0:
             return "excavation", OBJECT_TYPES["excavation"], 0.5, True
         return "fill", OBJECT_TYPES["fill"], 0.5, True
@@ -900,6 +903,8 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
                 bld_score += 2.0
             elif best_ndvi < 0.2:
                 bld_score += 1.0
+            elif best_ndvi > 0.55:
+                bld_score -= 6.0  # unambiguous vegetation at 1m
             elif best_ndvi > 0.45:
                 bld_score -= 4.0  # certainly vegetation
             elif best_ndvi > 0.35:
@@ -922,45 +927,32 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         if has_spectral and brightness > 100 and ndvi < 0.1:
             bld_score += 1.5
 
-        # Temporal stability
-        if stability > 0.8:
-            bld_score += 1.0
+        # Temporal stability is the strongest building indicator:
+        # buildings don't move between LIDAR dates; tree canopies sway
+        # and grow.  When temporal data is available (stability != 1.0
+        # default), lean heavily on it.
+        has_temporal = stability != 1.0  # 1.0 = no temporal data loaded
+        if has_temporal:
+            if stability > 0.9:
+                bld_score += 3.0  # rock solid = strong building signal
+            elif stability > 0.7:
+                bld_score += 1.5
+            elif stability < 0.4:
+                bld_score -= 2.0  # volatile = tree canopy
+            elif stability < 0.6:
+                bld_score -= 1.0
+        else:
+            # No temporal data — mild bonus for stability placeholder
+            if stability > 0.8:
+                bld_score += 1.0
 
-        # Rectangularity: buildings are boxy with straight edges
-        # Solidity (area/convex_area): buildings ≈0.85-0.99, trees ≈0.5-0.8
-        if solidity > 0.90:
-            bld_score += 2.0
-        elif solidity > 0.80:
-            bld_score += 1.0
-        elif solidity < 0.60:
-            bld_score -= 1.0  # very irregular = tree canopy
-
-        # Extent (area/bbox_area): rectangular buildings fill their bbox
-        if extent > 0.70:
-            bld_score += 2.0
-        elif extent > 0.55:
-            bld_score += 1.0
-        elif extent < 0.35:
-            bld_score -= 1.0  # scattered shape = tree
-
-        # DSM edge sharpness: roofs have crisp boundaries (>2.0 m/px gradient)
-        if dsm_edge > 3.0:
-            bld_score += 2.0
-        elif dsm_edge > 2.0:
-            bld_score += 1.0
-        elif dsm_edge > 1.0:
-            bld_score += 0.5
-
-        # Combined geometric signal: rectangular + smooth + stable = very likely building
-        if solidity > 0.85 and extent > 0.60 and stability > 0.7 and dsm_rough < 1.0:
-            bld_score += 2.0
-
-        # Temporal stability is the strongest building indicator
-        # Buildings don't change between dates; strengthen the existing stability signal
-        if stability > 0.9:
-            bld_score += 1.5  # very stable = strong building signal (adds to existing +1.0)
-        elif stability < 0.4 and h_mean > 3:
-            bld_score -= 1.5  # unstable + tall = swaying tree canopy
+        # Rectangularity: only use as mild tiebreaker, not primary signal.
+        # In practice solidity/extent overlap too much between compact tree
+        # crowns and small buildings to carry heavy weight.
+        if solidity > 0.90 and extent > 0.65:
+            bld_score += 1.0  # very boxy = mild building hint
+        elif solidity < 0.55 and extent < 0.35:
+            bld_score -= 0.5  # very irregular = mild tree hint
 
         # ESA built-up prior
         if esa_built > 0.3:

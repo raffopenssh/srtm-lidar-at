@@ -661,7 +661,7 @@ def segment_objects():
 
 # Cache for last segmentation result so legend filter re-renders are instant
 _seg_cache = {"labels": None, "objects": None, "mask": None,
-              "transform": None, "shape": None, "key": None}
+              "transform": None, "shape": None, "ndsm": None, "key": None}
 
 # Segment type → RGBA colour (matches frontend TYPE_SHAPES)
 SEGMENT_COLORS = {
@@ -720,7 +720,7 @@ def _diverging_rgb(t):
         return (int(255 - f * 37), int(255 - f * 192), int(255 - f * 192))
 
 
-def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type'):
+def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', ndsm=None):
     """Render segmentation labels as RGBA image.
 
     color_mode: 'type' = categorical colors, 'height' = viridis by height
@@ -728,31 +728,43 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type'):
     h, w = labels.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     obj_map = {o.obj_id: o for o in objects}
-    for obj_id, obj in obj_map.items():
-        if type_filter and obj.obj_type not in type_filter:
-            continue
-        seg_mask = labels == obj_id
-        if color_mode == 'height':
-            t = min(obj.height_mean / 35.0, 1.0)
-            r, g, b = _viridis_rgb(t)
-            alpha = 180 if obj.height_mean > 0.3 else 60
-            color = (r, g, b, alpha)
-        else:
+
+    if color_mode == 'height' and ndsm is not None:
+        # Per-pixel viridis coloring from actual nDSM values
+        included = np.zeros((h, w), dtype=bool)
+        for obj_id, obj in obj_map.items():
+            if type_filter and obj.obj_type not in type_filter:
+                continue
+            included |= (labels == obj_id)
+        # Build viridis LUT (256 entries)
+        lut = np.zeros((256, 3), dtype=np.uint8)
+        for i in range(256):
+            lut[i] = _viridis_rgb(i / 255.0)
+        idx = np.clip((np.clip(ndsm / 35.0, 0, 1) * 255).astype(np.uint8), 0, 255)
+        for c in range(3):
+            rgba[:, :, c] = lut[idx, c]
+        rgba[:, :, 3] = np.where(included & mask, np.where(ndsm > 0.3, 180, 60).astype(np.uint8), 0)
+    else:
+        for obj_id, obj in obj_map.items():
+            if type_filter and obj.obj_type not in type_filter:
+                continue
+            seg_mask = labels == obj_id
             color = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
-        for c in range(4):
-            rgba[:, :, c][seg_mask] = color[c]
+            for c in range(4):
+                rgba[:, :, c][seg_mask] = color[c]
+
     # Transparent where no data
     rgba[:, :, 3][~mask] = 0
     return rgba
 
 
-def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None, color_mode='type'):
+def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None, color_mode='type', ndsm=None):
     """Render segmentation as RGBA, reproject to WGS84, return overlay response."""
     from rasterio.warp import calculate_default_transform, reproject as rp, Resampling
     from rasterio.crs import CRS
     from rasterio.transform import array_bounds
 
-    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter, color_mode=color_mode)
+    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter, color_mode=color_mode, ndsm=ndsm)
 
     src_crs = CRS.from_epsg(3035)
     dst_crs = CRS.from_epsg(4326)
@@ -807,7 +819,7 @@ def segment_overlay():
         _validate_area(geom_3035)
 
         # Build a cache key from geometry bounds + dataset + analysis options
-        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}"
+        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
 
         if _seg_cache["key"] == cache_key:
             # Re-render from cache — instant
@@ -816,10 +828,33 @@ def segment_overlay():
                 _seg_cache["labels"], _seg_cache["objects"],
                 _seg_cache["mask"], _seg_cache["transform"],
                 _seg_cache["shape"], type_filter, color_mode,
+                ndsm=_seg_cache.get("ndsm"),
             )
 
         # Full segmentation pipeline
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        # Always load temporal data for stability-based building detection
+        dtm_dates, dsm_dates = None, None
+        try:
+            multi = raster_io.read_multi_date_ndsm(geom_3035)
+            data = {
+                'dtm': multi['dtm'], 'dsm': multi['dsm'],
+                'ndsm': multi['ndsm'], 'mask': multi['mask'],
+                'transform': multi['transform'], 'crs': multi['crs'],
+                'shape': multi['shape'],
+            }
+            dtm_dates, dsm_dates = {}, {}
+            for d in multi['dates_loaded']:
+                try:
+                    dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
+                    mh = min(dd['shape'][0], data['shape'][0])
+                    mw = min(dd['shape'][1], data['shape'][1])
+                    dtm_dates[d] = dd['dtm'][:mh, :mw]
+                    dsm_dates[d] = dd['dsm'][:mh, :mw]
+                except Exception as e:
+                    log.warning("overlay: date %s load failed: %s", d, e)
+        except Exception as e:
+            log.warning("overlay: multi-temporal failed, single date: %s", e)
+            data = raster_io.read_dtm_dsm(geom_3035, dataset)
 
         rgb, spectral = (None, None)
         if include_ortho:
@@ -835,6 +870,8 @@ def segment_overlay():
 
         result = seg.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
+            dtm_dates=dtm_dates,
+            dsm_dates=dsm_dates,
             spectral=spectral,
             copernicus=copernicus_data,
             building_footprints=building_footprints,
@@ -858,12 +895,13 @@ def segment_overlay():
         _seg_cache.update({
             "labels": labels, "objects": objects,
             "mask": data['mask'], "transform": data['transform'],
-            "shape": data['shape'], "key": cache_key,
+            "shape": data['shape'], "ndsm": data['ndsm'], "key": cache_key,
         })
         log.info("segment overlay: full pipeline %.1fs, cached for re-renders", time.time() - t0)
 
         return _render_seg_overlay(labels, objects, data['mask'],
-                                   data['transform'], data['shape'], type_filter, color_mode)
+                                   data['transform'], data['shape'], type_filter, color_mode,
+                                   ndsm=data['ndsm'])
     except Exception as e:
         log.error("segment overlay: %s", traceback.format_exc())
         return _error(str(e))
@@ -969,13 +1007,13 @@ def export_geopackage():
                     filtered_ids = {o.obj_id for o in objects}
 
                 type_raster = np.zeros((h, w), dtype=np.float32)
-                height_raster = np.zeros((h, w), dtype=np.float32)
                 obj_map = {o.obj_id: o for o in objects}
                 for oid in filtered_ids:
                     if oid in obj_map:
                         seg_mask = labels == oid
                         type_raster[seg_mask] = float(obj_map[oid].type_code)
-                        height_raster[seg_mask] = obj_map[oid].height_mean
+                # Per-pixel nDSM height (not per-segment mean)
+                height_raster = np.where(ndsm > 0, ndsm, 0).astype(np.float32)
 
                 bands.append('segment_type')
                 arrays.append(type_raster)

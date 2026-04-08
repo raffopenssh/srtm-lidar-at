@@ -29,8 +29,9 @@ object_segmentation.py   NEW: Watershed-based segmentation + classification
                           Hierarchical: tree→forest, roof→building, road→road_network
                           Cadastre-calibrated building detection (F1=0.74)
                           Endpoint: POST /api/v1/segment
-landscape_classifier.py  10-type pixel-level classifier (Hessian, roughness, DTM time series)
-                          Endpoint: POST /api/v1/objects
+landscape_classifier.py  DEPRECATED: 10-type pixel-level classifier
+                          Superseded by object_segmentation.py
+                          Endpoint: POST /api/v1/objects (legacy)
 copernicus.py            Sentinel-2 NDVI, ESA WorldCover, SAR via openEO
 cadastre.py              Building footprint fetcher + ground truth evaluator
 tile_index.py            55-tile grid index, CRS transforms

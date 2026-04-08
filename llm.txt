@@ -1,4 +1,4 @@
-# Austrian Landscape Transformation Analysis API — v3.0
+# Austrian Landscape Transformation Analysis API — v4.0
 # Base URL: https://srtm-lidar-at.exe.xyz:8000
 # All geometry input in WGS84 (lon/lat). Processing in EPSG:3035.
 # Max query area: 25 km².
@@ -6,8 +6,9 @@
 ## Philosophy
 
 This API answers: "How has man shaped this landscape?"
-Instead of 27 fragile object types, we classify 10 landscape types focused
-on distinguishing man-made from natural, and detecting terrain modification.
+Watershed-based segmentation classifies 25 individual object types and
+11 hierarchical group types, focused on distinguishing man-made from
+natural and detecting terrain modification.
 
 ## Data Sources (6 layers)
 
@@ -18,59 +19,128 @@ on distinguishing man-made from natural, and detecting terrain modification.
 5. Copernicus Sentinel-1 SAR: VV+VH backscatter
 6. Austrian Cadastre: mm-precision building footprint polygons (ground truth)
 
-## 10 Landscape Types
+## NDVI Fusion
 
-| Code | Type | Description |
+BEV ortho provides 1m spatial detail but has seasonal bias (arbitrary
+capture date — could be winter).  Copernicus provides reliable
+growing-season median (Apr-Sep) but at coarse 10m resolution that bleeds
+across boundaries.  The API fuses both:
+
+  1. Block-average BEV and Copernicus NDVI at ~30m windows
+  2. Compute seasonal offset = Copernicus_block − BEV_block
+  3. Smooth offset field (σ=15m) to avoid 10m staircase artefacts
+  4. fused = BEV + smoothed_offset (clamped to [-1, 1])
+
+Result: 1m spatial precision with growing-season absolute levels.
+Fallback: BEV alone → Copernicus alone → no NDVI.
+
+## 25 Object Types (individual, /api/v1/segment)
+
+| Code | Type | How detected |
 |------|------|-------------|
-| 1 | engineered_surface | Roads, parking, paved — flat, smooth at 1m scale |
-| 2 | engineered_slope | Embankments, cuttings, retaining walls — linear terrain features |
-| 3 | excavation | Quarries, pits, construction sites — terrain removed |
-| 4 | fill | Landfill, raised platforms, levees — terrain added |
-| 5 | building | Structures: height + stability + spectral evidence |
-| 6 | infrastructure | Bridges, masts, fences, walls, other man-made elevated |
-| 7 | tree_canopy | All trees (no conifer/broadleaf split needed) |
-| 8 | vegetation | Low veg, shrubs, meadows, crops |
-| 9 | bare_natural | Rock, cliff, bare soil, natural water |
-| 10 | recent_disturbance | Terrain modified between LIDAR dates (machinery traces) |
+| 1 | tree | nDSM>4m, rough DSM, high NDVI |
+| 2 | shrub | nDSM 0.5-4m, high NDVI |
+| 3 | grass | Ground, moderate+ NDVI, smooth DTM |
+| 4 | hedge | Elongated shrub (length/width>4) |
+| 5 | water | ESA water class, very low NDVI+NIR, flat |
+| 10 | roof | Compact elevated, smooth DSM, low NDVI |
+| 11 | greenhouse | Roof-like but high NIR transmittance |
+| 12 | solar_panel | Very smooth, bright, low NDVI on roof |
+| 15 | fence | Low (0.5-2m), thin, elongated |
+| 16 | wall | Narrow elevated, adjacent to roof |
+| 17 | mast | Tiny footprint (<10m²), very tall (>15m) |
+| 20 | road | Smooth DTM (<0.04m roughness), elongated, low NDVI |
+| 21 | path | Narrower road (<3m effective width) |
+| 22 | parking | Smooth, large, compact, low NDVI |
+| 23 | bridge | Elevated road/path over gap |
+| 30 | crop | Flat, seasonal NDVI, ESA cropland |
+| 31 | orchard | Regular tree spacing, <10m height |
+| 32 | vineyard | Low rows, <3m, row pattern |
+| 33 | garden | Mixed veg near buildings |
+| 40 | bare_soil | Low NDVI, flat-moderate slope |
+| 41 | rock | Steep + very rough DTM + low NDVI |
+| 50 | excavation | DTM lowered >0.20m between dates, ground-level (≥25m²) |
+| 51 | fill | DTM raised >0.20m between dates, ground-level (≥25m²) |
+| 52 | clear_cut | Trees felled/died: nDSM dropped >2m, terrain intact (≥8m²) |
+| 53 | construction | New structure, OR site clearing (clear_cut + earthworks) |
+
+## 11 Group Types (hierarchical merge of adjacent objects)
+
+| Code | Group | Members merged |
+|------|-------|---------------|
+| 101 | forest | tree + shrub + hedge |
+| 102 | woodland | shrub + hedge (sparse) |
+| 103 | hedgerow | hedge + hedge |
+| 106 | waterbody | water + water |
+| 110 | building | roof + wall + solar_panel + greenhouse |
+| 115 | road_network | road + path + parking |
+| 120 | cropland | crop + grass |
+| 121 | pasture | grass + garden |
+| 122 | orchard_grove | orchard + vineyard |
+| 130 | quarry | excavation + fill |
+| 131 | construction_site | construction + excavation + fill |
 
 ## Key Detection Methods
 
-- **Linear features**: Hessian eigenvalue analysis on DTM detects ridges (embankments)
-  and valleys (ditches) — identifies engineered vs natural terrain form
-- **Engineered surfaces**: Multi-scale roughness ratio (3m/15m window) detects
-  unnaturally smooth terrain (roads, parking)
-- **Machinery traces**: DTM time series differencing with spatial coherence filtering
-  detects where excavators/bulldozers reshaped terrain
-- **Buildings**: Multi-criteria score (DSM roughness + height uniformity + terrain
-  slope + NDVI + temporal stability). Calibrated against BEV cadastre footprints.
-- **Building F1=0.70** with ortho (P=0.56, R=0.92). Temporal + Copernicus improve further.
+- **Segmentation**: Sobel fused gradient (DTM+DSM+nDSM+RGBI+NDVI weighted)
+  → Felzenszwalb over-segmentation → RAG boundary merge.
+  Two-layer: ground (<0.3m) and elevated (≥0.3m) segmented separately.
+
+- **NDVI fusion**: BEV 1m spatial + Copernicus growing-season seasonal
+  correction.  Eliminates winter bias while preserving road/grass boundaries.
+
+- **Engineered surfaces**: DTM roughness <0.04m at 3m scale + slope <15°.
+  Roads identified even when coarse NDVI shows vegetation bleed.
+
+- **Buildings**: Multi-criteria score (DSM roughness + height uniformity +
+  slope + NDVI + brightness + temporal stability + ESA built-up prior).
+  Calibrated against BEV cadastre footprints.
+
+- **Disturbance**: Three-tier detection with size gates:
+  - Excavation/fill: DTM change >0.20m, ground-level only (≥25m²).
+    Elevated objects filtered (DTM noise from tree crown interpolation).
+  - Clear_cut: nDSM dropped >2m, terrain intact. Captures individual
+    tree death/felling (≥8m²) and larger timber harvest patches.
+  - Construction: nDSM grew >2m (non-vegetation), OR clear_cut combined
+    with earthworks (DTM change >0.15m = site clearing for development).
+  - Vegetation filter: growing trees (high NDVI + rough DSM) excluded
+    from construction false positives.
+
+- **Temporal analysis**: 3-date LIDAR (2022/2023/2024) detects terrain
+  modification, building construction, tree growth/felling.
 
 ## Endpoints
 
-### POST /api/v1/objects
-Landscape classification. 10 types from LIDAR + optional enrichment.
+### POST /api/v1/segment  ← PRIMARY
+Watershed-based segmentation and classification. 25 types + 11 groups.
 Body: GeoJSON geometry
 Params:
   dataset           — ALS date (default 20240915)
-  min_height        — min object height in metres (default 0.2)
-  min_area          — min object area in m² (default 2)
-  include_ortho     — "true" to use BEV RGBI orthophoto (adds NDVI, improves buildings)
-  include_temporal  — "true" to use 3-date LIDAR (2022/2023/2024).
-                      Detects machinery traces, building stability, tree growth.
-                      Costs ~3x loading time but dramatically improves accuracy.
-  include_copernicus — "true" to use Sentinel-2 NDVI + ESA land cover (10m, via openEO).
-                       Provides reliable growing-season NDVI (eliminates seasonal bias).
-  include_cadastre  — "true" to use cadastre building footprints for calibration.
-  object_types      — comma-separated type filter
-Returns: summary + FeatureCollection of objects with:
-  type, type_code, is_manmade, confidence, linear_feature, machinery_trace,
-  height_max_m, area_sqm, temporal_signal, ndvi_mean
+  min_object_size   — min segment size in pixels/m² (default 30)
+  felz_scale        — Felzenszwalb scale, higher = fewer segments (default 150)
+  rag_threshold     — RAG merge threshold (default 0.12)
+  include_ortho     — "true" for BEV RGBI 1m (NDVI, NIR, brightness)
+  include_temporal  — "true" for 3-date LIDAR (2022/2023/2024)
+  include_copernicus — "true" for Sentinel-2 NDVI + ESA land cover
+  include_cadastre  — "true" for cadastre building footprints
+  types             — comma-separated type filter (e.g. "roof,tree,road")
+  groups            — comma-separated group filter (e.g. "building,forest")
+Returns: FeatureCollection of objects with:
+  type, type_code, group_id, group_type, is_manmade, confidence,
+  height_max_m, height_mean_m, height_p90_m, area_sqm,
+  compactness, elongation, slope_mean, roughness,
+  ndvi_mean (BEV 1m), ndvi_fused (seasonal-corrected), nir_mean,
+  brightness_mean, height_change, dtm_change, temporal_stability
 
-Each object includes:
-- is_manmade (bool): the key question answered
-- confidence (0-1): how certain the classification is
-- linear_feature (bool): detected as linear man-made feature
-- machinery_trace (bool): terrain shows machinery modification
+### POST /api/v1/objects  ⚠️ DEPRECATED — use /api/v1/segment
+Legacy 10-type pixel-level landscape classifier.
+Still functional but superseded by watershed segmentation.
+Params: dataset, min_height, min_area, include_ortho, include_temporal,
+  include_copernicus, include_cadastre, object_types
+Returns: summary + FeatureCollection with 10 landscape types:
+  1=engineered_surface, 2=engineered_slope, 3=excavation, 4=fill,
+  5=building, 6=infrastructure, 7=tree_canopy, 8=vegetation,
+  9=bare_natural, 10=recent_disturbance
 
 ### POST /api/v1/elevation
 Enrich features with DSM/DTM elevation values.
@@ -107,17 +177,17 @@ All POST endpoints accept:
 - Coordinate string: "lon,lat" or "lon,lat;lon,lat;..."
 - File upload (multipart)
 
-Point inputs are automatically buffered (100m for objects, 200m for changes).
+Point inputs are automatically buffered (100m for objects/segment, 200m for changes).
 
 ## Examples
 
-# Basic classification (LIDAR only)
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/objects \
+# Watershed segmentation with all data sources
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?include_ortho=true&include_temporal=true&include_copernicus=true' \
   -H 'Content-Type: application/json' \
   -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
 
-# Full analysis with all data sources
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/objects?include_ortho=true&include_temporal=true' \
+# Filter to buildings only
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?include_ortho=true&types=roof,wall,greenhouse' \
   -H 'Content-Type: application/json' \
   -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
 

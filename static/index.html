@@ -59,7 +59,8 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     <select id="endpoint">
       <option value="elevation">Elevation Enrichment</option>
       <option value="terrain">Terrain Characterisation</option>
-      <option value="objects" selected>Object Detection</option>
+      <option value="segment" selected>Segment &amp; Classify</option>
+      <option value="objects">Object Detection (legacy)</option>
       <option value="objects/raster">Object Raster (download)</option>
     </select>
     <div class="row">
@@ -68,7 +69,7 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     </div>
     <div class="row">
       <div><label>Resolution (m)</label><input id="resolution" type="number" value="0.2" step="0.1" min="0.2"></div>
-      <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: building,tree_canopy,excavation)"></div>
+      <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: roof,tree,road,excavation)"></div>
     </div>
     <div class="cb-row">
       <label><input id="include_ortho" type="checkbox" checked> Ortho (NDVI)</label>
@@ -148,16 +149,48 @@ function viridisGradient() {
 
 // ======= OBJECT TYPE SHAPES (SVG) =======
 const TYPE_SHAPES = {
-  engineered_surface:  { shape: 'square',   label: '■', color: '#808080' },  // grey
-  engineered_slope:    { shape: 'diamond',  label: '◆', color: '#8B4513' },  // brown
-  excavation:          { shape: 'pentagon', label: '⬟', color: '#8B0000' },  // dark red
-  fill:                { shape: 'triangle', label: '▲', color: '#FF8C00' },  // orange
-  building:            { shape: 'square',   label: '▪', color: '#DC143C' },  // red
-  infrastructure:      { shape: 'dash',     label: '—', color: '#404040' },  // dark grey
-  tree_canopy:         { shape: 'triangle', label: '▲', color: '#006400' },  // dark green
-  vegetation:          { shape: 'circle',   label: '●', color: '#7CFC00' },  // light green
-  bare_natural:        { shape: 'cross',    label: '×', color: '#D2B48C' },  // tan/beige
-  recent_disturbance:  { shape: 'diamond',  label: '◆', color: '#FF00FF' },  // magenta/pink
+  // --- Vegetation ---
+  tree:          { shape: 'triangle', label: '▲', color: '#006400' },  // dark green
+  shrub:         { shape: 'triangle', label: '▲', color: '#228B22' },  // forest green
+  grass:         { shape: 'circle',   label: '●', color: '#7CFC00' },  // lawn green
+  hedge:         { shape: 'dash',     label: '—', color: '#2E8B57' },  // sea green
+  // --- Water ---
+  water:         { shape: 'circle',   label: '●', color: '#1E90FF' },  // dodger blue
+  // --- Buildings ---
+  roof:          { shape: 'square',   label: '■', color: '#DC143C' },  // crimson
+  greenhouse:    { shape: 'square',   label: '□', color: '#FF69B4' },  // pink
+  solar_panel:   { shape: 'square',   label: '◫', color: '#4169E1' },  // royal blue
+  // --- Infrastructure ---
+  fence:         { shape: 'dash',     label: '—', color: '#A0522D' },  // sienna
+  wall:          { shape: 'dash',     label: '—', color: '#8B4513' },  // saddle brown
+  mast:          { shape: 'cross',    label: '✦', color: '#404040' },  // dark grey
+  // --- Transportation ---
+  road:          { shape: 'square',   label: '■', color: '#808080' },  // grey
+  path:          { shape: 'dash',     label: '—', color: '#A9A9A9' },  // dark grey
+  parking:       { shape: 'square',   label: '▪', color: '#696969' },  // dim grey
+  bridge:        { shape: 'diamond',  label: '◆', color: '#708090' },  // slate grey
+  // --- Agricultural ---
+  crop:          { shape: 'circle',   label: '●', color: '#DAA520' },  // goldenrod
+  orchard:       { shape: 'triangle', label: '▲', color: '#6B8E23' },  // olive drab
+  vineyard:      { shape: 'triangle', label: '▲', color: '#9370DB' },  // medium purple
+  garden:        { shape: 'circle',   label: '●', color: '#3CB371' },  // medium sea green
+  // --- Terrain ---
+  bare_soil:     { shape: 'cross',    label: '×', color: '#D2B48C' },  // tan
+  rock:          { shape: 'cross',    label: '×', color: '#8B8682' },  // grey
+  // --- Disturbance ---
+  excavation:    { shape: 'diamond',  label: '◆', color: '#8B0000' },  // dark red
+  fill:          { shape: 'diamond',  label: '◆', color: '#FF8C00' },  // orange
+  clear_cut:     { shape: 'diamond',  label: '◆', color: '#FF00FF' },  // magenta
+  construction:  { shape: 'diamond',  label: '◆', color: '#FF4500' },  // orange red
+  // --- Legacy 10-type (objects endpoint) ---
+  engineered_surface:  { shape: 'square',   label: '■', color: '#808080' },
+  engineered_slope:    { shape: 'diamond',  label: '◆', color: '#8B4513' },
+  building:            { shape: 'square',   label: '■', color: '#DC143C' },
+  infrastructure:      { shape: 'dash',     label: '—', color: '#404040' },
+  tree_canopy:         { shape: 'triangle', label: '▲', color: '#006400' },
+  vegetation:          { shape: 'circle',   label: '●', color: '#7CFC00' },
+  bare_natural:        { shape: 'cross',    label: '×', color: '#D2B48C' },
+  recent_disturbance:  { shape: 'diamond',  label: '◆', color: '#FF00FF' },
 };
 const DEFAULT_SHAPE = { shape: 'circle', label: '○', color: '#666' };
 
@@ -373,12 +406,17 @@ document.getElementById('btn-run').onclick = async () => {
   document.getElementById('lyr-ortho').checked = false;
 
   const isRaster = endpoint === 'objects/raster';
+  const isSegment = endpoint === 'segment';
   const params = new URLSearchParams();
   params.set('min_height', parseFloat(document.getElementById('min_height').value) || 0.2);
-  params.set('min_area', parseInt(document.getElementById('min_area').value) || 0);
+  if (isSegment) {
+    params.set('min_object_size', parseInt(document.getElementById('min_area').value) || 30);
+  } else {
+    params.set('min_area', parseInt(document.getElementById('min_area').value) || 0);
+  }
   params.set('resolution', parseFloat(document.getElementById('resolution').value) || 1);
   const ot = document.getElementById('object_types').value.trim();
-  if (ot) params.set('object_types', ot);
+  if (ot) params.set(isSegment ? 'types' : 'object_types', ot);
   if (document.getElementById('include_ortho').checked) params.set('include_ortho', 'true');
   if (document.getElementById('include_temporal').checked) params.set('include_temporal', 'true');
   if (document.getElementById('include_copernicus').checked) params.set('include_copernicus', 'true');
@@ -467,7 +505,7 @@ function showObjectsOnMap(data) {
     onEachFeature: (f, layer) => {
       const p = f.properties;
       // Prioritised fields for v2 landscape classifier
-      const priorityKeys = ['type','obj_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','linear_feature','machinery_trace','temporal_signal','ndvi_mean','slope_mean'];
+      const priorityKeys = ['type','group_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','ndvi_fused','ndvi_mean','nir_mean','roughness','compactness','elongation','height_change','dtm_change','temporal_stability'];
       const seen = new Set();
       const rows = [];
       // Show priority fields first

@@ -113,6 +113,13 @@ def _try_read_ortho(data: dict) -> tuple:
         import ortho_io
         rgb, nir = ortho_io.read_ortho_for_als(data)
         spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+        # Add raw bands for object_segmentation fused gradient + classification
+        if rgb is not None:
+            spectral["red"] = rgb[0].astype(np.float32)
+            spectral["green"] = rgb[1].astype(np.float32)
+            spectral["blue"] = rgb[2].astype(np.float32)
+        if nir is not None:
+            spectral["nir"] = nir.astype(np.float32)
         return rgb, spectral
     except Exception as e:
         log.warning("Ortho read failed (non-fatal): %s", e)
@@ -552,7 +559,9 @@ def segment_objects():
             }
             if include_ortho or include_copernicus:
                 props["ndvi_mean"] = obj.ndvi_mean
+                props["ndvi_fused"] = obj.ndvi_fused
                 props["brightness_mean"] = obj.brightness_mean
+                props["nir_mean"] = obj.nir_mean
             if include_temporal:
                 props["height_change"] = obj.height_change
                 props["dtm_change"] = obj.dtm_change

@@ -81,8 +81,8 @@ OBJECT_TYPES = {
     # ---- Disturbance (DTM temporal change) ----
     "excavation": 50,    # DTM lowered between dates                [Ab 80,93]
     "fill": 51,          # DTM raised between dates                 [Dep 81]
-    "clear_cut": 52,     # was tall (nDSM>4), now ground (temporal)
-    "construction": 53,  # DTM changed + new elevation appeared
+    "clear_cut": 52,     # logging/timber harvest: was tall, now ground, terrain intact
+    "construction": 53,  # new structure, or site clearing (clear_cut + earthworks)
 }
 
 # Group types (merge adjacent compatible individuals)
@@ -178,6 +178,7 @@ class SegmentedObject:
     # Spectral (from ortho or Sentinel-2)
     ndvi_mean: float = 0.0
     ndvi_std: float = 0.0
+    ndvi_fused: float = 0.0   # seasonal-corrected (BEV 1m + Cop growing-season)
     brightness_mean: float = 0.0
     nir_mean: float = 0.0
     # Temporal
@@ -461,6 +462,16 @@ def extract_object_features(
 
     # --- Copernicus (resampled to 1m) ---
     cop_ndvi = _get_spectral_layer(cop, "ndvi", h, w) if cop else None
+
+    # --- Fused NDVI: seasonal-corrected 1m ---
+    # BEV ortho has 1m spatial detail but arbitrary capture date (could be
+    # winter → all veg looks dead).  Copernicus growing-season median is the
+    # seasonal truth but at 10m (bleeds across boundaries).
+    #
+    # Strategy: keep BEV spatial *contrast* (road edge vs grass), shift
+    # absolute level toward Copernicus.  Where BEV is unavailable, use
+    # Copernicus alone.
+    fused_ndvi = _fuse_ndvi(bev_ndvi, cop_ndvi, mask)
     cop_lc = None
     if cop and cop.get("landcover") is not None:
         arr = np.asarray(cop["landcover"], dtype=np.uint8)
@@ -529,6 +540,8 @@ def extract_object_features(
         f["brightness_mean"] = _seg_mean(bev_brightness, seg_v)
         f["nir_mean"] = _seg_mean(bev_nir, seg_v)
         f["cop_ndvi_mean"] = _seg_mean(cop_ndvi, seg_v)
+        # Fused NDVI: seasonal-corrected 1m (best of both worlds)
+        f["fused_ndvi_mean"], f["fused_ndvi_std"], _ = _seg_stats(fused_ndvi, seg_v)
 
         # ESA WorldCover
         if cop_lc is not None:
@@ -588,6 +601,84 @@ def _seg_mean_abs(arr: np.ndarray | None, seg: np.ndarray) -> float:
     return float(np.nanmean(sv[valid])) if valid.any() else 0.0
 
 
+def _fuse_ndvi(
+    bev: np.ndarray | None,
+    cop: np.ndarray | None,
+    mask: np.ndarray,
+) -> np.ndarray | None:
+    """Fuse BEV 1m NDVI with Copernicus 10m growing-season NDVI.
+
+    The BEV ortho can be captured any day of the year, so a deciduous
+    forest in January has NDVI ≈ 0.1 while Copernicus growing-season
+    median shows 0.7.  We want to keep the 1m spatial detail (road vs
+    adjacent grass) but shift the absolute level toward Copernicus.
+
+    Method (local histogram matching at ~30m blocks):
+      1. Compute block-mean of BEV and Cop (30m blocks ≈ 3× Cop pixels).
+      2. For each block: offset = cop_block − bev_block.  This is the
+         seasonal bias at that location.
+      3. Smooth the offset field (Gaussian σ=15m) so it doesn't inject
+         the 10m staircase artefact.
+      4. fused = clip(bev + offset, -1, 1).
+
+    Where BEV is unavailable → Copernicus.  Where Cop is unavailable → BEV.
+    Where both unavailable → None.
+    """
+    if bev is None and cop is None:
+        return None
+    if bev is None:
+        return cop
+    if cop is None:
+        return bev
+
+    h, w = bev.shape
+    if cop.shape != (h, w):
+        return bev  # shape mismatch, trust BEV
+
+    bev_f = np.where(mask & np.isfinite(bev), bev, np.nan).astype(np.float64)
+    cop_f = np.where(mask & np.isfinite(cop), cop, np.nan).astype(np.float64)
+
+    # Block-average both at ~30m (30 px at 1m) using a uniform filter
+    # that ignores NaN via a count trick.
+    blk = 31  # odd kernel
+    valid_bev = np.isfinite(bev_f).astype(np.float64)
+    valid_cop = np.isfinite(cop_f).astype(np.float64)
+    bev_fill = np.nan_to_num(bev_f, 0.0)
+    cop_fill = np.nan_to_num(cop_f, 0.0)
+
+    bev_sum = uniform_filter(bev_fill, blk, mode="nearest")
+    bev_cnt = uniform_filter(valid_bev, blk, mode="nearest")
+    cop_sum = uniform_filter(cop_fill, blk, mode="nearest")
+    cop_cnt = uniform_filter(valid_cop, blk, mode="nearest")
+
+    eps = 1e-6
+    bev_blk = np.where(bev_cnt > eps, bev_sum / bev_cnt, np.nan)
+    cop_blk = np.where(cop_cnt > eps, cop_sum / cop_cnt, np.nan)
+
+    # Seasonal offset = how much Copernicus is above BEV at this location
+    both_valid = np.isfinite(bev_blk) & np.isfinite(cop_blk)
+    offset = np.where(both_valid, cop_blk - bev_blk, 0.0)
+
+    # Smooth the offset so it doesn't carry 10m staircase edges
+    offset = gaussian_filter(offset, sigma=15)
+
+    # Apply: shift BEV toward Copernicus seasonal level
+    fused = np.where(
+        np.isfinite(bev_f),
+        np.clip(bev_f + offset, -1.0, 1.0),
+        cop_f,  # BEV missing → fall back to Cop
+    )
+    fused = np.where(mask, fused, np.nan).astype(np.float32)
+
+    log.info("NDVI fusion: BEV mean=%.3f, Cop mean=%.3f, Fused mean=%.3f, "
+             "offset mean=%.3f",
+             float(np.nanmean(bev_f[mask])) if valid_bev.any() else 0,
+             float(np.nanmean(cop_f[mask])) if valid_cop.any() else 0,
+             float(np.nanmean(fused[mask & np.isfinite(fused)])),
+             float(np.nanmean(offset[both_valid])) if both_valid.any() else 0)
+    return fused
+
+
 def _seg_stats(arr: np.ndarray | None, seg: np.ndarray) -> tuple[float, float, float]:
     """Return (mean, std, max) for array values in segment."""
     if arr is None:
@@ -629,6 +720,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     brightness = feat.get("brightness_mean", 0)
     nir = feat.get("nir_mean", 0)
     cop_ndvi = feat.get("cop_ndvi_mean", 0)
+    fused_ndvi = feat.get("fused_ndvi_mean", 0)
     esa_built = feat.get("esa_built_frac", 0)
     esa_tree = feat.get("esa_tree_frac", 0)
     esa_crop = feat.get("esa_crop_frac", 0)
@@ -640,24 +732,85 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     stability = feat.get("stability", 1)
     temporal_h_std = feat.get("temporal_h_std", 0)
 
-    # Best available NDVI (prefer BEV ortho 1m, fall back to Copernicus 10m)
-    best_ndvi = ndvi if (has_spectral and ndvi != 0) else cop_ndvi
-    have_ndvi = has_spectral or cop_ndvi != 0
+    # --- NDVI selection hierarchy ---
+    #   1. Fused (BEV 1m spatial + Copernicus seasonal correction) — best
+    #   2. BEV 1m alone — good spatial, possibly wrong season
+    #   3. Copernicus 10m alone — right season, coarse (bleeds into roads)
+    # "have_ndvi" = any NDVI source is available
+    # "ndvi_is_coarse" = relying on 10m Copernicus without 1m spatial detail
+    if fused_ndvi != 0:
+        best_ndvi = fused_ndvi
+        have_ndvi = True
+        ndvi_is_coarse = False
+    elif has_spectral and ndvi != 0:
+        best_ndvi = ndvi
+        have_ndvi = True
+        ndvi_is_coarse = False
+    elif cop_ndvi != 0:
+        best_ndvi = cop_ndvi
+        have_ndvi = True
+        ndvi_is_coarse = True   # 10m, bleeds across boundaries
+    else:
+        best_ndvi = 0
+        have_ndvi = False
+        ndvi_is_coarse = False
 
     # ---------------------------------------------------------------
     # DISTURBANCE (highest priority — recent changes)
     # ---------------------------------------------------------------
-    if dtm_change_abs > 0.3:
-        if dtm_change < -0.3:
-            return "excavation", OBJECT_TYPES["excavation"], min(0.5 + dtm_change_abs, 0.95), True
-        if dtm_change > 0.3:
-            return "fill", OBJECT_TYPES["fill"], min(0.5 + dtm_change_abs, 0.95), True
+    # Trees naturally grow 2-5m between LIDAR dates (2022→2024).
+    # Exclude objects that look like growing vegetation.
+    is_veg_like = best_ndvi > 0.35 and dsm_rough > 0.8
 
-    if h_change < -3.0 and h_mean < 2.0 and temporal_h_std > 2.0:
-        return "clear_cut", OBJECT_TYPES["clear_cut"], 0.8, True
+    # Size gates: earthworks are spatially large; individual tree death
+    # can be a single crown (~15-30m² at 1m).  Tiny slivers (<8m²) at
+    # layer boundaries are always noise.
+    big_enough_earthwork = area >= 25  # excavation, fill, construction
+    big_enough_tree_loss = area >= 8   # single tree crown
 
-    if dtm_change_abs > 0.2 and h_change > 2.0:
-        return "construction", OBJECT_TYPES["construction"], 0.7, True
+    # --- DTM change: terrain was physically moved (excavation/fill) ---
+    # DTM noise is ±0.05-0.15m on elevated objects (tree crowns cause
+    # interpolation shifts).  Only trust DTM change on GROUND or where
+    # the signal is strong enough to exceed noise.
+    on_ground = h_mean < 2.0
+    dtm_signal_strong = dtm_change_abs > 0.5  # unambiguous earthwork
+    dtm_signal_mod = dtm_change_abs > 0.20    # moderate, needs corroboration
+
+    if big_enough_earthwork and (dtm_signal_strong or (dtm_signal_mod and on_ground)):
+        if dtm_change < -0.20:
+            return "excavation", OBJECT_TYPES["excavation"], min(0.4 + dtm_change_abs, 0.95), True
+        if dtm_change > 0.20:
+            return "fill", OBJECT_TYPES["fill"], min(0.4 + dtm_change_abs, 0.95), True
+
+    # --- nDSM change: something was built, removed, or felled ---
+    if abs(h_change) > 2.0 and temporal_h_std > 1.0:
+
+        # Height DROPPED → clear_cut / tree death / site clearing
+        if h_change < -2.0 and h_mean < 2.0:
+            if big_enough_earthwork and dtm_change_abs > 0.15:
+                # Trees removed AND terrain reshaped → site clearing
+                # (preparatory earthworks for construction)
+                return "construction", OBJECT_TYPES["construction"], 0.8, True
+            elif big_enough_tree_loss:
+                # Trees removed, terrain intact → logging / tree death
+                # Single trees (8-50m²) are individual felling/death;
+                # larger patches (>50m²) are timber harvest / clear-cut.
+                conf = 0.7 if area < 50 else 0.85
+                return "clear_cut", OBJECT_TYPES["clear_cut"], conf, True
+
+        # Height GREW and doesn't look like vegetation → new structure
+        if h_change > 2.0 and not is_veg_like and big_enough_earthwork:
+            return "construction", OBJECT_TYPES["construction"], min(0.5 + abs(h_change) / 10, 0.9), True
+
+    # Combined: moderate DTM + nDSM change on non-vegetation
+    if big_enough_earthwork and dtm_change_abs > 0.15 and abs(h_change) > 1.0 and not is_veg_like and on_ground:
+        return "construction", OBJECT_TYPES["construction"], 0.65, True
+
+    # High instability on ground with real DTM shift
+    if big_enough_earthwork and stability < 0.3 and temporal_h_std > 1.5 and dtm_change_abs > 0.15 and on_ground:
+        if dtm_change < 0:
+            return "excavation", OBJECT_TYPES["excavation"], 0.5, True
+        return "fill", OBJECT_TYPES["fill"], 0.5, True
 
     # ---------------------------------------------------------------
     # WATER (ESA WorldCover hint + low NDVI + low NIR + flat)
@@ -813,35 +966,54 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     # GROUND OBJECTS (nDSM < 0.5m)
     # ---------------------------------------------------------------
 
-    # Engineered surface: very smooth terrain + low NDVI
-    if dtm_rough < 0.025 and slope_mean < 15:
-        if elong > 3 and area > 20:
-            conf = 0.6
-            if has_spectral and ndvi < 0.15:
-                conf = 0.8
-            return "road", OBJECT_TYPES["road"], conf, True
-        elif area > 50 and compact > 0.3:
-            conf = 0.5
-            if has_spectral and ndvi < 0.15 and brightness > 80:
-                conf = 0.75
-            return "parking", OBJECT_TYPES["parking"], conf, True
-        elif area > 10:
-            return "path", OBJECT_TYPES["path"], 0.4, True
+    # Engineered surface: smooth terrain = roads, parking, foundations.
+    # This MUST be checked before NDVI-based veg classification because
+    # even fused NDVI can read high near vegetation edges.
+    is_smooth = dtm_rough < 0.04 and slope_mean < 15
+    is_very_smooth = dtm_rough < 0.02 and slope_mean < 10
+
+    if is_smooth:
+        # Very smooth terrain is almost certainly engineered.
+        # With fused or 1m NDVI, also accept moderate NDVI (adjacent veg
+        # bleeds a little even at 1m).  With coarse-only NDVI, always
+        # trust DTM roughness over the 10m NDVI.
+        ndvi_ok = best_ndvi < 0.30 or ndvi_is_coarse or is_very_smooth
+        if ndvi_ok:
+            if elong > 3 and area > 15:
+                conf = 0.7 if is_very_smooth else 0.55
+                if have_ndvi and best_ndvi < 0.10:
+                    conf = 0.85
+                elif have_ndvi and best_ndvi < 0.20:
+                    conf = 0.75
+                return "road", OBJECT_TYPES["road"], conf, True
+            elif area > 40 and compact > 0.25:
+                conf = 0.55
+                if have_ndvi and best_ndvi < 0.15 and brightness > 80:
+                    conf = 0.75
+                return "parking", OBJECT_TYPES["parking"], conf, True
+            elif area > 8:
+                return "path", OBJECT_TYPES["path"], 0.45, True
 
     # Garden: moderate NDVI, near buildings (small area)
     if best_ndvi > 0.2 and best_ndvi < 0.5 and area < 300 and esa_built > 0.1:
-        return "garden", OBJECT_TYPES["garden"], 0.45, False
+        # But not if terrain is smooth (would be paved yard/driveway)
+        if dtm_rough > 0.03:
+            return "garden", OBJECT_TYPES["garden"], 0.45, False
 
     # Crop vs grass (use ESA WorldCover + NDVI)
     if best_ndvi > 0.4:
+        if ndvi_is_coarse and is_smooth:
+            # Coarse NDVI on smooth ground = likely road with 10m veg bleed
+            return "road", OBJECT_TYPES["road"], 0.45, True
         if esa_crop > 0.3:
             return "crop", OBJECT_TYPES["crop"], 0.7, False
         if area > 500:
-            # Large flat green area = pasture/meadow
             return "grass", OBJECT_TYPES["grass"], 0.65, False
         return "grass", OBJECT_TYPES["grass"], 0.5, False
 
     if best_ndvi > 0.2:
+        if ndvi_is_coarse and is_smooth:
+            return "path", OBJECT_TYPES["path"], 0.4, True
         if esa_crop > 0.3:
             return "crop", OBJECT_TYPES["crop"], 0.55, False
         return "grass", OBJECT_TYPES["grass"], 0.4, False
@@ -1195,6 +1367,7 @@ def segment_and_classify(
             roughness=round(feat["dsm_roughness"], 3),
             ndvi_mean=round(feat.get("ndvi_mean", 0), 4),
             ndvi_std=round(feat.get("ndvi_std", 0), 4),
+            ndvi_fused=round(feat.get("fused_ndvi_mean", 0), 4),
             brightness_mean=round(feat.get("brightness_mean", 0), 1),
             nir_mean=round(feat.get("nir_mean", 0), 1),
             height_change=round(feat.get("h_change", 0), 3),

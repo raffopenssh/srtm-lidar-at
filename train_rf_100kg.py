@@ -48,6 +48,12 @@ CADASTRE_BASE = "https://cadastre-process-api.exe.xyz/api/v1"
 RESULTS_DIR = Path("/tmp/rf_train_100kg")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Permanent storage — survives /tmp cleanup
+PERMANENT_DIR = Path("/home/exedev/srtm-lidar/rf_training_data")
+PERMANENT_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR = PERMANENT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
 # WGS84 <-> EPSG:3035 transformers
 _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -507,12 +513,32 @@ def process_one_kg(
         if copernicus_data:
             stats["cop_layers"] = list(copernicus_data.keys())
 
-    # 5. Segment
+    # 5. Hansen Global Forest Change
+    hansen_data = None
+    t0 = time.time()
+    try:
+        import hansen
+        hansen_data = hansen.get_forest_prior(
+            (west, south, east, north),
+            data["transform"], data["shape"],
+        )
+        stats["has_hansen"] = True
+        log.info("KG %s: Hansen OK (forest=%d px, loss=%d px)",
+                 kg_code,
+                 int(hansen_data["current_forest"].sum()),
+                 int((hansen_data["loss_year"] > 0).sum()))
+    except Exception as e:
+        log.warning("KG %s: Hansen failed: %s", kg_code, e)
+        stats["has_hansen"] = False
+    stats["hansen_time"] = round(time.time() - t0, 1)
+
+    # 6. Segment
     t0 = time.time()
     try:
         result = oc.segment_and_classify(
             data["dtm"], data["dsm"], data["mask"], data["transform"],
             spectral=spectral, copernicus=copernicus_data,
+            hansen=hansen_data,
         )
     except Exception as e:
         stats["error"] = f"segmentation: {e}"
@@ -568,22 +594,59 @@ def main():
     kgs = get_random_kgs(100)
     log.info("Selected %d KGs", len(kgs))
 
-    # Save KG list
-    kg_list_path = RESULTS_DIR / "kg_list.json"
-    with open(kg_list_path, "w") as f:
-        json.dump([{"kg_code": k["kg_code"], "kg_name": k.get("kg_name", "")} for k in kgs], f, indent=2)
+    # Save KG list to both locations
+    kg_list_data = [{"kg_code": k["kg_code"], "kg_name": k.get("kg_name", "")} for k in kgs]
+    for dest in [RESULTS_DIR / "kg_list.json", PERMANENT_DIR / "kg_list.json"]:
+        with open(dest, "w") as f:
+            json.dump(kg_list_data, f, indent=2)
 
-    # Process each KG
+    # --- Resume from checkpoint if available ---
     all_features = []
     all_labels = []
     all_stats = []
     n_success = 0
     n_fail = 0
+    completed_kgs = set()
 
+    # Load any existing per-KG checkpoints
+    for ckpt_file in sorted(CHECKPOINT_DIR.glob("kg_*.npz")):
+        try:
+            ckpt = np.load(ckpt_file, allow_pickle=True)
+            kg_code = str(ckpt["kg_code"])
+            feats = ckpt["features"].tolist()
+            lbls = ckpt["labels"].tolist()
+            all_features.extend(feats)
+            all_labels.extend(lbls)
+            completed_kgs.add(kg_code)
+            n_success += 1
+        except Exception as e:
+            log.warning("Failed to load checkpoint %s: %s", ckpt_file, e)
+
+    # Load stats checkpoint
+    stats_ckpt = PERMANENT_DIR / "kg_stats_partial.json"
+    if stats_ckpt.exists():
+        try:
+            all_stats = json.loads(stats_ckpt.read_text())
+        except Exception:
+            pass
+
+    if completed_kgs:
+        log.info("RESUMING: loaded %d KGs (%d samples) from checkpoints",
+                 len(completed_kgs), len(all_features))
+
+    # Process each KG
     for i, kg in enumerate(kgs):
+        kg_code = kg["kg_code"]
+
+        # Skip already completed
+        if kg_code in completed_kgs:
+            log.info("[%d/%d] KG %s — already checkpointed, skipping",
+                     i + 1, len(kgs), kg_code)
+            continue
+
         log.info("-" * 50)
         log.info("[%d/%d] Processing KG %s (%s)",
-                 i + 1, len(kgs), kg["kg_code"], kg.get("kg_name", ""))
+                 i + 1, len(kgs), kg_code, kg.get("kg_name", ""))
 
         try:
             features, labels, stats = process_one_kg(kg, include_copernicus=True)
@@ -595,33 +658,53 @@ def main():
                 all_labels.extend(labels)
                 n_success += 1
                 log.info("  → +%d samples (total: %d)", len(features), len(all_features))
+
+                # --- Per-KG checkpoint: save to permanent storage ---
+                ckpt_path = CHECKPOINT_DIR / f"kg_{kg_code}.npz"
+                np.savez_compressed(
+                    ckpt_path,
+                    kg_code=kg_code,
+                    features=np.array(features, dtype=object),
+                    labels=np.array(labels, dtype=object),
+                )
+                log.info("  Checkpoint saved: %s (%d samples)", ckpt_path.name, len(features))
             else:
                 n_fail += 1
                 log.warning("  → FAILED: %s", stats.get("error", "no labelled segments"))
         except Exception as e:
             n_fail += 1
             log.error("  → EXCEPTION: %s", traceback.format_exc())
-            all_stats.append({"kg_code": kg["kg_code"], "error": str(e), "index": i})
+            all_stats.append({"kg_code": kg_code, "error": str(e), "index": i})
 
-        # Save progress every 10 KGs
-        if (i + 1) % 10 == 0:
-            progress = {
-                "completed": i + 1,
-                "total": len(kgs),
-                "success": n_success,
-                "fail": n_fail,
-                "total_samples": len(all_features),
-                "elapsed_min": round((time.time() - t_start) / 60, 1),
-            }
-            with open(RESULTS_DIR / "progress.json", "w") as f:
+        # Save progress + stats after every KG
+        progress = {
+            "completed": len(completed_kgs) + i + 1,
+            "total": len(kgs),
+            "success": n_success,
+            "fail": n_fail,
+            "total_samples": len(all_features),
+            "elapsed_min": round((time.time() - t_start) / 60, 1),
+            "completed_kgs": sorted(completed_kgs | {kg_code}),
+        }
+        for dest in [RESULTS_DIR / "progress.json", PERMANENT_DIR / "progress.json"]:
+            with open(dest, "w") as f:
                 json.dump(progress, f, indent=2)
+
+        # Save stats incrementally
+        with open(stats_ckpt, "w") as f:
+            json.dump(all_stats, f, indent=2, default=str)
+
+        completed_kgs.add(kg_code)
+
+        if (i + 1) % 5 == 0 or len(completed_kgs) % 5 == 0:
             log.info("Progress: %d/%d done, %d samples, %.1f min elapsed",
-                     i + 1, len(kgs), len(all_features),
+                     len(completed_kgs), len(kgs), len(all_features),
                      (time.time() - t_start) / 60)
 
-    # Save all stats
-    with open(RESULTS_DIR / "kg_stats.json", "w") as f:
-        json.dump(all_stats, f, indent=2, default=str)
+    # Save all stats to both locations
+    for dest in [RESULTS_DIR / "kg_stats.json", PERMANENT_DIR / "kg_stats.json"]:
+        with open(dest, "w") as f:
+            json.dump(all_stats, f, indent=2, default=str)
 
     log.info("=" * 70)
     log.info("Collection complete: %d KGs succeeded, %d failed", n_success, n_fail)
@@ -674,10 +757,11 @@ def main():
             "source_distribution": source_dist,
             "elapsed_minutes": round((time.time() - t_start) / 60, 1),
         }
-        with open(RESULTS_DIR / "training_report.json", "w") as f:
-            json.dump(report, f, indent=2, default=str)
+        for dest in [RESULTS_DIR / "training_report.json", PERMANENT_DIR / "training_report.json"]:
+            with open(dest, "w") as f:
+                json.dump(report, f, indent=2, default=str)
 
-        log.info("Report saved to %s", RESULTS_DIR / "training_report.json")
+        log.info("Report saved to %s", PERMANENT_DIR / "training_report.json")
     except Exception as e:
         log.error("Training failed: %s", traceback.format_exc())
 

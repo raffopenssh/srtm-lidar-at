@@ -427,6 +427,7 @@ def extract_object_features(
     cop: dict | None = None,
     dtm_dates: dict | None = None,
     dsm_dates: dict | None = None,
+    hansen: dict | None = None,
 ) -> list[dict]:
     """Extract a feature vector for each labelled segment.
 
@@ -508,6 +509,12 @@ def extract_object_features(
     harm_amp = _get_spectral_layer(harm, "h_amplitude", h, w) if harm else None
     harm_phase = _get_spectral_layer(harm, "h_phase", h, w) if harm else None
     harm_rmse = _get_spectral_layer(harm, "h_rmse", h, w) if harm else None
+
+    # --- Hansen Global Forest Change (resampled to 1m) ---
+    hansen_tc = hansen.get("treecover2000") if hansen else None
+    hansen_loss = hansen.get("loss_year") if hansen else None
+    hansen_gain = hansen.get("gain") if hansen else None
+    hansen_current = hansen.get("current_forest") if hansen else None
 
     # --- Extract per-region ---
     regions = measure.regionprops(labels, intensity_image=ndsm)
@@ -623,6 +630,21 @@ def extract_object_features(
         f["dtm_change"] = _seg_mean(temporal_dtm_change, seg_v)
         f["dtm_change_abs"] = _seg_mean_abs(temporal_dtm_change, seg_v)
         f["stability"] = 1.0 / (1.0 + f["temporal_h_std"] + f["dtm_change_abs"])
+
+        # Hansen Global Forest Change
+        if hansen_tc is not None:
+            n_pix = max(int(seg_v.sum()), 1)
+            f["hansen_treecover2000"] = float(np.mean(hansen_tc[seg_v])) if n_pix > 0 else 0.0
+            f["hansen_loss_frac"] = float(np.sum(hansen_loss[seg_v] > 0)) / n_pix if hansen_loss is not None else 0.0
+            f["hansen_recent_loss_frac"] = float(np.sum(hansen_loss[seg_v] >= 20)) / n_pix if hansen_loss is not None else 0.0
+            f["hansen_gain_frac"] = float(np.sum(hansen_gain[seg_v] > 0)) / n_pix if hansen_gain is not None else 0.0
+            f["hansen_current_forest_frac"] = float(np.sum(hansen_current[seg_v])) / n_pix if hansen_current is not None else 0.0
+        else:
+            f["hansen_treecover2000"] = 0.0
+            f["hansen_loss_frac"] = 0.0
+            f["hansen_recent_loss_frac"] = 0.0
+            f["hansen_gain_frac"] = 0.0
+            f["hansen_current_forest_frac"] = 0.0
 
         objects.append(f)
 
@@ -1572,6 +1594,7 @@ def segment_and_classify(
     spectral: dict | None = None,
     copernicus: dict | None = None,
     building_footprints: np.ndarray | None = None,
+    hansen: dict | None = None,
     min_object_size: int = 30,
     felz_scale: float = 150.0,
     rag_threshold: float = 0.12,
@@ -1629,6 +1652,7 @@ def segment_and_classify(
         labels, dtm, dsm, ndsm, mask, transform,
         spectral=spectral, cop=cop_resampled,
         dtm_dates=dtm_dates, dsm_dates=dsm_dates,
+        hansen=hansen,
     )
 
     # --- Step 3b: Texture features (GLCM from ortho) ---

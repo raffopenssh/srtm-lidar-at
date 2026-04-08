@@ -66,6 +66,11 @@ FEATURE_KEYS = [
     "sar_vv", "sar_vh", "sar_ratio",
     # NDVI harmonics
     "harm_mean", "harm_amplitude", "harm_phase", "harm_rmse",
+    # Hansen Global Forest Change
+    "hansen_treecover2000", "hansen_loss_frac", "hansen_recent_loss_frac",
+    "hansen_gain_frac", "hansen_current_forest_frac",
+    # Additional discriminators
+    "ndvi_max", "slope_max", "h_p10", "perimeter", "esa_dominant_lc",
 ]
 
 # Mapping from cadastre land-use codes (Benützungsart) to our types.

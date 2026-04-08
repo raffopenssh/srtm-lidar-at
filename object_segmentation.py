@@ -1033,16 +1033,20 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         if esa_built > 0.3:
             bld_score += 1.0
 
-        # Texture: buildings have low-moderate entropy (uniform surfaces)
+        # Texture: buildings have lower entropy than tree canopy
+        # Real data: roof median ~8.1, tree ~7.7 — heavy overlap, use mild signals
         if has_texture:
-            if glcm_entropy < 3.5:
+            if glcm_entropy < 5.5:
                 bld_score += 1.5   # very uniform = roof material
-            elif glcm_entropy < 5.0:
+            elif glcm_entropy < 6.5:
                 bld_score += 0.5   # moderate = possible building
-            elif glcm_entropy > 6.0:
-                bld_score -= 1.5   # complex texture = tree canopy
-            elif glcm_entropy > 5.0:
-                bld_score -= 0.5
+            elif glcm_entropy > 8.0 and glcm_homogeneity < 0.25:
+                bld_score -= 1.0   # very complex + very non-uniform = canopy
+            # Homogeneity is more discriminative than entropy for buildings
+            if glcm_homogeneity > 0.45:
+                bld_score += 1.0   # smooth surface = built
+            elif glcm_homogeneity < 0.25:
+                bld_score -= 0.5   # rough = vegetation
 
         # SAR: buildings are strong corner reflectors (high VV)
         if has_sar:
@@ -1107,7 +1111,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
             if h_change > 0.5:  # growing
                 conf = min(conf + 0.1, 0.95)
             # Texture boost: high entropy + low homogeneity = forest canopy
-            if has_texture and glcm_entropy > 5.0 and glcm_homogeneity < 0.5:
+            if has_texture and glcm_entropy > 7.0 and glcm_homogeneity < 0.35:
                 conf = min(conf + 0.1, 0.95)
             # SAR boost: high VH = volume scattering from canopy
             if has_sar and sar_vh > 0.04 and sar_ratio < 2.0:
@@ -1146,16 +1150,18 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     is_very_smooth = dtm_rough < 0.02 and slope_mean < 10
 
     # Texture-based road score: roads have very low entropy, high homogeneity
+    # Texture road score: calibrated from real data
+    # road median: ent=5.9, hom=0.53 | grass: ent=6.6, hom=0.44 | tree: ent=7.7, hom=0.28
     tex_road_score = 0.0
     if has_texture:
-        if glcm_entropy < 3.0 and glcm_homogeneity > 0.7:
-            tex_road_score = 1.0   # textbook road signature
-        elif glcm_entropy < 4.0 and glcm_homogeneity > 0.5:
+        if glcm_entropy < 5.5 and glcm_homogeneity > 0.5:
+            tex_road_score = 1.0   # uniform surface = road
+        elif glcm_entropy < 6.2 and glcm_homogeneity > 0.45:
             tex_road_score = 0.5   # likely paved
-        elif glcm_entropy > 5.0 and glcm_homogeneity < 0.4:
-            tex_road_score = -0.5  # complex texture = vegetation
-        elif 3.0 <= glcm_entropy <= 5.0:
-            tex_road_score = -0.3  # medium entropy = grass/pasture
+        elif glcm_entropy > 7.0 and glcm_homogeneity < 0.3:
+            tex_road_score = -0.5  # complex texture = tree canopy
+        elif glcm_entropy > 6.5 and glcm_homogeneity < 0.4:
+            tex_road_score = -0.3  # medium-high = grass/vegetation
 
     if is_smooth:
         # Very smooth terrain is almost certainly engineered.
@@ -1191,7 +1197,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     # Texture override: very low entropy + high homogeneity on ground =
     # road/path even with moderate NDVI (ortho bleed near edges).
     if has_texture and tex_road_score >= 0.5 and is_smooth:
-        conf = 0.55 + tex_road_score * 0.1
+        conf = 0.55 + tex_road_score * 0.15
         if elong > 3 and area > 15:
             return "road", OBJECT_TYPES["road"], min(conf, 0.85), True
         elif area > 8:
@@ -1210,7 +1216,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
                 conf = 0.85
             if best_ndvi > 0.3:
                 conf = min(conf + 0.05, 0.95)
-            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+            if has_texture and 5.5 <= glcm_entropy <= 7.5:
                 conf = min(conf + 0.05, 0.95)
             return "crop", OBJECT_TYPES["crop"], conf, False
 
@@ -1265,12 +1271,12 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
             return "road", OBJECT_TYPES["road"], 0.45, True
         if esa_crop > 0.3:
             conf = 0.7
-            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+            if has_texture and 5.5 <= glcm_entropy <= 7.5:
                 conf = min(conf + 0.05, 0.85)
             return "crop", OBJECT_TYPES["crop"], conf, False
         if area > 500:
             conf = 0.65
-            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+            if has_texture and 5.5 <= glcm_entropy <= 7.5:
                 conf = min(conf + 0.05, 0.80)
             return "grass", OBJECT_TYPES["grass"], conf, False
         return "grass", OBJECT_TYPES["grass"], 0.5, False

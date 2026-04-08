@@ -78,6 +78,7 @@ CADASTRE_TO_TYPE = {
     53: "grass",      # Hutweide (pasture)
     54: "grass",      # Alpe (alpine pasture)
     55: "grass",      # Weide (grazing)
+    58: "grass",      # Alpe (alpine meadow)
     61: "grass",      # Grünland (grassland)
     # Forest
     56: "tree",       # Wald (forest)
@@ -87,6 +88,7 @@ CADASTRE_TO_TYPE = {
     64: "garden",     # Hausgarten
     65: "orchard",    # Obstgarten
     # Buildings
+    40: "garden",     # Baufläche begrünt (green built-up)
     42: "roof",       # Gebäude
     43: "roof",       # Gebäude (other)
     44: "roof",       # Gebäude (farm)
@@ -105,6 +107,8 @@ CADASTRE_TO_TYPE = {
     96: "water",      # Feuchtgebiet
     # Terrain
     59: "bare_soil",  # Ödland
+    60: "water",      # Sumpf/Moor (wetland)
+    72: "water",      # Quelle/Brunnen (spring)
     80: "excavation", # Abbaufläche (quarry)
     81: "fill",       # Deponie
     83: "rock",       # Felsen (rock)

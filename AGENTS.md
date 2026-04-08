@@ -22,6 +22,10 @@ Cadastre: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
 
 ```
 app.py                   Flask API — all endpoints
+hansen.py                Hansen Global Forest Change (GFC-2024-v1.12) integration
+                          Reads treecover2000/lossyear/gain via /vsicurl/
+                          calibrate_clear_cut() boosts/downgrades clear_cut confidence
+                          evaluate_forest_loss() returns P/R/F1 vs Hansen reference
 object_segmentation.py   NEW: Watershed-based segmentation + classification
                           Fused gradient (Sobel on DTM/DSM/CHM/RGBI/NDVI)
                           Felzenszwalb over-segmentation + RAG boundary merge
@@ -151,5 +155,35 @@ result = lc.classify_landscape(data['dtm'], data['dsm'], data['mask'], data['tra
 print(cadastre.evaluate_classification(result['type_map'], bldg, building_codes={5}))
 "
 ```
+
+## Hansen Global Forest Change
+
+GFC-2024-v1.12 tile 50N_010E (covers Austria). Layers:
+- treecover2000: canopy cover % in year 2000
+- lossyear: year of loss 1-24 (2001-2024), 0=no loss
+- gain: forest gained 2000-2012
+- datamask: 1=land, 2=water
+
+Used by `hansen.py` to calibrate clear_cut detection:
+- clear_cut on Hansen loss → confidence +0.15
+- vegetation on recent Hansen loss + temporal instability → reclassify to clear_cut
+- clear_cut on non-forest area → confidence -0.20
+
+Cached in /tmp/hansen_cache/ as .npz files.
+
+## GeoPackage Export
+
+POST /api/v1/export/geopackage returns all layers in one GPKG:
+- Band 1: DTM, Band 2: DSM, Band 3: nDSM
+- Bands 4-6: RGB ortho (optional), Band 7: NIR (if available)
+- Final band: segment_type (type codes from object_segmentation.py)
+- Filter by ?types=roof,tree,road to include only specific segment types
+
+## Segment Raster Overlay
+
+POST /api/v1/segment/overlay returns coloured PNG (RGBA) showing segmentation.
+Server caches last segmentation result — re-renders with different ?types= filter
+are instant (no re-running pipeline). Legend filter in frontend toggles both
+point markers AND segment raster overlay simultaneously.
 
 Dependencies: rasterio, pyproj, shapely, numpy, scipy, scikit-image, flask, openeo, requests

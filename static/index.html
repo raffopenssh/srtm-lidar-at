@@ -63,15 +63,11 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
       <option value="elevation">Elevation Enrichment</option>
       <option value="terrain">Terrain Characterisation</option>
       <option value="segment" selected>Segment &amp; Classify</option>
-      <option value="objects">Object Detection (legacy)</option>
-      <option value="objects/raster">Object Raster (download)</option>
+      <option value="changes">Temporal Changes</option>
+      <option value="changes/trees">Tree Growth Analysis</option>
     </select>
     <div class="row">
-      <div><label>Min Height (m)</label><input id="min_height" type="number" value="0.2" step="0.1"></div>
-      <div><label>Min Area (m²)</label><input id="min_area" type="number" value="0" step="1"></div>
-    </div>
-    <div class="row">
-      <div><label>Resolution (m)</label><input id="resolution" type="number" value="0.2" step="0.1" min="0.2"></div>
+      <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
       <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: roof,tree,road,excavation)"></div>
     </div>
     <div class="cb-row">
@@ -81,6 +77,9 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     <div class="cb-row">
       <label><input id="include_copernicus" type="checkbox" checked> Copernicus</label>
       <label><input id="include_cadastre" type="checkbox" checked> Cadastre</label>
+    </div>
+    <div class="cb-row">
+      <label><input id="include_hansen" type="checkbox"> Hansen Forest</label>
     </div>
     <label>Geometry (GeoJSON / KML / coords)</label>
     <textarea id="geometry"></textarea>
@@ -94,8 +93,7 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     <div class="dl-bar">
       <button class="btn btn-sm btn-outline" id="btn-copy" title="Copy JSON">📋 Copy</button>
       <button class="btn btn-sm btn-outline" id="btn-dl-json" title="Download GeoJSON">💾 JSON</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-lidar" title="Download LIDAR GeoTIFF">🗺️ LIDAR</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-ortho" title="Download Ortho GeoTIFF">📸 Ortho</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-gpkg" title="Download GeoPackage with all layers">📦 GeoPackage</button>
     </div>
     <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
   </div>
@@ -108,6 +106,7 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     <div class="lyr"><input type="checkbox" id="lyr-dtm"><span class="lyr-label">DTM Relief</span><input type="range" id="op-dtm" min="0" max="100" value="80"></div>
     <div class="lyr"><input type="checkbox" id="lyr-lidar"><span class="lyr-label">nDSM Heights</span><input type="range" id="op-lidar" min="0" max="100" value="70"></div>
     <div class="lyr"><input type="checkbox" id="lyr-ortho"><span class="lyr-label">Orthophoto</span><input type="range" id="op-ortho" min="0" max="100" value="80"></div>
+    <div class="lyr"><input type="checkbox" id="lyr-segments"><span class="lyr-label">Segment Raster</span><input type="range" id="op-segments" min="0" max="100" value="65"></div>
     <div class="lyr"><input type="checkbox" id="lyr-objects" checked><span class="lyr-label">Objects</span><input type="range" id="op-objects" min="0" max="100" value="90"></div>
     <div class="lyr"><input type="checkbox" id="lyr-base" checked><span class="lyr-label">Base map</span><input type="range" id="op-base" min="0" max="100" value="100"></div>
   </div>
@@ -152,88 +151,46 @@ function viridisGradient() {
 
 // ======= OBJECT TYPE SHAPES (SVG) =======
 const TYPE_SHAPES = {
-  // --- Vegetation ---
-  tree:          { shape: 'triangle', label: '▲', color: '#006400' },  // dark green
-  shrub:         { shape: 'triangle', label: '▲', color: '#228B22' },  // forest green
-  grass:         { shape: 'circle',   label: '●', color: '#7CFC00' },  // lawn green
-  hedge:         { shape: 'dash',     label: '—', color: '#2E8B57' },  // sea green
-  // --- Water ---
-  water:         { shape: 'circle',   label: '●', color: '#1E90FF' },  // dodger blue
-  // --- Buildings ---
-  roof:          { shape: 'square',   label: '■', color: '#DC143C' },  // crimson
-  greenhouse:    { shape: 'square',   label: '□', color: '#FF69B4' },  // pink
-  solar_panel:   { shape: 'square',   label: '◫', color: '#4169E1' },  // royal blue
-  // --- Infrastructure ---
-  fence:         { shape: 'dash',     label: '—', color: '#A0522D' },  // sienna
-  wall:          { shape: 'dash',     label: '—', color: '#8B4513' },  // saddle brown
-  mast:          { shape: 'cross',    label: '✦', color: '#404040' },  // dark grey
-  // --- Transportation ---
-  road:          { shape: 'square',   label: '■', color: '#808080' },  // grey
-  path:          { shape: 'dash',     label: '—', color: '#A9A9A9' },  // dark grey
-  parking:       { shape: 'square',   label: '▪', color: '#696969' },  // dim grey
-  bridge:        { shape: 'diamond',  label: '◆', color: '#708090' },  // slate grey
-  // --- Agricultural ---
-  crop:          { shape: 'circle',   label: '●', color: '#DAA520' },  // goldenrod
-  orchard:       { shape: 'triangle', label: '▲', color: '#6B8E23' },  // olive drab
-  vineyard:      { shape: 'triangle', label: '▲', color: '#9370DB' },  // medium purple
-  garden:        { shape: 'circle',   label: '●', color: '#3CB371' },  // medium sea green
-  // --- Terrain ---
-  bare_soil:     { shape: 'cross',    label: '×', color: '#D2B48C' },  // tan
-  rock:          { shape: 'cross',    label: '×', color: '#8B8682' },  // grey
-  // --- Disturbance ---
-  excavation:    { shape: 'diamond',  label: '◆', color: '#8B0000' },  // dark red
-  fill:          { shape: 'diamond',  label: '◆', color: '#FF8C00' },  // orange
-  clear_cut:     { shape: 'diamond',  label: '◆', color: '#FF00FF' },  // magenta
-  construction:  { shape: 'diamond',  label: '◆', color: '#FF4500' },  // orange red
-  // --- Legacy 10-type (objects endpoint) ---
-  engineered_surface:  { shape: 'square',   label: '■', color: '#808080' },
-  engineered_slope:    { shape: 'diamond',  label: '◆', color: '#8B4513' },
-  building:            { shape: 'square',   label: '■', color: '#DC143C' },
-  infrastructure:      { shape: 'dash',     label: '—', color: '#404040' },
-  tree_canopy:         { shape: 'triangle', label: '▲', color: '#006400' },
-  vegetation:          { shape: 'circle',   label: '●', color: '#7CFC00' },
-  bare_natural:        { shape: 'cross',    label: '×', color: '#D2B48C' },
-  recent_disturbance:  { shape: 'diamond',  label: '◆', color: '#FF00FF' },
+  tree:          { shape: 'triangle', label: '▲', color: '#006400' },
+  shrub:         { shape: 'triangle', label: '▲', color: '#228B22' },
+  grass:         { shape: 'circle',   label: '●', color: '#7CFC00' },
+  hedge:         { shape: 'dash',     label: '—', color: '#2E8B57' },
+  water:         { shape: 'circle',   label: '●', color: '#1E90FF' },
+  roof:          { shape: 'square',   label: '■', color: '#DC143C' },
+  greenhouse:    { shape: 'square',   label: '□', color: '#FF69B4' },
+  solar_panel:   { shape: 'square',   label: '◫', color: '#4169E1' },
+  fence:         { shape: 'dash',     label: '—', color: '#A0522D' },
+  wall:          { shape: 'dash',     label: '—', color: '#8B4513' },
+  mast:          { shape: 'cross',    label: '✦', color: '#404040' },
+  road:          { shape: 'square',   label: '■', color: '#808080' },
+  path:          { shape: 'dash',     label: '—', color: '#A9A9A9' },
+  parking:       { shape: 'square',   label: '▪', color: '#696969' },
+  bridge:        { shape: 'diamond',  label: '◆', color: '#708090' },
+  crop:          { shape: 'circle',   label: '●', color: '#DAA520' },
+  orchard:       { shape: 'triangle', label: '▲', color: '#6B8E23' },
+  vineyard:      { shape: 'triangle', label: '▲', color: '#9370DB' },
+  garden:        { shape: 'circle',   label: '●', color: '#3CB371' },
+  bare_soil:     { shape: 'cross',    label: '×', color: '#D2B48C' },
+  rock:          { shape: 'cross',    label: '×', color: '#8B8682' },
+  excavation:    { shape: 'diamond',  label: '◆', color: '#8B0000' },
+  fill:          { shape: 'diamond',  label: '◆', color: '#FF8C00' },
+  clear_cut:     { shape: 'diamond',  label: '◆', color: '#FF00FF' },
+  construction:  { shape: 'diamond',  label: '◆', color: '#FF4500' },
 };
 const DEFAULT_SHAPE = { shape: 'circle', label: '○', color: '#666' };
 
 function makeSVGMarker(type, heightM, areaSqm) {
   const info = TYPE_SHAPES[type] || DEFAULT_SHAPE;
-  // Use the type's own color as fill; overlay viridis tint if height is significant
   const fill = heightM > 0.5 ? viridisCSS(Math.min(heightM / 35, 1)) : info.color;
-  const r = 5;
-  const d = 10;
+  const r = 5, d = 10;
   let svg;
   const s = info.shape;
-  if (s === 'triangle') {
-    svg = `<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  } else if (s === 'square') {
-    svg = `<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.8" rx="1"/>`;
-  } else if (s === 'diamond') {
-    svg = `<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  } else if (s === 'cross') {
-    svg = `<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
-  } else if (s === 'dash') {
-    svg = `<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
-  } else if (s === 'line') {
-    svg = `<rect x="${r-1.5}" y="1" width="3" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
-  } else if (s === 'hrect') {
-    svg = `<rect x="0" y="${r-3}" width="${d}" height="6" fill="${fill}" stroke="#000" stroke-width="0.5" rx="2"/>`;
-  } else if (s === 'wave') {
-    svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#0066AA" stroke-width="1"/>`;
-  } else if (s === 'pentagon') {
-    const pts = [0,1,2,3,4].map(i => {
-      const a = Math.PI*2*i/5 - Math.PI/2;
-      return `${r+Math.cos(a)*(r-1)},${r+Math.sin(a)*(r-1)}`;
-    }).join(' ');
-    svg = `<polygon points="${pts}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  } else if (s === 'dots') {
-    svg = `<circle cx="${r*0.3}" cy="${r}" r="2" fill="${fill}"/><circle cx="${r}" cy="${r}" r="2" fill="${fill}"/><circle cx="${r*1.7}" cy="${r}" r="2" fill="${fill}"/>`;
-  } else if (s === 'dot') {
-    svg = `<circle cx="${r}" cy="${r}" r="${Math.max(2,r*0.5)}" fill="${fill}"/>`;
-  } else {
-    svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  }
+  if (s === 'triangle') svg = `<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  else if (s === 'square') svg = `<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.8" rx="1"/>`;
+  else if (s === 'diamond') svg = `<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
+  else if (s === 'cross') svg = `<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
+  else if (s === 'dash') svg = `<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
+  else svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
   return L.divIcon({
     html: `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">${svg}</svg>`,
     iconSize: [d, d], iconAnchor: [r, r], className: ''
@@ -248,7 +205,7 @@ const baseLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.pn
 
 const drawnItems = new L.FeatureGroup().addTo(map);
 const resultLayer = new L.FeatureGroup().addTo(map);
-let dtmOverlay = null, lidarOverlay = null, orthoOverlay = null;
+let dtmOverlay = null, lidarOverlay = null, orthoOverlay = null, segmentOverlay = null;
 
 new L.Control.Draw({
   edit: { featureGroup: drawnItems },
@@ -263,14 +220,12 @@ map.on(L.Draw.Event.CREATED, e => {
 
 // ======= LEGEND =======
 document.getElementById('viridis-bar').style.background = viridisGradient();
-// Dynamic legend: built from actual data, each entry toggles visibility
-const hiddenTypes = new Set();    // types currently hidden
-let markersByType = {};           // type → [leaflet layer, ...]
+const hiddenTypes = new Set();
+let markersByType = {};
 
 function buildLegend(typeCounts) {
   const ltDiv = document.getElementById('legend-types');
   ltDiv.innerHTML = '';
-  // Sort by count descending
   const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
   const total = sorted.reduce((s, [,n]) => s + n, 0);
   for (const [t, count] of sorted) {
@@ -296,6 +251,10 @@ function toggleType(type, el) {
     el.classList.add('hidden');
   }
   applyTypeVisibility();
+  // Reload segment raster overlay with filter if it's active
+  if (document.getElementById('lyr-segments').checked && segmentOverlay) {
+    reloadSegmentOverlay();
+  }
 }
 
 function applyTypeVisibility() {
@@ -319,7 +278,7 @@ function updateLayerOpacity(id, layer) {
     const op = cb.checked ? slider.value / 100 : 0;
     resultLayer.eachLayer(l => { if (l.setOpacity) l.setOpacity(op); else if (l._icon) l._icon.style.opacity = op; });
   } else {
-    if (layer.setOpacity) layer.setOpacity(cb.checked ? slider.value / 100 : 0);
+    if (layer && layer.setOpacity) layer.setOpacity(cb.checked ? slider.value / 100 : 0);
   }
 }
 function getLayerForId(id) {
@@ -327,14 +286,14 @@ function getLayerForId(id) {
   if (id === 'dtm') return dtmOverlay;
   if (id === 'lidar') return lidarOverlay;
   if (id === 'ortho') return orthoOverlay;
+  if (id === 'segments') return segmentOverlay;
   if (id === 'objects') return resultLayer;
   return null;
 }
-['base','dtm','lidar','ortho','objects'].forEach(id => {
+['base','dtm','lidar','ortho','segments','objects'].forEach(id => {
   const sl = document.getElementById('op-' + id);
   const cb = document.getElementById('lyr-' + id);
   sl.oninput = () => updateLayerOpacity(id, getLayerForId(id));
-  // Only wire simple opacity toggle for base/objects — overlay loading is separate
   if (id === 'base' || id === 'objects') {
     cb.onchange = () => updateLayerOpacity(id, getLayerForId(id));
   }
@@ -384,31 +343,86 @@ async function loadOverlay(type) {
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const imageBounds = [[south, west], [north, east]];
-    const overlay = L.imageOverlay(url, imageBounds, { opacity: 0.7, interactive: false });
-    return overlay;
+    return L.imageOverlay(url, imageBounds, { opacity: 0.7, interactive: false });
   } catch(e) {
     status.textContent = `${type} overlay failed: ${e.message}`;
     return null;
   }
 }
 
-// Wire up overlay checkboxes: load on first enable, toggle visibility after
+async function loadSegmentOverlay(typeFilter) {
+  const gb = getGeomBody();
+  if (!gb) return null;
+  const status = document.getElementById('status');
+  status.textContent = 'Loading segment raster...';
+  try {
+    let url = '/api/v1/segment/overlay?include_ortho=true';
+    if (document.getElementById('include_copernicus').checked) url += '&include_copernicus=true';
+    if (document.getElementById('include_cadastre').checked) url += '&include_cadastre=true';
+    if (document.getElementById('include_hansen').checked) url += '&include_hansen=true';
+    if (typeFilter && typeFilter.length > 0) url += '&types=' + typeFilter.join(',');
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': gb.json ? 'application/json' : 'text/plain' },
+      body: gb.body
+    });
+    if (!resp.ok) throw new Error((await resp.json()).error);
+    const bounds_str = resp.headers.get('X-Bounds');
+    if (!bounds_str) throw new Error('No bounds in response');
+    const [south, west, north, east] = bounds_str.split(',').map(Number);
+    const blob = await resp.blob();
+    const imgUrl = URL.createObjectURL(blob);
+    const imageBounds = [[south, west], [north, east]];
+    return L.imageOverlay(imgUrl, imageBounds, { opacity: 0.65, interactive: false });
+  } catch(e) {
+    status.textContent = `Segment overlay failed: ${e.message}`;
+    return null;
+  }
+}
+
+async function reloadSegmentOverlay() {
+  // Get visible types (all except hidden)
+  const allTypes = Object.keys(TYPE_SHAPES);
+  const visibleTypes = allTypes.filter(t => !hiddenTypes.has(t));
+  // Only send filter if some types are hidden
+  const filter = hiddenTypes.size > 0 ? visibleTypes : null;
+
+  if (segmentOverlay) { map.removeLayer(segmentOverlay); segmentOverlay = null; }
+  const ovl = await loadSegmentOverlay(filter);
+  if (ovl) {
+    segmentOverlay = ovl;
+    ovl.addTo(map);
+    orderLayers();
+    updateLayerOpacity('segments', ovl);
+  }
+  document.getElementById('status').textContent = 'Done.';
+}
+
+function orderLayers() {
+  if (orthoOverlay) orthoOverlay.bringToBack();
+  if (dtmOverlay) dtmOverlay.bringToFront();
+  if (lidarOverlay) lidarOverlay.bringToFront();
+  if (segmentOverlay) segmentOverlay.bringToFront();
+  baseLayer.bringToBack();
+}
+
 async function handleOverlayToggle(id, urlPath) {
   const cb = document.getElementById('lyr-' + id);
   const status = document.getElementById('status');
-  const getOvl = () => id === 'dtm' ? dtmOverlay : id === 'lidar' ? lidarOverlay : orthoOverlay;
-  const setOvl = (v) => { if (id === 'dtm') dtmOverlay = v; else if (id === 'lidar') lidarOverlay = v; else orthoOverlay = v; };
+  const getOvl = () => id === 'dtm' ? dtmOverlay : id === 'lidar' ? lidarOverlay : id === 'ortho' ? orthoOverlay : segmentOverlay;
+  const setOvl = (v) => { if (id === 'dtm') dtmOverlay = v; else if (id === 'lidar') lidarOverlay = v; else if (id === 'ortho') orthoOverlay = v; else segmentOverlay = v; };
 
   if (cb.checked && !getOvl()) {
-    const ovl = await loadOverlay(urlPath);
+    let ovl;
+    if (id === 'segments') {
+      ovl = await loadSegmentOverlay(null);
+    } else {
+      ovl = await loadOverlay(urlPath);
+    }
     if (ovl) {
       setOvl(ovl);
       ovl.addTo(map);
-      // Layer order: ortho at bottom, DTM above, nDSM on top
-      if (orthoOverlay) orthoOverlay.bringToBack();
-      if (dtmOverlay) dtmOverlay.bringToFront();
-      if (lidarOverlay) lidarOverlay.bringToFront();
-      baseLayer.bringToBack();
+      orderLayers();
       updateLayerOpacity(id, ovl);
     } else {
       cb.checked = false;
@@ -420,6 +434,7 @@ async function handleOverlayToggle(id, urlPath) {
 document.getElementById('lyr-dtm').onchange = () => handleOverlayToggle('dtm', 'dtm');
 document.getElementById('lyr-lidar').onchange = () => handleOverlayToggle('lidar', 'lidar');
 document.getElementById('lyr-ortho').onchange = () => handleOverlayToggle('ortho', 'ortho');
+document.getElementById('lyr-segments').onchange = () => handleOverlayToggle('segments', 'segment');
 
 // ======= ANALYSE =======
 let lastResult = null;
@@ -441,26 +456,24 @@ document.getElementById('btn-run').onclick = async () => {
   if (dtmOverlay) { map.removeLayer(dtmOverlay); dtmOverlay = null; }
   if (lidarOverlay) { map.removeLayer(lidarOverlay); lidarOverlay = null; }
   if (orthoOverlay) { map.removeLayer(orthoOverlay); orthoOverlay = null; }
+  if (segmentOverlay) { map.removeLayer(segmentOverlay); segmentOverlay = null; }
   document.getElementById('lyr-dtm').checked = false;
   document.getElementById('lyr-lidar').checked = false;
   document.getElementById('lyr-ortho').checked = false;
+  document.getElementById('lyr-segments').checked = false;
 
-  const isRaster = endpoint === 'objects/raster';
   const isSegment = endpoint === 'segment';
   const params = new URLSearchParams();
-  params.set('min_height', parseFloat(document.getElementById('min_height').value) || 0.2);
   if (isSegment) {
     params.set('min_object_size', parseInt(document.getElementById('min_area').value) || 30);
-  } else {
-    params.set('min_area', parseInt(document.getElementById('min_area').value) || 0);
   }
-  params.set('resolution', parseFloat(document.getElementById('resolution').value) || 1);
   const ot = document.getElementById('object_types').value.trim();
   if (ot) params.set(isSegment ? 'types' : 'object_types', ot);
   if (document.getElementById('include_ortho').checked) params.set('include_ortho', 'true');
   if (document.getElementById('include_temporal').checked) params.set('include_temporal', 'true');
   if (document.getElementById('include_copernicus').checked) params.set('include_copernicus', 'true');
   if (document.getElementById('include_cadastre').checked) params.set('include_cadastre', 'true');
+  if (document.getElementById('include_hansen').checked) params.set('include_hansen', 'true');
 
   let contentType = 'text/plain', sendBody = geometry;
   try {
@@ -473,20 +486,11 @@ document.getElementById('btn-run').onclick = async () => {
     const resp = await fetch(`/api/v1/${endpoint}?${params}`, {
       method: 'POST', headers: { 'Content-Type': contentType }, body: sendBody
     });
-    if (isRaster) {
-      if (!resp.ok) { const e = await resp.json(); throw new Error(e.error); }
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = 'objects.tif'; a.click();
-      resultDiv.textContent = 'Raster downloaded!';
-      lastResult = null;
-    } else {
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error);
-      lastResult = data;
-      resultDiv.textContent = JSON.stringify(data, null, 2);
-      if (data.features) showObjectsOnMap(data);
-    }
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    lastResult = data;
+    resultDiv.textContent = JSON.stringify(data, null, 2);
+    if (data.features) showObjectsOnMap(data);
     status.textContent = 'Done.';
   } catch(e) {
     resultDiv.textContent = 'Error: ' + e.message;
@@ -512,42 +516,38 @@ function buildSummary(data) {
   const manmadePct = totalArea > 0 ? (manmadeArea / totalArea * 100).toFixed(1) : '0.0';
   const eval_ = data.cadastre_evaluation || data.evaluation;
   let html = `<b>${totalCount}</b> objects &nbsp; <b>${manmadePct}%</b> manmade`;
-  if (eval_) {
-    html += `<br><b>Cadastre:</b> P=${eval_.precision} R=${eval_.recall} F1=${eval_.f1}`;
-  }
+  if (eval_) html += `<br><b>Cadastre:</b> P=${eval_.precision} R=${eval_.recall} F1=${eval_.f1}`;
+  if (data.hansen_evaluation) html += `<br><b>Hansen:</b> P=${data.hansen_evaluation.precision} R=${data.hansen_evaluation.recall} F1=${data.hansen_evaluation.f1}`;
   content.innerHTML = html;
 }
 
 function showObjectsOnMap(data) {
   document.getElementById('legend').style.display = '';
-  markersByType = {};  // reset
+  markersByType = {};
 
-  // Count types for legend
   const typeCounts = {};
   for (const f of data.features) {
-    const t = (f.properties.type || f.properties.obj_type || 'unknown');
+    const t = (f.properties.type || f.properties.obj_type || f.properties.event_type || 'unknown');
     typeCounts[t] = (typeCounts[t] || 0) + 1;
   }
 
-  // Build legend + summary
   buildLegend(typeCounts);
   buildSummary(data);
 
   const gj = L.geoJSON(data, {
     pointToLayer: (f, ll) => {
       const p = f.properties;
-      const t = p.type || p.obj_type || '';
+      const t = p.type || p.obj_type || p.event_type || '';
       const h = p.height_max_m || p.height_max || 0;
       const a = p.area_sqm || 4;
       const marker = L.marker(ll, { icon: makeSVGMarker(t, h, a) });
-      // Track for toggling
       if (!markersByType[t]) markersByType[t] = [];
       markersByType[t].push(marker);
       return marker;
     },
     onEachFeature: (f, layer) => {
       const p = f.properties;
-      const priorityKeys = ['type','group_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','ndvi_fused','ndvi_mean','nir_mean','roughness','compactness','elongation','height_change','dtm_change','temporal_stability'];
+      const priorityKeys = ['type','group_type','event_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','ndvi_fused','ndvi_mean','nir_mean','roughness','compactness','elongation','height_change','dtm_change','temporal_stability','dsm_elevation_m','dtm_elevation_m','object_height_m'];
       const seen = new Set();
       const rows = [];
       for (const k of priorityKeys) {
@@ -568,9 +568,7 @@ function showObjectsOnMap(data) {
     }
   }).addTo(resultLayer);
   if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.05));
-  // Apply current opacity and type visibility
   updateLayerOpacity('objects', resultLayer);
-  // Defer visibility toggle so Leaflet has added icons to DOM
   setTimeout(() => applyTypeVisibility(), 50);
 }
 
@@ -585,33 +583,34 @@ document.getElementById('btn-dl-json').onclick = () => {
   const blob = new Blob([JSON.stringify(lastResult, null, 2)], {type: 'application/geo+json'});
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'result.geojson'; a.click();
 };
-document.getElementById('btn-dl-lidar').onclick = async () => {
+document.getElementById('btn-dl-gpkg').onclick = async () => {
   const gb = getGeomBody();
   if (!gb) { alert('Provide geometry first'); return; }
-  document.getElementById('status').textContent = 'Downloading LIDAR GeoTIFF...';
+  const status = document.getElementById('status');
+  status.textContent = 'Generating GeoPackage (DTM + DSM + ortho + segments)...';
   try {
-    const resp = await fetch('/api/v1/lidar/geotiff', {
-      method: 'POST', headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'}, body: gb.body
+    let url = '/api/v1/export/geopackage?include_ortho=true&include_segments=true';
+    // Pass type filter if any types are hidden
+    if (hiddenTypes.size > 0) {
+      const allTypes = Object.keys(TYPE_SHAPES);
+      const visibleTypes = allTypes.filter(t => !hiddenTypes.has(t));
+      url += '&types=' + visibleTypes.join(',');
+    }
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'},
+      body: gb.body
     });
     if (!resp.ok) throw new Error((await resp.json()).error);
     const blob = await resp.blob();
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'lidar_dtm_dsm_ndsm.tif'; a.click();
-    document.getElementById('status').textContent = 'LIDAR GeoTIFF downloaded!';
-  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
-};
-document.getElementById('btn-dl-ortho').onclick = async () => {
-  const gb = getGeomBody();
-  if (!gb) { alert('Provide geometry first'); return; }
-  document.getElementById('status').textContent = 'Downloading Ortho GeoTIFF...';
-  try {
-    const resp = await fetch('/api/v1/ortho/geotiff', {
-      method: 'POST', headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'}, body: gb.body
-    });
-    if (!resp.ok) throw new Error((await resp.json()).error);
-    const blob = await resp.blob();
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'orthophoto_rgbi.tif'; a.click();
-    document.getElementById('status').textContent = 'Ortho GeoTIFF downloaded!';
-  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'landscape_export.gpkg';
+    a.click();
+    status.textContent = 'GeoPackage downloaded!';
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
 };
 </script>
 </body>

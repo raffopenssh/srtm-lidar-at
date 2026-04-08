@@ -28,13 +28,14 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 from flask import Flask, request, jsonify, send_file, Response
-from shapely.geometry import mapping, shape, Point
+from shapely.geometry import mapping, shape, Point, LineString as SLineString
 
 import tile_index as ti
 import raster_io
 import terrain_analysis as ta
 import landscape_classifier as oc  # new landscape-focused classifier
 import object_segmentation as seg  # watershed-based segmentation
+import hansen  # Hansen Global Forest Change calibration
 import temporal_analysis as tca
 import geo_parse
 
@@ -201,11 +202,15 @@ def elevation():
                 dtm_data, _, _ = raster_io.read_window_bbox('DTM', *bounds, dataset, pad=0)
                 row = max(0, min(int((tf.f - n) / abs(tf.e)), dsm_data.shape[0]-1))
                 col = max(0, min(int((e - tf.c) / tf.a), dsm_data.shape[1]-1))
+                dsm_val = round(float(dsm_data[row, col]), 2)
+                dtm_val = round(float(dtm_data[row, col]), 2)
                 props = dict(feat.get('properties', {}))
-                props['dsm_elevation_m'] = round(float(dsm_data[row, col]), 2)
-                props['dtm_elevation_m'] = round(float(dtm_data[row, col]), 2)
-                props['object_height_m'] = round(float(dsm_data[row, col] - dtm_data[row, col]), 2)
-                result_features.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})
+                props['dsm_elevation_m'] = dsm_val
+                props['dtm_elevation_m'] = dtm_val
+                props['object_height_m'] = round(float(dsm_val - dtm_val), 2)
+                # Add DSM altitude as Z coordinate
+                geom_z = Point(geom.x, geom.y, dsm_val)
+                result_features.append({"type": "Feature", "properties": props, "geometry": mapping(geom_z)})
 
             elif geom.geom_type in ('LineString', 'MultiLineString'):
                 _validate_area(geom_3035.buffer(10))
@@ -215,21 +220,27 @@ def elevation():
                 dsm_data, tf, _ = raster_io.read_window_bbox('DSM', *bounds, dataset)
                 dtm_data, _, _ = raster_io.read_window_bbox('DTM', *bounds, dataset)
                 enriched_coords = []
+                coords_wgs_3d = []
                 for e, n in coords_3035:
                     row = max(0, min(int((tf.f - n) / abs(tf.e)), dsm_data.shape[0]-1))
                     col = max(0, min(int((e - tf.c) / tf.a), dsm_data.shape[1]-1))
+                    dsm_val = round(float(dsm_data[row, col]), 2)
+                    dtm_val = round(float(dtm_data[row, col]), 2)
                     pt_wgs = ti.geometry_from_3035(Point(e, n))
                     enriched_coords.append({
                         "lon": round(pt_wgs.x, 8), "lat": round(pt_wgs.y, 8),
-                        "dsm_elevation_m": round(float(dsm_data[row, col]), 2),
-                        "dtm_elevation_m": round(float(dtm_data[row, col]), 2),
-                        "object_height_m": round(float(dsm_data[row, col] - dtm_data[row, col]), 2),
+                        "dsm_elevation_m": dsm_val,
+                        "dtm_elevation_m": dtm_val,
+                        "object_height_m": round(float(dsm_val - dtm_val), 2),
                     })
+                    coords_wgs_3d.append((round(pt_wgs.x, 8), round(pt_wgs.y, 8), dsm_val))
                 props = dict(feat.get('properties', {}))
                 props['elevation_profile'] = enriched_coords
                 props['dsm_elevation_min'] = min(p['dsm_elevation_m'] for p in enriched_coords)
                 props['dsm_elevation_max'] = max(p['dsm_elevation_m'] for p in enriched_coords)
-                result_features.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})
+                # Return geometry with DSM altitude as Z coordinate
+                geom_z = SLineString(coords_wgs_3d)
+                result_features.append({"type": "Feature", "properties": props, "geometry": mapping(geom_z)})
 
             else:
                 _validate_area(geom_3035)
@@ -241,7 +252,15 @@ def elevation():
                 for name, arr in [('dsm_elevation', dsm_valid), ('dtm_elevation', dtm_valid), ('object_heights', ndsm_valid)]:
                     props[name] = {'min': round(float(np.nanmin(arr)), 2), 'max': round(float(np.nanmax(arr)), 2), 'mean': round(float(np.nanmean(arr)), 2)}
                 props['area_sqm'] = int(np.sum(data['mask']))
-                result_features.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})
+                # Add mean DSM altitude as Z coordinate on polygon exterior
+                dsm_mean = round(float(np.nanmean(dsm_valid)), 2)
+                geom_dict = mapping(geom)
+                if geom_dict.get('type') == 'Polygon' and geom_dict.get('coordinates'):
+                    geom_dict['coordinates'] = tuple(
+                        tuple((x, y, dsm_mean) for x, y, *_ in ring)
+                        for ring in geom_dict['coordinates']
+                    )
+                result_features.append({"type": "Feature", "properties": props, "geometry": geom_dict})
 
         return jsonify({"type": "FeatureCollection", "features": result_features,
                         "meta": {"dataset": dataset, "processing_time_s": round(time.time()-t0, 2)}})
@@ -451,6 +470,7 @@ def segment_objects():
         include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
         include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
+        include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         type_filter = params.get('types', None)
         if isinstance(type_filter, str):
             type_filter = [t.strip() for t in type_filter.split(',')]
@@ -461,6 +481,11 @@ def segment_objects():
         all_objects = []
         all_stats = None
         all_evaluation = None
+        all_labels = None
+        all_transform = None
+        all_shape = None
+        all_mask = None
+        hansen_evaluation = None
 
         for feat in features:
             geom = feat['geometry']
@@ -524,6 +549,20 @@ def segment_objects():
             )
 
             objects = result['objects']
+            labels = result['labels']
+
+            # Hansen forest loss calibration
+            hansen_evaluation = None
+            if include_hansen:
+                try:
+                    bbox_wgs = geom.bounds  # WGS84
+                    hansen_prior = hansen.get_forest_prior(
+                        bbox_wgs, data['transform'], data['shape'],
+                    )
+                    objects = hansen.calibrate_clear_cut(objects, labels, hansen_prior)
+                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_prior)
+                except Exception as e:
+                    log.warning("Hansen calibration failed: %s", e)
 
             # Filters
             if type_filter:
@@ -533,6 +572,10 @@ def segment_objects():
 
             all_objects.extend(objects)
             all_stats = result.get('stats')
+            all_labels = labels
+            all_transform = data['transform']
+            all_shape = data['shape']
+            all_mask = data['mask']
             if result.get('evaluation'):
                 all_evaluation = result['evaluation']
 
@@ -587,17 +630,327 @@ def segment_objects():
                 "include_temporal": include_temporal,
                 "include_copernicus": include_copernicus,
                 "include_cadastre": include_cadastre,
+                "include_hansen": include_hansen,
                 "processing_time_s": round(time.time() - t0, 2),
             },
         }
         if all_evaluation:
             resp["cadastre_evaluation"] = all_evaluation
+        if hansen_evaluation:
+            resp["hansen_evaluation"] = hansen_evaluation
 
         return jsonify(resp)
     except ValueError as e:
         return _error(str(e))
     except Exception as e:
         log.error(traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
+
+
+# ---------------------------------------------------------------------------
+# 3c. SEGMENT RASTER OVERLAY
+# ---------------------------------------------------------------------------
+
+# Cache for last segmentation result so legend filter re-renders are instant
+_seg_cache = {"labels": None, "objects": None, "mask": None,
+              "transform": None, "shape": None, "key": None}
+
+# Segment type → RGBA colour (matches frontend TYPE_SHAPES)
+SEGMENT_COLORS = {
+    "tree":         (0, 100, 0, 180),
+    "shrub":        (34, 139, 34, 180),
+    "grass":        (124, 252, 0, 150),
+    "hedge":        (46, 139, 87, 170),
+    "water":        (30, 144, 255, 180),
+    "roof":         (220, 20, 60, 200),
+    "greenhouse":   (255, 105, 180, 180),
+    "solar_panel":  (65, 105, 225, 200),
+    "fence":        (160, 82, 45, 170),
+    "wall":         (139, 69, 19, 170),
+    "mast":         (64, 64, 64, 200),
+    "road":         (128, 128, 128, 160),
+    "path":         (169, 169, 169, 150),
+    "parking":      (105, 105, 105, 160),
+    "bridge":       (112, 128, 144, 170),
+    "crop":         (218, 165, 32, 160),
+    "orchard":      (107, 142, 35, 170),
+    "vineyard":     (147, 112, 219, 170),
+    "garden":       (60, 179, 113, 160),
+    "bare_soil":    (210, 180, 140, 140),
+    "rock":         (139, 134, 130, 160),
+    "excavation":   (139, 0, 0, 200),
+    "fill":         (255, 140, 0, 200),
+    "clear_cut":    (255, 0, 255, 200),
+    "construction": (255, 69, 0, 200),
+}
+
+
+def _segment_rgba(labels, objects, mask, type_filter=None):
+    """Render segmentation labels as RGBA image."""
+    h, w = labels.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    obj_map = {o.obj_id: o for o in objects}
+    for obj_id, obj in obj_map.items():
+        if type_filter and obj.obj_type not in type_filter:
+            continue
+        seg_mask = labels == obj_id
+        color = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+        for c in range(4):
+            rgba[:, :, c][seg_mask] = color[c]
+    # Transparent where no data
+    rgba[:, :, 3][~mask] = 0
+    return rgba
+
+
+def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None):
+    """Render segmentation as RGBA, reproject to WGS84, return overlay response."""
+    from rasterio.warp import calculate_default_transform, reproject as rp, Resampling
+    from rasterio.crs import CRS
+    from rasterio.transform import array_bounds
+
+    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter)
+
+    src_crs = CRS.from_epsg(3035)
+    dst_crs = CRS.from_epsg(4326)
+    h, w = shape_hw
+    dst_tf, dst_w, dst_h = calculate_default_transform(
+        src_crs, dst_crs, w, h, *array_bounds(h, w, transform),
+    )
+    rgba_wgs = np.zeros((4, dst_h, dst_w), dtype=np.uint8)
+    for band in range(4):
+        rp(
+            source=rgba_3035[:, :, band],
+            destination=rgba_wgs[band],
+            src_transform=transform,
+            src_crs=src_crs,
+            dst_transform=dst_tf,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+        )
+    rgba_out = np.transpose(rgba_wgs, (1, 2, 0))  # (H,W,4)
+    bounds = array_bounds(dst_h, dst_w, dst_tf)
+    bounds_wgs = (bounds[1], bounds[0], bounds[3], bounds[2])  # south,west,north,east
+    return _send_rgba_overlay(rgba_out, bounds_wgs)
+
+
+@app.route('/api/v1/segment/overlay', methods=['POST'])
+def segment_overlay():
+    """Return segment classification as a coloured PNG overlay (reprojected to WGS84).
+
+    First call runs full segmentation and caches the result.
+    Subsequent calls with only ?types= changed use the cache for instant re-renders.
+    """
+    try:
+        t0 = time.time()
+        features = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', ti.DEFAULT_DATASET)
+        include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+        include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
+        include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
+        type_filter_str = params.get('types', None)
+        type_filter = None
+        if type_filter_str:
+            type_filter = set(t.strip() for t in type_filter_str.split(','))
+
+        feat = features[0]
+        geom = feat['geometry']
+        geom_3035 = ti.geometry_to_3035(geom)
+        if geom.geom_type == 'Point':
+            geom_3035 = geom_3035.buffer(100)
+        _validate_area(geom_3035)
+
+        # Build a cache key from geometry bounds + dataset + analysis options
+        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}"
+
+        if _seg_cache["key"] == cache_key:
+            # Re-render from cache — instant
+            log.info("segment overlay: re-render from cache (filter=%s)", type_filter)
+            return _render_seg_overlay(
+                _seg_cache["labels"], _seg_cache["objects"],
+                _seg_cache["mask"], _seg_cache["transform"],
+                _seg_cache["shape"], type_filter,
+            )
+
+        # Full segmentation pipeline
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+        rgb, spectral = (None, None)
+        if include_ortho:
+            rgb, spectral = _try_read_ortho(data)
+
+        copernicus_data = None
+        if include_copernicus:
+            copernicus_data = _try_copernicus(geom)
+
+        building_footprints = None
+        if include_cadastre:
+            building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
+
+        result = seg.segment_and_classify(
+            data['dtm'], data['dsm'], data['mask'], data['transform'],
+            spectral=spectral,
+            copernicus=copernicus_data,
+            building_footprints=building_footprints,
+        )
+
+        objects = result['objects']
+        labels = result['labels']
+
+        # Hansen calibration
+        if include_hansen:
+            try:
+                bbox_wgs = geom.bounds
+                hansen_prior = hansen.get_forest_prior(
+                    bbox_wgs, data['transform'], data['shape'],
+                )
+                objects = hansen.calibrate_clear_cut(objects, labels, hansen_prior)
+            except Exception as e:
+                log.warning("Hansen calibration failed in overlay: %s", e)
+
+        # Store in cache for fast re-renders with different type filters
+        _seg_cache.update({
+            "labels": labels, "objects": objects,
+            "mask": data['mask'], "transform": data['transform'],
+            "shape": data['shape'], "key": cache_key,
+        })
+        log.info("segment overlay: full pipeline %.1fs, cached for re-renders", time.time() - t0)
+
+        return _render_seg_overlay(labels, objects, data['mask'],
+                                   data['transform'], data['shape'], type_filter)
+    except Exception as e:
+        log.error("segment overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# 3d. GEOPACKAGE EXPORT
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/export/geopackage', methods=['POST'])
+def export_geopackage():
+    """Export all current map data as a GeoPackage (DTM, DSM, ortho, segments, raster)."""
+    try:
+        import fiona
+        from fiona.crs import from_epsg
+    except ImportError:
+        # fiona not available, use rasterio-only approach
+        pass
+
+    try:
+        t0 = time.time()
+        features = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', ti.DEFAULT_DATASET)
+        include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+        include_segments = str(params.get('include_segments', 'true')).lower() in ('true', '1', 'yes')
+        type_filter_str = params.get('types', None)
+        type_filter = None
+        if type_filter_str:
+            type_filter = set(t.strip() for t in type_filter_str.split(','))
+
+        feat = features[0]
+        geom = feat['geometry']
+        geom_3035 = ti.geometry_to_3035(geom)
+        if geom.geom_type == 'Point':
+            geom_3035 = geom_3035.buffer(100)
+        _validate_area(geom_3035)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        dtm = data['dtm']
+        dsm = data['dsm']
+        ndsm = data['ndsm']
+        tf = data['transform']
+        h, w = data['shape']
+        mask = data['mask']
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.gpkg', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        # Band count: DTM, DSM, nDSM + optional ortho RGB(I) + optional segment type
+        bands = ['DTM', 'DSM', 'nDSM']
+        arrays = [dtm.astype(np.float32), dsm.astype(np.float32), ndsm.astype(np.float32)]
+
+        # Ortho
+        rgb = None
+        if include_ortho:
+            try:
+                import ortho_io
+                rgb_arr, nir = ortho_io.read_ortho_for_als(data)
+                if rgb_arr is not None:
+                    for i, name in enumerate(['Red', 'Green', 'Blue']):
+                        bands.append(name)
+                        arrays.append(rgb_arr[i].astype(np.float32))
+                    if nir is not None:
+                        bands.append('NIR')
+                        arrays.append(nir.astype(np.float32))
+                    rgb = rgb_arr
+            except Exception as e:
+                log.warning("Ortho for gpkg failed: %s", e)
+
+        # Segments
+        seg_type_band = None
+        if include_segments:
+            try:
+                spectral = None
+                if rgb is not None:
+                    import ortho_io
+                    _, nir_arr = ortho_io.read_ortho_for_als(data)
+                    spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
+                    if rgb is not None:
+                        spectral["red"] = rgb[0].astype(np.float32)
+                        spectral["green"] = rgb[1].astype(np.float32)
+                        spectral["blue"] = rgb[2].astype(np.float32)
+                    if nir_arr is not None:
+                        spectral["nir"] = nir_arr.astype(np.float32)
+
+                result = seg.segment_and_classify(
+                    dtm, dsm, mask, tf, spectral=spectral,
+                )
+                objects = result['objects']
+                labels = result['labels']
+
+                # Type filter
+                if type_filter:
+                    filtered_ids = {o.obj_id for o in objects if o.obj_type in type_filter}
+                else:
+                    filtered_ids = {o.obj_id for o in objects}
+
+                type_raster = np.zeros((h, w), dtype=np.float32)
+                obj_map = {o.obj_id: o for o in objects}
+                for oid in filtered_ids:
+                    if oid in obj_map:
+                        type_raster[labels == oid] = float(obj_map[oid].type_code)
+
+                bands.append('segment_type')
+                arrays.append(type_raster)
+                seg_type_band = type_raster
+            except Exception as e:
+                log.warning("Segments for gpkg failed: %s", e)
+
+        n_bands = len(arrays)
+        with rasterio.open(
+            tmp_path, 'w', driver='GPKG', width=w, height=h,
+            count=n_bands, dtype='float32', crs='EPSG:3035',
+            transform=tf, nodata=np.nan,
+        ) as dst:
+            for i, (arr, name) in enumerate(zip(arrays, bands), 1):
+                # Ensure shape matches
+                out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
+                dst.write(out, i)
+                dst.set_band_description(i, name)
+
+        log.info("GeoPackage export: %d bands, %.1fs", n_bands, time.time() - t0)
+        return send_file(
+            tmp_path, mimetype='application/geopackage+sqlite3',
+            as_attachment=True, download_name='landscape_export.gpkg',
+        )
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error("geopackage export: %s", traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
 
 

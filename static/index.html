@@ -7,51 +7,75 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; height: 100vh; background: #f5f5f5; }
-#sidebar { width: 420px; display: flex; flex-direction: column; background: #fff; border-right: 1px solid #ddd; overflow: hidden; }
-#sidebar h1 { font-size: 16px; padding: 12px 16px; background: #1a1a2e; color: #fff; flex-shrink: 0; }
-#sidebar h1 span { color: #7fdbca; }
-.controls { padding: 10px 16px; flex-shrink: 0; overflow-y: auto; }
-label { display: block; font-size: 12px; font-weight: 600; color: #555; margin: 6px 0 3px; }
-select, input[type=number], input[type=text], textarea { width: 100%; padding: 5px 7px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
-textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertical; }
-.row { display: flex; gap: 8px; }
-.row > * { flex: 1; }
-.btn { padding: 7px 14px; background: #0d7377; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; }
-.btn:hover { background: #14a3a8; }
-.btn:disabled { opacity: .5; cursor: wait; }
-.btn-sm { padding: 4px 10px; font-size: 11px; }
-.btn-outline { background: transparent; color: #0d7377; border: 1px solid #0d7377; }
-.btn-outline:hover { background: #e8f7f7; }
-#result-area { flex: 1; overflow: auto; padding: 0 16px 12px; min-height: 0; }
-.dl-bar { display: flex; gap: 4px; flex-wrap: wrap; padding: 6px 0; }
-#result { font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; background: #f9f9f9; padding: 8px; border-radius: 4px; border: 1px solid #eee; min-height: 40px; max-height: 100%; overflow: auto; }
-#map-area { flex: 1; position: relative; }
-#map { height: 100%; }
-.status { padding: 4px 16px; font-size: 11px; color: #888; background: #f0f0f0; border-top: 1px solid #ddd; flex-shrink: 0; }
-.hint { font-size: 11px; color: #999; margin-top: 2px; }
-.cb-row { display: flex; gap: 12px; align-items: center; margin: 4px 0; }
-.cb-row label { margin: 0; display: flex; align-items: center; gap: 4px; font-weight: 500; cursor: pointer; }
-
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;background:#f5f5f5}
+#sidebar{width:420px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;overflow:hidden;z-index:2000}
+#sidebar h1{font-size:16px;padding:12px 16px;background:#1a1a2e;color:#fff;flex-shrink:0}
+#sidebar h1 span{color:#7fdbca}
+.controls{padding:10px 16px;flex-shrink:0;overflow-y:auto}
+label{display:block;font-size:12px;font-weight:600;color:#555;margin:6px 0 3px}
+select,input[type=number],input[type=text],textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px}
+textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.btn{padding:7px 14px;background:#0d7377;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600}
+.btn:hover{background:#14a3a8}.btn:disabled{opacity:.5;cursor:wait}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn-outline{background:transparent;color:#0d7377;border:1px solid #0d7377}
+.btn-outline:hover{background:#e8f7f7}
+#result-area{flex:1;overflow:auto;padding:0 16px 12px;min-height:0}
+.dl-bar{display:flex;gap:4px;flex-wrap:wrap;padding:6px 0}
+#result{font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;background:#f9f9f9;padding:8px;border-radius:4px;border:1px solid #eee;min-height:40px;max-height:100%;overflow:auto}
+#map-area{flex:1;position:relative}
+#map{height:100%}
+.status{padding:4px 16px;font-size:11px;color:#888;background:#f0f0f0;border-top:1px solid #ddd;flex-shrink:0;display:flex;align-items:center;gap:8px}
+.hint{font-size:11px;color:#999;margin-top:2px}
+.cb-row{display:flex;gap:10px;align-items:center;margin:4px 0;flex-wrap:wrap}
+.cb-row label{margin:0;display:flex;align-items:center;gap:4px;font-weight:500;cursor:pointer;font-size:12px}
 /* Layer panel */
-.layer-panel { position: absolute; top: 10px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.25); padding: 10px 14px; font-size: 12px; min-width: 180px; }
-.layer-panel h3 { font-size: 12px; margin-bottom: 6px; color: #333; }
-.lyr { display: flex; align-items: center; gap: 6px; margin: 5px 0; }
-.lyr input[type=checkbox] { margin: 0; }
-.lyr input[type=range] { width: 60px; height: 14px; }
-.lyr-label { flex: 1; font-size: 11px; }
-
+.layer-panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);padding:10px 14px;font-size:12px;min-width:200px;max-height:80vh;overflow-y:auto}
+.layer-panel h3{font-size:12px;margin-bottom:6px;color:#333}
+.lp-group{margin:4px 0}
+.lp-group-header{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 2px;cursor:pointer;user-select:none}
+.lp-group-header:hover{color:#333}
+.lp-group-body{display:none}
+.lp-group-body.open{display:block}
+.lyr{display:flex;align-items:center;gap:6px;margin:3px 0}
+.lyr input[type=checkbox]{margin:0}
+.lyr input[type=range]{width:55px;height:14px}
+.lyr-label{flex:1;font-size:11px}
 /* Legend */
-.legend { position: absolute; bottom: 24px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); padding: 10px 12px; font-size: 11px; max-width: 240px; max-height: 55vh; overflow-y: auto; }
-.legend h4 { font-size: 11px; margin-bottom: 6px; color: #333; }
-.legend-bar { height: 14px; border-radius: 3px; margin-bottom: 2px; }
-.legend-labels { display: flex; justify-content: space-between; font-size: 10px; color: #666; margin-bottom: 8px; }
-.legend-item { display: flex; align-items: center; gap: 5px; margin: 2px 0; font-size: 10px; cursor: pointer; user-select: none; padding: 1px 2px; border-radius: 3px; }
-.legend-item:hover { background: #f0f0f0; }
-.legend-item.hidden { opacity: 0.35; text-decoration: line-through; }
-.legend-icon { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
-.legend-count { margin-left: auto; color: #999; font-size: 9px; }
+.legend{position:absolute;bottom:24px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:10px 12px;font-size:11px;max-width:260px;max-height:50vh;overflow-y:auto}
+.legend h4{font-size:11px;margin-bottom:4px;color:#333}
+.legend-bar{height:14px;border-radius:3px;margin-bottom:2px}
+.legend-labels{display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:6px}
+.legend-item{display:flex;align-items:center;gap:5px;margin:2px 0;font-size:10px;cursor:pointer;user-select:none;padding:1px 2px;border-radius:3px}
+.legend-item:hover{background:#f0f0f0}
+.legend-item.hidden{opacity:.35;text-decoration:line-through}
+.legend-icon{width:14px;height:14px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0}
+.legend-count{margin-left:auto;color:#999;font-size:9px}
+.color-mode-bar{display:flex;gap:2px;margin:4px 0}
+.color-mode-bar button{flex:1;font-size:10px;padding:3px 6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;border-radius:3px}
+.color-mode-bar button.active{background:#0d7377;color:#fff;border-color:#0d7377}
+.meta-info{font-size:10px;color:#666;margin-bottom:4px;padding:3px 6px;background:#f0f8ff;border-radius:3px}
+/* Spinner */
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #ccc;border-top-color:#0d7377;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* Mobile */
+@media(max-width:900px){
+  body{flex-direction:column}
+  #sidebar{width:100%;height:auto;max-height:45vh;border-right:none;border-bottom:1px solid #ddd}
+  #map-area{flex:1;min-height:0}
+  .layer-panel{top:4px;right:4px;padding:6px 10px;font-size:11px;max-height:50vh}
+  .legend{bottom:4px;right:4px;max-height:35vh;max-width:200px;font-size:10px}
+  .controls{padding:8px 12px}
+  #sidebar h1{font-size:14px;padding:8px 12px}
+  textarea{height:50px}
+}
+@media(max-width:600px){
+  #sidebar{max-height:40vh}
+  .row{flex-direction:column;gap:4px}
+  .cb-row{gap:6px}
+}
 </style>
 </head>
 <body>
@@ -68,22 +92,20 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
     </select>
     <div class="row">
       <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
-      <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: roof,tree,road,excavation)"></div>
+      <div><label>Object Types</label><input id="object_types" type="text" placeholder="all (or: roof,tree,road)"></div>
     </div>
     <div class="cb-row">
-      <label><input id="include_ortho" type="checkbox" checked> Ortho (NDVI)</label>
+      <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
       <label><input id="include_temporal" type="checkbox" checked> Temporal</label>
-    </div>
-    <div class="cb-row">
       <label><input id="include_copernicus" type="checkbox" checked> Copernicus</label>
-      <label><input id="include_cadastre" type="checkbox" checked> Cadastre</label>
     </div>
     <div class="cb-row">
-      <label><input id="include_hansen" type="checkbox"> Hansen Forest</label>
+      <label><input id="include_cadastre" type="checkbox" checked> Cadastre</label>
+      <label><input id="include_hansen" type="checkbox"> Hansen</label>
     </div>
-    <label>Geometry (GeoJSON / KML / coords)</label>
+    <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / coords)</span></label>
     <textarea id="geometry"></textarea>
-    <p class="hint">Or draw on the map. Click ▶ to load the sample polygon.</p>
+    <p class="hint">Or draw on the map — click ▶ Sample for a demo area.</p>
     <div class="row" style="margin-top:6px">
       <button class="btn" id="btn-sample">▶ Sample</button>
       <button class="btn" id="btn-run">🚀 Analyse</button>
@@ -91,34 +113,61 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
   </div>
   <div id="result-area">
     <div class="dl-bar">
-      <button class="btn btn-sm btn-outline" id="btn-copy" title="Copy JSON">📋 Copy</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-json" title="Download GeoJSON">💾 JSON</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-gpkg" title="Download GeoPackage with all layers">📦 GeoPackage</button>
+      <button class="btn btn-sm btn-outline" id="btn-copy">📋 Copy</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-json">💾 JSON</button>
+      <button class="btn btn-sm btn-outline" id="btn-dl-gpkg">📦 GeoPackage</button>
     </div>
     <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
   </div>
-  <div class="status" id="status">Idle</div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span></div>
 </div>
 <div id="map-area">
   <div id="map"></div>
   <div class="layer-panel" id="layer-panel">
     <h3>Layers</h3>
-    <div class="lyr"><input type="checkbox" id="lyr-dtm"><span class="lyr-label">DTM Relief</span><input type="range" id="op-dtm" min="0" max="100" value="80"></div>
-    <div class="lyr"><input type="checkbox" id="lyr-lidar"><span class="lyr-label">nDSM Heights</span><input type="range" id="op-lidar" min="0" max="100" value="70"></div>
-    <div class="lyr"><input type="checkbox" id="lyr-ortho"><span class="lyr-label">Orthophoto</span><input type="range" id="op-ortho" min="0" max="100" value="80"></div>
-    <div class="lyr"><input type="checkbox" id="lyr-segments"><span class="lyr-label">Segment Raster</span><input type="range" id="op-segments" min="0" max="100" value="65"></div>
-    <div class="lyr"><input type="checkbox" id="lyr-objects" checked><span class="lyr-label">Objects</span><input type="range" id="op-objects" min="0" max="100" value="90"></div>
-    <div class="lyr"><input type="checkbox" id="lyr-base" checked><span class="lyr-label">Base map</span><input type="range" id="op-base" min="0" max="100" value="100"></div>
+
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">LIDAR ▸</div>
+      <div class="lp-group-body">
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2024"><span class="lyr-label">DTM 2024</span><input type="range" data-op="dtm-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2023"><span class="lyr-label">DTM 2023</span><input type="range" data-op="dtm-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2022"><span class="lyr-label">DTM 2022</span><input type="range" data-op="dtm-2022" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2024"><span class="lyr-label">nDSM 2024</span><input type="range" data-op="dsm-2024" min="0" max="100" value="70"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2023"><span class="lyr-label">nDSM 2023</span><input type="range" data-op="dsm-2023" min="0" max="100" value="70"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2022"><span class="lyr-label">nDSM 2022</span><input type="range" data-op="dsm-2022" min="0" max="100" value="70"></div>
+      </div>
+    </div>
+
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ORTHO & FOREST ▸</div>
+      <div class="lp-group-body">
+        <div class="lyr"><input type="checkbox" data-lyr="ortho"><span class="lyr-label">Orthophoto</span><input type="range" data-op="ortho" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="hansen"><span class="lyr-label">Hansen Forest Δ</span><input type="range" data-op="hansen" min="0" max="100" value="70"></div>
+      </div>
+    </div>
+
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ANALYSIS ▸</div>
+      <div class="lp-group-body open">
+        <div class="lyr"><input type="checkbox" data-lyr="raster"><span class="lyr-label">Segment Raster</span><input type="range" data-op="raster" min="0" max="100" value="65"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="segments" checked><span class="lyr-label">Segments</span><input type="range" data-op="segments" min="0" max="100" value="90"></div>
+      </div>
+    </div>
+
+    <div class="lyr" style="margin-top:6px;border-top:1px solid #eee;padding-top:4px"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
   </div>
   <div class="legend" id="legend" style="display:none">
-    <h4>Height (viridis)</h4>
-    <div class="legend-bar" id="viridis-bar"></div>
-    <div class="legend-labels"><span>0 m</span><span>10</span><span>20</span><span>30+ m</span></div>
-    <h4 style="margin-top:6px">Object Types</h4>
+    <div id="meta-info" class="meta-info" style="display:none"></div>
+    <div class="color-mode-bar" id="color-mode-bar">
+      <button id="cm-type" class="active" onclick="setColorMode('type')">Type</button>
+      <button id="cm-height" onclick="setColorMode('height')">Height</button>
+    </div>
+    <div id="legend-scale"></div>
+    <h4 id="legend-types-title">Object Types</h4>
     <div id="legend-types"></div>
-    <div id="summary-panel" style="display:none; margin-top:8px; padding-top:6px; border-top:1px solid #ddd;">
+    <div id="summary-panel" style="display:none;margin-top:6px;padding-top:6px;border-top:1px solid #ddd">
       <h4>Summary</h4>
-      <div id="summary-content" style="font-size:10px; margin-top:4px;"></div>
+      <div id="summary-content" style="font-size:10px;margin-top:4px"></div>
     </div>
   </div>
 </div>
@@ -126,491 +175,369 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-// ======= VIRIDIS COLORMAP =======
-const VIRIDIS = [
-  [68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],
-  [32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]
-];
-function viridis(t) {
-  t = Math.max(0, Math.min(1, t));
-  const idx = t * (VIRIDIS.length - 1);
-  const lo = Math.floor(idx), hi = Math.min(lo + 1, VIRIDIS.length - 1);
-  const f = idx - lo;
-  return [
-    Math.round(VIRIDIS[lo][0] + f * (VIRIDIS[hi][0] - VIRIDIS[lo][0])),
-    Math.round(VIRIDIS[lo][1] + f * (VIRIDIS[hi][1] - VIRIDIS[lo][1])),
-    Math.round(VIRIDIS[lo][2] + f * (VIRIDIS[hi][2] - VIRIDIS[lo][2]))
-  ];
-}
-function viridisCSS(t) { const c = viridis(t); return `rgb(${c[0]},${c[1]},${c[2]})`; }
-function viridisGradient() {
-  const stops = [];
-  for (let i = 0; i <= 10; i++) stops.push(viridisCSS(i / 10) + ` ${i * 10}%`);
-  return `linear-gradient(to right, ${stops.join(', ')})`;
-}
+// ============ COLORMAPS ============
+const VIRIDIS=[[68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],[32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]];
+function viridis(t){t=Math.max(0,Math.min(1,t));const i=t*(VIRIDIS.length-1),lo=Math.floor(i),hi=Math.min(lo+1,VIRIDIS.length-1),f=i-lo;return VIRIDIS[lo].map((v,c)=>Math.round(v+f*(VIRIDIS[hi][c]-v)));}
+function viridisCSS(t){const c=viridis(t);return`rgb(${c[0]},${c[1]},${c[2]})`}
+function viridisGrad(){const s=[];for(let i=0;i<=10;i++)s.push(viridisCSS(i/10)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
+function divCSS(t){const n=(t+1)/2;let r,g,b;if(n<.5){const f=n*2;r=33+f*222;g=102+f*153;b=172+f*83}else{const f=(n-.5)*2;r=255-f*37;g=255-f*192;b=255-f*192}return`rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`}
+function divGrad(){const s=[];for(let i=0;i<=10;i++)s.push(divCSS(-1+i*.2)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
 
-// ======= OBJECT TYPE SHAPES (SVG) =======
-const TYPE_SHAPES = {
-  tree:          { shape: 'triangle', label: '▲', color: '#006400' },
-  shrub:         { shape: 'triangle', label: '▲', color: '#228B22' },
-  grass:         { shape: 'circle',   label: '●', color: '#7CFC00' },
-  hedge:         { shape: 'dash',     label: '—', color: '#2E8B57' },
-  water:         { shape: 'circle',   label: '●', color: '#1E90FF' },
-  roof:          { shape: 'square',   label: '■', color: '#DC143C' },
-  greenhouse:    { shape: 'square',   label: '□', color: '#FF69B4' },
-  solar_panel:   { shape: 'square',   label: '◫', color: '#4169E1' },
-  fence:         { shape: 'dash',     label: '—', color: '#A0522D' },
-  wall:          { shape: 'dash',     label: '—', color: '#8B4513' },
-  mast:          { shape: 'cross',    label: '✦', color: '#404040' },
-  road:          { shape: 'square',   label: '■', color: '#808080' },
-  path:          { shape: 'dash',     label: '—', color: '#A9A9A9' },
-  parking:       { shape: 'square',   label: '▪', color: '#696969' },
-  bridge:        { shape: 'diamond',  label: '◆', color: '#708090' },
-  crop:          { shape: 'circle',   label: '●', color: '#DAA520' },
-  orchard:       { shape: 'triangle', label: '▲', color: '#6B8E23' },
-  vineyard:      { shape: 'triangle', label: '▲', color: '#9370DB' },
-  garden:        { shape: 'circle',   label: '●', color: '#3CB371' },
-  bare_soil:     { shape: 'cross',    label: '×', color: '#D2B48C' },
-  rock:          { shape: 'cross',    label: '×', color: '#8B8682' },
-  excavation:    { shape: 'diamond',  label: '◆', color: '#8B0000' },
-  fill:          { shape: 'diamond',  label: '◆', color: '#FF8C00' },
-  clear_cut:     { shape: 'diamond',  label: '◆', color: '#FF00FF' },
-  construction:  { shape: 'diamond',  label: '◆', color: '#FF4500' },
-};
-const DEFAULT_SHAPE = { shape: 'circle', label: '○', color: '#666' };
+// ============ TYPE CONFIG ============
+const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},clear_cut:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'}};
+const STATUS_COLORS={grown:{l:'▲',c:'#228B22'},felled:{l:'▼',c:'#DC143C'},new:{l:'★',c:'#00BFFF'},stable:{l:'●',c:'#888'},declined:{l:'▼',c:'#FF8C00'},dead:{l:'✖',c:'#8B0000'}};
+const EVENT_COLORS={tree_growth:{l:'▲',c:'#228B22'},tree_felling:{l:'▼',c:'#DC143C'},new_tree:{l:'★',c:'#00BFFF'},forest_clearcut:{l:'◆',c:'#FF00FF'},vegetation_growth:{l:'▲',c:'#7CFC00'},vegetation_loss:{l:'▼',c:'#FF8C00'},new_building:{l:'■',c:'#DC143C'},demolition:{l:'□',c:'#FF4500'},construction:{l:'■',c:'#FF6347'},earthwork_fill:{l:'◆',c:'#DAA520'},earthwork_cut:{l:'◇',c:'#8B4513'},earthwork_grading:{l:'◆',c:'#A0522D'},earthwork_dam:{l:'█',c:'#696969'},earthwork_trench:{l:'—',c:'#404040'},earthwork_pond:{l:'●',c:'#1E90FF'},road_new:{l:'—',c:'#808080'},road_resurfaced:{l:'—',c:'#A9A9A9'},road_widened:{l:'—',c:'#696969'},surface_change:{l:'×',c:'#D2B48C'},unknown_change:{l:'?',c:'#888'}};
+const DEF={l:'○',c:'#666'};
+function typeInfo(t,ep){if(ep==='changes/trees')return STATUS_COLORS[t]||DEF;if(ep==='changes')return EVENT_COLORS[t]||DEF;return TYPE_SHAPES[t]||DEF;}
 
-function makeSVGMarker(type, heightM, areaSqm) {
-  const info = TYPE_SHAPES[type] || DEFAULT_SHAPE;
-  const fill = heightM > 0.5 ? viridisCSS(Math.min(heightM / 35, 1)) : info.color;
-  const r = 5, d = 10;
+function mkIcon(info,colorOvr){
+  const fill=colorOvr||info.c||'#666',r=5,d=10;
   let svg;
-  const s = info.shape;
-  if (s === 'triangle') svg = `<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  else if (s === 'square') svg = `<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width="0.8" rx="1"/>`;
-  else if (s === 'diamond') svg = `<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  else if (s === 'cross') svg = `<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
-  else if (s === 'dash') svg = `<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width="0.5" rx="1"/>`;
-  else svg = `<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width="0.8"/>`;
-  return L.divIcon({
-    html: `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">${svg}</svg>`,
-    iconSize: [d, d], iconAnchor: [r, r], className: ''
+  const s=info.s||'cir';
+  if(s==='tri')svg=`<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  else if(s==='sq')svg=`<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width=".8" rx="1"/>`;
+  else if(s==='dia')svg=`<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  else if(s==='x')svg=`<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
+  else if(s==='dash')svg=`<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width=".5" rx="1"/>`;
+  else svg=`<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  return L.divIcon({html:`<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">${svg}</svg>`,iconSize:[d,d],iconAnchor:[r,r],className:''});
+}
+
+// ============ MAP ============
+const map=L.map('map').setView([47.137,15.117],14);
+const baseLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}).addTo(map);
+const drawnItems=new L.FeatureGroup().addTo(map);
+const resultLayer=new L.FeatureGroup().addTo(map);
+
+new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:true,marker:true,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
+map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);});
+
+// ============ STATE ============
+let colorMode='type';
+const hiddenTypes=new Set();
+let markersByType={};
+let lastResult=null, lastEndpoint='segment', allFeatureData=[];
+
+// Dynamic overlays: id -> L.imageOverlay
+const overlays={};
+
+// Layer definitions: id -> {url-builder, dataset}
+const LAYER_DEFS={
+  'dtm-2024':{url:'/api/v1/dtm/overlay',ds:'20240915'},
+  'dtm-2023':{url:'/api/v1/dtm/overlay',ds:'20230915'},
+  'dtm-2022':{url:'/api/v1/dtm/overlay',ds:'20220915'},
+  'dsm-2024':{url:'/api/v1/lidar/overlay',ds:'20240915'},
+  'dsm-2023':{url:'/api/v1/lidar/overlay',ds:'20230915'},
+  'dsm-2022':{url:'/api/v1/lidar/overlay',ds:'20220915'},
+  'ortho':{url:'/api/v1/ortho/overlay',ds:'20240915'},
+  'hansen':{url:'/api/v1/hansen/overlay',ds:'20240915'},
+  'raster':{url:null}, // special
+};
+
+// ============ SPINNER ============
+let loadingCount=0;
+function showLoading(msg){loadingCount++;document.getElementById('spinner').style.display='';document.getElementById('status-text').textContent=msg||'Loading...';}
+function hideLoading(msg){loadingCount=Math.max(0,loadingCount-1);if(!loadingCount){document.getElementById('spinner').style.display='none';document.getElementById('status-text').textContent=msg||'Done.';}}
+function setStatus(msg){document.getElementById('status-text').textContent=msg;}
+
+// ============ COLOR MODE ============
+function setColorMode(m){
+  colorMode=m;
+  document.querySelectorAll('.color-mode-bar button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('cm-'+m).classList.add('active');
+  updateLegendScale();
+  reRenderMarkers();
+  if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked) reloadRasterOverlay();
+}
+function updateLegendScale(){
+  const d=document.getElementById('legend-scale');
+  if(colorMode==='height'){
+    d.innerHTML=`<div class="legend-bar" style="background:${viridisGrad()}"></div><div class="legend-labels"><span>0 m</span><span>10</span><span>20</span><span>30+ m</span></div>`;
+  } else if(lastEndpoint==='changes'||lastEndpoint==='changes/trees'){
+    d.innerHTML=`<div class="legend-bar" style="background:${divGrad()}"></div><div class="legend-labels"><span>−5 m</span><span>0</span><span>+5 m</span></div>`;
+  } else d.innerHTML='';
+}
+function markerColor(f){
+  const p=f.properties;
+  if(colorMode==='height'){const h=p.height_max_m||p.height_after_m||p.height_max||0;return viridisCSS(Math.min(h/35,1));}
+  if(lastEndpoint==='changes/trees'){const dh=p.height_change_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
+  if(lastEndpoint==='changes'){const dh=p.height_change_mean_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
+  return null;
+}
+function reRenderMarkers(){resultLayer.clearLayers();markersByType={};if(allFeatureData.length)showFeaturesOnMap({features:allFeatureData});}
+
+// ============ LEGEND ============
+function buildLegend(typeCounts,tiMap){
+  const d=document.getElementById('legend-types');
+  d.innerHTML='';
+  const sorted=Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]);
+  const total=sorted.reduce((s,[,n])=>s+n,0);
+  for(const[t,count]of sorted){
+    const info=tiMap[t]||DEF;
+    const el=document.createElement('div');
+    el.className='legend-item'+(hiddenTypes.has(t)?' hidden':'');
+    el.innerHTML=`<span class="legend-icon" style="color:${info.c}">${info.l}</span><span>${t.replace(/_/g,' ')}</span><span class="legend-count">${count} (${(count/total*100).toFixed(0)}%)</span>`;
+    el.onclick=()=>{if(hiddenTypes.has(t)){hiddenTypes.delete(t);el.classList.remove('hidden')}else{hiddenTypes.add(t);el.classList.add('hidden')}applyVis();if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked)reloadRasterOverlay();};
+    d.appendChild(el);
+  }
+}
+function applyVis(){
+  for(const[t,layers]of Object.entries(markersByType)){
+    const vis=!hiddenTypes.has(t);
+    for(const lyr of layers){const el=lyr._icon||lyr.getElement?.();if(el)el.style.display=vis?'':'none';}
+  }
+}
+
+// ============ LAYER CONTROLS ============
+function layerOpacity(id){
+  const sl=document.querySelector(`[data-op="${id}"]`);
+  const cb=document.querySelector(`[data-lyr="${id}"]`);
+  if(!sl||!cb)return 0;
+  return cb.checked?sl.value/100:0;
+}
+function applyOpacity(id){
+  if(id==='base'){baseLayer.setOpacity(layerOpacity('base'));return;}
+  if(id==='segments'){
+    const op=layerOpacity('segments');
+    resultLayer.eachLayer(l=>{if(l.setOpacity)l.setOpacity(op);else if(l._icon)l._icon.style.opacity=op;});
+    return;
+  }
+  const ovl=overlays[id];
+  if(ovl&&ovl.setOpacity)ovl.setOpacity(layerOpacity(id));
+}
+function orderLayers(){
+  // bottom-to-top: base, ortho, dtms, dsms, hansen, raster, segments
+  baseLayer.bringToBack();
+  ['ortho','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
+    if(overlays[id])overlays[id].bringToFront();
   });
 }
 
-// ======= MAP SETUP =======
-const map = L.map('map').setView([47.137, 15.117], 14);
-const baseLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OSM', maxZoom: 19
-}).addTo(map);
-
-const drawnItems = new L.FeatureGroup().addTo(map);
-const resultLayer = new L.FeatureGroup().addTo(map);
-let dtmOverlay = null, lidarOverlay = null, orthoOverlay = null, segmentOverlay = null;
-
-new L.Control.Draw({
-  edit: { featureGroup: drawnItems },
-  draw: { polygon: true, polyline: true, marker: true, rectangle: true, circle: false, circlemarker: false }
-}).addTo(map);
-
-map.on(L.Draw.Event.CREATED, e => {
-  drawnItems.clearLayers();
-  drawnItems.addLayer(e.layer);
-  document.getElementById('geometry').value = JSON.stringify(e.layer.toGeoJSON().geometry, null, 2);
+// Wire all checkboxes & sliders
+document.querySelectorAll('[data-lyr]').forEach(cb=>{
+  const id=cb.dataset.lyr;
+  cb.onchange=()=>handleLayerToggle(id);
+  const sl=document.querySelector(`[data-op="${id}"]`);
+  if(sl)sl.oninput=()=>applyOpacity(id);
 });
 
-// ======= LEGEND =======
-document.getElementById('viridis-bar').style.background = viridisGradient();
-const hiddenTypes = new Set();
-let markersByType = {};
-
-function buildLegend(typeCounts) {
-  const ltDiv = document.getElementById('legend-types');
-  ltDiv.innerHTML = '';
-  const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
-  const total = sorted.reduce((s, [,n]) => s + n, 0);
-  for (const [t, count] of sorted) {
-    const info = TYPE_SHAPES[t] || DEFAULT_SHAPE;
-    const pct = (count / total * 100).toFixed(0);
-    const el = document.createElement('div');
-    el.className = 'legend-item' + (hiddenTypes.has(t) ? ' hidden' : '');
-    el.dataset.type = t;
-    el.innerHTML = `<span class="legend-icon" style="color:${info.color}">${info.label}</span>`
-      + `<span>${t.replace(/_/g,' ')}</span>`
-      + `<span class="legend-count">${count} (${pct}%)</span>`;
-    el.onclick = () => toggleType(t, el);
-    ltDiv.appendChild(el);
-  }
+function getPostArgs(){
+  const raw=document.getElementById('geometry').value.trim();
+  if(!raw)return null;
+  try{const p=JSON.parse(raw);return{ct:'application/json',body:JSON.stringify({geometry:p})};}
+  catch(e){return{ct:'text/plain',body:raw};}
 }
 
-function toggleType(type, el) {
-  if (hiddenTypes.has(type)) {
-    hiddenTypes.delete(type);
-    el.classList.remove('hidden');
-  } else {
-    hiddenTypes.add(type);
-    el.classList.add('hidden');
-  }
-  applyTypeVisibility();
-  // Reload segment raster overlay with filter if it's active
-  if (document.getElementById('lyr-segments').checked && segmentOverlay) {
-    reloadSegmentOverlay();
-  }
-}
-
-function applyTypeVisibility() {
-  for (const [t, layers] of Object.entries(markersByType)) {
-    const visible = !hiddenTypes.has(t);
-    for (const lyr of layers) {
-      const el = lyr._icon || lyr.getElement?.();
-      if (el) el.style.display = visible ? '' : 'none';
-    }
-  }
-}
-
-// ======= LAYER CONTROLS =======
-function updateLayerOpacity(id, layer) {
-  const slider = document.getElementById('op-' + id);
-  const cb = document.getElementById('lyr-' + id);
-  if (!layer) return;
-  if (id === 'base') {
-    layer.setOpacity(cb.checked ? slider.value / 100 : 0);
-  } else if (id === 'objects') {
-    const op = cb.checked ? slider.value / 100 : 0;
-    resultLayer.eachLayer(l => { if (l.setOpacity) l.setOpacity(op); else if (l._icon) l._icon.style.opacity = op; });
-  } else {
-    if (layer && layer.setOpacity) layer.setOpacity(cb.checked ? slider.value / 100 : 0);
-  }
-}
-function getLayerForId(id) {
-  if (id === 'base') return baseLayer;
-  if (id === 'dtm') return dtmOverlay;
-  if (id === 'lidar') return lidarOverlay;
-  if (id === 'ortho') return orthoOverlay;
-  if (id === 'segments') return segmentOverlay;
-  if (id === 'objects') return resultLayer;
-  return null;
-}
-['base','dtm','lidar','ortho','segments','objects'].forEach(id => {
-  const sl = document.getElementById('op-' + id);
-  const cb = document.getElementById('lyr-' + id);
-  sl.oninput = () => updateLayerOpacity(id, getLayerForId(id));
-  if (id === 'base' || id === 'objects') {
-    cb.onchange = () => updateLayerOpacity(id, getLayerForId(id));
-  }
-});
-
-// ======= SAMPLE =======
-const SAMPLE_GEOJSON = {"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
-document.getElementById('btn-sample').onclick = () => {
-  document.getElementById('geometry').value = JSON.stringify(SAMPLE_GEOJSON, null, 2);
-  drawnItems.clearLayers();
-  const coords = SAMPLE_GEOJSON.coordinates[0].map(c => [c[1], c[0]]);
-  const poly = L.polygon(coords, {color: '#0d7377', weight: 2, fillOpacity: 0.05}).addTo(drawnItems);
-  map.fitBounds(poly.getBounds().pad(0.1));
-};
-
-// ======= CURRENT GEOMETRY =======
-function getCurrentGeometry() {
-  return document.getElementById('geometry').value.trim();
-}
-function getGeomBody() {
-  const raw = getCurrentGeometry();
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return { json: true, body: JSON.stringify({geometry: parsed}) };
-  } catch(e) {
-    return { json: false, body: raw };
-  }
-}
-
-// ======= OVERLAY LOADING =======
-async function loadOverlay(type) {
-  const gb = getGeomBody();
-  if (!gb) return;
-  const status = document.getElementById('status');
-  status.textContent = `Loading ${type} overlay...`;
-  try {
-    const resp = await fetch(`/api/v1/${type}/overlay`, {
-      method: 'POST',
-      headers: { 'Content-Type': gb.json ? 'application/json' : 'text/plain' },
-      body: gb.body
-    });
-    if (!resp.ok) throw new Error((await resp.json()).error);
-    const bounds_str = resp.headers.get('X-Bounds');
-    if (!bounds_str) throw new Error('No bounds in response');
-    const [south, west, north, east] = bounds_str.split(',').map(Number);
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const imageBounds = [[south, west], [north, east]];
-    return L.imageOverlay(url, imageBounds, { opacity: 0.7, interactive: false });
-  } catch(e) {
-    status.textContent = `${type} overlay failed: ${e.message}`;
-    return null;
-  }
-}
-
-async function loadSegmentOverlay(typeFilter) {
-  const gb = getGeomBody();
-  if (!gb) return null;
-  const status = document.getElementById('status');
-  status.textContent = 'Loading segment raster...';
-  try {
-    let url = '/api/v1/segment/overlay?include_ortho=true';
-    if (document.getElementById('include_copernicus').checked) url += '&include_copernicus=true';
-    if (document.getElementById('include_cadastre').checked) url += '&include_cadastre=true';
-    if (document.getElementById('include_hansen').checked) url += '&include_hansen=true';
-    if (typeFilter && typeFilter.length > 0) url += '&types=' + typeFilter.join(',');
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': gb.json ? 'application/json' : 'text/plain' },
-      body: gb.body
-    });
-    if (!resp.ok) throw new Error((await resp.json()).error);
-    const bounds_str = resp.headers.get('X-Bounds');
-    if (!bounds_str) throw new Error('No bounds in response');
-    const [south, west, north, east] = bounds_str.split(',').map(Number);
-    const blob = await resp.blob();
-    const imgUrl = URL.createObjectURL(blob);
-    const imageBounds = [[south, west], [north, east]];
-    return L.imageOverlay(imgUrl, imageBounds, { opacity: 0.65, interactive: false });
-  } catch(e) {
-    status.textContent = `Segment overlay failed: ${e.message}`;
-    return null;
-  }
-}
-
-async function reloadSegmentOverlay() {
-  // Get visible types (all except hidden)
-  const allTypes = Object.keys(TYPE_SHAPES);
-  const visibleTypes = allTypes.filter(t => !hiddenTypes.has(t));
-  // Only send filter if some types are hidden
-  const filter = hiddenTypes.size > 0 ? visibleTypes : null;
-
-  if (segmentOverlay) { map.removeLayer(segmentOverlay); segmentOverlay = null; }
-  const ovl = await loadSegmentOverlay(filter);
-  if (ovl) {
-    segmentOverlay = ovl;
-    ovl.addTo(map);
-    orderLayers();
-    updateLayerOpacity('segments', ovl);
-  }
-  document.getElementById('status').textContent = 'Done.';
-}
-
-function orderLayers() {
-  if (orthoOverlay) orthoOverlay.bringToBack();
-  if (dtmOverlay) dtmOverlay.bringToFront();
-  if (lidarOverlay) lidarOverlay.bringToFront();
-  if (segmentOverlay) segmentOverlay.bringToFront();
-  baseLayer.bringToBack();
-}
-
-async function handleOverlayToggle(id, urlPath) {
-  const cb = document.getElementById('lyr-' + id);
-  const status = document.getElementById('status');
-  const getOvl = () => id === 'dtm' ? dtmOverlay : id === 'lidar' ? lidarOverlay : id === 'ortho' ? orthoOverlay : segmentOverlay;
-  const setOvl = (v) => { if (id === 'dtm') dtmOverlay = v; else if (id === 'lidar') lidarOverlay = v; else if (id === 'ortho') orthoOverlay = v; else segmentOverlay = v; };
-
-  if (cb.checked && !getOvl()) {
+async function handleLayerToggle(id){
+  const cb=document.querySelector(`[data-lyr="${id}"]`);
+  if(id==='base'||id==='segments'){applyOpacity(id);return;}
+  if(!cb.checked){applyOpacity(id);return;}
+  if(overlays[id]){applyOpacity(id);return;}
+  // Need to load
+  const args=getPostArgs();
+  if(!args){cb.checked=false;return;}
+  showLoading(`Loading ${id}...`);
+  try{
     let ovl;
-    if (id === 'segments') {
-      ovl = await loadSegmentOverlay(null);
-    } else {
-      ovl = await loadOverlay(urlPath);
+    if(id==='raster')ovl=await loadRasterOverlay(null);
+    else{
+      const def=LAYER_DEFS[id];
+      const url=def.url+'?dataset='+def.ds;
+      const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+      if(!resp.ok)throw new Error((await resp.json()).error);
+      const bs=resp.headers.get('X-Bounds');
+      if(!bs)throw new Error('No bounds');
+      const[s,w,n,e]=bs.split(',').map(Number);
+      const blob=await resp.blob();
+      ovl=L.imageOverlay(URL.createObjectURL(blob),[[s,w],[n,e]],{opacity:.7,interactive:false});
     }
-    if (ovl) {
-      setOvl(ovl);
-      ovl.addTo(map);
-      orderLayers();
-      updateLayerOpacity(id, ovl);
-    } else {
-      cb.checked = false;
-    }
-  }
-  if (getOvl()) updateLayerOpacity(id, getOvl());
-  status.textContent = 'Done.';
+    if(ovl){overlays[id]=ovl;ovl.addTo(map);orderLayers();applyOpacity(id);}
+    else cb.checked=false;
+    hideLoading();
+  }catch(e){hideLoading(`${id} failed: ${e.message}`);cb.checked=false;}
 }
-document.getElementById('lyr-dtm').onchange = () => handleOverlayToggle('dtm', 'dtm');
-document.getElementById('lyr-lidar').onchange = () => handleOverlayToggle('lidar', 'lidar');
-document.getElementById('lyr-ortho').onchange = () => handleOverlayToggle('ortho', 'ortho');
-document.getElementById('lyr-segments').onchange = () => handleOverlayToggle('segments', 'segment');
 
-// ======= ANALYSE =======
-let lastResult = null;
-document.getElementById('btn-run').onclick = async () => {
-  const btn = document.getElementById('btn-run');
-  const status = document.getElementById('status');
-  const resultDiv = document.getElementById('result');
-  const endpoint = document.getElementById('endpoint').value;
-  const geometry = getCurrentGeometry();
-  if (!geometry) { resultDiv.textContent = 'Please provide geometry first.'; return; }
+async function loadRasterOverlay(typeFilter){
+  const args=getPostArgs();
+  if(!args)return null;
+  let url='/api/v1/segment/overlay?include_ortho=true&color_mode='+colorMode;
+  if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
+  if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
+  if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
+  if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
+  const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+  if(!resp.ok)throw new Error((await resp.json()).error);
+  const bs=resp.headers.get('X-Bounds');
+  if(!bs)throw new Error('No bounds');
+  const[s,w,n,e]=bs.split(',').map(Number);
+  const blob=await resp.blob();
+  return L.imageOverlay(URL.createObjectURL(blob),[[s,w],[n,e]],{opacity:.65,interactive:false});
+}
 
-  btn.disabled = true;
-  status.textContent = 'Analysing... (remote LIDAR reads may take 10-30s)';
-  resultDiv.textContent = 'Loading...';
-  resultLayer.clearLayers();
-  markersByType = {};
-  document.getElementById('legend-types').innerHTML = '';
-  // Clear overlays so they reload with new geometry
-  if (dtmOverlay) { map.removeLayer(dtmOverlay); dtmOverlay = null; }
-  if (lidarOverlay) { map.removeLayer(lidarOverlay); lidarOverlay = null; }
-  if (orthoOverlay) { map.removeLayer(orthoOverlay); orthoOverlay = null; }
-  if (segmentOverlay) { map.removeLayer(segmentOverlay); segmentOverlay = null; }
-  document.getElementById('lyr-dtm').checked = false;
-  document.getElementById('lyr-lidar').checked = false;
-  document.getElementById('lyr-ortho').checked = false;
-  document.getElementById('lyr-segments').checked = false;
+async function reloadRasterOverlay(){
+  const vis=Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t));
+  const filter=hiddenTypes.size>0?vis:null;
+  if(overlays.raster){map.removeLayer(overlays.raster);delete overlays.raster;}
+  showLoading('Re-rendering raster...');
+  try{
+    const ovl=await loadRasterOverlay(filter);
+    if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
+  }catch(e){/* ignore */}
+  hideLoading();
+}
 
-  const isSegment = endpoint === 'segment';
-  const params = new URLSearchParams();
-  if (isSegment) {
-    params.set('min_object_size', parseInt(document.getElementById('min_area').value) || 30);
-  }
-  const ot = document.getElementById('object_types').value.trim();
-  if (ot) params.set(isSegment ? 'types' : 'object_types', ot);
-  if (document.getElementById('include_ortho').checked) params.set('include_ortho', 'true');
-  if (document.getElementById('include_temporal').checked) params.set('include_temporal', 'true');
-  if (document.getElementById('include_copernicus').checked) params.set('include_copernicus', 'true');
-  if (document.getElementById('include_cadastre').checked) params.set('include_cadastre', 'true');
-  if (document.getElementById('include_hansen').checked) params.set('include_hansen', 'true');
-
-  let contentType = 'text/plain', sendBody = geometry;
-  try {
-    const parsed = JSON.parse(geometry);
-    contentType = 'application/json';
-    sendBody = JSON.stringify({geometry: parsed});
-  } catch(e) {}
-
-  try {
-    const resp = await fetch(`/api/v1/${endpoint}?${params}`, {
-      method: 'POST', headers: { 'Content-Type': contentType }, body: sendBody
-    });
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error);
-    lastResult = data;
-    resultDiv.textContent = JSON.stringify(data, null, 2);
-    if (data.features) showObjectsOnMap(data);
-    status.textContent = 'Done.';
-  } catch(e) {
-    resultDiv.textContent = 'Error: ' + e.message;
-    status.textContent = 'Error';
-    lastResult = null;
-  } finally {
-    btn.disabled = false;
-  }
+// ============ SAMPLE ============
+const SAMPLE={"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
+document.getElementById('btn-sample').onclick=()=>{
+  document.getElementById('geometry').value=JSON.stringify(SAMPLE,null,2);
+  drawnItems.clearLayers();
+  const coords=SAMPLE.coordinates[0].map(c=>[c[1],c[0]]);
+  const poly=L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+  map.fitBounds(poly.getBounds().pad(.1));
 };
 
-function buildSummary(data) {
-  const panel = document.getElementById('summary-panel');
-  const content = document.getElementById('summary-content');
-  if (!data.features || !data.features.length) { panel.style.display = 'none'; return; }
-  panel.style.display = '';
-  let totalCount = data.features.length;
-  let totalArea = 0, manmadeArea = 0;
-  for (const f of data.features) {
-    const area = f.properties.area_sqm || 0;
-    totalArea += area;
-    if (f.properties.is_manmade === true || f.properties.is_manmade === 1) manmadeArea += area;
+function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8);}
+
+// ============ ANALYSE ============
+document.getElementById('btn-run').onclick=async()=>{
+  const btn=document.getElementById('btn-run');
+  const resultDiv=document.getElementById('result');
+  const endpoint=document.getElementById('endpoint').value;
+  const geometry=document.getElementById('geometry').value.trim();
+  if(!geometry){resultDiv.textContent='Provide geometry first.';return;}
+
+  btn.disabled=true;
+  showLoading('Analysing... (remote reads may take 10-30s)');
+  resultDiv.textContent='Loading...';
+  resultLayer.clearLayers();
+  markersByType={};allFeatureData=[];hiddenTypes.clear();
+  document.getElementById('legend-types').innerHTML='';
+  // Clear all dynamic overlays
+  for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
+  for(const k of Object.keys(overlays))delete overlays[k];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.dataset.lyr!=='segments'&&cb.dataset.lyr!=='base')cb.checked=false;});
+
+  lastEndpoint=endpoint;
+  const isSeg=endpoint==='segment';
+  const params=new URLSearchParams();
+  if(isSeg)params.set('min_object_size',parseInt(document.getElementById('min_area').value)||30);
+  const ot=document.getElementById('object_types').value.trim();
+  if(ot)params.set(isSeg?'types':'object_types',ot);
+  if(document.getElementById('include_ortho').checked)params.set('include_ortho','true');
+  if(document.getElementById('include_temporal').checked)params.set('include_temporal','true');
+  if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
+  if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
+  if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
+
+  let ct='text/plain',body=geometry;
+  try{const p=JSON.parse(geometry);ct='application/json';body=JSON.stringify({geometry:p});}catch(e){}
+
+  try{
+    const resp=await fetch(`/api/v1/${endpoint}?${params}`,{method:'POST',headers:{'Content-Type':ct},body});
+    const data=await resp.json();
+    if(data.error)throw new Error(data.error);
+    lastResult=data;
+    resultDiv.textContent=JSON.stringify(data,null,2);
+    if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+    hideLoading();
+  }catch(e){
+    resultDiv.textContent='Error: '+e.message;
+    hideLoading('Error');
+    lastResult=null;
+  }finally{btn.disabled=false;}
+};
+
+function showResultOnMap(data){
+  document.getElementById('legend').style.display='';
+  const mi=document.getElementById('meta-info');
+  const meta=data.meta||{};
+  let mh='';
+  if(meta.date_a)mh+=`<b>${fmtDate(meta.date_a)}</b> → <b>${fmtDate(meta.date_b)}</b>`;
+  if(meta.dataset&&!meta.date_a)mh+=`<b>Dataset:</b> ${fmtDate(meta.dataset)}`;
+  if(meta.processing_time_s)mh+=(mh?' &nbsp; ':'')+`${meta.processing_time_s}s`;
+  mi.innerHTML=mh;mi.style.display=mh?'':'none';
+
+  const cmBar=document.getElementById('color-mode-bar');
+  cmBar.style.display=['segment','changes','changes/trees'].includes(lastEndpoint)?'':'none';
+  updateLegendScale();
+
+  const typeCounts={};
+  let tiMap=lastEndpoint==='changes/trees'?STATUS_COLORS:lastEndpoint==='changes'?EVENT_COLORS:TYPE_SHAPES;
+  for(const f of data.features){
+    const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+    typeCounts[t]=(typeCounts[t]||0)+1;
   }
-  const manmadePct = totalArea > 0 ? (manmadeArea / totalArea * 100).toFixed(1) : '0.0';
-  const eval_ = data.cadastre_evaluation || data.evaluation;
-  let html = `<b>${totalCount}</b> objects &nbsp; <b>${manmadePct}%</b> manmade`;
-  if (eval_) html += `<br><b>Cadastre:</b> P=${eval_.precision} R=${eval_.recall} F1=${eval_.f1}`;
-  if (data.hansen_evaluation) html += `<br><b>Hansen:</b> P=${data.hansen_evaluation.precision} R=${data.hansen_evaluation.recall} F1=${data.hansen_evaluation.f1}`;
-  content.innerHTML = html;
+  document.getElementById('legend-types-title').textContent=lastEndpoint==='changes/trees'?'Tree Status':lastEndpoint==='changes'?'Event Types':'Object Types';
+  buildLegend(typeCounts,tiMap);
+  buildSummary(data);
+  showFeaturesOnMap(data);
 }
 
-function showObjectsOnMap(data) {
-  document.getElementById('legend').style.display = '';
-  markersByType = {};
-
-  const typeCounts = {};
-  for (const f of data.features) {
-    const t = (f.properties.type || f.properties.obj_type || f.properties.event_type || 'unknown');
-    typeCounts[t] = (typeCounts[t] || 0) + 1;
-  }
-
-  buildLegend(typeCounts);
-  buildSummary(data);
-
-  const gj = L.geoJSON(data, {
-    pointToLayer: (f, ll) => {
-      const p = f.properties;
-      const t = p.type || p.obj_type || p.event_type || '';
-      const h = p.height_max_m || p.height_max || 0;
-      const a = p.area_sqm || 4;
-      const marker = L.marker(ll, { icon: makeSVGMarker(t, h, a) });
-      if (!markersByType[t]) markersByType[t] = [];
-      markersByType[t].push(marker);
-      return marker;
+function showFeaturesOnMap(data){
+  resultLayer.clearLayers();markersByType={};
+  L.geoJSON(data,{
+    pointToLayer:(f,ll)=>{
+      const p=f.properties;
+      const t=p.type||p.obj_type||p.event_type||p.status||'unknown';
+      const info=typeInfo(t,lastEndpoint);
+      const col=markerColor(f);
+      const m=L.marker(ll,{icon:mkIcon(info,col)});
+      if(!markersByType[t])markersByType[t]=[];
+      markersByType[t].push(m);
+      return m;
     },
-    onEachFeature: (f, layer) => {
-      const p = f.properties;
-      const priorityKeys = ['type','group_type','event_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','ndvi_fused','ndvi_mean','nir_mean','roughness','compactness','elongation','height_change','dtm_change','temporal_stability','dsm_elevation_m','dtm_elevation_m','object_height_m'];
-      const seen = new Set();
-      const rows = [];
-      for (const k of priorityKeys) {
-        if (p[k] !== undefined && p[k] !== null) {
-          seen.add(k);
-          let v = p[k];
-          if (typeof v === 'boolean') v = v ? '✅ yes' : '❌ no';
-          else if (typeof v === 'number') v = Number.isInteger(v) ? v : v.toFixed(3);
-          else if (typeof v === 'object') v = JSON.stringify(v);
-          rows.push(`<b>${k}:</b> ${v}`);
-        }
-      }
-      for (const [k, v] of Object.entries(p)) {
-        if (seen.has(k) || k === 'elevation_profile') continue;
-        rows.push(`<b>${k}:</b> ${typeof v === 'object' ? JSON.stringify(v) : v}`);
-      }
+    onEachFeature:(f,layer)=>{
+      const p=f.properties,rows=[];
+      const keys=['type','status','group_type','event_type','detail','is_manmade','confidence','height_before_m','height_after_m','height_change_m','height_change_mean_m','height_max_m','height_mean_m','area_sqm','crown_area_before_sqm','crown_area_after_sqm','ndvi_fused','ndvi_mean','roughness','compactness','elongation','height_change','dtm_change','dtm_change_mean_m','dsm_change_mean_m','temporal_stability','dsm_elevation_m','dtm_elevation_m','object_height_m'];
+      const seen=new Set();
+      for(const k of keys){if(p[k]!==undefined&&p[k]!==null){seen.add(k);let v=p[k];if(typeof v==='boolean')v=v?'✅':'❌';else if(typeof v==='number')v=Number.isInteger(v)?v:v.toFixed(3);else if(typeof v==='object')v=JSON.stringify(v);rows.push(`<b>${k}:</b> ${v}`);}}
+      for(const[k,v]of Object.entries(p)){if(seen.has(k)||k==='elevation_profile')continue;rows.push(`<b>${k}:</b> ${typeof v==='object'?JSON.stringify(v):v}`);}
       layer.bindPopup(`<div style="max-height:300px;overflow:auto;font-size:12px">${rows.join('<br>')}</div>`);
     }
   }).addTo(resultLayer);
-  if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.05));
-  updateLayerOpacity('objects', resultLayer);
-  setTimeout(() => applyTypeVisibility(), 50);
+  if(resultLayer.getLayers().length)map.fitBounds(resultLayer.getBounds().pad(.05));
+  applyOpacity('segments');
+  setTimeout(()=>applyVis(),50);
 }
 
-// ======= DOWNLOAD / COPY =======
-document.getElementById('btn-copy').onclick = () => {
-  if (!lastResult) return;
-  navigator.clipboard.writeText(JSON.stringify(lastResult, null, 2));
-  document.getElementById('status').textContent = 'Copied to clipboard!';
-};
-document.getElementById('btn-dl-json').onclick = () => {
-  if (!lastResult) return;
-  const blob = new Blob([JSON.stringify(lastResult, null, 2)], {type: 'application/geo+json'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'result.geojson'; a.click();
-};
-document.getElementById('btn-dl-gpkg').onclick = async () => {
-  const gb = getGeomBody();
-  if (!gb) { alert('Provide geometry first'); return; }
-  const status = document.getElementById('status');
-  status.textContent = 'Generating GeoPackage (DTM + DSM + ortho + segments)...';
-  try {
-    let url = '/api/v1/export/geopackage?include_ortho=true&include_segments=true';
-    // Pass type filter if any types are hidden
-    if (hiddenTypes.size > 0) {
-      const allTypes = Object.keys(TYPE_SHAPES);
-      const visibleTypes = allTypes.filter(t => !hiddenTypes.has(t));
-      url += '&types=' + visibleTypes.join(',');
-    }
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': gb.json ? 'application/json' : 'text/plain'},
-      body: gb.body
-    });
-    if (!resp.ok) throw new Error((await resp.json()).error);
-    const blob = await resp.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'landscape_export.gpkg';
-    a.click();
-    status.textContent = 'GeoPackage downloaded!';
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message;
+function buildSummary(data){
+  const panel=document.getElementById('summary-panel'),content=document.getElementById('summary-content');
+  if(!data.features||!data.features.length){panel.style.display='none';return;}
+  panel.style.display='';const n=data.features.length;let html='';
+  if(lastEndpoint==='changes/trees'){
+    const bs={};
+    for(const f of data.features){const s=f.properties.status||'?';bs[s]=(bs[s]||0)+1;}
+    html=`<b>${n}</b> trees — `+Object.entries(bs).map(([s,c])=>`<span style="color:${(STATUS_COLORS[s]||DEF).c}">${s}: ${c}</span>`).join(', ');
+    if(data.meta)html+=`<br><b>Period:</b> ${fmtDate(data.meta.date_a)} → ${fmtDate(data.meta.date_b)}`;
+  } else if(lastEndpoint==='changes'){
+    html=`<b>${n}</b> change events`;
+    if(data.meta)html+=` &nbsp; ${fmtDate(data.meta.date_a)} → ${fmtDate(data.meta.date_b)}`;
+  } else {
+    let totalA=0,mmA=0;
+    for(const f of data.features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
+    html=`<b>${n}</b> objects &nbsp; <b>${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</b> manmade`;
+    const ev=data.cadastre_evaluation;if(ev)html+=`<br><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}`;
+    if(data.hansen_evaluation){const h=data.hansen_evaluation;html+=`<br><b>Hansen:</b> P=${h.precision} R=${h.recall} F1=${h.f1}`;}
   }
+  content.innerHTML=html;
+}
+
+// ============ DOWNLOAD ============
+document.getElementById('btn-copy').onclick=()=>{if(!lastResult)return;navigator.clipboard.writeText(JSON.stringify(lastResult,null,2));setStatus('Copied!');};
+document.getElementById('btn-dl-json').onclick=()=>{if(!lastResult)return;const b=new Blob([JSON.stringify(lastResult,null,2)],{type:'application/geo+json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='result.geojson';a.click();};
+document.getElementById('btn-dl-gpkg').onclick=async()=>{
+  const args=getPostArgs();
+  if(!args){alert('Provide geometry first');return;}
+  showLoading('Generating GeoPackage...');
+  try{
+    let url='/api/v1/export/geopackage?include_ortho=true&include_segments=true';
+    if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
+    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+    if(!resp.ok)throw new Error((await resp.json()).error);
+    const blob=await resp.blob();
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.gpkg';a.click();
+    hideLoading('GeoPackage downloaded!');
+  }catch(e){hideLoading('Error: '+e.message);}
 };
 </script>
 </body>

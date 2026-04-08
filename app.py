@@ -685,8 +685,38 @@ SEGMENT_COLORS = {
 }
 
 
-def _segment_rgba(labels, objects, mask, type_filter=None):
-    """Render segmentation labels as RGBA image."""
+def _viridis_rgb(t):
+    """Return (R,G,B) for t in [0,1] on the viridis scale."""
+    VIRIDIS = [
+        (68,1,84),(72,35,116),(64,67,135),(52,94,141),(41,120,142),
+        (32,144,140),(34,167,132),(68,190,112),(121,209,81),(189,222,38),(253,231,37)
+    ]
+    t = max(0.0, min(1.0, t))
+    idx = t * (len(VIRIDIS) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(VIRIDIS) - 1)
+    f = idx - lo
+    return tuple(int(VIRIDIS[lo][c] + f * (VIRIDIS[hi][c] - VIRIDIS[lo][c])) for c in range(3))
+
+
+def _diverging_rgb(t):
+    """Blue-white-red diverging scale, t in [-1,1] mapped to [0,1]."""
+    t = max(0.0, min(1.0, t))
+    if t < 0.5:
+        # Blue to white
+        f = t * 2
+        return (int(33 + f * 222), int(102 + f * 153), int(172 + f * 83))
+    else:
+        # White to red
+        f = (t - 0.5) * 2
+        return (int(255 - f * 37), int(255 - f * 192), int(255 - f * 192))
+
+
+def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type'):
+    """Render segmentation labels as RGBA image.
+
+    color_mode: 'type' = categorical colors, 'height' = viridis by height
+    """
     h, w = labels.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     obj_map = {o.obj_id: o for o in objects}
@@ -694,7 +724,13 @@ def _segment_rgba(labels, objects, mask, type_filter=None):
         if type_filter and obj.obj_type not in type_filter:
             continue
         seg_mask = labels == obj_id
-        color = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+        if color_mode == 'height':
+            t = min(obj.height_mean / 35.0, 1.0)
+            r, g, b = _viridis_rgb(t)
+            alpha = 180 if obj.height_mean > 0.3 else 60
+            color = (r, g, b, alpha)
+        else:
+            color = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
         for c in range(4):
             rgba[:, :, c][seg_mask] = color[c]
     # Transparent where no data
@@ -702,13 +738,13 @@ def _segment_rgba(labels, objects, mask, type_filter=None):
     return rgba
 
 
-def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None):
+def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None, color_mode='type'):
     """Render segmentation as RGBA, reproject to WGS84, return overlay response."""
     from rasterio.warp import calculate_default_transform, reproject as rp, Resampling
     from rasterio.crs import CRS
     from rasterio.transform import array_bounds
 
-    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter)
+    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter, color_mode=color_mode)
 
     src_crs = CRS.from_epsg(3035)
     dst_crs = CRS.from_epsg(4326)
@@ -753,6 +789,7 @@ def segment_overlay():
         type_filter = None
         if type_filter_str:
             type_filter = set(t.strip() for t in type_filter_str.split(','))
+        color_mode = params.get('color_mode', 'type')  # 'type' or 'height'
 
         feat = features[0]
         geom = feat['geometry']
@@ -770,7 +807,7 @@ def segment_overlay():
             return _render_seg_overlay(
                 _seg_cache["labels"], _seg_cache["objects"],
                 _seg_cache["mask"], _seg_cache["transform"],
-                _seg_cache["shape"], type_filter,
+                _seg_cache["shape"], type_filter, color_mode,
             )
 
         # Full segmentation pipeline
@@ -818,7 +855,7 @@ def segment_overlay():
         log.info("segment overlay: full pipeline %.1fs, cached for re-renders", time.time() - t0)
 
         return _render_seg_overlay(labels, objects, data['mask'],
-                                   data['transform'], data['shape'], type_filter)
+                                   data['transform'], data['shape'], type_filter, color_mode)
     except Exception as e:
         log.error("segment overlay: %s", traceback.format_exc())
         return _error(str(e))
@@ -890,27 +927,32 @@ def export_geopackage():
             except Exception as e:
                 log.warning("Ortho for gpkg failed: %s", e)
 
-        # Segments
-        seg_type_band = None
+        # Segments — use cache if available, otherwise run pipeline
         if include_segments:
             try:
-                spectral = None
-                if rgb is not None:
-                    import ortho_io
-                    _, nir_arr = ortho_io.read_ortho_for_als(data)
-                    spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
+                # Check if cached segmentation matches this geometry
+                cache_key_check = f"{geom_3035.bounds}_{dataset}"
+                if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
+                    log.info("GeoPackage: using cached segmentation")
+                    labels = _seg_cache["labels"]
+                    objects = _seg_cache["objects"]
+                else:
+                    spectral = None
                     if rgb is not None:
-                        spectral["red"] = rgb[0].astype(np.float32)
-                        spectral["green"] = rgb[1].astype(np.float32)
-                        spectral["blue"] = rgb[2].astype(np.float32)
-                    if nir_arr is not None:
-                        spectral["nir"] = nir_arr.astype(np.float32)
-
-                result = seg.segment_and_classify(
-                    dtm, dsm, mask, tf, spectral=spectral,
-                )
-                objects = result['objects']
-                labels = result['labels']
+                        import ortho_io
+                        _, nir_arr = ortho_io.read_ortho_for_als(data)
+                        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
+                        if rgb is not None:
+                            spectral["red"] = rgb[0].astype(np.float32)
+                            spectral["green"] = rgb[1].astype(np.float32)
+                            spectral["blue"] = rgb[2].astype(np.float32)
+                        if nir_arr is not None:
+                            spectral["nir"] = nir_arr.astype(np.float32)
+                    result = seg.segment_and_classify(
+                        dtm, dsm, mask, tf, spectral=spectral,
+                    )
+                    objects = result['objects']
+                    labels = result['labels']
 
                 # Type filter
                 if type_filter:
@@ -919,14 +961,18 @@ def export_geopackage():
                     filtered_ids = {o.obj_id for o in objects}
 
                 type_raster = np.zeros((h, w), dtype=np.float32)
+                height_raster = np.zeros((h, w), dtype=np.float32)
                 obj_map = {o.obj_id: o for o in objects}
                 for oid in filtered_ids:
                     if oid in obj_map:
-                        type_raster[labels == oid] = float(obj_map[oid].type_code)
+                        seg_mask = labels == oid
+                        type_raster[seg_mask] = float(obj_map[oid].type_code)
+                        height_raster[seg_mask] = obj_map[oid].height_mean
 
                 bands.append('segment_type')
                 arrays.append(type_raster)
-                seg_type_band = type_raster
+                bands.append('segment_height')
+                arrays.append(height_raster)
             except Exception as e:
                 log.warning("Segments for gpkg failed: %s", e)
 
@@ -1518,6 +1564,85 @@ def ortho_overlay():
         return _send_rgba_overlay(rgba, bounds_wgs)
     except Exception as e:
         log.error("ortho overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/hansen/overlay', methods=['POST'])
+def hansen_overlay():
+    """Return Hansen forest loss as a coloured PNG overlay.
+
+    Green = current forest, magenta = loss (brighter = more recent),
+    cyan = forest gain.
+    """
+    try:
+        geom_wgs84 = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
+
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        geom_wgs = _extract_single_geom(geom_wgs84)
+        bbox_wgs = geom_wgs.bounds
+
+        prior = hansen.get_forest_prior(
+            bbox_wgs, data['transform'], data['shape'],
+        )
+
+        h, w = data['shape']
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+        # Current forest: green
+        forest = prior['current_forest']
+        rgba[:, :, 0][forest] = 20
+        rgba[:, :, 1][forest] = 120
+        rgba[:, :, 2][forest] = 20
+        rgba[:, :, 3][forest] = 140
+
+        # Forest gain: cyan
+        gain = prior['gain']
+        rgba[:, :, 0][gain] = 0
+        rgba[:, :, 1][gain] = 200
+        rgba[:, :, 2][gain] = 200
+        rgba[:, :, 3][gain] = 180
+
+        # Loss: magenta, brightness by recency (year 1=2001 dark, 24=2024 bright)
+        ly = prior['loss_year']
+        loss = ly > 0
+        brightness = np.clip(80 + (ly.astype(np.float32) / 24.0) * 175, 80, 255).astype(np.uint8)
+        rgba[:, :, 0][loss] = brightness[loss]
+        rgba[:, :, 1][loss] = 0
+        rgba[:, :, 2][loss] = brightness[loss]
+        rgba[:, :, 3][loss] = 200
+
+        # Transparent where no data
+        rgba[:, :, 3][~data['mask']] = 0
+
+        from rasterio.warp import calculate_default_transform, reproject as rp, Resampling
+        from rasterio.crs import CRS
+        from rasterio.transform import array_bounds
+
+        src_crs = CRS.from_epsg(3035)
+        dst_crs = CRS.from_epsg(4326)
+        dst_tf, dst_w, dst_h = calculate_default_transform(
+            src_crs, dst_crs, w, h, *array_bounds(h, w, data['transform']),
+        )
+        rgba_wgs = np.zeros((4, dst_h, dst_w), dtype=np.uint8)
+        for band in range(4):
+            rp(
+                source=rgba[:, :, band],
+                destination=rgba_wgs[band],
+                src_transform=data['transform'],
+                src_crs=src_crs,
+                dst_transform=dst_tf,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+            )
+        rgba_out = np.transpose(rgba_wgs, (1, 2, 0))
+        bounds = array_bounds(dst_h, dst_w, dst_tf)
+        bounds_wgs = (bounds[1], bounds[0], bounds[3], bounds[2])
+        return _send_rgba_overlay(rgba_out, bounds_wgs)
+    except Exception as e:
+        log.error("hansen overlay: %s", traceback.format_exc())
         return _error(str(e))
 
 

@@ -431,6 +431,46 @@ def process_one_kg(
     stats["lidar_time"] = round(time.time() - t0, 1)
     stats["shape"] = list(data["shape"])
 
+    # 2b. Read multi-date DTM/DSM for temporal features
+    dtm_dates = None
+    dsm_dates = None
+    try:
+        other_dates = sorted(d for d in ti.DATASETS if d != ti.DEFAULT_DATASET)
+        if other_dates:
+            dtm_dates = {}
+            dsm_dates = {}
+            ref_h, ref_w = data["shape"]
+            for date_key in other_dates:
+                try:
+                    d2 = raster_io.read_dtm_dsm(geom_3035, date_key)
+                    # Align to primary extent
+                    mh = min(ref_h, d2["shape"][0])
+                    mw = min(ref_w, d2["shape"][1])
+                    dtm_dates[date_key] = d2["dtm"][:mh, :mw]
+                    dsm_dates[date_key] = d2["dsm"][:mh, :mw]
+                except Exception as e:
+                    log.warning("KG %s: multi-date %s failed: %s", kg_code, date_key, e)
+            # Also include the primary date
+            if dtm_dates:  # at least one other date loaded
+                mh = min(ref_h, *(a.shape[0] for a in dtm_dates.values()))
+                mw = min(ref_w, *(a.shape[1] for a in dtm_dates.values()))
+                dtm_dates[ti.DEFAULT_DATASET] = data["dtm"][:mh, :mw]
+                dsm_dates[ti.DEFAULT_DATASET] = data["dsm"][:mh, :mw]
+                # Re-trim all arrays to common extent
+                for dk in list(dtm_dates):
+                    dtm_dates[dk] = dtm_dates[dk][:mh, :mw]
+                    dsm_dates[dk] = dsm_dates[dk][:mh, :mw]
+                log.info("KG %s: loaded %d temporal dates: %s",
+                         kg_code, len(dtm_dates), sorted(dtm_dates))
+            else:
+                dtm_dates = None
+                dsm_dates = None
+    except Exception as e:
+        log.warning("KG %s: multi-date read failed: %s", kg_code, e)
+        dtm_dates = None
+        dsm_dates = None
+    stats["has_temporal"] = dtm_dates is not None and len(dtm_dates) >= 2
+
     # 3. Read ortho
     t0 = time.time()
     spectral = None
@@ -537,6 +577,7 @@ def process_one_kg(
     try:
         result = oc.segment_and_classify(
             data["dtm"], data["dsm"], data["mask"], data["transform"],
+            dtm_dates=dtm_dates, dsm_dates=dsm_dates,
             spectral=spectral, copernicus=copernicus_data,
             hansen=hansen_data,
         )

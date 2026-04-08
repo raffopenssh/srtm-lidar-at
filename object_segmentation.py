@@ -729,8 +729,9 @@ def _fuse_ndvi(
     cop_cnt = uniform_filter(valid_cop, blk, mode="nearest")
 
     eps = 1e-6
-    bev_blk = np.where(bev_cnt > eps, bev_sum / bev_cnt, np.nan)
-    cop_blk = np.where(cop_cnt > eps, cop_sum / cop_cnt, np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        bev_blk = np.where(bev_cnt > eps, bev_sum / bev_cnt, np.nan)
+        cop_blk = np.where(cop_cnt > eps, cop_sum / cop_cnt, np.nan)
 
     # Seasonal offset = how much Copernicus is above BEV at this location
     both_valid = np.isfinite(bev_blk) & np.isfinite(cop_blk)

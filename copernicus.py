@@ -394,33 +394,52 @@ def get_ndvi_timeseries(
 
     # Download missing months in parallel (2 concurrent — openEO rate limit)
     def _download_month(args):
+        import re as _re
         import time as _time
         label, m_start, m_end, month_cache = args
         logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
-        try:
-            c = _get_connection()
-            s2 = c.load_collection(
-                "SENTINEL2_L2A",
-                spatial_extent=bbox,
-                temporal_extent=[m_start, m_end],
-                bands=["B04", "B08", "SCL"],
-            )
-            s2_masked = s2.process(
-                "mask_scl_dilation", data=s2, scl_band_name="SCL",
-            )
-            ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
-            ndvi_median = ndvi_cube.reduce_dimension(
-                dimension="t", reducer="median",
-            )
-            # Use sync-only download for monthly NDVI — don't fall back to
-            # batch on EmptyBounds (no data = skip month, batch won't help)
-            month_cache.parent.mkdir(parents=True, exist_ok=True)
-            ndvi_median.download(str(month_cache), format="GTiff")
-            logger.info("NDVI %s downloaded OK", label)
-            return label, None
-        except Exception as exc:
-            logger.warning("NDVI %s failed: %s — skipping month", label, exc)
-            return label, exc
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                c = _get_connection()
+                s2 = c.load_collection(
+                    "SENTINEL2_L2A",
+                    spatial_extent=bbox,
+                    temporal_extent=[m_start, m_end],
+                    bands=["B04", "B08", "SCL"],
+                )
+                s2_masked = s2.process(
+                    "mask_scl_dilation", data=s2, scl_band_name="SCL",
+                )
+                ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+                ndvi_median = ndvi_cube.reduce_dimension(
+                    dimension="t", reducer="median",
+                )
+                # Use sync-only download for monthly NDVI — don't fall back to
+                # batch on EmptyBounds (no data = skip month, batch won't help)
+                month_cache.parent.mkdir(parents=True, exist_ok=True)
+                ndvi_median.download(str(month_cache), format="GTiff")
+                logger.info("NDVI %s downloaded OK", label)
+                return label, None
+            except Exception as exc:
+                exc_str = str(exc)
+                if "429" in exc_str and attempt < max_retries:
+                    # Parse Retry-After from exception string if available
+                    retry_match = _re.search(r'Retry-After[":\s]+(\d+)', exc_str, _re.IGNORECASE)
+                    if retry_match:
+                        wait_secs = int(retry_match.group(1))
+                    else:
+                        wait_secs = 10 * (attempt + 1)  # 10s, 20s, 30s
+                    logger.warning(
+                        "NDVI %s rate limited (429), retry %d/%d in %ds...",
+                        label, attempt + 1, max_retries, wait_secs,
+                    )
+                    _time.sleep(wait_secs)
+                    continue
+                logger.warning("NDVI %s failed: %s — skipping month", label, exc)
+                return label, exc
+        # Should not be reached, but guard anyway
+        return label, Exception(f"NDVI {label}: retries exhausted")
 
     if to_download:
         logger.info("Downloading %d NDVI months (2 parallel)...", len(to_download))

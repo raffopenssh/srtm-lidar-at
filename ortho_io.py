@@ -319,9 +319,21 @@ def _read_ortho_single_tile(
             col_end = (max_e - origin_e) / ds.transform.a
             row_off = (min_n - origin_n) / ds.transform.e
             row_end = (max_n - origin_n) / ds.transform.e
+            # Clamp to valid tile extent to avoid negative indices
+            # (bbox may extend beyond this tile when KG straddles a
+            # tile boundary).
+            row_start_c = max(0, int(round(row_off)))
+            row_end_c = min(ds.height, int(round(row_end)))
+            col_start_c = max(0, int(round(col_off)))
+            col_end_c = min(ds.width, int(round(col_end)))
+            if row_end_c <= row_start_c or col_end_c <= col_start_c:
+                raise ValueError(
+                    f"Empty window for tile N{tile[0]}E{tile[1]} with bbox "
+                    f"[{min_e},{min_n}]-[{max_e},{max_n}] (clamped to zero)"
+                )
             window = Window.from_slices(
-                (int(round(row_off)), int(round(row_end))),
-                (int(round(col_off)), int(round(col_end))),
+                (row_start_c, row_end_c),
+                (col_start_c, col_end_c),
             )
         else:
             window = from_bounds(min_e, min_n, max_e, max_n, ds.transform)

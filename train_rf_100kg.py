@@ -91,7 +91,7 @@ def get_random_kgs(n: int = 100) -> list[dict]:
             districts = resp.json().get("data", [])
             for d in districts:
                 code = d.get("district_code")
-                if not code:
+                if not code or not d.get("district_name", "").strip():
                     continue
                 try:
                     resp2 = requests.get(

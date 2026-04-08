@@ -307,8 +307,9 @@ def get_ndvi_timeseries(
 ) -> Dict[str, Any]:
     """Fetch monthly NDVI aggregates over a period.
 
-    Clouds are filtered using SCL-based masking.  Each month is aggregated
-    with the **median** reducer.
+    Downloads one NDVI composite per month and stacks them locally.
+    This avoids the openEO aggregate_temporal_period bug where
+    sync download collapses multi-band temporal output to 1 band.
 
     Parameters
     ----------
@@ -323,49 +324,110 @@ def get_ndvi_timeseries(
         ``{"monthly_ndvi": {"2023-01": ndarray, ...},
         "transform": Affine, "crs": CRS}``
     """
+    from datetime import datetime
+    import calendar
+
     bbox = _validate_bbox(bbox_wgs84)
 
-    cache_file = _cache_path("ndvi_ts", bbox, start=start_date, end=end_date)
+    # Check for stacked cache (new format)
+    cache_file = _cache_path("ndvi_ts_v2", bbox, start=start_date, end=end_date)
     if cache_file.exists():
-        logger.info("Cache hit for NDVI time series: %s", cache_file)
+        logger.info("Cache hit for NDVI time series v2: %s", cache_file)
         return _parse_timeseries_tiff(cache_file, start_date, end_date)
 
     logger.info(
-        "Fetching NDVI time series for bbox=%s, %s → %s",
+        "Fetching NDVI time series (per-month) for bbox=%s, %s → %s",
         bbox, start_date, end_date,
     )
+
+    # Build month list
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    months = []
+    current = start_dt.replace(day=1)
+    while current <= end_dt:
+        months.append(current)
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+
+    # Fetch each month as a separate NDVI composite
+    monthly_ndvi: Dict[str, np.ndarray] = {}
+    transform = None
+    crs = None
+
     conn = _get_connection()
 
-    s2 = conn.load_collection(
-        "SENTINEL2_L2A",
-        spatial_extent=bbox,
-        temporal_extent=[start_date, end_date],
-        bands=["B04", "B08", "SCL"],
-    )
+    for m in months:
+        label = m.strftime("%Y-%m")
+        last_day = calendar.monthrange(m.year, m.month)[1]
+        m_start = m.strftime("%Y-%m-%d")
+        m_end = m.replace(day=last_day).strftime("%Y-%m-%d")
 
-    # Cloud mask
-    s2_masked = s2.process(
-        "mask_scl_dilation",
-        data=s2,
-        scl_band_name="SCL",
-    )
+        month_cache = _cache_path("ndvi_month", bbox, start=m_start, end=m_end)
+        if month_cache.exists():
+            logger.debug("Cache hit for %s: %s", label, month_cache)
+        else:
+            logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
+            try:
+                s2 = conn.load_collection(
+                    "SENTINEL2_L2A",
+                    spatial_extent=bbox,
+                    temporal_extent=[m_start, m_end],
+                    bands=["B04", "B08", "SCL"],
+                )
+                s2_masked = s2.process(
+                    "mask_scl_dilation", data=s2, scl_band_name="SCL",
+                )
+                ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+                ndvi_median = ndvi_cube.reduce_dimension(
+                    dimension="t", reducer="median",
+                )
+                _run_datacube(ndvi_median, month_cache, title=f"NDVI {label}")
+            except Exception as exc:
+                logger.warning("NDVI %s failed: %s — skipping month", label, exc)
+                continue
 
-    # NDVI
-    ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+        # Read the single-band result
+        try:
+            with rasterio.open(str(month_cache)) as ds:
+                data = ds.read(1).astype(np.float32)
+                if transform is None:
+                    transform = ds.transform
+                    crs = ds.crs
+                monthly_ndvi[label] = data
+        except Exception as exc:
+            logger.warning("Failed to read NDVI %s: %s", label, exc)
 
-    # Monthly aggregation
-    ndvi_monthly = ndvi_cube.aggregate_temporal_period(
-        period="month",
-        reducer="median",
-    )
+    if not monthly_ndvi:
+        raise RuntimeError("No monthly NDVI data retrieved")
 
+    logger.info("NDVI time series: %d/%d months retrieved", len(monthly_ndvi), len(months))
+
+    # Stack into multi-band cache for future use
     try:
-        _run_datacube(ndvi_monthly, cache_file, title="NDVI time series")
+        ref_shape = next(iter(monthly_ndvi.values())).shape
+        sorted_labels = sorted(monthly_ndvi.keys())
+        stack = np.stack([monthly_ndvi[l] for l in sorted_labels], axis=0)
+        with rasterio.open(
+            str(cache_file), "w", driver="GTiff",
+            height=ref_shape[0], width=ref_shape[1],
+            count=len(sorted_labels), dtype="float32",
+            crs=crs, transform=transform,
+        ) as dst:
+            for i, label in enumerate(sorted_labels):
+                dst.write(stack[i], i + 1)
+                dst.set_band_description(i + 1, label)
+        logger.info("Saved stacked NDVI TS cache: %s (%d bands)", cache_file, len(sorted_labels))
     except Exception as exc:
-        logger.error("Failed to download NDVI time series: %s", exc)
-        raise RuntimeError(f"NDVI time series download failed: {exc}") from exc
+        logger.warning("Failed to write stacked cache: %s", exc)
 
-    return _parse_timeseries_tiff(cache_file, start_date, end_date)
+    return {
+        "monthly_ndvi": monthly_ndvi,
+        "transform": transform,
+        "crs": crs,
+    }
 
 
 def _parse_timeseries_tiff(
@@ -382,12 +444,10 @@ def _parse_timeseries_tiff(
         transform = ds.transform
         crs = ds.crs
         band_count = ds.count
-        # Try to get band descriptions/dates from tags
         descriptions = [ds.descriptions[i] if ds.descriptions[i] else None for i in range(band_count)]
 
     # Build month labels from date range
-    from datetime import datetime, timedelta
-    import calendar
+    from datetime import datetime
 
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
@@ -396,22 +456,21 @@ def _parse_timeseries_tiff(
     current = start.replace(day=1)
     while current <= end:
         months.append(current.strftime("%Y-%m"))
-        # Advance to next month
         if current.month == 12:
             current = current.replace(year=current.year + 1, month=1)
         else:
             current = current.replace(month=current.month + 1)
 
     monthly_ndvi: Dict[str, np.ndarray] = {}
-    for i in range(min(band_count, len(months))):
-        label = descriptions[i] if descriptions[i] else months[i]
+    for i in range(band_count):
+        # Prefer band description (set by our stacked cache writer)
+        if descriptions[i]:
+            label = descriptions[i]
+        elif i < len(months):
+            label = months[i]
+        else:
+            label = f"band_{i+1}"
         monthly_ndvi[label] = data[i].astype(np.float32)
-
-    # If more bands than expected months, use numeric fallback
-    if band_count > len(months):
-        for i in range(len(months), band_count):
-            label = descriptions[i] if descriptions[i] else f"band_{i+1}"
-            monthly_ndvi[label] = data[i].astype(np.float32)
 
     return {
         "monthly_ndvi": monthly_ndvi,

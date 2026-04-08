@@ -43,12 +43,15 @@ textarea { height: 80px; font-family: monospace; font-size: 11px; resize: vertic
 .lyr-label { flex: 1; font-size: 11px; }
 
 /* Legend */
-.legend { position: absolute; bottom: 24px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); padding: 10px 12px; font-size: 11px; max-width: 220px; }
+.legend { position: absolute; bottom: 24px; right: 10px; z-index: 1000; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); padding: 10px 12px; font-size: 11px; max-width: 240px; max-height: 55vh; overflow-y: auto; }
 .legend h4 { font-size: 11px; margin-bottom: 6px; color: #333; }
 .legend-bar { height: 14px; border-radius: 3px; margin-bottom: 2px; }
 .legend-labels { display: flex; justify-content: space-between; font-size: 10px; color: #666; margin-bottom: 8px; }
-.legend-item { display: flex; align-items: center; gap: 5px; margin: 2px 0; font-size: 10px; }
-.legend-icon { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-size: 11px; }
+.legend-item { display: flex; align-items: center; gap: 5px; margin: 2px 0; font-size: 10px; cursor: pointer; user-select: none; padding: 1px 2px; border-radius: 3px; }
+.legend-item:hover { background: #f0f0f0; }
+.legend-item.hidden { opacity: 0.35; text-decoration: line-through; }
+.legend-icon { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
+.legend-count { margin-left: auto; color: #999; font-size: 9px; }
 </style>
 </head>
 <body>
@@ -260,15 +263,50 @@ map.on(L.Draw.Event.CREATED, e => {
 
 // ======= LEGEND =======
 document.getElementById('viridis-bar').style.background = viridisGradient();
-const LEGEND_TYPES = ['engineered_surface','engineered_slope','excavation','fill','building','infrastructure','tree_canopy','vegetation','bare_natural','recent_disturbance'];
-const ltDiv = document.getElementById('legend-types');
-LEGEND_TYPES.forEach(t => {
-  const info = TYPE_SHAPES[t] || DEFAULT_SHAPE;
-  const el = document.createElement('div');
-  el.className = 'legend-item';
-  el.innerHTML = `<span class="legend-icon" style="color:${info.color}">${info.label}</span><span>${t.replace(/_/g,' ')}</span>`;
-  ltDiv.appendChild(el);
-});
+// Dynamic legend: built from actual data, each entry toggles visibility
+const hiddenTypes = new Set();    // types currently hidden
+let markersByType = {};           // type → [leaflet layer, ...]
+
+function buildLegend(typeCounts) {
+  const ltDiv = document.getElementById('legend-types');
+  ltDiv.innerHTML = '';
+  // Sort by count descending
+  const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
+  const total = sorted.reduce((s, [,n]) => s + n, 0);
+  for (const [t, count] of sorted) {
+    const info = TYPE_SHAPES[t] || DEFAULT_SHAPE;
+    const pct = (count / total * 100).toFixed(0);
+    const el = document.createElement('div');
+    el.className = 'legend-item' + (hiddenTypes.has(t) ? ' hidden' : '');
+    el.dataset.type = t;
+    el.innerHTML = `<span class="legend-icon" style="color:${info.color}">${info.label}</span>`
+      + `<span>${t.replace(/_/g,' ')}</span>`
+      + `<span class="legend-count">${count} (${pct}%)</span>`;
+    el.onclick = () => toggleType(t, el);
+    ltDiv.appendChild(el);
+  }
+}
+
+function toggleType(type, el) {
+  if (hiddenTypes.has(type)) {
+    hiddenTypes.delete(type);
+    el.classList.remove('hidden');
+  } else {
+    hiddenTypes.add(type);
+    el.classList.add('hidden');
+  }
+  applyTypeVisibility();
+}
+
+function applyTypeVisibility() {
+  for (const [t, layers] of Object.entries(markersByType)) {
+    const visible = !hiddenTypes.has(t);
+    for (const lyr of layers) {
+      const el = lyr._icon || lyr.getElement?.();
+      if (el) el.style.display = visible ? '' : 'none';
+    }
+  }
+}
 
 // ======= LAYER CONTROLS =======
 function updateLayerOpacity(id, layer) {
@@ -397,6 +435,8 @@ document.getElementById('btn-run').onclick = async () => {
   status.textContent = 'Analysing... (remote LIDAR reads may take 10-30s)';
   resultDiv.textContent = 'Loading...';
   resultLayer.clearLayers();
+  markersByType = {};
+  document.getElementById('legend-types').innerHTML = '';
   // Clear overlays so they reload with new geometry
   if (dtmOverlay) { map.removeLayer(dtmOverlay); dtmOverlay = null; }
   if (lidarOverlay) { map.removeLayer(lidarOverlay); lidarOverlay = null; }
@@ -462,53 +502,54 @@ function buildSummary(data) {
   const content = document.getElementById('summary-content');
   if (!data.features || !data.features.length) { panel.style.display = 'none'; return; }
   panel.style.display = '';
-  // Count by type
-  const typeCounts = {};
-  let manmadeCount = 0, totalCount = data.features.length;
+  let totalCount = data.features.length;
   let totalArea = 0, manmadeArea = 0;
   for (const f of data.features) {
-    const p = f.properties;
-    const t = p.type || p.obj_type || 'unknown';
-    typeCounts[t] = (typeCounts[t] || 0) + 1;
-    const area = p.area_sqm || 0;
+    const area = f.properties.area_sqm || 0;
     totalArea += area;
-    if (p.is_manmade === true || p.is_manmade === 1) { manmadeCount++; manmadeArea += area; }
+    if (f.properties.is_manmade === true || f.properties.is_manmade === 1) manmadeArea += area;
   }
-  // Use server-provided manmade_pct if available (from summary metadata)
-  const meta = data.summary || data.metadata || {};
-  const manmadePct = meta.manmade_pct !== undefined
-    ? meta.manmade_pct.toFixed(1)
-    : (totalArea > 0 ? (manmadeArea / totalArea * 100).toFixed(1) : '0.0');
-  let html = `<div style="margin-bottom:4px"><b>Objects:</b> ${totalCount} &nbsp; <b>Manmade:</b> ${manmadePct}%</div>`;
-  // Sort types by count descending
-  const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
-  for (const [t, count] of sorted) {
-    const info = TYPE_SHAPES[t] || DEFAULT_SHAPE;
-    const pct = (count / totalCount * 100).toFixed(0);
-    html += `<div class="legend-item"><span class="legend-icon" style="color:${info.color}">${info.label}</span><span>${t.replace(/_/g,' ')}: ${count} (${pct}%)</span></div>`;
+  const manmadePct = totalArea > 0 ? (manmadeArea / totalArea * 100).toFixed(1) : '0.0';
+  const eval_ = data.evaluation;
+  let html = `<b>${totalCount}</b> objects &nbsp; <b>${manmadePct}%</b> manmade`;
+  if (eval_) {
+    html += `<br><b>Cadastre:</b> P=${eval_.precision} R=${eval_.recall} F1=${eval_.f1}`;
   }
   content.innerHTML = html;
 }
 
 function showObjectsOnMap(data) {
   document.getElementById('legend').style.display = '';
-  // Build summary from response metadata or features
+  markersByType = {};  // reset
+
+  // Count types for legend
+  const typeCounts = {};
+  for (const f of data.features) {
+    const t = (f.properties.type || f.properties.obj_type || 'unknown');
+    typeCounts[t] = (typeCounts[t] || 0) + 1;
+  }
+
+  // Build legend + summary
+  buildLegend(typeCounts);
   buildSummary(data);
+
   const gj = L.geoJSON(data, {
     pointToLayer: (f, ll) => {
       const p = f.properties;
       const t = p.type || p.obj_type || '';
       const h = p.height_max_m || p.height_max || 0;
       const a = p.area_sqm || 4;
-      return L.marker(ll, { icon: makeSVGMarker(t, h, a) });
+      const marker = L.marker(ll, { icon: makeSVGMarker(t, h, a) });
+      // Track for toggling
+      if (!markersByType[t]) markersByType[t] = [];
+      markersByType[t].push(marker);
+      return marker;
     },
     onEachFeature: (f, layer) => {
       const p = f.properties;
-      // Prioritised fields for v2 landscape classifier
       const priorityKeys = ['type','group_type','is_manmade','confidence','height_max_m','height_mean_m','area_sqm','ndvi_fused','ndvi_mean','nir_mean','roughness','compactness','elongation','height_change','dtm_change','temporal_stability'];
       const seen = new Set();
       const rows = [];
-      // Show priority fields first
       for (const k of priorityKeys) {
         if (p[k] !== undefined && p[k] !== null) {
           seen.add(k);
@@ -519,7 +560,6 @@ function showObjectsOnMap(data) {
           rows.push(`<b>${k}:</b> ${v}`);
         }
       }
-      // Then remaining fields
       for (const [k, v] of Object.entries(p)) {
         if (seen.has(k) || k === 'elevation_profile') continue;
         rows.push(`<b>${k}:</b> ${typeof v === 'object' ? JSON.stringify(v) : v}`);
@@ -528,8 +568,10 @@ function showObjectsOnMap(data) {
     }
   }).addTo(resultLayer);
   if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.05));
-  // Apply current opacity
+  // Apply current opacity and type visibility
   updateLayerOpacity('objects', resultLayer);
+  // Defer visibility toggle so Leaflet has added icons to DOM
+  setTimeout(() => applyTypeVisibility(), 50);
 }
 
 // ======= DOWNLOAD / COPY =======

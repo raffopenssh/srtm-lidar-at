@@ -352,44 +352,73 @@ def get_ndvi_timeseries(
         else:
             current = current.replace(month=current.month + 1)
 
-    # Fetch each month as a separate NDVI composite
+    # Fetch each month as a separate NDVI composite — parallel downloads
+    import concurrent.futures
+
     monthly_ndvi: Dict[str, np.ndarray] = {}
     transform = None
     crs = None
 
     conn = _get_connection()
 
+    # Build download tasks: (label, cache_path, datacube_or_None)
+    tasks = []
     for m in months:
         label = m.strftime("%Y-%m")
         last_day = calendar.monthrange(m.year, m.month)[1]
         m_start = m.strftime("%Y-%m-%d")
         m_end = m.replace(day=last_day).strftime("%Y-%m-%d")
-
         month_cache = _cache_path("ndvi_month", bbox, start=m_start, end=m_end)
+        tasks.append((label, m_start, m_end, month_cache))
+
+    # Check which months need downloading
+    to_download = []
+    for label, m_start, m_end, month_cache in tasks:
         if month_cache.exists():
             logger.debug("Cache hit for %s: %s", label, month_cache)
         else:
-            logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
-            try:
-                s2 = conn.load_collection(
-                    "SENTINEL2_L2A",
-                    spatial_extent=bbox,
-                    temporal_extent=[m_start, m_end],
-                    bands=["B04", "B08", "SCL"],
-                )
-                s2_masked = s2.process(
-                    "mask_scl_dilation", data=s2, scl_band_name="SCL",
-                )
-                ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
-                ndvi_median = ndvi_cube.reduce_dimension(
-                    dimension="t", reducer="median",
-                )
-                _run_datacube(ndvi_median, month_cache, title=f"NDVI {label}")
-            except Exception as exc:
-                logger.warning("NDVI %s failed: %s — skipping month", label, exc)
-                continue
+            to_download.append((label, m_start, m_end, month_cache))
 
-        # Read the single-band result
+    # Download missing months in parallel (3 concurrent — openEO rate limit)
+    def _download_month(args):
+        label, m_start, m_end, month_cache = args
+        logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
+        try:
+            c = _get_connection()
+            s2 = c.load_collection(
+                "SENTINEL2_L2A",
+                spatial_extent=bbox,
+                temporal_extent=[m_start, m_end],
+                bands=["B04", "B08", "SCL"],
+            )
+            s2_masked = s2.process(
+                "mask_scl_dilation", data=s2, scl_band_name="SCL",
+            )
+            ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+            ndvi_median = ndvi_cube.reduce_dimension(
+                dimension="t", reducer="median",
+            )
+            _run_datacube(ndvi_median, month_cache, title=f"NDVI {label}")
+            return label, None
+        except Exception as exc:
+            logger.warning("NDVI %s failed: %s — skipping month", label, exc)
+            return label, exc
+
+    if to_download:
+        logger.info("Downloading %d NDVI months (3 parallel)...", len(to_download))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_download_month, t): t[0] for t in to_download}
+            for fut in concurrent.futures.as_completed(futures):
+                label, exc = fut.result()
+                if exc:
+                    logger.debug("Month %s failed", label)
+                else:
+                    logger.info("Month %s done", label)
+
+    # Read all cached months
+    for label, m_start, m_end, month_cache in tasks:
+        if not month_cache.exists():
+            continue
         try:
             with rasterio.open(str(month_cache)) as ds:
                 data = ds.read(1).astype(np.float32)

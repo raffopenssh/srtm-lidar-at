@@ -868,6 +868,8 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
             bld_score -= 1.0  # very irregular = tree canopy
 
         # Spectral: low NDVI = non-vegetated
+        # Note: fused NDVI shifts values toward growing-season levels,
+        # so bare roofs may show 0.10-0.20 from Copernicus bleed.
         if have_ndvi:
             if best_ndvi < -0.1:
                 bld_score += 3.0  # strongly non-vegetated
@@ -875,12 +877,23 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
                 bld_score += 2.0
             elif best_ndvi < 0.2:
                 bld_score += 1.0
+            elif best_ndvi > 0.45:
+                bld_score -= 4.0  # certainly vegetation
             elif best_ndvi > 0.35:
-                bld_score -= 3.0  # definitely vegetation
+                bld_score -= 3.0  # very likely vegetation
             elif best_ndvi > 0.25:
                 bld_score -= 2.0
-            elif best_ndvi > 0.15:
-                bld_score -= 1.0
+            elif best_ndvi > 0.20:
+                bld_score -= 0.5  # mild penalty
+
+        # Combined tree signal: rough DSM + green = tree canopy, not roof.
+        # Only apply heavy penalty when BOTH signals are strong.
+        # Roofs can show roughness ~0.8-1.0 (chimneys, edges) and
+        # fused NDVI ~0.15-0.25 (Copernicus bleed), so don't penalise those.
+        if dsm_rough > 1.5 and best_ndvi > 0.25:
+            bld_score -= 3.0  # very rough + green = certainly tree
+        elif dsm_rough > 1.2 and best_ndvi > 0.35:
+            bld_score -= 2.5  # rough + clearly green
 
         # Bright surface + low NDVI
         if has_spectral and brightness > 100 and ndvi < 0.1:
@@ -1197,8 +1210,11 @@ def calibrate_with_cadastre(
 ) -> list[SegmentedObject]:
     """Refine building classification using cadastre ground truth.
 
-    High overlap with cadastre but not classified as building → reclassify.
-    Classified as roof but zero overlap → lower confidence.
+    High overlap with cadastre but not classified as building → reclassify,
+    UNLESS the object looks clearly like vegetation (high NDVI + rough DSM).
+    Trees commonly overhang building footprints.
+
+    Classified as roof but zero cadastre overlap → lower confidence.
     """
     if building_mask is None or not building_mask.any():
         return objects
@@ -1213,14 +1229,30 @@ def calibrate_with_cadastre(
         precision = overlap / max(seg_area, 1)
 
         if precision > overlap_threshold:
-            if obj.obj_type not in ("roof", "wall", "solar_panel", "greenhouse", "fence"):
-                if obj.height_mean > 1.5:
-                    obj.obj_type = "roof"
-                    obj.type_code = OBJECT_TYPES["roof"]
-                    obj.is_manmade = True
-                    obj.confidence = max(obj.confidence, 0.7)
-            else:
+            # Don't reclassify objects that are clearly tree canopy
+            # overhanging a building footprint.  Key signal: DSM roughness.
+            # Roofs rarely exceed roughness=1.5; tree crowns typically >1.5.
+            # Be conservative — prefer to reclassify (helps recall) unless
+            # the canopy signal is very strong.
+            looks_like_canopy = (
+                obj.roughness > 1.5  # very rough = definite tree texture
+            ) or (
+                obj.roughness > 1.0 and obj.ndvi_fused > 0.40
+            ) or (
+                obj.ndvi_fused > 0.55  # overwhelmingly vegetated
+            )
+
+            if obj.obj_type in ("roof", "wall", "solar_panel", "greenhouse", "fence"):
+                # Already building — just boost confidence
                 obj.confidence = min(obj.confidence + 0.15, 0.95)
+            elif not looks_like_canopy and obj.height_mean > 1.5:
+                # Reclassify non-veg elevated object to roof
+                obj.obj_type = "roof"
+                obj.type_code = OBJECT_TYPES["roof"]
+                obj.is_manmade = True
+                obj.confidence = max(obj.confidence, 0.7)
+            # else: canopy overhanging cadastre footprint → leave as-is
+
         elif precision < 0.05:
             if obj.obj_type == "roof" and obj.confidence < 0.7:
                 obj.confidence = max(obj.confidence - 0.15, 0.2)

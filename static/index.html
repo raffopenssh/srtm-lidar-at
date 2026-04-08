@@ -510,7 +510,7 @@ function buildSummary(data) {
     if (f.properties.is_manmade === true || f.properties.is_manmade === 1) manmadeArea += area;
   }
   const manmadePct = totalArea > 0 ? (manmadeArea / totalArea * 100).toFixed(1) : '0.0';
-  const eval_ = data.evaluation;
+  const eval_ = data.cadastre_evaluation || data.evaluation;
   let html = `<b>${totalCount}</b> objects &nbsp; <b>${manmadePct}%</b> manmade`;
   if (eval_) {
     html += `<br><b>Cadastre:</b> P=${eval_.precision} R=${eval_.recall} F1=${eval_.f1}`;

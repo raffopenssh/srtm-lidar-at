@@ -143,7 +143,7 @@ def fetch_cadastre_layers(kg_code: str) -> dict:
             f"{CADASTRE_BASE}/export/geojson",
             params={
                 "kg": kg_code,
-                "layers": "parcels,building_footprints,landuse",
+                "layers": "parcels,building_footprints,landuse_polygons",
                 "include_geometry": "true",
             },
             timeout=120,
@@ -192,12 +192,12 @@ def fetch_cadastre_layers(kg_code: str) -> dict:
         except Exception:
             continue
 
-    # Parse landuse polygons (sub-parcel landuse areas)
-    lu_fc = data.get("landuse", {}).get("features", [])
+    # Parse landuse polygons (sub-parcel landuse areas — real polygons with area_sqm)
+    lu_fc = data.get("landuse_polygons", {}).get("features", [])
     for f in lu_fc:
         try:
             geom = shapely_shape(f["geometry"])
-            if geom.is_empty:
+            if geom.is_empty or not isinstance(geom, (Polygon, MultiPolygon)):
                 continue
             props = f.get("properties", {})
             code_str = props.get("landuse_code", "")
@@ -206,23 +206,13 @@ def fetch_cadastre_layers(kg_code: str) -> dict:
                 code = int(code_str)
             except (ValueError, TypeError):
                 code = None
-            # Landuse may be Points (centroids) if polygons not available
-            if isinstance(geom, (Polygon, MultiPolygon)):
-                geom_3035 = transform_to_3035(geom)
-                result["landuse"].append({
-                    "geometry": geom_3035,
-                    "code": code,
-                    "abbr": abbr,
-                })
-            else:
-                # Point geometry — still useful for labelling via nearest
-                geom_3035 = transform_to_3035(geom)
-                result["landuse"].append({
-                    "geometry": geom_3035,
-                    "code": code,
-                    "abbr": abbr,
-                    "is_point": True,
-                })
+            geom_3035 = transform_to_3035(geom)
+            result["landuse"].append({
+                "geometry": geom_3035,
+                "code": code,
+                "abbr": abbr,
+                "area_sqm": props.get("area_sqm", 0),
+            })
         except Exception:
             continue
 
@@ -317,24 +307,14 @@ def match_segment_to_cadastre(
         if code is None:
             continue
         geom = lu["geometry"]
-        if lu.get("is_point"):
-            # Point — check distance
-            try:
-                d = pt.distance(geom)
-                if d < 20:  # within 20m
-                    if best_lu_code is None:
-                        best_lu_code = code
-            except Exception:
-                continue
-        else:
-            try:
-                if geom.intersects(seg_poly):
-                    overlap = geom.intersection(seg_poly).area
-                    if overlap > best_lu_overlap:
-                        best_lu_overlap = overlap
-                        best_lu_code = code
-            except Exception:
-                continue
+        try:
+            if geom.intersects(seg_poly):
+                overlap = geom.intersection(seg_poly).area
+                if overlap > best_lu_overlap:
+                    best_lu_overlap = overlap
+                    best_lu_code = code
+        except Exception:
+            continue
 
     if best_lu_code is not None and best_lu_overlap > 0.2 * seg_poly.area:
         return best_lu_code, "landuse_polygon"
@@ -359,9 +339,9 @@ def match_segment_to_cadastre(
     if best_parcel_code is not None:
         return best_parcel_code, "parcel"
 
-    # 4. If landuse point was close enough
+    # 4. If landuse polygon overlapped at all (even < 20% threshold)
     if best_lu_code is not None:
-        return best_lu_code, "landuse_point"
+        return best_lu_code, "landuse_polygon_weak"
 
     return None, ""
 
@@ -551,7 +531,7 @@ def process_one_kg(
     train_features = []
     train_labels = []
     source_counts = {"building_footprint": 0, "landuse_polygon": 0,
-                     "parcel": 0, "landuse_point": 0, "unmatched": 0}
+                     "landuse_polygon_weak": 0, "parcel": 0, "unmatched": 0}
 
     for feat in features_list:
         code, source = match_segment_to_cadastre(feat, cadastre_data, data["transform"])

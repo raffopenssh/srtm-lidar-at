@@ -34,6 +34,7 @@ import tile_index as ti
 import raster_io
 import terrain_analysis as ta
 import landscape_classifier as oc  # new landscape-focused classifier
+import object_segmentation as seg  # watershed-based segmentation
 import temporal_analysis as tca
 import geo_parse
 
@@ -413,6 +414,177 @@ def objects_summary():
                      "object_types_filter": object_types_filter,
                      "processing_time_s": round(time.time()-t0, 2)},
         })
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error(traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
+
+
+# ---------------------------------------------------------------------------
+# 3b. WATERSHED SEGMENTATION (new — Felzenszwalb + RAG)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/segment', methods=['POST'])
+def segment_objects():
+    """Watershed-based object segmentation and classification.
+
+    Fused gradient → Felzenszwalb → RAG merge → per-object features → classify → group.
+    Returns individual objects (tree, roof, road_surface, …) AND groups (forest, building, …).
+    """
+    try:
+        t0 = time.time()
+        features = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', ti.DEFAULT_DATASET)
+        min_object_size = int(params.get('min_object_size', 30))
+        felz_scale = float(params.get('felz_scale', 150))
+        rag_threshold = float(params.get('rag_threshold', 0.12))
+        include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
+        include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
+        type_filter = params.get('types', None)
+        if isinstance(type_filter, str):
+            type_filter = [t.strip() for t in type_filter.split(',')]
+        group_filter = params.get('groups', None)
+        if isinstance(group_filter, str):
+            group_filter = [g.strip() for g in group_filter.split(',')]
+
+        all_objects = []
+        all_stats = None
+        all_evaluation = None
+
+        for feat in features:
+            geom = feat['geometry']
+            geom_3035 = ti.geometry_to_3035(geom)
+            if geom.geom_type == 'Point':
+                geom_3035 = geom_3035.buffer(100)
+            _validate_area(geom_3035)
+
+            # Load DTM/DSM
+            dtm_dates, dsm_dates = None, None
+            if include_temporal:
+                try:
+                    multi = raster_io.read_multi_date_ndsm(geom_3035)
+                    data = {
+                        'dtm': multi['dtm'], 'dsm': multi['dsm'],
+                        'ndsm': multi['ndsm'], 'mask': multi['mask'],
+                        'transform': multi['transform'], 'crs': multi['crs'],
+                        'shape': multi['shape'],
+                    }
+                    dtm_dates, dsm_dates = {}, {}
+                    for d in multi['dates_loaded']:
+                        try:
+                            dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
+                            mh = min(dd['shape'][0], data['shape'][0])
+                            mw = min(dd['shape'][1], data['shape'][1])
+                            dtm_dates[d] = dd['dtm'][:mh, :mw]
+                            dsm_dates[d] = dd['dsm'][:mh, :mw]
+                        except Exception as e:
+                            log.warning("Date %s load failed: %s", d, e)
+                except Exception as e:
+                    log.warning("Multi-temporal failed, single date: %s", e)
+                    data = raster_io.read_dtm_dsm(geom_3035, dataset)
+            else:
+                data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+            rgb, spectral = (None, None)
+            if include_ortho:
+                rgb, spectral = _try_read_ortho(data)
+
+            copernicus_data = None
+            if include_copernicus:
+                copernicus_data = _try_copernicus(geom)
+
+            building_footprints = None
+            if include_cadastre:
+                building_footprints = _try_cadastre(
+                    geom, data['transform'], data['shape'],
+                )
+
+            # Run segmentation pipeline
+            result = seg.segment_and_classify(
+                data['dtm'], data['dsm'], data['mask'], data['transform'],
+                dtm_dates=dtm_dates,
+                dsm_dates=dsm_dates,
+                spectral=spectral,
+                copernicus=copernicus_data,
+                building_footprints=building_footprints,
+                min_object_size=min_object_size,
+                felz_scale=felz_scale,
+                rag_threshold=rag_threshold,
+            )
+
+            objects = result['objects']
+
+            # Filters
+            if type_filter:
+                objects = [o for o in objects if o.obj_type in type_filter]
+            if group_filter:
+                objects = [o for o in objects if o.group_type in group_filter]
+
+            all_objects.extend(objects)
+            all_stats = result.get('stats')
+            if result.get('evaluation'):
+                all_evaluation = result['evaluation']
+
+        # Build GeoJSON response
+        obj_features = []
+        for obj in all_objects:
+            centroid_wgs = ti.geometry_from_3035(Point(obj.centroid_e, obj.centroid_n))
+            props = {
+                "id": obj.obj_id,
+                "type": obj.obj_type,
+                "type_code": obj.type_code,
+                "group_id": obj.group_id,
+                "group_type": obj.group_type,
+                "height_max_m": obj.height_max,
+                "height_mean_m": obj.height_mean,
+                "height_p90_m": obj.height_p90,
+                "area_sqm": obj.area_sqm,
+                "compactness": obj.compactness,
+                "elongation": obj.elongation,
+                "slope_mean": obj.slope_mean,
+                "roughness": obj.roughness,
+                "is_manmade": obj.is_manmade,
+                "confidence": obj.confidence,
+            }
+            if include_ortho or include_copernicus:
+                props["ndvi_mean"] = obj.ndvi_mean
+                props["brightness_mean"] = obj.brightness_mean
+            if include_temporal:
+                props["height_change"] = obj.height_change
+                props["dtm_change"] = obj.dtm_change
+                props["temporal_stability"] = obj.temporal_stability
+            obj_features.append({
+                "type": "Feature",
+                "properties": props,
+                "geometry": mapping(centroid_wgs),
+            })
+
+        resp = {
+            "type": "FeatureCollection",
+            "features": obj_features,
+            "stats": all_stats,
+            "meta": {
+                "classifier": "watershed_v1",
+                "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
+                "dataset": dataset,
+                "min_object_size": min_object_size,
+                "felz_scale": felz_scale,
+                "rag_threshold": rag_threshold,
+                "include_ortho": include_ortho,
+                "include_temporal": include_temporal,
+                "include_copernicus": include_copernicus,
+                "include_cadastre": include_cadastre,
+                "processing_time_s": round(time.time() - t0, 2),
+            },
+        }
+        if all_evaluation:
+            resp["cadastre_evaluation"] = all_evaluation
+
+        return jsonify(resp)
     except ValueError as e:
         return _error(str(e))
     except Exception as e:
@@ -1091,7 +1263,8 @@ def info():
         "endpoints": {
             "POST /api/v1/elevation": "Enrich features with DSM/DTM elevation",
             "POST /api/v1/terrain": "Terrain characterisation (slope, ruggedness, etc.)",
-            "POST /api/v1/objects": "Object detection and classification (27 types)",
+            "POST /api/v1/objects": "Object detection and classification (10 landscape types)",
+            "POST /api/v1/segment": "Watershed segmentation: 25 object types + 11 group types (Felzenszwalb+RAG)",
             "POST /api/v1/objects/raster": "Classified object raster download (GeoTIFF)",
             "POST /api/v1/changes": "Temporal change detection (earthworks, trees, buildings, roads)",
             "POST /api/v1/changes/trees": "Per-tree growth / felling analysis",

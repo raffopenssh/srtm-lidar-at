@@ -21,28 +21,34 @@ Cadastre: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
 ## Architecture
 
 ```
-app.py                 Flask API — all endpoints
-landscape_classifier.py  NEW: 10-type landscape classifier (replaced 27-type)
-                        Hessian linear features, multi-scale roughness,
-                        DTM time series machinery detection, building scoring
-                        Calibrated against BEV cadastre (F1=0.70 with ortho)
-copernicus.py          Sentinel-2 NDVI, ESA WorldCover, SAR via openEO
-cadastre.py            Building footprint fetcher + ground truth evaluator
-tile_index.py          55-tile grid index, CRS transforms
-raster_io.py           Windowed reads from remote GeoTIFFs via /vsicurl/
-ortho_io.py            BEV orthophoto reader (RGBI operates + DOP fallback)
-terrain_analysis.py    Slope, aspect, TRI, TPI, curvature
-temporal_analysis.py   Multi-date comparison, 20 change event types
-geo_parse.py           KML / GeoJSON / coordinate parser
-static/index.html      Leaflet web UI
-llm.txt                Machine-readable API reference
-srv.service            systemd + gunicorn (2 workers, port 8000)
+app.py                   Flask API — all endpoints
+object_segmentation.py   NEW: Watershed-based segmentation + classification
+                          Fused gradient (Sobel on DTM/DSM/CHM/RGBI/NDVI)
+                          Felzenszwalb over-segmentation + RAG boundary merge
+                          25 individual types + 11 group types
+                          Hierarchical: tree→forest, roof→building, road→road_network
+                          Cadastre-calibrated building detection (F1=0.74)
+                          Endpoint: POST /api/v1/segment
+landscape_classifier.py  10-type pixel-level classifier (Hessian, roughness, DTM time series)
+                          Endpoint: POST /api/v1/objects
+copernicus.py            Sentinel-2 NDVI, ESA WorldCover, SAR via openEO
+cadastre.py              Building footprint fetcher + ground truth evaluator
+tile_index.py            55-tile grid index, CRS transforms
+raster_io.py             Windowed reads from remote GeoTIFFs via /vsicurl/
+ortho_io.py              BEV orthophoto reader (RGBI operates + DOP fallback)
+terrain_analysis.py      Slope, aspect, TRI, TPI, curvature
+temporal_analysis.py     Multi-date comparison, 20 change event types
+geo_parse.py             KML / GeoJSON / coordinate parser
+static/index.html        Leaflet web UI
+llm.txt                  Machine-readable API reference
+srv.service              systemd + gunicorn (2 workers, port 8000)
+docs/reference_algorithms_summary.md  Algorithm design notes
 
 OLD (kept for reference):
-object_classifier.py   Original 27-type classifier (superseded by landscape_classifier)
+object_classifier.py   Original 27-type classifier
 ```
 
-## 10 Landscape Types
+## 10 Landscape Types (pixel-level, /api/v1/objects)
 
 | Code | Type | How detected |
 |------|------|-------------|
@@ -56,6 +62,37 @@ object_classifier.py   Original 27-type classifier (superseded by landscape_clas
 | 8 | vegetation | Low/medium height, not engineered |
 | 9 | bare_natural | Steep + rough terrain, or bare soil |
 | 10 | recent_disturbance | DTM changed >0.15m between dates + spatial coherence |
+
+## 25 Object Types + 11 Groups (watershed, /api/v1/segment)
+
+Individual objects detected per-segment after Felzenszwalb+RAG segmentation:
+
+| Category | Types | How detected |
+|----------|-------|-------------|
+| Vegetation | tree, shrub, grass, hedge | nDSM height + NDVI + roughness + elongation |
+| Water | water | ESA WorldCover + very low NDVI + low NIR + flat |
+| Buildings | roof, greenhouse, solar_panel | Smooth DSM + low NDVI + compact + stable |
+| Infrastructure | fence, wall, mast | Shape (elongated/tiny) + height + non-vegetated |
+| Transportation | road, path, parking, bridge | Smooth DTM + elongated/compact + low NDVI |
+| Agricultural | crop, orchard, vineyard, garden | NDVI + ESA cropland prior + area/spacing |
+| Terrain | bare_soil, rock | Low NDVI + steep/rough (rock) or flat (soil) |
+| Disturbance | excavation, fill, clear_cut, construction | DTM temporal change + nDSM temporal change |
+
+Groups (adjacent compatible objects merged):
+
+| Group | Members merged | Cadastre ref |
+|-------|---------------|-------------|
+| forest | tree+shrub+hedge | W 56, W(Kr) 57 |
+| building | roof+wall+solar_panel+greenhouse | B 42-47 |
+| road_network | road+path+parking | V 48,73,74 |
+| cropland | crop+grass | A 51,62 |
+| pasture | grass+garden | LN 52-55 |
+| quarry | excavation+fill | Ab 80,93 |
+| construction_site | construction+excavation+fill | recent |
+| waterbody | water | GW 70,71 |
+| woodland | shrub+hedge | sparse trees |
+| hedgerow | hedge | linear veg |
+| orchard_grove | orchard+vineyard | OG 65, WG 63 |
 
 ## Key Detection Methods
 

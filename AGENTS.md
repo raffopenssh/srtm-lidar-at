@@ -26,17 +26,28 @@ hansen.py                Hansen Global Forest Change (GFC-2024-v1.12) integratio
                           Reads treecover2000/lossyear/gain via /vsicurl/
                           calibrate_clear_cut() boosts/downgrades clear_cut confidence
                           evaluate_forest_loss() returns P/R/F1 vs Hansen reference
-object_segmentation.py   NEW: Watershed-based segmentation + classification
+object_segmentation.py   Watershed-based segmentation + classification
                           Fused gradient (Sobel on DTM/DSM/CHM/RGBI/NDVI)
                           Felzenszwalb over-segmentation + RAG boundary merge
                           25 individual types + 11 group types
                           Hierarchical: tree→forest, roof→building, road→road_network
                           Cadastre-calibrated building detection (F1=0.74)
+                          Now uses texture+harmonics+SAR+RF when available
                           Endpoint: POST /api/v1/segment
+texture_features.py      GLCM texture from 20cm orthophotos (NEW)
+                          Reads ortho at 0.5m, computes contrast/entropy/homogeneity
+                          Key discriminator: road (low entropy) vs grass vs forest
+ndvi_harmonics.py        NDVI time series harmonic fit (NEW)
+                          Monthly NDVI → harmonic model (mean, amplitude, phase)
+                          Separates crop (high amp) vs pasture (low amp) vs road (flat)
+learned_classifier.py    Random Forest trained on cadastre ground truth (NEW)
+                          44-feature vector: height+shape+NDVI+texture+SAR+harmonics
+                          Falls back to rule-based when no model trained
+                          Endpoints: POST /api/v1/classifier/train, GET /status
 landscape_classifier.py  DEPRECATED: 10-type pixel-level classifier
                           Superseded by object_segmentation.py
                           Endpoint: POST /api/v1/objects (legacy)
-copernicus.py            Sentinel-2 NDVI, ESA WorldCover, SAR via openEO
+copernicus.py            Sentinel-2 NDVI, ESA WorldCover, SAR, NDVI time series
 cadastre.py              Building footprint fetcher + ground truth evaluator
 tile_index.py            55-tile grid index, CRS transforms
 raster_io.py             Windowed reads from remote GeoTIFFs via /vsicurl/
@@ -98,6 +109,40 @@ Groups (adjacent compatible objects merged):
 | woodland | shrub+hedge | sparse trees |
 | hedgerow | hedge | linear veg |
 | orchard_grove | orchard+vineyard | OG 65, WG 63 |
+
+## Step-Change Features (v3.1)
+
+Four additions that move beyond threshold tuning:
+
+### 1. GLCM Texture from 20cm Orthophoto (texture_features.py)
+Reads ortho at 0.5m (not 1m), computes Grey-Level Co-occurrence Matrix.
+Features per segment: contrast, homogeneity, entropy, dissimilarity, energy.
+- Road: entropy <3, homogeneity >0.7 (uniform surface)
+- Grass: entropy 3-5, homogeneity 0.4-0.6
+- Forest canopy: entropy >5, homogeneity <0.4 (complex texture)
+This is the single most discriminative new signal for ground-level classes.
+
+### 2. NDVI Harmonic Phenology (ndvi_harmonics.py)
+Monthly Sentinel-2 NDVI → harmonic fit: y(t) = mean + amp*cos(2πt/12 - phase)
+- Crop: high amplitude (>0.15), peak Jun-Aug (phase 5-7)
+- Pasture: moderate mean (>0.3), low amplitude (<0.15)
+- Forest: high mean (>0.5), very low amplitude (<0.08)
+- Road/bare: low mean (<0.15), near-zero amplitude
+Primary discriminator for crop vs pasture — previously indistinguishable.
+
+### 3. Sentinel-1 SAR Backscatter
+VV+VH polarisation from copernicus.py, now consumed by classifier.
+- Buildings: high VV, high VV/VH ratio (>3) = corner reflectors
+- Forest: high VH, low ratio (<2) = volume scattering
+- Roads: low VH, moderate VV = specular reflection
+Orthogonal to optical — works through clouds and at night.
+
+### 4. Random Forest Classifier (learned_classifier.py)
+44-feature vector (height+shape+NDVI+texture+SAR+harmonics) trained
+on cadastre land-use codes as noisy labels. OOB score validation.
+Falls back to rule-based classify_object() when no model available.
+Training: POST /api/v1/classifier/train with a bbox.
+Disagreements between RF and cadastre = candidate cadastre errors.
 
 ## Key Detection Methods
 

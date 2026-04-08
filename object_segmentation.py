@@ -195,6 +195,17 @@ class SegmentedObject:
     # Group membership
     group_id: int = 0
     group_type: str = ""
+    # Texture (GLCM from ortho)
+    glcm_entropy: float = 0.0
+    glcm_homogeneity: float = 0.0
+    texture_complexity: float = 0.0
+    # SAR backscatter
+    sar_vv: float = 0.0
+    sar_vh: float = 0.0
+    # NDVI harmonics (phenology)
+    harm_amplitude: float = 0.0
+    harm_phase: float = 0.0
+    phenology_class: str = ""
     # Features vector (for debugging / calibration)
     features: dict = field(default_factory=dict)
 
@@ -487,6 +498,17 @@ def extract_object_features(
         if arr.shape == (h, w):
             cop_lc = arr
 
+    # --- SAR backscatter (resampled to 1m) ---
+    sar_vv = _get_spectral_layer(cop, "vv", h, w) if cop else None
+    sar_vh = _get_spectral_layer(cop, "vh", h, w) if cop else None
+
+    # --- NDVI harmonic parameters (resampled to 1m) ---
+    harm = cop.get("harmonics") if cop else None
+    harm_mean = _get_spectral_layer(harm, "h_mean", h, w) if harm else None
+    harm_amp = _get_spectral_layer(harm, "h_amplitude", h, w) if harm else None
+    harm_phase = _get_spectral_layer(harm, "h_phase", h, w) if harm else None
+    harm_rmse = _get_spectral_layer(harm, "h_rmse", h, w) if harm else None
+
     # --- Extract per-region ---
     regions = measure.regionprops(labels, intensity_image=ndsm)
     objects = []
@@ -562,6 +584,19 @@ def extract_object_features(
         f["cop_ndvi_mean"] = _seg_mean(cop_ndvi, seg_v)
         # Fused NDVI: seasonal-corrected 1m (best of both worlds)
         f["fused_ndvi_mean"], f["fused_ndvi_std"], _ = _seg_stats(fused_ndvi, seg_v)
+
+        # SAR backscatter
+        f["sar_vv"] = _seg_mean(sar_vv, seg_v)
+        f["sar_vh"] = _seg_mean(sar_vh, seg_v)
+        vv_val = f["sar_vv"]
+        vh_val = f["sar_vh"]
+        f["sar_ratio"] = vv_val / max(vh_val, 1e-6) if vv_val > 0 else 0
+
+        # NDVI harmonic parameters (prefix 'harm_' to avoid collision with height)
+        f["harm_mean"] = _seg_mean(harm_mean, seg_v)
+        f["harm_amplitude"] = _seg_mean(harm_amp, seg_v)
+        f["harm_phase"] = _seg_mean(harm_phase, seg_v)
+        f["harm_rmse"] = _seg_mean(harm_rmse, seg_v)
 
         # ESA WorldCover
         if cop_lc is not None:
@@ -715,6 +750,26 @@ def _seg_stats(arr: np.ndarray | None, seg: np.ndarray) -> tuple[float, float, f
 # 4. OBJECT CLASSIFICATION — decision tree on per-object features
 # ===================================================================
 
+def _phenology_class(feat: dict) -> str:
+    """Derive phenology class label from harmonic features."""
+    amp = feat.get("harm_amplitude", 0)
+    mean_v = feat.get("harm_mean", 0)
+    phase = feat.get("harm_phase", 0)
+    if amp == 0 and mean_v == 0:
+        return ""
+    if mean_v < 0.15 and amp < 0.05:
+        return "road_or_bare"
+    if amp > 0.15 and 4 <= phase <= 8:
+        return "crop"
+    if mean_v > 0.5 and amp < 0.08:
+        return "forest"
+    if mean_v > 0.3 and amp < 0.15:
+        return "pasture"
+    if amp > 0.10:
+        return "seasonal_vegetation"
+    return "unknown"
+
+
 def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int, float, bool]:
     """Classify a single object from its feature vector.
 
@@ -754,6 +809,26 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     solidity = feat.get("solidity", 0)
     extent = feat.get("extent", 0)
     dsm_edge = feat.get("dsm_edge_strength", 0)
+
+    # --- Texture features (GLCM from ortho) ---
+    glcm_entropy = feat.get("glcm_entropy", 0)
+    glcm_homogeneity = feat.get("glcm_homogeneity", 0)
+    glcm_contrast = feat.get("glcm_contrast", 0)
+    tex_complexity = feat.get("texture_complexity", 0)
+    has_texture = glcm_entropy > 0 or glcm_homogeneity > 0
+
+    # --- SAR backscatter features ---
+    sar_vv = feat.get("sar_vv", 0)
+    sar_vh = feat.get("sar_vh", 0)
+    sar_ratio = feat.get("sar_ratio", 0)
+    has_sar = sar_vv > 0 or sar_vh > 0
+
+    # --- NDVI harmonic (phenology) features ---
+    harm_mean = feat.get("harm_mean", 0)
+    harm_amp = feat.get("harm_amplitude", 0)
+    harm_phase = feat.get("harm_phase", 0)
+    harm_rmse = feat.get("harm_rmse", 0)
+    has_harmonics = harm_mean != 0 or harm_amp != 0
 
     # --- NDVI selection hierarchy ---
     #   1. Fused (BEV 1m spatial + Copernicus seasonal correction) — best
@@ -958,6 +1033,31 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         if esa_built > 0.3:
             bld_score += 1.0
 
+        # Texture: buildings have low-moderate entropy (uniform surfaces)
+        if has_texture:
+            if glcm_entropy < 3.5:
+                bld_score += 1.5   # very uniform = roof material
+            elif glcm_entropy < 5.0:
+                bld_score += 0.5   # moderate = possible building
+            elif glcm_entropy > 6.0:
+                bld_score -= 1.5   # complex texture = tree canopy
+            elif glcm_entropy > 5.0:
+                bld_score -= 0.5
+
+        # SAR: buildings are strong corner reflectors (high VV)
+        if has_sar:
+            if sar_vv > 0.1 and sar_ratio > 3.0:
+                bld_score += 1.5  # strong VV + high VV/VH = corner reflector
+            elif sar_vh > 0.05 and sar_ratio < 1.5:
+                bld_score -= 1.0  # high VH + low ratio = volume scattering (trees)
+
+        # Harmonics: buildings have ~zero seasonal amplitude
+        if has_harmonics:
+            if harm_amp < 0.03 and harm_mean < 0.15:
+                bld_score += 1.0  # no seasonality + bare = likely built
+            elif harm_amp > 0.10:
+                bld_score -= 1.0  # seasonal = vegetation
+
         # Height penalty: very tall more likely tree/tower
         if h_mean > 25:
             bld_score -= 1.5
@@ -1006,6 +1106,15 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
                 conf = 0.7
             if h_change > 0.5:  # growing
                 conf = min(conf + 0.1, 0.95)
+            # Texture boost: high entropy + low homogeneity = forest canopy
+            if has_texture and glcm_entropy > 5.0 and glcm_homogeneity < 0.5:
+                conf = min(conf + 0.1, 0.95)
+            # SAR boost: high VH = volume scattering from canopy
+            if has_sar and sar_vh > 0.04 and sar_ratio < 2.0:
+                conf = min(conf + 0.1, 0.95)
+            # Harmonics boost: low amplitude + high mean = evergreen/stable forest
+            if has_harmonics and harm_amp < 0.08 and harm_mean > 0.5:
+                conf = min(conf + 0.1, 0.95)
             return "tree", OBJECT_TYPES["tree"], conf, False
 
         if h_mean >= 1.0:
@@ -1036,6 +1145,18 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     is_smooth = dtm_rough < 0.04 and slope_mean < 15
     is_very_smooth = dtm_rough < 0.02 and slope_mean < 10
 
+    # Texture-based road score: roads have very low entropy, high homogeneity
+    tex_road_score = 0.0
+    if has_texture:
+        if glcm_entropy < 3.0 and glcm_homogeneity > 0.7:
+            tex_road_score = 1.0   # textbook road signature
+        elif glcm_entropy < 4.0 and glcm_homogeneity > 0.5:
+            tex_road_score = 0.5   # likely paved
+        elif glcm_entropy > 5.0 and glcm_homogeneity < 0.4:
+            tex_road_score = -0.5  # complex texture = vegetation
+        elif 3.0 <= glcm_entropy <= 5.0:
+            tex_road_score = -0.3  # medium entropy = grass/pasture
+
     if is_smooth:
         # Very smooth terrain is almost certainly engineered.
         # With fused or 1m NDVI, also accept moderate NDVI (adjacent veg
@@ -1049,14 +1170,17 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
                     conf = 0.85
                 elif have_ndvi and best_ndvi < 0.20:
                     conf = 0.75
+                conf = min(conf + tex_road_score * 0.1, 0.95)
                 return "road", OBJECT_TYPES["road"], conf, True
             elif area > 40 and compact > 0.25:
                 conf = 0.55
                 if have_ndvi and best_ndvi < 0.15 and brightness > 80:
                     conf = 0.75
+                conf = min(conf + tex_road_score * 0.1, 0.95)
                 return "parking", OBJECT_TYPES["parking"], conf, True
             elif area > 8:
-                return "path", OBJECT_TYPES["path"], 0.45, True
+                conf = 0.45 + tex_road_score * 0.1
+                return "path", OBJECT_TYPES["path"], min(conf, 0.95), True
 
     # Garden: moderate NDVI, near buildings (small area)
     if best_ndvi > 0.2 and best_ndvi < 0.5 and area < 300 and esa_built > 0.1:
@@ -1064,15 +1188,91 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         if dtm_rough > 0.03:
             return "garden", OBJECT_TYPES["garden"], 0.45, False
 
-    # Crop vs grass (use ESA WorldCover + NDVI)
+    # Texture override: very low entropy + high homogeneity on ground =
+    # road/path even with moderate NDVI (ortho bleed near edges).
+    if has_texture and tex_road_score >= 0.5 and is_smooth:
+        conf = 0.55 + tex_road_score * 0.1
+        if elong > 3 and area > 15:
+            return "road", OBJECT_TYPES["road"], min(conf, 0.85), True
+        elif area > 8:
+            return "path", OBJECT_TYPES["path"], min(conf, 0.75), True
+
+    # ---------------------------------------------------------------
+    # HARMONIC PHENOLOGY OVERRIDE (strongest temporal signal)
+    # If we have harmonic features, use them as primary discriminator
+    # for crop vs pasture vs road — this is the step change.
+    # ---------------------------------------------------------------
+    if has_harmonics and harm_amp > 0:
+        # Crop: high amplitude (>0.15), peak Jun-Aug
+        if harm_amp > 0.15 and 4 <= harm_phase <= 8:
+            conf = 0.75
+            if esa_crop > 0.3:
+                conf = 0.85
+            if best_ndvi > 0.3:
+                conf = min(conf + 0.05, 0.95)
+            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+                conf = min(conf + 0.05, 0.95)
+            return "crop", OBJECT_TYPES["crop"], conf, False
+
+        # Road/bare: very low mean + very low amplitude
+        if harm_mean < 0.15 and harm_amp < 0.05:
+            conf = 0.6
+            if is_smooth:
+                conf = 0.75
+            if has_texture and tex_road_score > 0:
+                conf = min(conf + 0.1, 0.90)
+            # SAR confirmation: low VH = specular (road), not volume (veg)
+            if has_sar and sar_vh < 0.03:
+                conf = min(conf + 0.1, 0.90)
+            if elong > 3 and area > 15:
+                return "road", OBJECT_TYPES["road"], conf, True
+            elif area > 40 and compact > 0.25:
+                return "parking", OBJECT_TYPES["parking"], conf, True
+            elif area > 8:
+                return "path", OBJECT_TYPES["path"], conf, True
+            return "bare_soil", OBJECT_TYPES["bare_soil"], 0.5, False
+
+        # Pasture: moderate mean, low-moderate amplitude
+        if harm_mean > 0.3 and harm_amp < 0.15:
+            conf = 0.65
+            if esa_grass > 0.3:
+                conf = 0.75
+            if best_ndvi > 0.3:
+                conf = min(conf + 0.05, 0.85)
+            return "grass", OBJECT_TYPES["grass"], conf, False
+
+    # ---------------------------------------------------------------
+    # SAR-based ground classification (cloud-proof)
+    # ---------------------------------------------------------------
+    if has_sar and not has_harmonics:
+        # Very low VH on ground = specular surface = road/parking
+        if sar_vh < 0.02 and sar_vv > 0.03 and is_smooth:
+            conf = 0.55
+            if elong > 3:
+                return "road", OBJECT_TYPES["road"], conf, True
+            elif area > 40:
+                return "parking", OBJECT_TYPES["parking"], conf, True
+        # High VH relative to height = dense low vegetation
+        if sar_vh > 0.04 and best_ndvi > 0.3:
+            if esa_crop > 0.3:
+                return "crop", OBJECT_TYPES["crop"], 0.6, False
+            return "grass", OBJECT_TYPES["grass"], 0.55, False
+
+    # Crop vs grass (use ESA WorldCover + NDVI — fallback when no harmonics)
     if best_ndvi > 0.4:
         if ndvi_is_coarse and is_smooth:
             # Coarse NDVI on smooth ground = likely road with 10m veg bleed
             return "road", OBJECT_TYPES["road"], 0.45, True
         if esa_crop > 0.3:
-            return "crop", OBJECT_TYPES["crop"], 0.7, False
+            conf = 0.7
+            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+                conf = min(conf + 0.05, 0.85)
+            return "crop", OBJECT_TYPES["crop"], conf, False
         if area > 500:
-            return "grass", OBJECT_TYPES["grass"], 0.65, False
+            conf = 0.65
+            if has_texture and 3.0 <= glcm_entropy <= 5.0:
+                conf = min(conf + 0.05, 0.80)
+            return "grass", OBJECT_TYPES["grass"], conf, False
         return "grass", OBJECT_TYPES["grass"], 0.5, False
 
     if best_ndvi > 0.2:
@@ -1369,6 +1569,7 @@ def segment_and_classify(
     min_object_size: int = 30,
     felz_scale: float = 150.0,
     rag_threshold: float = 0.12,
+    ortho_year: int | None = None,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
 
@@ -1424,13 +1625,52 @@ def segment_and_classify(
         dtm_dates=dtm_dates, dsm_dates=dsm_dates,
     )
 
+    # --- Step 3b: Texture features (GLCM from ortho) ---
+    try:
+        from texture_features import compute_texture_per_segment
+        als_result_dict = {"transform": transform, "shape": (h, w)}
+        tex_by_label = compute_texture_per_segment(
+            labels, als_result_dict, year=ortho_year,
+        )
+        if tex_by_label:
+            log.info("Step 3b: Merging texture features for %d segments", len(tex_by_label))
+            for feat in features:
+                lbl = feat["label"]
+                tex = tex_by_label.get(lbl, {})
+                for key in ("glcm_contrast", "glcm_homogeneity", "glcm_entropy",
+                            "glcm_dissimilarity", "glcm_energy", "texture_complexity"):
+                    feat[key] = tex.get(key, 0.0)
+        else:
+            log.info("Step 3b: No texture features available (ortho not found)")
+    except Exception as e:
+        log.warning("Step 3b: Texture computation failed: %s", e)
+
     # --- Step 4: Classification ---
-    log.info("Step 4: Object classification")
+    # Try learned RF classifier first, fall back to rules
+    use_rf = False
+    try:
+        from learned_classifier import get_classifier
+        rf_clf = get_classifier()
+        if rf_clf.is_trained:
+            use_rf = True
+            log.info("Step 4: Object classification (RF classifier, OOB=%.3f)",
+                     rf_clf.oob_score)
+        else:
+            log.info("Step 4: Object classification (rule-based, no RF model)")
+    except Exception:
+        log.info("Step 4: Object classification (rule-based)")
+
     objects = []
     for feat in features:
-        type_name, type_code, conf, is_mm = classify_object(
-            feat, has_spectral=has_spectral,
-        )
+        if use_rf:
+            from learned_classifier import classify_with_rf
+            type_name, type_code, conf, is_mm = classify_with_rf(
+                feat, has_spectral=has_spectral,
+            )
+        else:
+            type_name, type_code, conf, is_mm = classify_object(
+                feat, has_spectral=has_spectral,
+            )
         obj = SegmentedObject(
             obj_id=feat["label"],
             obj_type=type_name,
@@ -1459,6 +1699,14 @@ def segment_and_classify(
             solidity=round(feat.get("solidity", 0), 3),
             extent=round(feat.get("extent", 0), 3),
             dsm_edge_strength=round(feat.get("dsm_edge_strength", 0), 3),
+            glcm_entropy=round(feat.get("glcm_entropy", 0), 4),
+            glcm_homogeneity=round(feat.get("glcm_homogeneity", 0), 4),
+            texture_complexity=round(feat.get("texture_complexity", 0), 4),
+            sar_vv=round(feat.get("sar_vv", 0), 4),
+            sar_vh=round(feat.get("sar_vh", 0), 4),
+            harm_amplitude=round(feat.get("harm_amplitude", 0), 4),
+            harm_phase=round(feat.get("harm_phase", 0), 1),
+            phenology_class=_phenology_class(feat),
             confidence=round(conf, 3),
             is_manmade=is_mm,
             features=feat,
@@ -1502,26 +1750,34 @@ def segment_and_classify(
 
 def _resample_copernicus(copernicus: dict, target_transform, target_shape: tuple) -> dict:
     """Resample Copernicus data from 10m to 1m grid."""
-    result = {"ndvi": None, "landcover": None}
+    result = {"ndvi": None, "landcover": None, "vv": None, "vh": None,
+              "harmonics": None}
     try:
         from rasterio.warp import reproject, Resampling
         from rasterio.crs import CRS
     except ImportError:
         return result
 
+    def _reproject_layer(src_arr, src_tf, src_crs, dtype=np.float32,
+                         resamp=Resampling.bilinear, fill=np.nan):
+        dst = np.full(target_shape, fill, dtype=dtype)
+        reproject(
+            source=src_arr.astype(dtype), destination=dst,
+            src_transform=src_tf,
+            src_crs=src_crs or CRS.from_epsg(4326),
+            dst_transform=target_transform,
+            dst_crs=CRS.from_epsg(3035),
+            resampling=resamp,
+        )
+        return dst
+
+    cop_tf = copernicus.get("transform")
+    cop_crs = copernicus.get("crs")
+
     if copernicus.get("ndvi") is not None:
         try:
-            src = np.asarray(copernicus["ndvi"], dtype=np.float32)
-            dst = np.full(target_shape, np.nan, dtype=np.float32)
-            reproject(
-                source=src, destination=dst,
-                src_transform=copernicus.get("transform"),
-                src_crs=copernicus.get("crs") or CRS.from_epsg(4326),
-                dst_transform=target_transform,
-                dst_crs=CRS.from_epsg(3035),
-                resampling=Resampling.bilinear,
-            )
-            result["ndvi"] = dst
+            result["ndvi"] = _reproject_layer(
+                np.asarray(copernicus["ndvi"]), cop_tf, cop_crs)
         except Exception as e:
             log.warning("Failed to resample Copernicus NDVI: %s", e)
 
@@ -1529,18 +1785,40 @@ def _resample_copernicus(copernicus: dict, target_transform, target_shape: tuple
         try:
             lc_data = copernicus["landcover"]
             lc_info = lc_data if isinstance(lc_data, dict) else {"map": lc_data}
-            dst = np.zeros(target_shape, dtype=np.uint8)
-            reproject(
-                source=lc_info["map"].astype(np.uint8), destination=dst,
-                src_transform=lc_info.get("transform", copernicus.get("transform")),
-                src_crs=lc_info.get("crs", copernicus.get("crs")) or CRS.from_epsg(4326),
-                dst_transform=target_transform,
-                dst_crs=CRS.from_epsg(3035),
-                resampling=Resampling.nearest,
-            )
-            result["landcover"] = dst
+            result["landcover"] = _reproject_layer(
+                lc_info["map"].astype(np.uint8),
+                lc_info.get("transform", cop_tf),
+                lc_info.get("crs", cop_crs),
+                dtype=np.uint8, resamp=Resampling.nearest, fill=0)
         except Exception as e:
             log.warning("Failed to resample land cover: %s", e)
+
+    # SAR backscatter (VV, VH)
+    sar_tf = copernicus.get("sar_transform", cop_tf)
+    sar_crs = copernicus.get("sar_crs", cop_crs)
+    for band in ("vv", "vh"):
+        if copernicus.get(band) is not None:
+            try:
+                result[band] = _reproject_layer(
+                    np.asarray(copernicus[band]), sar_tf, sar_crs)
+            except Exception as e:
+                log.warning("Failed to resample SAR %s: %s", band, e)
+
+    # NDVI harmonics (h_mean, h_amplitude, h_phase, h_rmse)
+    if copernicus.get("harmonics") is not None:
+        harm = copernicus["harmonics"]
+        harm_tf = harm.get("transform", cop_tf)
+        harm_crs = harm.get("crs", cop_crs)
+        h_resampled = {}
+        for key in ("h_mean", "h_amplitude", "h_phase", "h_rmse"):
+            if key in harm:
+                try:
+                    h_resampled[key] = _reproject_layer(
+                        np.asarray(harm[key]), harm_tf, harm_crs)
+                except Exception as e:
+                    log.warning("Failed to resample harmonic %s: %s", key, e)
+        if h_resampled:
+            result["harmonics"] = h_resampled
 
     return result
 

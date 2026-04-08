@@ -130,7 +130,8 @@ def _try_read_ortho(data: dict) -> tuple:
         return None, None
 
 
-def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False) -> dict | None:
+def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
+                    harmonics=False) -> dict | None:
     """Attempt to fetch Copernicus data for a geometry."""
     try:
         import copernicus
@@ -156,8 +157,20 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False) -> dict
                 sar_data = copernicus.get_sar_backscatter(bbox_dict, "2023-06-01", "2023-09-30")
                 result["vv"] = sar_data["vv"]
                 result["vh"] = sar_data["vh"]
+                result["sar_transform"] = sar_data["transform"]
+                result["sar_crs"] = sar_data["crs"]
             except Exception as e:
                 log.warning("Copernicus SAR failed: %s", e)
+        if harmonics:
+            try:
+                import ndvi_harmonics
+                harm = ndvi_harmonics.get_harmonic_features(bbox_dict)
+                if harm:
+                    result["harmonics"] = harm
+                    log.info("NDVI harmonics: mean amp=%.3f",
+                             float(np.nanmean(harm.get("h_amplitude", [0]))))
+            except Exception as e:
+                log.warning("NDVI harmonics failed: %s", e)
         return result if result else None
     except ImportError:
         log.info("Copernicus module not available")
@@ -375,7 +388,7 @@ def objects_summary():
             # Copernicus data (Sentinel-2 NDVI, land cover, SAR)
             copernicus_data = None
             if include_copernicus:
-                copernicus_data = _try_copernicus(geom)
+                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
 
             # Cadastre building footprints (ground truth)
             building_footprints = None
@@ -532,7 +545,7 @@ def segment_objects():
 
             copernicus_data = None
             if include_copernicus:
-                copernicus_data = _try_copernicus(geom)
+                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
 
             building_footprints = None
             if include_cadastre:
@@ -617,6 +630,20 @@ def segment_objects():
                 props["height_change"] = obj.height_change
                 props["dtm_change"] = obj.dtm_change
                 props["temporal_stability"] = obj.temporal_stability
+            # Texture features
+            if obj.glcm_entropy > 0:
+                props["glcm_entropy"] = obj.glcm_entropy
+                props["glcm_homogeneity"] = obj.glcm_homogeneity
+                props["texture_complexity"] = obj.texture_complexity
+            # SAR features
+            if obj.sar_vv > 0:
+                props["sar_vv"] = obj.sar_vv
+                props["sar_vh"] = obj.sar_vh
+            # Phenology features
+            if obj.harm_amplitude > 0:
+                props["harm_amplitude"] = obj.harm_amplitude
+                props["harm_phase"] = obj.harm_phase
+                props["phenology_class"] = obj.phenology_class
             obj_features.append({
                 "type": "Feature",
                 "properties": props,
@@ -862,7 +889,7 @@ def segment_overlay():
 
         copernicus_data = None
         if include_copernicus:
-            copernicus_data = _try_copernicus(geom)
+            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
 
         building_footprints = None
         if include_cadastre:
@@ -1769,6 +1796,127 @@ def ortho_geotiff():
 
 
 # ---------------------------------------------------------------------------
+# RF CLASSIFIER TRAINING
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/classifier/train', methods=['POST'])
+def train_classifier():
+    """Train RF classifier from cadastre ground truth over a bbox.
+
+    Params: geometry (bbox/geojson), dataset, include_ortho, include_copernicus.
+    Fetches segment features + cadastre parcel codes, trains RF model.
+    """
+    try:
+        import learned_classifier as lc
+        import object_segmentation as oc
+        import cadastre
+
+        params = _parse_params()
+        geom, geom_3035 = _parse_geometry(params)
+        dataset = params.get('dataset', ti.DEFAULT_DATASET)
+
+        # Read LIDAR
+        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+        # Read ortho
+        rgb, spectral = _try_read_ortho(data)
+
+        # Copernicus
+        copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
+
+        # Segment (feature extraction)
+        result = oc.segment_and_classify(
+            data['dtm'], data['dsm'], data['mask'], data['transform'],
+            spectral=spectral, copernicus=copernicus_data,
+        )
+        features = [obj.features for obj in result['objects']]
+        labels_arr = result['labels']
+
+        # Fetch cadastre parcel codes
+        bbox_wgs = geom.bounds
+        try:
+            parcels = cadastre.fetch_parcel_land_use(
+                (bbox_wgs[0], bbox_wgs[1], bbox_wgs[2], bbox_wgs[3]))
+        except Exception:
+            # Try alternative: rasterise cadastre codes onto label grid
+            parcels = None
+
+        if parcels is None:
+            return _error("Could not fetch cadastre parcel codes")
+
+        # Match segments to cadastre labels
+        train_features = []
+        train_labels = []
+        for feat in features:
+            lbl = feat.get("label", 0)
+            # Find dominant cadastre code for this segment
+            code = _dominant_cadastre_code(feat, parcels)
+            if code and code in lc.CADASTRE_TO_TYPE:
+                train_features.append(feat)
+                train_labels.append(lc.CADASTRE_TO_TYPE[code])
+
+        if len(train_features) < 20:
+            return _error(f"Only {len(train_features)} labelled segments, need >= 20")
+
+        clf = lc.LearnedClassifier()
+        stats = clf.train(train_features, train_labels)
+
+        return jsonify({
+            "status": "trained",
+            "training_stats": stats,
+            "n_segments_total": len(features),
+            "n_segments_labelled": len(train_features),
+        })
+
+    except Exception as e:
+        log.error("classifier train: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/classifier/status', methods=['GET'])
+def classifier_status():
+    """Check if a trained RF model exists."""
+    try:
+        import learned_classifier as lc
+        clf = lc.get_classifier()
+        return jsonify({
+            "trained": clf.is_trained,
+            "n_train": clf.n_train,
+            "oob_score": clf.oob_score,
+            "n_classes": len(clf.classes),
+            "classes": clf.classes,
+            "top_features": dict(sorted(
+                clf.feature_importances.items(),
+                key=lambda x: -x[1]
+            )[:15]) if clf.feature_importances else {},
+        })
+    except Exception as e:
+        return _error(str(e))
+
+
+def _dominant_cadastre_code(feat, parcels):
+    """Find the most common cadastre code overlapping a segment."""
+    # parcels is expected to be a list of {geometry, code} or similar
+    # For now, find parcels whose centroid falls within segment bbox
+    ce = feat.get("centroid_e", 0)
+    cn = feat.get("centroid_n", 0)
+    if not parcels:
+        return None
+    # Simple: find nearest parcel
+    best = None
+    best_dist = float('inf')
+    for p in parcels:
+        pc = p.get("centroid")
+        code = p.get("code")
+        if pc and code:
+            d = ((pc[0] - ce)**2 + (pc[1] - cn)**2)**0.5
+            if d < best_dist:
+                best_dist = d
+                best = code
+    return best
+
+
+# ---------------------------------------------------------------------------
 # INFO & DOCS
 # ---------------------------------------------------------------------------
 
@@ -1781,7 +1929,7 @@ def info():
         "classifier": "landscape_v2 — 10 types focused on human transformation of terrain",
         "source": "data.bev.gv.at",
         "resolution_lidar": "1m",
-        "resolution_ortho": "0.2m (resampled to 1m for analysis)",
+        "resolution_ortho": "0.2m (1m for analysis, 0.5m for GLCM texture)",
         "crs": "EPSG:3035",
         "datasets_als": {k: {"dtm": True, "dsm": True} for k in sorted(ti.DATASETS.keys())},
         "datasets_ortho": ["20220128 (RGB 50km tiles)"],

@@ -394,15 +394,16 @@ def process_one_kg(
             stats["error"] = f"bbox fetch: {e}"
             return [], [], stats
 
-    # Limit KG size — skip very large ones (>5km in any direction)
+    # Limit KG size — crop large KGs to center 3km to stay within
+    # ~7.8 GB RAM (3 temporal dates × DTM+DSM + spectral + segments).
     dx_km = (east - west) * 111 * np.cos(np.radians((south + north) / 2))
     dy_km = (north - south) * 111
-    if dx_km > 5 or dy_km > 5:
-        # Take center 2km x 2km
+    if dx_km > 3 or dy_km > 3:
+        # Take center 3km x 3km
         cx, cy = (west + east) / 2, (south + north) / 2
-        half = 0.01  # ~1km
+        half = 0.0135  # ~1.5km
         west, south, east, north = cx - half, cy - half, cx + half, cy + half
-        log.info("KG %s: large (%.1f x %.1f km), cropping to center 2km",
+        log.info("KG %s: large (%.1f x %.1f km), cropping to center 3km",
                  kg_code, dx_km, dy_km)
 
     stats["bbox"] = [west, south, east, north]
@@ -736,6 +737,10 @@ def main():
             json.dump(all_stats, f, indent=2, default=str)
 
         completed_kgs.add(kg_code)
+
+        # Free memory between KGs to avoid OOM on 8GB VM
+        import gc
+        gc.collect()
 
         if (i + 1) % 5 == 0 or len(completed_kgs) % 5 == 0:
             log.info("Progress: %d/%d done, %d samples, %.1f min elapsed",

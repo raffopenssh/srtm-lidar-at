@@ -574,6 +574,23 @@ def process_one_kg(
             stats["has_osm"] = False
         stats["osm_time"] = round(time.time() - t0, 1)
 
+    # 5c. Rasterize building footprints into a bool mask for segment calibration
+    building_fp_mask = None
+    if cadastre_data["building_footprints"]:
+        try:
+            from rasterio.features import rasterize as rio_rasterize
+            h, w = data["shape"]
+            pairs = [(g, 1) for g in cadastre_data["building_footprints"] if not g.is_empty]
+            if pairs:
+                building_fp_mask = rio_rasterize(
+                    pairs, out_shape=(h, w), transform=data["transform"],
+                    fill=0, dtype=np.uint8, all_touched=True,
+                ).astype(bool)
+                log.info("KG %s: rasterized %d building footprints (%d px)",
+                         kg_code, len(pairs), int(building_fp_mask.sum()))
+        except Exception as e:
+            log.warning("KG %s: building footprint rasterize failed: %s", kg_code, e)
+
     # 6. Segment
     t0 = time.time()
     try:
@@ -581,7 +598,9 @@ def process_one_kg(
             data["dtm"], data["dsm"], data["mask"], data["transform"],
             dtm_dates=dtm_dates, dsm_dates=dsm_dates,
             spectral=spectral, copernicus=copernicus_data,
+            building_footprints=building_fp_mask,
             hansen=hansen_data,
+            ortho_year=obs_year,
             observation_year=obs_year,
         )
     except Exception as e:

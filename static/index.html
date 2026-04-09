@@ -424,7 +424,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(!geometry){resultDiv.textContent='Provide geometry first.';return;}
 
   btn.disabled=true;
-  showLoading('Analysing... (remote reads may take 10-30s)');
+  showLoading('Starting...');
   resultDiv.textContent='Loading...';
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
@@ -446,6 +446,24 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
 
+  // Progress polling for segment endpoint
+  const taskId=isSeg?crypto.randomUUID():'';
+  if(taskId)params.set('task_id',taskId);
+  let progressIv=null;
+  if(taskId){
+    progressIv=setInterval(async()=>{
+      try{
+        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+        const pj=await pr.json();
+        if(pj.active){
+          const el=pj.elapsed?` (${pj.elapsed}s)`:''; 
+          const det=pj.detail?` — ${pj.detail}`:'';
+          setStatus(`${pj.step}${det}${el}`);
+        }
+      }catch(e){}
+    },1500);
+  }
+
   let ct='text/plain',body=geometry;
   try{const p=JSON.parse(geometry);ct='application/json';body=JSON.stringify({geometry:p});}catch(e){}
 
@@ -461,7 +479,7 @@ document.getElementById('btn-run').onclick=async()=>{
     resultDiv.textContent='Error: '+e.message;
     hideLoading('Error');
     lastResult=null;
-  }finally{btn.disabled=false;}
+  }finally{btn.disabled=false;if(progressIv)clearInterval(progressIv);}
 };
 
 function showResultOnMap(data){

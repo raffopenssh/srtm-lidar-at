@@ -19,8 +19,10 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -45,6 +47,39 @@ log = logging.getLogger(__name__)
 app = Flask(__name__, static_folder='static', static_url_path='')
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
+
+# ---------------------------------------------------------------------------
+# Segment progress tracking
+# ---------------------------------------------------------------------------
+_segment_progress: dict[str, dict] = {}  # task_id → {step, detail, t0}
+_segment_progress_lock = threading.Lock()
+
+def _progress_set(task_id: str, step: str, detail: str = ""):
+    """Update progress for a running segment task."""
+    with _segment_progress_lock:
+        if task_id in _segment_progress:
+            _segment_progress[task_id].update(step=step, detail=detail,
+                                              updated=time.time())
+
+def _progress_start(task_id: str):
+    with _segment_progress_lock:
+        _segment_progress[task_id] = dict(step="starting", detail="",
+                                          t0=time.time(), updated=time.time())
+
+def _progress_end(task_id: str):
+    with _segment_progress_lock:
+        _segment_progress.pop(task_id, None)
+
+@app.route('/api/v1/segment/progress')
+def segment_progress():
+    """Poll progress of a running segment task."""
+    task_id = request.args.get('task_id', '')
+    with _segment_progress_lock:
+        info = _segment_progress.get(task_id)
+    if info is None:
+        return jsonify(dict(active=False, step='', detail='', elapsed=0))
+    return jsonify(dict(active=True, step=info['step'], detail=info['detail'],
+                        elapsed=round(time.time() - info['t0'], 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +569,15 @@ def segment_objects():
     Fused gradient → Felzenszwalb → RAG merge → per-object features → classify → group.
     Returns individual objects (tree, roof, road_surface, …) AND groups (forest, building, …).
     """
+    task_id = request.args.get('task_id', '')
+    def _prog(step, detail=''):
+        if task_id:
+            _progress_set(task_id, step, detail)
     try:
         t0 = time.time()
+        if task_id:
+            _progress_start(task_id)
+        _prog('Parsing geometry')
         features = _get_geometry()
         params = _get_params()
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
@@ -571,8 +613,10 @@ def segment_objects():
             _validate_area(geom_3035)
 
             # Load DTM/DSM
+            _prog('Loading DTM/DSM', 'remote raster reads')
             dtm_dates, dsm_dates = None, None
             if include_temporal:
+                _prog('Loading DTM/DSM', 'multi-temporal (3 dates)')
                 try:
                     multi = raster_io.read_multi_date_ndsm(geom_3035)
                     data = {
@@ -584,6 +628,7 @@ def segment_objects():
                     dtm_dates, dsm_dates = {}, {}
                     for d in multi['dates_loaded']:
                         try:
+                            _prog('Loading DTM/DSM', f'date {d}')
                             dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
                             mh = min(dd['shape'][0], data['shape'][0])
                             mw = min(dd['shape'][1], data['shape'][1])
@@ -599,23 +644,28 @@ def segment_objects():
 
             rgb, spectral = (None, None)
             if include_ortho:
+                _prog('Loading orthophoto', 'RGBI 20cm')
                 rgb, spectral = _try_read_ortho(data)
 
             copernicus_data = None
             if include_copernicus:
+                _prog('Loading Copernicus', 'NDVI + landcover + SAR + harmonics')
                 copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
             building_footprints = None
             if include_cadastre:
+                _prog('Loading cadastre', 'building footprints')
                 building_footprints = _try_cadastre(
                     geom, data['transform'], data['shape'],
                 )
 
             hansen_data = None
             if include_hansen:
+                _prog('Loading Hansen', 'forest change data')
                 hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
             # Run segmentation pipeline
+            _prog('Segmenting & classifying', 'watershed + classification')
             obs_year = ti.dataset_to_year(dataset)
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], data['mask'], data['transform'],
@@ -736,10 +786,13 @@ def segment_objects():
         if hansen_evaluation:
             resp["hansen_evaluation"] = hansen_evaluation
 
+        _progress_end(task_id)
         return jsonify(resp)
     except ValueError as e:
+        _progress_end(task_id)
         return _error(str(e))
     except Exception as e:
+        _progress_end(task_id)
         log.error(traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
 

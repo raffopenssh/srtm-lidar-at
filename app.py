@@ -107,6 +107,23 @@ def _error(msg, code=400):
     return jsonify({"error": str(msg)}), code
 
 
+def _rf_model_meta() -> dict:
+    """Return RF model version info for response metadata."""
+    try:
+        import learned_classifier as lc
+        clf = lc.get_classifier()
+        if clf.is_trained:
+            return {
+                "rf_trained_at": clf.trained_at,
+                "rf_n_kgs": clf.n_kgs,
+                "rf_oob": round(clf.oob_score, 4),
+                "rf_n_train": clf.n_train,
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def _try_read_ortho(data: dict) -> tuple:
     """Attempt to read RGB+NIR ortho aligned to ALS data.
 
@@ -678,6 +695,7 @@ def segment_objects():
                 "include_cadastre": include_cadastre,
                 "include_hansen": include_hansen,
                 "processing_time_s": round(time.time() - t0, 2),
+                **_rf_model_meta(),
             },
         }
         if all_evaluation:
@@ -1893,6 +1911,8 @@ def classifier_status():
         clf = lc.get_classifier()
         return jsonify({
             "trained": clf.is_trained,
+            "trained_at": clf.trained_at,
+            "n_kgs": clf.n_kgs,
             "n_train": clf.n_train,
             "oob_score": clf.oob_score,
             "n_classes": len(clf.classes),

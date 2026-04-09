@@ -145,6 +145,8 @@ class LearnedClassifier:
         self.feature_importances: dict[str, float] = {}
         self.n_train: int = 0
         self.oob_score: float = 0.0
+        self.trained_at: str = ""
+        self.n_kgs: int = 0
 
     def train(
         self,
@@ -154,6 +156,7 @@ class LearnedClassifier:
         n_estimators: int = 200,
         max_depth: int = 20,
         min_samples_leaf: int = 5,
+        n_kgs: int = 0,
     ) -> dict:
         """Train RF on feature dicts + string labels.
 
@@ -201,6 +204,10 @@ class LearnedClassifier:
             k: float(v) for k, v in zip(FEATURE_KEYS, rf.feature_importances_)
         }
 
+        import datetime
+        self.trained_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        self.n_kgs = n_kgs
+
         # Save
         joblib.dump(rf, MODEL_PATH)
         meta = {
@@ -209,6 +216,8 @@ class LearnedClassifier:
             "oob_score": self.oob_score,
             "feature_importances": self.feature_importances,
             "feature_keys": FEATURE_KEYS,
+            "trained_at": self.trained_at,
+            "n_kgs": self.n_kgs,
         }
         META_PATH.write_text(json.dumps(meta, indent=2))
 
@@ -303,8 +312,11 @@ class LearnedClassifier:
                 inst.n_train = meta.get("n_train", 0)
                 inst.oob_score = meta.get("oob_score", 0)
                 inst.feature_importances = meta.get("feature_importances", {})
-                log.info("Loaded RF model: %d classes, OOB=%.3f, n=%d",
-                         len(inst.classes), inst.oob_score, inst.n_train)
+                inst.trained_at = meta.get("trained_at", "")
+                inst.n_kgs = meta.get("n_kgs", 0)
+                log.info("Loaded RF model: %d classes, OOB=%.3f, n=%d, kgs=%d, trained=%s",
+                         len(inst.classes), inst.oob_score, inst.n_train,
+                         inst.n_kgs, inst.trained_at)
             except Exception as e:
                 log.warning("Failed to load RF model: %s", e)
         return inst

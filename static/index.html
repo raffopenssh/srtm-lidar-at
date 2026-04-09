@@ -472,6 +472,12 @@ function showResultOnMap(data){
   if(meta.date_a)mh+=`<b>${fmtDate(meta.date_a)}</b> → <b>${fmtDate(meta.date_b)}</b>`;
   if(meta.dataset&&!meta.date_a)mh+=`<b>Dataset:</b> ${fmtDate(meta.dataset)}`;
   if(meta.processing_time_s)mh+=(mh?' &nbsp; ':'')+`${meta.processing_time_s}s`;
+  if(meta.rf_trained_at||meta.rf_n_kgs){
+    mh+='<br><b>RF model:</b> ';
+    if(meta.rf_trained_at)mh+=meta.rf_trained_at;
+    if(meta.rf_n_kgs)mh+=` &nbsp; ${meta.rf_n_kgs} KGs`;
+    if(meta.rf_oob)mh+=` &nbsp; OOB ${meta.rf_oob}`;
+  }
   mi.innerHTML=mh;mi.style.display=mh?'':'none';
 
   const cmBar=document.getElementById('color-mode-bar');

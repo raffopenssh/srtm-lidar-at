@@ -49,37 +49,58 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
 # ---------------------------------------------------------------------------
-# Segment progress tracking
+# Segment progress tracking  (file-backed so all gunicorn workers can read)
 # ---------------------------------------------------------------------------
-_segment_progress: dict[str, dict] = {}  # task_id → {step, detail, t0}
-_segment_progress_lock = threading.Lock()
+_PROGRESS_DIR = Path('/tmp/segment_progress')
+_PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _progress_set(task_id: str, step: str, detail: str = ""):
     """Update progress for a running segment task."""
-    with _segment_progress_lock:
-        if task_id in _segment_progress:
-            _segment_progress[task_id].update(step=step, detail=detail,
-                                              updated=time.time())
+    if not task_id:
+        return
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    try:
+        t0 = 0.0
+        if p.exists():
+            try:
+                t0 = json.loads(p.read_text()).get('t0', 0.0)
+            except Exception:
+                pass
+        p.write_text(json.dumps(dict(step=step, detail=detail, t0=t0,
+                                     updated=time.time())))
+    except Exception:
+        pass
 
 def _progress_start(task_id: str):
-    with _segment_progress_lock:
-        _segment_progress[task_id] = dict(step="starting", detail="",
-                                          t0=time.time(), updated=time.time())
+    if not task_id:
+        return
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    p.write_text(json.dumps(dict(step='starting', detail='',
+                                 t0=time.time(), updated=time.time())))
 
 def _progress_end(task_id: str):
-    with _segment_progress_lock:
-        _segment_progress.pop(task_id, None)
+    if not task_id:
+        return
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 @app.route('/api/v1/segment/progress')
 def segment_progress():
     """Poll progress of a running segment task."""
     task_id = request.args.get('task_id', '')
-    with _segment_progress_lock:
-        info = _segment_progress.get(task_id)
-    if info is None:
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    if not task_id or not p.exists():
         return jsonify(dict(active=False, step='', detail='', elapsed=0))
-    return jsonify(dict(active=True, step=info['step'], detail=info['detail'],
-                        elapsed=round(time.time() - info['t0'], 1)))
+    try:
+        info = json.loads(p.read_text())
+        return jsonify(dict(active=True, step=info.get('step', ''),
+                            detail=info.get('detail', ''),
+                            elapsed=round(time.time() - info.get('t0', time.time()), 1)))
+    except Exception:
+        return jsonify(dict(active=False, step='', detail='', elapsed=0))
 
 
 # ---------------------------------------------------------------------------

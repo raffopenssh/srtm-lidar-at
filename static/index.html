@@ -451,16 +451,19 @@ document.getElementById('btn-run').onclick=async()=>{
   if(taskId)params.set('task_id',taskId);
   let progressIv=null;
   if(taskId){
+    console.log('Progress polling started, taskId='+taskId);
     progressIv=setInterval(async()=>{
       try{
+        console.log('Polling progress...');
         const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
         const pj=await pr.json();
+        console.log('Progress response:', JSON.stringify(pj));
         if(pj.active){
           const el=pj.elapsed?` (${pj.elapsed}s)`:''; 
           const det=pj.detail?` — ${pj.detail}`:'';
           setStatus(`${pj.step}${det}${el}`);
         }
-      }catch(e){}
+      }catch(e){console.error('Progress poll error:', e);}
     },1500);
   }
 

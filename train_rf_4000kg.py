@@ -401,6 +401,9 @@ def process_one_kg(
         stats["error"] = "no cadastre data"
         return [], [], stats
 
+    # Observation year — drives Copernicus/SAR/Hansen year scoping
+    obs_year = ti.dataset_to_year(ti.DEFAULT_DATASET)
+
     # 2. Read LIDAR
     t0 = time.time()
     try:
@@ -477,19 +480,21 @@ def process_one_kg(
             cop = {}
 
             def _fetch_ndvi():
-                d = copernicus.get_ndvi_composite(bbox_dict)
+                d = copernicus.get_ndvi_composite(bbox_dict, year=obs_year)
                 return {"ndvi": d["ndvi"], "transform": d["transform"], "crs": d["crs"]}
 
             def _fetch_landcover():
                 return copernicus.get_land_cover(bbox_dict)
 
             def _fetch_sar():
-                d = copernicus.get_sar_backscatter(bbox_dict, "2023-06-01", "2023-09-30")
+                sar_start = f"{obs_year}-06-01"
+                sar_end   = f"{obs_year}-09-30"
+                d = copernicus.get_sar_backscatter(bbox_dict, sar_start, sar_end)
                 return {"vv": d["vv"], "vh": d["vh"], "sar_transform": d["transform"], "sar_crs": d["crs"]}
 
             def _fetch_harmonics():
                 import ndvi_harmonics
-                return ndvi_harmonics.get_harmonic_features(bbox_dict)
+                return ndvi_harmonics.get_harmonic_features(bbox_dict, year=obs_year)
 
             COP_TIMEOUT = 180
             HARM_TIMEOUT = 900
@@ -577,6 +582,7 @@ def process_one_kg(
             dtm_dates=dtm_dates, dsm_dates=dsm_dates,
             spectral=spectral, copernicus=copernicus_data,
             hansen=hansen_data,
+            observation_year=obs_year,
         )
     except Exception as e:
         stats["error"] = f"segmentation: {e}"
@@ -633,6 +639,28 @@ def process_one_kg(
              ", ".join(f"{k}={v}" for k, v in source_counts.items() if v > 0))
 
     return train_features, train_labels, stats
+
+
+def _clear_downloaded_caches():
+    """Delete cached .npz/.tif files from /tmp to reclaim memory."""
+    import shutil
+    cleared = 0
+    for cache_dir in [
+        Path("/tmp/copernicus_cache"),
+        Path("/tmp/hansen_cache"),
+    ]:
+        if cache_dir.exists():
+            for f in cache_dir.iterdir():
+                try:
+                    if f.is_dir():
+                        shutil.rmtree(f)
+                    else:
+                        f.unlink()
+                    cleared += 1
+                except Exception:
+                    pass
+    if cleared:
+        log.info("Cleared %d cached raster entries to free memory", cleared)
 
 
 def train_and_save_model(all_features, all_labels, n_kgs, tag="checkpoint"):
@@ -754,6 +782,8 @@ def main():
                     if train_stats:
                         log.info("  ✓ Model checkpoint saved at %d KGs (OOB=%.4f)",
                                  n_success, train_stats["oob_score"])
+                    # Clear downloaded cache data to prevent memory buildup
+                    _clear_downloaded_caches()
             else:
                 n_fail += 1
                 log.warning("  → FAILED: %s", stats.get("error", "no labelled segments"))

@@ -178,13 +178,24 @@ def _run_datacube(
 
     # Try synchronous download first (faster for small areas)
     # Retry once on 429 Too Many Requests
+    # Use a thread with timeout to avoid blocking workers indefinitely
     import time as _time
+    import concurrent.futures
+    SYNC_DOWNLOAD_TIMEOUT = 180  # 3 minutes max for synchronous download
+
     for attempt in range(2):
-        logger.info("Downloading datacube synchronously → %s", output_path)
+        logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
+                    output_path, SYNC_DOWNLOAD_TIMEOUT)
         try:
-            datacube.download(str(output_path), format=format)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(datacube.download, str(output_path), format)
+                future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
             logger.info("Synchronous download complete: %s", output_path)
             return output_path
+        except concurrent.futures.TimeoutError:
+            logger.warning("Synchronous download timed out after %ds, falling back to batch job",
+                          SYNC_DOWNLOAD_TIMEOUT)
+            break
         except Exception as exc:
             exc_str = str(exc)
             if "429" in exc_str and attempt == 0:

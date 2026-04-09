@@ -1,15 +1,20 @@
 """OpenStreetMap ground truth fetcher for RF classifier training.
 
-Fetches road/path and land-cover polygons from the Overpass API, reprojects
-them to EPSG:3035, and rasterises them onto a 1 m LIDAR grid so they can be
-used as training labels alongside cadastre building footprints.
+Fetches road/path, waterway, and land-cover data from the Overpass API,
+reprojects to EPSG:3035, and rasterises onto a 1m LIDAR grid for use as
+training labels alongside cadastre building footprints.
+
+Key design choices:
+- Uses `out geom;` format (inline coordinates) to avoid expensive node recursion
+- Separate sequential queries per tag category to stay within Overpass limits
+- z.overpass-api.de endpoint with proper User-Agent
+- 5s pause between queries to respect rate limits
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -17,13 +22,7 @@ from typing import Optional
 import numpy as np
 import requests
 from pyproj import Transformer
-from shapely.geometry import (
-    LineString,
-    MultiLineString,
-    MultiPolygon,
-    Polygon,
-    shape as shapely_shape,
-)
+from shapely.geometry import LineString, Polygon
 from shapely.ops import transform as shapely_transform
 
 log = logging.getLogger("osm_features")
@@ -32,13 +31,18 @@ log = logging.getLogger("osm_features")
 # Constants
 # ---------------------------------------------------------------------------
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://z.overpass-api.de/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+]
+USER_AGENT = "srtm-lidar-at/1.0 (raffaelhickisch+exedev@gmail.com)"
+
 CACHE_DIR = Path("/tmp/osm_cache")
 MAX_RETRIES = 3
-RETRY_SLEEP = 10  # seconds
-REQUEST_TIMEOUT = 120  # seconds (must exceed Overpass server timeout)
+RETRY_SLEEP = 10
+REQUEST_TIMEOUT = 120
+INTER_QUERY_PAUSE = 5  # seconds between sequential queries
 
-# CRS transformer WGS-84 → EPSG:3035 (thread-safe after creation)
 _T_4326_TO_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 
 # ---------------------------------------------------------------------------
@@ -46,18 +50,26 @@ _T_4326_TO_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 # ---------------------------------------------------------------------------
 
 _HIGHWAY_ROAD = {
-    "motorway", "motorway_link",
-    "trunk", "trunk_link",
-    "primary", "primary_link",
-    "secondary", "secondary_link",
-    "tertiary", "tertiary_link",
-    "residential", "service",
-    "unclassified",
-    "pedestrian", "living_street",
+    "motorway", "motorway_link", "trunk", "trunk_link",
+    "primary", "primary_link", "secondary", "secondary_link",
+    "tertiary", "tertiary_link", "residential", "service",
+    "unclassified", "pedestrian", "living_street",
 }
 
 _HIGHWAY_PATH = {
     "track", "footway", "cycleway", "bridleway", "path", "steps",
+}
+
+# ---------------------------------------------------------------------------
+# Waterway linestrings → buffer radii in metres (EPSG:3035)
+# ---------------------------------------------------------------------------
+
+_WATERWAY_BUFFER = {
+    "river": 12.0,
+    "canal": 8.0,
+    "stream": 3.0,
+    "drain": 2.0,
+    "ditch": 1.5,
 }
 
 # ---------------------------------------------------------------------------
@@ -66,7 +78,7 @@ _HIGHWAY_PATH = {
 
 _LANDCOVER_MAP: dict[tuple[str, str], str] = {}
 
-# tree
+# tree / forest
 for v in ("forest", "wood"):
     _LANDCOVER_MAP[("landuse", v)] = "tree"
 _LANDCOVER_MAP[("natural", "wood")] = "tree"
@@ -84,7 +96,7 @@ _LANDCOVER_MAP[("natural", "grassland")] = "grass"
 _LANDCOVER_MAP[("landuse", "orchard")] = "orchard"
 _LANDCOVER_MAP[("landuse", "vineyard")] = "vineyard"
 
-# roof (approximate for built-up)
+# residential/commercial → roof (approximate)
 for v in ("residential", "commercial", "industrial", "retail"):
     _LANDCOVER_MAP[("landuse", v)] = "roof"
 
@@ -96,15 +108,6 @@ _LANDCOVER_MAP[("natural", "water")] = "water"
 _LANDCOVER_MAP[("waterway", "riverbank")] = "water"
 for v in ("reservoir", "basin"):
     _LANDCOVER_MAP[("landuse", v)] = "water"
-
-# water (linestrings — rivers, streams, canals → buffered during rasterization)
-_WATERWAY_LINES = {
-    "river": 12.0,     # buffer radius in metres (3035)
-    "canal": 8.0,
-    "stream": 3.0,
-    "drain": 2.0,
-    "ditch": 1.5,
-}
 
 # rock
 for v in ("bare_rock", "scree"):
@@ -124,411 +127,9 @@ for v in ("scrub", "heath"):
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers
+# Landcover rasterization codes
 # ---------------------------------------------------------------------------
 
-def _bbox_cache_key(bbox: tuple[float, float, float, float]) -> str:
-    """Deterministic short hash for a rounded WGS-84 bounding box."""
-    rounded = tuple(round(c, 4) for c in bbox)
-    key = ",".join(f"{c:.4f}" for c in rounded)
-    return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-
-def _cache_path(bbox: tuple[float, float, float, float]) -> Path:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR / f"osm_{_bbox_cache_key(bbox)}.json"
-
-
-def _read_cache(bbox: tuple[float, float, float, float]) -> Optional[dict]:
-    p = _cache_path(bbox)
-    if p.exists():
-        try:
-            data = json.loads(p.read_text())
-            log.debug("OSM cache hit: %s", p.name)
-            return data
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("OSM cache read failed: %s", exc)
-    return None
-
-
-def _write_cache(bbox: tuple[float, float, float, float], data: dict) -> None:
-    try:
-        _cache_path(bbox).write_text(json.dumps(data))
-    except OSError as exc:
-        log.warning("Failed to write OSM cache: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Overpass API query
-# ---------------------------------------------------------------------------
-
-def _build_overpass_query(bbox: tuple[float, float, float, float]) -> str:
-    """Build a single Overpass QL query fetching roads + landcover.
-
-    bbox is (west, south, east, north) in WGS-84.
-    Overpass expects (south, west, north, east).
-    """
-    west, south, east, north = bbox
-    header = f"[out:json][timeout:90][bbox:{south},{west},{north},{east}];"
-
-    # Single grouped query: roads, waterways (lines), landcover (polygons)
-    query = (
-        f"{header}\n"
-        f"(\n"
-        # Roads & paths
-        f'  way["highway"];\n'
-        # Waterway linestrings (rivers, streams, canals)
-        f'  way["waterway"~"^(river|stream|canal|drain|ditch)$"];\n'
-        # Landcover polygons
-        f'  way["landuse"];\n'
-        f'  relation["landuse"];\n'
-        f'  way["natural"];\n'
-        f'  relation["natural"];\n'
-        # Waterway area polygons (riverbank)
-        f'  way["waterway"="riverbank"];\n'
-        f'  relation["waterway"="riverbank"];\n'
-        f");\n"
-        f"out body;\n"
-        f">;\n"
-        f"out skel qt;\n"
-    )
-    return query
-
-
-def _query_overpass(bbox: tuple[float, float, float, float]) -> Optional[dict]:
-    """Execute an Overpass query with retries on rate-limiting."""
-    cached = _read_cache(bbox)
-    if cached is not None:
-        return cached
-
-    query = _build_overpass_query(bbox)
-    log.info("Querying Overpass API for bbox %s", bbox)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.post(
-                OVERPASS_URL,
-                data={"data": query},
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                _write_cache(bbox, data)
-                return data
-            if resp.status_code == 429:
-                log.warning(
-                    "Overpass rate-limited (attempt %d/%d), sleeping %ds",
-                    attempt, MAX_RETRIES, RETRY_SLEEP,
-                )
-                time.sleep(RETRY_SLEEP)
-                continue
-            log.error("Overpass HTTP %d: %s", resp.status_code, resp.text[:200])
-        except requests.RequestException as exc:
-            log.error("Overpass request failed (attempt %d/%d): %s", attempt, MAX_RETRIES, exc)
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_SLEEP)
-
-    log.error("Overpass query failed after %d attempts", MAX_RETRIES)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# OSM JSON → Shapely geometries
-# ---------------------------------------------------------------------------
-
-def _parse_elements(data: dict) -> tuple[list, list]:
-    """Parse Overpass JSON into road geometries and landcover geometries.
-
-    Returns
-    -------
-    roads : list of (shapely_geom_3035, label)  where label is "road" or "path"
-    landcover : list of (shapely_geom_3035, label)
-    """
-    # Build node lookup  {id: (lon, lat)}
-    nodes: dict[int, tuple[float, float]] = {}
-    ways: dict[int, dict] = {}
-    relations: list[dict] = []
-
-    for el in data.get("elements", []):
-        t = el.get("type")
-        if t == "node":
-            nodes[el["id"]] = (el["lon"], el["lat"])
-        elif t == "way":
-            ways[el["id"]] = el
-        elif t == "relation":
-            relations.append(el)
-
-    roads: list[tuple] = []
-    landcover: list[tuple] = []
-
-    # --- Process ways -------------------------------------------------------
-    for wid, w in ways.items():
-        tags = w.get("tags", {})
-        nds = w.get("nodes", [])
-        if not tags or len(nds) < 2:
-            continue
-
-        coords = [nodes[n] for n in nds if n in nodes]
-        if len(coords) < 2:
-            continue
-
-        highway = tags.get("highway")
-        if highway:
-            # Build linestring for road/path
-            label = None
-            if highway in _HIGHWAY_ROAD:
-                label = "road"
-            elif highway in _HIGHWAY_PATH:
-                label = "path"
-            if label:
-                line = LineString(coords)
-                line_3035 = _to_3035(line)
-                if not line_3035.is_empty:
-                    roads.append((line_3035, label))
-            # Don't also treat it as landcover even if it has landuse tags
-            continue
-
-        # Waterway linestrings (rivers, streams, canals, drains, ditches)
-        waterway = tags.get("waterway")
-        if waterway and waterway in _WATERWAY_LINES:
-            line = LineString(coords)
-            line_3035 = _to_3035(line)
-            if not line_3035.is_empty:
-                # Store as (geometry, "water", buffer_radius)
-                buf = _WATERWAY_LINES[waterway]
-                buffered = line_3035.buffer(buf, cap_style=2)
-                if not buffered.is_empty:
-                    landcover.append((buffered, "water"))
-            continue
-
-        # Landcover: closed ways (polygons)
-        lc_label = _match_landcover(tags)
-        if lc_label and len(coords) >= 4 and coords[0] == coords[-1]:
-            try:
-                poly = Polygon(coords)
-                if poly.is_valid and not poly.is_empty:
-                    poly_3035 = _to_3035(poly)
-                    if not poly_3035.is_empty:
-                        landcover.append((poly_3035, lc_label))
-            except Exception:
-                pass
-
-    # --- Process relations (multipolygons) ----------------------------------
-    for rel in relations:
-        tags = rel.get("tags", {})
-        lc_label = _match_landcover(tags)
-        if not lc_label:
-            continue
-        if tags.get("type") != "multipolygon":
-            continue
-
-        outers: list[list] = []
-        inners: list[list] = []
-        for member in rel.get("members", []):
-            if member.get("type") != "way":
-                continue
-            wid = member["ref"]
-            w = ways.get(wid)
-            if not w:
-                continue
-            coords = [nodes[n] for n in w.get("nodes", []) if n in nodes]
-            if len(coords) < 2:
-                continue
-            role = member.get("role", "outer")
-            if role == "inner":
-                inners.append(coords)
-            else:
-                outers.append(coords)
-
-        # Assemble outer rings (may need merging)
-        merged_outers = _merge_rings(outers)
-        merged_inners = _merge_rings(inners)
-
-        for outer_ring in merged_outers:
-            if len(outer_ring) < 4:
-                continue
-            # Close ring if needed
-            if outer_ring[0] != outer_ring[-1]:
-                outer_ring.append(outer_ring[0])
-            # Find inners that belong to this outer
-            try:
-                outer_poly = Polygon(outer_ring)
-            except Exception:
-                continue
-            holes = []
-            for inner_ring in merged_inners:
-                if len(inner_ring) < 4:
-                    continue
-                if inner_ring[0] != inner_ring[-1]:
-                    inner_ring.append(inner_ring[0])
-                try:
-                    ip = Polygon(inner_ring)
-                    if outer_poly.contains(ip.representative_point()):
-                        holes.append(inner_ring)
-                except Exception:
-                    pass
-            try:
-                poly = Polygon(outer_ring, holes)
-                if poly.is_valid and not poly.is_empty:
-                    poly_3035 = _to_3035(poly)
-                    if not poly_3035.is_empty:
-                        landcover.append((poly_3035, lc_label))
-            except Exception:
-                pass
-
-    log.info(
-        "Parsed %d road/path geometries and %d landcover geometries from OSM",
-        len(roads), len(landcover),
-    )
-    return roads, landcover
-
-
-def _merge_rings(segments: list[list]) -> list[list]:
-    """Try to merge way segments that share endpoints into closed rings."""
-    if not segments:
-        return []
-
-    # Already closed single-way rings
-    closed = [s for s in segments if len(s) >= 4 and s[0] == s[-1]]
-    open_segs = [s for s in segments if not (len(s) >= 4 and s[0] == s[-1])]
-
-    if not open_segs:
-        return closed
-
-    # Greedy merge: join segments sharing endpoints
-    merged: list[list] = []
-    remaining = list(open_segs)
-
-    while remaining:
-        current = list(remaining.pop(0))
-        changed = True
-        while changed:
-            changed = False
-            for i, seg in enumerate(remaining):
-                if not seg:
-                    continue
-                if current[-1] == seg[0]:
-                    current.extend(seg[1:])
-                    remaining.pop(i)
-                    changed = True
-                    break
-                elif current[-1] == seg[-1]:
-                    current.extend(reversed(seg[:-1]))
-                    remaining.pop(i)
-                    changed = True
-                    break
-                elif current[0] == seg[-1]:
-                    current = seg[:-1] + current
-                    remaining.pop(i)
-                    changed = True
-                    break
-                elif current[0] == seg[0]:
-                    current = list(reversed(seg[1:])) + current
-                    remaining.pop(i)
-                    changed = True
-                    break
-        merged.append(current)
-
-    return closed + merged
-
-
-def _match_landcover(tags: dict) -> Optional[str]:
-    """Match OSM tags to our landcover label set."""
-    for key in ("landuse", "natural", "waterway"):
-        val = tags.get(key)
-        if val:
-            label = _LANDCOVER_MAP.get((key, val))
-            if label:
-                return label
-    return None
-
-
-def _to_3035(geom):
-    """Transform a shapely geometry from EPSG:4326 → EPSG:3035."""
-    return shapely_transform(_T_4326_TO_3035.transform, geom)
-
-
-# ---------------------------------------------------------------------------
-# Rasterization
-# ---------------------------------------------------------------------------
-
-def _rasterize_roads(
-    roads: list[tuple],
-    transform,
-    shape: tuple[int, int],
-) -> np.ndarray:
-    """Buffer road/path linestrings and rasterize into a label grid.
-
-    Returns an array of uint8 codes: 0=no road, 1=road, 2=path.
-    """
-    from rasterio.features import rasterize
-
-    if not roads:
-        return np.zeros(shape, dtype=np.uint8)
-
-    geom_value_pairs = []
-    for geom, label in roads:
-        try:
-            buf = 3.0 if label == "road" else 1.5
-            buffered = geom.buffer(buf, cap_style=2)  # flat caps
-            if not buffered.is_empty:
-                code = 1 if label == "road" else 2
-                geom_value_pairs.append((buffered, code))
-        except Exception:
-            pass
-
-    if not geom_value_pairs:
-        return np.zeros(shape, dtype=np.uint8)
-
-    # Roads (code=1) should win over paths (code=2), so put paths first
-    geom_value_pairs.sort(key=lambda x: x[1], reverse=True)
-
-    return rasterize(
-        geom_value_pairs,
-        out_shape=shape,
-        transform=transform,
-        fill=0,
-        dtype=np.uint8,
-        all_touched=True,
-    )
-
-
-def _rasterize_landcover(
-    landcover: list[tuple],
-    transform,
-    shape: tuple[int, int],
-) -> np.ndarray:
-    """Rasterize landcover polygons into a coded grid.
-
-    Label encoding:
-      0 = unmatched
-      1..N = index into _LC_LABELS
-    """
-    from rasterio.features import rasterize
-
-    if not landcover:
-        return np.zeros(shape, dtype=np.uint8)
-
-    geom_value_pairs = []
-    for geom, label in landcover:
-        code = _LC_LABEL_TO_CODE.get(label, 0)
-        if code and not geom.is_empty:
-            geom_value_pairs.append((geom, code))
-
-    if not geom_value_pairs:
-        return np.zeros(shape, dtype=np.uint8)
-
-    return rasterize(
-        geom_value_pairs,
-        out_shape=shape,
-        transform=transform,
-        fill=0,
-        dtype=np.uint8,
-        all_touched=False,
-    )
-
-
-# Landcover label → code mapping
 _LC_LABELS = [
     "",           # 0 = unmatched
     "tree",       # 1
@@ -550,6 +151,289 @@ _LC_CODE_TO_LABEL = {i: lbl for i, lbl in enumerate(_LC_LABELS)}
 
 
 # ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_key(bbox: tuple) -> str:
+    raw = f"{bbox[0]:.5f},{bbox[1]:.5f},{bbox[2]:.5f},{bbox[3]:.5f}"
+    return "osm_" + hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+def _read_cache(bbox: tuple) -> Optional[dict]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p = CACHE_DIR / f"{_cache_key(bbox)}.json"
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+            log.info("OSM cache hit: %s (%d elements)", p.name,
+                     sum(len(v.get("elements", [])) for v in data.values()))
+            return data
+        except Exception:
+            pass
+    return None
+
+
+def _write_cache(bbox: tuple, data: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p = CACHE_DIR / f"{_cache_key(bbox)}.json"
+    try:
+        p.write_text(json.dumps(data))
+    except Exception as e:
+        log.warning("Failed to write OSM cache: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Overpass queries — separate sequential queries with `out geom;`
+# ---------------------------------------------------------------------------
+
+def _overpass_post(query: str, tag: str = "") -> Optional[dict]:
+    """POST a single query to Overpass with retries across multiple endpoints."""
+    for url in OVERPASS_URLS:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    url,
+                    data={"data": query},
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code in (429, 504):
+                    reason = "rate-limited" if resp.status_code == 429 else "timeout"
+                    sleep_s = RETRY_SLEEP * attempt
+                    log.warning("Overpass [%s] %s %s (attempt %d/%d), sleeping %ds",
+                                tag, url.split('/')[2], reason, attempt, MAX_RETRIES, sleep_s)
+                    time.sleep(sleep_s)
+                    continue
+                log.error("Overpass [%s] HTTP %d from %s",
+                          tag, resp.status_code, url.split('/')[2])
+                break  # try next URL
+            except requests.RequestException as exc:
+                log.error("Overpass [%s] request error (attempt %d/%d): %s",
+                          tag, attempt, MAX_RETRIES, exc)
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_SLEEP)
+        # If we exhausted retries on this URL, try next
+    return None
+
+
+def _query_all(bbox: tuple[float, float, float, float]) -> Optional[dict]:
+    """Fetch OSM data as separate sequential queries. Returns merged result dict."""
+    cached = _read_cache(bbox)
+    if cached is not None:
+        return cached
+
+    west, south, east, north = bbox
+    bb = f"[bbox:{south},{west},{north},{east}]"
+
+    # Four separate queries, each using `out geom;` (inline coords, no recursion)
+    queries = {
+        "highway":  f'[out:json][timeout:60]{bb};way["highway"];out geom;',
+        "waterway": f'[out:json][timeout:60]{bb};way["waterway"];out geom;',
+        "landuse":  f'[out:json][timeout:60]{bb};(way["landuse"];relation["landuse"];);out geom;',
+        "natural":  f'[out:json][timeout:60]{bb};(way["natural"];relation["natural"];);out geom;',
+    }
+
+    results = {}
+    for tag, query in queries.items():
+        log.info("Overpass: fetching %s for bbox %s", tag, bbox)
+        data = _overpass_post(query, tag=tag)
+        if data is not None:
+            results[tag] = data
+            n = len(data.get("elements", []))
+            log.info("Overpass: %s → %d elements", tag, n)
+        else:
+            log.warning("Overpass: %s query failed, skipping", tag)
+            results[tag] = {"elements": []}
+        time.sleep(INTER_QUERY_PAUSE)
+
+    _write_cache(bbox, results)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Parse `out geom;` elements → shapely geometries
+# ---------------------------------------------------------------------------
+
+def _to_3035(geom):
+    return shapely_transform(_T_4326_TO_3035.transform, geom)
+
+
+def _way_coords(el: dict) -> list[tuple[float, float]]:
+    """Extract (lon, lat) coordinate list from an `out geom;` way element."""
+    geom = el.get("geometry", [])
+    if not geom:
+        return []
+    return [(pt["lon"], pt["lat"]) for pt in geom]
+
+
+def _match_landcover(tags: dict) -> Optional[str]:
+    for key in ("landuse", "natural", "waterway"):
+        val = tags.get(key)
+        if val:
+            label = _LANDCOVER_MAP.get((key, val))
+            if label:
+                return label
+    return None
+
+
+def _parse_all(data: dict) -> tuple[list, list]:
+    """Parse merged query results into road and landcover geometries.
+
+    Returns
+    -------
+    roads : list of (shapely_geom_3035, label)  "road" or "path"
+    landcover : list of (shapely_geom_3035, label)
+    """
+    roads: list[tuple] = []
+    landcover: list[tuple] = []
+
+    # --- Highway ways ---
+    for el in data.get("highway", {}).get("elements", []):
+        if el.get("type") != "way":
+            continue
+        tags = el.get("tags", {})
+        highway = tags.get("highway", "")
+        coords = _way_coords(el)
+        if len(coords) < 2:
+            continue
+        label = None
+        if highway in _HIGHWAY_ROAD:
+            label = "road"
+        elif highway in _HIGHWAY_PATH:
+            label = "path"
+        if label:
+            try:
+                line = _to_3035(LineString(coords))
+                if not line.is_empty:
+                    roads.append((line, label))
+            except Exception:
+                pass
+
+    # --- Waterway ways ---
+    for el in data.get("waterway", {}).get("elements", []):
+        if el.get("type") != "way":
+            continue
+        tags = el.get("tags", {})
+        ww = tags.get("waterway", "")
+        coords = _way_coords(el)
+        if len(coords) < 2:
+            continue
+
+        # Riverbank polygons (closed ways)
+        if ww == "riverbank" and len(coords) >= 4 and coords[0] == coords[-1]:
+            try:
+                poly = _to_3035(Polygon(coords))
+                if poly.is_valid and not poly.is_empty:
+                    landcover.append((poly, "water"))
+            except Exception:
+                pass
+            continue
+
+        # Linestring waterways → buffer to polygon
+        buf_r = _WATERWAY_BUFFER.get(ww)
+        if buf_r:
+            try:
+                line = _to_3035(LineString(coords))
+                if not line.is_empty:
+                    buffered = line.buffer(buf_r, cap_style=2)
+                    if not buffered.is_empty:
+                        landcover.append((buffered, "water"))
+            except Exception:
+                pass
+
+    # --- Landuse + natural ways/relations ---
+    for section in ("landuse", "natural"):
+        for el in data.get(section, {}).get("elements", []):
+            tags = el.get("tags", {})
+            lc_label = _match_landcover(tags)
+            if not lc_label:
+                continue
+
+            if el.get("type") == "way":
+                coords = _way_coords(el)
+                if len(coords) >= 4 and coords[0] == coords[-1]:
+                    try:
+                        poly = _to_3035(Polygon(coords))
+                        if poly.is_valid and not poly.is_empty:
+                            landcover.append((poly, lc_label))
+                    except Exception:
+                        pass
+
+            elif el.get("type") == "relation":
+                # `out geom;` on relations includes member geometries
+                members = el.get("members", [])
+                outers = []
+                for m in members:
+                    if m.get("type") != "way":
+                        continue
+                    geom = m.get("geometry", [])
+                    if not geom:
+                        continue
+                    coords = [(pt["lon"], pt["lat"]) for pt in geom]
+                    role = m.get("role", "outer")
+                    if role == "outer" and len(coords) >= 4:
+                        if coords[0] == coords[-1]:
+                            try:
+                                poly = _to_3035(Polygon(coords))
+                                if poly.is_valid and not poly.is_empty:
+                                    landcover.append((poly, lc_label))
+                            except Exception:
+                                pass
+
+    log.info("Parsed %d road/path + %d landcover geometries from OSM",
+             len(roads), len(landcover))
+    return roads, landcover
+
+
+# ---------------------------------------------------------------------------
+# Rasterization
+# ---------------------------------------------------------------------------
+
+def _rasterize_roads(roads, transform, shape):
+    """Buffer and rasterize roads/paths. Returns uint8: 0=none, 1=road, 2=path."""
+    from rasterio.features import rasterize
+    if not roads:
+        return np.zeros(shape, dtype=np.uint8)
+
+    pairs = []
+    for geom, label in roads:
+        try:
+            buf = 3.0 if label == "road" else 1.5
+            buffered = geom.buffer(buf, cap_style=2)
+            if not buffered.is_empty:
+                pairs.append((buffered, 1 if label == "road" else 2))
+        except Exception:
+            pass
+    if not pairs:
+        return np.zeros(shape, dtype=np.uint8)
+
+    # Roads (1) win over paths (2): put paths first
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return rasterize(pairs, out_shape=shape, transform=transform,
+                     fill=0, dtype=np.uint8, all_touched=True)
+
+
+def _rasterize_landcover(landcover, transform, shape):
+    """Rasterize landcover polygons. Returns uint8 coded grid."""
+    from rasterio.features import rasterize
+    if not landcover:
+        return np.zeros(shape, dtype=np.uint8)
+
+    pairs = []
+    for geom, label in landcover:
+        code = _LC_LABEL_TO_CODE.get(label, 0)
+        if code and not geom.is_empty:
+            pairs.append((geom, code))
+    if not pairs:
+        return np.zeros(shape, dtype=np.uint8)
+
+    return rasterize(pairs, out_shape=shape, transform=transform,
+                     fill=0, dtype=np.uint8, all_touched=False)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -562,54 +446,36 @@ def fetch_osm_ground_truth(
 
     Parameters
     ----------
-    bbox_wgs84 : (west, south, east, north) in WGS-84
-    transform : rasterio Affine transform for the output grid (EPSG:3035)
-    shape : (rows, cols) of the output grid
+    bbox_wgs84 : (west, south, east, north)
+    transform  : rasterio Affine transform in EPSG:3035
+    shape      : (rows, cols)
 
     Returns
     -------
-    dict with keys:
-        labels : np.ndarray (rows, cols) of dtype '<U12' with string labels
-                 or "" for unmatched pixels.
-        source : "osm"
-        n_road_px : int  – number of pixels labelled road or path
-        n_landcover_px : int  – number of pixels with a landcover label
+    dict with keys: labels (ndarray), source, n_road_px, n_landcover_px
     """
-    rows, cols = shape
-    empty_result = {
+    empty = {
         "labels": np.full(shape, "", dtype="<U12"),
         "source": "osm",
         "n_road_px": 0,
         "n_landcover_px": 0,
     }
 
-    # Fetch data from Overpass
-    try:
-        data = _query_overpass(bbox_wgs84)
-    except Exception as exc:
-        log.error("Failed to query Overpass API: %s", exc)
-        return empty_result
-
+    data = _query_all(bbox_wgs84)
     if data is None:
-        return empty_result
+        return empty
 
-    # Parse elements
-    try:
-        roads, landcover = _parse_elements(data)
-    except Exception as exc:
-        log.error("Failed to parse OSM elements: %s", exc)
-        return empty_result
-
+    roads, landcover = _parse_all(data)
     if not roads and not landcover:
         log.info("No relevant OSM features found in bbox")
-        return empty_result
+        return empty
 
-    # Rasterize
     labels = np.full(shape, "", dtype="<U12")
 
+    # Rasterize landcover first
+    n_lc = 0
     try:
         lc_grid = _rasterize_landcover(landcover, transform, shape)
-        # Write landcover labels into the string grid
         for code, lbl in _LC_CODE_TO_LABEL.items():
             if code == 0 or not lbl:
                 continue
@@ -618,22 +484,19 @@ def fetch_osm_ground_truth(
         n_lc = int(np.count_nonzero(lc_grid))
     except Exception as exc:
         log.error("Landcover rasterization failed: %s", exc)
-        n_lc = 0
 
+    # Roads override landcover (more precise ground truth)
+    n_road = 0
     try:
         road_grid = _rasterize_roads(roads, transform, shape)
-        # Roads override landcover (more precise ground truth)
         labels[road_grid == 1] = "road"
         labels[road_grid == 2] = "path"
         n_road = int(np.count_nonzero(road_grid))
     except Exception as exc:
         log.error("Road rasterization failed: %s", exc)
-        n_road = 0
 
-    log.info(
-        "OSM ground truth: %d road/path pixels, %d landcover pixels in %s grid",
-        n_road, n_lc, shape,
-    )
+    log.info("OSM ground truth: %d road/path px, %d landcover px in %s grid",
+             n_road, n_lc, shape)
 
     return {
         "labels": labels,

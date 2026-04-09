@@ -319,13 +319,19 @@ class LearnedClassifier:
 # ===================================================================
 
 _cached_classifier: Optional[LearnedClassifier] = None
+_cached_model_mtime: float = 0.0
 
 
 def get_classifier() -> LearnedClassifier:
-    """Get or load the singleton classifier."""
-    global _cached_classifier
-    if _cached_classifier is None:
+    """Get or load the singleton classifier.  Reloads when model file changes."""
+    global _cached_classifier, _cached_model_mtime
+    try:
+        mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _cached_classifier is None or mtime != _cached_model_mtime:
         _cached_classifier = LearnedClassifier.load()
+        _cached_model_mtime = mtime
     return _cached_classifier
 
 

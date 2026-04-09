@@ -194,6 +194,16 @@ def _try_cadastre(geom_wgs84, transform, shape) -> np.ndarray | None:
         return None
 
 
+def _try_hansen(geom_wgs84, transform, shape) -> dict | None:
+    """Attempt to load Hansen forest prior for segment_and_classify."""
+    try:
+        bbox = geom_wgs84.bounds
+        return hansen.get_forest_prior(bbox, transform, shape)
+    except Exception as e:
+        log.warning("Hansen prior failed: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 1. ELEVATION
 # ---------------------------------------------------------------------------
@@ -553,6 +563,10 @@ def segment_objects():
                     geom, data['transform'], data['shape'],
                 )
 
+            hansen_data = None
+            if include_hansen:
+                hansen_data = _try_hansen(geom, data['transform'], data['shape'])
+
             # Run segmentation pipeline
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], data['mask'], data['transform'],
@@ -561,6 +575,7 @@ def segment_objects():
                 spectral=spectral,
                 copernicus=copernicus_data,
                 building_footprints=building_footprints,
+                hansen=hansen_data,
                 min_object_size=min_object_size,
                 felz_scale=felz_scale,
                 rag_threshold=rag_threshold,
@@ -571,14 +586,10 @@ def segment_objects():
 
             # Hansen forest loss calibration
             hansen_evaluation = None
-            if include_hansen:
+            if include_hansen and hansen_data:
                 try:
-                    bbox_wgs = geom.bounds  # WGS84
-                    hansen_prior = hansen.get_forest_prior(
-                        bbox_wgs, data['transform'], data['shape'],
-                    )
-                    objects = hansen.calibrate_clear_cut(objects, labels, hansen_prior)
-                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_prior)
+                    objects = hansen.calibrate_clear_cut(objects, labels, hansen_data)
+                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_data)
                 except Exception as e:
                     log.warning("Hansen calibration failed: %s", e)
 
@@ -895,6 +906,10 @@ def segment_overlay():
         if include_cadastre:
             building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
 
+        hansen_data = None
+        if include_hansen:
+            hansen_data = _try_hansen(geom, data['transform'], data['shape'])
+
         result = seg.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
             dtm_dates=dtm_dates,
@@ -902,19 +917,16 @@ def segment_overlay():
             spectral=spectral,
             copernicus=copernicus_data,
             building_footprints=building_footprints,
+            hansen=hansen_data,
         )
 
         objects = result['objects']
         labels = result['labels']
 
         # Hansen calibration
-        if include_hansen:
+        if include_hansen and hansen_data:
             try:
-                bbox_wgs = geom.bounds
-                hansen_prior = hansen.get_forest_prior(
-                    bbox_wgs, data['transform'], data['shape'],
-                )
-                objects = hansen.calibrate_clear_cut(objects, labels, hansen_prior)
+                objects = hansen.calibrate_clear_cut(objects, labels, hansen_data)
             except Exception as e:
                 log.warning("Hansen calibration failed in overlay: %s", e)
 

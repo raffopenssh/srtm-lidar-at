@@ -1,7 +1,8 @@
-"""Train RF classifier on Kohlschwarz KG (63330) cadastre ground truth.
+"""DEPRECATED — Train RF classifier on Kohlschwarz KG (63330) cadastre ground truth.
 
-Processes multiple tiles across the KG, extracts segment features,
-matches them to cadastre landuse polygons, and trains the RF.
+Superseded by POST /api/v1/classifier/train in app.py, which passes all
+data sources (Hansen, Copernicus, temporal, texture) to the segmentation
+pipeline.  Kept for reference only.
 """
 import json
 import logging

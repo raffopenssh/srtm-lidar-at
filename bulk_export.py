@@ -457,22 +457,26 @@ def run_segmentation(tile_data: dict, hansen_data: dict | None = None,
                 "crs": "EPSG:3035",
             }
 
+        # Observation year = latest dataset available
+        _obs_year = max(int(ds[:4]) for ds in DATASETS)
         result = seg.segment_and_classify(
             dtm, dsm, mask, tf,
             dtm_dates=dtm_dates if dtm_dates else None,
             dsm_dates=dsm_dates if dsm_dates else None,
             spectral=spectral,
             copernicus=cop,
+            observation_year=_obs_year,
         )
 
-        # Hansen calibration of clear_cut
+        # Hansen calibration of tree_loss
         if hansen_data and hansen_data.get("hansen_treecover2000") is not None:
             try:
                 clip_geom = tile_data["clip_geom"]
                 bbox_wgs = shapely_transform(_T_3035_4326.transform, clip_geom).bounds
                 prior = hn.get_forest_prior(bbox_wgs, tf, (h, w))
-                result["objects"] = hn.calibrate_clear_cut(
-                    result["objects"], result["labels"], prior)
+                result["objects"] = hn.calibrate_tree_loss(
+                    result["objects"], result["labels"], prior,
+                    observation_year=_obs_year)
             except Exception as e:
                 log.warning("  Hansen calibration failed: %s", e)
 
@@ -1150,7 +1154,7 @@ def main():
   • Terrain: slope, aspect, TRI, TPI, curvature
   • NDVI (fused BEV + Copernicus)
   • Watershed segmentation (25 object types + 11 groups)
-  • Temporal change detection (excavation, fill, clear_cut, etc.)
+  • Temporal change detection (excavation, fill, tree_loss, etc.)
   • Per-tree growth/felling analysis
   • Hansen Global Forest Change (treecover, loss year)
   • ESA WorldCover land cover

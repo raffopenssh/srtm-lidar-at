@@ -41,6 +41,12 @@ DATASETS: dict[str, dict[str, str]] = {
 
 DEFAULT_DATASET = "20240915"
 
+
+def dataset_to_year(dataset: str) -> int:
+    """Extract the calendar year from a dataset key like '20240915'."""
+    return int(dataset[:4])
+
+
 # ---------------------------------------------------------------------------
 # Tile geometry constants
 # ---------------------------------------------------------------------------

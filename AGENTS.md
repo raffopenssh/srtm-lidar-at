@@ -24,7 +24,7 @@ Cadastre: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
 app.py                   Flask API — all endpoints
 hansen.py                Hansen Global Forest Change (GFC-2024-v1.12) integration
                           Reads treecover2000/lossyear/gain via /vsicurl/
-                          calibrate_clear_cut() boosts/downgrades clear_cut confidence
+                          calibrate_tree_loss() boosts/downgrades tree_loss confidence
                           evaluate_forest_loss() returns P/R/F1 vs Hansen reference
 object_segmentation.py   Watershed-based segmentation + classification
                           Fused gradient (Sobel on DTM/DSM/CHM/RGBI/NDVI)
@@ -92,7 +92,7 @@ Individual objects detected per-segment after Felzenszwalb+RAG segmentation:
 | Transportation | road, path, parking, bridge | Smooth DTM + elongated/compact + low NDVI |
 | Agricultural | crop, orchard, vineyard, garden | NDVI + ESA cropland prior + area/spacing |
 | Terrain | bare_soil, rock | Low NDVI + steep/rough (rock) or flat (soil) |
-| Disturbance | excavation, fill, clear_cut, construction | DTM temporal change + nDSM temporal change |
+| Disturbance | excavation, fill, tree_loss, construction | DTM temporal change + nDSM temporal change |
 
 Groups (adjacent compatible objects merged):
 
@@ -209,10 +209,10 @@ GFC-2024-v1.12 tile 50N_010E (covers Austria). Layers:
 - gain: forest gained 2000-2012
 - datamask: 1=land, 2=water
 
-Used by `hansen.py` to calibrate clear_cut detection:
-- clear_cut on Hansen loss → confidence +0.15
-- vegetation on recent Hansen loss + temporal instability → reclassify to clear_cut
-- clear_cut on non-forest area → confidence -0.20
+Used by `hansen.py` to calibrate tree_loss detection:
+- tree_loss on Hansen loss → confidence +0.15
+- vegetation on recent Hansen loss + temporal instability → reclassify to tree_loss
+- tree_loss on non-forest area → confidence -0.20
 
 Cached in /tmp/hansen_cache/ as .npz files.
 

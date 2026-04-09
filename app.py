@@ -148,8 +148,15 @@ def _try_read_ortho(data: dict) -> tuple:
 
 
 def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
-                    harmonics=False) -> dict | None:
-    """Attempt to fetch Copernicus data for a geometry."""
+                    harmonics=False, year: int = 2023) -> dict | None:
+    """Attempt to fetch Copernicus data for a geometry.
+
+    Parameters
+    ----------
+    year : int
+        Observation year.  NDVI composite and SAR backscatter are fetched
+        for the growing season (Apr–Sep) of this year.
+    """
     try:
         import copernicus
         bbox = geom_wgs84.bounds  # (minx, miny, maxx, maxy) = (west, south, east, north)
@@ -157,7 +164,7 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
         result = {}
         if ndvi:
             try:
-                ndvi_data = copernicus.get_ndvi_composite(bbox_dict)
+                ndvi_data = copernicus.get_ndvi_composite(bbox_dict, year=year)
                 result["ndvi"] = ndvi_data["ndvi"]
                 result["transform"] = ndvi_data["transform"]
                 result["crs"] = ndvi_data["crs"]
@@ -171,7 +178,9 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
                 log.warning("Copernicus land cover failed: %s", e)
         if sar:
             try:
-                sar_data = copernicus.get_sar_backscatter(bbox_dict, "2023-06-01", "2023-09-30")
+                sar_start = f"{year}-06-01"
+                sar_end   = f"{year}-09-30"
+                sar_data = copernicus.get_sar_backscatter(bbox_dict, sar_start, sar_end)
                 result["vv"] = sar_data["vv"]
                 result["vh"] = sar_data["vh"]
                 result["sar_transform"] = sar_data["transform"]
@@ -181,7 +190,7 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
         if harmonics:
             try:
                 import ndvi_harmonics
-                harm = ndvi_harmonics.get_harmonic_features(bbox_dict)
+                harm = ndvi_harmonics.get_harmonic_features(bbox_dict, year=year)
                 if harm:
                     result["harmonics"] = harm
                     log.info("NDVI harmonics: mean amp=%.3f",
@@ -219,6 +228,28 @@ def _try_hansen(geom_wgs84, transform, shape) -> dict | None:
     except Exception as e:
         log.warning("Hansen prior failed: %s", e)
         return None
+
+
+def _clear_raster_caches():
+    """Delete cached .npz / .tif / batch dirs to reclaim memory after training."""
+    import pathlib, shutil
+    cleared = 0
+    for cache_dir in [
+        pathlib.Path("/tmp/copernicus_cache"),
+        pathlib.Path("/tmp/hansen_cache"),
+    ]:
+        if cache_dir.exists():
+            for f in cache_dir.iterdir():
+                try:
+                    if f.is_dir():
+                        shutil.rmtree(f)
+                    else:
+                        f.unlink()
+                    cleared += 1
+                except Exception:
+                    pass
+    if cleared:
+        log.info("Cleared %d cached raster entries after training", cleared)
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +446,7 @@ def objects_summary():
             # Copernicus data (Sentinel-2 NDVI, land cover, SAR)
             copernicus_data = None
             if include_copernicus:
-                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
+                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
             # Cadastre building footprints (ground truth)
             building_footprints = None
@@ -572,7 +603,7 @@ def segment_objects():
 
             copernicus_data = None
             if include_copernicus:
-                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
+                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
             building_footprints = None
             if include_cadastre:
@@ -585,6 +616,7 @@ def segment_objects():
                 hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
             # Run segmentation pipeline
+            obs_year = ti.dataset_to_year(dataset)
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], data['mask'], data['transform'],
                 dtm_dates=dtm_dates,
@@ -596,6 +628,7 @@ def segment_objects():
                 min_object_size=min_object_size,
                 felz_scale=felz_scale,
                 rag_threshold=rag_threshold,
+                observation_year=obs_year,
             )
 
             objects = result['objects']
@@ -605,8 +638,8 @@ def segment_objects():
             hansen_evaluation = None
             if include_hansen and hansen_data:
                 try:
-                    objects = hansen.calibrate_clear_cut(objects, labels, hansen_data)
-                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_data)
+                    objects = hansen.calibrate_tree_loss(objects, labels, hansen_data, observation_year=obs_year)
+                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_data, observation_year=obs_year)
                 except Exception as e:
                     log.warning("Hansen calibration failed: %s", e)
 
@@ -744,7 +777,7 @@ SEGMENT_COLORS = {
     "rock":         (139, 134, 130, 160),
     "excavation":   (139, 0, 0, 200),
     "fill":         (255, 140, 0, 200),
-    "clear_cut":    (255, 0, 255, 200),
+    "tree_loss":    (255, 0, 255, 200),
     "construction": (255, 69, 0, 200),
 }
 
@@ -918,7 +951,7 @@ def segment_overlay():
 
         copernicus_data = None
         if include_copernicus:
-            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
+            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
         building_footprints = None
         if include_cadastre:
@@ -928,6 +961,7 @@ def segment_overlay():
         if include_hansen:
             hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
+        obs_year = ti.dataset_to_year(dataset)
         result = seg.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
             dtm_dates=dtm_dates,
@@ -936,6 +970,7 @@ def segment_overlay():
             copernicus=copernicus_data,
             building_footprints=building_footprints,
             hansen=hansen_data,
+            observation_year=obs_year,
         )
 
         objects = result['objects']
@@ -944,7 +979,7 @@ def segment_overlay():
         # Hansen calibration
         if include_hansen and hansen_data:
             try:
-                objects = hansen.calibrate_clear_cut(objects, labels, hansen_data)
+                objects = hansen.calibrate_tree_loss(objects, labels, hansen_data, observation_year=obs_year)
             except Exception as e:
                 log.warning("Hansen calibration failed in overlay: %s", e)
 
@@ -1053,6 +1088,7 @@ def export_geopackage():
                             spectral["nir"] = nir_arr.astype(np.float32)
                     result = seg.segment_and_classify(
                         dtm, dsm, mask, tf, spectral=spectral,
+                        observation_year=ti.dataset_to_year(dataset),
                     )
                     objects = result['objects']
                     labels = result['labels']
@@ -1833,8 +1869,11 @@ def ortho_geotiff():
 def train_classifier():
     """Train RF classifier from cadastre ground truth over a bbox.
 
-    Params: geometry (bbox/geojson), dataset, include_ortho, include_copernicus.
+    Params: geometry (bbox/geojson), dataset, include_ortho, include_copernicus,
+            include_temporal, include_hansen.
     Fetches segment features + cadastre parcel codes, trains RF model.
+    All data sources (ortho, copernicus, hansen, temporal) are included by
+    default so the RF sees the same features it will use at inference time.
     """
     try:
         import learned_classifier as lc
@@ -1844,23 +1883,72 @@ def train_classifier():
         params = _parse_params()
         geom, geom_3035 = _parse_geometry(params)
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
+        obs_year = ti.dataset_to_year(dataset)
+
+        include_temporal = str(params.get('include_temporal', 'true')).lower() in ('true', '1', 'yes')
+        include_hansen = str(params.get('include_hansen', 'true')).lower() in ('true', '1', 'yes')
 
         # Read LIDAR
         data = raster_io.read_dtm_dsm(geom_3035, dataset)
 
+        # Multi-temporal DTM/DSM
+        dtm_dates, dsm_dates = None, None
+        if include_temporal:
+            try:
+                multi = raster_io.read_multi_date_ndsm(geom_3035)
+                dtm_dates, dsm_dates = {}, {}
+                for d in multi['dates_loaded']:
+                    try:
+                        dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
+                        mh = min(dd['shape'][0], data['shape'][0])
+                        mw = min(dd['shape'][1], data['shape'][1])
+                        dtm_dates[d] = dd['dtm'][:mh, :mw]
+                        dsm_dates[d] = dd['dsm'][:mh, :mw]
+                    except Exception as e:
+                        log.warning("Train: date %s load failed: %s", d, e)
+            except Exception as e:
+                log.warning("Train: multi-temporal failed: %s", e)
+
         # Read ortho
         rgb, spectral = _try_read_ortho(data)
 
-        # Copernicus
-        copernicus_data = _try_copernicus(geom, sar=True, harmonics=True)
+        # Copernicus (NDVI, land cover, SAR, harmonics)
+        copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
-        # Segment (feature extraction)
+        # Hansen forest prior
+        hansen_data = None
+        if include_hansen:
+            hansen_data = _try_hansen(geom, data['transform'], data['shape'])
+
+        # Building footprints from cadastre (for calibration features)
+        building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
+
+        # Segment (feature extraction) — pass ALL data sources
         result = oc.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
-            spectral=spectral, copernicus=copernicus_data,
+            dtm_dates=dtm_dates,
+            dsm_dates=dsm_dates,
+            spectral=spectral,
+            copernicus=copernicus_data,
+            building_footprints=building_footprints,
+            hansen=hansen_data,
+            ortho_year=obs_year,
+            observation_year=obs_year,
         )
-        features = [obj.features for obj in result['objects']]
+        objects = result['objects']
         labels_arr = result['labels']
+
+        # Hansen tree-loss calibration
+        if include_hansen and hansen_data:
+            try:
+                objects = hansen.calibrate_tree_loss(
+                    objects, labels_arr, hansen_data,
+                    observation_year=obs_year,
+                )
+            except Exception as e:
+                log.warning("Train: Hansen calibration failed: %s", e)
+
+        features = [obj.features for obj in objects]
 
         # Fetch cadastre parcel codes
         bbox_wgs = geom.bounds
@@ -1868,7 +1956,6 @@ def train_classifier():
             parcels = cadastre.fetch_parcel_land_use(
                 (bbox_wgs[0], bbox_wgs[1], bbox_wgs[2], bbox_wgs[3]))
         except Exception:
-            # Try alternative: rasterise cadastre codes onto label grid
             parcels = None
 
         if parcels is None:
@@ -1878,8 +1965,6 @@ def train_classifier():
         train_features = []
         train_labels = []
         for feat in features:
-            lbl = feat.get("label", 0)
-            # Find dominant cadastre code for this segment
             code = _dominant_cadastre_code(feat, parcels)
             if code and code in lc.CADASTRE_TO_TYPE:
                 train_features.append(feat)
@@ -1891,11 +1976,23 @@ def train_classifier():
         clf = lc.LearnedClassifier()
         stats = clf.train(train_features, train_labels)
 
+        # Clear cached raster data to reclaim memory
+        _clear_raster_caches()
+
         return jsonify({
             "status": "trained",
             "training_stats": stats,
             "n_segments_total": len(features),
             "n_segments_labelled": len(train_features),
+            "dataset": dataset,
+            "observation_year": obs_year,
+            "data_sources": {
+                "temporal": dtm_dates is not None and len(dtm_dates) >= 2,
+                "ortho": spectral is not None,
+                "copernicus": copernicus_data is not None,
+                "hansen": hansen_data is not None,
+                "building_footprints": building_footprints is not None,
+            },
         })
 
     except Exception as e:

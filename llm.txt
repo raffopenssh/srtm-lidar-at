@@ -61,8 +61,8 @@ Fallback: BEV alone → Copernicus alone → no NDVI.
 | 41 | rock | Steep + very rough DTM + low NDVI |
 | 50 | excavation | DTM lowered >0.20m between dates, ground-level (≥25m²) |
 | 51 | fill | DTM raised >0.20m between dates, ground-level (≥25m²) |
-| 52 | clear_cut | Trees felled/died: nDSM dropped >2m, terrain intact (≥8m²) |
-| 53 | construction | New structure, OR site clearing (clear_cut + earthworks) |
+| 52 | tree_loss | Trees felled/died: nDSM dropped >2m, terrain intact (≥8m²) |
+| 53 | construction | New structure, OR site clearing (tree_loss + earthworks) |
 
 ## 11 Group Types (hierarchical merge of adjacent objects)
 
@@ -101,7 +101,7 @@ Fallback: BEV alone → Copernicus alone → no NDVI.
     Elevated objects filtered (DTM noise from tree crown interpolation).
   - Clear_cut: nDSM dropped >2m, terrain intact. Captures individual
     tree death/felling (≥8m²) and larger timber harvest patches.
-  - Construction: nDSM grew >2m (non-vegetation), OR clear_cut combined
+  - Construction: nDSM grew >2m (non-vegetation), OR tree_loss combined
     with earthworks (DTM change >0.15m = site clearing for development).
   - Vegetation filter: growing trees (high NDVI + rough DSM) excluded
     from construction false positives.

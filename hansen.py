@@ -2,7 +2,7 @@
 
 Reads forest cover, loss, and gain data from Google's Hansen GFC tiles
 via HTTP range requests. Used to calibrate and validate forest loss
-(clear_cut) detection from BEV LIDAR time series.
+(tree_loss) detection from BEV LIDAR time series.
 
 Data:
   - treecover2000: % canopy cover in 2000 (uint8, 0-100)
@@ -238,24 +238,38 @@ def get_forest_loss_mask(
     return loss
 
 
-def calibrate_clear_cut(
+def calibrate_tree_loss(
     objects: list,
     labels: np.ndarray,
     hansen_prior: dict,
+    observation_year: int | None = None,
 ) -> list:
-    """Improve clear_cut detection using Hansen forest loss data.
+    """Improve tree_loss detection using Hansen forest loss data.
 
     Modifies objects in-place and returns the list.
 
+    Parameters
+    ----------
+    observation_year : int or None
+        Calendar year of the LIDAR observation (e.g. 2024).  "Recent" loss
+        is scoped to the 5 years ending at this year.  Defaults to 2024.
+
     Logic:
-    1. clear_cut objects overlapping Hansen loss → boost confidence
-    2. tree/shrub/grass objects on recent Hansen loss → reclassify to clear_cut
-    3. clear_cut objects with NO Hansen support → reduce confidence
+    1. tree_loss objects overlapping Hansen loss → boost confidence
+    2. tree/shrub/grass objects on recent Hansen loss → reclassify to tree_loss
+    3. tree_loss objects with NO Hansen support → reduce confidence
     """
+    _obs = observation_year or 2024
+    _recent_start = max(_obs - 2000 - 5, 1)  # Hansen code for obs_year-5
+    _recent_end   = min(_obs - 2000, 24)      # Hansen code for obs_year
     loss_mask = hansen_prior["loss_year"] > 0
     was_forest = hansen_prior["was_forest_2000"]
-    # Recent loss (last ~5 years): years 20-24 = 2020-2024
-    recent_loss = (hansen_prior["loss_year"] >= 20) & was_forest
+    # Recent loss scoped to [obs_year-5 .. obs_year]
+    recent_loss = (
+        (hansen_prior["loss_year"] >= _recent_start)
+        & (hansen_prior["loss_year"] <= _recent_end)
+        & was_forest
+    )
 
     modified = 0
     for obj in objects:
@@ -273,7 +287,7 @@ def calibrate_clear_cut(
         forest_overlap = int((seg_mask & was_forest).sum())
         forest_frac = forest_overlap / seg_pixels
 
-        if obj.obj_type == "clear_cut":
+        if obj.obj_type == "tree_loss":
             if loss_frac > 0.3:
                 # Hansen confirms forest loss - boost confidence
                 obj.confidence = min(obj.confidence + 0.15, 0.95)
@@ -286,7 +300,7 @@ def calibrate_clear_cut(
             # keep existing confidence (our LIDAR is more recent than Hansen)
 
         elif obj.obj_type in ("tree", "shrub", "grass", "bare_soil"):
-            # Vegetation on recent Hansen loss area → possible clear_cut
+            # Vegetation on recent Hansen loss area → possible tree_loss
             # that has regrown or is being classified as vegetation
             if recent_frac > 0.5 and forest_frac > 0.5:
                 # Strong Hansen loss signal on former forest
@@ -295,8 +309,8 @@ def calibrate_clear_cut(
                 dtm_change_abs = abs(obj.dtm_change)
                 if h_change > 0.5 or obj.temporal_stability < 0.6:
                     from object_segmentation import OBJECT_TYPES
-                    obj.obj_type = "clear_cut"
-                    obj.type_code = OBJECT_TYPES["clear_cut"]
+                    obj.obj_type = "tree_loss"
+                    obj.type_code = OBJECT_TYPES["tree_loss"]
                     obj.confidence = min(0.6 + recent_frac * 0.2, 0.85)
                     obj.is_manmade = True
                     modified += 1
@@ -309,18 +323,31 @@ def evaluate_forest_loss(
     objects: list,
     labels: np.ndarray,
     hansen_prior: dict,
+    observation_year: int | None = None,
 ) -> dict:
-    """Compare clear_cut detections against Hansen loss.
+    """Compare tree_loss detections against Hansen loss.
+
+    Parameters
+    ----------
+    observation_year : int or None
+        Calendar year of the observation.  Only Hansen loss *up to* this
+        year is used as reference.  Defaults to 2024.
 
     Returns precision, recall, F1 metrics.
     """
+    _obs = observation_year or 2024
+    _max_code = min(_obs - 2000, 24)
     h, w = labels.shape
-    loss_mask = (hansen_prior["loss_year"] > 0) & hansen_prior["was_forest_2000"]
+    loss_mask = (
+        (hansen_prior["loss_year"] > 0)
+        & (hansen_prior["loss_year"] <= _max_code)
+        & hansen_prior["was_forest_2000"]
+    )
 
     # Build our detection mask
     our_loss = np.zeros((h, w), dtype=bool)
     for obj in objects:
-        if obj.obj_type == "clear_cut":
+        if obj.obj_type == "tree_loss":
             our_loss[labels == obj.obj_id] = True
 
     # Crop to common shape

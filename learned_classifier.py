@@ -127,7 +127,7 @@ TYPE_CLASSES = [
     "tree", "shrub", "grass", "crop", "road", "path", "parking",
     "roof", "water", "bare_soil", "rock", "excavation", "fill",
     "garden", "orchard", "vineyard", "hedge", "fence", "wall",
-    "clear_cut", "construction",
+    "tree_loss", "construction",
 ]
 
 

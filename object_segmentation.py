@@ -81,8 +81,8 @@ OBJECT_TYPES = {
     # ---- Disturbance (DTM temporal change) ----
     "excavation": 50,    # DTM lowered between dates                [Ab 80,93]
     "fill": 51,          # DTM raised between dates                 [Dep 81]
-    "clear_cut": 52,     # logging/timber harvest: was tall, now ground, terrain intact
-    "construction": 53,  # new structure, or site clearing (clear_cut + earthworks)
+    "tree_loss": 52,     # logging/timber harvest: was tall, now ground, terrain intact
+    "construction": 53,  # new structure, or site clearing (tree_loss + earthworks)
 }
 
 # Group types (merge adjacent compatible individuals)
@@ -124,7 +124,7 @@ _COMPAT_MAP = {
     # Terrain
     "bare_soil": 9, "rock": 9,
     # Disturbance
-    "excavation": 3, "fill": 4, "clear_cut": 10, "construction": 10,
+    "excavation": 3, "fill": 4, "tree_loss": 10, "construction": 10,
 }
 
 # Map cadastre land-use codes → our detectable types (for cross-validation)
@@ -428,11 +428,23 @@ def extract_object_features(
     dtm_dates: dict | None = None,
     dsm_dates: dict | None = None,
     hansen: dict | None = None,
+    observation_year: int | None = None,
 ) -> list[dict]:
     """Extract a feature vector for each labelled segment.
 
-    Computed ONCE per object — the main speed advantage over per-pixel.
+    Parameters
+    ----------
+    observation_year : int or None
+        Calendar year of the primary LIDAR/ortho observation (e.g. 2024).
+        Used to scope Hansen "recent loss" to years *before* the observation.
+        If None, defaults to 2024.
     """
+    _obs_year = observation_year or 2024
+    # Hansen lossyear is 1-24 → 2001-2024.  "Recent" = within 5 years
+    # *before* the observation, i.e. [obs_year-5, obs_year] mapped to
+    # Hansen codes [obs_year-2000-5, obs_year-2000].
+    _hansen_recent_start = max(_obs_year - 2000 - 5, 1)   # e.g. 2024→19
+    _hansen_recent_end   = min(_obs_year - 2000, 24)       # e.g. 2024→24
     h, w = dtm.shape
     slope_arr = _slope(dtm)
     dsm_rough = _local_std(dsm, 3)
@@ -636,7 +648,7 @@ def extract_object_features(
             n_pix = max(int(seg_v.sum()), 1)
             f["hansen_treecover2000"] = float(np.mean(hansen_tc[seg_v])) if n_pix > 0 else 0.0
             f["hansen_loss_frac"] = float(np.sum(hansen_loss[seg_v] > 0)) / n_pix if hansen_loss is not None else 0.0
-            f["hansen_recent_loss_frac"] = float(np.sum(hansen_loss[seg_v] >= 20)) / n_pix if hansen_loss is not None else 0.0
+            f["hansen_recent_loss_frac"] = float(np.sum((hansen_loss[seg_v] >= _hansen_recent_start) & (hansen_loss[seg_v] <= _hansen_recent_end))) / n_pix if hansen_loss is not None else 0.0
             f["hansen_gain_frac"] = float(np.sum(hansen_gain[seg_v] > 0)) / n_pix if hansen_gain is not None else 0.0
             f["hansen_current_forest_frac"] = float(np.sum(hansen_current[seg_v])) / n_pix if hansen_current is not None else 0.0
         else:
@@ -912,7 +924,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     # --- nDSM change: something was built, removed, or felled ---
     if abs(h_change) > 2.0 and temporal_h_std > 1.0:
 
-        # Height DROPPED → clear_cut / tree death / site clearing
+        # Height DROPPED → tree_loss / tree death / site clearing
         if h_change < -2.0 and h_mean < 2.0:
             if big_enough_earthwork and not is_green and dtm_change_abs > 0.4:
                 # Trees removed AND terrain significantly reshaped → site clearing
@@ -920,7 +932,7 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
             elif big_enough_tree_loss:
                 # Trees removed, terrain intact → logging / tree death
                 conf = 0.7 if area < 50 else 0.85
-                return "clear_cut", OBJECT_TYPES["clear_cut"], conf, True
+                return "tree_loss", OBJECT_TYPES["tree_loss"], conf, True
 
         # Height GREW and doesn't look like vegetation → new structure
         if h_change > 2.0 and not is_veg_like and not is_green and big_enough_earthwork:
@@ -1352,7 +1364,7 @@ _MERGE_RULES = {
     "excavation": {"excavation", "fill", "construction", "bare_soil"},
     "fill": {"excavation", "fill", "construction", "bare_soil"},
     "construction": {"excavation", "fill", "construction"},
-    "clear_cut": {"clear_cut", "bare_soil"},
+    "tree_loss": {"tree_loss", "bare_soil"},
     "water": {"water"},
 }
 
@@ -1398,8 +1410,8 @@ _GROUP_NAME_MAP: list[tuple[set[str], str]] = [
     ({"excavation", "fill", "construction"}, "construction_site"),
     ({"construction"}, "construction_site"),
     ({"excavation", "fill", "construction", "bare_soil"}, "construction_site"),
-    ({"clear_cut"}, "construction_site"),
-    ({"clear_cut", "bare_soil"}, "construction_site"),
+    ({"tree_loss"}, "construction_site"),
+    ({"tree_loss", "bare_soil"}, "construction_site"),
 ]
 
 
@@ -1600,6 +1612,7 @@ def segment_and_classify(
     felz_scale: float = 150.0,
     rag_threshold: float = 0.12,
     ortho_year: int | None = None,
+    observation_year: int | None = None,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
 
@@ -1654,6 +1667,7 @@ def segment_and_classify(
         spectral=spectral, cop=cop_resampled,
         dtm_dates=dtm_dates, dsm_dates=dsm_dates,
         hansen=hansen,
+        observation_year=observation_year,
     )
 
     # --- Step 3b: Texture features (GLCM from ortho) ---

@@ -2726,8 +2726,8 @@ def share_save():
         # Extract reuse_id (not stored)
         reuse_id = payload.pop('reuse_id', None)
         
-        # Hash based on state+result only (exclude overlays — they're derived data)
-        hash_payload = {k: v for k, v in payload.items() if k != 'overlays'}
+        # Hash based on state+result only (exclude overlays and name — they're metadata)
+        hash_payload = {k: v for k, v in payload.items() if k not in ('overlays', 'name')}
         hash_json = json.dumps(hash_payload, separators=(',', ':'), sort_keys=True)
         content_hash = hashlib.sha256(hash_json.encode()).hexdigest()[:24]
         
@@ -2753,24 +2753,26 @@ def share_save():
             try:
                 existing_data = gzip.decompress(existing_file.read_bytes()).decode()
                 existing_obj = json.loads(existing_data)
-                existing_hash_payload = {k: v for k, v in existing_obj.items() if k != 'overlays'}
+                existing_hash_payload = {k: v for k, v in existing_obj.items() if k not in ('overlays', 'name')}
                 existing_hash = hashlib.sha256(
                     json.dumps(existing_hash_payload, separators=(',', ':'), sort_keys=True).encode()
                 ).hexdigest()[:24]
                 if existing_hash == content_hash:
                     share_id = existing_file.stem.split('.')[0]
-                    # If new payload has overlays but old didn't (or has more), update
+                    # If new payload has overlays/name changes, update stored data
                     new_ovl = payload.get('overlays', {})
                     old_ovl = existing_obj.get('overlays', {})
-                    if len(new_ovl) > len(old_ovl):
+                    new_name = payload.get('name')
+                    old_name = existing_obj.get('name')
+                    if len(new_ovl) > len(old_ovl) or new_name != old_name:
                         existing_file.write_bytes(data)
-                        log.info("share: dedup hit %s, updated overlays (%d→%d)",
-                                 share_id, len(old_ovl), len(new_ovl))
+                        log.info("share: dedup hit %s, updated (overlays %d→%d, name=%s)",
+                                 share_id, len(old_ovl), len(new_ovl), new_name)
                     else:
                         log.info("share: dedup hit %s", share_id)
                     existing_file.touch()
                     url = f'{proto}://{host}/?share={share_id}'
-                    return jsonify({'id': share_id, 'url': url, 'reused': True})
+                    return jsonify({'id': share_id, 'url': url, 'reused': True, 'name': new_name})
             except Exception:
                 continue
         
@@ -2789,16 +2791,23 @@ def share_save():
 
 @app.route('/api/v1/share/<share_id>', methods=['GET'])
 def share_load(share_id):
-    """Retrieve a saved share."""
+    """Retrieve a saved share. Serves gzip-compressed if client accepts it."""
     try:
         if not re.match(r'^[a-f0-9]{12}$', share_id):
             return _error('Invalid share ID', 400)
         p = SHARE_DIR / f'{share_id}.json.gz'
         if not p.exists():
             return _error('Share not found', 404)
-        data = gzip.decompress(p.read_bytes())
         # Touch file to keep it alive (LRU)
         p.touch()
+        # Serve pre-compressed gzip if client accepts it (saves bandwidth, critical for mobile)
+        accept_enc = request.headers.get('Accept-Encoding', '')
+        if 'gzip' in accept_enc:
+            raw = p.read_bytes()
+            return Response(raw, mimetype='application/json',
+                            headers={'Content-Encoding': 'gzip',
+                                     'Vary': 'Accept-Encoding'})
+        data = gzip.decompress(p.read_bytes())
         return Response(data, mimetype='application/json')
     except Exception as e:
         log.error("share load: %s", traceback.format_exc())

@@ -94,6 +94,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 /* ===== SHARE BUTTON ===== */
 .share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100vw - 40px);overflow:hidden;text-overflow:ellipsis;user-select:all}
 .share-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
+.share-name-popup{display:none;position:absolute;bottom:60px;left:14px;z-index:1002;background:#1a1a2e;padding:6px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:calc(100vw - 40px)}
+.share-name-popup.show{display:block}
+.share-name-row{display:flex;gap:4px;align-items:center}
+.share-name-popup input{width:180px;padding:6px 10px;border-radius:8px 0 0 8px;border:1px solid #444;border-right:0;background:#0d0d1a;color:#fff;font-size:13px}
+.share-name-popup input:focus{outline:none;border-color:#16a085}
+.share-name-popup .btn-sm{padding:6px 12px;font-size:12px;border-radius:0 8px 8px 0;white-space:nowrap}
 
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
@@ -262,6 +268,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
     <button class="btn" onclick="openResultModal()">📥 Results</button>
   </div>
   <div class="share-toast" id="share-toast">Link copied!</div>
+  <div class="share-name-popup" id="share-name-popup">
+    <div class="share-name-row">
+      <input type="text" id="share-name-input" placeholder="Name (optional)" maxlength="80">
+      <button class="btn btn-sm" id="share-name-ok">🔗 Copy</button>
+    </div>
+  </div>
 </div>
 
 <!-- ===== RESULT MODAL ===== -->
@@ -1042,6 +1054,40 @@ async function copyToClipboard(text){
   return false;
 }
 
+let currentShareName=null;  // Name of current share
+
+async function doShareSave(name){
+  const btn=document.getElementById('btn-share');
+  const toast=document.getElementById('share-toast');
+  const state=getShareState();
+  btn.disabled=true;btn.textContent='\u23f3 Saving...';
+  const payload={state:state};
+  if(name) payload.name=name;
+  if(lastResult) payload.result=lastResult;
+  const ovlBlobs=await collectOverlayBlobs();
+  if(Object.keys(ovlBlobs).length) payload.overlays=ovlBlobs;
+  if(currentShareId) payload.reuse_id=currentShareId;
+  try{
+    const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await resp.json();
+    if(d.error) throw new Error(d.error);
+    currentShareId=d.id;
+    currentShareName=name||null;
+    shareStateHash=computeShareHash(state,lastResult);
+    const url=location.origin+location.pathname+'?share='+d.id;
+    history.replaceState(null,'',`?share=${d.id}`);
+    const copied=await copyToClipboard(url);
+    const label=name?` "${name}"`:(d.reused?' (existing share)':'');
+    toast.textContent=copied?`\u2705 Link copied!${label}`:'\u2705 '+url;
+    toast.classList.add('show');
+    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
+  }catch(e){
+    toast.textContent='\u274c '+e.message;
+    toast.classList.add('show');
+    setTimeout(()=>toast.classList.remove('show'),4000);
+  }finally{btn.disabled=false;btn.textContent='\ud83d\udd17 Share';}
+}
+
 document.getElementById('btn-share').onclick=async()=>{
   const btn=document.getElementById('btn-share');
   if(btn.disabled)return;
@@ -1053,39 +1099,38 @@ document.getElementById('btn-share').onclick=async()=>{
   if(currentShareId && shareStateHash===stateH){
     const url=location.origin+location.pathname+'?share='+currentShareId;
     const copied=await copyToClipboard(url);
-    toast.textContent=copied?'\u2705 Link copied!':'\u2705 '+url;
+    const label=currentShareName?` "${currentShareName}"`:'';
+    toast.textContent=copied?`\u2705 Link copied!${label}`:'\u2705 '+url;
     toast.classList.add('show');
     setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
     return;
   }
   
-  btn.disabled=true;btn.textContent='\u23f3 Saving...';
-  const payload={state:state};
-  if(lastResult) payload.result=lastResult;
-  // Capture active overlay images for instant restore
-  const ovlBlobs=await collectOverlayBlobs();
-  if(Object.keys(ovlBlobs).length) payload.overlays=ovlBlobs;
-  // If we have an existing share ID, offer to update it
-  if(currentShareId) payload.reuse_id=currentShareId;
-  try{
-    const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const d=await resp.json();
-    if(d.error) throw new Error(d.error);
-    currentShareId=d.id;
-    shareStateHash=stateH;
-    const url=location.origin+location.pathname+'?share='+d.id;
-    // Update URL bar without reload
-    history.replaceState(null,'',`?share=${d.id}`);
-    const copied=await copyToClipboard(url);
-    toast.textContent=copied?'\u2705 Link copied to clipboard!'+(d.reused?' (existing share)':''):'\u2705 '+url;
-    toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
-  }catch(e){
-    toast.textContent='\u274c '+e.message;
-    toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),4000);
-  }finally{btn.disabled=false;btn.textContent='\ud83d\udd17 Share';}
+  // Show name popup for new shares
+  const popup=document.getElementById('share-name-popup');
+  const inp=document.getElementById('share-name-input');
+  inp.value=currentShareName||'';
+  popup.classList.add('show');
+  inp.focus();
 };
+
+// Share name popup handlers
+document.getElementById('share-name-ok').onclick=()=>{
+  const popup=document.getElementById('share-name-popup');
+  const name=document.getElementById('share-name-input').value.trim();
+  popup.classList.remove('show');
+  doShareSave(name||null);
+};
+document.getElementById('share-name-input').onkeydown=(e)=>{
+  if(e.key==='Enter'){e.preventDefault();document.getElementById('share-name-ok').click();}
+  if(e.key==='Escape'){document.getElementById('share-name-popup').classList.remove('show');}
+};
+document.addEventListener('click',(e)=>{
+  const popup=document.getElementById('share-name-popup');
+  if(popup.classList.contains('show') && !popup.contains(e.target) && e.target.id!=='btn-share'){
+    popup.classList.remove('show');
+  }
+});
 
 // Restore from share link on page load
 (async function checkShareParam(){
@@ -1100,8 +1145,10 @@ document.getElementById('btn-share').onclick=async()=>{
     await restoreShareResult(data);
     // Track this share so re-sharing won't create duplicates
     currentShareId=shareId;
+    currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
-    hideLoading('Shared view restored.');
+    const label=currentShareName?` "${currentShareName}"`:'.';
+    hideLoading('Shared view restored'+label);
   }catch(e){
     hideLoading('Failed to load share: '+e.message);
     console.error('Share restore failed:',e);

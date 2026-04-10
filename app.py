@@ -786,6 +786,20 @@ def segment_objects():
                 except Exception as e:
                     log.warning("Hansen calibration failed: %s", e)
 
+            # Populate seg_cache so overlay/gpkg endpoints can reuse results
+            seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
+            _seg_cache.update({
+                "labels": labels, "objects": objects,
+                "mask": data['mask'], "transform": data['transform'],
+                "shape": data['shape'], "ndsm": data.get('ndsm'), "key": seg_cache_key,
+            })
+            # Populate raster data cache so overlay endpoints don't re-fetch
+            raster_cache_key = f"{geom_3035.bounds}_{dataset}"
+            _raster_cache.update({"key": raster_cache_key, "data": data})
+            if rgb is not None:
+                _raster_cache.update({"ortho": rgb, "ortho_key": raster_cache_key})
+            log.info("segment: cached results for overlay reuse")
+
             # Filters
             if type_filter:
                 objects = [o for o in objects if o.obj_type in type_filter]
@@ -897,6 +911,10 @@ def segment_objects():
 # Cache for last segmentation result so legend filter re-renders are instant
 _seg_cache = {"labels": None, "objects": None, "mask": None,
               "transform": None, "shape": None, "ndsm": None, "key": None}
+
+# Cache for raster data (DTM/DSM/nDSM/ortho) keyed by (bounds, dataset)
+# so overlay endpoints don't re-fetch from remote after segment has loaded them
+_raster_cache = {"key": None, "data": None, "ortho": None, "ortho_key": None}
 
 # Segment type → RGBA colour (matches frontend TYPE_SHAPES)
 SEGMENT_COLORS = {
@@ -1553,6 +1571,18 @@ def _geometry_to_3035_bbox(features_or_geom):
     return geom_3035, b, bw
 
 
+def _get_cached_raster(geom_3035, dataset):
+    """Return DTM/DSM data from cache if available, else read from remote."""
+    cache_key = f"{geom_3035.bounds}_{dataset}"
+    if _raster_cache["key"] == cache_key and _raster_cache["data"] is not None:
+        log.info("raster cache hit for %s", cache_key)
+        return _raster_cache["data"]
+    log.info("raster cache miss, reading from remote")
+    data = raster_io.read_dtm_dsm(geom_3035, dataset)
+    _raster_cache.update({"key": cache_key, "data": data})
+    return data
+
+
 def _hillshade(elevation, azimuth=315, altitude=45, z_factor=1.0):
     """Compute hillshade from an elevation array."""
     dy, dx = np.gradient(elevation, 1.0)
@@ -1777,7 +1807,7 @@ def dtm_overlay():
         dataset = params.get('dataset', '20240915')
         geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
 
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        data = _get_cached_raster(geom_3035, dataset)
 
         # Reproject raw elevation to WGS84 *before* computing hillshade
         arrays_wgs, mask_wgs, tf_wgs, bounds_wgs = _reproject_rasters_to_wgs84(
@@ -1804,7 +1834,7 @@ def lidar_overlay():
         dataset = params.get('dataset', '20240915')
         geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
 
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        data = _get_cached_raster(geom_3035, dataset)
 
         # Reproject raw elevation to WGS84 before rendering
         arrays_wgs, mask_wgs, tf_wgs, bounds_wgs = _reproject_rasters_to_wgs84(
@@ -1834,8 +1864,17 @@ def ortho_overlay():
         ortho_year = params.get('ortho_year')
         if ortho_year:
             ortho_year = int(ortho_year)
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
-        rgb, nir = ortho_io.read_ortho_for_als(data, year=ortho_year)
+        data = _get_cached_raster(geom_3035, dataset)
+
+        # Use cached ortho if available and matches (same geometry, default year)
+        raster_cache_key = f"{geom_3035.bounds}_{dataset}"
+        if (not ortho_year and _raster_cache.get("ortho") is not None
+                and _raster_cache.get("ortho_key") == raster_cache_key):
+            log.info("ortho overlay: using cached ortho")
+            rgb = _raster_cache["ortho"]
+            nir = None  # nir not needed for RGB overlay
+        else:
+            rgb, nir = ortho_io.read_ortho_for_als(data, year=ortho_year)
 
         # Reproject RGB to WGS84
         rgb_wgs, mask_wgs, bounds_wgs = _reproject_rgb_to_wgs84(

@@ -643,7 +643,7 @@ async function handleLayerToggle(id){
   showLoading(`Loading ${id}...`);
   try{
     let ovl;
-    if(id==='raster')ovl=await loadRasterOverlay(null);
+    if(id==='raster'){const vis=Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t));ovl=await loadRasterOverlay(hiddenTypes.size>0?vis:null);}
     else{
       const def=LAYER_DEFS[id];
       let url=def.url+'?dataset='+def.ds;

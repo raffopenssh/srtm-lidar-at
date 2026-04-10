@@ -350,13 +350,15 @@ const selectedTypes=new Set(ALL_OBJ_TYPES);
   dd.querySelector('#ot-none').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=false;selectedTypes.delete(cb.value);});updateOTLabel();};
   dd.querySelector('#ot-invert').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=!cb.checked;if(cb.checked)selectedTypes.add(cb.value);else selectedTypes.delete(cb.value);});updateOTLabel();};
 
-  function updateOTLabel(){
-    if(selectedTypes.size===ALL_OBJ_TYPES.length)lbl.textContent='All types';
-    else if(selectedTypes.size===0)lbl.textContent='None selected';
-    else if(selectedTypes.size<=3)lbl.textContent=[...selectedTypes].map(t=>t.replace(/_/g,' ')).join(', ');
-    else lbl.textContent=`${selectedTypes.size} of ${ALL_OBJ_TYPES.length} types`;
-  }
 })();
+
+function updateOTLabel(){
+  const lbl=document.getElementById('ot-label');
+  if(selectedTypes.size===ALL_OBJ_TYPES.length)lbl.textContent='All types';
+  else if(selectedTypes.size===0)lbl.textContent='None selected';
+  else if(selectedTypes.size<=3)lbl.textContent=[...selectedTypes].map(t=>t.replace(/_/g,' ')).join(', ');
+  else lbl.textContent=`${selectedTypes.size} of ${ALL_OBJ_TYPES.length} types`;
+}
 
 function getSelectedTypes(){
   if(selectedTypes.size===ALL_OBJ_TYPES.length)return '';

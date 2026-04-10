@@ -138,15 +138,15 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .gpkg-layers .gpkg-group{grid-column:1/-1;font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-top:6px;padding-bottom:2px;border-bottom:1px solid #eee}
 
 /* ===== GPS CONTROL ===== */
-.gps-btn{position:absolute;bottom:24px;left:60px;z-index:1000;width:36px;height:36px;background:#fff;border:2px solid rgba(0,0,0,.2);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 6px rgba(0,0,0,.3);transition:background .15s}
+.gps-btn{width:34px;height:34px;background:#fff;border:2px solid rgba(0,0,0,.2);border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 1px 5px rgba(0,0,0,.25);transition:background .15s}
 .gps-btn:hover{background:#f4f4f4}
 .gps-btn.active{background:#e8f7f7;border-color:#0d7377;color:#0d7377}
 .gps-btn .gps-dot{fill:none;stroke:none}
 .gps-btn.active .gps-dot{fill:currentColor;stroke:none}
 .gps-btn.searching{animation:gps-pulse 1.2s ease infinite}
 @keyframes gps-pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.gps-hint{position:absolute;bottom:68px;left:60px;z-index:1000;background:#1a1a2e;color:#fff;padding:6px 12px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .5s;pointer-events:none}
-.gps-hint.show{opacity:1}
+.gps-hint{position:absolute;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .5s;pointer-events:none;cursor:pointer}
+.gps-hint.show{opacity:1;pointer-events:auto}
 
 /* ===== MOBILE ===== */
 @media(max-width:900px){
@@ -230,8 +230,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 
 <div id="map-area">
   <div id="map"></div>
-  <button class="gps-btn" id="gps-btn" title="Use my location" onclick="toggleGPS()"><svg id="gps-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" class="gps-dot" stroke="none" fill="none"/><line x1="12" y1="0" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="24"/><line x1="0" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="24" y2="12"/></svg></button>
-  <div class="gps-hint" id="gps-hint">Tap to use your GPS location</div>
+  <div class="gps-hint" id="gps-hint"></div>
 
   <div class="layer-panel" id="layer-panel">
     <h3>Layers</h3>
@@ -454,6 +453,13 @@ function mkIcon(info,colorOvr){
 // ============ MAP ============
 const map=L.map('map').setView([47.137,15.117],14);
 const baseLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}).addTo(map);
+
+// GPS control as Leaflet control (bottomleft, stacks neatly)
+L.Control.GPS=L.Control.extend({
+  onAdd(){const btn=L.DomUtil.create('button','gps-btn');btn.id='gps-btn';btn.title='Use my location';btn.innerHTML='<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" class="gps-dot" stroke="none" fill="none"/><line x1="12" y1="0" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="24"/><line x1="0" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="24" y2="12"/></svg>';L.DomEvent.disableClickPropagation(btn);L.DomEvent.on(btn,'click',toggleGPS);return btn;},
+  onRemove(){}
+});
+new L.Control.GPS({position:'topleft'}).addTo(map);
 const drawnItems=new L.FeatureGroup().addTo(map);
 const resultLayer=new L.FeatureGroup().addTo(map);
 
@@ -1515,29 +1521,27 @@ function buildSummary(data){
 
 // ============ GPS LOCATION ============
 let gpsActive=false, gpsWatchId=null, gpsMarker=null, gpsCircle=null, gpsFlewTo=false, gpsHeadingMarker=null;
+let _gpsLatLng=null; // last known position for hint-tap
 function toggleGPS(){
   const btn=document.getElementById('gps-btn');
   if(gpsActive){stopGPS();return;}
   if(!navigator.geolocation){alert('Geolocation not available');return;}
-  gpsActive=true;gpsFlewTo=false;
+  gpsActive=true;gpsFlewTo=false;_gpsLatLng=null;
   btn.classList.add('active','searching');
-  const hint=document.getElementById('gps-hint');
-  hint.classList.add('show');
-  setTimeout(()=>hint.classList.remove('show'),4000);
   gpsWatchId=navigator.geolocation.watchPosition(onGPSPos,onGPSErr,{enableHighAccuracy:true,maximumAge:5000,timeout:15000});
   // Listen for device orientation
   if(window.DeviceOrientationEvent){
     window.addEventListener('deviceorientation',onDeviceOrientation,true);
-    // iOS 13+ permission
     if(typeof DeviceOrientationEvent.requestPermission==='function'){
       DeviceOrientationEvent.requestPermission().catch(()=>{});
     }
   }
 }
 function stopGPS(){
-  gpsActive=false;
+  gpsActive=false;_gpsLatLng=null;
   const btn=document.getElementById('gps-btn');
   btn.classList.remove('active','searching');
+  document.getElementById('gps-hint').classList.remove('show');
   if(gpsWatchId!==null){navigator.geolocation.clearWatch(gpsWatchId);gpsWatchId=null;}
   if(gpsMarker){map.removeLayer(gpsMarker);gpsMarker=null;}
   if(gpsCircle){map.removeLayer(gpsCircle);gpsCircle=null;}
@@ -1548,7 +1552,6 @@ let _lastHeading=null;
 function onDeviceOrientation(e){
   if(e.alpha!==null)_lastHeading=e.alpha;
   if(!gpsMarker||!_lastHeading)return;
-  // Update heading indicator
   const ll=gpsMarker.getLatLng();
   if(!gpsHeadingMarker){
     gpsHeadingMarker=L.marker(ll,{icon:L.divIcon({html:'<div style="width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:18px solid #0d7377;transform-origin:center bottom;opacity:.7" id="gps-heading-arrow"></div>',iconSize:[12,18],iconAnchor:[6,18],className:''})}).addTo(map);
@@ -1562,6 +1565,7 @@ function onGPSPos(pos){
   btn.classList.remove('searching');
   const lat=pos.coords.latitude,lng=pos.coords.longitude;
   const acc=pos.coords.accuracy||50;
+  _gpsLatLng=[lat,lng];
   if(!gpsMarker){
     gpsMarker=L.circleMarker([lat,lng],{radius:7,fillColor:'#0d7377',fillOpacity:1,color:'#fff',weight:2}).addTo(map);
     gpsCircle=L.circle([lat,lng],{radius:acc,color:'#0d7377',fillColor:'#0d7377',fillOpacity:.1,weight:1,dashArray:'4'}).addTo(map);
@@ -1572,23 +1576,40 @@ function onGPSPos(pos){
   if(!gpsFlewTo){
     gpsFlewTo=true;
     map.flyTo([lat,lng],map.getZoom(),{duration:1.5});
-    // Set geometry to 1km radius circle around location
-    const circle=turf_circle([lng,lat],1,{units:'kilometers',steps:64});
-    if(circle){
-      document.getElementById('geometry').value=JSON.stringify(circle.geometry,null,2);
-      drawnItems.clearLayers();
-      const coords=circle.geometry.coordinates[0].map(c=>[c[1],c[0]]);
-      L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
-      showFABIfGeometry();
+    // Show hint near GPS button — user taps it to set area
+    const hint=document.getElementById('gps-hint');
+    const gpsBtnEl=document.getElementById('gps-btn');
+    if(gpsBtnEl){
+      const r=gpsBtnEl.getBoundingClientRect();
+      const mr=document.getElementById('map').getBoundingClientRect();
+      hint.style.top=(r.bottom-mr.top+6)+'px';
+      hint.style.left=(r.left-mr.left)+'px';
     }
+    hint.textContent='Tap here to select 1 km around you';
+    hint.classList.add('show');
+    setTimeout(()=>hint.classList.remove('show'),6000);
   }
 }
 function onGPSErr(e){
   console.warn('GPS error:',e);
   const btn=document.getElementById('gps-btn');
   btn.classList.remove('searching');
-  if(e.code===1)stopGPS(); // Permission denied
+  if(e.code===1)stopGPS();
 }
+// Hint tap → set 1km circle geometry
+document.getElementById('gps-hint').addEventListener('click',function(){
+  if(!_gpsLatLng)return;
+  const[lat,lng]=_gpsLatLng;
+  const circle=turf_circle([lng,lat],1,{units:'kilometers',steps:64});
+  if(circle){
+    document.getElementById('geometry').value=JSON.stringify(circle.geometry,null,2);
+    drawnItems.clearLayers();
+    const coords=circle.geometry.coordinates[0].map(c=>[c[1],c[0]]);
+    L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+    showFABIfGeometry();
+  }
+  this.classList.remove('show');
+});
 // Simple turf circle helper
 function turf_circle(center,radiusKm,opts){
   const steps=opts.steps||64;

@@ -122,9 +122,13 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .summary-table td{padding:4px 8px;border-bottom:1px solid #f0f0f0}
 .summary-table .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
 /* GeoPackage tab */
-.gpkg-info{text-align:center;padding:20px 0}
+.gpkg-info{padding:12px 0}
 .gpkg-info p{color:#666;font-size:13px;margin:8px 0}
 .gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:8px}
+.gpkg-layers{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;margin:10px 0;font-size:12px}
+.gpkg-layers label{display:flex;align-items:center;gap:5px;cursor:pointer;padding:3px 0}
+.gpkg-layers label input{margin:0}
+.gpkg-layers .gpkg-group{grid-column:1/-1;font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-top:6px;padding-bottom:2px;border-bottom:1px solid #eee}
 
 /* ===== MOBILE ===== */
 @media(max-width:900px){
@@ -221,6 +225,9 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         <div class="lyr"><input type="checkbox" data-lyr="ortho-2024"><span class="lyr-label">Ortho ~2024</span><input type="range" data-op="ortho-2024" min="0" max="100" value="80"></div>
         <div class="lyr"><input type="checkbox" data-lyr="ortho-2023"><span class="lyr-label">Ortho ~2023</span><input type="range" data-op="ortho-2023" min="0" max="100" value="80"></div>
         <div class="lyr"><input type="checkbox" data-lyr="ortho-2020"><span class="lyr-label">Ortho ~2020</span><input type="range" data-op="ortho-2020" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2024"><span class="lyr-label">CIR ~2024</span><input type="range" data-op="cir-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2023"><span class="lyr-label">CIR ~2023</span><input type="range" data-op="cir-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2020"><span class="lyr-label">CIR ~2020</span><input type="range" data-op="cir-2020" min="0" max="100" value="80"></div>
         <div class="lyr"><input type="checkbox" data-lyr="hansen"><span class="lyr-label">Hansen Forest Δ</span><input type="range" data-op="hansen" min="0" max="100" value="70"></div>
       </div>
     </div>
@@ -282,9 +289,32 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="tab-pane" id="tab-gpkg">
         <div class="gpkg-info">
-          <p style="font-size:32px">📦</p>
-          <p>Export all layers (DTM, DSM, nDSM, Ortho, Segments) as a GeoPackage for use in QGIS or other GIS software.</p>
-          <button class="btn" id="btn-dl-gpkg">📦 Download GeoPackage</button>
+          <p style="font-size:24px;margin-bottom:4px">📦 GeoPackage Export</p>
+          <p>Select raster layers to include. Active layers are pre-selected.</p>
+          <div class="gpkg-layers" id="gpkg-layers">
+            <div class="gpkg-group">Core</div>
+            <label><input type="checkbox" data-gpkg="dtm" checked> DTM (terrain)</label>
+            <label><input type="checkbox" data-gpkg="dsm" checked> DSM / nDSM</label>
+            <div class="gpkg-group">Orthophoto</div>
+            <label><input type="checkbox" data-gpkg="ortho-2024"> Ortho ~2024</label>
+            <label><input type="checkbox" data-gpkg="ortho-2023"> Ortho ~2023</label>
+            <label><input type="checkbox" data-gpkg="ortho-2020"> Ortho ~2020</label>
+            <label><input type="checkbox" data-gpkg="cir-2024"> CIR ~2024</label>
+            <label><input type="checkbox" data-gpkg="cir-2023"> CIR ~2023</label>
+            <label><input type="checkbox" data-gpkg="cir-2020"> CIR ~2020</label>
+            <div class="gpkg-group">LiDAR overlays</div>
+            <label><input type="checkbox" data-gpkg="dtm-2024"> DTM 2024 hillshade</label>
+            <label><input type="checkbox" data-gpkg="dtm-2023"> DTM 2023 hillshade</label>
+            <label><input type="checkbox" data-gpkg="dtm-2022"> DTM 2022 hillshade</label>
+            <label><input type="checkbox" data-gpkg="dsm-2024"> nDSM 2024 overlay</label>
+            <label><input type="checkbox" data-gpkg="dsm-2023"> nDSM 2023 overlay</label>
+            <label><input type="checkbox" data-gpkg="dsm-2022"> nDSM 2022 overlay</label>
+            <div class="gpkg-group">Analysis</div>
+            <label><input type="checkbox" data-gpkg="segments"> Segment types</label>
+            <label><input type="checkbox" data-gpkg="raster"> Segment raster (RGBA)</label>
+            <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
+          </div>
+          <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoPackage</button>
         </div>
       </div>
     </div>
@@ -405,6 +435,9 @@ const LAYER_DEFS={
   'ortho-2024':{url:'/api/v1/ortho/overlay',ds:'20240915',ortho_year:2024},
   'ortho-2023':{url:'/api/v1/ortho/overlay',ds:'20230915',ortho_year:2023},
   'ortho-2020':{url:'/api/v1/ortho/overlay',ds:'20220915',ortho_year:2020},
+  'cir-2024':{url:'/api/v1/cir/overlay',ds:'20240915',ortho_year:2024},
+  'cir-2023':{url:'/api/v1/cir/overlay',ds:'20230915',ortho_year:2023},
+  'cir-2020':{url:'/api/v1/cir/overlay',ds:'20220915',ortho_year:2020},
   'hansen':{url:'/api/v1/hansen/overlay',ds:'20240915'},
   'raster':{url:null},
 };
@@ -420,6 +453,19 @@ function closeResultModal(){
 function switchTab(tab){
   document.querySelectorAll('.modal-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+tab));
+  if(tab==='gpkg') syncGpkgCheckboxes();
+}
+function syncGpkgCheckboxes(){
+  // Map from gpkg checkbox ids to map layer checkbox ids
+  const mapLayerToGpkg={'dtm-2024':1,'dtm-2023':1,'dtm-2022':1,'dsm-2024':1,'dsm-2023':1,'dsm-2022':1,
+    'ortho-2024':1,'ortho-2023':1,'ortho-2020':1,'cir-2024':1,'cir-2023':1,'cir-2020':1,'hansen':1,'raster':1,'segments':1};
+  document.querySelectorAll('[data-gpkg]').forEach(cb=>{
+    const id=cb.dataset.gpkg;
+    if(id==='dtm'||id==='dsm') return; // core layers always checked
+    // Check if the corresponding map layer is active
+    const mapCb=document.querySelector(`[data-lyr="${id}"]`);
+    if(mapCb) cb.checked=mapCb.checked;
+  });
 }
 // Close on backdrop click
 document.getElementById('result-modal').onclick=e=>{if(e.target===e.currentTarget)closeResultModal();};
@@ -523,8 +569,26 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
   const btn=document.getElementById('btn-dl-gpkg');
   btn.disabled=true;btn.textContent='⏳ Generating...';
   try{
-    let url='/api/v1/export/geopackage?include_ortho=true&include_segments=true';
+    // Read selected layers from gpkg checkboxes
+    const sel={};
+    document.querySelectorAll('[data-gpkg]').forEach(cb=>{sel[cb.dataset.gpkg]=cb.checked;});
+    let url='/api/v1/export/geopackage?include_dtm='+(sel.dtm||false);
+    url+='&include_dsm='+(sel.dsm||false);
+    url+='&include_segments='+(sel.segments||false);
+    // Ortho years
+    const orthoYears=[];
+    if(sel['ortho-2024'])orthoYears.push('2024');
+    if(sel['ortho-2023'])orthoYears.push('2023');
+    if(sel['ortho-2020'])orthoYears.push('2020');
+    if(orthoYears.length)url+='&ortho_years='+orthoYears.join(',');
+    // Raster overlays (rendered RGBA)
+    const rasterLayers=[];
+    ['dtm-2024','dtm-2023','dtm-2022','dsm-2024','dsm-2023','dsm-2022','cir-2024','cir-2023','cir-2020','hansen','raster'].forEach(id=>{
+      if(sel[id])rasterLayers.push(id);
+    });
+    if(rasterLayers.length)url+='&raster_layers='+rasterLayers.join(',');
     if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
+    url+='&color_mode='+colorMode;
     const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
     if(!resp.ok)throw new Error((await resp.json()).error);
     const blob=await resp.blob();
@@ -641,7 +705,7 @@ function applyOpacity(id){
 }
 function orderLayers(){
   baseLayer.bringToBack();
-  ['ortho-2020','ortho-2023','ortho-2024','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
+  ['ortho-2020','ortho-2023','ortho-2024','cir-2020','cir-2023','cir-2024','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
     if(overlays[id])overlays[id].bringToFront();
   });
 }
@@ -756,6 +820,28 @@ function getShareState(){
   };
 }
 
+// Collect active overlay image blobs + bounds for share caching
+async function collectOverlayBlobs(){
+  const blobs={};
+  for(const[id,ovl] of Object.entries(overlays)){
+    if(!ovl||!ovl._url||!ovl._bounds) continue;
+    try{
+      // ovl._url is a blob: URL or data: URL
+      const resp=await fetch(ovl._url);
+      const blob=await resp.blob();
+      // Convert to base64 for JSON transport
+      const b64=await new Promise(resolve=>{
+        const reader=new FileReader();
+        reader.onloadend=()=>resolve(reader.result);
+        reader.readAsDataURL(blob);
+      });
+      const b=ovl._bounds;// LatLngBounds
+      blobs[id]={data:b64,bounds:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()]};
+    }catch(e){console.warn('overlay capture failed for',id,e);}
+  }
+  return blobs;
+}
+
 function restoreShareState(s){
   // Map view
   if(s.center&&s.zoom) map.setView(s.center,s.zoom);
@@ -801,7 +887,7 @@ function restoreShareState(s){
 }
 
 async function restoreShareResult(data){
-  // data has {state, result}
+  // data has {state, result, overlays?}
   restoreShareState(data.state);
   // Set hiddenTypes BEFORE showResultOnMap so buildLegend respects them
   if(data.state.hidden) data.state.hidden.forEach(t=>hiddenTypes.add(t));
@@ -814,10 +900,29 @@ async function restoreShareResult(data){
     applyVis();
   }
   // Restore layer checkboxes and load overlays
+  // First restore cached overlay images (instant), then fall back to re-fetch
+  const cachedOverlays=data.overlays||{};
   if(data.state.layers){
     for(const id of data.state.layers){
       const cb=document.querySelector(`[data-lyr="${id}"]`);
-      if(cb&&!cb.checked){cb.checked=true;handleLayerToggle(id);}
+      if(!cb||cb.checked) continue;
+      cb.checked=true;
+      if(id==='base'||id==='segments'){applyOpacity(id);continue;}
+      // Try cached overlay first
+      const cached=cachedOverlays[id];
+      if(cached&&cached.data&&cached.bounds){
+        try{
+          const[s,w,n,e]=cached.bounds;
+          const ovl=L.imageOverlay(cached.data,[[s,w],[n,e]],{opacity:.65,interactive:false});
+          overlays[id]=ovl;
+          ovl.addTo(map);
+          orderLayers();
+          applyOpacity(id);
+          continue;
+        }catch(err){console.warn('cached overlay restore failed for',id,err);}
+      }
+      // Fall back to re-fetch from server
+      handleLayerToggle(id);
     }
   }
 }
@@ -862,6 +967,9 @@ document.getElementById('btn-share').onclick=async()=>{
   btn.disabled=true;btn.textContent='\u23f3 Saving...';
   const payload={state:state};
   if(lastResult) payload.result=lastResult;
+  // Capture active overlay images for instant restore
+  const ovlBlobs=await collectOverlayBlobs();
+  if(Object.keys(ovlBlobs).length) payload.overlays=ovlBlobs;
   // If we have an existing share ID, offer to update it
   if(currentShareId) payload.reuse_id=currentShareId;
   try{

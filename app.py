@@ -1171,12 +1171,22 @@ def segment_overlay():
 
 @app.route('/api/v1/export/geopackage', methods=['POST'])
 def export_geopackage():
-    """Export all current map data as a GeoPackage (DTM, DSM, ortho, segments, raster)."""
+    """Export selected raster layers as a GeoPackage.
+
+    Query params:
+      include_dtm=true       Include DTM/DSM/nDSM bands
+      include_dsm=true       (same as above, kept for compat)
+      include_segments=true   Include segment_type + segment_height bands
+      ortho_years=2024,2023   Ortho RGB(I) for listed years
+      raster_layers=dtm-2024,dsm-2023,hansen,raster  RGBA overlay renders
+      types=tree,road,...     Segment type filter
+      color_mode=type|height  Segment raster color mode
+      include_ortho=true      Legacy: same as ortho_years=default
+    """
     try:
         import fiona
         from fiona.crs import from_epsg
     except ImportError:
-        # fiona not available, use rasterio-only approach
         pass
 
     try:
@@ -1184,12 +1194,24 @@ def export_geopackage():
         features = _get_geometry()
         params = _get_params()
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
-        include_segments = str(params.get('include_segments', 'true')).lower() in ('true', '1', 'yes')
+
+        # --- Parse layer selection params ---
+        _bool = lambda k, d='false': str(params.get(k, d)).lower() in ('true', '1', 'yes')
+        include_dtm = _bool('include_dtm', 'true') or _bool('include_dsm', 'true')
+        include_segments = _bool('include_segments', 'false')
+        include_ortho_legacy = _bool('include_ortho', 'false')
+
+        ortho_years_str = params.get('ortho_years', '')
+        ortho_years = [int(y.strip()) for y in ortho_years_str.split(',') if y.strip().isdigit()] if ortho_years_str else []
+        if include_ortho_legacy and not ortho_years:
+            ortho_years = [ti.dataset_to_year(dataset)]
+
+        raster_layers_str = params.get('raster_layers', '')
+        raster_layers = [x.strip() for x in raster_layers_str.split(',') if x.strip()] if raster_layers_str else []
+
         type_filter_str = params.get('types', None)
-        type_filter = None
-        if type_filter_str:
-            type_filter = set(t.strip() for t in type_filter_str.split(','))
+        type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
+        color_mode = params.get('color_mode', 'type')
 
         feat = features[0]
         geom = feat['geometry']
@@ -1210,31 +1232,35 @@ def export_geopackage():
         tmp_path = tmp.name
         tmp.close()
 
-        # Band count: DTM, DSM, nDSM + optional ortho RGB(I) + optional segment type
-        bands = ['DTM', 'DSM', 'nDSM']
-        arrays = [dtm.astype(np.float32), dsm.astype(np.float32), ndsm.astype(np.float32)]
+        bands = []
+        arrays = []
 
-        # Ortho
+        # --- Core DTM/DSM/nDSM ---
+        if include_dtm:
+            bands += ['DTM', 'DSM', 'nDSM']
+            arrays += [dtm.astype(np.float32), dsm.astype(np.float32), ndsm.astype(np.float32)]
+
+        # --- Orthophoto for each requested year ---
         rgb = None
-        if include_ortho:
+        for year in ortho_years:
             try:
                 import ortho_io
-                rgb_arr, nir = ortho_io.read_ortho_for_als(data)
+                rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
                 if rgb_arr is not None:
-                    for i, name in enumerate(['Red', 'Green', 'Blue']):
-                        bands.append(name)
+                    for i, ch in enumerate(['R', 'G', 'B']):
+                        bands.append(f'Ortho_{year}_{ch}')
                         arrays.append(rgb_arr[i].astype(np.float32))
                     if nir is not None:
-                        bands.append('NIR')
+                        bands.append(f'Ortho_{year}_NIR')
                         arrays.append(nir.astype(np.float32))
-                    rgb = rgb_arr
+                    if rgb is None:
+                        rgb = rgb_arr  # keep first for segment pipeline
             except Exception as e:
-                log.warning("Ortho for gpkg failed: %s", e)
+                log.warning("Ortho %d for gpkg failed: %s", year, e)
 
-        # Segments — use cache if available, otherwise run pipeline
+        # --- Segment type/height rasters ---
         if include_segments:
             try:
-                # Check if cached segmentation matches this geometry
                 cache_key_check = f"{geom_3035.bounds}_{dataset}"
                 if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
                     log.info("GeoPackage: using cached segmentation")
@@ -1246,10 +1272,9 @@ def export_geopackage():
                         import ortho_io
                         _, nir_arr = ortho_io.read_ortho_for_als(data)
                         spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
-                        if rgb is not None:
-                            spectral["red"] = rgb[0].astype(np.float32)
-                            spectral["green"] = rgb[1].astype(np.float32)
-                            spectral["blue"] = rgb[2].astype(np.float32)
+                        spectral["red"] = rgb[0].astype(np.float32)
+                        spectral["green"] = rgb[1].astype(np.float32)
+                        spectral["blue"] = rgb[2].astype(np.float32)
                         if nir_arr is not None:
                             spectral["nir"] = nir_arr.astype(np.float32)
                     result = seg.segment_and_classify(
@@ -1259,7 +1284,6 @@ def export_geopackage():
                     objects = result['objects']
                     labels = result['labels']
 
-                # Type filter
                 if type_filter:
                     filtered_ids = {o.obj_id for o in objects if o.obj_type in type_filter}
                 else:
@@ -1269,17 +1293,31 @@ def export_geopackage():
                 obj_map = {o.obj_id: o for o in objects}
                 for oid in filtered_ids:
                     if oid in obj_map:
-                        seg_mask = labels == oid
-                        type_raster[seg_mask] = float(obj_map[oid].type_code)
-                # Per-pixel nDSM height (not per-segment mean)
+                        type_raster[labels == oid] = float(obj_map[oid].type_code)
                 height_raster = np.where(ndsm > 0, ndsm, 0).astype(np.float32)
 
-                bands.append('segment_type')
-                arrays.append(type_raster)
-                bands.append('segment_height')
-                arrays.append(height_raster)
+                bands += ['segment_type', 'segment_height']
+                arrays += [type_raster, height_raster]
             except Exception as e:
                 log.warning("Segments for gpkg failed: %s", e)
+
+        # --- Rendered RGBA raster overlays ---
+        geom_wgs = _extract_single_geom(features)
+        for rlayer in raster_layers:
+            try:
+                rgba = _render_overlay_for_gpkg(
+                    rlayer, data, geom_3035, geom_wgs, dataset,
+                    type_filter, color_mode, params,
+                )
+                if rgba is not None:
+                    for i, ch in enumerate(['R', 'G', 'B', 'A']):
+                        bands.append(f'{rlayer}_{ch}')
+                        arrays.append(rgba[:, :, i].astype(np.float32))
+            except Exception as e:
+                log.warning("Raster overlay %s for gpkg failed: %s", rlayer, e)
+
+        if not bands:
+            return _error('No layers selected')
 
         n_bands = len(arrays)
         with rasterio.open(
@@ -1288,12 +1326,12 @@ def export_geopackage():
             transform=tf, nodata=np.nan,
         ) as dst:
             for i, (arr, name) in enumerate(zip(arrays, bands), 1):
-                # Ensure shape matches
                 out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
                 dst.write(out, i)
                 dst.set_band_description(i, name)
 
-        log.info("GeoPackage export: %d bands, %.1fs", n_bands, time.time() - t0)
+        log.info("GeoPackage export: %d bands (%s), %.1fs",
+                 n_bands, ','.join(bands), time.time() - t0)
         return send_file(
             tmp_path, mimetype='application/geopackage+sqlite3',
             as_attachment=True, download_name='landscape_export.gpkg',
@@ -1303,6 +1341,106 @@ def export_geopackage():
     except Exception as e:
         log.error("geopackage export: %s", traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
+
+
+def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
+                              type_filter, color_mode, params):
+    """Render a single overlay layer as RGBA array in EPSG:3035 space.
+
+    Returns (h, w, 4) uint8 array or None.
+    """
+    h, w = data['shape']
+    tf = data['transform']
+    mask = data['mask']
+
+    ds_map = {
+        'dtm-2024': '20240915', 'dtm-2023': '20230915', 'dtm-2022': '20220915',
+        'dsm-2024': '20240915', 'dsm-2023': '20230915', 'dsm-2022': '20220915',
+    }
+
+    if layer_id.startswith('dtm-'):
+        ds = ds_map.get(layer_id, dataset)
+        d = raster_io.read_dtm_dsm(geom_3035, ds) if ds != dataset else data
+        return _dtm_rgba(d['dtm'], d['mask'])
+
+    elif layer_id.startswith('dsm-'):
+        ds = ds_map.get(layer_id, dataset)
+        d = raster_io.read_dtm_dsm(geom_3035, ds) if ds != dataset else data
+        return _ndsm_rgba(d['ndsm'], d['dsm'], d['mask'])
+
+    elif layer_id.startswith('cir-'):
+        # CIR false-color: NIR→R, Red→G, Green→B
+        year_str = layer_id.split('-', 1)[1]
+        year = int(year_str) if year_str.isdigit() else None
+        import ortho_io
+        rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
+        if nir is None or rgb_arr is None:
+            return None
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[:, :, 0] = nir[:h, :w]
+        rgba[:, :, 1] = rgb_arr[0, :h, :w]
+        rgba[:, :, 2] = rgb_arr[1, :h, :w]
+        rgba[:, :, 3] = np.where(mask[:h, :w], 255, 0)
+        return rgba
+
+    elif layer_id == 'hansen':
+        bbox_wgs = geom_wgs.bounds if hasattr(geom_wgs, 'bounds') else _extract_single_geom([{'geometry': geom_wgs}]).bounds
+        prior = hansen.get_forest_prior(bbox_wgs, tf, (h, w))
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        forest = prior['current_forest']
+        rgba[forest] = [20, 120, 20, 140]
+        gain = prior['gain']
+        rgba[gain] = [0, 200, 200, 180]
+        ly = prior['loss_year']
+        loss = ly > 0
+        brightness = np.clip(80 + (ly.astype(np.float32) / 24.0) * 175, 80, 255).astype(np.uint8)
+        rgba[:, :, 0][loss] = brightness[loss]
+        rgba[:, :, 1][loss] = 0
+        rgba[:, :, 2][loss] = brightness[loss]
+        rgba[:, :, 3][loss] = 200
+        rgba[:, :, 3][~mask] = 0
+        return rgba
+
+    elif layer_id == 'raster':
+        # Segment classification raster — needs segmentation
+        import object_segmentation as oseg
+        cache_key_check = f"{geom_3035.bounds}_{dataset}"
+        if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
+            labels = _seg_cache["labels"]
+            objects = _seg_cache["objects"]
+            seg_mask = _seg_cache["mask"]
+            seg_ndsm = _seg_cache.get("ndsm")
+        else:
+            log.info("gpkg raster overlay: running segmentation")
+            spectral = None
+            try:
+                import ortho_io
+                rgb_arr, nir = ortho_io.read_ortho_for_als(data)
+                if rgb_arr is not None:
+                    spectral = ortho_io.compute_spectral_indices(rgb_arr, nir=nir)
+                    spectral["red"] = rgb_arr[0].astype(np.float32)
+                    spectral["green"] = rgb_arr[1].astype(np.float32)
+                    spectral["blue"] = rgb_arr[2].astype(np.float32)
+                    if nir is not None:
+                        spectral["nir"] = nir.astype(np.float32)
+            except Exception:
+                pass
+            result = seg.segment_and_classify(
+                data['dtm'], data['dsm'], mask, tf, spectral=spectral,
+                observation_year=ti.dataset_to_year(dataset),
+            )
+            labels = result['labels']
+            objects = result['objects']
+            seg_mask = mask
+            seg_ndsm = data.get('ndsm')
+
+        rgba = _segment_rgba(
+            labels, objects, seg_mask,
+            type_filter, color_mode=color_mode, ndsm=seg_ndsm,
+        )
+        return rgba
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1896,6 +2034,49 @@ def ortho_overlay():
         return _error(str(e))
 
 
+@app.route('/api/v1/cir/overlay', methods=['POST'])
+def cir_overlay():
+    """Return Color Infrared (CIR) false-color overlay.
+
+    CIR maps NIR→Red, Red→Green, Green→Blue, highlighting vegetation
+    health (bright red = vigorous vegetation, dark = bare/water).
+    """
+    try:
+        import ortho_io
+        geom_wgs84 = _get_geometry()
+        params = _get_params()
+        dataset = params.get('dataset', '20240915')
+        geom_3035, b3035, bwgs = _geometry_to_3035_bbox(geom_wgs84)
+
+        ortho_year = params.get('ortho_year')
+        if ortho_year:
+            ortho_year = int(ortho_year)
+        data = _get_cached_raster(geom_3035, dataset)
+
+        rgb, nir = ortho_io.read_ortho_for_als(data, year=ortho_year)
+        if nir is None:
+            return _error('NIR band not available for this area (no RGBI operate coverage)', 404)
+
+        # CIR: NIR→R, Red→G, Green→B
+        cir = np.stack([nir, rgb[0], rgb[1]], axis=0)  # (3,H,W) uint8
+
+        cir_wgs, mask_wgs, bounds_wgs = _reproject_rgb_to_wgs84(
+            cir, data['transform'], data['shape'],
+        )
+
+        h, w = cir_wgs.shape[1], cir_wgs.shape[2]
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[:, :, 0] = cir_wgs[0]
+        rgba[:, :, 1] = cir_wgs[1]
+        rgba[:, :, 2] = cir_wgs[2]
+        rgba[:, :, 3] = np.where(mask_wgs, 255, 0)
+
+        return _send_rgba_overlay(rgba, bounds_wgs)
+    except Exception as e:
+        log.error("cir overlay: %s", traceback.format_exc())
+        return _error(str(e))
+
+
 @app.route('/api/v1/hansen/overlay', methods=['POST'])
 def hansen_overlay():
     """Return Hansen forest loss as a coloured PNG overlay.
@@ -2427,6 +2608,7 @@ def share_save():
     
     Content-hash dedup: if payload matches an existing share, reuse its ID.
     Client can also send {reuse_id: "abc123"} to update an existing share in-place.
+    Overlays (base64 PNG images) are included in the stored payload for instant restore.
     """
     try:
         import hashlib
@@ -2437,34 +2619,53 @@ def share_save():
         host = request.headers.get('X-Forwarded-Host', request.host)
         proto = request.headers.get('X-Forwarded-Proto', 'https')
         
-        # Extract and remove reuse_id before hashing/storing
+        # Extract reuse_id (not stored)
         reuse_id = payload.pop('reuse_id', None)
         
+        # Hash based on state+result only (exclude overlays — they're derived data)
+        hash_payload = {k: v for k, v in payload.items() if k != 'overlays'}
+        hash_json = json.dumps(hash_payload, separators=(',', ':'), sort_keys=True)
+        content_hash = hashlib.sha256(hash_json.encode()).hexdigest()[:24]
+        
+        # Full payload including overlays for storage
         data_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
         data = gzip.compress(data_json.encode())
-        content_hash = hashlib.sha256(data_json.encode()).hexdigest()[:24]
         
-        # Check if client wants to reuse an existing share ID
-        
+        # Check if client wants to reuse an existing share ID (update in-place)
         if reuse_id and re.match(r'^[a-f0-9]{12}$', reuse_id):
             existing = SHARE_DIR / f'{reuse_id}.json.gz'
             if existing.exists():
                 existing.write_bytes(data)
                 existing.touch()
                 url = f'{proto}://{host}/?share={reuse_id}'
-                log.info("share: updated existing %s (%d KB)", reuse_id, len(data) // 1024)
+                ovl_count = len(payload.get('overlays', {}))
+                log.info("share: updated existing %s (%d KB, %d overlays)",
+                         reuse_id, len(data) // 1024, ovl_count)
                 return jsonify({'id': reuse_id, 'url': url, 'reused': True})
         
-        # Content-hash dedup: check all existing shares for identical content
+        # Content-hash dedup: check existing shares (state+result match)
+        # If overlays differ but state+result same, update overlays in existing share
         for existing_file in SHARE_DIR.glob('*.json.gz'):
             try:
-                existing_json = gzip.decompress(existing_file.read_bytes()).decode()
-                existing_hash = hashlib.sha256(existing_json.encode()).hexdigest()[:24]
+                existing_data = gzip.decompress(existing_file.read_bytes()).decode()
+                existing_obj = json.loads(existing_data)
+                existing_hash_payload = {k: v for k, v in existing_obj.items() if k != 'overlays'}
+                existing_hash = hashlib.sha256(
+                    json.dumps(existing_hash_payload, separators=(',', ':'), sort_keys=True).encode()
+                ).hexdigest()[:24]
                 if existing_hash == content_hash:
                     share_id = existing_file.stem.split('.')[0]
-                    existing_file.touch()  # Keep alive (LRU)
+                    # If new payload has overlays but old didn't (or has more), update
+                    new_ovl = payload.get('overlays', {})
+                    old_ovl = existing_obj.get('overlays', {})
+                    if len(new_ovl) > len(old_ovl):
+                        existing_file.write_bytes(data)
+                        log.info("share: dedup hit %s, updated overlays (%d→%d)",
+                                 share_id, len(old_ovl), len(new_ovl))
+                    else:
+                        log.info("share: dedup hit %s", share_id)
+                    existing_file.touch()
                     url = f'{proto}://{host}/?share={share_id}'
-                    log.info("share: dedup hit %s", share_id)
                     return jsonify({'id': share_id, 'url': url, 'reused': True})
             except Exception:
                 continue
@@ -2473,8 +2674,9 @@ def share_save():
         share_id = uuid.uuid4().hex[:12]
         (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
         _share_evict()
+        ovl_count = len(payload.get('overlays', {}))
         url = f'{proto}://{host}/?share={share_id}'
-        log.info("share: saved %s (%d KB)", share_id, len(data) // 1024)
+        log.info("share: saved %s (%d KB, %d overlays)", share_id, len(data) // 1024, ovl_count)
         return jsonify({'id': share_id, 'url': url, 'reused': False})
     except Exception as e:
         log.error("share save: %s", traceback.format_exc())

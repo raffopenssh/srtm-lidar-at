@@ -11,9 +11,10 @@
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;height:100dvh;background:#f5f5f5;overflow:hidden}
 
 /* ===== SIDEBAR ===== */
-#sidebar{width:380px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;z-index:2000;overflow:hidden}
+#sidebar{width:380px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;z-index:2000;overflow:hidden;transition:max-height .3s ease}
 #sidebar h1{font-size:15px;padding:10px 14px;background:#1a1a2e;color:#fff;flex-shrink:0;display:flex;align-items:center;gap:6px}
 #sidebar h1 span{color:#7fdbca}
+#sidebar h1 .menu-toggle{display:none;margin-left:auto;background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 4px;line-height:1}
 .controls{padding:10px 14px;flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
 label{display:block;font-size:12px;font-weight:600;color:#555;margin:6px 0 3px}
 select,input[type=number],input[type=text]{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px;background:#fff}
@@ -136,10 +137,23 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .gpkg-layers label input{margin:0}
 .gpkg-layers .gpkg-group{grid-column:1/-1;font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-top:6px;padding-bottom:2px;border-bottom:1px solid #eee}
 
+/* ===== GPS CONTROL ===== */
+.gps-btn{position:absolute;bottom:24px;left:60px;z-index:1000;width:36px;height:36px;background:#fff;border:2px solid rgba(0,0,0,.2);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 6px rgba(0,0,0,.3);transition:background .15s}
+.gps-btn:hover{background:#f4f4f4}
+.gps-btn.active{background:#e8f7f7;border-color:#0d7377;color:#0d7377}
+.gps-btn .gps-dot{fill:none;transition:fill .2s}
+.gps-btn.active .gps-dot{fill:currentColor}
+.gps-btn.searching{animation:gps-pulse 1.2s ease infinite}
+@keyframes gps-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.gps-hint{position:absolute;bottom:68px;left:60px;z-index:1000;background:#1a1a2e;color:#fff;padding:6px 12px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .5s;pointer-events:none}
+.gps-hint.show{opacity:1}
+
 /* ===== MOBILE ===== */
 @media(max-width:900px){
   body{flex-direction:column}
   #sidebar{width:100%;flex:0 0 auto;max-height:none;border-right:none;border-bottom:1px solid #ddd}
+  #sidebar h1 .menu-toggle{display:block}
+  #sidebar.collapsed .controls,#sidebar.collapsed .status{display:none}
   .controls{max-height:calc(38vh - 70px);padding:8px 12px}
   #sidebar h1{font-size:14px;padding:8px 12px}
   #map-area{flex:1;min-height:0}
@@ -165,7 +179,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 </head>
 <body>
 <div id="sidebar">
-  <h1>🌍 Austrian <span>Landscape</span> Analysis</h1>
+  <h1>🌍 Austrian <span>Landscape</span> Analysis<button class="menu-toggle" id="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('collapsed');this.textContent=this.textContent==='☰'?'✕':'☰';setTimeout(()=>{if(typeof map!=='undefined')map.invalidateSize()},350)" aria-label="Toggle menu">☰</button></h1>
   <div class="controls">
     <label>Endpoint</label>
     <select id="endpoint">
@@ -181,13 +195,18 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         <div id="ot-dropdown" class="ot-dropdown"></div>
       </div>
     </div>
-    <div class="cb-row">
-      <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
-      <label><input id="include_temporal" type="checkbox" checked> Temporal</label>
-      <label><input id="include_copernicus" type="checkbox" checked> Copernicus</label>
+    <div class="row">
+      <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
+      <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
+      <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
     </div>
     <div class="cb-row">
-      <label><input id="include_cadastre" type="checkbox" checked> Cadastre</label>
+      <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
+      <label><input id="include_temporal" type="checkbox"> Temporal</label>
+      <label><input id="include_copernicus" type="checkbox"> Copernicus</label>
+    </div>
+    <div class="cb-row">
+      <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
       <label><input id="include_hansen" type="checkbox"> Hansen</label>
     </div>
     <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / Shapefile / GPX / WKT)</span></label>
@@ -211,6 +230,8 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 
 <div id="map-area">
   <div id="map"></div>
+  <button class="gps-btn" id="gps-btn" title="Use my location" onclick="toggleGPS()"><svg id="gps-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" class="gps-dot"/><line x1="12" y1="0" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="24"/><line x1="0" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="24" y2="12"/></svg></button>
+  <div class="gps-hint" id="gps-hint">Tap to use your GPS location</div>
 
   <div class="layer-panel" id="layer-panel">
     <h3>Layers</h3>
@@ -265,10 +286,11 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   <!-- Download FAB + Share -->
   <div class="fab-download" id="fab-download">
     <button class="btn" id="btn-share" title="Copy share link">🔗 Share</button>
-    <button class="btn" onclick="openResultModal()">📥 Results</button>
+    <button class="btn" onclick="openResultModal()">📥 Download</button>
   </div>
   <div class="share-toast" id="share-toast">Link copied!</div>
   <div class="share-name-popup" id="share-name-popup">
+    <div id="share-preview-url" style="font-size:10px;color:#8af;padding:2px 10px 4px;word-break:break-all;max-width:320px;opacity:.8;font-family:monospace"></div>
     <div class="share-name-row">
       <input type="text" id="share-name-input" placeholder="Name (optional)" maxlength="80">
       <button class="btn btn-sm" id="share-name-ok">🔗 Copy</button>
@@ -287,6 +309,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div class="modal-tab active" data-tab="summary" onclick="switchTab('summary')">Summary</div>
       <div class="modal-tab" data-tab="json" onclick="switchTab('json')">JSON</div>
       <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoPackage</div>
+      <div class="modal-tab" data-tab="mbtiles" onclick="switchTab('mbtiles')">MBTiles</div>
     </div>
     <div class="modal-body">
       <div class="tab-pane active" id="tab-summary">
@@ -298,6 +321,14 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
           <button class="btn btn-sm btn-outline" id="btn-dl-json">💾 Download .geojson</button>
         </div>
         <pre id="modal-json">No results yet.</pre>
+      </div>
+      <div class="tab-pane" id="tab-mbtiles">
+        <div class="gpkg-info">
+          <p style="font-size:24px;margin-bottom:4px">📱 MBTiles Export</p>
+          <p>Download individual raster layers as MBTiles for offline mobile use (e.g. in QField, Avenza Maps, OSMAND).</p>
+          <div id="mbtiles-list" style="margin:12px 0"></div>
+          <p class="hint" style="display:block;color:#888;font-size:11px">Each layer is downloaded as a separate .mbtiles file. Async download — runs in background.</p>
+        </div>
       </div>
       <div class="tab-pane" id="tab-gpkg">
         <div class="gpkg-info">
@@ -867,6 +898,8 @@ async function loadRasterOverlay(typeFilter){
   if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
   if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
+  const topNC=document.getElementById('top_n_classes').value;
+  if(topNC)url+='&top_n_classes='+topNC;
   if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
   const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
   if(!resp.ok)throw new Error((await resp.json()).error);
@@ -918,6 +951,9 @@ function getShareState(){
     copernicus:document.getElementById('include_copernicus').checked,
     cadastre:document.getElementById('include_cadastre').checked,
     hansen:document.getElementById('include_hansen').checked,
+    top_n_classes:document.getElementById('top_n_classes').value,
+    top_n_objects:document.getElementById('top_n_objects').value,
+    min_height_m:document.getElementById('min_height_m').value,
     colorMode:colorMode,
     hidden:[...hiddenTypes],
     layers:layers,
@@ -960,6 +996,9 @@ function restoreShareState(s){
   if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
   if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
+  if(s.top_n_classes) document.getElementById('top_n_classes').value=s.top_n_classes;
+  if(s.top_n_objects) document.getElementById('top_n_objects').value=s.top_n_objects;
+  if(s.min_height_m) document.getElementById('min_height_m').value=s.min_height_m;
   // Geometry
   if(s.geometry){
     document.getElementById('geometry').value=s.geometry;
@@ -1076,6 +1115,9 @@ async function doShareSave(name){
     shareStateHash=computeShareHash(state,lastResult);
     const url=location.origin+location.pathname+'?share='+d.id;
     history.replaceState(null,'',`?share=${d.id}`);
+    // Update preview URL in popup if still visible
+    const preview=document.getElementById('share-preview-url');
+    if(preview)preview.textContent=url;
     const copied=await copyToClipboard(url);
     const label=name?` "${name}"`:(d.reused?' (existing share)':'');
     toast.textContent=copied?`\u2705 Link copied!${label}`:'\u2705 '+url;
@@ -1292,7 +1334,6 @@ document.getElementById('btn-run').onclick=async()=>{
 
   btn.disabled=true;
   showLoading('Starting...');
-  document.getElementById('fab-download').style.display='none';
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
   document.getElementById('legend-types').innerHTML='';
@@ -1306,6 +1347,12 @@ document.getElementById('btn-run').onclick=async()=>{
   if(isSeg)params.set('min_object_size',parseInt(document.getElementById('min_area').value)||30);
   const ot=getSelectedTypes();
   if(ot)params.set(isSeg?'types':'object_types',ot);
+  const topNC=document.getElementById('top_n_classes').value;
+  if(topNC)params.set('top_n_classes',topNC);
+  const topNO=document.getElementById('top_n_objects').value;
+  if(topNO)params.set('top_n_objects',topNO);
+  const minH=document.getElementById('min_height_m').value;
+  if(minH)params.set('min_height_m',minH);
   if(document.getElementById('include_ortho').checked)params.set('include_ortho','true');
   if(document.getElementById('include_temporal').checked)params.set('include_temporal','true');
   if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
@@ -1465,6 +1512,194 @@ function buildSummary(data){
   }
   content.innerHTML=html;
 }
+
+// ============ GPS LOCATION ============
+let gpsActive=false, gpsWatchId=null, gpsMarker=null, gpsCircle=null, gpsFlewTo=false, gpsHeadingMarker=null;
+function toggleGPS(){
+  const btn=document.getElementById('gps-btn');
+  if(gpsActive){stopGPS();return;}
+  if(!navigator.geolocation){alert('Geolocation not available');return;}
+  gpsActive=true;gpsFlewTo=false;
+  btn.classList.add('active','searching');
+  const hint=document.getElementById('gps-hint');
+  hint.classList.add('show');
+  setTimeout(()=>hint.classList.remove('show'),4000);
+  gpsWatchId=navigator.geolocation.watchPosition(onGPSPos,onGPSErr,{enableHighAccuracy:true,maximumAge:5000,timeout:15000});
+  // Listen for device orientation
+  if(window.DeviceOrientationEvent){
+    window.addEventListener('deviceorientation',onDeviceOrientation,true);
+    // iOS 13+ permission
+    if(typeof DeviceOrientationEvent.requestPermission==='function'){
+      DeviceOrientationEvent.requestPermission().catch(()=>{});
+    }
+  }
+}
+function stopGPS(){
+  gpsActive=false;
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('active','searching');
+  if(gpsWatchId!==null){navigator.geolocation.clearWatch(gpsWatchId);gpsWatchId=null;}
+  if(gpsMarker){map.removeLayer(gpsMarker);gpsMarker=null;}
+  if(gpsCircle){map.removeLayer(gpsCircle);gpsCircle=null;}
+  if(gpsHeadingMarker){map.removeLayer(gpsHeadingMarker);gpsHeadingMarker=null;}
+  window.removeEventListener('deviceorientation',onDeviceOrientation,true);
+}
+let _lastHeading=null;
+function onDeviceOrientation(e){
+  if(e.alpha!==null)_lastHeading=e.alpha;
+  if(!gpsMarker||!_lastHeading)return;
+  // Update heading indicator
+  const ll=gpsMarker.getLatLng();
+  if(!gpsHeadingMarker){
+    gpsHeadingMarker=L.marker(ll,{icon:L.divIcon({html:'<div style="width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:18px solid #0d7377;transform-origin:center bottom;opacity:.7" id="gps-heading-arrow"></div>',iconSize:[12,18],iconAnchor:[6,18],className:''})}).addTo(map);
+  }
+  gpsHeadingMarker.setLatLng(ll);
+  const arrow=document.getElementById('gps-heading-arrow');
+  if(arrow)arrow.style.transform=`rotate(${360-_lastHeading}deg)`;
+}
+function onGPSPos(pos){
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('searching');
+  const lat=pos.coords.latitude,lng=pos.coords.longitude;
+  const acc=pos.coords.accuracy||50;
+  if(!gpsMarker){
+    gpsMarker=L.circleMarker([lat,lng],{radius:7,fillColor:'#0d7377',fillOpacity:1,color:'#fff',weight:2}).addTo(map);
+    gpsCircle=L.circle([lat,lng],{radius:acc,color:'#0d7377',fillColor:'#0d7377',fillOpacity:.1,weight:1,dashArray:'4'}).addTo(map);
+  }else{
+    gpsMarker.setLatLng([lat,lng]);
+    gpsCircle.setLatLng([lat,lng]).setRadius(acc);
+  }
+  if(!gpsFlewTo){
+    gpsFlewTo=true;
+    map.flyTo([lat,lng],map.getZoom(),{duration:1.5});
+    // Set geometry to 1km radius circle around location
+    const circle=turf_circle([lng,lat],1,{units:'kilometers',steps:64});
+    if(circle){
+      document.getElementById('geometry').value=JSON.stringify(circle.geometry,null,2);
+      drawnItems.clearLayers();
+      const coords=circle.geometry.coordinates[0].map(c=>[c[1],c[0]]);
+      L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+      showFABIfGeometry();
+    }
+  }
+}
+function onGPSErr(e){
+  console.warn('GPS error:',e);
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('searching');
+  if(e.code===1)stopGPS(); // Permission denied
+}
+// Simple turf circle helper
+function turf_circle(center,radiusKm,opts){
+  const steps=opts.steps||64;
+  const coords=[];
+  for(let i=0;i<=steps;i++){
+    const angle=(i/steps)*Math.PI*2;
+    const dx=radiusKm*Math.cos(angle);
+    const dy=radiusKm*Math.sin(angle);
+    const lat=center[1]+dy/111.32;
+    const lng=center[0]+dx/(111.32*Math.cos(center[1]*Math.PI/180));
+    coords.push([lng,lat]);
+  }
+  return{type:'Feature',geometry:{type:'Polygon',coordinates:[coords]},properties:{}};
+}
+
+// ============ FAB VISIBILITY: show when geometry present ============
+function showFABIfGeometry(){
+  const geo=document.getElementById('geometry').value.trim();
+  document.getElementById('fab-download').style.display=geo?'flex':'none';
+}
+// Monitor geometry field changes
+const geoTA=document.getElementById('geometry');
+geoTA.addEventListener('input',showFABIfGeometry);
+// Watch for programmatic changes via property setter override
+const _origGeoDesc=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
+Object.defineProperty(geoTA,'value',{get(){return _origGeoDesc.get.call(this)},set(v){_origGeoDesc.set.call(this,v);setTimeout(showFABIfGeometry,0);}});
+// Also show on draw
+map.on(L.Draw.Event.CREATED,()=>setTimeout(showFABIfGeometry,100));
+showFABIfGeometry();
+
+// ============ MBTILES DOWNLOAD ============
+const MBTILES_LAYERS=[
+  {id:'dtm-2024',name:'DTM 2024',group:'LiDAR'},
+  {id:'dtm-2023',name:'DTM 2023',group:'LiDAR'},
+  {id:'dtm-2022',name:'DTM 2022',group:'LiDAR'},
+  {id:'dsm-2024',name:'nDSM 2024',group:'LiDAR'},
+  {id:'dsm-2023',name:'nDSM 2023',group:'LiDAR'},
+  {id:'dsm-2022',name:'nDSM 2022',group:'LiDAR'},
+  {id:'ortho-2024',name:'Ortho ~2024',group:'Ortho'},
+  {id:'ortho-2023',name:'Ortho ~2023',group:'Ortho'},
+  {id:'ortho-2020',name:'Ortho ~2020',group:'Ortho'},
+  {id:'cir-2024',name:'CIR ~2024',group:'Ortho'},
+  {id:'cir-2023',name:'CIR ~2023',group:'Ortho'},
+  {id:'cir-2020',name:'CIR ~2020',group:'Ortho'},
+  {id:'hansen',name:'Hansen Forest Δ',group:'Analysis'},
+  {id:'raster',name:'Segment Raster',group:'Analysis'},
+];
+function buildMBTilesList(){
+  const el=document.getElementById('mbtiles-list');
+  let html='';let lastGroup='';
+  for(const ly of MBTILES_LAYERS){
+    if(ly.group!==lastGroup){html+=`<div style="font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;padding-bottom:2px;border-bottom:1px solid #eee">${ly.group}</div>`;lastGroup=ly.group;}
+    html+=`<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px" id="mbt-row-${ly.id}"><span style="flex:1">${ly.name}</span><button class="btn btn-sm btn-outline" onclick="downloadMBTiles('${ly.id}','${ly.name}',this)">Download</button></div>`;
+  }
+  el.innerHTML=html;
+}
+async function downloadMBTiles(layerId,layerName,btn){
+  const args=getPostArgs();
+  if(!args){alert('Provide geometry first');return;}
+  const origText=btn.textContent;
+  btn.disabled=true;btn.textContent='⏳ Starting...';
+  try{
+    const url=`/api/v1/export/mbtiles?layer=${layerId}&async=true`;
+    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+    if(!resp.ok)throw new Error((await resp.json()).error);
+    const submit=await resp.json();
+    const taskId=submit.task_id;
+    if(!taskId)throw new Error('No task_id');
+    btn.textContent='⏳ Generating...';
+    const t0=Date.now();
+    while(Date.now()-t0<600000){
+      await new Promise(r=>setTimeout(r,2000));
+      try{
+        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+        const pj=await pr.json();
+        if(pj.error)throw new Error(pj.error);
+        if(pj.done){
+          window.location.href=`/api/v1/export/mbtiles/download/${taskId}?layer=${layerId}`;
+          btn.textContent='✅ Done';setTimeout(()=>{btn.textContent=origText;btn.disabled=false;},3000);
+          return;
+        }
+        if(pj.active)btn.textContent=`⏳ ${pj.detail||pj.step||'Working...'}`;
+      }catch(e){if(!e.message?.startsWith('Failed to fetch'))throw e;}
+    }
+    throw new Error('Timed out');
+  }catch(e){alert('MBTiles error: '+e.message);}finally{btn.disabled=false;btn.textContent=origText;}
+}
+
+// ============ SHARE URL PREVIEW ============
+(function(){
+  // When share popup opens, show preview URL
+  const obs=new MutationObserver(()=>{
+    const popup=document.getElementById('share-name-popup');
+    if(popup.classList.contains('show')){
+      const preview=document.getElementById('share-preview-url');
+      if(currentShareId){
+        preview.textContent=location.origin+location.pathname+'?share='+currentShareId;
+      }else{
+        preview.textContent=location.origin+location.pathname+'?share=…';
+      }
+    }
+  });
+  obs.observe(document.getElementById('share-name-popup'),{attributes:true,attributeFilter:['class']});
+})();
+
+// Init MBTiles list on modal open
+const _origOpenModal=openResultModal;
+openResultModal=function(){
+  buildMBTilesList();
+  _origOpenModal();
+};
 </script>
 </body>
 </html>

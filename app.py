@@ -1228,7 +1228,7 @@ def export_geopackage():
         h, w = data['shape']
         mask = data['mask']
 
-        tmp = tempfile.NamedTemporaryFile(suffix='.gpkg', delete=False)
+        tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
         tmp_path = tmp.name
         tmp.close()
 
@@ -1321,9 +1321,10 @@ def export_geopackage():
 
         n_bands = len(arrays)
         with rasterio.open(
-            tmp_path, 'w', driver='GPKG', width=w, height=h,
+            tmp_path, 'w', driver='GTiff', width=w, height=h,
             count=n_bands, dtype='float32', crs='EPSG:3035',
             transform=tf, nodata=np.nan,
+            compress='deflate', predictor=2, tiled=True,
         ) as dst:
             for i, (arr, name) in enumerate(zip(arrays, bands), 1):
                 out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
@@ -1333,8 +1334,8 @@ def export_geopackage():
         log.info("GeoPackage export: %d bands (%s), %.1fs",
                  n_bands, ','.join(bands), time.time() - t0)
         return send_file(
-            tmp_path, mimetype='application/geopackage+sqlite3',
-            as_attachment=True, download_name='landscape_export.gpkg',
+            tmp_path, mimetype='image/tiff',
+            as_attachment=True, download_name='landscape_export.tif',
         )
     except ValueError as e:
         return _error(str(e))

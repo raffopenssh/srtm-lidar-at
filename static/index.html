@@ -121,7 +121,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .summary-table th{text-align:left;font-weight:600;color:#555;padding:4px 8px;border-bottom:1px solid #ddd}
 .summary-table td{padding:4px 8px;border-bottom:1px solid #f0f0f0}
 .summary-table .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
-/* GeoPackage tab */
+/* GeoTIFF export tab */
 .gpkg-info{padding:12px 0}
 .gpkg-info p{color:#666;font-size:13px;margin:8px 0}
 .gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:8px}
@@ -274,7 +274,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
     <div class="modal-tabs">
       <div class="modal-tab active" data-tab="summary" onclick="switchTab('summary')">Summary</div>
       <div class="modal-tab" data-tab="json" onclick="switchTab('json')">JSON</div>
-      <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoPackage</div>
+      <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoTIFF</div>
     </div>
     <div class="modal-body">
       <div class="tab-pane active" id="tab-summary">
@@ -289,7 +289,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="tab-pane" id="tab-gpkg">
         <div class="gpkg-info">
-          <p style="font-size:24px;margin-bottom:4px">📦 GeoPackage Export</p>
+          <p style="font-size:24px;margin-bottom:4px">📦 GeoTIFF Export</p>
           <p>Select raster layers to include. Active layers are pre-selected.</p>
           <div class="gpkg-layers" id="gpkg-layers">
             <div class="gpkg-group">Core</div>
@@ -314,7 +314,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
             <label><input type="checkbox" data-gpkg="raster"> Segment raster (RGBA)</label>
             <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
           </div>
-          <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoPackage</button>
+          <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoTIFF</button>
         </div>
       </div>
     </div>
@@ -456,15 +456,16 @@ function switchTab(tab){
   if(tab==='gpkg') syncGpkgCheckboxes();
 }
 function syncGpkgCheckboxes(){
-  // Map from gpkg checkbox ids to map layer checkbox ids
-  const mapLayerToGpkg={'dtm-2024':1,'dtm-2023':1,'dtm-2022':1,'dsm-2024':1,'dsm-2023':1,'dsm-2022':1,
-    'ortho-2024':1,'ortho-2023':1,'ortho-2020':1,'cir-2024':1,'cir-2023':1,'cir-2020':1,'hansen':1,'raster':1,'segments':1};
+  // Mirror map layer panel state into GeoTIFF export checkboxes.
+  // Core (dtm/dsm) default to checked; everything else mirrors its map toggle.
   document.querySelectorAll('[data-gpkg]').forEach(cb=>{
     const id=cb.dataset.gpkg;
-    if(id==='dtm'||id==='dsm') return; // core layers always checked
-    // Check if the corresponding map layer is active
+    if(id==='dtm'||id==='dsm'){
+      cb.checked=true; // core always on by default
+      return;
+    }
     const mapCb=document.querySelector(`[data-lyr="${id}"]`);
-    if(mapCb) cb.checked=mapCb.checked;
+    cb.checked=mapCb?mapCb.checked:false;
   });
 }
 // Close on backdrop click
@@ -592,9 +593,9 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
     if(!resp.ok)throw new Error((await resp.json()).error);
     const blob=await resp.blob();
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.gpkg';a.click();
-    setStatus('GeoPackage downloaded!');
-  }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoPackage';}
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.tif';a.click();
+    setStatus('GeoTIFF downloaded!');
+  }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoTIFF';}
 };
 
 // ============ SPINNER ============
@@ -733,7 +734,7 @@ async function handleLayerToggle(id){
   showLoading(`Loading ${id}...`);
   try{
     let ovl;
-    if(id==='raster'){const vis=Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t));ovl=await loadRasterOverlay(hiddenTypes.size>0?vis:null);}
+    if(id==='raster'){ovl=await loadRasterOverlay(getVisibleTypes());}
     else{
       const def=LAYER_DEFS[id];
       let url=def.url+'?dataset='+def.ds;
@@ -750,6 +751,15 @@ async function handleLayerToggle(id){
     else cb.checked=false;
     hideLoading();
   }catch(e){hideLoading(`${id} failed: ${e.message}`);cb.checked=false;}
+}
+
+function getVisibleTypes(){
+  // Combine selectedTypes (dropdown) and hiddenTypes (legend) filters
+  // A type is visible only if it's in selectedTypes AND not in hiddenTypes
+  const vis=Object.keys(TYPE_SHAPES).filter(t=>selectedTypes.has(t)&&!hiddenTypes.has(t));
+  // If all types visible, return null (no filter needed)
+  if(vis.length===Object.keys(TYPE_SHAPES).length) return null;
+  return vis;
 }
 
 async function loadRasterOverlay(typeFilter){
@@ -770,8 +780,7 @@ async function loadRasterOverlay(typeFilter){
 }
 
 async function reloadRasterOverlay(){
-  const vis=Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t));
-  const filter=hiddenTypes.size>0?vis:null;
+  const filter=getVisibleTypes();
   if(overlays.raster){map.removeLayer(overlays.raster);delete overlays.raster;}
   showLoading('Re-rendering raster...');
   try{

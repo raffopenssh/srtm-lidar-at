@@ -92,15 +92,22 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .fab-download{position:absolute;bottom:24px;left:14px;z-index:1000;display:none;gap:8px;align-items:center}
 .fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
 
-/* ===== SHARE BUTTON ===== */
+/* ===== SHARE LINK POPUP ===== */
 .share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100vw - 40px);overflow:hidden;text-overflow:ellipsis;user-select:all}
 .share-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
-.share-name-popup{display:none;position:absolute;bottom:60px;left:14px;z-index:1002;background:#1a1a2e;padding:6px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:calc(100vw - 40px)}
-.share-name-popup.show{display:block}
-.share-name-row{display:flex;gap:4px;align-items:center}
-.share-name-popup input{width:180px;padding:6px 10px;border-radius:8px 0 0 8px;border:1px solid #444;border-right:0;background:#0d0d1a;color:#fff;font-size:13px}
-.share-name-popup input:focus{outline:none;border-color:#16a085}
-.share-name-popup .btn-sm{padding:6px 12px;font-size:12px;border-radius:0 8px 8px 0;white-space:nowrap}
+.share-link-popup{display:none;position:absolute;bottom:60px;left:14px;z-index:1002;background:#1a1a2e;padding:10px 12px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:calc(100vw - 28px);min-width:240px}
+.share-link-popup.show{display:flex;flex-direction:column;gap:8px}
+.share-link-url{font-family:monospace;font-size:11px;color:#8af;word-break:break-all;line-height:1.6;user-select:all}
+.share-link-url .share-hash{color:#5fffb0;cursor:text;border-bottom:1px dashed rgba(95,255,176,.4);outline:none;padding:1px 2px;border-radius:2px;min-width:20px;display:inline-block}
+.share-link-url .share-hash:hover{background:rgba(95,255,176,.1)}
+.share-link-url .share-hash:focus{background:rgba(95,255,176,.15);border-bottom-style:solid;border-bottom-color:#5fffb0}
+.share-link-url .share-hash::selection{background:rgba(95,255,176,.3)}
+.share-link-bottom{display:flex;gap:8px;align-items:center}
+.share-link-bottom .btn-sm{padding:6px 12px;font-size:12px;border-radius:8px;display:flex;align-items:center;gap:4px}
+.share-copied{font-size:11px;color:#5fffb0;opacity:0;transition:opacity .2s}
+.share-copied.show{opacity:1}
+.share-saving{font-size:10px;color:#ff9;opacity:0;transition:opacity .3s}
+.share-saving.show{opacity:1}
 
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
@@ -290,11 +297,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
     <button class="btn" onclick="openResultModal()">📥 Download</button>
   </div>
   <div class="share-toast" id="share-toast">Link copied!</div>
-  <div class="share-name-popup" id="share-name-popup">
-    <div id="share-preview-url" style="font-size:10px;color:#8af;padding:2px 10px 4px;word-break:break-all;max-width:320px;opacity:.8;font-family:monospace"></div>
-    <div class="share-name-row">
-      <input type="text" id="share-name-input" placeholder="Name (optional)" maxlength="80">
-      <button class="btn btn-sm" id="share-name-ok">🔗 Copy</button>
+  <div class="share-link-popup" id="share-link-popup">
+    <div class="share-link-url" id="share-link-url"></div>
+    <div class="share-link-bottom">
+      <button class="btn btn-sm" id="share-copy-btn">🔗 Copy link</button>
+      <span class="share-copied" id="share-copied">✓ Copied</span>
+      <span class="share-saving" id="share-saving">Saving…</span>
     </div>
   </div>
 </div>
@@ -1082,105 +1090,204 @@ async function restoreShareResult(data){
 }
 
 async function copyToClipboard(text){
-  // Try multiple approaches for clipboard copy
-  // 1. Clipboard API (works in secure contexts)
-  try{await navigator.clipboard.writeText(text);return true;}catch(e){}
-  // 2. execCommand fallback
+  // 1. Clipboard API with timeout (hangs in some contexts)
+  try{
+    await Promise.race([
+      navigator.clipboard.writeText(text),
+      new Promise((_,rej)=>setTimeout(()=>rej('timeout'),1000))
+    ]);
+    return true;
+  }catch(e){}
+  // 2. execCommand fallback (synchronous)
   try{
     const ta=document.createElement('textarea');
     ta.value=text;
-    ta.style.cssText='position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent';
+    ta.style.cssText='position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0';
     document.body.appendChild(ta);
     ta.focus();ta.select();
     const ok=document.execCommand('copy');
     document.body.removeChild(ta);
     if(ok) return true;
   }catch(e){}
-  // 3. window.prompt fallback — let user copy manually
-  try{window.prompt('Copy this share link:',text);return true;}catch(e){}
   return false;
 }
 
-let currentShareName=null;  // Name of current share
+let currentShareName=null;
+let _shareUrl=null;         // Always the real copyable URL (null until save done)
 
-async function doShareSave(name){
-  const btn=document.getElementById('btn-share');
-  const toast=document.getElementById('share-toast');
-  const state=getShareState();
-  btn.disabled=true;btn.textContent='\u23f3 Saving...';
-  const payload={state:state};
-  if(name) payload.name=name;
-  if(lastResult) payload.result=lastResult;
-  const ovlBlobs=await collectOverlayBlobs();
-  if(Object.keys(ovlBlobs).length) payload.overlays=ovlBlobs;
-  if(currentShareId) payload.reuse_id=currentShareId;
-  try{
-    const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const d=await resp.json();
-    if(d.error) throw new Error(d.error);
-    currentShareId=d.id;
-    currentShareName=name||null;
-    shareStateHash=computeShareHash(state,lastResult);
-    const url=location.origin+location.pathname+'?share='+d.id;
-    history.replaceState(null,'',`?share=${d.id}`);
-    // Update preview URL in popup if still visible
-    const preview=document.getElementById('share-preview-url');
-    if(preview)preview.textContent=url;
-    const copied=await copyToClipboard(url);
-    const label=name?` "${name}"`:(d.reused?' (existing share)':'');
-    toast.textContent=copied?`\u2705 Link copied!${label}`:'\u2705 '+url;
-    toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
-  }catch(e){
-    toast.textContent='\u274c '+e.message;
-    toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),4000);
-  }finally{btn.disabled=false;btn.textContent='\ud83d\udd17 Share';}
+function _buildShareUrl(id){return location.origin+location.pathname+'?share='+encodeURIComponent(id);}
+function _esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function _showSharePopup(id, saving){
+  const popup=document.getElementById('share-link-popup');
+  const urlEl=document.getElementById('share-link-url');
+  const savingEl=document.getElementById('share-saving');
+  const copiedEl=document.getElementById('share-copied');
+  const base=location.origin+location.pathname+'?share=';
+  if(saving){
+    // Non-editable saving state
+    urlEl.innerHTML='<span style="color:#ff9">Saving link…</span>';
+  }else{
+    // Show base (dim) + editable hash (green, contenteditable)
+    urlEl.innerHTML=_esc(base)+
+      '<span class="share-hash" id="share-hash" contenteditable="true" spellcheck="false" inputmode="url">'+
+      _esc(id)+'</span>';
+    _wireHashEditing();
+  }
+  copiedEl.classList.remove('show');
+  savingEl.classList.toggle('show',!!saving);
+  popup.classList.add('show');
 }
 
-document.getElementById('btn-share').onclick=async()=>{
-  const btn=document.getElementById('btn-share');
-  if(btn.disabled)return;
-  const toast=document.getElementById('share-toast');
-  const state=getShareState();
-  const stateH=computeShareHash(state,lastResult);
-  
-  // If we already have a share for this exact state, just copy the URL
-  if(currentShareId && shareStateHash===stateH){
-    const url=location.origin+location.pathname+'?share='+currentShareId;
-    const copied=await copyToClipboard(url);
-    const label=currentShareName?` "${currentShareName}"`:'';
-    toast.textContent=copied?`\u2705 Link copied!${label}`:'\u2705 '+url;
-    toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
+function _wireHashEditing(){
+  const el=document.getElementById('share-hash');
+  if(!el) return;
+  // Select all on focus
+  el.addEventListener('focus',()=>{
+    const r=document.createRange();r.selectNodeContents(el);
+    const s=window.getSelection();s.removeAllRanges();s.addRange(r);
+  });
+  // Prevent newlines, handle Enter/Escape
+  el.addEventListener('keydown',(e)=>{
+    if(e.key==='Enter'){e.preventDefault();el.blur();}
+    if(e.key==='Escape'){e.preventDefault();el.textContent=currentShareId||'';el.blur();}
+  });
+  // Paste as plain text
+  el.addEventListener('paste',(e)=>{
+    e.preventDefault();
+    const text=(e.clipboardData||window.clipboardData).getData('text/plain').replace(/\s+/g,'-');
+    document.execCommand('insertText',false,text);
+  });
+  // On blur = commit rename
+  el.addEventListener('blur',()=>_commitRename());
+}
+
+async function _commitRename(){
+  const el=document.getElementById('share-hash');
+  if(!el||!currentShareId) return;
+  let newId=el.textContent.trim().replace(/[^A-Za-z0-9_-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,80);
+  if(!newId||newId===currentShareId){
+    el.textContent=currentShareId;
     return;
   }
-  
-  // Show name popup for new shares
-  const popup=document.getElementById('share-name-popup');
-  const inp=document.getElementById('share-name-input');
-  inp.value=currentShareName||'';
-  popup.classList.add('show');
-  inp.focus();
+  const savingEl=document.getElementById('share-saving');
+  savingEl.classList.add('show');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(currentShareId)+'/rename',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({new_id:newId})
+    });
+    const d=await resp.json();
+    if(d.error){
+      el.textContent=currentShareId;
+      const toast=document.getElementById('share-toast');
+      toast.textContent=d.error==='Name already taken'?'Name taken \u2014 try another':'Rename failed: '+d.error;
+      toast.classList.add('show');
+      setTimeout(()=>toast.classList.remove('show'),3000);
+      savingEl.classList.remove('show');
+      return;
+    }
+    // Update everything to new ID
+    currentShareId=d.id;
+    _shareUrl=_buildShareUrl(d.id);
+    history.replaceState(null,'',`?share=${encodeURIComponent(d.id)}`);
+    el.textContent=d.id;
+    // Auto-copy the fresh renamed URL
+    copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+  }catch(e){
+    el.textContent=currentShareId;
+    console.warn('rename failed:',e);
+  }finally{savingEl.classList.remove('show');}
+}
+
+function _hideSharePopup(){document.getElementById('share-link-popup').classList.remove('show');}
+function _flashCopied(){
+  const el=document.getElementById('share-copied');
+  el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2000);
+}
+
+// Fast save: state+result only (no overlay blobs).
+// Kicks off background re-save with overlays after.
+async function _doShareSave(){
+  const state=getShareState();
+  const payload={state:state};
+  if(lastResult) payload.result=lastResult;
+  if(currentShareId) payload.reuse_id=currentShareId;
+  const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await resp.json();
+  if(d.error) throw new Error(d.error);
+  _backfillOverlays(d.id);
+  return d;
+}
+async function _backfillOverlays(shareId){
+  try{
+    const ovlBlobs=await collectOverlayBlobs();
+    if(!Object.keys(ovlBlobs).length) return;
+    const payload={state:getShareState(),reuse_id:shareId,overlays:ovlBlobs};
+    if(lastResult) payload.result=lastResult;
+    await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  }catch(e){console.warn('overlay backfill failed:',e);}
+}
+
+document.getElementById('btn-share').onclick=()=>{
+  const btn=document.getElementById('btn-share');
+  if(btn.disabled)return;
+  const state=getShareState();
+  const stateH=computeShareHash(state,lastResult);
+  // Already have a share for this exact state — show popup + copy
+  if(currentShareId && shareStateHash===stateH){
+    _shareUrl=_buildShareUrl(currentShareId);
+    _showSharePopup(currentShareId, false);
+    copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+    return;
+  }
+  // New share: save in background, show saving state
+  btn.disabled=true;
+  _shareUrl=null;  // No URL yet — don't let Copy copy garbage
+  _showSharePopup(null, true);
+  (async()=>{
+    try{
+      const d=await _doShareSave();
+      currentShareId=d.id;
+      currentShareName=d.name||null;
+      shareStateHash=computeShareHash(state,lastResult);
+      _shareUrl=_buildShareUrl(d.id);
+      history.replaceState(null,'',`?share=${encodeURIComponent(d.id)}`);
+      // Update popup with real ID (editable)
+      const popup=document.getElementById('share-link-popup');
+      if(popup.classList.contains('show')){
+        _showSharePopup(d.id, false);
+      }
+      copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+    }catch(e){
+      const toast=document.getElementById('share-toast');
+      toast.textContent='\u274c '+e.message;
+      toast.classList.add('show');
+      setTimeout(()=>toast.classList.remove('show'),4000);
+      _hideSharePopup();
+    }finally{btn.disabled=false;}
+  })();
 };
 
-// Share name popup handlers
-document.getElementById('share-name-ok').onclick=()=>{
-  const popup=document.getElementById('share-name-popup');
-  const name=document.getElementById('share-name-input').value.trim();
-  popup.classList.remove('show');
-  doShareSave(name||null);
+// Copy button in popup — always reads latest _shareUrl
+document.getElementById('share-copy-btn').onclick=()=>{
+  if(!_shareUrl){
+    // Still saving — briefly indicate
+    const el=document.getElementById('share-saving');
+    el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1500);
+    return;
+  }
+  copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
 };
-document.getElementById('share-name-input').onkeydown=(e)=>{
-  if(e.key==='Enter'){e.preventDefault();document.getElementById('share-name-ok').click();}
-  if(e.key==='Escape'){document.getElementById('share-name-popup').classList.remove('show');}
-};
+
+// Close popup on outside click
 document.addEventListener('click',(e)=>{
-  const popup=document.getElementById('share-name-popup');
-  if(popup.classList.contains('show') && !popup.contains(e.target) && e.target.id!=='btn-share'){
-    popup.classList.remove('show');
+  const popup=document.getElementById('share-link-popup');
+  if(popup.classList.contains('show')&&!popup.contains(e.target)&&e.target.id!=='btn-share'){
+    _hideSharePopup();
   }
 });
+
 
 // Restore from share link on page load
 (async function checkShareParam(){

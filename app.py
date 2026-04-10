@@ -2995,6 +2995,10 @@ SHARE_DIR = Path('data/shares')
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
 SHARE_MAX_BYTES = 1_000_000_000  # 1 GB
 
+_SHARE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,80}$')  # hex hashes or named slugs
+def _valid_share_id(s):
+    return bool(s and _SHARE_ID_RE.match(s))
+
 
 def _share_evict():
     """Remove oldest share files until total size < SHARE_MAX_BYTES."""
@@ -3037,7 +3041,7 @@ def share_save():
         data = gzip.compress(data_json.encode())
         
         # Check if client wants to reuse an existing share ID (update in-place)
-        if reuse_id and re.match(r'^[a-f0-9]{12}$', reuse_id):
+        if reuse_id and _valid_share_id(reuse_id):
             existing = SHARE_DIR / f'{reuse_id}.json.gz'
             if existing.exists():
                 existing.write_bytes(data)
@@ -3094,7 +3098,7 @@ def share_save():
 def share_load(share_id):
     """Retrieve a saved share. Serves gzip-compressed if client accepts it."""
     try:
-        if not re.match(r'^[a-f0-9]{12}$', share_id):
+        if not _valid_share_id(share_id):
             return _error('Invalid share ID', 400)
         p = SHARE_DIR / f'{share_id}.json.gz'
         if not p.exists():
@@ -3112,6 +3116,38 @@ def share_load(share_id):
         return Response(data, mimetype='application/json')
     except Exception as e:
         log.error("share load: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/share/<old_id>/rename', methods=['POST'])
+def share_rename(old_id):
+    """Rename a share: move file from old_id to new slug.
+    Body: {"new_id": "MySlug"}
+    Returns: {"id": "MySlug", "old_id": "abc123def456"}
+    """
+    try:
+        if not _valid_share_id(old_id):
+            return _error('Invalid share ID', 400)
+        body = request.get_json(force=True)
+        new_id = (body.get('new_id') or '').strip()
+        if not new_id:
+            return _error('new_id required', 400)
+        # Sanitise: replace spaces/special chars with hyphens
+        new_id = re.sub(r'[^A-Za-z0-9_-]+', '-', new_id).strip('-')[:80]
+        if not _valid_share_id(new_id):
+            return _error('Invalid new ID', 400)
+        old_path = SHARE_DIR / f'{old_id}.json.gz'
+        if not old_path.exists():
+            return _error('Share not found', 404)
+        new_path = SHARE_DIR / f'{new_id}.json.gz'
+        if new_path.exists() and new_id != old_id:
+            return _error('Name already taken', 409)
+        old_path.rename(new_path)
+        new_path.touch()
+        log.info("share: renamed %s → %s", old_id, new_id)
+        return jsonify({'id': new_id, 'old_id': old_id})
+    except Exception as e:
+        log.error("share rename: %s", traceback.format_exc())
         return _error(str(e))
 
 

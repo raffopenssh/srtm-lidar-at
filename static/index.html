@@ -46,6 +46,15 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .ot-dropdown .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
 .ot-dropdown .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
 
+/* ===== GEOMETRY DROP ZONE ===== */
+.geo-drop{position:relative}
+.geo-drop textarea{transition:border-color .15s,background .15s}
+.geo-drop.dragover textarea{border-color:#0d7377;background:#e8f7f7}
+.geo-drop-overlay{display:none;position:absolute;inset:0;background:rgba(13,115,119,.12);border:2px dashed #0d7377;border-radius:4px;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#0d7377;pointer-events:none}
+.geo-drop.dragover .geo-drop-overlay{display:flex}
+.file-pick-btn{display:inline-flex;align-items:center;cursor:pointer;font-size:16px;padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;transition:background .15s;margin:0!important;font-weight:400}
+.file-pick-btn:hover{background:#e8f7f7;border-color:#0d7377}
+
 /* ===== MAP ===== */
 #map-area{flex:1;position:relative;min-width:0;min-height:0}
 #map{height:100%;width:100%}
@@ -83,8 +92,8 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
 
 /* ===== SHARE BUTTON ===== */
-.share-toast{position:fixed;bottom:70px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:6px 12px;border-radius:6px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .2s;pointer-events:none}
-.share-toast.show{opacity:1}
+.share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none}
+.share-toast.show{opacity:1;transform:translateY(0)}
 
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
@@ -171,9 +180,17 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <label><input id="include_cadastre" type="checkbox" checked> Cadastre</label>
       <label><input id="include_hansen" type="checkbox"> Hansen</label>
     </div>
-    <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / coords)</span></label>
-    <textarea id="geometry" placeholder="Paste GeoJSON, KML, or coordinates…"></textarea>
-    <p class="hint">Or draw on map — click ▶ Sample for a demo area.</p>
+    <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / Shapefile / GPX / WKT)</span></label>
+    <div class="geo-drop" id="geo-drop">
+      <textarea id="geometry" placeholder="Paste GeoJSON, KML, or coordinates… or drop a file here"></textarea>
+      <div class="geo-drop-overlay" id="geo-drop-overlay">📂 Drop file here</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-top:3px">
+      <label class="file-pick-btn" title="Upload geometry file">
+        📎 <input type="file" id="geo-file" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
+      </label>
+      <p class="hint" style="margin:0;flex:1">Or draw on map — click ▶ Sample for a demo area.</p>
+    </div>
     <div class="row" style="margin-top:6px">
       <button class="btn" id="btn-sample">▶ Sample</button>
       <button class="btn" id="btn-run">🚀 Analyse</button>
@@ -791,6 +808,9 @@ async function restoreShareResult(data){
 }
 
 document.getElementById('btn-share').onclick=async()=>{
+  const btn=document.getElementById('btn-share');
+  if(btn.disabled)return;
+  btn.disabled=true;btn.textContent='\u23f3 Saving...';
   const state=getShareState();
   const payload={state:state};
   if(lastResult) payload.result=lastResult;
@@ -800,14 +820,18 @@ document.getElementById('btn-share').onclick=async()=>{
     const d=await resp.json();
     if(d.error) throw new Error(d.error);
     const url=location.origin+location.pathname+'?share='+d.id;
-    try{await navigator.clipboard.writeText(url);toast.textContent='\u2705 Link copied!';}catch(ce){const ta=document.createElement('textarea');ta.value=url;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);toast.textContent='\u2705 Link copied!';}
+    let copied=false;
+    try{await navigator.clipboard.writeText(url);copied=true;}catch(ce){
+      try{const ta=document.createElement('textarea');ta.value=url;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();copied=document.execCommand('copy');document.body.removeChild(ta);}catch(e2){}
+    }
+    toast.textContent=copied?'\u2705 Link copied to clipboard!':'\u2705 '+url;
     toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),2500);
+    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
   }catch(e){
     toast.textContent='\u274c '+e.message;
     toast.classList.add('show');
-    setTimeout(()=>toast.classList.remove('show'),3000);
-  }
+    setTimeout(()=>toast.classList.remove('show'),4000);
+  }finally{btn.disabled=false;btn.textContent='\ud83d\udd17 Share';}
 };
 
 // Restore from share link on page load
@@ -839,6 +863,122 @@ document.getElementById('btn-sample').onclick=()=>{
 };
 
 function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8);}
+
+// ============ GEOMETRY FILE DROP/UPLOAD ============
+(function initGeoDrop(){
+  const drop=document.getElementById('geo-drop');
+  const ta=document.getElementById('geometry');
+  const fileInput=document.getElementById('geo-file');
+  const TEXT_EXTS=['.geojson','.json','.kml','.xml','.gpx','.wkt','.gml'];
+  const BIN_EXTS=['.shp','.zip','.gpkg','.kmz','.dxf'];
+
+  // Prevent default drag on whole page
+  ['dragenter','dragover','dragleave','drop'].forEach(ev=>{
+    document.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();});
+  });
+
+  // Highlight drop zone
+  drop.addEventListener('dragenter',()=>drop.classList.add('dragover'));
+  drop.addEventListener('dragover',()=>drop.classList.add('dragover'));
+  drop.addEventListener('dragleave',e=>{if(!drop.contains(e.relatedTarget))drop.classList.remove('dragover');});
+  drop.addEventListener('drop',e=>{drop.classList.remove('dragover');handleFiles(e.dataTransfer.files);});
+
+  // File picker
+  fileInput.addEventListener('change',()=>{if(fileInput.files.length)handleFiles(fileInput.files);fileInput.value='';});
+
+  async function handleFiles(files){
+    if(!files.length)return;
+    const file=files[0];
+    const name=file.name.toLowerCase();
+    const ext='.'+name.split('.').pop();
+    setStatus('Reading '+file.name+'...');
+
+    // Text-based formats: read and parse client-side or set directly
+    if(TEXT_EXTS.includes(ext)){
+      try{
+        const text=await file.text();
+        const geojson=textToGeoJSON(text,ext);
+        if(geojson) applyGeoJSON(geojson,file.name);
+        else{ta.value=text; setStatus('File loaded: '+file.name);}
+      }catch(e){setStatus('Error reading '+file.name+': '+e.message);}
+      return;
+    }
+
+    // Binary formats: upload to server
+    if(BIN_EXTS.includes(ext)||!TEXT_EXTS.includes(ext)){
+      try{
+        showLoading('Parsing '+file.name+'...');
+        const fd=new FormData();
+        fd.append('file',file);
+        const resp=await fetch('/api/v1/parse-geometry',{method:'POST',body:fd});
+        const data=await resp.json();
+        if(data.error)throw new Error(data.error);
+        applyGeoJSON(data,file.name);
+        hideLoading('Parsed '+file.name);
+      }catch(e){hideLoading('Error: '+e.message);}
+      return;
+    }
+  }
+
+  function textToGeoJSON(text,ext){
+    text=text.trim();
+    // GeoJSON
+    if(ext==='.geojson'||ext==='.json'||(text.startsWith('{')&&text.includes('"type"'))){
+      try{
+        const obj=JSON.parse(text);
+        if(obj.type==='FeatureCollection')return obj;
+        if(obj.type==='Feature')return{type:'FeatureCollection',features:[obj]};
+        if(obj.coordinates||obj.geometries)return{type:'FeatureCollection',features:[{type:'Feature',geometry:obj,properties:{}}]};
+      }catch(e){}
+    }
+    // KML/GPX/GML — set as text, backend parses via geo_parse
+    if(ext==='.kml'||ext==='.xml'||ext==='.gpx'||ext==='.gml')return null;
+    // WKT
+    if(ext==='.wkt')return null; // let server handle
+    return null;
+  }
+
+  function applyGeoJSON(fc,fname){
+    if(!fc.features||!fc.features.length){setStatus('No features in '+fname);return;}
+    // Extract first polygon/multipolygon, or merge all into one
+    drawnItems.clearLayers();
+    let geom=null;
+    // Prefer polygon features
+    const polys=fc.features.filter(f=>f.geometry&&(f.geometry.type==='Polygon'||f.geometry.type==='MultiPolygon'));
+    if(polys.length===1){
+      geom=polys[0].geometry;
+    }else if(polys.length>1){
+      // Merge into MultiPolygon
+      const coords=[];
+      for(const f of polys){
+        if(f.geometry.type==='Polygon')coords.push(f.geometry.coordinates);
+        else if(f.geometry.type==='MultiPolygon')coords.push(...f.geometry.coordinates);
+      }
+      geom={type:'MultiPolygon',coordinates:coords};
+    }else{
+      // Use first feature whatever it is
+      geom=fc.features[0].geometry;
+    }
+    if(!geom){setStatus('No geometry found in '+fname);return;}
+    ta.value=JSON.stringify(geom,null,2);
+    // Draw on map
+    try{
+      const layer=L.geoJSON(geom,{style:{color:'#0d7377',weight:2,fillOpacity:.05}});
+      layer.eachLayer(l=>drawnItems.addLayer(l));
+      map.fitBounds(drawnItems.getBounds().pad(.1));
+    }catch(e){}
+    setStatus('Loaded '+fc.features.length+' feature'+(fc.features.length>1?'s':'')+' from '+fname);
+  }
+
+  // Also handle paste of files (e.g. from file manager)
+  ta.addEventListener('paste',e=>{
+    const items=e.clipboardData?.items;
+    if(!items)return;
+    for(const item of items){
+      if(item.kind==='file'){e.preventDefault();handleFiles([item.getAsFile()]);return;}
+    }
+  });
+})();
 
 // ============ ANALYSE ============
 document.getElementById('btn-run').onclick=async()=>{

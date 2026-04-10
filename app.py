@@ -2283,6 +2283,125 @@ def llm_docs():
     return Response("Documentation not yet generated.", mimetype='text/plain')
 
 
+# ============ PARSE GEOMETRY FILE ============
+
+@app.route('/api/v1/parse-geometry', methods=['POST'])
+def parse_geometry_file():
+    """Parse an uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT, etc).
+    Returns GeoJSON FeatureCollection with all features.
+    """
+    import fiona
+    import fiona.io
+    import zipfile
+    from shapely.geometry import shape as shp_shape, mapping as shp_mapping
+    from shapely.ops import unary_union
+    try:
+        if 'file' not in request.files:
+            return _error('No file uploaded', 400)
+        f = request.files['file']
+        fname = (f.filename or '').lower()
+        raw = f.read()
+        if not raw:
+            return _error('Empty file', 400)
+
+        features = []
+
+        # Try text-based formats first
+        if fname.endswith(('.geojson', '.json')):
+            gj = json.loads(raw)
+            return jsonify(gj if gj.get('type') == 'FeatureCollection' else {
+                'type': 'FeatureCollection',
+                'features': gj.get('features', [{'type': 'Feature', 'geometry': gj, 'properties': {}}])
+            })
+
+        if fname.endswith(('.kml', '.xml')):
+            parsed = geo_parse.parse_input(raw.decode('utf-8', errors='replace'))
+            return jsonify(geo_parse.features_to_geojson(parsed))
+
+        if fname.endswith('.wkt'):
+            from shapely import wkt
+            geom = wkt.loads(raw.decode('utf-8', errors='replace').strip())
+            return jsonify({'type': 'FeatureCollection', 'features': [
+                {'type': 'Feature', 'geometry': shp_mapping(geom), 'properties': {}}
+            ]})
+
+        # Binary formats via fiona
+        tmp_dir = tempfile.mkdtemp(prefix='geo_upload_')
+        try:
+            # Shapefile in ZIP
+            if fname.endswith('.zip'):
+                zpath = os.path.join(tmp_dir, 'upload.zip')
+                with open(zpath, 'wb') as wf:
+                    wf.write(raw)
+                # Find .shp inside zip
+                with zipfile.ZipFile(zpath) as zf:
+                    zf.extractall(tmp_dir)
+                # Find shp file
+                shp_files = []
+                for root, dirs, files in os.walk(tmp_dir):
+                    for fn in files:
+                        if fn.lower().endswith('.shp'):
+                            shp_files.append(os.path.join(root, fn))
+                if not shp_files:
+                    # Try as GPKG or other format inside zip
+                    for root, dirs, files in os.walk(tmp_dir):
+                        for fn in files:
+                            if fn.lower().endswith(('.gpkg', '.geojson', '.json', '.kml', '.gpx')):
+                                shp_files.append(os.path.join(root, fn))
+                if not shp_files:
+                    return _error('No shapefile (.shp) or supported file found in ZIP', 400)
+                src_path = shp_files[0]
+            else:
+                # Single file (gpkg, gpx, shp, etc)
+                ext = os.path.splitext(fname)[1] or '.gpkg'
+                src_path = os.path.join(tmp_dir, 'upload' + ext)
+                with open(src_path, 'wb') as wf:
+                    wf.write(raw)
+
+            with fiona.open(src_path) as src:
+                src_crs = src.crs
+                # Reproject to WGS84 if needed
+                need_reproject = False
+                if src_crs and str(src_crs).upper() not in ('EPSG:4326', '{"INIT": "EPSG:4326"}'):
+                    try:
+                        from pyproj import CRS, Transformer
+                        c = CRS(src_crs)
+                        if c.to_epsg() != 4326:
+                            need_reproject = True
+                            transformer = Transformer.from_crs(c, CRS.from_epsg(4326), always_xy=True)
+                    except Exception:
+                        pass
+
+                for feat in src:
+                    geom = shp_shape(feat['geometry'])
+                    if need_reproject:
+                        from shapely.ops import transform
+                        geom = transform(transformer.transform, geom)
+                    props = dict(feat.get('properties', {}))
+                    # Convert non-serializable values
+                    for k, v in list(props.items()):
+                        if v is not None and not isinstance(v, (str, int, float, bool)):
+                            props[k] = str(v)
+                    features.append({
+                        'type': 'Feature',
+                        'geometry': shp_mapping(geom),
+                        'properties': props,
+                    })
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if not features:
+            return _error('No features found in file', 400)
+
+        log.info("parse-geometry: %s → %d features", fname, len(features))
+        return jsonify({'type': 'FeatureCollection', 'features': features})
+
+    except Exception as e:
+        log.error("parse-geometry: %s", traceback.format_exc())
+        return _error(f'Failed to parse file: {e}')
+
+
 # ============ SHARE ============
 
 SHARE_DIR = Path('data/shares')
@@ -2312,7 +2431,10 @@ def share_save():
         data = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
         (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
         _share_evict()
-        url = request.url_root.rstrip('/').replace('http://', 'https://') + f'/?share={share_id}'
+        # Use X-Forwarded-Host/Proto if behind proxy, else request.url_root
+        host = request.headers.get('X-Forwarded-Host', request.host)
+        proto = request.headers.get('X-Forwarded-Proto', 'https')
+        url = f'{proto}://{host}/?share={share_id}'
         log.info("share: saved %s (%d KB)", share_id, len(data) // 1024)
         return jsonify({'id': share_id, 'url': url})
     except Exception as e:

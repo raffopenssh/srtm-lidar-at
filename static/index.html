@@ -417,6 +417,7 @@ const resultLayer=new L.FeatureGroup().addTo(map);
 new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:true,marker:true,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
 map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();});
 map.on('moveend',markShareDirty);
+map.on('moveend',_debouncedLayerAvailCheck);
 
 // ============ STATE ============
 let colorMode='type';
@@ -446,6 +447,7 @@ const LAYER_DEFS={
 function openResultModal(){
   document.getElementById('result-modal').classList.add('open');
   updateModalContent();
+  syncGpkgCheckboxes();
 }
 function closeResultModal(){
   document.getElementById('result-modal').classList.remove('open');
@@ -573,7 +575,8 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     // Read selected layers from gpkg checkboxes
     const sel={};
     document.querySelectorAll('[data-gpkg]').forEach(cb=>{sel[cb.dataset.gpkg]=cb.checked;});
-    let url='/api/v1/export/geopackage?include_dtm='+(sel.dtm||false);
+    let url='/api/v1/export/geopackage?async=true';
+    url+='&include_dtm='+(sel.dtm||false);
     url+='&include_dsm='+(sel.dsm||false);
     url+='&include_segments='+(sel.segments||false);
     // Ortho years
@@ -590,11 +593,38 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     if(rasterLayers.length)url+='&raster_layers='+rasterLayers.join(',');
     if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
     url+='&color_mode='+colorMode;
+    // Submit async export
     const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
     if(!resp.ok)throw new Error((await resp.json()).error);
-    const blob=await resp.blob();
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.gpkg';a.click();
-    setStatus('GeoPackage downloaded!');
+    const submit=await resp.json();
+    if(submit.error)throw new Error(submit.error);
+    const taskId=submit.task_id;
+    if(!taskId)throw new Error('No task_id returned');
+    // Poll for progress using the segment progress endpoint
+    btn.textContent='⏳ Exporting...';
+    const t0=Date.now(), maxWait=600000, interval=2000;
+    while(Date.now()-t0<maxWait){
+      await new Promise(r=>setTimeout(r,interval));
+      try{
+        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+        const pj=await pr.json();
+        if(pj.error)throw new Error(pj.error);
+        if(pj.done){
+          // Download via browser-native navigation (no fetch blob)
+          window.location.href=`/api/v1/export/geopackage/download/${taskId}`;
+          setStatus('GeoPackage downloaded!');
+          return;
+        }
+        if(pj.active){
+          const el=pj.elapsed?` (${pj.elapsed}s)`:'';
+          const det=pj.detail?` — ${pj.detail}`:'';
+          btn.textContent=`⏳ ${pj.step||'Exporting'}${det}${el}`;
+        }
+      }catch(e){
+        if(e.message&&!e.message.startsWith('Failed to fetch'))throw e;
+      }
+    }
+    throw new Error('Export timed out after 10 minutes');
   }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoPackage';}
 };
 
@@ -751,6 +781,62 @@ async function handleLayerToggle(id){
     else cb.checked=false;
     hideLoading();
   }catch(e){hideLoading(`${id} failed: ${e.message}`);cb.checked=false;}
+}
+
+// ============ DYNAMIC LAYER AVAILABILITY ============
+let _layerAvailTimer=null;
+function _debouncedLayerAvailCheck(){
+  if(_layerAvailTimer)clearTimeout(_layerAvailTimer);
+  _layerAvailTimer=setTimeout(checkLayerAvailability,2000);
+}
+async function checkLayerAvailability(){
+  const b=map.getBounds();
+  const bbox=`${b.getWest().toFixed(6)},${b.getSouth().toFixed(6)},${b.getEast().toFixed(6)},${b.getNorth().toFixed(6)}`;
+  try{
+    const resp=await fetch(`/api/v1/layers?bbox=${bbox}`);
+    if(!resp.ok)return;
+    const avail=await resp.json();
+    // Build a flat map: "ortho-2024" -> true/false, "cir-2020" -> true/false, etc.
+    const flat={};
+    for(const[group,val]of Object.entries(avail)){
+      if(typeof val==='object'){
+        for(const[year,ok]of Object.entries(val)){
+          flat[`${group}-${year}`]=!!ok;
+        }
+      }else{
+        flat[group]=!!val;
+      }
+    }
+    // Apply to layer panel checkboxes
+    document.querySelectorAll('[data-lyr]').forEach(cb=>{
+      const id=cb.dataset.lyr;
+      if(!(id in flat))return; // analysis layers etc. — leave as-is
+      const lyrDiv=cb.closest('.lyr');
+      if(flat[id]){
+        // Available — show the layer div
+        if(lyrDiv)lyrDiv.style.display='';
+      }else{
+        // Not available — hide, uncheck, remove tile layer
+        if(lyrDiv)lyrDiv.style.display='none';
+        if(cb.checked){
+          cb.checked=false;
+          if(overlays[id]){map.removeLayer(overlays[id]);delete overlays[id];}
+        }
+      }
+    });
+    // Apply to GPKG download checkboxes
+    document.querySelectorAll('[data-gpkg]').forEach(cb=>{
+      const id=cb.dataset.gpkg;
+      if(!(id in flat))return;
+      const lbl=cb.closest('label');
+      if(flat[id]){
+        if(lbl)lbl.style.display='';
+      }else{
+        if(lbl)lbl.style.display='none';
+        cb.checked=false;
+      }
+    });
+  }catch(e){console.warn('Layer availability check failed:',e);}
 }
 
 function getVisibleTypes(){
@@ -1280,6 +1366,8 @@ function showResultOnMap(data){
   buildLegend(typeCounts,tiMap);
   buildSummary(data);
   showFeaturesOnMap(data);
+  // Recheck layer availability for the new view
+  _debouncedLayerAvailCheck();
 }
 
 function showFeaturesOnMap(data){

@@ -7,8 +7,9 @@ import re
 from typing import Optional
 from xml.etree import ElementTree as ET
 
-from shapely.geometry import shape, Point, LineString, Polygon, mapping, MultiPolygon
+from shapely.geometry import shape, Point, LineString, Polygon, mapping, MultiPolygon, box
 from shapely.ops import unary_union
+import pyproj
 import shapely
 
 KML_NS = {
@@ -175,6 +176,66 @@ def _parse_coords(text: str) -> list[dict]:
         geom = Polygon(points)
 
     return [{"name": "input", "geometry": geom, "properties": {}}]
+
+
+# ---------------------------------------------------------------------------
+# Austria bounds validation
+# ---------------------------------------------------------------------------
+
+# Rough bounding box of Austria in WGS84
+_AUSTRIA_BBOX = box(9.5, 46.3, 17.2, 49.0)
+
+
+def validate_austria_bounds(geom) -> None:
+    """Check that a WGS84 geometry intersects Austria's bounding box.
+
+    Raises ValueError if the geometry is entirely outside Austria.
+    """
+    if not geom.intersects(_AUSTRIA_BBOX):
+        raise ValueError(
+            "Geometry is outside Austria. This service only covers Austrian territory."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-feature union
+# ---------------------------------------------------------------------------
+
+def union_features(features: list[dict]) -> list[dict]:
+    """Union multiple features into a single feature with a convex hull boundary.
+
+    - Points are buffered by ~100 m (≈0.001° at Austrian latitudes) before union.
+    - Mixed geometry types (points, lines, polygons) are supported.
+    - If there is only one feature, it is returned as-is.
+
+    Returns a list containing a single feature dict.
+    """
+    if len(features) <= 1:
+        return features
+
+    # Approximate 100 m buffer in WGS84 degrees at ~47°N
+    POINT_BUFFER_DEG = 0.001  # ~100 m
+
+    geoms = []
+    for f in features:
+        g = f["geometry"]
+        if g.geom_type == "Point":
+            g = g.buffer(POINT_BUFFER_DEG)
+        elif g.geom_type == "MultiPoint":
+            g = unary_union([p.buffer(POINT_BUFFER_DEG) for p in g.geoms])
+        geoms.append(g)
+
+    merged = unary_union(geoms).convex_hull
+
+    # Combine properties from all features
+    names = [f.get("name", "") for f in features if f.get("name")]
+    combined_name = "; ".join(names) if names else "union"
+
+    return [{
+        "name": combined_name,
+        "geometry": merged,
+        "properties": {"name": combined_name, "source_feature_count": len(features)},
+    }]
 
 
 def features_to_geojson(features: list[dict], properties_extra: dict = None) -> dict:

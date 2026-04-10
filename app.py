@@ -3,9 +3,7 @@
 Endpoints:
   1. POST /api/v1/elevation        — Enrich features with DSM/DTM elevation
   2. POST /api/v1/terrain          — Terrain characterisation (slope, ruggedness, …)
-  3. POST /api/v1/objects          — Object detection & classification summary
-  4. POST /api/v1/objects/raster   — Classified object raster (GeoTIFF)
-  5. POST /api/v1/changes          — Temporal change detection between ALS dates
+  3. POST /api/v1/changes          — Temporal change detection between ALS dates
   6. POST /api/v1/changes/trees    — Per-tree growth / felling analysis
   7. POST /api/v1/changes/summary  — Multi-epoch change summary
   8. GET  /api/v1/info             — Datasets, object types, event types
@@ -37,7 +35,6 @@ from shapely.geometry import mapping, shape, Point, LineString as SLineString
 import tile_index as ti
 import raster_io
 import terrain_analysis as ta
-import landscape_classifier as oc  # new landscape-focused classifier
 import object_segmentation as seg  # watershed-based segmentation
 import hansen  # Hansen Global Forest Change calibration
 import temporal_analysis as tca
@@ -146,6 +143,9 @@ def _cleanup_old_results(max_age_s: int = 3600):
     try:
         cutoff = time.time() - max_age_s
         for f in _RESULTS_DIR.glob('*.json.gz'):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+        for f in _RESULTS_DIR.glob('*.gpkg'):
             if f.stat().st_mtime < cutoff:
                 f.unlink(missing_ok=True)
         for f in _PROGRESS_DIR.glob('*.json'):
@@ -282,12 +282,16 @@ def training_status():
 # ---------------------------------------------------------------------------
 
 def _get_geometry():
-    """Extract geometry from request. Supports JSON body, form data, file upload."""
+    """Extract geometry from request. Supports JSON body, form data, file upload.
+
+    Also validates each feature is within Austria and unions multiple features
+    into a single convex-hull geometry.
+    """
     if 'file' in request.files:
         f = request.files['file']
         content = f.read().decode('utf-8')
-        return geo_parse.parse_input(content)
-    if request.is_json:
+        features = geo_parse.parse_input(content)
+    elif request.is_json:
         body = request.get_json()
         if 'geometry' in body:
             geom_input = body['geometry']
@@ -295,13 +299,25 @@ def _get_geometry():
             geom_input = body
         else:
             raise ValueError("JSON body must contain 'geometry' or be a valid GeoJSON")
-        return geo_parse.parse_input(geom_input)
-    if request.form.get('geometry'):
-        return geo_parse.parse_input(request.form['geometry'])
-    data = request.get_data(as_text=True)
-    if data:
-        return geo_parse.parse_input(data)
-    raise ValueError("No geometry provided. Send GeoJSON, KML, or coordinates.")
+        features = geo_parse.parse_input(geom_input)
+    elif request.form.get('geometry'):
+        features = geo_parse.parse_input(request.form['geometry'])
+    else:
+        data = request.get_data(as_text=True)
+        if data:
+            features = geo_parse.parse_input(data)
+        else:
+            raise ValueError("No geometry provided. Send GeoJSON, KML, or coordinates.")
+
+    # Validate each feature is within Austria
+    for feat in features:
+        geo_parse.validate_austria_bounds(feat['geometry'])
+
+    # Union multiple features into one
+    if len(features) > 1:
+        features = geo_parse.union_features(features)
+
+    return features
 
 
 def _get_params():
@@ -330,8 +346,9 @@ def _validate_area(geom_3035):
     area = geom_3035.area
     if area > MAX_AREA_SQM:
         raise ValueError(
-            f"Area too large: {area/1e6:.1f} km² (max {MAX_AREA_SQM/1e6:.0f} km²). "
-            f"Use a smaller geometry."
+            f"The selected area is too large ({area/1e6:.1f} km²). "
+            f"Please choose a smaller region — the maximum allowed is "
+            f"{MAX_AREA_SQM/1e6:.0f} km²."
         )
 
 
@@ -609,150 +626,7 @@ def terrain():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# 3. OBJECTS
-# ---------------------------------------------------------------------------
 
-@app.route('/api/v1/objects', methods=['POST'])
-def objects_summary():
-    try:
-        t0 = time.time()
-        features = _get_geometry()
-        params = _get_params()
-        dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        min_height = float(params.get('min_height', 0.2))
-        min_area = int(params.get('min_area', 2))
-        include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
-        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
-        include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
-        object_types_filter = params.get('object_types', None)
-        if isinstance(object_types_filter, str):
-            object_types_filter = [t.strip() for t in object_types_filter.split(',')]
-
-        all_objects = []
-        for feat in features:
-            geom = feat['geometry']
-            geom_3035 = ti.geometry_to_3035(geom)
-            if geom.geom_type == 'Point':
-                geom_3035 = geom_3035.buffer(100)
-            _validate_area(geom_3035)
-
-            # Multi-temporal LIDAR: loads DTM+DSM for all dates
-            dtm_dates, dsm_dates = None, None
-            temporal_std, temporal_range, n_dates = None, None, 1
-            if include_temporal:
-                try:
-                    multi = raster_io.read_multi_date_ndsm(geom_3035)
-                    data = {
-                        'dtm': multi['dtm'], 'dsm': multi['dsm'],
-                        'ndsm': multi['ndsm'], 'mask': multi['mask'],
-                        'transform': multi['transform'], 'crs': multi['crs'],
-                        'shape': multi['shape'],
-                    }
-                    temporal_std = multi['temporal_std']
-                    temporal_range = multi['temporal_range']
-                    n_dates = len(multi['dates_loaded'])
-                    # Build per-date DTM/DSM dicts for landscape classifier
-                    dtm_dates = {}
-                    dsm_dates = {}
-                    for d in multi['dates_loaded']:
-                        try:
-                            dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
-                            mh = min(dd['shape'][0], data['shape'][0])
-                            mw = min(dd['shape'][1], data['shape'][1])
-                            dtm_dates[d] = dd['dtm'][:mh, :mw]
-                            dsm_dates[d] = dd['dsm'][:mh, :mw]
-                        except Exception as e:
-                            log.warning("Failed to load date %s for time series: %s", d, e)
-                except Exception as e:
-                    log.warning("Multi-temporal load failed, falling back to single date: %s", e)
-                    data = raster_io.read_dtm_dsm(geom_3035, dataset)
-            else:
-                data = raster_io.read_dtm_dsm(geom_3035, dataset)
-
-            rgb, spectral = (None, None)
-            if include_ortho:
-                rgb, spectral = _try_read_ortho(data)
-
-            # Copernicus data (Sentinel-2 NDVI, land cover, SAR)
-            copernicus_data = None
-            if include_copernicus:
-                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
-
-            # Cadastre building footprints (ground truth)
-            building_footprints = None
-            if include_cadastre:
-                building_footprints = _try_cadastre(
-                    geom, data['transform'], data['shape'],
-                )
-
-            # Use new landscape classifier
-            result = oc.classify_landscape(
-                data['dtm'], data['dsm'], data['mask'], data['transform'],
-                dtm_dates=dtm_dates,
-                dsm_dates=dsm_dates,
-                copernicus=copernicus_data,
-                building_footprints=building_footprints,
-                min_height=min_height,
-                min_area=min_area,
-                spectral=spectral,
-                rgb=rgb,
-                temporal_std=temporal_std,
-                temporal_range=temporal_range,
-                n_temporal_dates=n_dates,
-            )
-            objects = result['objects']
-
-            if object_types_filter:
-                objects = [o for o in objects if o.obj_type in object_types_filter]
-            max_height = params.get('max_height')
-            if max_height:
-                objects = [o for o in objects if o.height_max <= float(max_height)]
-            all_objects.extend(objects)
-
-        summary = oc.summarise_objects(all_objects)
-        obj_features = []
-        for obj in all_objects:
-            centroid_wgs = ti.geometry_from_3035(Point(obj.centroid_e, obj.centroid_n))
-            props = {
-                "id": obj.obj_id, "type": obj.obj_type, "type_code": obj.type_code,
-                "height_max_m": obj.height_max, "height_mean_m": obj.height_mean,
-                "height_p90_m": obj.height_p90, "area_sqm": obj.area_sqm,
-                "compactness": obj.compactness, "elongation": obj.elongation,
-                "solidity": obj.solidity, "extent": obj.extent,
-                "dsm_edge_strength": obj.dsm_edge_strength,
-                "height_class": obj.height_class,
-                "is_manmade": obj.is_manmade,
-                "confidence": obj.confidence,
-                "linear_feature": obj.linear_feature,
-                "machinery_trace": obj.machinery_trace,
-            }
-            if include_ortho or include_copernicus:
-                props["ndvi_mean"] = obj.ndvi_mean
-            if include_temporal:
-                props["temporal_std"] = obj.temporal_std
-                props["temporal_stable"] = obj.temporal_stable
-                props["temporal_signal"] = obj.temporal_signal
-            obj_features.append({"type": "Feature", "properties": props, "geometry": mapping(centroid_wgs)})
-
-        return jsonify({
-            "summary": summary, "type": "FeatureCollection", "features": obj_features,
-            "meta": {"dataset": dataset, "min_height": min_height, "min_area": min_area,
-                     "include_ortho": include_ortho,
-                     "include_temporal": include_temporal,
-                     "include_copernicus": include_copernicus,
-                     "include_cadastre": include_cadastre,
-                     "n_temporal_dates": n_dates if include_temporal else 1,
-                     "classifier": "landscape_v2",
-                     "object_types_filter": object_types_filter,
-                     "processing_time_s": round(time.time()-t0, 2)},
-        })
-    except ValueError as e:
-        return _error(str(e))
-    except Exception as e:
-        log.error(traceback.format_exc())
-        return _error(f"Internal error: {e}", 500)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,6 +1206,7 @@ def export_geopackage():
       types=tree,road,...     Segment type filter
       color_mode=type|height  Segment raster color mode
       include_ortho=true      Legacy: same as ortho_years=default
+      async=true              Return 202 with task_id; poll progress; download via GET
     """
     try:
         import fiona
@@ -1340,160 +1215,29 @@ def export_geopackage():
         pass
 
     try:
-        t0 = time.time()
         features = _get_geometry()
         params = _get_params()
-        dataset = params.get('dataset', ti.DEFAULT_DATASET)
 
-        # --- Parse layer selection params ---
-        _bool = lambda k, d='false': str(params.get(k, d)).lower() in ('true', '1', 'yes')
-        include_dtm = _bool('include_dtm', 'true') or _bool('include_dsm', 'true')
-        include_segments = _bool('include_segments', 'false')
-        include_ortho_legacy = _bool('include_ortho', 'false')
+        run_async = str(request.args.get('async', params.get('async', 'false'))).lower() in ('true', '1', 'yes')
+        task_id = request.args.get('task_id', params.get('task_id', ''))
 
-        ortho_years_str = params.get('ortho_years', '')
-        ortho_years = [int(y.strip()) for y in ortho_years_str.split(',') if y.strip().isdigit()] if ortho_years_str else []
-        if include_ortho_legacy and not ortho_years:
-            ortho_years = [ti.dataset_to_year(dataset)]
-
-        raster_layers_str = params.get('raster_layers', '')
-        raster_layers = [x.strip() for x in raster_layers_str.split(',') if x.strip()] if raster_layers_str else []
-
-        type_filter_str = params.get('types', None)
-        type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
-        color_mode = params.get('color_mode', 'type')
-
-        feat = features[0]
-        geom = feat['geometry']
-        geom_3035 = ti.geometry_to_3035(geom)
-        if geom.geom_type == 'Point':
-            geom_3035 = geom_3035.buffer(100)
-        _validate_area(geom_3035)
-
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
-        dtm = data['dtm']
-        dsm = data['dsm']
-        ndsm = data['ndsm']
-        tf = data['transform']
-        h, w = data['shape']
-        mask = data['mask']
-
-        tmp = tempfile.NamedTemporaryFile(suffix='.gpkg', delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        os.unlink(tmp_path)  # GPKG driver needs a fresh path
-
-        table_count = 0
-
-        def _write_gpkg_table(name, arrays_list, dtype='float32', descriptions=None):
-            """Write one raster table to the GPKG. First call creates, rest append."""
-            nonlocal table_count
-            n = len(arrays_list)
-            opts = dict(
-                driver='GPKG', width=w, height=h, count=n,
-                dtype=dtype, crs='EPSG:3035', transform=tf,
-                RASTER_TABLE=name, RASTER_IDENTIFIER=name,
+        if run_async:
+            if not task_id:
+                task_id = str(uuid.uuid4())
+            _progress_start(task_id)
+            thread = threading.Thread(
+                target=_gpkg_worker,
+                args=(task_id, features, params),
+                daemon=True,
             )
-            if dtype == 'float32':
-                opts['nodata'] = float('nan')
-            if table_count > 0:
-                opts['APPEND_SUBDATASET'] = 'YES'
-            with rasterio.open(tmp_path, 'w', **opts) as dst:
-                for i, arr in enumerate(arrays_list, 1):
-                    out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
-                    dst.write(out, i)
-                    if descriptions and i <= len(descriptions):
-                        dst.set_band_description(i, descriptions[i - 1])
-            table_count += 1
-            log.info("GPKG table %s: %d bands (%s)", name, n, dtype)
+            thread.start()
+            return jsonify({"task_id": task_id, "status": "running"}), 202
 
-        # --- Core DTM/DSM/nDSM (1 band each = cleaner in QGIS) ---
-        if include_dtm:
-            _write_gpkg_table('DTM', [dtm.astype(np.float32)])
-            _write_gpkg_table('DSM', [dsm.astype(np.float32)])
-            _write_gpkg_table('nDSM', [ndsm.astype(np.float32)])
-
-        # --- Orthophoto for each requested year (RGBA uint8) ---
-        rgb = None
-        for year in ortho_years:
-            try:
-                import ortho_io
-                rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
-                if rgb_arr is not None:
-                    bands_u8 = [rgb_arr[0], rgb_arr[1], rgb_arr[2]]
-                    descs = ['Red', 'Green', 'Blue']
-                    if nir is not None:
-                        bands_u8.append(nir)
-                        descs.append('NIR')
-                    _write_gpkg_table(f'Ortho_{year}', bands_u8,
-                                      dtype='uint8', descriptions=descs)
-                    if rgb is None:
-                        rgb = rgb_arr
-            except Exception as e:
-                log.warning("Ortho %d for gpkg failed: %s", year, e)
-
-        # --- Segment type/height rasters ---
-        if include_segments:
-            try:
-                cache_key_check = f"{geom_3035.bounds}_{dataset}"
-                if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
-                    log.info("GeoPackage: using cached segmentation")
-                    labels = _seg_cache["labels"]
-                    objects = _seg_cache["objects"]
-                else:
-                    spectral = None
-                    if rgb is not None:
-                        import ortho_io
-                        _, nir_arr = ortho_io.read_ortho_for_als(data)
-                        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
-                        spectral["red"] = rgb[0].astype(np.float32)
-                        spectral["green"] = rgb[1].astype(np.float32)
-                        spectral["blue"] = rgb[2].astype(np.float32)
-                        if nir_arr is not None:
-                            spectral["nir"] = nir_arr.astype(np.float32)
-                    result = seg.segment_and_classify(
-                        dtm, dsm, mask, tf, spectral=spectral,
-                        observation_year=ti.dataset_to_year(dataset),
-                    )
-                    objects = result['objects']
-                    labels = result['labels']
-
-                if type_filter:
-                    filtered_ids = {o.obj_id for o in objects if o.obj_type in type_filter}
-                else:
-                    filtered_ids = {o.obj_id for o in objects}
-
-                type_raster = np.zeros((h, w), dtype=np.float32)
-                obj_map = {o.obj_id: o for o in objects}
-                for oid in filtered_ids:
-                    if oid in obj_map:
-                        type_raster[labels == oid] = float(obj_map[oid].type_code)
-                height_raster = np.where(ndsm > 0, ndsm, 0).astype(np.float32)
-
-                _write_gpkg_table('segment_type', [type_raster])
-                _write_gpkg_table('segment_height', [height_raster])
-            except Exception as e:
-                log.warning("Segments for gpkg failed: %s", e)
-
-        # --- Rendered RGBA raster overlays ---
-        geom_wgs = _extract_single_geom(features)
-        for rlayer in raster_layers:
-            try:
-                rgba = _render_overlay_for_gpkg(
-                    rlayer, data, geom_3035, geom_wgs, dataset,
-                    type_filter, color_mode, params,
-                )
-                if rgba is not None:
-                    bands_u8 = [rgba[:, :, i] for i in range(4)]
-                    _write_gpkg_table(rlayer, bands_u8, dtype='uint8',
-                                      descriptions=['R', 'G', 'B', 'A'])
-            except Exception as e:
-                log.warning("Raster overlay %s for gpkg failed: %s", rlayer, e)
-
+        # Synchronous path
+        tmp_path, table_count, elapsed = _gpkg_core(features, params)
         if table_count == 0:
             return _error('No layers selected')
-
-        log.info("GeoPackage export: %d tables, %.1fs", table_count, time.time() - t0)
+        log.info("GeoPackage export: %d tables, %.1fs", table_count, elapsed)
         return send_file(
             tmp_path, mimetype='application/geopackage+sqlite3',
             as_attachment=True, download_name='landscape_export.gpkg',
@@ -1503,6 +1247,211 @@ def export_geopackage():
     except Exception as e:
         log.error("geopackage export: %s", traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
+
+
+def _gpkg_worker(task_id: str, features: list, params: dict):
+    """Background worker for async GeoPackage export."""
+    try:
+        _progress_set(task_id, 'gpkg_export', 'Building GeoPackage…')
+        tmp_path, table_count, elapsed = _gpkg_core(features, params, task_id=task_id)
+        if table_count == 0:
+            _progress_error(task_id, 'No layers selected')
+            return
+        # Move result to well-known location
+        dest = _RESULTS_DIR / f"{task_id}.gpkg"
+        import shutil
+        shutil.move(tmp_path, str(dest))
+        _progress_done(task_id)
+        log.info("Async GPKG task %s completed: %d tables, %.1fs", task_id, table_count, elapsed)
+    except Exception as e:
+        log.error("Async GPKG task %s failed: %s", task_id, traceback.format_exc())
+        _progress_error(task_id, str(e))
+
+
+@app.route('/api/v1/export/geopackage/download/<task_id>', methods=['GET'])
+def download_gpkg(task_id):
+    """Download a completed async GeoPackage export."""
+    if not task_id or not re.match(r'^[a-f0-9\-]+$', task_id):
+        return _error('Invalid task_id', 400)
+    dest = _RESULTS_DIR / f"{task_id}.gpkg"
+    if not dest.exists():
+        return _error('GeoPackage not found or not ready yet', 404)
+    try:
+        resp = send_file(
+            str(dest), mimetype='application/geopackage+sqlite3',
+            as_attachment=True, download_name='landscape_export.gpkg',
+        )
+        # Clean up after download
+        @resp.call_on_close
+        def _cleanup():
+            try:
+                dest.unlink(missing_ok=True)
+                (_PROGRESS_DIR / f"{task_id}.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+        return resp
+    except Exception as e:
+        log.error("GPKG download failed: %s", e)
+        return _error(f"Download error: {e}", 500)
+
+
+def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
+    """Core GeoPackage building logic. Returns (tmp_path, table_count, elapsed_s)."""
+    t0 = time.time()
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+
+    # --- Parse layer selection params ---
+    _bool = lambda k, d='false': str(params.get(k, d)).lower() in ('true', '1', 'yes')
+    include_dtm = _bool('include_dtm', 'true') or _bool('include_dsm', 'true')
+    include_segments = _bool('include_segments', 'false')
+    include_ortho_legacy = _bool('include_ortho', 'false')
+
+    ortho_years_str = params.get('ortho_years', '')
+    ortho_years = [int(y.strip()) for y in ortho_years_str.split(',') if y.strip().isdigit()] if ortho_years_str else []
+    if include_ortho_legacy and not ortho_years:
+        ortho_years = [ti.dataset_to_year(dataset)]
+
+    raster_layers_str = params.get('raster_layers', '')
+    raster_layers = [x.strip() for x in raster_layers_str.split(',') if x.strip()] if raster_layers_str else []
+
+    type_filter_str = params.get('types', None)
+    type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
+    color_mode = params.get('color_mode', 'type')
+
+    feat = features[0]
+    geom = feat['geometry']
+    geom_3035 = ti.geometry_to_3035(geom)
+    if geom.geom_type == 'Point':
+        geom_3035 = geom_3035.buffer(100)
+    _validate_area(geom_3035)
+
+    _progress_set(task_id, 'gpkg_raster', 'Reading DTM/DSM…')
+    data = raster_io.read_dtm_dsm(geom_3035, dataset)
+    dtm = data['dtm']
+    dsm = data['dsm']
+    ndsm = data['ndsm']
+    tf = data['transform']
+    h, w = data['shape']
+    mask = data['mask']
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.gpkg', delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    os.unlink(tmp_path)  # GPKG driver needs a fresh path
+
+    table_count = 0
+
+    def _write_gpkg_table(name, arrays_list, dtype='float32', descriptions=None):
+        """Write one raster table to the GPKG. First call creates, rest append."""
+        nonlocal table_count
+        n = len(arrays_list)
+        opts = dict(
+            driver='GPKG', width=w, height=h, count=n,
+            dtype=dtype, crs='EPSG:3035', transform=tf,
+            RASTER_TABLE=name, RASTER_IDENTIFIER=name,
+        )
+        if dtype == 'float32':
+            opts['nodata'] = float('nan')
+        if table_count > 0:
+            opts['APPEND_SUBDATASET'] = 'YES'
+        with rasterio.open(tmp_path, 'w', **opts) as dst:
+            for i, arr in enumerate(arrays_list, 1):
+                out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
+                dst.write(out, i)
+                if descriptions and i <= len(descriptions):
+                    dst.set_band_description(i, descriptions[i - 1])
+        table_count += 1
+        log.info("GPKG table %s: %d bands (%s)", name, n, dtype)
+
+    # --- Core DTM/DSM/nDSM (1 band each = cleaner in QGIS) ---
+    if include_dtm:
+        _progress_set(task_id, 'gpkg_dtm', 'Writing DTM/DSM/nDSM…')
+        _write_gpkg_table('DTM', [dtm.astype(np.float32)])
+        _write_gpkg_table('DSM', [dsm.astype(np.float32)])
+        _write_gpkg_table('nDSM', [ndsm.astype(np.float32)])
+
+    # --- Orthophoto for each requested year (RGBA uint8) ---
+    rgb = None
+    for year in ortho_years:
+        try:
+            import ortho_io
+            _progress_set(task_id, 'gpkg_ortho', f'Writing ortho {year}…')
+            rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
+            if rgb_arr is not None:
+                bands_u8 = [rgb_arr[0], rgb_arr[1], rgb_arr[2]]
+                descs = ['Red', 'Green', 'Blue']
+                if nir is not None:
+                    bands_u8.append(nir)
+                    descs.append('NIR')
+                _write_gpkg_table(f'Ortho_{year}', bands_u8,
+                                  dtype='uint8', descriptions=descs)
+                if rgb is None:
+                    rgb = rgb_arr
+        except Exception as e:
+            log.warning("Ortho %d for gpkg failed: %s", year, e)
+
+    # --- Segment type/height rasters ---
+    if include_segments:
+        try:
+            _progress_set(task_id, 'gpkg_segments', 'Building segment rasters…')
+            cache_key_check = f"{geom_3035.bounds}_{dataset}"
+            if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
+                log.info("GeoPackage: using cached segmentation")
+                labels = _seg_cache["labels"]
+                objects = _seg_cache["objects"]
+            else:
+                spectral = None
+                if rgb is not None:
+                    import ortho_io
+                    _, nir_arr = ortho_io.read_ortho_for_als(data)
+                    spectral = ortho_io.compute_spectral_indices(rgb, nir=nir_arr)
+                    spectral["red"] = rgb[0].astype(np.float32)
+                    spectral["green"] = rgb[1].astype(np.float32)
+                    spectral["blue"] = rgb[2].astype(np.float32)
+                    if nir_arr is not None:
+                        spectral["nir"] = nir_arr.astype(np.float32)
+                result = seg.segment_and_classify(
+                    dtm, dsm, mask, tf, spectral=spectral,
+                    observation_year=ti.dataset_to_year(dataset),
+                )
+                objects = result['objects']
+                labels = result['labels']
+
+            if type_filter:
+                filtered_ids = {o.obj_id for o in objects if o.obj_type in type_filter}
+            else:
+                filtered_ids = {o.obj_id for o in objects}
+
+            type_raster = np.zeros((h, w), dtype=np.float32)
+            obj_map = {o.obj_id: o for o in objects}
+            for oid in filtered_ids:
+                if oid in obj_map:
+                    type_raster[labels == oid] = float(obj_map[oid].type_code)
+            height_raster = np.where(ndsm > 0, ndsm, 0).astype(np.float32)
+
+            _write_gpkg_table('segment_type', [type_raster])
+            _write_gpkg_table('segment_height', [height_raster])
+        except Exception as e:
+            log.warning("Segments for gpkg failed: %s", e)
+
+    # --- Rendered RGBA raster overlays ---
+    geom_wgs = _extract_single_geom(features)
+    for rlayer in raster_layers:
+        try:
+            _progress_set(task_id, 'gpkg_overlay', f'Rendering {rlayer}…')
+            rgba = _render_overlay_for_gpkg(
+                rlayer, data, geom_3035, geom_wgs, dataset,
+                type_filter, color_mode, params,
+            )
+            if rgba is not None:
+                bands_u8 = [rgba[:, :, i] for i in range(4)]
+                _write_gpkg_table(rlayer, bands_u8, dtype='uint8',
+                                  descriptions=['R', 'G', 'B', 'A'])
+        except Exception as e:
+            log.warning("Raster overlay %s for gpkg failed: %s", rlayer, e)
+
+    elapsed = round(time.time() - t0, 2)
+    return tmp_path, table_count, elapsed
 
 
 def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
@@ -1604,86 +1553,6 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# 4. OBJECT RASTER
-# ---------------------------------------------------------------------------
-
-@app.route('/api/v1/objects/raster', methods=['POST'])
-def objects_raster():
-    try:
-        t0 = time.time()
-        features = _get_geometry()
-        params = _get_params()
-        dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        resolution = float(params.get('resolution', 1.0))
-        min_height = float(params.get('min_height', 0.2))
-        min_area = int(params.get('min_area', 2))
-        include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
-        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
-
-        feat = features[0]
-        geom = feat['geometry']
-        geom_3035 = ti.geometry_to_3035(geom)
-        if geom.geom_type == 'Point':
-            geom_3035 = geom_3035.buffer(100)
-        _validate_area(geom_3035)
-
-        temporal_std, temporal_range, n_dates = None, None, 1
-        if include_temporal:
-            try:
-                multi = raster_io.read_multi_date_ndsm(geom_3035)
-                data = {
-                    'dtm': multi['dtm'], 'dsm': multi['dsm'],
-                    'ndsm': multi['ndsm'], 'mask': multi['mask'],
-                    'transform': multi['transform'], 'crs': multi['crs'],
-                    'shape': multi['shape'],
-                }
-                temporal_std = multi['temporal_std']
-                temporal_range = multi['temporal_range']
-                n_dates = len(multi['dates_loaded'])
-            except Exception as e:
-                log.warning("Multi-temporal load failed: %s", e)
-                data = raster_io.read_dtm_dsm(geom_3035, dataset)
-        else:
-            data = raster_io.read_dtm_dsm(geom_3035, dataset)
-
-        rgb, spectral = (None, None)
-        if include_ortho:
-            rgb, spectral = _try_read_ortho(data)
-
-        objects = oc.classify_objects(
-            data['ndsm'], data['dtm'], data['mask'], data['transform'],
-            min_height=min_height, min_area=min_area,
-            dsm=data['dsm'], rgb=rgb, spectral=spectral,
-            temporal_std=temporal_std, temporal_range=temporal_range,
-            n_temporal_dates=n_dates,
-        )
-
-        type_band, height_band, out_tf = oc.create_classified_raster(
-            data['ndsm'], data['dtm'], data['dsm'], data['mask'],
-            data['transform'], objects, output_resolution=resolution,
-            spectral=spectral,
-        )
-
-        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-            tmp_path = tmp.name
-        h, w = type_band.shape
-        with rasterio.open(tmp_path, 'w', driver='GTiff', width=w, height=h, count=2,
-                           dtype='float32', crs='EPSG:3035', transform=out_tf, nodata=-9999) as dst:
-            dst.write(type_band.astype(np.float32), 1)
-            dst.write(height_band, 2)
-            dst.set_band_description(1, 'object_type_code')
-            dst.set_band_description(2, 'object_height_m')
-            dst.update_tags(1, **{f'OBJECT_TYPE_{v}': k for k, v in oc.OBJECT_TYPES.items()})
-
-        return send_file(tmp_path, mimetype='image/tiff', as_attachment=True,
-                         download_name=f'objects_{dataset}.tif')
-    except ValueError as e:
-        return _error(str(e))
-    except Exception as e:
-        log.error(traceback.format_exc())
-        return _error(f"Internal error: {e}", 500)
 
 
 # ---------------------------------------------------------------------------
@@ -2593,7 +2462,7 @@ def info():
         "datasets_als": {k: {"dtm": True, "dsm": True} for k in sorted(ti.DATASETS.keys())},
         "datasets_ortho": ["20220128 (RGB 50km tiles)"],
         "tiles": len(ti.TILE_COORDS),
-        "landscape_types": oc.LANDSCAPE_TYPES,
+        "landscape_types": seg.OBJECT_TYPES,
         "data_sources": {
             "bev_als_dtm_dsm": "1m resolution, 3 dates (2022/2023/2024)",
             "bev_dop_rgbi": "0.2m orthophoto, 47 RGBI operates",
@@ -2606,9 +2475,7 @@ def info():
         "endpoints": {
             "POST /api/v1/elevation": "Enrich features with DSM/DTM elevation",
             "POST /api/v1/terrain": "Terrain characterisation (slope, ruggedness, etc.)",
-            "POST /api/v1/objects": "Object detection and classification (10 landscape types)",
             "POST /api/v1/segment": "Watershed segmentation: 25 object types + 11 group types (Felzenszwalb+RAG)",
-            "POST /api/v1/objects/raster": "Classified object raster download (GeoTIFF)",
             "POST /api/v1/changes": "Temporal change detection (earthworks, trees, buildings, roads)",
             "POST /api/v1/changes/trees": "Per-tree growth / felling analysis",
             "POST /api/v1/changes/summary": "Multi-epoch change summary (2022→2023→2024)",
@@ -2617,6 +2484,81 @@ def info():
         },
         "max_area_sqkm": MAX_AREA_SQM / 1e6,
     })
+
+
+# ---------------------------------------------------------------------------
+# LAYER AVAILABILITY
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/layers', methods=['GET'])
+def layers_availability():
+    """Return which data layers are available for a given bounding box.
+
+    Query params:
+      bbox=lon_min,lat_min,lon_max,lat_max   (WGS84)
+    """
+    try:
+        import ortho_io
+        bbox_str = request.args.get('bbox', '')
+        if not bbox_str:
+            return _error('bbox parameter required (lon_min,lat_min,lon_max,lat_max)')
+        parts = [float(x.strip()) for x in bbox_str.split(',')]
+        if len(parts) != 4:
+            return _error('bbox must have 4 values: lon_min,lat_min,lon_max,lat_max')
+        lon_min, lat_min, lon_max, lat_max = parts
+
+        # Tile coverage check
+        from shapely.geometry import box as shp_box
+        bbox_wgs = shp_box(lon_min, lat_min, lon_max, lat_max)
+        geom_3035 = ti.geometry_to_3035(bbox_wgs)
+        b = geom_3035.bounds
+        tiles = ti.find_tiles_for_bbox(b[0], b[1], b[2], b[3])
+        has_tiles = len(tiles) > 0
+
+        # RGBI operates per year (needed for CIR; ortho falls back to DOP)
+        rgbi_by_year = {}
+        for year in (2024, 2023, 2020):
+            try:
+                operates = ortho_io.find_rgbi_operates(
+                    lat_min, lon_min, lat_max, lon_max, year=year,
+                )
+                rgbi_by_year[str(year)] = len(operates) > 0
+            except Exception:
+                rgbi_by_year[str(year)] = False
+
+        # Ortho: RGBI operates preferred, but DOP (2022) is the fallback
+        # So ortho is available if tiles exist (DOP covers all Austria)
+        # We mark the year that has RGBI as "best" but the ~2020 slot
+        # also covers the DOP 2022 fallback.
+        ortho_result = {
+            "2024": rgbi_by_year.get("2024", False) or has_tiles,
+            "2023": rgbi_by_year.get("2023", False),
+            "2020": has_tiles,  # DOP ~2022 always available where tiles exist
+        }
+
+        # CIR requires NIR from RGBI operates — no DOP fallback
+        cir_result = {
+            "2024": rgbi_by_year.get("2024", False),
+            "2023": rgbi_by_year.get("2023", False),
+            "2020": rgbi_by_year.get("2020", False),
+        }
+
+        dtm_result = {y: has_tiles for y in ('2024', '2023', '2022')}
+        dsm_result = {y: has_tiles for y in ('2024', '2023', '2022')}
+        hansen_available = has_tiles
+
+        return jsonify({
+            "ortho": ortho_result,
+            "cir": cir_result,
+            "dtm": dtm_result,
+            "dsm": dsm_result,
+            "hansen": hansen_available,
+        })
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error("layers endpoint: %s", traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
 
 
 @app.route('/api/v1/docs/llm.txt', methods=['GET'])

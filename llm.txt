@@ -1,7 +1,7 @@
-# Austrian Landscape Transformation Analysis API — v4.0
+# Austrian Landscape Transformation Analysis API — v5.0
 # Base URL: https://srtm-lidar-at.exe.xyz:8000
 # All geometry input in WGS84 (lon/lat). Processing in EPSG:3035.
-# Max query area: 25 km².
+# Max query area: 25 km². Territory: Austria only.
 
 ## Philosophy
 
@@ -13,26 +13,24 @@ natural and detecting terrain modification.
 ## Data Sources (6 layers)
 
 1. BEV ALS DTM + DSM: 1m resolution, EPSG:3035, 3 dates (2022/2023/2024)
-2. BEV DOP RGBI Orthophoto: 0.2m resolution, 47 operates covering Austria
+2. BEV DOP RGBI Orthophoto: 0.2m resolution, 47 operates + DOP RGB fallback
 3. Copernicus Sentinel-2: 10m NDVI growing-season composite (via openEO)
 4. Copernicus ESA WorldCover: 10m land cover classification
 5. Copernicus Sentinel-1 SAR: VV+VH backscatter
 6. Austrian Cadastre: mm-precision building footprint polygons (ground truth)
 
+## Step-Change Features (v3.1+)
+
+1. GLCM Texture from 20cm orthophoto (0.5m GLCM → contrast/entropy/homogeneity)
+2. NDVI Harmonic Phenology (monthly → mean + amplitude + phase)
+3. Sentinel-1 SAR Backscatter (VV+VH — orthogonal to optical)
+4. Random Forest Classifier (44-feature vector, cadastre-trained, OOB validation)
+
 ## NDVI Fusion
 
-BEV ortho provides 1m spatial detail but has seasonal bias (arbitrary
-capture date — could be winter).  Copernicus provides reliable
-growing-season median (Apr-Sep) but at coarse 10m resolution that bleeds
-across boundaries.  The API fuses both:
-
-  1. Block-average BEV and Copernicus NDVI at ~30m windows
-  2. Compute seasonal offset = Copernicus_block − BEV_block
-  3. Smooth offset field (σ=15m) to avoid 10m staircase artefacts
-  4. fused = BEV + smoothed_offset (clamped to [-1, 1])
-
+BEV ortho (1m spatial) fused with Copernicus growing-season median (10m):
+  fused = BEV + smoothed(Copernicus_block − BEV_block)
 Result: 1m spatial precision with growing-season absolute levels.
-Fallback: BEV alone → Copernicus alone → no NDVI.
 
 ## 25 Object Types (individual, /api/v1/segment)
 
@@ -59,12 +57,12 @@ Fallback: BEV alone → Copernicus alone → no NDVI.
 | 33 | garden | Mixed veg near buildings |
 | 40 | bare_soil | Low NDVI, flat-moderate slope |
 | 41 | rock | Steep + very rough DTM + low NDVI |
-| 50 | excavation | DTM lowered >0.20m between dates, ground-level (≥25m²) |
-| 51 | fill | DTM raised >0.20m between dates, ground-level (≥25m²) |
-| 52 | tree_loss | Trees felled/died: nDSM dropped >2m, terrain intact (≥8m²) |
-| 53 | construction | New structure, OR site clearing (tree_loss + earthworks) |
+| 50 | excavation | DTM lowered >0.20m between dates (≥25m²) |
+| 51 | fill | DTM raised >0.20m between dates (≥25m²) |
+| 52 | tree_loss | nDSM dropped >2m, terrain intact (≥8m²) |
+| 53 | construction | New structure or site clearing |
 
-## 11 Group Types (hierarchical merge of adjacent objects)
+## 11 Group Types (hierarchical merge)
 
 | Code | Group | Members merged |
 |------|-------|---------------|
@@ -80,77 +78,47 @@ Fallback: BEV alone → Copernicus alone → no NDVI.
 | 130 | quarry | excavation + fill |
 | 131 | construction_site | construction + excavation + fill |
 
-## Key Detection Methods
-
-- **Segmentation**: Sobel fused gradient (DTM+DSM+nDSM+RGBI+NDVI weighted)
-  → Felzenszwalb over-segmentation → RAG boundary merge.
-  Two-layer: ground (<0.3m) and elevated (≥0.3m) segmented separately.
-
-- **NDVI fusion**: BEV 1m spatial + Copernicus growing-season seasonal
-  correction.  Eliminates winter bias while preserving road/grass boundaries.
-
-- **Engineered surfaces**: DTM roughness <0.04m at 3m scale + slope <15°.
-  Roads identified even when coarse NDVI shows vegetation bleed.
-
-- **Buildings**: Multi-criteria score (DSM roughness + height uniformity +
-  slope + NDVI + brightness + temporal stability + ESA built-up prior).
-  Calibrated against BEV cadastre footprints.
-
-- **Disturbance**: Three-tier detection with size gates:
-  - Excavation/fill: DTM change >0.20m, ground-level only (≥25m²).
-    Elevated objects filtered (DTM noise from tree crown interpolation).
-  - Clear_cut: nDSM dropped >2m, terrain intact. Captures individual
-    tree death/felling (≥8m²) and larger timber harvest patches.
-  - Construction: nDSM grew >2m (non-vegetation), OR tree_loss combined
-    with earthworks (DTM change >0.15m = site clearing for development).
-  - Vegetation filter: growing trees (high NDVI + rough DSM) excluded
-    from construction false positives.
-
-- **Temporal analysis**: 3-date LIDAR (2022/2023/2024) detects terrain
-  modification, building construction, tree growth/felling.
-
 ## Endpoints
 
 ### POST /api/v1/segment  ← PRIMARY
-Watershed-based segmentation and classification. 25 types + 11 groups.
-Body: GeoJSON geometry
+Watershed segmentation and classification. 25 types + 11 groups.
+Supports async mode for long-running analysis.
+
+Body: GeoJSON, KML, coordinates, or file upload.
 Params:
-  dataset           — ALS date (default 20240915)
-  min_object_size   — min segment size in pixels/m² (default 30)
-  felz_scale        — Felzenszwalb scale, higher = fewer segments (default 150)
-  rag_threshold     — RAG merge threshold (default 0.12)
-  include_ortho     — "true" for BEV RGBI 1m (NDVI, NIR, brightness)
-  include_temporal  — "true" for 3-date LIDAR (2022/2023/2024)
-  include_copernicus — "true" for Sentinel-2 NDVI + ESA land cover
-  include_cadastre  — "true" for cadastre building footprints
-  types             — comma-separated type filter (e.g. "roof,tree,road")
-  groups            — comma-separated group filter (e.g. "building,forest")
-Returns: FeatureCollection of objects with:
+  dataset            ALS date (default 20240915)
+  min_object_size    min segment m² (default 30)
+  felz_scale         Felzenszwalb scale (default 150)
+  rag_threshold      RAG merge threshold (default 0.12)
+  include_ortho      "true" for BEV RGBI (NDVI, NIR, brightness)
+  include_temporal   "true" for 3-date LIDAR (2022/2023/2024)
+  include_copernicus "true" for Sentinel-2 NDVI + ESA land cover + SAR
+  include_cadastre   "true" for cadastre building footprints
+  include_hansen     "true" for Hansen Global Forest Change calibration
+  types              comma-separated type filter (e.g. "roof,tree,road")
+  groups             comma-separated group filter (e.g. "building,forest")
+  async              "true" → returns 202 with {task_id}, poll progress
+  task_id            client-provided UUID for progress tracking
+
+Async flow:
+  1. POST /api/v1/segment?async=true → 202 {task_id, status: "running"}
+  2. GET  /api/v1/segment/progress?task_id=... → {active, step, detail, elapsed, done, error}
+  3. GET  /api/v1/segment/result?task_id=...   → full GeoJSON result
+
+Returns: FeatureCollection with per-object properties:
   type, type_code, group_id, group_type, is_manmade, confidence,
   height_max_m, height_mean_m, height_p90_m, area_sqm,
-  compactness, elongation, slope_mean, roughness,
-  ndvi_mean (BEV 1m), ndvi_fused (seasonal-corrected), nir_mean,
-  brightness_mean, height_change, dtm_change, temporal_stability
-
-### POST /api/v1/objects  ⚠️ DEPRECATED — use /api/v1/segment
-Legacy 10-type pixel-level landscape classifier.
-Still functional but superseded by watershed segmentation.
-Params: dataset, min_height, min_area, include_ortho, include_temporal,
-  include_copernicus, include_cadastre, object_types
-Returns: summary + FeatureCollection with 10 landscape types:
-  1=engineered_surface, 2=engineered_slope, 3=excavation, 4=fill,
-  5=building, 6=infrastructure, 7=tree_canopy, 8=vegetation,
-  9=bare_natural, 10=recent_disturbance
+  compactness, elongation, solidity, extent, dsm_edge_strength,
+  slope_mean, roughness, ndvi_mean, ndvi_fused, nir_mean,
+  brightness_mean, height_change, dtm_change, temporal_stability,
+  glcm_entropy, glcm_homogeneity, texture_complexity,
+  sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class
 
 ### POST /api/v1/elevation
 Enrich features with DSM/DTM elevation values.
 
 ### POST /api/v1/terrain
 Terrain characterisation: slope, aspect, ruggedness, curvature.
-
-### POST /api/v1/objects/raster
-Download classified raster as GeoTIFF.
-Band 1: landscape type code (uint8). Band 2: height (float32).
 
 ### POST /api/v1/changes
 Temporal change detection between two ALS dates.
@@ -162,34 +130,92 @@ Per-tree growth/felling analysis between dates.
 ### POST /api/v1/changes/summary
 Multi-epoch change summary (2022→2023→2024).
 
+### POST /api/v1/export/geopackage
+Export all layers as a single GeoPackage file.
+Supports async mode (async=true → poll + download).
+Params:
+  include_dtm        DTM/DSM/nDSM bands (default true)
+  include_dsm        same as above
+  include_segments   segment_type + segment_height bands
+  ortho_years        comma-separated (e.g. 2024,2023)
+  raster_layers      comma-separated overlay IDs to render as RGBA
+  types              segment type filter
+  color_mode         type|height
+  async              "true" → 202 with {task_id}
+Async flow:
+  1. POST /api/v1/export/geopackage?async=true → 202 {task_id}
+  2. GET  /api/v1/segment/progress?task_id=... → poll
+  3. GET  /api/v1/export/geopackage/download/{task_id} → binary .gpkg
+
+### POST /api/v1/segment/overlay
+Rendered RGBA PNG overlay of segmentation results.
+Params: types, color_mode (type|height)
+
+### GET /api/v1/layers?bbox=lon_min,lat_min,lon_max,lat_max
+Return which data layers are available for a bounding box.
+Response:
+  {
+    "ortho": {"2024": true, "2023": false, "2020": true},
+    "cir":   {"2024": true, "2023": false, "2020": false},
+    "dtm":   {"2024": true, "2023": true, "2022": true},
+    "dsm":   {"2024": true, "2023": true, "2022": true},
+    "hansen": true
+  }
+Ortho falls back to DOP RGB tiles (~2020/2022 vintage).
+CIR requires RGBI operates with NIR band (no fallback).
+
 ### GET /api/v1/info
 Dataset inventory, landscape types, data sources.
 
-### GET /api/v1/docs/llm.txt
-This document.
+### GET /api/v1/training/status
+RF classifier training job status, current KG, model info.
+
+### POST /api/v1/classifier/train
+Train/retrain the Random Forest classifier on cadastre ground truth.
+Params: bbox (lon_min,lat_min,lon_max,lat_max), n_estimators, max_depth
+
+### Overlay endpoints (POST, return PNG with X-Bounds header)
+  /api/v1/dtm/overlay      DTM hillshade
+  /api/v1/dsm/overlay      nDSM height overlay (viridis colormap)
+  /api/v1/ortho/overlay    RGB orthophoto
+  /api/v1/cir/overlay      Color Infrared false-color (NIR→R, R→G, G→B)
+  /api/v1/hansen/overlay    Hansen forest change overlay
+  /api/v1/lidar/overlay     Combined DTM+DSM overlay
+
+### GET /api/v1/lidar/geotiff, /api/v1/ortho/geotiff
+Download raw raster data as GeoTIFF.
 
 ## Geometry Input
 
 All POST endpoints accept:
 - GeoJSON Feature or FeatureCollection in body
-- {"geometry": <GeoJSON geometry>, ...params} in body
+- {"geometry": <GeoJSON>, ...params} in body
 - KML string in body
 - Coordinate string: "lon,lat" or "lon,lat;lon,lat;..."
-- File upload (multipart)
+- File upload (multipart: KML, GeoJSON, Shapefile, GPX)
 
-Point inputs are automatically buffered (100m for objects/segment, 200m for changes).
+Multi-feature inputs (FeatureCollection, multi-placemark KML) are
+automatically unioned into a single convex hull boundary.
+Geometries outside Austria (lon 9.5-17.2, lat 46.3-49.0) are rejected.
+Areas exceeding 25 km² are rejected.
+Point inputs are buffered to 100m radius.
 
 ## Examples
 
-# Watershed segmentation with all data sources
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?include_ortho=true&include_temporal=true&include_copernicus=true' \
+# Async watershed segmentation with all data sources
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?async=true&include_ortho=true&include_temporal=true&include_copernicus=true&include_cadastre=true' \
   -H 'Content-Type: application/json' \
   -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+# → {"task_id": "...", "status": "running"}
 
-# Filter to buildings only
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?include_ortho=true&types=roof,wall,greenhouse' \
-  -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+# Poll progress
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/progress?task_id=...'
+
+# Get result
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/result?task_id=...'
+
+# Check layer availability
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/layers?bbox=15.1,47.1,15.2,47.2'
 
 # Change detection
 curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes \

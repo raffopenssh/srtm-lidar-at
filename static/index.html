@@ -79,8 +79,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .meta-info{font-size:10px;color:#666;margin-bottom:4px;padding:3px 6px;background:#f0f8ff;border-radius:3px}
 
 /* ===== DOWNLOAD FAB on map ===== */
-.fab-download{position:absolute;bottom:24px;left:14px;z-index:1000;display:none}
+.fab-download{position:absolute;bottom:24px;left:14px;z-index:1000;display:none;gap:8px;align-items:center}
 .fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
+
+/* ===== SHARE BUTTON ===== */
+.share-toast{position:fixed;bottom:70px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:6px 12px;border-radius:6px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .2s;pointer-events:none}
+.share-toast.show{opacity:1}
 
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
@@ -228,10 +232,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
     </div>
   </div>
 
-  <!-- Download FAB -->
+  <!-- Download FAB + Share -->
   <div class="fab-download" id="fab-download">
+    <button class="btn" id="btn-share" title="Copy share link">🔗 Share</button>
     <button class="btn" onclick="openResultModal()">📥 Results</button>
   </div>
+  <div class="share-toast" id="share-toast">Link copied!</div>
 </div>
 
 <!-- ===== RESULT MODAL ===== -->
@@ -691,6 +697,137 @@ async function reloadRasterOverlay(){
   hideLoading();
 }
 
+// ============ SHARE ============
+function getShareState(){
+  const c=map.getCenter(),z=map.getZoom();
+  const layers=[];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.checked)layers.push(cb.dataset.lyr);});
+  const opacities={};
+  document.querySelectorAll('[data-op]').forEach(r=>{opacities[r.dataset.op]=parseInt(r.value);});
+  return {
+    v:1,
+    center:[+c.lat.toFixed(6),+c.lng.toFixed(6)],
+    zoom:z,
+    endpoint:document.getElementById('endpoint').value,
+    min_area:parseInt(document.getElementById('min_area').value)||30,
+    ortho:document.getElementById('include_ortho').checked,
+    temporal:document.getElementById('include_temporal').checked,
+    copernicus:document.getElementById('include_copernicus').checked,
+    cadastre:document.getElementById('include_cadastre').checked,
+    hansen:document.getElementById('include_hansen').checked,
+    colorMode:colorMode,
+    hidden:[...hiddenTypes],
+    layers:layers,
+    opacities:opacities,
+    geometry:document.getElementById('geometry').value,
+    selectedTypes:[...selectedTypes],
+  };
+}
+
+function restoreShareState(s){
+  // Map view
+  if(s.center&&s.zoom) map.setView(s.center,s.zoom);
+  // Sidebar controls
+  if(s.endpoint) document.getElementById('endpoint').value=s.endpoint;
+  if(s.min_area) document.getElementById('min_area').value=s.min_area;
+  if(s.ortho!==undefined) document.getElementById('include_ortho').checked=s.ortho;
+  if(s.temporal!==undefined) document.getElementById('include_temporal').checked=s.temporal;
+  if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
+  if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;
+  if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
+  // Geometry
+  if(s.geometry){
+    document.getElementById('geometry').value=s.geometry;
+    try{
+      const g=JSON.parse(s.geometry);
+      drawnItems.clearLayers();
+      const coords=(g.coordinates||[[]])[0].map(c=>[c[1],c[0]]);
+      if(coords.length) L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+    }catch(e){}
+  }
+  // Object type filter
+  if(s.selectedTypes){
+    selectedTypes.clear();
+    s.selectedTypes.forEach(t=>selectedTypes.add(t));
+    document.querySelectorAll('#ot-dropdown input[type=checkbox]').forEach(cb=>{
+      cb.checked=selectedTypes.has(cb.value);
+    });
+    updateOTLabel();
+  }
+  // Color mode
+  if(s.colorMode&&s.colorMode!==colorMode) setColorMode(s.colorMode);
+  // Hidden legend types
+  hiddenTypes.clear();
+  if(s.hidden) s.hidden.forEach(t=>hiddenTypes.add(t));
+  // Layer opacities
+  if(s.opacities){
+    for(const[id,val] of Object.entries(s.opacities)){
+      const r=document.querySelector(`[data-op="${id}"]`);
+      if(r) r.value=val;
+    }
+  }
+}
+
+async function restoreShareResult(data){
+  // data has {state, result}
+  restoreShareState(data.state);
+  // Set hiddenTypes BEFORE showResultOnMap so buildLegend respects them
+  if(data.state.hidden) data.state.hidden.forEach(t=>hiddenTypes.add(t));
+  if(data.result&&data.result.features){
+    lastResult=data.result;
+    lastEndpoint=data.state.endpoint||'segment';
+    allFeatureData=data.result.features;
+    showResultOnMap(data.result);
+    document.getElementById('fab-download').style.display='flex';
+    applyVis();
+  }
+  // Restore layer checkboxes and load overlays
+  if(data.state.layers){
+    for(const id of data.state.layers){
+      const cb=document.querySelector(`[data-lyr="${id}"]`);
+      if(cb&&!cb.checked){cb.checked=true;handleLayerToggle(id);}
+    }
+  }
+}
+
+document.getElementById('btn-share').onclick=async()=>{
+  const state=getShareState();
+  const payload={state:state};
+  if(lastResult) payload.result=lastResult;
+  const toast=document.getElementById('share-toast');
+  try{
+    const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await resp.json();
+    if(d.error) throw new Error(d.error);
+    const url=location.origin+location.pathname+'?share='+d.id;
+    try{await navigator.clipboard.writeText(url);toast.textContent='\u2705 Link copied!';}catch(ce){const ta=document.createElement('textarea');ta.value=url;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);toast.textContent='\u2705 Link copied!';}
+    toast.classList.add('show');
+    setTimeout(()=>toast.classList.remove('show'),2500);
+  }catch(e){
+    toast.textContent='\u274c '+e.message;
+    toast.classList.add('show');
+    setTimeout(()=>toast.classList.remove('show'),3000);
+  }
+};
+
+// Restore from share link on page load
+(async function checkShareParam(){
+  const p=new URLSearchParams(location.search);
+  const shareId=p.get('share');
+  if(!shareId) return;
+  showLoading('Loading shared view...');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(shareId));
+    if(!resp.ok) throw new Error('Share not found');
+    const data=await resp.json();
+    await restoreShareResult(data);
+    hideLoading('Shared view restored.');
+  }catch(e){
+    hideLoading('Failed to load share: '+e.message);
+    console.error('Share restore failed:',e);
+  }
+})();
+
 // ============ SAMPLE ============
 const SAMPLE={"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
 document.getElementById('btn-sample').onclick=()=>{
@@ -758,7 +895,7 @@ document.getElementById('btn-run').onclick=async()=>{
     if(data.error)throw new Error(data.error);
     lastResult=data;
     if(data.features){allFeatureData=data.features;showResultOnMap(data);}
-    document.getElementById('fab-download').style.display='';
+    document.getElementById('fab-download').style.display='flex';
     hideLoading();
   }catch(e){
     setStatus('Error: '+e.message);

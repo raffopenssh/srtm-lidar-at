@@ -1,3 +1,5 @@
 __pycache__/
 
 rf_training_data/checkpoints/
+
+data/shares/

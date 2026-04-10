@@ -14,6 +14,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import logging
@@ -2280,6 +2281,62 @@ def llm_docs():
     if p.exists():
         return Response(p.read_text(), mimetype='text/plain')
     return Response("Documentation not yet generated.", mimetype='text/plain')
+
+
+# ============ SHARE ============
+
+SHARE_DIR = Path('data/shares')
+SHARE_DIR.mkdir(parents=True, exist_ok=True)
+SHARE_MAX_BYTES = 1_000_000_000  # 1 GB
+
+
+def _share_evict():
+    """Remove oldest share files until total size < SHARE_MAX_BYTES."""
+    files = sorted(SHARE_DIR.glob('*.json.gz'), key=lambda f: f.stat().st_mtime)
+    total = sum(f.stat().st_size for f in files)
+    while total > SHARE_MAX_BYTES and files:
+        victim = files.pop(0)
+        total -= victim.stat().st_size
+        victim.unlink(missing_ok=True)
+        log.info("share: evicted %s (total was %d MB)", victim.name, total // 1_000_000)
+
+
+@app.route('/api/v1/share', methods=['POST'])
+def share_save():
+    """Save analysis result + UI state for sharing. Returns {id, url}."""
+    try:
+        payload = request.get_json(force=True)
+        if not payload:
+            return _error('Empty payload')
+        share_id = uuid.uuid4().hex[:12]
+        data = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
+        (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
+        _share_evict()
+        url = request.url_root.rstrip('/').replace('http://', 'https://') + f'/?share={share_id}'
+        log.info("share: saved %s (%d KB)", share_id, len(data) // 1024)
+        return jsonify({'id': share_id, 'url': url})
+    except Exception as e:
+        log.error("share save: %s", traceback.format_exc())
+        return _error(str(e))
+
+
+@app.route('/api/v1/share/<share_id>', methods=['GET'])
+def share_load(share_id):
+    """Retrieve a saved share."""
+    try:
+        import re
+        if not re.match(r'^[a-f0-9]{12}$', share_id):
+            return _error('Invalid share ID', 400)
+        p = SHARE_DIR / f'{share_id}.json.gz'
+        if not p.exists():
+            return _error('Share not found', 404)
+        data = gzip.decompress(p.read_bytes())
+        # Touch file to keep it alive (LRU)
+        p.touch()
+        return Response(data, mimetype='application/json')
+    except Exception as e:
+        log.error("share load: %s", traceback.format_exc())
+        return _error(str(e))
 
 
 @app.route('/')

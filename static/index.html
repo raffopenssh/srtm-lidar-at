@@ -459,10 +459,17 @@ function updateModalContent(){
     const total=sorted.reduce((s,[,n])=>s+n,0);
     const tiMap=lastEndpoint==='changes/trees'?STATUS_COLORS:lastEndpoint==='changes'?EVENT_COLORS:TYPE_SHAPES;
 
-    html+='<table class="summary-table"><thead><tr><th>Type</th><th style="text-align:right">Count</th><th style="text-align:right">%</th></tr></thead><tbody>';
+    const typeAreas={};
+    for(const f of features){
+      const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+      typeAreas[t]=(typeAreas[t]||0)+(f.properties.area_sqm||0);
+    }
+    html+='<table class="summary-table"><thead><tr><th>Type</th><th style="text-align:right">Count</th><th style="text-align:right">Area</th><th style="text-align:right">%</th></tr></thead><tbody>';
     for(const[t,count]of sorted){
       const info=tiMap[t]||DEF;
-      html+=`<tr><td><span class="swatch" style="background:${info.c}"></span>${t.replace(/_/g,' ')}</td><td style="text-align:right">${count}</td><td style="text-align:right">${(count/total*100).toFixed(1)}%</td></tr>`;
+      const a=typeAreas[t]||0;
+      const aStr=a>=10000?(a/10000).toFixed(2)+' ha':Math.round(a)+' m²';
+      html+=`<tr><td><span class="swatch" style="background:${info.c}"></span>${t.replace(/_/g,' ')}</td><td style="text-align:right">${count}</td><td style="text-align:right">${aStr}</td><td style="text-align:right">${(count/total*100).toFixed(1)}%</td></tr>`;
     }
     html+='</tbody></table>';
   }

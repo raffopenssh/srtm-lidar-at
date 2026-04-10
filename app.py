@@ -217,7 +217,9 @@ def _get_params():
                 'include_copernicus', 'include_cadastre',
                 'include_hansen', 'color_mode', 'types',
                 'ortho_year', 'min_object_size',
-                'felz_scale', 'rag_threshold', 'groups'):
+                'felz_scale', 'rag_threshold', 'groups',
+                'include_dtm', 'include_dsm', 'include_segments',
+                'ortho_years', 'raster_layers'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -1228,33 +1230,57 @@ def export_geopackage():
         h, w = data['shape']
         mask = data['mask']
 
-        tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+        tmp = tempfile.NamedTemporaryFile(suffix='.gpkg', delete=False)
         tmp_path = tmp.name
         tmp.close()
+        os.unlink(tmp_path)  # GPKG driver needs a fresh path
 
-        bands = []
-        arrays = []
+        table_count = 0
 
-        # --- Core DTM/DSM/nDSM ---
+        def _write_gpkg_table(name, arrays_list, dtype='float32', descriptions=None):
+            """Write one raster table to the GPKG. First call creates, rest append."""
+            nonlocal table_count
+            n = len(arrays_list)
+            opts = dict(
+                driver='GPKG', width=w, height=h, count=n,
+                dtype=dtype, crs='EPSG:3035', transform=tf,
+                RASTER_TABLE=name, RASTER_IDENTIFIER=name,
+            )
+            if dtype == 'float32':
+                opts['nodata'] = float('nan')
+            if table_count > 0:
+                opts['APPEND_SUBDATASET'] = 'YES'
+            with rasterio.open(tmp_path, 'w', **opts) as dst:
+                for i, arr in enumerate(arrays_list, 1):
+                    out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
+                    dst.write(out, i)
+                    if descriptions and i <= len(descriptions):
+                        dst.set_band_description(i, descriptions[i - 1])
+            table_count += 1
+            log.info("GPKG table %s: %d bands (%s)", name, n, dtype)
+
+        # --- Core DTM/DSM/nDSM (1 band each = cleaner in QGIS) ---
         if include_dtm:
-            bands += ['DTM', 'DSM', 'nDSM']
-            arrays += [dtm.astype(np.float32), dsm.astype(np.float32), ndsm.astype(np.float32)]
+            _write_gpkg_table('DTM', [dtm.astype(np.float32)])
+            _write_gpkg_table('DSM', [dsm.astype(np.float32)])
+            _write_gpkg_table('nDSM', [ndsm.astype(np.float32)])
 
-        # --- Orthophoto for each requested year ---
+        # --- Orthophoto for each requested year (RGBA uint8) ---
         rgb = None
         for year in ortho_years:
             try:
                 import ortho_io
                 rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
                 if rgb_arr is not None:
-                    for i, ch in enumerate(['R', 'G', 'B']):
-                        bands.append(f'Ortho_{year}_{ch}')
-                        arrays.append(rgb_arr[i].astype(np.float32))
+                    bands_u8 = [rgb_arr[0], rgb_arr[1], rgb_arr[2]]
+                    descs = ['Red', 'Green', 'Blue']
                     if nir is not None:
-                        bands.append(f'Ortho_{year}_NIR')
-                        arrays.append(nir.astype(np.float32))
+                        bands_u8.append(nir)
+                        descs.append('NIR')
+                    _write_gpkg_table(f'Ortho_{year}', bands_u8,
+                                      dtype='uint8', descriptions=descs)
                     if rgb is None:
-                        rgb = rgb_arr  # keep first for segment pipeline
+                        rgb = rgb_arr
             except Exception as e:
                 log.warning("Ortho %d for gpkg failed: %s", year, e)
 
@@ -1296,8 +1322,8 @@ def export_geopackage():
                         type_raster[labels == oid] = float(obj_map[oid].type_code)
                 height_raster = np.where(ndsm > 0, ndsm, 0).astype(np.float32)
 
-                bands += ['segment_type', 'segment_height']
-                arrays += [type_raster, height_raster]
+                _write_gpkg_table('segment_type', [type_raster])
+                _write_gpkg_table('segment_height', [height_raster])
             except Exception as e:
                 log.warning("Segments for gpkg failed: %s", e)
 
@@ -1310,32 +1336,19 @@ def export_geopackage():
                     type_filter, color_mode, params,
                 )
                 if rgba is not None:
-                    for i, ch in enumerate(['R', 'G', 'B', 'A']):
-                        bands.append(f'{rlayer}_{ch}')
-                        arrays.append(rgba[:, :, i].astype(np.float32))
+                    bands_u8 = [rgba[:, :, i] for i in range(4)]
+                    _write_gpkg_table(rlayer, bands_u8, dtype='uint8',
+                                      descriptions=['R', 'G', 'B', 'A'])
             except Exception as e:
                 log.warning("Raster overlay %s for gpkg failed: %s", rlayer, e)
 
-        if not bands:
+        if table_count == 0:
             return _error('No layers selected')
 
-        n_bands = len(arrays)
-        with rasterio.open(
-            tmp_path, 'w', driver='GTiff', width=w, height=h,
-            count=n_bands, dtype='float32', crs='EPSG:3035',
-            transform=tf, nodata=np.nan,
-            compress='deflate', predictor=2, tiled=True,
-        ) as dst:
-            for i, (arr, name) in enumerate(zip(arrays, bands), 1):
-                out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
-                dst.write(out, i)
-                dst.set_band_description(i, name)
-
-        log.info("GeoPackage export: %d bands (%s), %.1fs",
-                 n_bands, ','.join(bands), time.time() - t0)
+        log.info("GeoPackage export: %d tables, %.1fs", table_count, time.time() - t0)
         return send_file(
-            tmp_path, mimetype='image/tiff',
-            as_attachment=True, download_name='landscape_export.tif',
+            tmp_path, mimetype='application/geopackage+sqlite3',
+            as_attachment=True, download_name='landscape_export.gpkg',
         )
     except ValueError as e:
         return _error(str(e))

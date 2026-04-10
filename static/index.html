@@ -2,37 +2,56 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Austrian Landscape Analysis</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;background:#f5f5f5}
-#sidebar{width:420px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;overflow:hidden;z-index:2000}
-#sidebar h1{font-size:16px;padding:12px 16px;background:#1a1a2e;color:#fff;flex-shrink:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;height:100dvh;background:#f5f5f5;overflow:hidden}
+
+/* ===== SIDEBAR ===== */
+#sidebar{width:380px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;z-index:2000;overflow:hidden}
+#sidebar h1{font-size:15px;padding:10px 14px;background:#1a1a2e;color:#fff;flex-shrink:0;display:flex;align-items:center;gap:6px}
 #sidebar h1 span{color:#7fdbca}
-.controls{padding:10px 16px;flex-shrink:0;overflow-y:auto}
+.controls{padding:10px 14px;flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
 label{display:block;font-size:12px;font-weight:600;color:#555;margin:6px 0 3px}
-select,input[type=number],input[type=text],textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px}
-textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
+select,input[type=number],input[type=text]{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px;background:#fff}
+textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;height:60px;resize:none}
 .row{display:flex;gap:8px}.row>*{flex:1}
-.btn{padding:7px 14px;background:#0d7377;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600}
+.btn{padding:7px 14px;background:#0d7377;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap}
 .btn:hover{background:#14a3a8}.btn:disabled{opacity:.5;cursor:wait}
-.btn-sm{padding:4px 10px;font-size:11px}
+.btn-sm{padding:5px 10px;font-size:11px}
 .btn-outline{background:transparent;color:#0d7377;border:1px solid #0d7377}
 .btn-outline:hover{background:#e8f7f7}
-#result-area{flex:1;overflow:auto;padding:0 16px 12px;min-height:0}
-.dl-bar{display:flex;gap:4px;flex-wrap:wrap;padding:6px 0}
-#result{font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;background:#f9f9f9;padding:8px;border-radius:4px;border:1px solid #eee;min-height:40px;max-height:100%;overflow:auto}
-#map-area{flex:1;position:relative}
-#map{height:100%}
-.status{padding:4px 16px;font-size:11px;color:#888;background:#f0f0f0;border-top:1px solid #ddd;flex-shrink:0;display:flex;align-items:center;gap:8px}
+.btn-danger{background:#c0392b}.btn-danger:hover{background:#e74c3c}
 .hint{font-size:11px;color:#999;margin-top:2px}
 .cb-row{display:flex;gap:10px;align-items:center;margin:4px 0;flex-wrap:wrap}
 .cb-row label{margin:0;display:flex;align-items:center;gap:4px;font-weight:500;cursor:pointer;font-size:12px}
+.status{padding:4px 14px;font-size:10px;color:#888;background:#f0f0f0;border-top:1px solid #ddd;flex-shrink:0;display:flex;align-items:center;gap:6px;min-height:28px}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ccc;border-top-color:#0d7377;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Object type dropdown */
+.ot-wrap{position:relative}
+.ot-select{display:flex;align-items:center;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;background:#fff;min-height:28px;user-select:none}
+.ot-select:hover{border-color:#0d7377}
+.ot-dropdown{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:0 0 4px 4px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:9999;max-height:260px;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0;display:none}
+.ot-dropdown.open{display:block}
+.ot-dropdown .ot-group{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:6px 10px 2px;user-select:none}
+.ot-dropdown label{display:flex;align-items:center;gap:6px;padding:3px 10px;font-size:12px;font-weight:400;cursor:pointer;margin:0}
+.ot-dropdown label:hover{background:#f0f8f8}
+.ot-dropdown label .ot-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.ot-dropdown .ot-actions{display:flex;gap:4px;padding:4px 10px;border-top:1px solid #eee;margin-top:2px}
+.ot-dropdown .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
+.ot-dropdown .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
+
+/* ===== MAP ===== */
+#map-area{flex:1;position:relative;min-width:0;min-height:0}
+#map{height:100%;width:100%}
+
 /* Layer panel */
-.layer-panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);padding:10px 14px;font-size:12px;min-width:200px;max-height:80vh;overflow-y:auto}
+.layer-panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);padding:10px 14px;font-size:12px;min-width:200px;max-height:70vh;overflow-y:auto}
 .layer-panel h3{font-size:12px;margin-bottom:6px;color:#333}
 .lp-group{margin:4px 0}
 .lp-group-header{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 2px;cursor:pointer;user-select:none}
@@ -43,17 +62,7 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
 .lyr input[type=checkbox]{margin:0}
 .lyr input[type=range]{width:55px;height:14px}
 .lyr-label{flex:1;font-size:11px}
-/* Object type multi-select */
-.ot-select{display:flex;align-items:center;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;background:#fff;min-height:28px;user-select:none}
-.ot-select:hover{border-color:#0d7377}
-.ot-dropdown{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:0 0 4px 4px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:9999;max-height:260px;overflow-y:auto;padding:4px 0}
-.ot-dropdown .ot-group{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:6px 10px 2px;user-select:none}
-.ot-dropdown label{display:flex;align-items:center;gap:6px;padding:3px 10px;font-size:12px;font-weight:400;cursor:pointer;margin:0}
-.ot-dropdown label:hover{background:#f0f8f8}
-.ot-dropdown label .ot-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
-.ot-dropdown .ot-actions{display:flex;gap:4px;padding:4px 10px;border-top:1px solid #eee;margin-top:2px}
-.ot-dropdown .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
-.ot-dropdown .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
+
 /* Legend */
 .legend{position:absolute;bottom:24px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:10px 12px;font-size:11px;max-width:260px;max-height:50vh;overflow-y:auto}
 .legend h4{font-size:11px;margin-bottom:4px;color:#333}
@@ -68,24 +77,66 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
 .color-mode-bar button{flex:1;font-size:10px;padding:3px 6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;border-radius:3px}
 .color-mode-bar button.active{background:#0d7377;color:#fff;border-color:#0d7377}
 .meta-info{font-size:10px;color:#666;margin-bottom:4px;padding:3px 6px;background:#f0f8ff;border-radius:3px}
-/* Spinner */
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid #ccc;border-top-color:#0d7377;border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-/* Mobile */
+
+/* ===== DOWNLOAD FAB on map ===== */
+.fab-download{position:absolute;bottom:24px;left:14px;z-index:1000;display:none}
+.fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
+
+/* ===== MODAL ===== */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-backdrop.open{display:flex}
+.modal{background:#fff;border-radius:12px;width:100%;max-width:600px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.3);overflow:hidden}
+.modal-header{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid #eee;gap:8px;flex-shrink:0}
+.modal-header h2{flex:1;font-size:16px;color:#1a1a2e}
+.modal-close{background:none;border:none;font-size:22px;cursor:pointer;color:#888;padding:4px 8px;border-radius:4px}
+.modal-close:hover{background:#f0f0f0;color:#333}
+.modal-tabs{display:flex;border-bottom:1px solid #eee;flex-shrink:0}
+.modal-tab{flex:1;padding:10px 12px;text-align:center;font-size:13px;font-weight:600;cursor:pointer;color:#888;border-bottom:2px solid transparent;transition:all .15s}
+.modal-tab:hover{color:#333;background:#f8f8f8}
+.modal-tab.active{color:#0d7377;border-bottom-color:#0d7377}
+.modal-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0}
+.tab-pane{display:none;padding:16px 18px}
+.tab-pane.active{display:block}
+.tab-pane pre{font-family:'SF Mono',Monaco,Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:12px;border-radius:6px;border:1px solid #e1e4e8;max-height:50vh;overflow:auto;margin:0}
+.tab-pane .copy-bar{display:flex;justify-content:flex-end;margin-bottom:8px;gap:6px}
+/* Summary tab */
+.summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.summary-card{background:#f6f8fa;padding:10px 12px;border-radius:6px;border:1px solid #e1e4e8}
+.summary-card .val{font-size:20px;font-weight:700;color:#1a1a2e}
+.summary-card .lbl{font-size:11px;color:#888;margin-top:2px}
+.summary-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+.summary-table th{text-align:left;font-weight:600;color:#555;padding:4px 8px;border-bottom:1px solid #ddd}
+.summary-table td{padding:4px 8px;border-bottom:1px solid #f0f0f0}
+.summary-table .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+/* GeoPackage tab */
+.gpkg-info{text-align:center;padding:20px 0}
+.gpkg-info p{color:#666;font-size:13px;margin:8px 0}
+.gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:8px}
+
+/* ===== MOBILE ===== */
 @media(max-width:900px){
   body{flex-direction:column}
-  #sidebar{width:100%;height:auto;max-height:45vh;border-right:none;border-bottom:1px solid #ddd}
-  #map-area{flex:1;min-height:0}
-  .layer-panel{top:4px;right:4px;padding:6px 10px;font-size:11px;max-height:50vh}
-  .legend{bottom:4px;right:4px;max-height:35vh;max-width:200px;font-size:10px}
-  .controls{padding:8px 12px}
+  #sidebar{width:100%;flex:0 0 auto;max-height:none;border-right:none;border-bottom:1px solid #ddd}
+  .controls{max-height:calc(38vh - 70px);padding:8px 12px}
   #sidebar h1{font-size:14px;padding:8px 12px}
-  textarea{height:50px}
+  #map-area{flex:1;min-height:0}
+  .layer-panel{top:4px;right:4px;padding:6px 10px;font-size:11px;max-height:50vh;max-width:220px}
+  .legend{bottom:4px;right:4px;max-height:35vh;max-width:200px;font-size:10px}
+  textarea{height:36px}
+  label{margin:4px 0 2px}
+  .btn{padding:6px 10px;font-size:12px}
+  .fab-download .btn{padding:8px 14px;font-size:12px}
+  .modal{max-height:90vh;border-radius:8px}
+  .modal-header{padding:10px 14px}
+  .tab-pane{padding:12px 14px}
+  .summary-grid{grid-template-columns:1fr}
+  .hint{display:none}
 }
 @media(max-width:600px){
-  #sidebar{max-height:40vh}
+  .controls{max-height:calc(35vh - 60px)}
   .row{flex-direction:column;gap:4px}
   .cb-row{gap:6px}
+  .ot-dropdown{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25)}
 }
 </style>
 </head>
@@ -103,8 +154,8 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
     </select>
     <div class="row">
       <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
-      <div style="position:relative"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
-        <div id="ot-dropdown" class="ot-dropdown" style="display:none"></div>
+      <div class="ot-wrap"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+        <div id="ot-dropdown" class="ot-dropdown"></div>
       </div>
     </div>
     <div class="cb-row">
@@ -117,28 +168,21 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
       <label><input id="include_hansen" type="checkbox"> Hansen</label>
     </div>
     <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / coords)</span></label>
-    <textarea id="geometry"></textarea>
-    <p class="hint">Or draw on the map — click ▶ Sample for a demo area.</p>
+    <textarea id="geometry" placeholder="Paste GeoJSON, KML, or coordinates…"></textarea>
+    <p class="hint">Or draw on map — click ▶ Sample for a demo area.</p>
     <div class="row" style="margin-top:6px">
       <button class="btn" id="btn-sample">▶ Sample</button>
       <button class="btn" id="btn-run">🚀 Analyse</button>
     </div>
   </div>
-  <div id="result-area">
-    <div class="dl-bar">
-      <button class="btn btn-sm btn-outline" id="btn-copy">📋 Copy</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-json">💾 JSON</button>
-      <button class="btn btn-sm btn-outline" id="btn-dl-gpkg">📦 GeoPackage</button>
-    </div>
-    <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
-  </div>
-  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:11px;opacity:0.8"></span></div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span></div>
 </div>
+
 <div id="map-area">
   <div id="map"></div>
+
   <div class="layer-panel" id="layer-panel">
     <h3>Layers</h3>
-
     <div class="lp-group">
       <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">LIDAR ▸</div>
       <div class="lp-group-body">
@@ -150,7 +194,6 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
         <div class="lyr"><input type="checkbox" data-lyr="dsm-2022"><span class="lyr-label">nDSM 2022</span><input type="range" data-op="dsm-2022" min="0" max="100" value="70"></div>
       </div>
     </div>
-
     <div class="lp-group">
       <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ORTHO & FOREST ▸</div>
       <div class="lp-group-body">
@@ -160,7 +203,6 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
         <div class="lyr"><input type="checkbox" data-lyr="hansen"><span class="lyr-label">Hansen Forest Δ</span><input type="range" data-op="hansen" min="0" max="100" value="70"></div>
       </div>
     </div>
-
     <div class="lp-group">
       <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ANALYSIS ▸</div>
       <div class="lp-group-body open">
@@ -168,9 +210,9 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
         <div class="lyr"><input type="checkbox" data-lyr="segments" checked><span class="lyr-label">Segments</span><input type="range" data-op="segments" min="0" max="100" value="90"></div>
       </div>
     </div>
-
     <div class="lyr" style="margin-top:6px;border-top:1px solid #eee;padding-top:4px"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
   </div>
+
   <div class="legend" id="legend" style="display:none">
     <div id="meta-info" class="meta-info" style="display:none"></div>
     <div class="color-mode-bar" id="color-mode-bar">
@@ -183,6 +225,45 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
     <div id="summary-panel" style="display:none;margin-top:6px;padding-top:6px;border-top:1px solid #ddd">
       <h4>Summary</h4>
       <div id="summary-content" style="font-size:10px;margin-top:4px"></div>
+    </div>
+  </div>
+
+  <!-- Download FAB -->
+  <div class="fab-download" id="fab-download">
+    <button class="btn" onclick="openResultModal()">📥 Results</button>
+  </div>
+</div>
+
+<!-- ===== RESULT MODAL ===== -->
+<div class="modal-backdrop" id="result-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>📊 Analysis Results</h2>
+      <button class="modal-close" onclick="closeResultModal()">&times;</button>
+    </div>
+    <div class="modal-tabs">
+      <div class="modal-tab active" data-tab="summary" onclick="switchTab('summary')">Summary</div>
+      <div class="modal-tab" data-tab="json" onclick="switchTab('json')">JSON</div>
+      <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoPackage</div>
+    </div>
+    <div class="modal-body">
+      <div class="tab-pane active" id="tab-summary">
+        <div id="modal-summary">No results yet.</div>
+      </div>
+      <div class="tab-pane" id="tab-json">
+        <div class="copy-bar">
+          <button class="btn btn-sm btn-outline" id="btn-copy-json">📋 Copy</button>
+          <button class="btn btn-sm btn-outline" id="btn-dl-json">💾 Download .geojson</button>
+        </div>
+        <pre id="modal-json">No results yet.</pre>
+      </div>
+      <div class="tab-pane" id="tab-gpkg">
+        <div class="gpkg-info">
+          <p style="font-size:32px">📦</p>
+          <p>Export all layers (DTM, DSM, nDSM, Ortho, Segments) as a GeoPackage for use in QGIS or other GIS software.</p>
+          <button class="btn" id="btn-dl-gpkg">📦 Download GeoPackage</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -224,7 +305,6 @@ const selectedTypes=new Set(ALL_OBJ_TYPES);
   const lbl=document.getElementById('ot-label');
   const sel=document.getElementById('ot-select');
 
-  // Build dropdown contents
   let html='<div class="ot-actions"><button id="ot-all">All</button><button id="ot-none">None</button><button id="ot-invert">Invert</button></div>';
   for(const[group,types]of Object.entries(OT_GROUPS)){
     html+=`<div class="ot-group">${group}</div>`;
@@ -236,16 +316,13 @@ const selectedTypes=new Set(ALL_OBJ_TYPES);
   }
   dd.innerHTML=html;
 
-  // Toggle dropdown
-  sel.onclick=e=>{e.stopPropagation();dd.style.display=dd.style.display==='none'?'':'none';};
-  document.addEventListener('click',e=>{if(!dd.contains(e.target)&&e.target!==sel)dd.style.display='none';});
+  sel.onclick=e=>{e.stopPropagation();dd.classList.toggle('open');};
+  document.addEventListener('click',e=>{if(!dd.contains(e.target)&&!sel.contains(e.target))dd.classList.remove('open');});
 
-  // Checkbox changes
   dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{
     cb.onchange=()=>{if(cb.checked)selectedTypes.add(cb.value);else selectedTypes.delete(cb.value);updateOTLabel();};
   });
 
-  // All/None/Invert
   dd.querySelector('#ot-all').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=true;selectedTypes.add(cb.value);});updateOTLabel();};
   dd.querySelector('#ot-none').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=false;selectedTypes.delete(cb.value);});updateOTLabel();};
   dd.querySelector('#ot-invert').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=!cb.checked;if(cb.checked)selectedTypes.add(cb.value);else selectedTypes.delete(cb.value);});updateOTLabel();};
@@ -290,11 +367,8 @@ let colorMode='type';
 const hiddenTypes=new Set();
 let markersByType={};
 let lastResult=null, lastEndpoint='segment', allFeatureData=[];
-
-// Dynamic overlays: id -> L.imageOverlay
 const overlays={};
 
-// Layer definitions: id -> {url-builder, dataset}
 const LAYER_DEFS={
   'dtm-2024':{url:'/api/v1/dtm/overlay',ds:'20240915'},
   'dtm-2023':{url:'/api/v1/dtm/overlay',ds:'20230915'},
@@ -306,7 +380,124 @@ const LAYER_DEFS={
   'ortho-2023':{url:'/api/v1/ortho/overlay',ds:'20230915',ortho_year:2023},
   'ortho-2020':{url:'/api/v1/ortho/overlay',ds:'20220915',ortho_year:2020},
   'hansen':{url:'/api/v1/hansen/overlay',ds:'20240915'},
-  'raster':{url:null}, // special
+  'raster':{url:null},
+};
+
+// ============ MODAL ============
+function openResultModal(){
+  document.getElementById('result-modal').classList.add('open');
+  updateModalContent();
+}
+function closeResultModal(){
+  document.getElementById('result-modal').classList.remove('open');
+}
+function switchTab(tab){
+  document.querySelectorAll('.modal-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+tab));
+}
+// Close on backdrop click
+document.getElementById('result-modal').onclick=e=>{if(e.target===e.currentTarget)closeResultModal();};
+// Esc key
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeResultModal();});
+
+function updateModalContent(){
+  const data=lastResult;
+  const jsonEl=document.getElementById('modal-json');
+  const sumEl=document.getElementById('modal-summary');
+
+  if(!data){
+    jsonEl.textContent='No results yet. Run an analysis first.';
+    sumEl.innerHTML='<p style="color:#888">No results yet. Run an analysis first.</p>';
+    return;
+  }
+
+  // JSON tab
+  const jsonStr=JSON.stringify(data,null,2);
+  jsonEl.textContent=jsonStr;
+
+  // Summary tab
+  const features=data.features||[];
+  const meta=data.meta||{};
+  let html='';
+
+  // Cards
+  html+='<div class="summary-grid">';
+  html+=`<div class="summary-card"><div class="val">${features.length}</div><div class="lbl">${lastEndpoint==='changes'?'Change events':lastEndpoint==='changes/trees'?'Trees analysed':'Objects detected'}</div></div>`;
+
+  if(lastEndpoint==='segment'){
+    let totalA=0,mmA=0;
+    for(const f of features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
+    html+=`<div class="summary-card"><div class="val">${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</div><div class="lbl">Manmade area</div></div>`;
+    html+=`<div class="summary-card"><div class="val">${(totalA/10000).toFixed(2)} ha</div><div class="lbl">Total area</div></div>`;
+  }
+  if(meta.processing_time_s)html+=`<div class="summary-card"><div class="val">${meta.processing_time_s}s</div><div class="lbl">Processing time</div></div>`;
+  if(meta.date_a)html+=`<div class="summary-card"><div class="val">${fmtDate(meta.date_a)} → ${fmtDate(meta.date_b)}</div><div class="lbl">Date range</div></div>`;
+  if(meta.dataset&&!meta.date_a)html+=`<div class="summary-card"><div class="val">${fmtDate(meta.dataset)}</div><div class="lbl">Dataset</div></div>`;
+  html+='</div>';
+
+  // Evaluation metrics
+  if(data.cadastre_evaluation){
+    const ev=data.cadastre_evaluation;
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f0f8ff;border-radius:6px;font-size:12px"><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}</div>`;
+  }
+  if(data.hansen_evaluation){
+    const h=data.hansen_evaluation;
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f0fff0;border-radius:6px;font-size:12px"><b>Hansen:</b> P=${h.precision} R=${h.recall} F1=${h.f1}</div>`;
+  }
+  if(meta.rf_trained_at){
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#fff8f0;border-radius:6px;font-size:12px"><b>RF Model:</b> ${meta.rf_trained_at} · ${meta.rf_n_kgs||'?'} KGs · OOB ${meta.rf_oob||'?'}</div>`;
+  }
+
+  // Type breakdown table
+  if(features.length>0){
+    const typeCounts={};
+    for(const f of features){
+      const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+      typeCounts[t]=(typeCounts[t]||0)+1;
+    }
+    const sorted=Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]);
+    const total=sorted.reduce((s,[,n])=>s+n,0);
+    const tiMap=lastEndpoint==='changes/trees'?STATUS_COLORS:lastEndpoint==='changes'?EVENT_COLORS:TYPE_SHAPES;
+
+    html+='<table class="summary-table"><thead><tr><th>Type</th><th style="text-align:right">Count</th><th style="text-align:right">%</th></tr></thead><tbody>';
+    for(const[t,count]of sorted){
+      const info=tiMap[t]||DEF;
+      html+=`<tr><td><span class="swatch" style="background:${info.c}"></span>${t.replace(/_/g,' ')}</td><td style="text-align:right">${count}</td><td style="text-align:right">${(count/total*100).toFixed(1)}%</td></tr>`;
+    }
+    html+='</tbody></table>';
+  }
+
+  sumEl.innerHTML=html;
+}
+
+// Copy & Download from modal
+document.getElementById('btn-copy-json').onclick=()=>{
+  if(!lastResult)return;
+  navigator.clipboard.writeText(JSON.stringify(lastResult,null,2));
+  setStatus('Copied!');
+  const btn=document.getElementById('btn-copy-json');
+  btn.textContent='✅ Copied!';
+  setTimeout(()=>btn.textContent='📋 Copy',1500);
+};
+document.getElementById('btn-dl-json').onclick=()=>{
+  if(!lastResult)return;
+  const b=new Blob([JSON.stringify(lastResult,null,2)],{type:'application/geo+json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='result.geojson';a.click();
+};
+document.getElementById('btn-dl-gpkg').onclick=async()=>{
+  const args=getPostArgs();
+  if(!args){alert('Provide geometry first');return;}
+  const btn=document.getElementById('btn-dl-gpkg');
+  btn.disabled=true;btn.textContent='⏳ Generating...';
+  try{
+    let url='/api/v1/export/geopackage?include_ortho=true&include_segments=true';
+    if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
+    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+    if(!resp.ok)throw new Error((await resp.json()).error);
+    const blob=await resp.blob();
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.gpkg';a.click();
+    setStatus('GeoPackage downloaded!');
+  }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoPackage';}
 };
 
 // ============ SPINNER ============
@@ -401,14 +592,11 @@ function applyOpacity(id){
   if(id==='segments'){
     const op=layerOpacity('segments');
     const vis=op>0;
-    // Toggle entire result layer container for reliable show/hide
-    const container=resultLayer.getPane?resultLayer.getPane():null;
     resultLayer.eachLayer(function walk(l){
       if(l._icon)l._icon.style.display=vis?'':'none';
       if(l._shadow)l._shadow.style.display=vis?'':'none';
       if(l.eachLayer)l.eachLayer(walk);
     });
-    // Also set opacity on visible markers
     if(vis)resultLayer.eachLayer(function walkOp(l){
       if(l._icon)l._icon.style.opacity=op;
       if(l.eachLayer)l.eachLayer(walkOp);
@@ -419,14 +607,12 @@ function applyOpacity(id){
   if(ovl&&ovl.setOpacity)ovl.setOpacity(layerOpacity(id));
 }
 function orderLayers(){
-  // bottom-to-top: base, ortho, dtms, dsms, hansen, raster, segments
   baseLayer.bringToBack();
   ['ortho-2020','ortho-2023','ortho-2024','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
     if(overlays[id])overlays[id].bringToFront();
   });
 }
 
-// Wire all checkboxes & sliders
 document.querySelectorAll('[data-lyr]').forEach(cb=>{
   const id=cb.dataset.lyr;
   cb.onchange=()=>handleLayerToggle(id);
@@ -437,8 +623,7 @@ document.querySelectorAll('[data-lyr]').forEach(cb=>{
 function getPostArgs(){
   const raw=document.getElementById('geometry').value.trim();
   if(!raw)return null;
-  try{const p=JSON.parse(raw);return{ct:'application/json',body:JSON.stringify({geometry:p})};}
-  catch(e){return{ct:'text/plain',body:raw};}
+  try{const p=JSON.parse(raw);return{ct:'application/json',body:JSON.stringify({geometry:p})};}catch(e){return{ct:'text/plain',body:raw};}
 }
 
 async function handleLayerToggle(id){
@@ -446,7 +631,6 @@ async function handleLayerToggle(id){
   if(id==='base'||id==='segments'){applyOpacity(id);return;}
   if(!cb.checked){applyOpacity(id);return;}
   if(overlays[id]){applyOpacity(id);return;}
-  // Need to load
   const args=getPostArgs();
   if(!args){cb.checked=false;return;}
   showLoading(`Loading ${id}...`);
@@ -515,18 +699,16 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
 // ============ ANALYSE ============
 document.getElementById('btn-run').onclick=async()=>{
   const btn=document.getElementById('btn-run');
-  const resultDiv=document.getElementById('result');
   const endpoint=document.getElementById('endpoint').value;
   const geometry=document.getElementById('geometry').value.trim();
-  if(!geometry){resultDiv.textContent='Provide geometry first.';return;}
+  if(!geometry){setStatus('Provide geometry first.');return;}
 
   btn.disabled=true;
   showLoading('Starting...');
-  resultDiv.textContent='Loading...';
+  document.getElementById('fab-download').style.display='none';
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
   document.getElementById('legend-types').innerHTML='';
-  // Clear all dynamic overlays
   for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
   for(const k of Object.keys(overlays))delete overlays[k];
   document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.dataset.lyr!=='segments'&&cb.dataset.lyr!=='base')cb.checked=false;});
@@ -543,7 +725,6 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
 
-  // Progress polling for segment endpoint
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);
   let progressIv=null;
@@ -553,7 +734,7 @@ document.getElementById('btn-run').onclick=async()=>{
         const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
         const pj=await pr.json();
         if(pj.active){
-          const el=pj.elapsed?` (${pj.elapsed}s)`:''; 
+          const el=pj.elapsed?` (${pj.elapsed}s)`:'';
           const det=pj.detail?` — ${pj.detail}`:'';
           setStatus(`${pj.step}${det}${el}`);
         }
@@ -569,11 +750,11 @@ document.getElementById('btn-run').onclick=async()=>{
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     lastResult=data;
-    resultDiv.textContent=JSON.stringify(data,null,2);
     if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+    document.getElementById('fab-download').style.display='';
     hideLoading();
   }catch(e){
-    resultDiv.textContent='Error: '+e.message;
+    setStatus('Error: '+e.message);
     hideLoading('Error');
     lastResult=null;
   }finally{btn.disabled=false;if(progressIv)clearInterval(progressIv);}
@@ -659,24 +840,6 @@ function buildSummary(data){
   }
   content.innerHTML=html;
 }
-
-// ============ DOWNLOAD ============
-document.getElementById('btn-copy').onclick=()=>{if(!lastResult)return;navigator.clipboard.writeText(JSON.stringify(lastResult,null,2));setStatus('Copied!');};
-document.getElementById('btn-dl-json').onclick=()=>{if(!lastResult)return;const b=new Blob([JSON.stringify(lastResult,null,2)],{type:'application/geo+json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='result.geojson';a.click();};
-document.getElementById('btn-dl-gpkg').onclick=async()=>{
-  const args=getPostArgs();
-  if(!args){alert('Provide geometry first');return;}
-  showLoading('Generating GeoPackage...');
-  try{
-    let url='/api/v1/export/geopackage?include_ortho=true&include_segments=true';
-    if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
-    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
-    if(!resp.ok)throw new Error((await resp.json()).error);
-    const blob=await resp.blob();
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landscape_export.gpkg';a.click();
-    hideLoading('GeoPackage downloaded!');
-  }catch(e){hideLoading('Error: '+e.message);}
-};
 </script>
 </body>
 </html>

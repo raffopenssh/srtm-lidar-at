@@ -190,7 +190,7 @@ class LearnedClassifier:
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             oob_score=True,
-            n_jobs=-1,
+            n_jobs=2,  # limit parallelism to avoid memory issues + sklearn warnings
             random_state=42,
             class_weight="balanced",  # handle imbalanced classes
         )
@@ -385,3 +385,45 @@ def classify_with_rf(
     if fallback_fn:
         return fallback_fn(feat, has_spectral=has_spectral)
     return classify_object(feat, has_spectral=has_spectral)
+
+
+def classify_with_rf_batch(
+    features: list[dict],
+    *,
+    has_spectral: bool = False,
+    min_confidence: float = 0.4,
+) -> dict[int, tuple[str, int, float, bool]]:
+    """Batch-classify segments with RF, falling back to rules per-segment.
+
+    Returns dict mapping label -> (type_name, type_code, confidence, is_manmade).
+    Uses predict_batch for a single RF call instead of per-segment calls.
+    """
+    from object_segmentation import OBJECT_TYPES, classify_object
+
+    results = {}
+    clf = get_classifier()
+    if not clf.is_trained or not features:
+        # All rule-based
+        for feat in features:
+            results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
+        return results
+
+    # Batch predict
+    batch_preds = clf.predict_batch(features)
+
+    MANMADE_TYPES = {
+        "road", "path", "parking", "roof", "wall", "fence",
+        "mast", "greenhouse", "solar_panel", "bridge",
+        "excavation", "fill", "construction",
+    }
+
+    for feat, (pred, conf) in zip(features, batch_preds):
+        if pred and conf >= min_confidence and pred in OBJECT_TYPES:
+            code = OBJECT_TYPES[pred]
+            is_mm = pred in MANMADE_TYPES
+            results[feat["label"]] = (pred, code, conf, is_mm)
+        else:
+            # Fall back to rule-based for low-confidence predictions
+            results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
+
+    return results

@@ -1705,13 +1705,22 @@ def segment_and_classify(
     except Exception:
         log.info("Step 4: Object classification (rule-based)")
 
+    # Batch RF prediction (much faster than per-segment)
+    rf_results = {}  # label -> (type_name, type_code, conf, is_mm)
+    if use_rf:
+        import warnings as _w
+        from learned_classifier import classify_with_rf_batch
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", UserWarning)
+            rf_results = classify_with_rf_batch(
+                features, has_spectral=has_spectral,
+            )
+        log.info("Step 4: RF batch classified %d segments", len(rf_results))
+
     objects = []
     for feat in features:
-        if use_rf:
-            from learned_classifier import classify_with_rf
-            type_name, type_code, conf, is_mm = classify_with_rf(
-                feat, has_spectral=has_spectral,
-            )
+        if use_rf and feat["label"] in rf_results:
+            type_name, type_code, conf, is_mm = rf_results[feat["label"]]
         else:
             type_name, type_code, conf, is_mm = classify_object(
                 feat, has_spectral=has_spectral,

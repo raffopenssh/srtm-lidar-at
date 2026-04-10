@@ -51,10 +51,12 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
 # ---------------------------------------------------------------------------
-# Segment progress tracking  (file-backed so all gunicorn workers can read)
+# Async job + progress tracking (file-backed so all gunicorn workers can read)
 # ---------------------------------------------------------------------------
 _PROGRESS_DIR = Path('/tmp/segment_progress')
 _PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+_RESULTS_DIR = Path('/tmp/segment_results')
+_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _progress_set(task_id: str, step: str, detail: str = ""):
     """Update progress for a running segment task."""
@@ -80,7 +82,42 @@ def _progress_start(task_id: str):
     p.write_text(json.dumps(dict(step='starting', detail='',
                                  t0=time.time(), updated=time.time())))
 
+def _progress_done(task_id: str):
+    """Mark task as completed (keeps file so polling sees 'done')."""
+    if not task_id:
+        return
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    try:
+        t0 = 0.0
+        if p.exists():
+            try:
+                t0 = json.loads(p.read_text()).get('t0', 0.0)
+            except Exception:
+                pass
+        p.write_text(json.dumps(dict(step='done', detail='',
+                                     t0=t0, updated=time.time())))
+    except Exception:
+        pass
+
+def _progress_error(task_id: str, error: str):
+    """Mark task as failed."""
+    if not task_id:
+        return
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    try:
+        t0 = 0.0
+        if p.exists():
+            try:
+                t0 = json.loads(p.read_text()).get('t0', 0.0)
+            except Exception:
+                pass
+        p.write_text(json.dumps(dict(step='error', detail=error,
+                                     t0=t0, updated=time.time())))
+    except Exception:
+        pass
+
 def _progress_end(task_id: str):
+    """Clean up progress file (legacy, used for non-async)."""
     if not task_id:
         return
     p = _PROGRESS_DIR / f"{task_id}.json"
@@ -89,20 +126,83 @@ def _progress_end(task_id: str):
     except Exception:
         pass
 
+def _store_result(task_id: str, result: dict):
+    """Store JSON result for async retrieval."""
+    p = _RESULTS_DIR / f"{task_id}.json.gz"
+    data = json.dumps(result).encode()
+    with gzip.open(str(p), 'wb') as f:
+        f.write(data)
+
+def _get_result(task_id: str) -> dict | None:
+    """Retrieve stored result, or None."""
+    p = _RESULTS_DIR / f"{task_id}.json.gz"
+    if not p.exists():
+        return None
+    with gzip.open(str(p), 'rb') as f:
+        return json.loads(f.read())
+
+def _cleanup_old_results(max_age_s: int = 3600):
+    """Remove results older than max_age_s."""
+    try:
+        cutoff = time.time() - max_age_s
+        for f in _RESULTS_DIR.glob('*.json.gz'):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+        for f in _PROGRESS_DIR.glob('*.json'):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 @app.route('/api/v1/segment/progress')
 def segment_progress():
-    """Poll progress of a running segment task."""
+    """Poll progress of a running segment task.
+
+    Returns {active, step, detail, elapsed, done, error}.
+    When step=='done', the result is available at /api/v1/segment/result?task_id=...
+    When step=='error', detail contains the error message.
+    """
     task_id = request.args.get('task_id', '')
     p = _PROGRESS_DIR / f"{task_id}.json"
     if not task_id or not p.exists():
-        return jsonify(dict(active=False, step='', detail='', elapsed=0))
+        # Check if result already exists (progress file cleaned up)
+        if task_id and (_RESULTS_DIR / f"{task_id}.json.gz").exists():
+            return jsonify(dict(active=False, step='done', detail='', elapsed=0, done=True, error=None))
+        return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
     try:
         info = json.loads(p.read_text())
-        return jsonify(dict(active=True, step=info.get('step', ''),
-                            detail=info.get('detail', ''),
-                            elapsed=round(time.time() - info.get('t0', time.time()), 1)))
+        step = info.get('step', '')
+        elapsed = round(time.time() - info.get('t0', time.time()), 1)
+        is_done = step == 'done'
+        is_error = step == 'error'
+        return jsonify(dict(
+            active=not is_done and not is_error,
+            step=step,
+            detail=info.get('detail', ''),
+            elapsed=elapsed,
+            done=is_done,
+            error=info.get('detail', '') if is_error else None,
+        ))
     except Exception:
-        return jsonify(dict(active=False, step='', detail='', elapsed=0))
+        return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
+
+
+@app.route('/api/v1/segment/result')
+def segment_result():
+    """Retrieve the result of an async segment task."""
+    task_id = request.args.get('task_id', '')
+    if not task_id:
+        return _error('task_id required')
+    result = _get_result(task_id)
+    if result is None:
+        return _error('Result not found or not ready', 404)
+    # Clean up after retrieval
+    try:
+        (_RESULTS_DIR / f"{task_id}.json.gz").unlink(missing_ok=True)
+        (_PROGRESS_DIR / f"{task_id}.json").unlink(missing_ok=True)
+    except Exception:
+        pass
+    return jsonify(result)
 
 
 @app.route('/api/v1/training/status')
@@ -665,238 +765,53 @@ def segment_objects():
 
     Fused gradient → Felzenszwalb → RAG merge → per-object features → classify → group.
     Returns individual objects (tree, roof, road_surface, …) AND groups (forest, building, …).
+
+    When async=true is passed, returns 202 immediately with {task_id, status: 'running'}.
+    Poll /api/v1/segment/progress?task_id=... for status.
+    Fetch /api/v1/segment/result?task_id=... when done.
     """
     task_id = request.args.get('task_id', '')
-    def _prog(step, detail=''):
-        if task_id:
-            _progress_set(task_id, step, detail)
+    run_async = str(request.args.get('async', 'false')).lower() in ('true', '1', 'yes')
+
+    # Parse request data upfront (must happen in request context)
     try:
-        t0 = time.time()
-        if task_id:
-            _progress_start(task_id)
-        _prog('Parsing geometry')
         features = _get_geometry()
         params = _get_params()
-        dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        min_object_size = int(params.get('min_object_size', 30))
-        felz_scale = float(params.get('felz_scale', 150))
-        rag_threshold = float(params.get('rag_threshold', 0.12))
-        include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
-        include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
-        include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
-        include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
-        type_filter = params.get('types', None)
-        if isinstance(type_filter, str):
-            type_filter = [t.strip() for t in type_filter.split(',')]
-        group_filter = params.get('groups', None)
-        if isinstance(group_filter, str):
-            group_filter = [g.strip() for g in group_filter.split(',')]
+    except Exception as e:
+        return _error(str(e))
 
-        all_objects = []
-        all_stats = None
-        all_evaluation = None
-        all_labels = None
-        all_transform = None
-        all_shape = None
-        all_mask = None
-        hansen_evaluation = None
+    if run_async:
+        if not task_id:
+            task_id = str(uuid.uuid4())
+        _progress_start(task_id)
+        _cleanup_old_results()
+        thread = threading.Thread(
+            target=_segment_worker,
+            args=(task_id, features, params),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({"task_id": task_id, "status": "running"}), 202
 
-        for feat in features:
-            geom = feat['geometry']
-            geom_3035 = ti.geometry_to_3035(geom)
-            if geom.geom_type == 'Point':
-                geom_3035 = geom_3035.buffer(100)
-            _validate_area(geom_3035)
+    return _segment_sync(task_id, features, params)
 
-            # Load DTM/DSM
-            _prog('Loading DTM/DSM', 'remote raster reads')
-            dtm_dates, dsm_dates = None, None
-            if include_temporal:
-                _prog('Loading DTM/DSM', 'multi-temporal (3 dates)')
-                try:
-                    multi = raster_io.read_multi_date_ndsm(geom_3035)
-                    data = {
-                        'dtm': multi['dtm'], 'dsm': multi['dsm'],
-                        'ndsm': multi['ndsm'], 'mask': multi['mask'],
-                        'transform': multi['transform'], 'crs': multi['crs'],
-                        'shape': multi['shape'],
-                    }
-                    dtm_dates, dsm_dates = {}, {}
-                    for d in multi['dates_loaded']:
-                        try:
-                            _prog('Loading DTM/DSM', f'date {d}')
-                            dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
-                            mh = min(dd['shape'][0], data['shape'][0])
-                            mw = min(dd['shape'][1], data['shape'][1])
-                            dtm_dates[d] = dd['dtm'][:mh, :mw]
-                            dsm_dates[d] = dd['dsm'][:mh, :mw]
-                        except Exception as e:
-                            log.warning("Date %s load failed: %s", d, e)
-                except Exception as e:
-                    log.warning("Multi-temporal failed, single date: %s", e)
-                    data = raster_io.read_dtm_dsm(geom_3035, dataset)
-            else:
-                data = raster_io.read_dtm_dsm(geom_3035, dataset)
 
-            rgb, spectral = (None, None)
-            if include_ortho:
-                _prog('Loading orthophoto', 'RGBI 20cm')
-                rgb, spectral = _try_read_ortho(data)
+def _segment_worker(task_id: str, features: list, params: dict):
+    """Background worker for async segment processing."""
+    try:
+        resp = _segment_core(task_id, features, params)
+        _store_result(task_id, resp)
+        _progress_done(task_id)
+        log.info("Async segment task %s completed", task_id)
+    except Exception as e:
+        log.error("Async segment task %s failed: %s", task_id, traceback.format_exc())
+        _progress_error(task_id, str(e))
 
-            copernicus_data = None
-            if include_copernicus:
-                _prog('Loading Copernicus', 'NDVI + landcover + SAR + harmonics')
-                copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
-            building_footprints = None
-            if include_cadastre:
-                _prog('Loading cadastre', 'building footprints')
-                building_footprints = _try_cadastre(
-                    geom, data['transform'], data['shape'],
-                )
-
-            hansen_data = None
-            if include_hansen:
-                _prog('Loading Hansen', 'forest change data')
-                hansen_data = _try_hansen(geom, data['transform'], data['shape'])
-
-            # Run segmentation pipeline
-            _prog('Segmenting & classifying', 'watershed + classification')
-            obs_year = ti.dataset_to_year(dataset)
-            result = seg.segment_and_classify(
-                data['dtm'], data['dsm'], data['mask'], data['transform'],
-                dtm_dates=dtm_dates,
-                dsm_dates=dsm_dates,
-                spectral=spectral,
-                copernicus=copernicus_data,
-                building_footprints=building_footprints,
-                hansen=hansen_data,
-                min_object_size=min_object_size,
-                felz_scale=felz_scale,
-                rag_threshold=rag_threshold,
-                observation_year=obs_year,
-            )
-
-            objects = result['objects']
-            labels = result['labels']
-
-            # Hansen forest loss calibration
-            hansen_evaluation = None
-            if include_hansen and hansen_data:
-                try:
-                    objects = hansen.calibrate_tree_loss(objects, labels, hansen_data, observation_year=obs_year)
-                    hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_data, observation_year=obs_year)
-                except Exception as e:
-                    log.warning("Hansen calibration failed: %s", e)
-
-            # Populate seg_cache so overlay/gpkg endpoints can reuse results
-            seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
-            _seg_cache.update({
-                "labels": labels, "objects": objects,
-                "mask": data['mask'], "transform": data['transform'],
-                "shape": data['shape'], "ndsm": data.get('ndsm'), "key": seg_cache_key,
-            })
-            # Populate raster data cache so overlay endpoints don't re-fetch
-            raster_cache_key = f"{geom_3035.bounds}_{dataset}"
-            _raster_cache.update({"key": raster_cache_key, "data": data})
-            if rgb is not None:
-                _raster_cache.update({"ortho": rgb, "ortho_key": raster_cache_key})
-            log.info("segment: cached results for overlay reuse")
-
-            # Filters
-            if type_filter:
-                objects = [o for o in objects if o.obj_type in type_filter]
-            if group_filter:
-                objects = [o for o in objects if o.group_type in group_filter]
-
-            all_objects.extend(objects)
-            all_stats = result.get('stats')
-            all_labels = labels
-            all_transform = data['transform']
-            all_shape = data['shape']
-            all_mask = data['mask']
-            if result.get('evaluation'):
-                all_evaluation = result['evaluation']
-
-        # Build GeoJSON response
-        obj_features = []
-        for obj in all_objects:
-            centroid_wgs = ti.geometry_from_3035(Point(obj.centroid_e, obj.centroid_n))
-            props = {
-                "id": obj.obj_id,
-                "type": obj.obj_type,
-                "type_code": obj.type_code,
-                "group_id": obj.group_id,
-                "group_type": obj.group_type,
-                "height_max_m": obj.height_max,
-                "height_mean_m": obj.height_mean,
-                "height_p90_m": obj.height_p90,
-                "area_sqm": obj.area_sqm,
-                "compactness": obj.compactness,
-                "elongation": obj.elongation,
-                "solidity": obj.solidity,
-                "extent": obj.extent,
-                "dsm_edge_strength": obj.dsm_edge_strength,
-                "slope_mean": obj.slope_mean,
-                "roughness": obj.roughness,
-                "is_manmade": obj.is_manmade,
-                "confidence": obj.confidence,
-            }
-            if include_ortho or include_copernicus:
-                props["ndvi_mean"] = obj.ndvi_mean
-                props["ndvi_fused"] = obj.ndvi_fused
-                props["brightness_mean"] = obj.brightness_mean
-                props["nir_mean"] = obj.nir_mean
-            if include_temporal:
-                props["height_change"] = obj.height_change
-                props["dtm_change"] = obj.dtm_change
-                props["temporal_stability"] = obj.temporal_stability
-            # Texture features
-            if obj.glcm_entropy > 0:
-                props["glcm_entropy"] = obj.glcm_entropy
-                props["glcm_homogeneity"] = obj.glcm_homogeneity
-                props["texture_complexity"] = obj.texture_complexity
-            # SAR features
-            if obj.sar_vv > 0:
-                props["sar_vv"] = obj.sar_vv
-                props["sar_vh"] = obj.sar_vh
-            # Phenology features
-            if obj.harm_amplitude > 0:
-                props["harm_amplitude"] = obj.harm_amplitude
-                props["harm_phase"] = obj.harm_phase
-                props["phenology_class"] = obj.phenology_class
-            obj_features.append({
-                "type": "Feature",
-                "properties": props,
-                "geometry": mapping(centroid_wgs),
-            })
-
-        resp = {
-            "type": "FeatureCollection",
-            "features": obj_features,
-            "stats": all_stats,
-            "meta": {
-                "classifier": "watershed_v1",
-                "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
-                "dataset": dataset,
-                "min_object_size": min_object_size,
-                "felz_scale": felz_scale,
-                "rag_threshold": rag_threshold,
-                "include_ortho": include_ortho,
-                "include_temporal": include_temporal,
-                "include_copernicus": include_copernicus,
-                "include_cadastre": include_cadastre,
-                "include_hansen": include_hansen,
-                "processing_time_s": round(time.time() - t0, 2),
-                **_rf_model_meta(),
-            },
-        }
-        if all_evaluation:
-            resp["cadastre_evaluation"] = all_evaluation
-        if hansen_evaluation:
-            resp["hansen_evaluation"] = hansen_evaluation
-
+def _segment_sync(task_id: str, features: list, params: dict):
+    """Synchronous segment processing (original behavior)."""
+    try:
+        resp = _segment_core(task_id, features, params)
         _progress_end(task_id)
         return jsonify(resp)
     except ValueError as e:
@@ -906,6 +821,239 @@ def segment_objects():
         _progress_end(task_id)
         log.error(traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
+
+
+def _segment_core(task_id: str, features: list, params: dict) -> dict:
+    """Core segment processing logic. Returns response dict."""
+    def _prog(step, detail=''):
+        if task_id:
+            _progress_set(task_id, step, detail)
+
+    t0 = time.time()
+    if task_id:
+        _progress_start(task_id)
+    _prog('Parsing geometry')
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+    min_object_size = int(params.get('min_object_size', 30))
+    felz_scale = float(params.get('felz_scale', 150))
+    rag_threshold = float(params.get('rag_threshold', 0.12))
+    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+    include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
+    include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+    include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
+    include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
+    type_filter = params.get('types', None)
+    if isinstance(type_filter, str):
+        type_filter = [t.strip() for t in type_filter.split(',')]
+    group_filter = params.get('groups', None)
+    if isinstance(group_filter, str):
+        group_filter = [g.strip() for g in group_filter.split(',')]
+
+    all_objects = []
+    all_stats = None
+    all_evaluation = None
+    all_labels = None
+    all_transform = None
+    all_shape = None
+    all_mask = None
+    hansen_evaluation = None
+
+    for feat in features:
+        geom = feat['geometry']
+        geom_3035 = ti.geometry_to_3035(geom)
+        if geom.geom_type == 'Point':
+            geom_3035 = geom_3035.buffer(100)
+        _validate_area(geom_3035)
+
+        # Load DTM/DSM
+        _prog('Loading DTM/DSM', 'remote raster reads')
+        dtm_dates, dsm_dates = None, None
+        if include_temporal:
+            _prog('Loading DTM/DSM', 'multi-temporal (3 dates)')
+            try:
+                multi = raster_io.read_multi_date_ndsm(geom_3035)
+                data = {
+                    'dtm': multi['dtm'], 'dsm': multi['dsm'],
+                    'ndsm': multi['ndsm'], 'mask': multi['mask'],
+                    'transform': multi['transform'], 'crs': multi['crs'],
+                    'shape': multi['shape'],
+                }
+                dtm_dates, dsm_dates = {}, {}
+                for d in multi['dates_loaded']:
+                    try:
+                        _prog('Loading DTM/DSM', f'date {d}')
+                        dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
+                        mh = min(dd['shape'][0], data['shape'][0])
+                        mw = min(dd['shape'][1], data['shape'][1])
+                        dtm_dates[d] = dd['dtm'][:mh, :mw]
+                        dsm_dates[d] = dd['dsm'][:mh, :mw]
+                    except Exception as e:
+                        log.warning("Date %s load failed: %s", d, e)
+            except Exception as e:
+                log.warning("Multi-temporal failed, single date: %s", e)
+                data = raster_io.read_dtm_dsm(geom_3035, dataset)
+        else:
+            data = raster_io.read_dtm_dsm(geom_3035, dataset)
+
+        rgb, spectral = (None, None)
+        if include_ortho:
+            _prog('Loading orthophoto', 'RGBI 20cm')
+            rgb, spectral = _try_read_ortho(data)
+
+        copernicus_data = None
+        if include_copernicus:
+            _prog('Loading Copernicus', 'NDVI + landcover + SAR + harmonics')
+            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
+
+        building_footprints = None
+        if include_cadastre:
+            _prog('Loading cadastre', 'building footprints')
+            building_footprints = _try_cadastre(
+                geom, data['transform'], data['shape'],
+            )
+
+        hansen_data = None
+        if include_hansen:
+            _prog('Loading Hansen', 'forest change data')
+            hansen_data = _try_hansen(geom, data['transform'], data['shape'])
+
+        # Run segmentation pipeline
+        _prog('Segmenting & classifying', 'watershed + classification')
+        obs_year = ti.dataset_to_year(dataset)
+        result = seg.segment_and_classify(
+            data['dtm'], data['dsm'], data['mask'], data['transform'],
+            dtm_dates=dtm_dates,
+            dsm_dates=dsm_dates,
+            spectral=spectral,
+            copernicus=copernicus_data,
+            building_footprints=building_footprints,
+            hansen=hansen_data,
+            min_object_size=min_object_size,
+            felz_scale=felz_scale,
+            rag_threshold=rag_threshold,
+            observation_year=obs_year,
+        )
+
+        objects = result['objects']
+        labels = result['labels']
+
+        # Hansen forest loss calibration
+        hansen_evaluation = None
+        if include_hansen and hansen_data:
+            try:
+                objects = hansen.calibrate_tree_loss(objects, labels, hansen_data, observation_year=obs_year)
+                hansen_evaluation = hansen.evaluate_forest_loss(objects, labels, hansen_data, observation_year=obs_year)
+            except Exception as e:
+                log.warning("Hansen calibration failed: %s", e)
+
+        # Populate seg_cache so overlay/gpkg endpoints can reuse results
+        seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
+        _seg_cache.update({
+            "labels": labels, "objects": objects,
+            "mask": data['mask'], "transform": data['transform'],
+            "shape": data['shape'], "ndsm": data.get('ndsm'), "key": seg_cache_key,
+        })
+        # Populate raster data cache so overlay endpoints don't re-fetch
+        raster_cache_key = f"{geom_3035.bounds}_{dataset}"
+        _raster_cache.update({"key": raster_cache_key, "data": data})
+        if rgb is not None:
+            _raster_cache.update({"ortho": rgb, "ortho_key": raster_cache_key})
+        log.info("segment: cached results for overlay reuse")
+
+        # Filters
+        if type_filter:
+            objects = [o for o in objects if o.obj_type in type_filter]
+        if group_filter:
+            objects = [o for o in objects if o.group_type in group_filter]
+
+        all_objects.extend(objects)
+        all_stats = result.get('stats')
+        all_labels = labels
+        all_transform = data['transform']
+        all_shape = data['shape']
+        all_mask = data['mask']
+        if result.get('evaluation'):
+            all_evaluation = result['evaluation']
+
+    # Build GeoJSON response
+    obj_features = []
+    for obj in all_objects:
+        centroid_wgs = ti.geometry_from_3035(Point(obj.centroid_e, obj.centroid_n))
+        props = {
+            "id": obj.obj_id,
+            "type": obj.obj_type,
+            "type_code": obj.type_code,
+            "group_id": obj.group_id,
+            "group_type": obj.group_type,
+            "height_max_m": obj.height_max,
+            "height_mean_m": obj.height_mean,
+            "height_p90_m": obj.height_p90,
+            "area_sqm": obj.area_sqm,
+            "compactness": obj.compactness,
+            "elongation": obj.elongation,
+            "solidity": obj.solidity,
+            "extent": obj.extent,
+            "dsm_edge_strength": obj.dsm_edge_strength,
+            "slope_mean": obj.slope_mean,
+            "roughness": obj.roughness,
+            "is_manmade": obj.is_manmade,
+            "confidence": obj.confidence,
+        }
+        if include_ortho or include_copernicus:
+            props["ndvi_mean"] = obj.ndvi_mean
+            props["ndvi_fused"] = obj.ndvi_fused
+            props["brightness_mean"] = obj.brightness_mean
+            props["nir_mean"] = obj.nir_mean
+        if include_temporal:
+            props["height_change"] = obj.height_change
+            props["dtm_change"] = obj.dtm_change
+            props["temporal_stability"] = obj.temporal_stability
+        # Texture features
+        if obj.glcm_entropy > 0:
+            props["glcm_entropy"] = obj.glcm_entropy
+            props["glcm_homogeneity"] = obj.glcm_homogeneity
+            props["texture_complexity"] = obj.texture_complexity
+        # SAR features
+        if obj.sar_vv > 0:
+            props["sar_vv"] = obj.sar_vv
+            props["sar_vh"] = obj.sar_vh
+        # Phenology features
+        if obj.harm_amplitude > 0:
+            props["harm_amplitude"] = obj.harm_amplitude
+            props["harm_phase"] = obj.harm_phase
+            props["phenology_class"] = obj.phenology_class
+        obj_features.append({
+            "type": "Feature",
+            "properties": props,
+            "geometry": mapping(centroid_wgs),
+        })
+
+    resp = {
+        "type": "FeatureCollection",
+        "features": obj_features,
+        "stats": all_stats,
+        "meta": {
+            "classifier": "watershed_v1",
+            "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
+            "dataset": dataset,
+            "min_object_size": min_object_size,
+            "felz_scale": felz_scale,
+            "rag_threshold": rag_threshold,
+            "include_ortho": include_ortho,
+            "include_temporal": include_temporal,
+            "include_copernicus": include_copernicus,
+            "include_cadastre": include_cadastre,
+            "include_hansen": include_hansen,
+            "processing_time_s": round(time.time() - t0, 2),
+            **_rf_model_meta(),
+        },
+    }
+    if all_evaluation:
+        resp["cadastre_evaluation"] = all_evaluation
+    if hansen_evaluation:
+        resp["hansen_evaluation"] = hansen_evaluation
+
+    return resp
 
 
 # ---------------------------------------------------------------------------

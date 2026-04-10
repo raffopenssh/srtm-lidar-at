@@ -1181,39 +1181,74 @@ document.getElementById('btn-run').onclick=async()=>{
 
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);
-  let progressIv=null;
-  if(taskId){
-    progressIv=setInterval(async()=>{
-      try{
-        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
-        const pj=await pr.json();
-        if(pj.active){
-          const el=pj.elapsed?` (${pj.elapsed}s)`:'';
-          const det=pj.detail?` — ${pj.detail}`:'';
-          setStatus(`${pj.step}${det}${el}`);
-        }
-      }catch(e){}
-    },1500);
-  }
+
+  // Always use async mode for segment endpoint — survives mobile screen-off
+  if(isSeg)params.set('async','true');
 
   let ct='text/plain',body=geometry;
   try{const p=JSON.parse(geometry);ct='application/json';body=JSON.stringify({geometry:p});}catch(e){}
 
   try{
+    // Submit the request
     const resp=await fetch(`/api/v1/${endpoint}?${params}`,{method:'POST',headers:{'Content-Type':ct},body});
-    const data=await resp.json();
-    if(data.error)throw new Error(data.error);
-    lastResult=data;
-    markShareDirty();
-    if(data.features){allFeatureData=data.features;showResultOnMap(data);}
-    document.getElementById('fab-download').style.display='flex';
-    hideLoading();
+    const submitData=await resp.json();
+    if(submitData.error)throw new Error(submitData.error);
+
+    if(isSeg && submitData.task_id){
+      // Async mode: poll for progress and result
+      const tid=submitData.task_id;
+      setStatus('Submitted, waiting...');
+      const data=await _pollForResult(tid);
+      if(data.error)throw new Error(data.error);
+      lastResult=data;
+      markShareDirty();
+      if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+      document.getElementById('fab-download').style.display='flex';
+      hideLoading();
+    }else{
+      // Sync mode (non-segment endpoints)
+      if(submitData.error)throw new Error(submitData.error);
+      lastResult=submitData;
+      markShareDirty();
+      if(submitData.features){allFeatureData=submitData.features;showResultOnMap(submitData);}
+      document.getElementById('fab-download').style.display='flex';
+      hideLoading();
+    }
   }catch(e){
     setStatus('Error: '+e.message);
     hideLoading('Error');
     lastResult=null;
-  }finally{btn.disabled=false;if(progressIv)clearInterval(progressIv);}
+  }finally{btn.disabled=false;}
 };
+
+// Poll progress + fetch result when done. Resilient to screen-off / network blips.
+async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=600000){
+  const t0=Date.now();
+  while(Date.now()-t0<maxWaitMs){
+    await new Promise(r=>setTimeout(r,intervalMs));
+    try{
+      const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+      const pj=await pr.json();
+      if(pj.error){
+        throw new Error(pj.error);
+      }
+      if(pj.done){
+        setStatus('Loading results...');
+        const rr=await fetch(`/api/v1/segment/result?task_id=${taskId}`);
+        return await rr.json();
+      }
+      if(pj.active){
+        const el=pj.elapsed?` (${pj.elapsed}s)`:'';
+        const det=pj.detail?` — ${pj.detail}`:'';
+        setStatus(`${pj.step}${det}${el}`);
+      }
+    }catch(e){
+      // Network blip — just retry on next poll
+      if(e.message && !e.message.startsWith('Failed to fetch'))throw e;
+    }
+  }
+  throw new Error('Analysis timed out after 10 minutes');
+}
 
 function showResultOnMap(data){
   document.getElementById('legend').style.display='';

@@ -475,7 +475,7 @@ const resultLayer=new L.FeatureGroup().addTo(map);
 
 new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:true,marker:true,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
 map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();});
-map.on('moveend',markShareDirty);
+// moveend no longer invalidates share — viewpoint is cosmetic, not part of share identity
 map.on('moveend',_debouncedLayerAvailCheck);
 
 // ============ STATE ============
@@ -942,8 +942,9 @@ let currentShareId=null;  // ID of current share (if loaded from or just created
 let shareStateHash=null;  // hash of state when share was created/loaded
 
 function computeShareHash(state,result){
-  // Simple hash of JSON to detect if state changed
-  const s=JSON.stringify({s:state,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
+  // Hash of state (excluding viewpoint) + result presence
+  const {center,zoom,...rest}=state;
+  const s=JSON.stringify({s:rest,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
   let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}
   return h;
 }
@@ -1114,6 +1115,7 @@ async function copyToClipboard(text){
 
 let currentShareName=null;
 let _shareUrl=null;         // Always the real copyable URL (null until save done)
+let _renamePromise=null;    // Pending rename, so Copy Link can wait for it
 
 function _buildShareUrl(id){return location.origin+location.pathname+'?share='+encodeURIComponent(id);}
 function _esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -1159,7 +1161,7 @@ function _wireHashEditing(){
     document.execCommand('insertText',false,text);
   });
   // On blur = commit rename
-  el.addEventListener('blur',()=>_commitRename());
+  el.addEventListener('blur',()=>{_renamePromise=_commitRename();});
 }
 
 async function _commitRename(){
@@ -1211,12 +1213,14 @@ function _flashCopied(){
 async function _doShareSave(){
   const state=getShareState();
   const payload={state:state};
-  if(lastResult) payload.result=lastResult;
+  // Only include result on first save — reuse_id means server already has it
+  if(lastResult && !currentShareId) payload.result=lastResult;
   if(currentShareId) payload.reuse_id=currentShareId;
   const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const d=await resp.json();
   if(d.error) throw new Error(d.error);
-  _backfillOverlays(d.id);
+  // Backfill overlays in background (never blocks)
+  if(!currentShareId) _backfillOverlays(d.id);
   return d;
 }
 async function _backfillOverlays(shareId){
@@ -1270,9 +1274,10 @@ document.getElementById('btn-share').onclick=()=>{
 };
 
 // Copy button in popup — always reads latest _shareUrl
-document.getElementById('share-copy-btn').onclick=()=>{
+document.getElementById('share-copy-btn').onclick=async()=>{
+  // Wait for any pending rename to finish so we copy the fresh URL
+  if(_renamePromise) await _renamePromise;
   if(!_shareUrl){
-    // Still saving — briefly indicate
     const el=document.getElementById('share-saving');
     el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1500);
     return;

@@ -119,7 +119,7 @@ textarea{height:70px;font-family:monospace;font-size:11px;resize:vertical}
     </div>
     <div id="result">Ready. Paste geometry or draw on map, then click Analyse.</div>
   </div>
-  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span></div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:11px;opacity:0.8"></span></div>
 </div>
 <div id="map-area">
   <div id="map"></div>
@@ -243,6 +243,32 @@ let loadingCount=0;
 function showLoading(msg){loadingCount++;document.getElementById('spinner').style.display='';document.getElementById('status-text').textContent=msg||'Loading...';}
 function hideLoading(msg){loadingCount=Math.max(0,loadingCount-1);if(!loadingCount){document.getElementById('spinner').style.display='none';document.getElementById('status-text').textContent=msg||'Done.';}}
 function setStatus(msg){document.getElementById('status-text').textContent=msg;}
+
+// ============ TRAINING STATUS ============
+(function pollTrainingStatus(){
+  const el=document.getElementById('train-status');
+  async function update(){
+    try{
+      const r=await fetch('/api/v1/training/status');
+      const d=await r.json();
+      if(d.running){
+        const kg=d.current_kg?` · KG ${d.current_kg.kg_code} (${d.current_kg.kg_name}) [${d.progress}]`:'';
+        const model=d.model?` · model: OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs`:'no model yet';
+        const res=d.ram_mb?` · ${d.ram_mb}MB / ${d.cpu_pct}% CPU`:'';
+        el.innerHTML=`🟢 RF training${kg}${res}${model}`;
+        el.style.color='#2a7';
+      } else if(d.model){
+        el.innerHTML=`⚪ RF model: OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`;
+        el.style.color='#888';
+      } else {
+        el.textContent='⚪ No RF model';
+        el.style.color='#888';
+      }
+    }catch(e){el.textContent='';}
+  }
+  update();
+  setInterval(update,10000);
+})();
 
 // ============ COLOR MODE ============
 function setColorMode(m){
@@ -451,19 +477,16 @@ document.getElementById('btn-run').onclick=async()=>{
   if(taskId)params.set('task_id',taskId);
   let progressIv=null;
   if(taskId){
-    console.log('Progress polling started, taskId='+taskId);
     progressIv=setInterval(async()=>{
       try{
-        console.log('Polling progress...');
         const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
         const pj=await pr.json();
-        console.log('Progress response:', JSON.stringify(pj));
         if(pj.active){
           const el=pj.elapsed?` (${pj.elapsed}s)`:''; 
           const det=pj.detail?` — ${pj.detail}`:'';
           setStatus(`${pj.step}${det}${el}`);
         }
-      }catch(e){console.error('Progress poll error:', e);}
+      }catch(e){}
     },1500);
   }
 

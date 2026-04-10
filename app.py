@@ -103,6 +103,78 @@ def segment_progress():
         return jsonify(dict(active=False, step='', detail='', elapsed=0))
 
 
+@app.route('/api/v1/training/status')
+def training_status():
+    """Return RF training job status: running, current KG, model info, resource usage."""
+    import subprocess, re, pathlib
+
+    result = dict(running=False, current_kg=None, progress=None,
+                  model=None, pid=None, cpu_pct=None, ram_mb=None)
+
+    # Find the training process
+    try:
+        ps = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+        for line in ps.stdout.splitlines():
+            if 'python3 train_rf_4000kg.py' in line and 'grep' not in line and 'bash' not in line and 'tee' not in line:
+                parts = line.split()
+                result['running'] = True
+                result['pid'] = int(parts[1])
+                result['cpu_pct'] = float(parts[2])
+                result['ram_mb'] = round(int(parts[5]) / 1024)  # RSS in KB → MB
+                break
+    except Exception:
+        pass
+
+    # Parse last log lines for current KG and progress
+    log_path = pathlib.Path('/tmp/rf_train_4000kg.log')
+    if log_path.exists():
+        try:
+            # Read last 32KB of log (enough to find current KG line)
+            with open(log_path, 'rb') as f:
+                f.seek(max(0, f.seek(0, 2) - 32768))
+                tail = f.read().decode('utf-8', errors='replace')
+            lines = tail.strip().splitlines()
+            # Find last "Processing KG" line
+            for line in reversed(lines):
+                m = re.search(r'\[(\d+)/(\d+)\]\s+Processing KG (\d+)\s+\(([^)]+)\)', line)
+                if m:
+                    result['current_kg'] = dict(
+                        index=int(m.group(1)), total=int(m.group(2)),
+                        kg_code=m.group(3), kg_name=m.group(4))
+                    result['progress'] = f"{m.group(1)}/{m.group(2)}"
+                    break
+            # Find last successful checkpoint count
+            for line in reversed(lines):
+                m = re.search(r'already checkpointed, skipping', line)
+                if not m:
+                    m2 = re.search(r'Checkpoint saved: (\S+)', line)
+                    if m2:
+                        break
+        except Exception:
+            pass
+
+    # Checkpoint count
+    ckpt_dir = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/checkpoints')
+    if ckpt_dir.exists():
+        result['n_checkpoints'] = len(list(ckpt_dir.glob('kg_*.npz')))
+
+    # Model info
+    meta_path = pathlib.Path('/tmp/learned_classifier/rf_meta.json')
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            result['model'] = dict(
+                oob_score=round(meta.get('oob_score', 0), 4),
+                n_train=meta.get('n_train', 0),
+                n_kgs=meta.get('n_kgs', 0),
+                n_classes=len(meta.get('classes', [])),
+                trained_at=meta.get('trained_at', ''))
+        except Exception:
+            pass
+
+    return jsonify(result)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

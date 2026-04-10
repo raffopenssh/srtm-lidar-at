@@ -1815,18 +1815,17 @@ async function downloadMBTiles(layerId,layerName,btn){
 // ============ SHARE URL PREVIEW ============
 (function(){
   // When share popup opens, show preview URL
+  const popupEl=document.getElementById('share-link-popup');
+  if(!popupEl) return;
   const obs=new MutationObserver(()=>{
-    const popup=document.getElementById('share-name-popup');
-    if(popup.classList.contains('show')){
-      const preview=document.getElementById('share-preview-url');
-      if(currentShareId){
+    if(popupEl.classList.contains('show')){
+      const preview=document.getElementById('share-link-url');
+      if(preview && currentShareId){
         preview.textContent=location.origin+location.pathname+'?share='+currentShareId;
-      }else{
-        preview.textContent=location.origin+location.pathname+'?share=…';
       }
     }
   });
-  obs.observe(document.getElementById('share-name-popup'),{attributes:true,attributeFilter:['class']});
+  obs.observe(popupEl,{attributes:true,attributeFilter:['class']});
 })();
 
 // Init MBTiles list on modal open

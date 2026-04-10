@@ -12,6 +12,11 @@ Environment=GDAL_HTTP_MERGE_CONSECUTIVE_RANGES=YES
 Environment=GDAL_HTTP_MULTIPLEX=YES
 Environment=VSI_CACHE=TRUE
 Environment=VSI_CACHE_SIZE=134217728
+# Prevent gunicorn from OOM-killing the RF training process
+MemoryMax=3G
+MemoryHigh=2500M
+OOMScoreAdjust=500
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

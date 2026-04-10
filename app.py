@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -2422,21 +2423,59 @@ def _share_evict():
 
 @app.route('/api/v1/share', methods=['POST'])
 def share_save():
-    """Save analysis result + UI state for sharing. Returns {id, url}."""
+    """Save analysis result + UI state for sharing. Returns {id, url}.
+    
+    Content-hash dedup: if payload matches an existing share, reuse its ID.
+    Client can also send {reuse_id: "abc123"} to update an existing share in-place.
+    """
     try:
+        import hashlib
         payload = request.get_json(force=True)
         if not payload:
             return _error('Empty payload')
-        share_id = uuid.uuid4().hex[:12]
-        data = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
-        (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
-        _share_evict()
-        # Use X-Forwarded-Host/Proto if behind proxy, else request.url_root
+        
         host = request.headers.get('X-Forwarded-Host', request.host)
         proto = request.headers.get('X-Forwarded-Proto', 'https')
+        
+        # Extract and remove reuse_id before hashing/storing
+        reuse_id = payload.pop('reuse_id', None)
+        
+        data_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+        data = gzip.compress(data_json.encode())
+        content_hash = hashlib.sha256(data_json.encode()).hexdigest()[:24]
+        
+        # Check if client wants to reuse an existing share ID
+        
+        if reuse_id and re.match(r'^[a-f0-9]{12}$', reuse_id):
+            existing = SHARE_DIR / f'{reuse_id}.json.gz'
+            if existing.exists():
+                existing.write_bytes(data)
+                existing.touch()
+                url = f'{proto}://{host}/?share={reuse_id}'
+                log.info("share: updated existing %s (%d KB)", reuse_id, len(data) // 1024)
+                return jsonify({'id': reuse_id, 'url': url, 'reused': True})
+        
+        # Content-hash dedup: check all existing shares for identical content
+        for existing_file in SHARE_DIR.glob('*.json.gz'):
+            try:
+                existing_json = gzip.decompress(existing_file.read_bytes()).decode()
+                existing_hash = hashlib.sha256(existing_json.encode()).hexdigest()[:24]
+                if existing_hash == content_hash:
+                    share_id = existing_file.stem.split('.')[0]
+                    existing_file.touch()  # Keep alive (LRU)
+                    url = f'{proto}://{host}/?share={share_id}'
+                    log.info("share: dedup hit %s", share_id)
+                    return jsonify({'id': share_id, 'url': url, 'reused': True})
+            except Exception:
+                continue
+        
+        # New share
+        share_id = uuid.uuid4().hex[:12]
+        (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
+        _share_evict()
         url = f'{proto}://{host}/?share={share_id}'
         log.info("share: saved %s (%d KB)", share_id, len(data) // 1024)
-        return jsonify({'id': share_id, 'url': url})
+        return jsonify({'id': share_id, 'url': url, 'reused': False})
     except Exception as e:
         log.error("share save: %s", traceback.format_exc())
         return _error(str(e))
@@ -2446,7 +2485,6 @@ def share_save():
 def share_load(share_id):
     """Retrieve a saved share."""
     try:
-        import re
         if not re.match(r'^[a-f0-9]{12}$', share_id):
             return _error('Invalid share ID', 400)
         p = SHARE_DIR / f'{share_id}.json.gz'

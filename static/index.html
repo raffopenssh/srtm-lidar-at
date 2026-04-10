@@ -92,8 +92,8 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
 
 /* ===== SHARE BUTTON ===== */
-.share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none}
-.share-toast.show{opacity:1;transform:translateY(0)}
+.share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100vw - 40px);overflow:hidden;text-overflow:ellipsis;user-select:all}
+.share-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
 
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
@@ -385,7 +385,8 @@ const drawnItems=new L.FeatureGroup().addTo(map);
 const resultLayer=new L.FeatureGroup().addTo(map);
 
 new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:true,marker:true,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
-map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);});
+map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();});
+map.on('moveend',markShareDirty);
 
 // ============ STATE ============
 let colorMode='type';
@@ -717,6 +718,18 @@ async function reloadRasterOverlay(){
 }
 
 // ============ SHARE ============
+let currentShareId=null;  // ID of current share (if loaded from or just created)
+let shareStateHash=null;  // hash of state when share was created/loaded
+
+function computeShareHash(state,result){
+  // Simple hash of JSON to detect if state changed
+  const s=JSON.stringify({s:state,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
+  let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}
+  return h;
+}
+
+// Mark share dirty on any state change
+function markShareDirty(){currentShareId=null;shareStateHash=null;}
 function getShareState(){
   const c=map.getCenter(),z=map.getZoom();
   const layers=[];
@@ -809,24 +822,59 @@ async function restoreShareResult(data){
   }
 }
 
+async function copyToClipboard(text){
+  // Try multiple approaches for clipboard copy
+  // 1. Clipboard API (works in secure contexts)
+  try{await navigator.clipboard.writeText(text);return true;}catch(e){}
+  // 2. execCommand fallback
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.style.cssText='position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent';
+    document.body.appendChild(ta);
+    ta.focus();ta.select();
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    if(ok) return true;
+  }catch(e){}
+  // 3. window.prompt fallback — let user copy manually
+  try{window.prompt('Copy this share link:',text);return true;}catch(e){}
+  return false;
+}
+
 document.getElementById('btn-share').onclick=async()=>{
   const btn=document.getElementById('btn-share');
   if(btn.disabled)return;
-  btn.disabled=true;btn.textContent='\u23f3 Saving...';
+  const toast=document.getElementById('share-toast');
   const state=getShareState();
+  const stateH=computeShareHash(state,lastResult);
+  
+  // If we already have a share for this exact state, just copy the URL
+  if(currentShareId && shareStateHash===stateH){
+    const url=location.origin+location.pathname+'?share='+currentShareId;
+    const copied=await copyToClipboard(url);
+    toast.textContent=copied?'\u2705 Link copied!':'\u2705 '+url;
+    toast.classList.add('show');
+    setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
+    return;
+  }
+  
+  btn.disabled=true;btn.textContent='\u23f3 Saving...';
   const payload={state:state};
   if(lastResult) payload.result=lastResult;
-  const toast=document.getElementById('share-toast');
+  // If we have an existing share ID, offer to update it
+  if(currentShareId) payload.reuse_id=currentShareId;
   try{
     const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d=await resp.json();
     if(d.error) throw new Error(d.error);
+    currentShareId=d.id;
+    shareStateHash=stateH;
     const url=location.origin+location.pathname+'?share='+d.id;
-    let copied=false;
-    try{await navigator.clipboard.writeText(url);copied=true;}catch(ce){
-      try{const ta=document.createElement('textarea');ta.value=url;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();copied=document.execCommand('copy');document.body.removeChild(ta);}catch(e2){}
-    }
-    toast.textContent=copied?'\u2705 Link copied to clipboard!':'\u2705 '+url;
+    // Update URL bar without reload
+    history.replaceState(null,'',`?share=${d.id}`);
+    const copied=await copyToClipboard(url);
+    toast.textContent=copied?'\u2705 Link copied to clipboard!'+(d.reused?' (existing share)':''):'\u2705 '+url;
     toast.classList.add('show');
     setTimeout(()=>toast.classList.remove('show'),copied?3000:8000);
   }catch(e){
@@ -847,6 +895,9 @@ document.getElementById('btn-share').onclick=async()=>{
     if(!resp.ok) throw new Error('Share not found');
     const data=await resp.json();
     await restoreShareResult(data);
+    // Track this share so re-sharing won't create duplicates
+    currentShareId=shareId;
+    shareStateHash=computeShareHash(data.state,data.result);
     hideLoading('Shared view restored.');
   }catch(e){
     hideLoading('Failed to load share: '+e.message);
@@ -1036,6 +1087,7 @@ document.getElementById('btn-run').onclick=async()=>{
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     lastResult=data;
+    markShareDirty();
     if(data.features){allFeatureData=data.features;showResultOnMap(data);}
     document.getElementById('fab-download').style.display='flex';
     hideLoading();

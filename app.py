@@ -1130,82 +1130,88 @@ def _seg_cache_path(cache_key: str) -> Path:
 def _seg_cache_save(cache_key: str, labels, objects, mask, transform, shape_hw, ndsm):
     """Persist seg cache to disk for cross-worker reuse.
 
-    Uses numpy.savez for arrays + pickle for objects list to avoid
-    duplicating large arrays in memory during serialization.
+    Snapshots all data into a single dict up-front (in the calling thread),
+    then pickles + writes to disk in a background thread so the API response
+    is not blocked.
     """
+    # Capture everything NOW — numpy arrays are refcounted, not copied
+    payload = {
+        'key': cache_key,
+        'labels': labels,
+        'objects': objects,
+        'mask': mask,
+        'transform': tuple(transform)[:6] if hasattr(transform, '__iter__') else transform,
+        'shape': shape_hw,
+        'ndsm': ndsm,
+        'ts': time.time(),
+    }
+
     def _do_save():
         try:
             p = _seg_cache_path(cache_key)
             tmp = p.with_suffix('.tmp')
-            tf_tuple = tuple(transform)[:6] if hasattr(transform, '__iter__') else transform
-            # Save arrays with np.savez (streams to disk, low memory overhead)
-            arrays = {'labels': labels, 'mask': mask}
-            if ndsm is not None:
-                arrays['ndsm'] = ndsm
-            np.savez(str(tmp) + '.npz', **arrays)
-            # Save metadata + objects with pickle (objects are small dataclasses)
-            meta = {
-                'key': cache_key,
-                'objects': objects,
-                'transform': tf_tuple,
-                'shape': shape_hw,
-                'has_ndsm': ndsm is not None,
-                'ts': time.time(),
-            }
-            with open(str(tmp) + '.meta', 'wb') as f:
-                pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
-            # Atomic rename both files
-            Path(str(tmp) + '.npz').rename(str(p) + '.npz')
-            Path(str(tmp) + '.meta').rename(str(p) + '.meta')
-            total = (p.with_suffix('.pkl.npz').stat().st_size +
-                     p.with_suffix('.pkl.meta').stat().st_size)
-            log.info("seg_cache: saved to disk (%s, %.1f MB)", p.name, total / 1e6)
-            # Evict old entries (keep at most 3 sets)
-            metas = sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime)
-            for old in metas[:-3]:
+            with open(tmp, 'wb') as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.rename(p)
+            log.info("seg_cache: saved to disk (%s, %.1f MB)", p.name, p.stat().st_size / 1e6)
+            # Evict old entries (keep at most 3)
+            entries = sorted(_SEG_CACHE_DIR.glob('seg_*.pkl'), key=lambda f: f.stat().st_mtime)
+            for old in entries[:-3]:
                 old.unlink(missing_ok=True)
-                npz = old.with_suffix('.npz')
-                npz.unlink(missing_ok=True)
         except Exception as e:
             log.warning("seg_cache: disk save failed: %s", e)
-    # Run in background thread to avoid blocking the response
+
     threading.Thread(target=_do_save, daemon=True).start()
+
 
 def _seg_cache_load(cache_key: str):
     """Try to load seg cache from disk. Returns dict or None."""
     try:
         p = _seg_cache_path(cache_key)
-        meta_p = Path(str(p) + '.meta')
-        npz_p = Path(str(p) + '.npz')
-        if not meta_p.exists() or not npz_p.exists():
+        if not p.exists():
             return None
-        # Skip if older than 1 hour
-        if time.time() - meta_p.stat().st_mtime > 3600:
-            meta_p.unlink(missing_ok=True)
-            npz_p.unlink(missing_ok=True)
+        if time.time() - p.stat().st_mtime > 3600:
+            p.unlink(missing_ok=True)
             return None
-        with open(meta_p, 'rb') as f:
-            meta = pickle.load(f)
-        if meta.get('key') != cache_key:
+        with open(p, 'rb') as f:
+            data = pickle.load(f)
+        if data.get('key') != cache_key:
             return None
-        arrs = np.load(str(npz_p))
+        # Restore transform as rasterio Affine
         from rasterio.transform import Affine
-        t = meta['transform']
-        data = {
-            'key': cache_key,
-            'labels': arrs['labels'],
-            'objects': meta['objects'],
-            'mask': arrs['mask'],
-            'transform': Affine(*t[:6]) if isinstance(t, (list, tuple)) else t,
-            'shape': meta['shape'],
-            'ndsm': arrs['ndsm'] if meta.get('has_ndsm') and 'ndsm' in arrs else None,
-        }
-        arrs.close()
+        t = data['transform']
+        if isinstance(t, (list, tuple)):
+            data['transform'] = Affine(*t[:6])
         log.info("seg_cache: loaded from disk (%s)", p.name)
         return data
     except Exception as e:
         log.warning("seg_cache: disk load failed: %s", e)
         return None
+
+
+def _seg_cache_scan(cache_key_substring: str):
+    """Scan all disk cache files for one whose key contains the substring.
+
+    Used by GeoPackage/MBTiles which match on a partial key (bounds+dataset).
+    Returns dict with labels/objects/mask/ndsm or None.
+    """
+    for p in sorted(_SEG_CACHE_DIR.glob('seg_*.pkl'),
+                    key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            if time.time() - p.stat().st_mtime > 3600:
+                continue
+            with open(p, 'rb') as f:
+                data = pickle.load(f)
+            if data.get('key') and cache_key_substring in data['key']:
+                from rasterio.transform import Affine
+                t = data['transform']
+                if isinstance(t, (list, tuple)):
+                    data['transform'] = Affine(*t[:6])
+                log.info("seg_cache: scan hit (%s)", p.name)
+                return data
+        except Exception:
+            pass
+    return None
 
 # Cache for raster data (DTM/DSM/nDSM/ortho) keyed by (bounds, dataset)
 # so overlay endpoints don't re-fetch from remote after segment has loaded them
@@ -1711,19 +1717,11 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                 objects = _seg_cache["objects"]
             else:
                 # Try file-backed cache (cross-worker)
-                for _mf in sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime, reverse=True):
-                    try:
-                        with open(_mf, 'rb') as _f:
-                            _mc = pickle.load(_f)
-                        if _mc.get('key') and cache_key_check in _mc['key']:
-                            _npz = np.load(str(_mf.with_suffix('.npz')))
-                            log.info("GeoPackage: using cached segmentation (disk)")
-                            labels = _npz['labels']
-                            objects = _mc['objects']
-                            _npz.close()
-                            break
-                    except Exception:
-                        pass
+                _dc = _seg_cache_scan(cache_key_check)
+                if _dc is not None:
+                    log.info("GeoPackage: using cached segmentation (disk)")
+                    labels = _dc['labels']
+                    objects = _dc['objects']
             if labels is None:
                 spectral = None
                 if rgb is not None:
@@ -1855,22 +1853,13 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
             seg_ndsm = _seg_cache.get("ndsm")
         else:
             # Try file-backed cache (cross-worker)
-            for _mf in sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime, reverse=True):
-                try:
-                    with open(_mf, 'rb') as _f:
-                        _mc = pickle.load(_f)
-                    if _mc.get('key') and cache_key_check in _mc['key']:
-                        _npz = np.load(str(_mf.with_suffix('.npz')))
-                        from rasterio.transform import Affine
-                        log.info("MBTiles raster: using cached segmentation (disk)")
-                        labels = _npz['labels']
-                        objects = _mc['objects']
-                        seg_mask = _npz['mask']
-                        seg_ndsm = _npz['ndsm'] if _mc.get('has_ndsm') and 'ndsm' in _npz else None
-                        _npz.close()
-                        break
-                except Exception:
-                    pass
+            _dc = _seg_cache_scan(cache_key_check)
+            if _dc is not None:
+                log.info("MBTiles raster: using cached segmentation (disk)")
+                labels = _dc['labels']
+                objects = _dc['objects']
+                seg_mask = _dc['mask']
+                seg_ndsm = _dc.get('ndsm')
         if not (labels is not None and objects is not None):
             log.info("gpkg raster overlay: running segmentation")
             spectral = None

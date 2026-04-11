@@ -187,6 +187,23 @@ def segment_progress():
         return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
 
 
+@app.route('/api/v1/segment/abort', methods=['POST'])
+def segment_abort():
+    """Abort a running segment task. Marks it as cancelled."""
+    task_id = request.args.get('task_id', '') or (request.get_json(silent=True) or {}).get('task_id', '')
+    if not task_id:
+        return _error('task_id required')
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    if p.exists():
+        try:
+            info = json.loads(p.read_text())
+            if info.get('step') not in ('done', 'error'):
+                _progress_error(task_id, 'Cancelled by user')
+        except Exception:
+            _progress_error(task_id, 'Cancelled by user')
+    return jsonify({"ok": True, "task_id": task_id})
+
+
 @app.route('/api/v1/segment/result')
 def segment_result():
     """Retrieve the result of an async segment task."""

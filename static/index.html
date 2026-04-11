@@ -232,6 +232,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
     <div class="row" style="margin-top:6px">
       <button class="btn" id="btn-sample">▶ Sample</button>
       <button class="btn" id="btn-run">🚀 Analyse</button>
+      <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
     </div>
   </div>
   <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span></div>
@@ -473,10 +474,55 @@ new L.Control.GPS({position:'topleft'}).addTo(map);
 const drawnItems=new L.FeatureGroup().addTo(map);
 const resultLayer=new L.FeatureGroup().addTo(map);
 
-new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:true,marker:true,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
+const drawControl=new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:false,marker:false,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
 map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();});
 // moveend no longer invalidates share — viewpoint is cosmetic, not part of share identity
 map.on('moveend',_debouncedLayerAvailCheck);
+
+// Override delete button: intercept leaflet-draw's delete toolbar
+// Replace delete button click to clear EVERYTHING with a confirmation
+(function(){
+  // Wait for draw toolbar to render, then find the trash button
+  setTimeout(()=>{
+    const delBtn=document.querySelector('.leaflet-draw-edit-remove');
+    if(!delBtn)return;
+    // Clone to remove existing event listeners
+    const newBtn=delBtn.cloneNode(true);
+    delBtn.parentNode.replaceChild(newBtn,delBtn);
+    newBtn.title='Clear map & results';
+    newBtn.onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      if(!confirm('Clear the drawn area and all analysis results? This cannot be undone.'))return;
+      clearEverything();
+    };
+  },500);
+})();
+
+function clearEverything(){
+  // Clear drawn geometry
+  drawnItems.clearLayers();
+  document.getElementById('geometry').value='';
+  // Clear results
+  resultLayer.clearLayers();
+  markersByType={};allFeatureData=[];hiddenTypes.clear();
+  lastResult=null;
+  // Remove all overlays
+  for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
+  for(const k of Object.keys(overlays))delete overlays[k];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.dataset.lyr!=='base')cb.checked=false;});
+  // Hide legend, download fab, share popup
+  document.getElementById('legend').style.display='none';
+  document.getElementById('fab-download').style.display='none';
+  const sp=document.getElementById('share-link-popup');if(sp)sp.classList.remove('show');
+  // Reset legend
+  document.getElementById('legend-types').innerHTML='';
+  document.getElementById('legend-scale').innerHTML='';
+  const mi=document.getElementById('meta-info');if(mi){mi.style.display='none';mi.innerHTML='';}
+  // Reset share
+  markShareDirty();
+  // Reset status
+  setStatus('Idle');
+}
 
 // ============ STATE ============
 let colorMode='type';
@@ -1446,6 +1492,23 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
 })();
 
 // ============ ANALYSE ============
+let _activeTaskId=null;
+let _aborted=false;
+
+document.getElementById('btn-abort').onclick=async()=>{
+  if(!_activeTaskId)return;
+  _aborted=true;
+  try{await fetch(`/api/v1/segment/abort?task_id=${_activeTaskId}`,{method:'POST'});}catch(e){}
+  setStatus('Cancelled');
+  hideLoading('Cancelled');
+  _showAbortBtn(false);
+  document.getElementById('btn-run').disabled=false;
+};
+
+function _showAbortBtn(show){
+  document.getElementById('btn-abort').style.display=show?'inline-block':'none';
+}
+
 document.getElementById('btn-run').onclick=async()=>{
   const btn=document.getElementById('btn-run');
   const endpoint=document.getElementById('endpoint').value;
@@ -1453,6 +1516,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(!geometry){setStatus('Provide geometry first.');return;}
 
   btn.disabled=true;
+  _aborted=false;
   showLoading('Starting...');
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
@@ -1481,9 +1545,13 @@ document.getElementById('btn-run').onclick=async()=>{
 
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);
+  _activeTaskId=taskId;
 
   // Always use async mode for segment endpoint — survives mobile screen-off
   if(isSeg)params.set('async','true');
+
+  // Show abort button for async tasks
+  if(isSeg)_showAbortBtn(true);
 
   let ct='text/plain',body=geometry;
   try{const p=JSON.parse(geometry);ct='application/json';body=JSON.stringify({geometry:p});}catch(e){}
@@ -1499,6 +1567,7 @@ document.getElementById('btn-run').onclick=async()=>{
       const tid=submitData.task_id;
       setStatus('Submitted, waiting...');
       const data=await _pollForResult(tid);
+      if(_aborted)return;
       if(data.error)throw new Error(data.error);
       lastResult=data;
       markShareDirty();
@@ -1515,17 +1584,20 @@ document.getElementById('btn-run').onclick=async()=>{
       hideLoading();
     }
   }catch(e){
+    if(_aborted)return;
     setStatus('Error: '+e.message);
     hideLoading('Error');
     lastResult=null;
-  }finally{btn.disabled=false;}
+  }finally{btn.disabled=false;_showAbortBtn(false);_activeTaskId=null;}
 };
 
 // Poll progress + fetch result when done. Resilient to screen-off / network blips.
 async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=600000){
   const t0=Date.now();
   while(Date.now()-t0<maxWaitMs){
+    if(_aborted)throw new Error('Cancelled');
     await new Promise(r=>setTimeout(r,intervalMs));
+    if(_aborted)throw new Error('Cancelled');
     try{
       const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
       const pj=await pr.json();
@@ -1771,13 +1843,33 @@ const MBTILES_LAYERS=[
   {id:'hansen',name:'Hansen Forest Δ',group:'Analysis'},
   {id:'raster',name:'Segment Raster',group:'Analysis'},
 ];
-function buildMBTilesList(){
+async function buildMBTilesList(){
   const el=document.getElementById('mbtiles-list');
-  let html='';let lastGroup='';
+  // Check layer availability via /api/v1/layers
+  let flat={};
+  try{
+    const b=map.getBounds();
+    const bbox=`${b.getWest().toFixed(6)},${b.getSouth().toFixed(6)},${b.getEast().toFixed(6)},${b.getNorth().toFixed(6)}`;
+    const resp=await fetch(`/api/v1/layers?bbox=${bbox}`);
+    if(resp.ok){
+      const avail=await resp.json();
+      for(const[group,val]of Object.entries(avail)){
+        if(typeof val==='object'){
+          for(const[year,ok]of Object.entries(val))flat[`${group}-${year}`]=!!ok;
+        }else flat[group]=!!val;
+      }
+    }
+  }catch(e){console.warn('MBTiles layer check failed:',e);}
+  let html='';let lastGroup='';let anyShown=false;
   for(const ly of MBTILES_LAYERS){
+    // Skip analysis layers from availability check (always show if we have results), skip unavailable data layers
+    const isAnalysis=ly.group==='Analysis';
+    if(!isAnalysis && Object.keys(flat).length>0 && flat[ly.id]===false)continue;
     if(ly.group!==lastGroup){html+=`<div style="font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;padding-bottom:2px;border-bottom:1px solid #eee">${ly.group}</div>`;lastGroup=ly.group;}
     html+=`<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px" id="mbt-row-${ly.id}"><span style="flex:1">${ly.name}</span><button class="btn btn-sm btn-outline" onclick="downloadMBTiles('${ly.id}','${ly.name}',this)">Download</button></div>`;
+    anyShown=true;
   }
+  if(!anyShown)html='<p style="color:#999;font-size:12px">No layers available for the current map view.</p>';
   el.innerHTML=html;
 }
 async function downloadMBTiles(layerId,layerName,btn){

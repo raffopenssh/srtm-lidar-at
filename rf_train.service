@@ -1,0 +1,18 @@
+[Unit]
+Description=RF Training (4000 KGs) for Austrian LIDAR
+After=network.target
+
+[Service]
+User=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+ExecStart=/bin/bash -c '/usr/bin/python3 train_rf_4000kg.py >> /tmp/rf_train_4000kg.log 2>&1'
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=60
+# Generous limits for long-running ML training
+TimeoutStartSec=infinity
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

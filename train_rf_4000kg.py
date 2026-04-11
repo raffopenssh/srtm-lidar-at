@@ -796,9 +796,30 @@ def main():
                  len(completed_kgs), total_samples)
 
     # --- Load failed KGs (ones that crashed, e.g. OOM) ---
+    # On restart, give previously-failed KGs one fresh attempt with the
+    # full retry ladder (3km → 1km → 200m).  KGs that already got a
+    # retry pass and failed again stay permanently skipped.
     failed_kgs = set()
+    RETRIED_KGS_FILE = PERMANENT_DIR / "retried_kgs.txt"
+    prev_retried = set()
+    if RETRIED_KGS_FILE.exists():
+        prev_retried = set(RETRIED_KGS_FILE.read_text().strip().splitlines()) - {""}
     if FAILED_KGS_FILE.exists():
-        failed_kgs = set(FAILED_KGS_FILE.read_text().strip().splitlines())
+        prev_failed = set(FAILED_KGS_FILE.read_text().strip().splitlines()) - {""}
+        # KGs that already got a retry pass stay permanently failed
+        permanently_failed = prev_failed & prev_retried
+        # KGs that haven't been retried yet get a fresh chance
+        to_retry = prev_failed - prev_retried
+        if to_retry:
+            log.info("Clearing %d previously-failed KGs for retry (200m window available): %s",
+                     len(to_retry), sorted(to_retry))
+            prev_retried |= to_retry
+            RETRIED_KGS_FILE.write_text("\n".join(sorted(prev_retried)) + "\n")
+        failed_kgs = permanently_failed
+        if failed_kgs:
+            FAILED_KGS_FILE.write_text("\n".join(sorted(failed_kgs)) + "\n")
+        else:
+            FAILED_KGS_FILE.unlink(missing_ok=True)
     # If we find an in-progress marker, the previous run was interrupted on that KG.
     # Don't add to failed list — it may have been a clean service restart.
     # Just clear the marker and let it be retried naturally.
@@ -846,10 +867,10 @@ def main():
 
         try:
             # Run with timeout to prevent stuck KGs from blocking forever.
-            # On timeout, retry once with a 1km crop window.
+            # Retry ladder: 3km → 1km → 200m crop window.
             # Uses multiprocessing so the child can be killed cleanly on timeout.
             features, labels, stats = None, None, None
-            for attempt_km in [3.0, 1.0]:
+            for attempt_km in [3.0, 1.0, 0.2]:
                 import gc; gc.collect()
                 pool = multiprocessing.Pool(processes=1)
                 try:
@@ -865,14 +886,14 @@ def main():
                         break  # success
                     except multiprocessing.TimeoutError:
                         log.warning(
-                            "  → TIMEOUT after %d min for KG %s (%.0fkm window)",
+                            "  → TIMEOUT after %d min for KG %s (%.1fkm window)",
                             KG_TIMEOUT_SECONDS // 60, kg_code, attempt_km)
                         pool.terminate()
                         pool.join()
-                        if attempt_km <= 1.0:
-                            # Already retried at 1km — give up
+                        if attempt_km <= 0.2:
+                            # Already retried at 200m — give up
                             log.error(
-                                "  → TIMEOUT on 1km retry too — skipping KG %s",
+                                "  → TIMEOUT on 200m retry too — skipping KG %s",
                                 kg_code)
                             failed_kgs.add(kg_code)
                             FAILED_KGS_FILE.write_text(
@@ -883,14 +904,15 @@ def main():
                             features = None
                             break
                         else:
-                            log.info("  → Retrying KG %s with 1km window",
-                                     kg_code)
+                            next_km = {3.0: 1.0, 1.0: 0.2}[attempt_km]
+                            log.info("  → Retrying KG %s with %.0fm window",
+                                     kg_code, next_km * 1000)
                             continue
                 finally:
                     pool.close()
                     pool.join()
             if features is None and stats is None:
-                # Timed out on both attempts
+                # Timed out on all attempts
                 continue
             stats["index"] = i
             all_stats.append(stats)

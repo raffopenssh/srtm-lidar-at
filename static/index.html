@@ -130,9 +130,9 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .share-link-popup{display:none;position:absolute;bottom:60px;left:14px;z-index:1002;background:#1a1a2e;padding:10px 12px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:calc(100vw - 28px);min-width:240px}
 .share-link-popup.show{display:flex;flex-direction:column;gap:8px}
 .share-link-url{font-family:monospace;font-size:11px;color:#8af;word-break:break-all;line-height:1.6;user-select:all}
-.share-link-url .share-hash{color:#5fffb0;cursor:text;border-bottom:1px dashed rgba(95,255,176,.4);outline:none;padding:1px 2px;border-radius:2px;min-width:20px;display:inline-block}
-.share-link-url .share-hash:hover{background:rgba(95,255,176,.1)}
-.share-link-url .share-hash:focus{background:rgba(95,255,176,.15);border-bottom-style:solid;border-bottom-color:#5fffb0}
+.share-link-url .share-hash{color:#5fffb0;cursor:text;border-bottom:1px dashed rgba(95,255,176,.5);outline:none;padding:2px 4px;border-radius:3px;min-width:20px;display:inline-block;background:rgba(95,255,176,.08);-webkit-tap-highlight-color:rgba(95,255,176,.2)}
+.share-link-url .share-hash:hover{background:rgba(95,255,176,.15)}
+.share-link-url .share-hash:focus{background:rgba(95,255,176,.18);border-bottom-style:solid;border-bottom-color:#5fffb0;box-shadow:0 0 0 1px rgba(95,255,176,.3)}
 .share-link-url .share-hash::selection{background:rgba(95,255,176,.3)}
 .share-link-bottom{display:flex;gap:8px;align-items:center}
 .share-link-bottom .btn-sm{padding:6px 12px;font-size:12px;border-radius:8px;display:flex;align-items:center;gap:4px}
@@ -355,6 +355,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   <div class="share-toast" id="share-toast">Link copied!</div>
   <div class="share-link-popup" id="share-link-popup">
     <div class="share-link-url" id="share-link-url"></div>
+    <div class="share-rename-hint" id="share-rename-hint" style="font-size:10px;color:rgba(95,255,176,.5);margin:-4px 0 0">tap <span style="color:#5fffb0">green name</span> to rename</div>
     <div class="share-link-bottom">
       <button class="btn btn-sm" id="share-copy-btn">🔗 Copy link</button>
       <span class="share-copied" id="share-copied">✓ Copied</span>
@@ -2340,20 +2341,8 @@ async function downloadMBTiles(layerId,layerName,btn){
 }
 
 // ============ SHARE URL PREVIEW ============
-(function(){
-  // When share popup opens, show preview URL
-  const popupEl=document.getElementById('share-link-popup');
-  if(!popupEl) return;
-  const obs=new MutationObserver(()=>{
-    if(popupEl.classList.contains('show')){
-      const preview=document.getElementById('share-link-url');
-      if(preview && currentShareId){
-        preview.textContent=location.origin+location.pathname+'?share='+currentShareId;
-      }
-    }
-  });
-  obs.observe(popupEl,{attributes:true,attributeFilter:['class']});
-})();
+// (Removed: MutationObserver was overwriting editable share-hash span
+//  with plain textContent. _showSharePopup already builds the popup.)
 
 // Init MBTiles list on modal open
 const _origOpenModal=openResultModal;

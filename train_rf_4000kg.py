@@ -12,7 +12,9 @@ Run: python3 train_rf_4000kg.py 2>&1 | tee /tmp/rf_train_4000kg.log
 import json
 import logging
 import os
+import multiprocessing
 import random
+import signal
 import sys
 import time
 import traceback
@@ -38,6 +40,8 @@ for name in ['rasterio', 'urllib3', 'botocore', 'PIL', 'fiona']:
 
 N_KGS = 4000
 MODEL_CHECKPOINT_INTERVAL = 10  # train & save model every N successful KGs
+KG_TIMEOUT_SECONDS = 20 * 60  # 20 min max per KG (prevents stuck segmentation)
+MAX_KG_PIXELS = 10_000_000  # skip KGs with > 10M valid pixels (OOM risk)
 
 CADASTRE_BASE = "https://cadastre-process-api.exe.xyz/api/v1"
 RESULTS_DIR = Path("/tmp/rf_train_4000kg")
@@ -341,8 +345,12 @@ def process_one_kg(
     kg: dict,
     include_copernicus: bool = True,
     include_osm: bool = True,
+    max_km: float = 3.0,
 ) -> tuple[list[dict], list[str], dict]:
     """Process one KG: segment + match to cadastre + OSM.
+
+    Args:
+        max_km: crop KG bbox to center NxN km (default 3, use 1 for retry).
 
     Returns (features, labels, stats).
     """
@@ -379,15 +387,15 @@ def process_one_kg(
             stats["error"] = f"bbox fetch: {e}"
             return [], [], stats
 
-    # Limit KG size to center 3km
+    # Limit KG size to center max_km x max_km
     dx_km = (east - west) * 111 * np.cos(np.radians((south + north) / 2))
     dy_km = (north - south) * 111
-    if dx_km > 3 or dy_km > 3:
+    if dx_km > max_km or dy_km > max_km:
         cx, cy = (west + east) / 2, (south + north) / 2
-        half = 0.0135
+        half = (max_km / 2) / 111  # approx degrees
         west, south, east, north = cx - half, cy - half, cx + half, cy + half
-        log.info("KG %s: large (%.1f x %.1f km), cropping to center 3km",
-                 kg_code, dx_km, dy_km)
+        log.info("KG %s: large (%.1f x %.1f km), cropping to center %.0fkm",
+                 kg_code, dx_km, dy_km, max_km)
 
     stats["bbox"] = [west, south, east, north]
     geom_wgs = box(west, south, east, north)
@@ -417,6 +425,14 @@ def process_one_kg(
         return [], [], stats
     stats["lidar_time"] = round(time.time() - t0, 1)
     stats["shape"] = list(data["shape"])
+
+    # Early bail-out for oversized KGs to avoid OOM in segmentation
+    valid_px = int(data["mask"].sum()) if data.get("mask") is not None else (data["shape"][0] * data["shape"][1])
+    if valid_px > MAX_KG_PIXELS:
+        stats["error"] = f"too large: {valid_px} valid px > {MAX_KG_PIXELS}"
+        log.warning("KG %s: skipping (%d valid px exceeds %d limit)",
+                    kg_code, valid_px, MAX_KG_PIXELS)
+        return [], [], stats
 
     # 2b. Multi-date DTM/DSM
     dtm_dates = None
@@ -729,6 +745,12 @@ def train_and_save_model(n_kgs, tag="checkpoint"):
 
 
 def main():
+    # Use 'spawn' to avoid fork-safety issues with loaded C libraries
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass  # already set
+
     t_start = time.time()
     log.info("=" * 70)
     log.info("RF Training: %d random KGs with cadastre + OSM ground truth", N_KGS)
@@ -809,12 +831,67 @@ def main():
         log.info("[%d/%d] Processing KG %s (%s)",
                  i + 1, len(kgs), kg_code, kg.get("kg_name", ""))
 
+        # Memory check — force GC if RSS > 2.5G before starting a new KG
+        try:
+            import resource
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            if rss_mb > 2500:
+                import gc; gc.collect()
+                log.info("  GC triggered (RSS=%.0f MB)", rss_mb)
+        except Exception:
+            pass
+
         # Mark this KG as in-progress (crash detection)
         IN_PROGRESS_FILE.write_text(kg_code + "\n")
 
         try:
-            features, labels, stats = process_one_kg(
-                kg, include_copernicus=True, include_osm=True)
+            # Run with timeout to prevent stuck KGs from blocking forever.
+            # On timeout, retry once with a 1km crop window.
+            # Uses multiprocessing so the child can be killed cleanly on timeout.
+            features, labels, stats = None, None, None
+            for attempt_km in [3.0, 1.0]:
+                import gc; gc.collect()
+                pool = multiprocessing.Pool(processes=1)
+                try:
+                    async_result = pool.apply_async(
+                        process_one_kg,
+                        args=(kg,),
+                        kwds={"include_copernicus": True,
+                              "include_osm": True,
+                              "max_km": attempt_km})
+                    try:
+                        features, labels, stats = async_result.get(
+                            timeout=KG_TIMEOUT_SECONDS)
+                        break  # success
+                    except multiprocessing.TimeoutError:
+                        log.warning(
+                            "  → TIMEOUT after %d min for KG %s (%.0fkm window)",
+                            KG_TIMEOUT_SECONDS // 60, kg_code, attempt_km)
+                        pool.terminate()
+                        pool.join()
+                        if attempt_km <= 1.0:
+                            # Already retried at 1km — give up
+                            log.error(
+                                "  → TIMEOUT on 1km retry too — skipping KG %s",
+                                kg_code)
+                            failed_kgs.add(kg_code)
+                            FAILED_KGS_FILE.write_text(
+                                "\n".join(sorted(failed_kgs)) + "\n")
+                            if IN_PROGRESS_FILE.exists():
+                                IN_PROGRESS_FILE.unlink()
+                            n_fail += 1
+                            features = None
+                            break
+                        else:
+                            log.info("  → Retrying KG %s with 1km window",
+                                     kg_code)
+                            continue
+                finally:
+                    pool.close()
+                    pool.join()
+            if features is None and stats is None:
+                # Timed out on both attempts
+                continue
             stats["index"] = i
             all_stats.append(stats)
 

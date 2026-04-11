@@ -81,7 +81,7 @@ def _progress_start(task_id: str):
     p.write_text(json.dumps(dict(step='starting', detail='',
                                  t0=time.time(), updated=time.time())))
 
-def _progress_done(task_id: str):
+def _progress_done(task_id: str, auto_share_id: str = None):
     """Mark task as completed (keeps file so polling sees 'done')."""
     if not task_id:
         return
@@ -93,8 +93,10 @@ def _progress_done(task_id: str):
                 t0 = json.loads(p.read_text()).get('t0', 0.0)
             except Exception:
                 pass
-        p.write_text(json.dumps(dict(step='done', detail='',
-                                     t0=t0, updated=time.time())))
+        d = dict(step='done', detail='', t0=t0, updated=time.time())
+        if auto_share_id:
+            d['auto_share_id'] = auto_share_id
+        p.write_text(json.dumps(d))
     except Exception:
         pass
 
@@ -140,7 +142,7 @@ def _get_result(task_id: str) -> dict | None:
     with gzip.open(str(p), 'rb') as f:
         return json.loads(f.read())
 
-def _cleanup_old_results(max_age_s: int = 3600):
+def _cleanup_old_results(max_age_s: int = 14400):
     """Remove results older than max_age_s."""
     try:
         cutoff = time.time() - max_age_s
@@ -184,6 +186,7 @@ def segment_progress():
             elapsed=elapsed,
             done=is_done,
             error=info.get('detail', '') if is_error else None,
+            auto_share_id=info.get('auto_share_id'),
         ))
     except Exception:
         return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
@@ -215,12 +218,7 @@ def segment_result():
     result = _get_result(task_id)
     if result is None:
         return _error('Result not found or not ready', 404)
-    # Clean up after retrieval
-    try:
-        (_RESULTS_DIR / f"{task_id}.json.gz").unlink(missing_ok=True)
-        (_PROGRESS_DIR / f"{task_id}.json").unlink(missing_ok=True)
-    except Exception:
-        pass
+    # Don't delete after retrieval — let _cleanup_old_results() handle it
     return jsonify(result)
 
 
@@ -810,6 +808,16 @@ def segment_objects():
     except Exception as e:
         return _error(str(e))
 
+    # Capture raw geometry text for auto-save share recovery
+    geometry_text = ''
+    try:
+        from shapely.geometry import mapping
+        if features:
+            geom_dict = mapping(features[0]['geometry'])
+            geometry_text = json.dumps(geom_dict)
+    except Exception:
+        pass
+
     if run_async:
         if not task_id:
             task_id = str(uuid.uuid4())
@@ -817,7 +825,7 @@ def segment_objects():
         _cleanup_old_results()
         thread = threading.Thread(
             target=_segment_worker,
-            args=(task_id, features, params),
+            args=(task_id, features, params, geometry_text),
             daemon=True,
         )
         thread.start()
@@ -826,16 +834,63 @@ def segment_objects():
     return _segment_sync(task_id, features, params)
 
 
-def _segment_worker(task_id: str, features: list, params: dict):
+def _segment_worker(task_id: str, features: list, params: dict, geometry_text: str = ''):
     """Background worker for async segment processing."""
     try:
         resp = _segment_core(task_id, features, params)
         _store_result(task_id, resp)
-        _progress_done(task_id)
-        log.info("Async segment task %s completed", task_id)
+        share_id = _auto_save_share(task_id, resp, geometry_text, params)
+        _progress_done(task_id, auto_share_id=share_id)
+        log.info("Async segment task %s completed (auto-share=%s)", task_id, share_id)
     except Exception as e:
         log.error("Async segment task %s failed: %s", task_id, traceback.format_exc())
         _progress_error(task_id, str(e))
+
+
+def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dict):
+    """Auto-save completed analysis as a share for recovery."""
+    try:
+        share_id = f"auto-{task_id[:8]}"
+        state = {
+            'v': 1, 'center': [47.3, 15.3], 'zoom': 14,
+            'endpoint': 'segment',
+            'min_area': int(params.get('min_object_size', 30)),
+            'ortho': str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes'),
+            'temporal': str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes'),
+            'copernicus': str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'),
+            'cadastre': str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'),
+            'hansen': str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'),
+            'geometry': geometry_text,
+        }
+        # Compute center from result bbox if available
+        if result.get('features'):
+            lats, lngs = [], []
+            for f in result['features'][:100]:
+                coords = f.get('geometry', {}).get('coordinates')
+                if coords:
+                    def _extract(c):
+                        if isinstance(c, (list, tuple)) and len(c) >= 2 and isinstance(c[0], (int, float)):
+                            lngs.append(c[0]); lats.append(c[1])
+                        elif isinstance(c, (list, tuple)):
+                            for x in c: _extract(x)
+                    _extract(coords)
+            if lats and lngs:
+                state['center'] = [round(sum(lats)/len(lats), 6), round(sum(lngs)/len(lngs), 6)]
+                state['zoom'] = 15
+
+        name = f"Auto-save {time.strftime('%Y-%m-%d %H:%M')}"
+        payload = {'state': state, 'result': result, 'name': name}
+        data_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+        data = gzip.compress(data_json.encode())
+
+        SHARE_DIR.mkdir(parents=True, exist_ok=True)
+        (SHARE_DIR / f'{share_id}.json.gz').write_bytes(data)
+        _share_evict()
+        log.info("auto-save: saved share %s (%d KB)", share_id, len(data) // 1024)
+        return share_id
+    except Exception as e:
+        log.error("auto-save failed: %s", e)
+        return None
 
 
 def _segment_sync(task_id: str, features: list, params: dict):

@@ -1557,6 +1557,110 @@ document.addEventListener('click',(e)=>{
   }
 })();
 
+// Recover from page refresh during long-running analysis
+(async function recoverActiveTask(){
+  const raw = localStorage.getItem('_activeTask');
+  if(!raw) return;
+  try{
+    const task = JSON.parse(raw);
+    if(!task.taskId || Date.now() - task.ts > 14400000) { // 4 hours max
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+    // Don't recover if we're loading a share
+    if(new URLSearchParams(location.search).get('share')){
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+
+    // Check if task is still running or has completed
+    const pr = await fetch(`/api/v1/segment/progress?task_id=${task.taskId}`);
+    const pj = await pr.json();
+
+    if(pj.done){
+      // Task completed while we were away — try to load auto-save share
+      if(pj.auto_share_id){
+        showLoading('Recovering auto-saved result...');
+        showFullscreenLoading('Recovering result','Loading auto-saved analysis\u2026');
+        const resp = await fetch('/api/v1/share/'+encodeURIComponent(pj.auto_share_id));
+        if(resp.ok){
+          const data = await resp.json();
+          await restoreShareResult(data);
+          currentShareId = pj.auto_share_id;
+          currentShareName = data.name || null;
+          shareStateHash = computeShareHash(data.state, data.result);
+          history.replaceState(null,'',`?share=${encodeURIComponent(pj.auto_share_id)}`);
+          hideLoading();
+          hideFullscreenLoading();
+          setStatus('Recovered auto-saved result.');
+          localStorage.removeItem('_activeTask');
+          localStorage.removeItem('_autoShareId');
+          return;
+        }
+      }
+      // Fallback: try result endpoint
+      try{
+        const rr = await fetch(`/api/v1/segment/result?task_id=${task.taskId}`);
+        if(rr.ok){
+          showLoading('Recovering result...');
+          const data = await rr.json();
+          if(task.geometry) document.getElementById('geometry').value = task.geometry;
+          lastResult = data;
+          if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+          document.getElementById('fab-download').style.display='flex';
+          hideLoading();
+          setStatus('Recovered completed result.');
+        }
+      }catch(e){}
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+
+    if(pj.active){
+      // Task still running — resume polling
+      showLoading('Resuming analysis...');
+      _showAbortBtn(true);
+      _activeTaskId = task.taskId;
+      if(task.geometry) document.getElementById('geometry').value = task.geometry;
+      setStatus(`Resuming: ${pj.step}${pj.detail?' \u2014 '+pj.detail:''}${pj.elapsed?' ('+pj.elapsed+'s)':''}`);
+      try{
+        const data = await _pollForResult(task.taskId);
+        if(data.error) throw new Error(data.error);
+        lastResult = data;
+        markShareDirty();
+        if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+        document.getElementById('fab-download').style.display='flex';
+        hideLoading();
+        hideFullscreenLoading();
+        const autoId=localStorage.getItem('_autoShareId');
+        if(autoId){
+          currentShareId=autoId;
+          currentShareName=null;
+          history.replaceState(null,'',`?share=${encodeURIComponent(autoId)}`);
+          localStorage.removeItem('_autoShareId');
+          setStatus('Analysis complete \u2014 auto-saved as share.');
+        }
+      }catch(e){
+        setStatus('Recovery error: '+e.message);
+        hideLoading('Error');
+        hideFullscreenLoading();
+      }finally{
+        _showAbortBtn(false);
+        _activeTaskId = null;
+        localStorage.removeItem('_activeTask');
+      }
+      return;
+    }
+
+    // Task not found / expired
+    localStorage.removeItem('_activeTask');
+  }catch(e){
+    localStorage.removeItem('_activeTask');
+  }finally{
+    hideFullscreenLoading();
+  }
+})();
+
 // ============ BUILT-IN SAMPLE ============
 const SAMPLE={"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
 function loadSampleGeometry(){
@@ -1989,6 +2093,7 @@ document.getElementById('btn-run').onclick=async()=>{
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);
   _activeTaskId=taskId;
+  if(isSeg && taskId) localStorage.setItem('_activeTask', JSON.stringify({taskId, geometry, ts:Date.now()}));
 
   // Always use async mode for segment endpoint — survives mobile screen-off
   if(isSeg)params.set('async','true');
@@ -2017,6 +2122,15 @@ document.getElementById('btn-run').onclick=async()=>{
       if(data.features){allFeatureData=data.features;showResultOnMap(data);}
       document.getElementById('fab-download').style.display='flex';
       hideLoading();
+      // Auto-saved share: set as current so user can access via Share button
+      const autoId=localStorage.getItem('_autoShareId');
+      if(autoId){
+        currentShareId=autoId;
+        currentShareName=null;
+        history.replaceState(null,'',`?share=${encodeURIComponent(autoId)}`);
+        localStorage.removeItem('_autoShareId');
+        setStatus('Analysis complete \u2014 auto-saved as share.');
+      }
     }else{
       // Sync mode (non-segment endpoints)
       if(submitData.error)throw new Error(submitData.error);
@@ -2031,11 +2145,11 @@ document.getElementById('btn-run').onclick=async()=>{
     setStatus('Error: '+e.message);
     hideLoading('Error');
     lastResult=null;
-  }finally{btn.disabled=false;_showAbortBtn(false);_activeTaskId=null;}
+  }finally{btn.disabled=false;_showAbortBtn(false);_activeTaskId=null;localStorage.removeItem('_activeTask');}
 };
 
 // Poll progress + fetch result when done. Resilient to screen-off / network blips.
-async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=600000){
+async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=3600000){
   const t0=Date.now();
   while(Date.now()-t0<maxWaitMs){
     if(_aborted)throw new Error('Cancelled');
@@ -2049,6 +2163,9 @@ async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=600000){
       }
       if(pj.done){
         setStatus('Loading results...');
+        if(pj.auto_share_id){
+          localStorage.setItem('_autoShareId', pj.auto_share_id);
+        }
         const rr=await fetch(`/api/v1/segment/result?task_id=${taskId}`);
         return await rr.json();
       }
@@ -2062,7 +2179,7 @@ async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=600000){
       if(e.message && !e.message.startsWith('Failed to fetch'))throw e;
     }
   }
-  throw new Error('Analysis timed out after 10 minutes');
+  throw new Error('Analysis timed out after 60 minutes');
 }
 
 function showResultOnMap(data){

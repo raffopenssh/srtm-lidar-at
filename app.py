@@ -386,6 +386,19 @@ def _get_geometry():
     if len(features) > 1:
         features = geo_parse.union_features(features)
 
+    # Convert non-polygon geometries (lines, points) to polygon via convex hull
+    for feat in features:
+        geom = feat['geometry']
+        if geom.geom_type in ('LineString', 'MultiLineString', 'MultiPoint', 'GeometryCollection'):
+            hull = geom.convex_hull
+            if hull.geom_type == 'Polygon' and not hull.is_empty:
+                feat['geometry'] = hull
+                log.info("_parse_geometry: converted %s → Polygon (convex hull)", geom.geom_type)
+        elif geom.geom_type == 'Point':
+            # Buffer single point by ~100m
+            feat['geometry'] = geom.buffer(0.001)
+            log.info("_parse_geometry: buffered Point → Polygon")
+
     return features
 
 

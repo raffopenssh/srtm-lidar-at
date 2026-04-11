@@ -1357,7 +1357,7 @@ function _showSharePopup(id, saving){
     _wireHashEditing();
   }
   copiedEl.classList.remove('show');
-  savingEl.classList.toggle('show',!!saving);
+  savingEl.classList.remove('show');
   popup.classList.add('show');
 }
 
@@ -1841,24 +1841,22 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
     let geom=null;
     // Prefer polygon features
     const polys=fc.features.filter(f=>f.geometry&&(f.geometry.type==='Polygon'||f.geometry.type==='MultiPolygon'));
-    if(polys.length===1){
+    if(polys.length===1 && fc.features.length===1){
+      // Single polygon feature: use as-is
       geom=polys[0].geometry;
-    }else if(fc.features.length>1){
-      // Multiple features (polygons, lines, points): compute MCP (convex hull)
+    }else{
+      // Multiple features or non-polygon: compute MCP (convex hull)
       const allPts=[];
       for(const f of fc.features)allPts.push(..._extractCoords(f.geometry));
       if(allPts.length>=3){
         const hull=_convexHull(allPts);
         hull.push(hull[0]); // close ring
         geom={type:'Polygon',coordinates:[hull]};
-      }else if(allPts.length===2){
+      }else if(allPts.length>=2){
         geom={type:'LineString',coordinates:allPts};
       }else if(allPts.length===1){
         geom={type:'Point',coordinates:allPts[0]};
       }
-    }else{
-      // Single non-polygon feature
-      geom=fc.features[0].geometry;
     }
     if(!geom){setStatus('No geometry found in '+fname);return;}
     ta.value=JSON.stringify(geom,null,2);

@@ -2962,19 +2962,40 @@ def parse_geometry_file():
 
         features = []
 
+        # Content-sniff: detect KML/GeoJSON/WKT regardless of file extension
+        text_raw = None
+        try:
+            text_raw = raw.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+
+        is_kml = fname.endswith(('.kml', '.xml'))
+        is_json = fname.endswith(('.geojson', '.json'))
+        is_wkt = fname.endswith('.wkt')
+
+        # Sniff content for unknown extensions (e.g. .txt)
+        if text_raw and not (is_kml or is_json or is_wkt):
+            stripped = text_raw.strip()[:500]
+            if '<?xml' in stripped or '<kml' in stripped.lower():
+                is_kml = True
+            elif stripped.startswith('{') and '"type"' in stripped:
+                is_json = True
+            elif re.match(r'^(POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|GEOMETRYCOLLECTION)\s*\(', stripped, re.IGNORECASE):
+                is_wkt = True
+
         # Try text-based formats first
-        if fname.endswith(('.geojson', '.json')):
+        if is_json:
             gj = json.loads(raw)
             return jsonify(gj if gj.get('type') == 'FeatureCollection' else {
                 'type': 'FeatureCollection',
                 'features': gj.get('features', [{'type': 'Feature', 'geometry': gj, 'properties': {}}])
             })
 
-        if fname.endswith(('.kml', '.xml')):
-            parsed = geo_parse.parse_input(raw.decode('utf-8', errors='replace'))
+        if is_kml:
+            parsed = geo_parse.parse_input(text_raw or raw.decode('utf-8', errors='replace'))
             return jsonify(geo_parse.features_to_geojson(parsed))
 
-        if fname.endswith('.wkt'):
+        if is_wkt:
             from shapely import wkt
             geom = wkt.loads(raw.decode('utf-8', errors='replace').strip())
             return jsonify({'type': 'FeatureCollection', 'features': [

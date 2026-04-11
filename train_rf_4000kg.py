@@ -799,13 +799,13 @@ def main():
     failed_kgs = set()
     if FAILED_KGS_FILE.exists():
         failed_kgs = set(FAILED_KGS_FILE.read_text().strip().splitlines())
-    # If we find an in-progress marker, the previous run crashed on that KG
+    # If we find an in-progress marker, the previous run was interrupted on that KG.
+    # Don't add to failed list — it may have been a clean service restart.
+    # Just clear the marker and let it be retried naturally.
     if IN_PROGRESS_FILE.exists():
-        crashed_kg = IN_PROGRESS_FILE.read_text().strip()
-        if crashed_kg:
-            log.warning("Detected crash during KG %s — adding to failed list", crashed_kg)
-            failed_kgs.add(crashed_kg)
-            FAILED_KGS_FILE.write_text("\n".join(sorted(failed_kgs)) + "\n")
+        interrupted_kg = IN_PROGRESS_FILE.read_text().strip()
+        if interrupted_kg:
+            log.info("Previous run interrupted during KG %s — will retry (not marking as failed)", interrupted_kg)
         IN_PROGRESS_FILE.unlink()
     if failed_kgs:
         log.info("Skipping %d previously-failed KGs: %s", len(failed_kgs), sorted(failed_kgs))

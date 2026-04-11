@@ -141,6 +141,13 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .share-saving{font-size:10px;color:#ff9;opacity:0;transition:opacity .3s}
 .share-saving.show{opacity:1}
 
+/* ===== FULLSCREEN LOADING OVERLAY ===== */
+.loading-overlay{display:none;position:fixed;inset:0;z-index:10000;background:rgba(255,255,255,.85);backdrop-filter:blur(2px);align-items:center;justify-content:center;flex-direction:column;gap:12px}
+.loading-overlay.show{display:flex}
+.loading-overlay .lo-spinner{width:36px;height:36px;border:3px solid #ddd;border-top-color:#0d7377;border-radius:50%;animation:spin .7s linear infinite}
+.loading-overlay .lo-text{font-size:14px;font-weight:600;color:#1a1a2e}
+.loading-overlay .lo-sub{font-size:11px;color:#888}
+
 /* ===== MODAL ===== */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
 .modal-backdrop.open{display:flex}
@@ -220,6 +227,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 </style>
 </head>
 <body>
+<div class="loading-overlay" id="loading-overlay"><div class="lo-spinner"></div><div class="lo-text" id="lo-text">Loading…</div><div class="lo-sub" id="lo-sub"></div></div>
 <div id="sidebar">
   <h1>🌍 Austrian <span>Landscape</span> Analysis</h1>
   <div class="controls">
@@ -235,6 +243,25 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="ot-wrap"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
         <div id="ot-dropdown" class="ot-dropdown"></div>
+      </div>
+    </div>
+    <div class="extra-params" id="extra-params">
+      <div class="row">
+        <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
+        <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
+      </div>
+      <div class="row">
+        <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
+        <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
+      </div>
+      <div class="cb-row">
+        <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
+        <label><input id="include_temporal" type="checkbox"> Temporal</label>
+        <label><input id="include_copernicus" type="checkbox"> Copernicus</label>
+      </div>
+      <div class="cb-row">
+        <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
+        <label><input id="include_hansen" type="checkbox"> Hansen</label>
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin:4px 0 2px">
@@ -260,25 +287,6 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <button class="btn" id="btn-run" style="flex:1">🚀 Analyse</button>
       <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
-    </div>
-    <div class="extra-params" id="extra-params">
-      <div class="row">
-        <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
-        <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
-      </div>
-      <div class="row">
-        <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
-        <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
-      </div>
-      <div class="cb-row">
-        <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
-        <label><input id="include_temporal" type="checkbox"> Temporal</label>
-        <label><input id="include_copernicus" type="checkbox"> Copernicus</label>
-      </div>
-      <div class="cb-row">
-        <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
-        <label><input id="include_hansen" type="checkbox"> Hansen</label>
-      </div>
     </div>
   </div>
   <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span></div>
@@ -792,6 +800,8 @@ let loadingCount=0;
 function showLoading(msg){loadingCount++;document.getElementById('spinner').style.display='';document.getElementById('status-text').textContent=msg||'Loading...';}
 function hideLoading(msg){loadingCount=Math.max(0,loadingCount-1);if(!loadingCount){document.getElementById('spinner').style.display='none';document.getElementById('status-text').textContent=msg||'Done.';}}
 function setStatus(msg){document.getElementById('status-text').textContent=msg;}
+function showFullscreenLoading(msg,sub){const o=document.getElementById('loading-overlay');document.getElementById('lo-text').textContent=msg||'Loading\u2026';document.getElementById('lo-sub').textContent=sub||'';o.classList.add('show');}
+function hideFullscreenLoading(){document.getElementById('loading-overlay').classList.remove('show');}
 
 // ============ TRAINING STATUS ============
 (function pollTrainingStatus(){
@@ -1412,12 +1422,12 @@ document.addEventListener('click',(e)=>{
   const shareId=p.get('share');
   if(!shareId) return;
   showLoading('Loading shared view...');
+  showFullscreenLoading('Loading shared view','Fetching data and restoring map\u2026');
   try{
     const resp=await fetch('/api/v1/share/'+encodeURIComponent(shareId));
     if(!resp.ok) throw new Error('Share not found');
     const data=await resp.json();
     await restoreShareResult(data);
-    // Track this share so re-sharing won't create duplicates
     currentShareId=shareId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
@@ -1426,6 +1436,8 @@ document.addEventListener('click',(e)=>{
   }catch(e){
     hideLoading('Failed to load share: '+e.message);
     console.error('Share restore failed:',e);
+  }finally{
+    hideFullscreenLoading();
   }
 })();
 
@@ -1581,6 +1593,7 @@ document.addEventListener('click',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.t
 
 async function _loadShareById(id, name){
   showLoading('Loading '+name+'\u2026');
+  showFullscreenLoading('Loading \u201c'+name+'\u201d','Restoring map layers and analysis results\u2026');
   try{
     const resp=await fetch('/api/v1/share/'+encodeURIComponent(id));
     if(!resp.ok) throw new Error('Share not found');
@@ -1594,6 +1607,8 @@ async function _loadShareById(id, name){
     hideLoading('Loaded: '+name);
   }catch(e){
     hideLoading('Failed: '+e.message);
+  }finally{
+    hideFullscreenLoading();
   }
 }
 

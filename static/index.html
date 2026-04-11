@@ -1156,9 +1156,8 @@ let currentShareId=null;  // ID of current share (if loaded from or just created
 let shareStateHash=null;  // hash of state when share was created/loaded
 
 function computeShareHash(state,result){
-  // Hash of state (excluding viewpoint) + result presence
-  const {center,zoom,...rest}=state;
-  const s=JSON.stringify({s:rest,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
+  // Hash of full state (including viewpoint) + result presence
+  const s=JSON.stringify({s:state,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
   let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}
   return h;
 }

@@ -3159,12 +3159,24 @@ def share_save():
         if reuse_id and _valid_share_id(reuse_id):
             existing = SHARE_DIR / f'{reuse_id}.json.gz'
             if existing.exists():
-                existing.write_bytes(data)
+                # Merge: keep existing result/overlays if not provided in new payload
+                try:
+                    existing_obj = json.loads(gzip.decompress(existing.read_bytes()).decode())
+                except Exception:
+                    existing_obj = {}
+                if 'result' not in payload and 'result' in existing_obj:
+                    payload['result'] = existing_obj['result']
+                if 'overlays' not in payload and 'overlays' in existing_obj:
+                    payload['overlays'] = existing_obj['overlays']
+                if 'name' not in payload and 'name' in existing_obj:
+                    payload['name'] = existing_obj['name']
+                merged_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+                existing.write_bytes(gzip.compress(merged_json.encode()))
                 existing.touch()
                 url = f'{proto}://{host}/?share={reuse_id}'
                 ovl_count = len(payload.get('overlays', {}))
                 log.info("share: updated existing %s (%d KB, %d overlays)",
-                         reuse_id, len(data) // 1024, ovl_count)
+                         reuse_id, len(gzip.compress(merged_json.encode())) // 1024, ovl_count)
                 return jsonify({'id': reuse_id, 'url': url, 'reused': True})
         
         # Content-hash dedup: check existing shares (state+result match)

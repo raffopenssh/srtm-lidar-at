@@ -49,6 +49,10 @@ PERMANENT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_DIR = PERMANENT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Track KGs that crash (e.g. OOM) to avoid infinite retry loops
+IN_PROGRESS_FILE = PERMANENT_DIR / "in_progress_kg.txt"
+FAILED_KGS_FILE = PERMANENT_DIR / "failed_kgs.txt"
+
 # WGS84 <-> EPSG:3035 transformers
 _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -682,9 +686,26 @@ def _clear_downloaded_caches():
         log.info("Cleared %d cached raster entries to free memory", cleared)
 
 
-def train_and_save_model(all_features, all_labels, n_kgs, tag="checkpoint"):
-    """Train RF model and save to disk. Returns training stats or None on failure."""
+def _load_all_checkpoints():
+    """Load all checkpoint features/labels from disk (not kept in RAM)."""
+    all_features = []
+    all_labels = []
+    for ckpt_file in sorted(CHECKPOINT_DIR.glob("kg_*.npz")):
+        try:
+            ckpt = np.load(ckpt_file, allow_pickle=True)
+            all_features.extend(ckpt["features"].tolist())
+            all_labels.extend(ckpt["labels"].tolist())
+        except Exception as e:
+            log.warning("Failed to load checkpoint %s: %s", ckpt_file, e)
+    return all_features, all_labels
+
+
+def train_and_save_model(n_kgs, tag="checkpoint"):
+    """Load checkpoints, train RF model, and save to disk. Returns training stats or None."""
     import learned_classifier as lc
+
+    log.info("Loading checkpoints for model training [%s]...", tag)
+    all_features, all_labels = _load_all_checkpoints()
 
     if len(all_features) < 20:
         log.warning("Not enough samples (%d) for model %s", len(all_features), tag)
@@ -702,6 +723,9 @@ def train_and_save_model(all_features, all_labels, n_kgs, tag="checkpoint"):
     except Exception as e:
         log.error("Model training [%s] failed: %s", tag, traceback.format_exc())
         return None
+    finally:
+        del all_features, all_labels
+        import gc; gc.collect()
 
 
 def main():
@@ -721,9 +745,8 @@ def main():
         with open(dest, "w") as f:
             json.dump(kg_list_data, f, indent=2)
 
-    # --- Resume from checkpoint ---
-    all_features = []
-    all_labels = []
+    # --- Resume from checkpoint (count only, don't load features into RAM) ---
+    total_samples = 0
     all_stats = []
     n_success = 0
     n_fail = 0
@@ -733,10 +756,7 @@ def main():
         try:
             ckpt = np.load(ckpt_file, allow_pickle=True)
             kg_code = str(ckpt["kg_code"])
-            feats = ckpt["features"].tolist()
-            lbls = ckpt["labels"].tolist()
-            all_features.extend(feats)
-            all_labels.extend(lbls)
+            total_samples += len(ckpt["features"])
             completed_kgs.add(kg_code)
             n_success += 1
         except Exception as e:
@@ -751,7 +771,22 @@ def main():
 
     if completed_kgs:
         log.info("RESUMING: loaded %d KGs (%d samples) from checkpoints",
-                 len(completed_kgs), len(all_features))
+                 len(completed_kgs), total_samples)
+
+    # --- Load failed KGs (ones that crashed, e.g. OOM) ---
+    failed_kgs = set()
+    if FAILED_KGS_FILE.exists():
+        failed_kgs = set(FAILED_KGS_FILE.read_text().strip().splitlines())
+    # If we find an in-progress marker, the previous run crashed on that KG
+    if IN_PROGRESS_FILE.exists():
+        crashed_kg = IN_PROGRESS_FILE.read_text().strip()
+        if crashed_kg:
+            log.warning("Detected crash during KG %s — adding to failed list", crashed_kg)
+            failed_kgs.add(crashed_kg)
+            FAILED_KGS_FILE.write_text("\n".join(sorted(failed_kgs)) + "\n")
+        IN_PROGRESS_FILE.unlink()
+    if failed_kgs:
+        log.info("Skipping %d previously-failed KGs: %s", len(failed_kgs), sorted(failed_kgs))
 
     # Track when we last trained a model checkpoint
     last_model_at_n_success = (n_success // MODEL_CHECKPOINT_INTERVAL) * MODEL_CHECKPOINT_INTERVAL
@@ -765,9 +800,17 @@ def main():
                      i + 1, len(kgs), kg_code)
             continue
 
+        if kg_code in failed_kgs:
+            log.info("[%d/%d] KG %s — previously failed (OOM/crash), skipping",
+                     i + 1, len(kgs), kg_code)
+            continue
+
         log.info("-" * 50)
         log.info("[%d/%d] Processing KG %s (%s)",
                  i + 1, len(kgs), kg_code, kg.get("kg_name", ""))
+
+        # Mark this KG as in-progress (crash detection)
+        IN_PROGRESS_FILE.write_text(kg_code + "\n")
 
         try:
             features, labels, stats = process_one_kg(
@@ -776,11 +819,11 @@ def main():
             all_stats.append(stats)
 
             if features:
-                all_features.extend(features)
-                all_labels.extend(labels)
+                n_new = len(features)
+                total_samples += n_new
                 n_success += 1
                 log.info("  → +%d samples (total: %d from %d KGs)",
-                         len(features), len(all_features), n_success)
+                         n_new, total_samples, n_success)
 
                 # Per-KG checkpoint
                 ckpt_path = CHECKPOINT_DIR / f"kg_{kg_code}.npz"
@@ -792,10 +835,17 @@ def main():
                 )
                 log.info("  Checkpoint saved: %s (%d samples)", ckpt_path.name, len(features))
 
+                # KG completed successfully — clear in-progress marker
+                if IN_PROGRESS_FILE.exists():
+                    IN_PROGRESS_FILE.unlink()
+
                 # Model checkpoint every N successful KGs
                 if n_success >= last_model_at_n_success + MODEL_CHECKPOINT_INTERVAL:
+                    # Free per-KG memory before loading all checkpoints for training
+                    del features, labels
+                    import gc; gc.collect()
                     train_stats = train_and_save_model(
-                        all_features, all_labels, n_success,
+                        n_success,
                         tag=f"checkpoint_{n_success}kg")
                     last_model_at_n_success = n_success
                     if train_stats:
@@ -806,10 +856,18 @@ def main():
             else:
                 n_fail += 1
                 log.warning("  → FAILED: %s", stats.get("error", "no labelled segments"))
+                # Clear in-progress marker (KG completed, just had no data)
+                if IN_PROGRESS_FILE.exists():
+                    IN_PROGRESS_FILE.unlink()
         except Exception as e:
             n_fail += 1
             log.error("  → EXCEPTION: %s", traceback.format_exc())
             all_stats.append({"kg_code": kg_code, "error": str(e), "index": i})
+            # Track this KG as failed so we skip it on restart
+            failed_kgs.add(kg_code)
+            FAILED_KGS_FILE.write_text("\n".join(sorted(failed_kgs)) + "\n")
+            if IN_PROGRESS_FILE.exists():
+                IN_PROGRESS_FILE.unlink()
 
         # Save progress
         progress = {
@@ -817,7 +875,7 @@ def main():
             "total": len(kgs),
             "success": n_success,
             "fail": n_fail,
-            "total_samples": len(all_features),
+            "total_samples": total_samples,
             "elapsed_min": round((time.time() - t_start) / 60, 1),
             "completed_kgs": sorted(completed_kgs | {kg_code}),
         }
@@ -835,7 +893,7 @@ def main():
 
         if (i + 1) % 5 == 0 or len(completed_kgs) % 5 == 0:
             log.info("Progress: %d/%d done (%d success), %d samples, %.1f min elapsed",
-                     len(completed_kgs), len(kgs), n_success, len(all_features),
+                     len(completed_kgs), len(kgs), n_success, total_samples,
                      (time.time() - t_start) / 60)
 
     # Final stats
@@ -845,14 +903,7 @@ def main():
 
     log.info("=" * 70)
     log.info("Collection complete: %d KGs succeeded, %d failed", n_success, n_fail)
-    log.info("Total training samples: %d", len(all_features))
-
-    label_dist = {}
-    for lbl in all_labels:
-        label_dist[lbl] = label_dist.get(lbl, 0) + 1
-    log.info("Label distribution:")
-    for lbl, cnt in sorted(label_dist.items(), key=lambda x: -x[1]):
-        log.info("  %-15s %6d (%.1f%%)", lbl, cnt, 100 * cnt / max(len(all_labels), 1))
+    log.info("Total training samples: %d", total_samples)
 
     source_dist = {}
     for s in all_stats:
@@ -862,22 +913,32 @@ def main():
     for src, cnt in sorted(source_dist.items(), key=lambda x: -x[1]):
         log.info("  %-20s %6d", src, cnt)
 
-    if len(all_features) < 20:
-        log.error("Not enough samples to train (%d < 20)", len(all_features))
+    if total_samples < 20:
+        log.error("Not enough samples to train (%d < 20)", total_samples)
         return
 
-    # Final model training
+    # Final model training (loads all checkpoints from disk)
     log.info("=" * 70)
     log.info("Training FINAL Random Forest on %d samples from %d KGs...",
-             len(all_features), n_success)
-    train_stats = train_and_save_model(all_features, all_labels, n_success, tag="final")
+             total_samples, n_success)
+    train_stats = train_and_save_model(n_success, tag="final")
 
     if train_stats:
+        # Load labels just for the report
+        _, all_labels_report = _load_all_checkpoints()
+        label_dist = {}
+        for lbl in all_labels_report:
+            label_dist[lbl] = label_dist.get(lbl, 0) + 1
+        del all_labels_report
+        log.info("Label distribution:")
+        for lbl, cnt in sorted(label_dist.items(), key=lambda x: -x[1]):
+            log.info("  %-15s %6d (%.1f%%)", lbl, cnt, 100 * cnt / max(total_samples, 1))
+
         report = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "n_kgs_processed": n_success,
             "n_kgs_failed": n_fail,
-            "n_total_samples": len(all_features),
+            "n_total_samples": total_samples,
             "training_stats": train_stats,
             "label_distribution": label_dist,
             "source_distribution": source_dist,

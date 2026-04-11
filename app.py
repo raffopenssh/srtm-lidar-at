@@ -224,23 +224,62 @@ def segment_result():
 
 @app.route('/api/v1/training/status')
 def training_status():
-    """Return RF training job status: running, current KG, model info, resource usage."""
-    import subprocess, re, pathlib
+    """Return RF training job status: running, current KG, model info, resource usage.
+
+    Uses cgroup/proc filesystem reads instead of subprocess to avoid
+    fork failures when the srv cgroup is under memory pressure.
+    """
+    import re, pathlib
 
     result = dict(running=False, current_kg=None, progress=None,
-                  model=None, pid=None, cpu_pct=None, ram_mb=None)
+                  model=None, pid=None, ram_mb=None,
+                  service_state=None)
 
-    # Find the training process
+    # Check rf_train service state via cgroup filesystem (no subprocess needed)
+    cgroup_base = pathlib.Path('/sys/fs/cgroup/system.slice/rf_train.service')
     try:
-        ps = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
-        for line in ps.stdout.splitlines():
-            if 'python3 train_rf_4000kg.py' in line and 'grep' not in line and 'bash' not in line and 'tee' not in line:
-                parts = line.split()
-                result['running'] = True
-                result['pid'] = int(parts[1])
-                result['cpu_pct'] = float(parts[2])
-                result['ram_mb'] = round(int(parts[5]) / 1024)  # RSS in KB → MB
+        events_text = (cgroup_base / 'cgroup.events').read_text()
+        populated = 'populated 1' in events_text
+        frozen = 'frozen 1' in events_text
+        if populated and not frozen:
+            result['running'] = True
+            result['service_state'] = 'active'
+        elif populated and frozen:
+            result['running'] = True
+            result['service_state'] = 'activating'  # possibly restarting
+        else:
+            result['service_state'] = 'inactive'
+    except FileNotFoundError:
+        result['service_state'] = 'not-found'
+    except Exception:
+        pass
+
+    # Get memory usage and PID from cgroup/proc (no subprocess needed)
+    try:
+        mem_bytes = int((cgroup_base / 'memory.current').read_text().strip())
+        result['ram_mb'] = round(mem_bytes / (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        pids = (cgroup_base / 'cgroup.procs').read_text().strip().splitlines()
+        for pid_str in pids:
+            pid = int(pid_str)
+            # Read null-separated args; first arg is the executable
+            args = pathlib.Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', errors='replace').split('\x00')
+            if len(args) >= 2 and 'python' in args[0] and 'train_rf_4000kg' in args[1]:
+                result['pid'] = pid
                 break
+    except Exception:
+        pass
+
+    # Check oom_kill events for this cgroup
+    try:
+        mem_events = (cgroup_base / 'memory.events').read_text()
+        for line in mem_events.splitlines():
+            if line.startswith('oom_kill '):
+                oom_kills = int(line.split()[1])
+                if oom_kills > 0:
+                    result['oom_kills'] = oom_kills
     except Exception:
         pass
 
@@ -280,10 +319,15 @@ def training_status():
         except Exception:
             pass
 
-    # Checkpoint count
+    # Checkpoint count + failed KGs
     ckpt_dir = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/checkpoints')
     if ckpt_dir.exists():
         result['n_checkpoints'] = len(list(ckpt_dir.glob('kg_*.npz')))
+    failed_file = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/failed_kgs.txt')
+    if failed_file.exists():
+        failed = [l.strip() for l in failed_file.read_text().strip().splitlines() if l.strip()]
+        result['n_failed_kgs'] = len(failed)
+        result['failed_kgs'] = failed
 
     # Model info
     meta_path = pathlib.Path('/tmp/learned_classifier/rf_meta.json')

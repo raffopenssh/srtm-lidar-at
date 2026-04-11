@@ -810,21 +810,32 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
     try{
       const r=await fetch('/api/v1/training/status');
       const d=await r.json();
+      const svc=d.service_state||'';
+      const modelStr=d.model?`OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`:'no model yet';
+      const failStr=(d.n_failed_kgs>0)?` · ${d.n_failed_kgs} skipped`:'';
       if(d.running){
-        const kg=d.current_kg?` · KG ${d.current_kg.kg_code} (${d.current_kg.kg_name}) [${d.progress}]`:'';
+        const kg=d.current_kg?` KG ${d.current_kg.kg_code} (${d.current_kg.kg_name}) [${d.progress}]`:'';
         const step=d.current_step?` · ${d.current_step}`:'';
-        const model=d.model?` · OOB=${d.model.oob_score}, ${d.model.n_kgs} KGs`:'no model yet';
         const res=d.ram_mb?` · ${d.ram_mb}MB`:'';
-        el.innerHTML=`🟢 RF${kg}${step}${res}${model}`;
+        const restarts=d.n_restarts?` · ${d.n_restarts} restarts`:'';
+        el.innerHTML=`🟢 RF training:${kg}${step}${res}${restarts}${failStr} · ${modelStr}`;
         el.style.color='#2a7';
+      } else if(svc==='activating'){
+        el.innerHTML=`🟡 RF training restarting...${failStr} · ${modelStr}`;
+        el.style.color='#b90';
+      } else if(d.n_checkpoints>0){
+        const ckpt=d.n_checkpoints?` ${d.n_checkpoints} KGs done`:'';
+        const stopped=(svc==='failed'||svc==='inactive')?` (${svc})`:''; 
+        el.innerHTML=`🔴 RF training stopped${stopped} ·${ckpt}${failStr} · ${modelStr}`;
+        el.style.color='#c44';
       } else if(d.model){
-        el.innerHTML=`⚪ RF model: OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`;
+        el.innerHTML=`⚪ RF model: ${modelStr}`;
         el.style.color='#888';
       } else {
         el.textContent='⚪ No RF model';
         el.style.color='#888';
       }
-    }catch(e){el.textContent='';}
+    }catch(e){/* keep previous display on transient fetch error */}
   }
   update();
   setInterval(update,10000);

@@ -1427,17 +1427,24 @@ def group_objects(
         return objects
 
     label_to_obj = {o.obj_id: o for o in objects}
-    struct = ndimage.generate_binary_structure(2, 1)  # 4-connectivity
 
-    # Build adjacency
+    # Build adjacency in one pass — find all neighboring label pairs
     adjacency: dict[int, set[int]] = {o.obj_id: set() for o in objects}
-    for obj in objects:
-        seg = labels == obj.obj_id
-        dilated = ndimage.binary_dilation(seg, structure=struct, iterations=1)
-        border = dilated & ~seg
-        for nl in np.unique(labels[border]):
-            if nl > 0 and nl != obj.obj_id and nl in label_to_obj:
-                adjacency[obj.obj_id].add(nl)
+    valid_ids = set(label_to_obj.keys())
+
+    def _add_pairs(arr_a, arr_b):
+        diff = arr_a != arr_b
+        a_vals = arr_a[diff]
+        b_vals = arr_b[diff]
+        # Stack and get unique pairs
+        pairs = np.unique(np.column_stack([a_vals, b_vals]), axis=0)
+        for a, b in pairs:
+            if a > 0 and b > 0 and a in valid_ids and b in valid_ids:
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+
+    _add_pairs(labels[:, :-1].ravel(), labels[:, 1:].ravel())   # horizontal
+    _add_pairs(labels[:-1, :].ravel(), labels[1:, :].ravel())   # vertical
 
     # Union-Find
     parent = {o.obj_id: o.obj_id for o in objects}

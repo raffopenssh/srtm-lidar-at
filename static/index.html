@@ -14,7 +14,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:
 #sidebar{width:380px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;z-index:2000;overflow:hidden;transition:max-height .3s ease}
 #sidebar h1{font-size:15px;padding:10px 14px;background:#1a1a2e;color:#fff;flex-shrink:0;display:flex;align-items:center;gap:6px}
 #sidebar h1 span{color:#7fdbca}
-#sidebar h1 .menu-toggle{display:none;margin-left:auto;background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 4px;line-height:1}
+
+/* More options pill */
+.more-pill{display:inline-flex;align-items:center;gap:3px;padding:2px 10px;font-size:10px;font-weight:600;color:#0d7377;background:#e8f7f7;border:1px solid #b5e0e0;border-radius:12px;cursor:pointer;user-select:none;transition:all .15s;white-space:nowrap;margin-left:auto}
+.more-pill:hover{background:#d0eeee;border-color:#0d7377}
+.more-pill.open{background:#0d7377;color:#fff;border-color:#0d7377}
+.extra-params{display:none;padding-top:6px}
+.extra-params.open{display:block}
+
+/* Sidebar collapse bar (mobile) */
+.sidebar-collapse-bar{display:none;text-align:center;padding:3px 0;cursor:pointer;background:linear-gradient(to bottom,#e8e8e8,#f4f4f4);border-top:1px solid #ddd;user-select:none;flex-shrink:0;line-height:1}
+.sidebar-collapse-bar .collapse-arrow{font-size:10px;color:#888;display:inline-block;transition:transform .25s}
+#sidebar.collapsed .sidebar-collapse-bar .collapse-arrow{transform:rotate(180deg)}
 .controls{padding:10px 14px;flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
 label{display:block;font-size:12px;font-weight:600;color:#555;margin:6px 0 3px}
 select,input[type=number],input[type=text]{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px;background:#fff}
@@ -73,7 +84,9 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .load-dropdown .ld-item .ld-name{font-size:12px;font-weight:600;color:#1a1a2e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .load-dropdown .ld-item .ld-desc{font-size:10px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .load-dropdown .ld-item .ld-time{font-size:9px;color:#aaa;flex-shrink:0;white-space:nowrap}
-.load-dropdown .ld-section{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.5px;padding:8px 12px 4px;user-select:none;border-bottom:1px solid #f0f0f0}
+.load-dropdown .ld-section{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.5px;padding:8px 12px 4px;user-select:none;border-bottom:1px solid #f0f0f0;display:flex;align-items:center}
+.ld-upload-btn{margin-left:auto;width:22px;height:22px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#e8f7f7;border:1px solid #b5e0e0;color:#0d7377;font-size:15px;font-weight:700;cursor:pointer;line-height:1;transition:all .15s;flex-shrink:0}
+.ld-upload-btn:hover{background:#0d7377;color:#fff;border-color:#0d7377}
 
 /* ===== MAP ===== */
 #map-area{flex:1;position:relative;min-width:0;min-height:0}
@@ -179,9 +192,10 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 @media(max-width:900px){
   .leaflet-control-gps{display:block}
   body{flex-direction:column}
-  #sidebar{width:100%;flex:0 0 auto;max-height:none;border-right:none;border-bottom:1px solid #ddd}
-  #sidebar h1 .menu-toggle{display:block}
+  #sidebar{width:100%;flex:0 0 auto;max-height:none;border-right:none;border-bottom:none}
+  .sidebar-collapse-bar{display:block}
   #sidebar.collapsed .controls,#sidebar.collapsed .status{display:none}
+  #sidebar.collapsed h1{display:none}
   .controls{max-height:calc(38vh - 70px);padding:8px 12px}
   #sidebar h1{font-size:14px;padding:8px 12px}
   #map-area{flex:1;min-height:0}
@@ -199,7 +213,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 }
 @media(max-width:600px){
   .controls{max-height:calc(35vh - 60px)}
-  .row{flex-direction:column;gap:4px}
+  .extra-params .row{flex-direction:column;gap:4px}
   .cb-row{gap:6px}
   .ot-dropdown,.load-dropdown.open{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);min-width:unset}
 }
@@ -207,37 +221,26 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 </head>
 <body>
 <div id="sidebar">
-  <h1>🌍 Austrian <span>Landscape</span> Analysis<button class="menu-toggle" id="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('collapsed');this.textContent=this.textContent==='☰'?'✕':'☰';setTimeout(()=>{if(typeof map!=='undefined')map.invalidateSize()},350)" aria-label="Toggle menu">☰</button></h1>
+  <h1>🌍 Austrian <span>Landscape</span> Analysis</h1>
   <div class="controls">
-    <label>Endpoint</label>
-    <select id="endpoint">
-      <option value="elevation">Elevation Enrichment</option>
-      <option value="terrain">Terrain Characterisation</option>
-      <option value="segment" selected>Segment &amp; Classify</option>
-      <option value="changes">Temporal Changes</option>
-      <option value="changes/trees">Tree Growth Analysis</option>
-    </select>
     <div class="row">
-      <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
+      <div><label>Endpoint</label>
+        <select id="endpoint">
+          <option value="elevation">Elevation</option>
+          <option value="terrain">Terrain</option>
+          <option value="segment" selected>Segment</option>
+          <option value="changes">Changes</option>
+          <option value="changes/trees">Tree Growth</option>
+        </select>
+      </div>
       <div class="ot-wrap"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
         <div id="ot-dropdown" class="ot-dropdown"></div>
       </div>
     </div>
-    <div class="row">
-      <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
-      <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
-      <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0 2px">
+      <label style="margin:0;flex-shrink:0">Area</label>
+      <button class="more-pill" id="more-toggle" onclick="document.getElementById('extra-params').classList.toggle('open');this.classList.toggle('open')">⚙ Options</button>
     </div>
-    <div class="cb-row">
-      <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
-      <label><input id="include_temporal" type="checkbox"> Temporal</label>
-      <label><input id="include_copernicus" type="checkbox"> Copernicus</label>
-    </div>
-    <div class="cb-row">
-      <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
-      <label><input id="include_hansen" type="checkbox"> Hansen</label>
-    </div>
-    <label>Area</label>
     <div class="geo-input-wrap" id="geo-drop">
       <textarea id="geometry" class="geo-hidden-ta"></textarea>
       <div class="geo-input" id="geo-input">
@@ -253,12 +256,33 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div style="position:relative;flex:1">
         <button class="btn btn-outline" id="btn-load" style="width:100%">📂 Load</button>
         <div class="load-dropdown" id="load-dropdown"></div>
+        <input type="file" id="ld-file-input" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
       </div>
       <button class="btn" id="btn-run" style="flex:1">🚀 Analyse</button>
       <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
     </div>
+    <div class="extra-params" id="extra-params">
+      <div class="row">
+        <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
+        <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
+      </div>
+      <div class="row">
+        <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
+        <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
+      </div>
+      <div class="cb-row">
+        <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
+        <label><input id="include_temporal" type="checkbox"> Temporal</label>
+        <label><input id="include_copernicus" type="checkbox"> Copernicus</label>
+      </div>
+      <div class="cb-row">
+        <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
+        <label><input id="include_hansen" type="checkbox"> Hansen</label>
+      </div>
+    </div>
   </div>
   <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span></div>
+  <div class="sidebar-collapse-bar" id="sidebar-collapse-bar"><span class="collapse-arrow">▲</span></div>
 </div>
 
 <div id="map-area">
@@ -778,9 +802,10 @@ function setStatus(msg){document.getElementById('status-text').textContent=msg;}
       const d=await r.json();
       if(d.running){
         const kg=d.current_kg?` · KG ${d.current_kg.kg_code} (${d.current_kg.kg_name}) [${d.progress}]`:'';
-        const model=d.model?` · model: OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs`:'no model yet';
-        const res=d.ram_mb?` · ${d.ram_mb}MB / ${d.cpu_pct}% CPU`:'';
-        el.innerHTML=`🟢 RF training${kg}${res}${model}`;
+        const step=d.current_step?` · ${d.current_step}`:'';
+        const model=d.model?` · OOB=${d.model.oob_score}, ${d.model.n_kgs} KGs`:'no model yet';
+        const res=d.ram_mb?` · ${d.ram_mb}MB`:'';
+        el.innerHTML=`🟢 RF${kg}${step}${res}${model}`;
         el.style.color='#2a7';
       } else if(d.model){
         el.innerHTML=`⚪ RF model: OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`;
@@ -793,6 +818,17 @@ function setStatus(msg){document.getElementById('status-text').textContent=msg;}
   }
   update();
   setInterval(update,10000);
+})();
+
+// ============ SIDEBAR COLLAPSE BAR (MOBILE) ============
+(function(){
+  const bar=document.getElementById('sidebar-collapse-bar');
+  const sidebar=document.getElementById('sidebar');
+  if(!bar||!sidebar) return;
+  bar.onclick=()=>{
+    sidebar.classList.toggle('collapsed');
+    setTimeout(()=>{if(typeof map!=='undefined')map.invalidateSize()},350);
+  };
 })();
 
 // ============ COLOR MODE ============
@@ -1475,43 +1511,71 @@ const _loadDrop=document.getElementById('load-dropdown');
 
 _loadBtn.onclick=async()=>{
   if(_loadDropOpen){_closeLoadDrop();return;}
-  _loadDrop.innerHTML='<div class="ld-empty">Loading\u2026</div>';
+  // Show sample + upload button immediately, load shares in background
+  let html='<div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>';
+  html+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
+  html+='<div id="ld-shares-area"><div class="ld-empty">Loading shares\u2026</div></div>';
+  _loadDrop.innerHTML=html;
+  _attachLoadHandlers();
   _loadDrop.classList.add('open');
   _loadDropOpen=true;
+  // Fetch shares with timeout
+  const ac=new AbortController();
+  const tid=setTimeout(()=>ac.abort(),5000);
   try{
-    const resp=await fetch('/api/v1/shares?limit=15');
+    const resp=await fetch('/api/v1/shares?limit=15',{signal:ac.signal});
+    clearTimeout(tid);
     const shares=await resp.json();
-    let html='';
-    // Built-in sample first
-    html+='<div class="ld-section">Built-in</div>';
-    html+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
-    // Recent shares
+    const area=document.getElementById('ld-shares-area');
+    if(!area)return;
     if(shares.length){
-      html+='<div class="ld-section">Recent Shares</div>';
+      let sh='<div class="ld-section">Recent Shares</div>';
       for(const s of shares){
         const name=s.name||s.id;
         const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
         const desc=s.description||'saved share';
         const ago=_timeAgo(s.updated);
-        html+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span></div>`;
+        sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span></div>`;
       }
-    }
-    _loadDrop.innerHTML=html;
-    // Attach click handlers
-    _loadDrop.querySelectorAll('.ld-item').forEach(el=>{
-      el.onclick=()=>{
-        _closeLoadDrop();
-        if(el.dataset.action==='sample'){
-          loadSampleGeometry();
-        } else if(el.dataset.shareId){
-          _loadShareById(el.dataset.shareId, el.querySelector('.ld-name')?.textContent||'');
-        }
-      };
-    });
+      area.innerHTML=sh;
+    } else { area.innerHTML=''; }
+    _attachLoadHandlers();
   }catch(e){
-    _loadDrop.innerHTML='<div class="ld-empty">Failed to load shares</div>';
+    clearTimeout(tid);
+    const area=document.getElementById('ld-shares-area');
+    if(area) area.innerHTML=e.name==='AbortError'?'':'<div class="ld-empty">Failed to load shares</div>';
   }
 };
+function _attachLoadHandlers(){
+  _loadDrop.querySelectorAll('.ld-item').forEach(el=>{
+    el.onclick=()=>{
+      _closeLoadDrop();
+      if(el.dataset.action==='sample'){
+        loadSampleGeometry();
+      } else if(el.dataset.shareId){
+        _loadShareById(el.dataset.shareId, el.querySelector('.ld-name')?.textContent||'');
+      }
+    };
+  });
+  const upBtn=document.getElementById('ld-upload-btn');
+  if(upBtn) upBtn.onclick=(e)=>{
+    e.stopPropagation();
+    document.getElementById('ld-file-input').click();
+  };
+}
+// Wire load-dropdown file input to the existing geo file handler
+document.getElementById('ld-file-input').addEventListener('change',function(){
+  if(this.files.length){
+    _closeLoadDrop();
+    // Reuse the geo-file handler
+    const dt=new DataTransfer();
+    for(const f of this.files) dt.items.add(f);
+    const geoInput=document.getElementById('geo-file');
+    geoInput.files=dt.files;
+    geoInput.dispatchEvent(new Event('change'));
+  }
+  this.value='';
+});
 function _closeLoadDrop(){_loadDrop.classList.remove('open');_loadDropOpen=false;}
 document.addEventListener('click',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.target)&&!_loadDrop.contains(e.target))_closeLoadDrop();});
 

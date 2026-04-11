@@ -13,6 +13,11 @@ TimeoutStopSec=60
 # Generous limits for long-running ML training
 TimeoutStartSec=infinity
 Environment=PYTHONUNBUFFERED=1
+# Cap memory to avoid OOM-killing gunicorn and other services
+MemoryMax=5G
+MemoryHigh=4G
+OOMScoreAdjust=-500
+OOMPolicy=stop
 
 [Install]
 WantedBy=multi-user.target

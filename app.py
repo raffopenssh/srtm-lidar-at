@@ -244,7 +244,7 @@ def training_status():
     except Exception:
         pass
 
-    # Parse last log lines for current KG and progress
+    # Parse last log lines for current KG, progress, and last activity
     log_path = pathlib.Path('/tmp/rf_train_4000kg.log')
     if log_path.exists():
         try:
@@ -262,13 +262,21 @@ def training_status():
                         kg_code=m.group(3), kg_name=m.group(4))
                     result['progress'] = f"{m.group(1)}/{m.group(2)}"
                     break
-            # Find last successful checkpoint count
+            # Last log line with timestamp → current step
             for line in reversed(lines):
-                m = re.search(r'already checkpointed, skipping', line)
-                if not m:
-                    m2 = re.search(r'Checkpoint saved: (\S+)', line)
-                    if m2:
-                        break
+                tm = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+                if tm:
+                    result['last_log_time'] = tm.group(1)
+                    # Extract step info from the line
+                    step = re.search(r'(Step \d+\S*:.*?)$', line)
+                    if step:
+                        result['current_step'] = step.group(1).strip()[:80]
+                    else:
+                        # Just the message part after the log prefix
+                        msg = re.sub(r'^.*?(INFO|WARNING|ERROR)\s+\S+:\s*', '', line)
+                        if msg:
+                            result['current_step'] = msg.strip()[:80]
+                    break
         except Exception:
             pass
 

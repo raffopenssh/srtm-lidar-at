@@ -47,14 +47,33 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .ot-dropdown .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
 .ot-dropdown .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
 
-/* ===== GEOMETRY DROP ZONE ===== */
-.geo-drop{position:relative}
-.geo-drop textarea{transition:border-color .15s,background .15s}
-.geo-drop.dragover textarea{border-color:#0d7377;background:#e8f7f7}
-.geo-drop-overlay{display:none;position:absolute;inset:0;background:rgba(13,115,119,.12);border:2px dashed #0d7377;border-radius:4px;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#0d7377;pointer-events:none}
-.geo-drop.dragover .geo-drop-overlay{display:flex}
-.file-pick-btn{display:inline-flex;align-items:center;cursor:pointer;font-size:16px;padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;transition:background .15s;margin:0!important;font-weight:400}
-.file-pick-btn:hover{background:#e8f7f7;border-color:#0d7377}
+/* ===== GEOMETRY INPUT ===== */
+.geo-input-wrap{position:relative}
+.geo-hidden-ta{position:absolute;width:0;height:0;opacity:0;pointer-events:none;overflow:hidden}
+.geo-input{display:flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid #ddd;border-radius:6px;background:#f8f9fa;min-height:36px;cursor:default;transition:border-color .15s,background .15s}
+.geo-input:hover{border-color:#bbb}
+.geo-input.has-geo{background:#e8f7f7;border-color:#0d7377}
+.geo-input-icon{font-size:15px;flex-shrink:0}
+.geo-input-text{flex:1;font-size:12px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.geo-input.has-geo .geo-input-text{color:#1a1a2e;font-weight:500}
+.geo-attach-btn{display:inline-flex;align-items:center;cursor:pointer;font-size:14px;padding:2px 4px;border-radius:4px;flex-shrink:0;opacity:.5;transition:opacity .15s}
+.geo-attach-btn:hover{opacity:1;background:#e0e0e0}
+.geo-input-wrap.dragover .geo-input{border-color:#0d7377;background:#e8f7f7;border-style:dashed}
+.geo-drop-overlay{display:none;position:absolute;inset:0;background:rgba(13,115,119,.12);border:2px dashed #0d7377;border-radius:6px;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#0d7377;pointer-events:none;z-index:2}
+.geo-input-wrap.dragover .geo-drop-overlay{display:flex}
+/* Load dropdown */
+.load-dropdown{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:340px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:9999;max-height:320px;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.load-dropdown.open{display:block}
+.load-dropdown .ld-empty{padding:16px;text-align:center;color:#999;font-size:12px}
+.load-dropdown .ld-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;transition:background .1s;border-bottom:1px solid #f0f0f0}
+.load-dropdown .ld-item:last-child{border-bottom:none}
+.load-dropdown .ld-item:hover{background:#f0f8f8}
+.load-dropdown .ld-item .ld-icon{font-size:16px;flex-shrink:0;width:20px;text-align:center}
+.load-dropdown .ld-item .ld-info{flex:1;min-width:0}
+.load-dropdown .ld-item .ld-name{font-size:12px;font-weight:600;color:#1a1a2e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.load-dropdown .ld-item .ld-desc{font-size:10px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.load-dropdown .ld-item .ld-time{font-size:9px;color:#aaa;flex-shrink:0;white-space:nowrap}
+.load-dropdown .ld-section{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.5px;padding:8px 12px 4px;user-select:none;border-bottom:1px solid #f0f0f0}
 
 /* ===== MAP ===== */
 #map-area{flex:1;position:relative;min-width:0;min-height:0}
@@ -182,7 +201,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   .controls{max-height:calc(35vh - 60px)}
   .row{flex-direction:column;gap:4px}
   .cb-row{gap:6px}
-  .ot-dropdown{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25)}
+  .ot-dropdown,.load-dropdown.open{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);min-width:unset}
 }
 </style>
 </head>
@@ -218,20 +237,24 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
       <label><input id="include_hansen" type="checkbox"> Hansen</label>
     </div>
-    <label>Geometry <span style="font-weight:400;color:#999">(GeoJSON / KML / Shapefile / GPX / WKT)</span></label>
-    <div class="geo-drop" id="geo-drop">
-      <textarea id="geometry" placeholder="Paste GeoJSON, KML, or coordinates… or drop a file here"></textarea>
+    <label>Area</label>
+    <div class="geo-input-wrap" id="geo-drop">
+      <textarea id="geometry" class="geo-hidden-ta"></textarea>
+      <div class="geo-input" id="geo-input">
+        <span class="geo-input-icon" id="geo-input-icon">📍</span>
+        <span class="geo-input-text" id="geo-input-text">Draw on map or load a share…</span>
+        <label class="geo-attach-btn" title="Upload geometry file">
+          📎 <input type="file" id="geo-file" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
+        </label>
+      </div>
       <div class="geo-drop-overlay" id="geo-drop-overlay">📂 Drop file here</div>
     </div>
-    <div style="display:flex;align-items:center;gap:6px;margin-top:3px">
-      <label class="file-pick-btn" title="Upload geometry file">
-        📎 <input type="file" id="geo-file" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
-      </label>
-      <p class="hint" style="margin:0;flex:1">Or draw on map — click ▶ Sample for a demo area.</p>
-    </div>
-    <div class="row" style="margin-top:6px">
-      <button class="btn" id="btn-sample">▶ Sample</button>
-      <button class="btn" id="btn-run">🚀 Analyse</button>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <div style="position:relative;flex:1">
+        <button class="btn btn-outline" id="btn-load" style="width:100%">📂 Load</button>
+        <div class="load-dropdown" id="load-dropdown"></div>
+      </div>
+      <button class="btn" id="btn-run" style="flex:1">🚀 Analyse</button>
       <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
     </div>
   </div>
@@ -520,6 +543,13 @@ function clearEverything(){
   const mi=document.getElementById('meta-info');if(mi){mi.style.display='none';mi.innerHTML='';}
   // Reset share
   markShareDirty();
+  // Reset geo display
+  if(typeof updateGeoInputDisplay==='function') updateGeoInputDisplay(null);
+  // Collapse textarea if visible
+  const _cta=document.getElementById('geometry');
+  if(_cta.classList.contains('geo-shown-ta')){_cta.classList.add('geo-hidden-ta');_cta.classList.remove('geo-shown-ta');_cta.style.cssText='';}
+  // Reset URL
+  history.replaceState(null,'',location.pathname);
   // Reset status
   setStatus('Idle');
 }
@@ -1355,7 +1385,7 @@ document.addEventListener('click',(e)=>{
     currentShareId=shareId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
-    const label=currentShareName?` "${currentShareName}"`:'.';
+    const label=currentShareName?` "${currentShareName}"`:'.';    updateGeoInputDisplay(currentShareName||shareId,'share');
     hideLoading('Shared view restored'+label);
   }catch(e){
     hideLoading('Failed to load share: '+e.message);
@@ -1363,15 +1393,156 @@ document.addEventListener('click',(e)=>{
   }
 })();
 
-// ============ SAMPLE ============
+// ============ BUILT-IN SAMPLE ============
 const SAMPLE={"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
-document.getElementById('btn-sample').onclick=()=>{
+function loadSampleGeometry(){
   document.getElementById('geometry').value=JSON.stringify(SAMPLE,null,2);
   drawnItems.clearLayers();
   const coords=SAMPLE.coordinates[0].map(c=>[c[1],c[0]]);
   const poly=L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
   map.fitBounds(poly.getBounds().pad(.1));
+  updateGeoInputDisplay('Sample area','drawn');
+}
+
+// ============ GEO INPUT DISPLAY ============
+let _geoDisplayLock=0;
+function updateGeoInputDisplay(label, source){
+  const now=Date.now();
+  // If this is an auto-update (no label) and a recent explicit update happened, skip
+  if(!label && !source && now-_geoDisplayLock<200) return;
+  if(label || source) _geoDisplayLock=now;
+  const el=document.getElementById('geo-input');
+  const txt=document.getElementById('geo-input-text');
+  const ico=document.getElementById('geo-input-icon');
+  const geo=document.getElementById('geometry').value.trim();
+  if(!geo && !label){
+    el.classList.remove('has-geo');
+    txt.textContent='Draw on map or load a share\u2026';
+    ico.textContent='\ud83d\udccd';
+    return;
+  }
+  el.classList.add('has-geo');
+  if(label){
+    txt.textContent=label;
+  } else {
+    try{
+      const g=JSON.parse(geo);
+      const t=g.type||'Geometry';
+      if(t==='Polygon'){
+        const c=g.coordinates?.[0];
+        txt.textContent=c?`Polygon (${c.length-1} points)`:'Polygon';
+      } else if(t==='MultiPolygon'){
+        txt.textContent=`MultiPolygon (${g.coordinates?.length||0} parts)`;
+      } else txt.textContent=t;
+    }catch(e){txt.textContent='Custom geometry';}
+  }
+  if(source==='share') ico.textContent='\ud83d\udd17';
+  else if(source==='file') ico.textContent='\ud83d\udcc4';
+  else if(source==='drawn') ico.textContent='\u270f\ufe0f';
+  else if(geo) ico.textContent='\ud83d\udccd';
+  else ico.textContent='\ud83d\udccd';
+}
+// Keep display synced with geometry changes
+const _geoTA=document.getElementById('geometry');
+// Watch drawn items
+map.on(L.Draw.Event.CREATED, ()=>setTimeout(()=>updateGeoInputDisplay(null,'drawn'),50));
+// Watch textarea changes (programmatic)
+const _origGeoDesc2=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
+Object.defineProperty(_geoTA,'value',{get(){return _origGeoDesc2.get.call(this)},set(v){_origGeoDesc2.set.call(this,v);setTimeout(()=>updateGeoInputDisplay(null),0);}});
+
+// Click on geo-input opens a paste dialog or just focuses
+document.getElementById('geo-input').addEventListener('click',(e)=>{
+  // Don't interfere with the attach button
+  if(e.target.closest('.geo-attach-btn'))return;
+  // Toggle showing the hidden textarea for manual paste
+  const ta=document.getElementById('geometry');
+  if(ta.classList.contains('geo-hidden-ta')){
+    ta.classList.remove('geo-hidden-ta');
+    ta.classList.add('geo-shown-ta');
+    ta.style.cssText='width:100%;height:60px;margin-top:4px;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;resize:none';
+    ta.focus();
+  } else {
+    ta.classList.add('geo-hidden-ta');
+    ta.classList.remove('geo-shown-ta');
+    ta.style.cssText='';
+  }
+});
+
+// ============ LOAD DROPDOWN ============
+let _loadDropOpen=false;
+const _loadBtn=document.getElementById('btn-load');
+const _loadDrop=document.getElementById('load-dropdown');
+
+_loadBtn.onclick=async()=>{
+  if(_loadDropOpen){_closeLoadDrop();return;}
+  _loadDrop.innerHTML='<div class="ld-empty">Loading\u2026</div>';
+  _loadDrop.classList.add('open');
+  _loadDropOpen=true;
+  try{
+    const resp=await fetch('/api/v1/shares?limit=15');
+    const shares=await resp.json();
+    let html='';
+    // Built-in sample first
+    html+='<div class="ld-section">Built-in</div>';
+    html+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
+    // Recent shares
+    if(shares.length){
+      html+='<div class="ld-section">Recent Shares</div>';
+      for(const s of shares){
+        const name=s.name||s.id;
+        const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
+        const desc=s.description||'saved share';
+        const ago=_timeAgo(s.updated);
+        html+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span></div>`;
+      }
+    }
+    _loadDrop.innerHTML=html;
+    // Attach click handlers
+    _loadDrop.querySelectorAll('.ld-item').forEach(el=>{
+      el.onclick=()=>{
+        _closeLoadDrop();
+        if(el.dataset.action==='sample'){
+          loadSampleGeometry();
+        } else if(el.dataset.shareId){
+          _loadShareById(el.dataset.shareId, el.querySelector('.ld-name')?.textContent||'');
+        }
+      };
+    });
+  }catch(e){
+    _loadDrop.innerHTML='<div class="ld-empty">Failed to load shares</div>';
+  }
 };
+function _closeLoadDrop(){_loadDrop.classList.remove('open');_loadDropOpen=false;}
+document.addEventListener('click',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.target)&&!_loadDrop.contains(e.target))_closeLoadDrop();});
+
+async function _loadShareById(id, name){
+  showLoading('Loading '+name+'\u2026');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(id));
+    if(!resp.ok) throw new Error('Share not found');
+    const data=await resp.json();
+    await restoreShareResult(data);
+    currentShareId=id;
+    currentShareName=data.name||null;
+    shareStateHash=computeShareHash(data.state,data.result);
+    updateGeoInputDisplay(name||id,'share');
+    history.replaceState(null,'',`?share=${encodeURIComponent(id)}`);
+    hideLoading('Loaded: '+name);
+  }catch(e){
+    hideLoading('Failed: '+e.message);
+  }
+}
+
+function _timeAgo(ts){
+  const s=Math.floor((Date.now()/1000)-ts);
+  if(s<60)return 'just now';
+  if(s<3600)return Math.floor(s/60)+'m ago';
+  if(s<86400)return Math.floor(s/3600)+'h ago';
+  if(s<604800)return Math.floor(s/86400)+'d ago';
+  return new Date(ts*1000).toLocaleDateString();
+}
+function _escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function _escAttr(s){return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8);}
 
@@ -1479,6 +1650,10 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
       map.fitBounds(drawnItems.getBounds().pad(.1));
     }catch(e){}
     setStatus('Loaded '+fc.features.length+' feature'+(fc.features.length>1?'s':'')+' from '+fname);
+    updateGeoInputDisplay(fname,'file');
+    // Collapse textarea if visible
+    const _ta2=document.getElementById('geometry');
+    if(_ta2.classList.contains('geo-shown-ta')){_ta2.classList.add('geo-hidden-ta');_ta2.classList.remove('geo-shown-ta');_ta2.style.cssText='';}
   }
 
   // Also handle paste of files (e.g. from file manager)
@@ -1814,17 +1989,10 @@ function turf_circle(center,radiusKm,opts){
 // ============ FAB VISIBILITY: show when geometry present ============
 function showFABIfGeometry(){
   const geo=document.getElementById('geometry').value.trim();
-  document.getElementById('fab-download').style.display=geo?'flex':'none';
+  // Only show fab if there are actual results, not just geometry
+  // (the fab was already shown by analyse handler when results arrive)
 }
-// Monitor geometry field changes
-const geoTA=document.getElementById('geometry');
-geoTA.addEventListener('input',showFABIfGeometry);
-// Watch for programmatic changes via property setter override
-const _origGeoDesc=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
-Object.defineProperty(geoTA,'value',{get(){return _origGeoDesc.get.call(this)},set(v){_origGeoDesc.set.call(this,v);setTimeout(showFABIfGeometry,0);}});
-// Also show on draw
-map.on(L.Draw.Event.CREATED,()=>setTimeout(showFABIfGeometry,100));
-showFABIfGeometry();
+// Already monitoring via property descriptor in geo input display section above
 
 // ============ MBTILES DOWNLOAD ============
 const MBTILES_LAYERS=[

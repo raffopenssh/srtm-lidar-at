@@ -1,234 +1,214 @@
 # AGENTS.md — srtm-lidar-at
 
-## What this is
+## Quick Reference
 
-Python/Flask API that analyses Austrian landscape transformation using 6 data layers:
-1. BEV ALS DTM+DSM (1m, 3 dates: 2022/2023/2024) via HTTP range requests
-2. BEV DOP RGBI orthophotos (0.2m, 47 operates) via HTTP range requests
-3. Copernicus Sentinel-2 NDVI growing-season composite (10m, via openEO)
-4. Copernicus ESA WorldCover land cover (10m)
-5. Copernicus Sentinel-1 SAR backscatter (10m)
-6. Austrian Cadastre building footprint polygons (mm-precision, ground truth)
+- **Live**: https://srtm-lidar-at.exe.xyz:8000/
+- **Stack**: Python 3.12 / Flask / gunicorn / Leaflet
+- **Restart**: `sudo systemctl restart srv` (app) or `sudo systemctl restart rf_train` (training)
+- **Logs**: `journalctl -u srv -f` or `tail -f /tmp/rf_train_4000kg.log`
+- **API docs**: `/api/v1/docs/llm.txt`
+- **Cadastre API**: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
 
-Classifies landscape into 10 types focused on human vs natural, detects
-machinery traces from DTM time series, and identifies linear features
-via Hessian eigenvalue analysis.
+## What This Is
 
-Live: https://srtm-lidar-at.exe.xyz:8000/
-API docs: /api/v1/docs/llm.txt
-Cadastre: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
+Flask API + Leaflet web UI that analyses Austrian landscape from remote sensing data.
+Draws on 6 data sources (BEV LiDAR DTM/DSM, BEV orthophotos, Sentinel-2 NDVI,
+ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
+25 object types + 11 groups via watershed segmentation + Random Forest classifier.
 
-## Architecture
+## File Layout
 
-```
-app.py                   Flask API — all endpoints
-hansen.py                Hansen Global Forest Change (GFC-2024-v1.12) integration
-                          Reads treecover2000/lossyear/gain via /vsicurl/
-                          calibrate_tree_loss() boosts/downgrades tree_loss confidence
-                          evaluate_forest_loss() returns P/R/F1 vs Hansen reference
-object_segmentation.py   Watershed-based segmentation + classification
-                          Fused gradient (Sobel on DTM/DSM/CHM/RGBI/NDVI)
-                          Felzenszwalb over-segmentation + RAG boundary merge
-                          25 individual types + 11 group types
-                          Hierarchical: tree→forest, roof→building, road→road_network
-                          Cadastre-calibrated building detection (F1=0.74)
-                          Now uses texture+harmonics+SAR+RF when available
-                          Endpoint: POST /api/v1/segment
-texture_features.py      GLCM texture from 20cm orthophotos (NEW)
-                          Reads ortho at 0.5m, computes contrast/entropy/homogeneity
-                          Key discriminator: road (low entropy) vs grass vs forest
-ndvi_harmonics.py        NDVI time series harmonic fit (NEW)
-                          Monthly NDVI → harmonic model (mean, amplitude, phase)
-                          Separates crop (high amp) vs pasture (low amp) vs road (flat)
-learned_classifier.py    Random Forest trained on cadastre ground truth (NEW)
-                          44-feature vector: height+shape+NDVI+texture+SAR+harmonics
-                          Falls back to rule-based when no model trained
-                          Endpoints: POST /api/v1/classifier/train, GET /status
-landscape_classifier.py  DEPRECATED: 10-type pixel-level classifier
-                          Superseded by object_segmentation.py
-                          Endpoint: POST /api/v1/objects (legacy)
-copernicus.py            Sentinel-2 NDVI, ESA WorldCover, SAR, NDVI time series
-cadastre.py              Building footprint fetcher + ground truth evaluator
-tile_index.py            55-tile grid index, CRS transforms
-raster_io.py             Windowed reads from remote GeoTIFFs via /vsicurl/
-ortho_io.py              BEV orthophoto reader (RGBI operates + DOP fallback)
-terrain_analysis.py      Slope, aspect, TRI, TPI, curvature
-temporal_analysis.py     Multi-date comparison, 20 change event types
-geo_parse.py             KML / GeoJSON / coordinate parser
-static/index.html        Leaflet web UI
-llm.txt                  Machine-readable API reference
-srv.service              systemd + gunicorn (2 workers, port 8000)
-docs/reference_algorithms_summary.md  Algorithm design notes
+### Core
+| File | Lines | Purpose |
+|------|------:|----------|
+| `app.py` | 3223 | Flask API — all endpoints, async task system, progress tracking |
+| `static/index.html` | ~2100 | Single-file Leaflet UI (all JS/CSS inline) |
+| `object_segmentation.py` | 1939 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
+| `learned_classifier.py` | — | Random Forest classifier (44 features, cadastre-trained) |
 
-OLD (kept for reference):
-object_classifier.py   Original 27-type classifier
-```
+### Data I/O
+| File | Purpose |
+|------|----------|
+| `raster_io.py` | Windowed reads from remote GeoTIFFs via `/vsicurl/` |
+| `ortho_io.py` | BEV orthophoto reader (RGBI, 47 operates + DOP fallback) |
+| `copernicus.py` | Sentinel-2 NDVI, ESA WorldCover, SAR, NDVI time series via openEO |
+| `cadastre.py` | Building footprint fetcher + ground truth evaluator |
+| `hansen.py` | Hansen Global Forest Change (GFC-2024-v1.12) |
+| `osm_features.py` | OSM road/landcover via Overpass API |
+| `tile_index.py` | 55-tile grid index, CRS transforms (EPSG:4326 ↔ EPSG:3035) |
+| `geo_parse.py` | KML / GeoJSON / Shapefile / GPX / WKT parser |
 
-## 10 Landscape Types (pixel-level, /api/v1/objects)
+### Feature Extraction
+| File | Purpose |
+|------|----------|
+| `terrain_analysis.py` | Slope, aspect, TRI, TPI, curvature from DTM |
+| `temporal_analysis.py` | Multi-date DTM comparison, 20 change event types |
+| `texture_features.py` | GLCM texture from 20cm orthophoto (contrast/entropy/homogeneity) |
+| `ndvi_harmonics.py` | Monthly NDVI → harmonic fit (mean, amplitude, phase) |
 
-| Code | Type | How detected |
-|------|------|-------------|
-| 1 | engineered_surface | DTM roughness < 0.025m at 3m scale, slope uniformity < 1° |
-| 2 | engineered_slope | Hessian ridge/valley strength + high linearity (>0.5) |
-| 3 | excavation | DTM time series: terrain lowered + spatially coherent |
-| 4 | fill | DTM time series: terrain raised + spatially coherent |
-| 5 | building | Multi-criteria score: DSM std + nDSM std + slope + NDVI + stability |
-| 6 | infrastructure | Elevated, non-building, non-tree: small/linear/irregular |
-| 7 | tree_canopy | Elevated >4m, rough DSM, high NDVI, growing over time |
-| 8 | vegetation | Low/medium height, not engineered |
-| 9 | bare_natural | Steep + rough terrain, or bare soil |
-| 10 | recent_disturbance | DTM changed >0.15m between dates + spatial coherence |
+### Training
+| File | Purpose |
+|------|----------|
+| `train_rf_4000kg.py` | Background RF training over 4000 KGs (runs as systemd service) |
+| `train_rf_100kg.py` | Earlier 100-KG training script (superseded) |
+| `calibrate.py` | Cadastre calibration utilities |
 
-## 25 Object Types + 11 Groups (watershed, /api/v1/segment)
+### Deprecated (kept for reference)
+`landscape_classifier.py`, `object_classifier.py`, `scene_adaptive_classifier_patches.py`
 
-Individual objects detected per-segment after Felzenszwalb+RAG segmentation:
+## Services
 
-| Category | Types | How detected |
-|----------|-------|-------------|
-| Vegetation | tree, shrub, grass, hedge | nDSM height + NDVI + roughness + elongation |
-| Water | water | ESA WorldCover + very low NDVI + low NIR + flat |
-| Buildings | roof, greenhouse, solar_panel | Smooth DSM + low NDVI + compact + stable |
-| Infrastructure | fence, wall, mast | Shape (elongated/tiny) + height + non-vegetated |
-| Transportation | road, path, parking, bridge | Smooth DTM + elongated/compact + low NDVI |
-| Agricultural | crop, orchard, vineyard, garden | NDVI + ESA cropland prior + area/spacing |
-| Terrain | bare_soil, rock | Low NDVI + steep/rough (rock) or flat (soil) |
-| Disturbance | excavation, fill, tree_loss, construction | DTM temporal change + nDSM temporal change |
+| Unit | What | Config |
+|------|------|--------|
+| `srv.service` | gunicorn (2 workers, 4 threads, port 8000) | MemoryMax=3G, Restart=on-failure |
+| `rf_train.service` | RF training background job (4000 KGs) | Restart=on-failure, RestartSec=30 |
 
-Groups (adjacent compatible objects merged):
+Both in `/etc/systemd/system/`. Source copies in repo root.
 
-| Group | Members merged | Cadastre ref |
-|-------|---------------|-------------|
-| forest | tree+shrub+hedge | W 56, W(Kr) 57 |
-| building | roof+wall+solar_panel+greenhouse | B 42-47 |
-| road_network | road+path+parking | V 48,73,74 |
-| cropland | crop+grass | A 51,62 |
-| pasture | grass+garden | LN 52-55 |
-| quarry | excavation+fill | Ab 80,93 |
-| construction_site | construction+excavation+fill | recent |
-| waterbody | water | GW 70,71 |
-| woodland | shrub+hedge | sparse trees |
-| hedgerow | hedge | linear veg |
-| orchard_grove | orchard+vineyard | OG 65, WG 63 |
+## API Endpoints
 
-## Step-Change Features (v3.1)
+### Analysis
+| Method | Path | Purpose |
+|--------|------|----------|
+| POST | `/api/v1/segment` | Main analysis — async when `async=true` |
+| POST | `/api/v1/elevation` | Elevation enrichment |
+| POST | `/api/v1/terrain` | Terrain characterisation |
+| POST | `/api/v1/changes` | Temporal changes |
+| POST | `/api/v1/changes/trees` | Tree growth analysis |
 
-Four additions that move beyond threshold tuning:
+### Async Task System
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/segment/progress?task_id=` | Poll task progress |
+| GET | `/api/v1/segment/result?task_id=` | Fetch completed result |
+| POST | `/api/v1/segment/abort?task_id=` | Cancel running task |
 
-### 1. GLCM Texture from 20cm Orthophoto (texture_features.py)
-Reads ortho at 0.5m (not 1m), computes Grey-Level Co-occurrence Matrix.
-Features per segment: contrast, homogeneity, entropy, dissimilarity, energy.
-- Road: entropy <3, homogeneity >0.7 (uniform surface)
-- Grass: entropy 3-5, homogeneity 0.4-0.6
-- Forest canopy: entropy >5, homogeneity <0.4 (complex texture)
-This is the single most discriminative new signal for ground-level classes.
+Tasks run in daemon threads. Progress tracked via JSON files in `/tmp/segment_progress/`.
+Results stored gzipped in `/tmp/segment_results/`. Auto-cleaned after 1 hour.
 
-### 2. NDVI Harmonic Phenology (ndvi_harmonics.py)
-Monthly Sentinel-2 NDVI → harmonic fit: y(t) = mean + amp*cos(2πt/12 - phase)
-- Crop: high amplitude (>0.15), peak Jun-Aug (phase 5-7)
-- Pasture: moderate mean (>0.3), low amplitude (<0.15)
-- Forest: high mean (>0.5), very low amplitude (<0.08)
-- Road/bare: low mean (<0.15), near-zero amplitude
-Primary discriminator for crop vs pasture — previously indistinguishable.
+### Overlays & Exports
+| Method | Path | Purpose |
+|--------|------|----------|
+| POST | `/api/v1/segment/overlay` | Coloured PNG of segmentation |
+| POST | `/api/v1/dtm/overlay`, `lidar/overlay`, `ortho/overlay`, `cir/overlay`, `hansen/overlay` | Tile overlays |
+| POST | `/api/v1/export/geopackage` | All layers in one GPKG |
+| POST | `/api/v1/export/mbtiles` | Single layer as MBTiles (async) |
+| POST | `/api/v1/lidar/geotiff`, `ortho/geotiff` | Raw GeoTIFF download |
 
-### 3. Sentinel-1 SAR Backscatter
-VV+VH polarisation from copernicus.py, now consumed by classifier.
-- Buildings: high VV, high VV/VH ratio (>3) = corner reflectors
-- Forest: high VH, low ratio (<2) = volume scattering
-- Roads: low VH, moderate VV = specular reflection
-Orthogonal to optical — works through clouds and at night.
+### Shares & State
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/shares` | List saved shares (most recent first) |
+| POST | `/api/v1/share` | Save share (dedup by content hash) |
+| GET | `/api/v1/share/<id>` | Load share |
+| POST | `/api/v1/share/<id>/rename` | Rename share ID |
 
-### 4. Random Forest Classifier (learned_classifier.py)
-44-feature vector (height+shape+NDVI+texture+SAR+harmonics) trained
-on cadastre land-use codes as noisy labels. OOB score validation.
-Falls back to rule-based classify_object() when no model available.
-Training: POST /api/v1/classifier/train with a bbox.
-Disagreements between RF and cadastre = candidate cadastre errors.
+Shares stored in `data/shares/` as `<id>.json.gz`. Max 1GB total, LRU eviction.
+Contain: UI state + analysis result + cached overlay images.
 
-## Key Detection Methods
+### Utilities
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/layers?bbox=` | Layer availability for a bbox |
+| GET | `/api/v1/info` | Server info |
+| POST | `/api/v1/parse-geometry` | Parse uploaded geometry file |
+| GET | `/api/v1/docs/llm.txt` | Machine-readable API docs |
+| POST | `/api/v1/classifier/train` | Train RF on a bbox |
+| GET | `/api/v1/classifier/status` | RF model status |
+| GET | `/api/v1/training/status` | Background RF training progress |
 
-### Linear Feature Detection (Hessian eigenvalues)
-DTM smoothed at σ=2m, Hessian matrix computed, eigenvalues λ1/λ2 extracted.
-Ridges (embankments): λ1 >> 0, |λ2| small. Valleys (ditches): λ2 << 0.
-Linearity = |λ1-λ2|/(λ1+λ2). Also applied to DSM for walls/fences.
+## Frontend (static/index.html)
 
-### Machinery Trace Detection (DTM time series)
-For each consecutive date pair: DTM differenced, filtered for spatial
-coherence (8-connected opening+closing), small regions removed.
-Roughness change computed (natural→smooth = machinery). Paired cut/fill
-detected via dilation overlap.
+Single HTML file (~2100 lines) with all CSS/JS inline. Key components:
 
-### Building Detection (multi-criteria scoring)
-Pixel score from 0-10+ combining:
-- DSM roughness (std3 < 0.5: +2, < 1.0: +1, < 1.5: +0.5)
-- Height uniformity (nDSM std5 < 1.0: +1.5, < 2.0: +0.8)
-- Terrain flatness (slope < 5°: +1.5, < 10°: +0.8)
-- NDVI < 0.15: +2.0 (if ortho available)
-- Brightness > 90 + NDVI < 0.20: +1.5
-- High NDVI > 0.30: -2.0 (penalize vegetation)
-Threshold: 5.0 with ortho, 6.0 without.
+- **Sidebar**: Endpoint selector, object type filter, option checkboxes, area input, Load/Analyse/Stop buttons
+- **Map**: Leaflet with draw controls (polygon + rectangle only), layer panel, legend
+- **Area input**: Compact display bar showing source (drawn/file/share), click to expand raw textarea. File drop/pick via 📎 button inside the bar.
+- **Load dropdown**: `📂 Load` button fetches `/api/v1/shares` and shows recent shares + built-in Sample. Loads share via restoreShareResult().
+- **Analyse**: Submits async task, shows ⏹ Stop button during processing, polls progress
+- **Results**: Point markers on map, segment raster overlay, legend with type filtering, Download modal (Summary/JSON/GeoPackage/MBTiles tabs)
+- **Share**: 🔗 Share button saves state + result, generates permalink, supports renaming share ID
+- **Clear**: Bin button (🗑) on draw toolbar clears everything with confirmation dialog
+- **Layer panel**: Checkboxes + opacity sliders. Availability auto-checked via `/api/v1/layers`.
+- **MBTiles tab**: Filters to only available layers using `/api/v1/layers` API.
 
-## Copernicus Integration
+### Key JS Functions
+- `getPostArgs()` — reads geometry textarea, returns `{ct, body}` for fetch
+- `showResultOnMap(data)` — renders features + legend + overlay
+- `restoreShareResult(data)` — restores full share state including overlays
+- `clearEverything()` — resets all state to blank
+- `updateGeoInputDisplay(label, source)` — updates the compact area input bar
+- `checkLayerAvailability()` — debounced, hides unavailable layers in panel
+- `buildMBTilesList()` — async, calls layers API to filter MBTiles options
 
-OpenEO client credentials:
-- Client ID: sh-19061cbb-c6f9-4464-bba6-006e7fa17435
-- Backend: openeo.dataspace.copernicus.eu
+### State Variables
+- `lastResult` — last analysis JSON response
+- `allFeatureData` — features array from result
+- `overlays` — `{layerId: L.imageOverlay}` map
+- `drawnItems` — L.FeatureGroup for drawn geometry
+- `currentShareId`, `currentShareName` — active share tracking
+- `_activeTaskId`, `_aborted` — async task abort control
+- `hiddenTypes` — Set of types hidden via legend click
+- `selectedTypes` — Set of types selected in dropdown filter
 
-Data fetched on-demand, cached in /tmp/copernicus_cache/.
-NDVI composite uses April-September median (cloud-masked via SCL dilation).
+## Analysis Pipeline (object_segmentation.py)
 
-## Cadastre Integration
+1. Read DTM+DSM from raster_io (1m GeoTIFFs via HTTP range requests)
+2. Optionally read: ortho (0.2m), NDVI, SAR, Hansen, cadastre
+3. Compute fused gradient (Sobel on DTM/DSM/CHM/spectral)
+4. Felzenszwalb over-segmentation (scale=150) + RAG boundary merge (threshold=0.12)
+5. Per-segment feature extraction (44 features: height, shape, NDVI, texture, SAR, harmonics)
+6. Classify via RF model if available, else rule-based `classify_object()`
+7. Group adjacent compatible segments (tree→forest, roof→building, etc.)
+8. Return GeoJSON features with properties
 
-Building footprints fetched from /api/v1/export/geojson?kg=...&layers=building_footprints.
-KG codes discovered via point-in-polygon lookup on bbox corners.
-Used for calibration/validation only, NOT as direct classification input.
+## 25 Object Types
+
+| Category | Types |
+|----------|-------|
+| Vegetation | tree, shrub, grass, hedge |
+| Water | water |
+| Buildings | roof, greenhouse, solar_panel |
+| Infrastructure | fence, wall, mast |
+| Transportation | road, path, parking, bridge |
+| Agricultural | crop, orchard, vineyard, garden |
+| Terrain | bare_soil, rock |
+| Disturbance | excavation, fill, tree_loss, construction |
+
+## External Data Sources
+
+| Source | Resolution | Access |
+|--------|-----------|--------|
+| BEV ALS DTM+DSM | 1m, 3 dates (2022/23/24) | HTTP range on remote GeoTIFF |
+| BEV DOP RGBI | 0.2m, 47 operates | HTTP range on remote GeoTIFF |
+| Sentinel-2 NDVI | 10m | openEO (client ID: `sh-19061cbb-...`) |
+| ESA WorldCover | 10m | openEO |
+| Sentinel-1 SAR | 10m | openEO |
+| Hansen GFC | 30m | `/vsicurl/` on UMD servers |
+| Austrian Cadastre | mm-precision | REST API (cadastre-process-api) |
+| OSM | varies | Overpass API |
+
+Caches: `/tmp/copernicus_cache/`, `/tmp/hansen_cache/`
+
+## RF Training
+
+Runs as `rf_train.service`. Script: `train_rf_4000kg.py`.
+
+- Iterates 4000 random KGs, fetches cadastre+OSM ground truth + all raster data
+- Checkpoints to `rf_training_data/checkpoints/kg_XXXXX.npz` — skips on restart
+- Trains model every 10 KGs, saves to `/tmp/learned_classifier/`
+- Status visible at `/api/v1/training/status` and in UI status bar
+- Log: `/tmp/rf_train_4000kg.log`
 
 ## Developing
 
 ```bash
-python3 app.py                    # Flask dev server on :8000
-sudo systemctl restart srv        # gunicorn production
-journalctl -u srv -f              # logs
-
-# Calibrate against cadastre
-python3 -c "
-import raster_io, tile_index as ti, cadastre, landscape_classifier as lc
-from shapely.geometry import box
-data = raster_io.read_dtm_dsm(ti.geometry_to_3035(box(15.085,47.065,15.095,47.075)), '20240915')
-fps = cadastre.fetch_building_footprints((15.085,47.065,15.095,47.075))
-bldg = cadastre.rasterize_buildings(fps, data['transform'], data['shape'])
-result = lc.classify_landscape(data['dtm'], data['dsm'], data['mask'], data['transform'])
-print(cadastre.evaluate_classification(result['type_map'], bldg, building_codes={5}))
-"
+python3 app.py                        # Flask dev server on :8000
+sudo systemctl restart srv             # restart gunicorn
+journalctl -u srv -f                   # app logs
+sudo systemctl restart rf_train        # restart RF training
+tail -f /tmp/rf_train_4000kg.log       # training logs
+systemctl status rf_train srv          # check both services
 ```
 
-## Hansen Global Forest Change
-
-GFC-2024-v1.12 tile 50N_010E (covers Austria). Layers:
-- treecover2000: canopy cover % in year 2000
-- lossyear: year of loss 1-24 (2001-2024), 0=no loss
-- gain: forest gained 2000-2012
-- datamask: 1=land, 2=water
-
-Used by `hansen.py` to calibrate tree_loss detection:
-- tree_loss on Hansen loss → confidence +0.15
-- vegetation on recent Hansen loss + temporal instability → reclassify to tree_loss
-- tree_loss on non-forest area → confidence -0.20
-
-Cached in /tmp/hansen_cache/ as .npz files.
-
-## GeoPackage Export
-
-POST /api/v1/export/geopackage returns all layers in one GPKG:
-- Band 1: DTM, Band 2: DSM, Band 3: nDSM
-- Bands 4-6: RGB ortho (optional), Band 7: NIR (if available)
-- Final band: segment_type (type codes from object_segmentation.py)
-- Filter by ?types=roof,tree,road to include only specific segment types
-
-## Segment Raster Overlay
-
-POST /api/v1/segment/overlay returns coloured PNG (RGBA) showing segmentation.
-Server caches last segmentation result — re-renders with different ?types= filter
-are instant (no re-running pipeline). Legend filter in frontend toggles both
-point markers AND segment raster overlay simultaneously.
-
-Dependencies: rasterio, pyproj, shapely, numpy, scipy, scikit-image, flask, openeo, requests
+Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask, gunicorn, openeo, requests

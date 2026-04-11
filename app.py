@@ -3028,6 +3028,52 @@ def _share_evict():
         log.info("share: evicted %s (total was %d MB)", victim.name, total // 1_000_000)
 
 
+@app.route('/api/v1/shares', methods=['GET'])
+def share_list():
+    """List saved shares with metadata, most recent first."""
+    try:
+        files = sorted(SHARE_DIR.glob('*.json.gz'), key=lambda f: f.stat().st_mtime, reverse=True)
+        limit = int(request.args.get('limit', 20))
+        items = []
+        for f in files[:limit]:
+            share_id = f.stem.replace('.json', '')
+            try:
+                data = json.loads(gzip.decompress(f.read_bytes()))
+                state = data.get('state', {})
+                name = data.get('name', '') or share_id
+                endpoint = state.get('endpoint', '')
+                has_result = 'result' in data and bool(data['result'])
+                has_geometry = bool(state.get('geometry', ''))
+                # Build a short description
+                tags = []
+                if endpoint:
+                    tags.append(endpoint)
+                if has_result:
+                    # Try to get object count from result
+                    result = data.get('result', {})
+                    n_features = len(result.get('features', []))
+                    if n_features:
+                        tags.append(f"{n_features} objects")
+                elif has_geometry:
+                    tags.append('geometry only')
+                items.append(dict(
+                    id=share_id,
+                    name=name,
+                    description=', '.join(tags) if tags else '',
+                    has_result=has_result,
+                    has_geometry=has_geometry,
+                    endpoint=endpoint,
+                    updated=f.stat().st_mtime,
+                    size_kb=round(f.stat().st_size / 1024, 1),
+                ))
+            except Exception:
+                items.append(dict(id=share_id, name=share_id, description='', has_result=False,
+                                  has_geometry=False, endpoint='', updated=f.stat().st_mtime, size_kb=0))
+        return jsonify(items)
+    except Exception as e:
+        return _error(str(e))
+
+
 @app.route('/api/v1/share', methods=['POST'])
 def share_save():
     """Save analysis result + UI state for sharing. Returns {id, url}.

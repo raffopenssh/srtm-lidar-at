@@ -431,6 +431,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
 <script>
 // ============ COLORMAPS ============
 const VIRIDIS=[[68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],[32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]];
@@ -1806,57 +1807,89 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
     return null;
   }
 
-  // Convex hull (Graham scan) for MCP on mixed/point geometry uploads
-  function _convexHull(pts){
-    if(pts.length<3)return pts.slice();
-    pts=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
-    const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
-    const lo=[];
-    for(const p of pts){while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p);}
-    const up=[];
-    for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(up.length>=2&&cross(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p);}
-    up.pop();lo.pop();
-    return lo.concat(up);
-  }
-  function _extractCoords(geom){
-    const pts=[];
-    function walk(g){
-      if(!g)return;
-      if(g.type==='Point')pts.push(g.coordinates.slice(0,2));
-      else if(g.type==='MultiPoint')g.coordinates.forEach(c=>pts.push(c.slice(0,2)));
-      else if(g.type==='LineString')g.coordinates.forEach(c=>pts.push(c.slice(0,2)));
-      else if(g.type==='MultiLineString')g.coordinates.forEach(r=>r.forEach(c=>pts.push(c.slice(0,2))));
-      else if(g.type==='Polygon')g.coordinates[0].forEach(c=>pts.push(c.slice(0,2)));
-      else if(g.type==='MultiPolygon')g.coordinates.forEach(p=>p[0].forEach(c=>pts.push(c.slice(0,2))));
-      else if(g.type==='GeometryCollection')g.geometries.forEach(walk);
+  // --- Geometry reconstruction via turf.polygonize + buffer + union ---
+
+  // Build polygon from uploaded features.
+  // Lines: polygonize the network, union, buffer to close gaps, simplify.
+  // Points/mixed: buffer each 10m, union.
+  function _buildPolygon(fc){
+    try{
+      // Separate lines from other geometry
+      const lineFeats=[],polyFeats=[];
+      for(const f of fc.features){
+        if(!f.geometry)continue;
+        const t=f.geometry.type;
+        if(t==='Polygon'||t==='MultiPolygon')polyFeats.push(turf.feature(f.geometry));
+        else if(t==='LineString'||t==='MultiLineString')lineFeats.push(turf.feature(f.geometry));
+        else{
+          // Points etc: buffer 10m
+          const buf=turf.buffer(turf.feature(f.geometry),0.01,{units:'kilometers'});
+          if(buf)polyFeats.push(buf);
+        }
+      }
+      // Polygonize line network
+      if(lineFeats.length){
+        const lineFc=turf.featureCollection(lineFeats);
+        const pgons=turf.polygonize(lineFc);
+        if(pgons?.features?.length){
+          for(const p of pgons.features)polyFeats.push(p);
+        }else{
+          // Polygonize failed — buffer lines as fallback
+          for(const lf of lineFeats){
+            const buf=turf.buffer(lf,0.01,{units:'kilometers'});
+            if(buf)polyFeats.push(buf);
+          }
+        }
+      }
+      if(!polyFeats.length)return null;
+      // Union all polygons
+      let merged=polyFeats[0];
+      for(let i=1;i<polyFeats.length;i++){
+        try{merged=turf.union(turf.featureCollection([merged,polyFeats[i]]));}catch(e){}
+      }
+      if(!merged)return null;
+      // Buffer +10m then -8m to close micro-gaps between adjacent parcels
+      merged=turf.buffer(merged,0.01,{units:'kilometers'});
+      if(merged)merged=turf.buffer(merged,-0.008,{units:'kilometers'});
+      // Remove small holes and sliver polygons
+      if(merged){
+        let g=merged.geometry||merged;
+        if(g.type==='Polygon'){
+          // Remove holes < ~500m² (≈0.000005 deg²)
+          g={type:'Polygon',coordinates:[g.coordinates[0],...g.coordinates.slice(1).filter(h=>{
+            let a=0;for(let i=0;i<h.length-1;i++)a+=(h[i][0]*h[i+1][1]-h[i+1][0]*h[i][1]);return Math.abs(a/2)>0.000005;
+          })]};
+        }else if(g.type==='MultiPolygon'){
+          // Remove tiny polygons and their small holes
+          const kept=g.coordinates.filter(p=>{
+            let a=0;const r=p[0];for(let i=0;i<r.length-1;i++)a+=(r[i][0]*r[i+1][1]-r[i+1][0]*r[i][1]);return Math.abs(a/2)>0.000001;
+          }).map(p=>[p[0],...p.slice(1).filter(h=>{
+            let a=0;for(let i=0;i<h.length-1;i++)a+=(h[i][0]*h[i+1][1]-h[i+1][0]*h[i][1]);return Math.abs(a/2)>0.000005;
+          })]);
+          g=kept.length===1?{type:'Polygon',coordinates:kept[0]}:{type:'MultiPolygon',coordinates:kept};
+        }
+        merged=turf.feature(g);
+      }
+      // Simplify (~1m tolerance)
+      if(merged)merged=turf.simplify(merged,{tolerance:0.00001,highQuality:true});
+      return merged?.geometry||null;
+    }catch(e){
+      console.warn('_buildPolygon turf error:',e);
+      return null;
     }
-    walk(geom);
-    return pts;
   }
 
   function applyGeoJSON(fc,fname){
     if(!fc.features||!fc.features.length){setStatus('No features in '+fname);return;}
-    // Extract first polygon/multipolygon, merge, or compute MCP (convex hull)
+    // Reconstruct exact polygon boundary from uploaded features
     drawnItems.clearLayers();
     let geom=null;
-    // Prefer polygon features
     const polys=fc.features.filter(f=>f.geometry&&(f.geometry.type==='Polygon'||f.geometry.type==='MultiPolygon'));
     if(polys.length===1 && fc.features.length===1){
-      // Single polygon feature: use as-is
       geom=polys[0].geometry;
     }else{
-      // Multiple features or non-polygon: compute MCP (convex hull)
-      const allPts=[];
-      for(const f of fc.features)allPts.push(..._extractCoords(f.geometry));
-      if(allPts.length>=3){
-        const hull=_convexHull(allPts);
-        hull.push(hull[0]); // close ring
-        geom={type:'Polygon',coordinates:[hull]};
-      }else if(allPts.length>=2){
-        geom={type:'LineString',coordinates:allPts};
-      }else if(allPts.length===1){
-        geom={type:'Point',coordinates:allPts[0]};
-      }
+      // Stitch lines into polygon, or convex hull as fallback
+      geom=_buildPolygon(fc);
     }
     if(!geom){setStatus('No geometry found in '+fname);return;}
     ta.value=JSON.stringify(geom,null,2);

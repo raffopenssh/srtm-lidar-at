@@ -386,20 +386,85 @@ def _get_geometry():
     if len(features) > 1:
         features = geo_parse.union_features(features)
 
-    # Convert non-polygon geometries (lines, points) to polygon via convex hull
+    # Convert non-polygon geometries to polygon via buffer + union
     for feat in features:
         geom = feat['geometry']
-        if geom.geom_type in ('LineString', 'MultiLineString', 'MultiPoint', 'GeometryCollection'):
-            hull = geom.convex_hull
-            if hull.geom_type == 'Polygon' and not hull.is_empty:
-                feat['geometry'] = hull
-                log.info("_parse_geometry: converted %s → Polygon (convex hull)", geom.geom_type)
-        elif geom.geom_type == 'Point':
-            # Buffer single point by ~100m
-            feat['geometry'] = geom.buffer(0.001)
-            log.info("_parse_geometry: buffered Point → Polygon")
+        if geom.geom_type not in ('Polygon', 'MultiPolygon'):
+            feat['geometry'] = _non_polygon_to_polygon(geom)
 
     return features
+
+
+def _clean_polygon(geom, min_hole_area=500, min_part_area=100):
+    """Remove small holes and tiny polygon slivers from a geometry (metric CRS)."""
+    from shapely.geometry import Polygon as ShpPolygon, MultiPolygon as ShpMultiPolygon
+    if geom.geom_type == 'Polygon':
+        kept = [h for h in geom.interiors if ShpPolygon(h).area >= min_hole_area]
+        return ShpPolygon(geom.exterior, kept)
+    elif geom.geom_type == 'MultiPolygon':
+        parts = [_clean_polygon(p, min_hole_area, min_part_area)
+                 for p in geom.geoms if p.area >= min_part_area]
+        if not parts:
+            return geom
+        return parts[0] if len(parts) == 1 else ShpMultiPolygon(parts)
+    return geom
+
+
+def _non_polygon_to_polygon(geom):
+    """Convert non-polygon geometry to Polygon.
+
+    For lines: polygonize the network, union, buffer to close gaps, simplify.
+    For points: buffer 10m.
+    Falls back to convex hull on error.
+    """
+    from shapely.ops import transform as shp_transform, linemerge, polygonize, unary_union
+
+    try:
+        to_m = pyproj.Transformer.from_crs('EPSG:4326', 'EPSG:3035', always_xy=True).transform
+        to_ll = pyproj.Transformer.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True).transform
+
+        if geom.geom_type in ('LineString', 'MultiLineString'):
+            # Polygonize the line network first
+            merged_lines = linemerge(geom)
+            polys = list(polygonize(merged_lines))
+            if polys:
+                result = unary_union(polys)
+                # Project to metric, buffer +10m to close gaps, -8m to shrink back
+                result_m = shp_transform(to_m, result)
+                result_m = result_m.buffer(10).buffer(-8)
+                # Remove small holes (< 500 m²) and tiny polygon slivers
+                result_m = _clean_polygon(result_m)
+                result_m = result_m.simplify(1)
+                result = shp_transform(to_ll, result_m)
+                if result.geom_type in ('Polygon', 'MultiPolygon') and not result.is_empty:
+                    n_verts = (len(result.exterior.coords) if result.geom_type == 'Polygon'
+                               else sum(len(p.exterior.coords) for p in result.geoms))
+                    log.info("_parse_geometry: polygonize+union %s → %s (%d polygonized, %d vertices)",
+                             geom.geom_type, result.geom_type, len(polys), n_verts)
+                    return result
+
+            # Polygonize failed — buffer lines directly
+            geom_m = shp_transform(to_m, geom)
+            result_m = geom_m.buffer(10).simplify(1)
+            result = shp_transform(to_ll, result_m)
+            if result.geom_type in ('Polygon', 'MultiPolygon') and not result.is_empty:
+                log.info("_parse_geometry: line buffer fallback %s → %s", geom.geom_type, result.geom_type)
+                return result
+        else:
+            # Points/other: buffer 10m
+            geom_m = shp_transform(to_m, geom)
+            result_m = geom_m.buffer(10).simplify(1)
+            result = shp_transform(to_ll, result_m)
+            if result.geom_type in ('Polygon', 'MultiPolygon') and not result.is_empty:
+                log.info("_parse_geometry: buffer %s → %s", geom.geom_type, result.geom_type)
+                return result
+    except Exception:
+        log.warning("_parse_geometry: polygonize/buffer failed, falling back", exc_info=True)
+
+    hull = geom.convex_hull
+    if hull.geom_type == 'Polygon' and not hull.is_empty:
+        return hull
+    return geom.buffer(0.001)
 
 
 def _get_params():

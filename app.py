@@ -418,6 +418,7 @@ def _non_polygon_to_polygon(geom):
     Falls back to convex hull on error.
     """
     from shapely.ops import transform as shp_transform, linemerge, polygonize, unary_union
+    import pyproj
 
     try:
         to_m = pyproj.Transformer.from_crs('EPSG:4326', 'EPSG:3035', always_xy=True).transform
@@ -429,12 +430,16 @@ def _non_polygon_to_polygon(geom):
             polys = list(polygonize(merged_lines))
             if polys:
                 result = unary_union(polys)
-                # Project to metric, buffer +10m to close gaps, -8m to shrink back
+                # Project to metric; gently close road-width gaps while
+                # preserving boundary detail: expand 5m to bridge narrow
+                # road gaps, remove small holes (< 2000 m² = road strips),
+                # then shrink back and lightly simplify.
                 result_m = shp_transform(to_m, result)
-                result_m = result_m.buffer(10).buffer(-8)
-                # Remove small holes (< 500 m²) and tiny polygon slivers
-                result_m = _clean_polygon(result_m)
-                result_m = result_m.simplify(1)
+                result_m = result_m.buffer(5)
+                result_m = _clean_polygon(result_m, min_hole_area=2000)
+                result_m = result_m.buffer(-5)
+                result_m = _clean_polygon(result_m, min_hole_area=500)
+                result_m = result_m.simplify(0.5)
                 result = shp_transform(to_ll, result_m)
                 if result.geom_type in ('Polygon', 'MultiPolygon') and not result.is_empty:
                     n_verts = (len(result.exterior.coords) if result.geom_type == 'Polygon'
@@ -3071,6 +3076,11 @@ def parse_geometry_file():
 
         if is_kml:
             parsed = geo_parse.parse_input(text_raw or raw.decode('utf-8', errors='replace'))
+            # Convert non-polygon geometries (lines from road boundaries etc)
+            for feat in parsed:
+                geom = feat['geometry']
+                if geom.geom_type not in ('Polygon', 'MultiPolygon'):
+                    feat['geometry'] = _non_polygon_to_polygon(geom)
             return jsonify(geo_parse.features_to_geojson(parsed))
 
         if is_wkt:

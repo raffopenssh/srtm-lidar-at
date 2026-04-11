@@ -1666,6 +1666,7 @@ def segment_and_classify(
     )
     n_seg = len(np.unique(labels[labels > 0]))
     log.info("  → %d total segments", n_seg)
+    del gradient  # free ~10MB
 
     # --- Step 3: Feature extraction ---
     log.info("Step 3: Per-object feature extraction")
@@ -1696,6 +1697,10 @@ def segment_and_classify(
             log.info("Step 3b: No texture features available (ortho not found)")
     except Exception as e:
         log.warning("Step 3b: Texture computation failed: %s", e)
+
+    # Free heavy intermediates before classification
+    del cop_resampled
+    import gc; gc.collect()
 
     # --- Step 4: Classification ---
     # Try learned RF classifier first, fall back to rules
@@ -1803,7 +1808,6 @@ def segment_and_classify(
     return {
         "objects": objects,
         "labels": labels,
-        "gradient": gradient,
         "stats": stats,
         "evaluation": evaluation,
     }

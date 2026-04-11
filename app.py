@@ -839,6 +839,7 @@ def _segment_worker(task_id: str, features: list, params: dict, geometry_text: s
     try:
         resp = _segment_core(task_id, features, params)
         _store_result(task_id, resp)
+        import gc; gc.collect()  # free serialization temporaries
         share_id = _auto_save_share(task_id, resp, geometry_text, params)
         _progress_done(task_id, auto_share_id=share_id)
         log.info("Async segment task %s completed (auto-share=%s)", task_id, share_id)
@@ -1021,6 +1022,10 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
         objects = result['objects']
         labels = result['labels']
+
+        # Free heavy intermediates that segment_and_classify already consumed
+        del dtm_dates, dsm_dates, spectral, copernicus_data, building_footprints
+        import gc; gc.collect()
 
         # Hansen forest loss calibration
         hansen_evaluation = None

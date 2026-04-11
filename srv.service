@@ -13,8 +13,9 @@ Environment=GDAL_HTTP_MULTIPLEX=YES
 Environment=VSI_CACHE=TRUE
 Environment=VSI_CACHE_SIZE=134217728
 # Prevent gunicorn from OOM-killing the RF training process
-MemoryMax=3G
-MemoryHigh=2500M
+# Raised from 3G/2.5G: all-options-on analysis with large areas needs ~3.5GB
+MemoryMax=5G
+MemoryHigh=4G
 OOMScoreAdjust=500
 OOMPolicy=continue
 

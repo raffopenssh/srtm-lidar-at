@@ -561,6 +561,7 @@ function clearEverything(){
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
   lastResult=null;
+  _rasterOrigImg=null;_rasterOrigBounds=null;
   // Remove all overlays
   for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
   for(const k of Object.keys(overlays))delete overlays[k];
@@ -592,6 +593,61 @@ const hiddenTypes=new Set();
 let markersByType={};
 let lastResult=null, lastEndpoint='segment', allFeatureData=[];
 const overlays={};
+
+// Client-side raster overlay filtering: cache original image + bounds for instant type toggling
+let _rasterOrigImg=null;  // HTMLImageElement of unfiltered overlay
+let _rasterOrigBounds=null; // LatLngBounds of the overlay
+
+// Segment overlay RGB colors (must match server SEGMENT_COLORS, alpha ignored — we match by RGB only)
+const SEGMENT_RGB={
+  tree:[0,100,0],shrub:[34,139,34],grass:[124,252,0],hedge:[46,139,87],water:[30,144,255],
+  roof:[220,20,60],greenhouse:[255,105,180],solar_panel:[65,105,225],fence:[160,82,45],
+  wall:[139,69,19],mast:[64,64,64],road:[128,128,128],path:[169,169,169],parking:[105,105,105],
+  bridge:[112,128,144],crop:[218,165,32],orchard:[107,142,35],vineyard:[147,112,219],
+  garden:[60,179,113],bare_soil:[210,180,140],rock:[139,134,130],excavation:[139,0,0],
+  fill:[255,140,0],tree_loss:[255,0,255],construction:[255,69,0]
+};
+// Build reverse lookup: "R,G,B" -> type name
+const _rgbToType={};
+for(const[t,rgb] of Object.entries(SEGMENT_RGB)) _rgbToType[rgb.join(',')]=t;
+
+function _filterRasterClientSide(){
+  if(!_rasterOrigImg||!_rasterOrigBounds) return null;
+  // Collect all types that should be hidden (legend-hidden OR deselected in dropdown)
+  const allHidden=new Set();
+  for(const t of hiddenTypes) allHidden.add(t);
+  for(const t of Object.keys(TYPE_SHAPES)){if(!selectedTypes.has(t)) allHidden.add(t);}
+  if(allHidden.size===0){
+    // Redraw original to fresh canvas to get a new URL (Leaflet ignores setUrl with same URL)
+    const c0=document.createElement('canvas');
+    c0.width=_rasterOrigImg.naturalWidth; c0.height=_rasterOrigImg.naturalHeight;
+    c0.getContext('2d').drawImage(_rasterOrigImg,0,0);
+    return c0.toDataURL('image/png');
+  }
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth; c.height=_rasterOrigImg.naturalHeight;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(_rasterOrigImg,0,0);
+  const imgData=ctx.getImageData(0,0,c.width,c.height);
+  const d=imgData.data;
+  // Build lookup: for each hidden type, store RGB with ±2 tolerance for premultiplied-alpha rounding
+  const hiddenArr=[];
+  for(const t of allHidden){const rgb=SEGMENT_RGB[t]; if(rgb) hiddenArr.push(rgb);}
+  // Pre-build a 3D boolean lookup (256^3 is too big, use hash set with tolerance)
+  const hiddenSet=new Set();
+  for(const[r,g,b] of hiddenArr){
+    for(let dr=-2;dr<=2;dr++) for(let dg=-2;dg<=2;dg++) for(let db=-2;db<=2;db++){
+      const rr=r+dr,gg=g+dg,bb=b+db;
+      if(rr>=0&&rr<=255&&gg>=0&&gg<=255&&bb>=0&&bb<=255) hiddenSet.add((rr<<16)|(gg<<8)|bb);
+    }
+  }
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]===0) continue;
+    if(hiddenSet.has((d[i]<<16)|(d[i+1]<<8)|d[i+2])) d[i+3]=0;
+  }
+  ctx.putImageData(imgData,0,0);
+  return c.toDataURL('image/png');
+}
 
 const LAYER_DEFS={
   'dtm-2024':{url:'/api/v1/dtm/overlay',ds:'20240915'},
@@ -889,13 +945,16 @@ function buildLegend(typeCounts,tiMap){
     const el=document.createElement('div');
     el.className='legend-item'+(hiddenTypes.has(t)?' hidden':'');
     el.innerHTML=`<span class="legend-icon" style="color:${info.c}">${info.l}</span><span>${t.replace(/_/g,' ')}</span><span class="legend-count">${count} (${(count/total*100).toFixed(0)}%)</span>`;
-    el.onclick=()=>{if(hiddenTypes.has(t)){hiddenTypes.delete(t);el.classList.remove('hidden')}else{hiddenTypes.add(t);el.classList.add('hidden')}applyVis();if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked)reloadRasterOverlay();};
+    el.onclick=()=>{if(hiddenTypes.has(t)){hiddenTypes.delete(t);el.classList.remove('hidden')}else{hiddenTypes.add(t);el.classList.add('hidden')}applyVis();if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked)applyRasterTypeFilter();};
     d.appendChild(el);
   }
 }
 function applyVis(){
+  // Respect the Segments layer checkbox — if unchecked, keep all markers hidden
+  const segCb=document.querySelector('[data-lyr="segments"]');
+  const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
   for(const[t,layers]of Object.entries(markersByType)){
-    const vis=!hiddenTypes.has(t);
+    const vis=segOn&&!hiddenTypes.has(t);
     for(const lyr of layers){const el=lyr._icon||lyr.getElement?.();if(el)el.style.display=vis?'':'none';}
   }
 }
@@ -1056,12 +1115,34 @@ async function loadRasterOverlay(typeFilter){
   if(!bs)throw new Error('No bounds');
   const[s,w,n,e]=bs.split(',').map(Number);
   const blob=await resp.blob();
-  return L.imageOverlay(URL.createObjectURL(blob),[[s,w],[n,e]],{opacity:.65,interactive:false});
+  const blobUrl=URL.createObjectURL(blob);
+  const bounds=[[s,w],[n,e]];
+  // Cache original image for client-side type filtering (legend toggles)
+  const img=new Image();
+  img.crossOrigin='anonymous';
+  img.src=blobUrl;
+  await new Promise(r=>{img.onload=r;img.onerror=r;});
+  _rasterOrigImg=img;
+  _rasterOrigBounds=bounds;
+  return L.imageOverlay(blobUrl,bounds,{opacity:.65,interactive:false});
+}
+
+function applyRasterTypeFilter(){
+  // Client-side instant filtering: redraw cached overlay with hidden types transparent
+  if(colorMode!=='type'||!_rasterOrigImg){
+    // Fall back to server-side for height mode or if no cached image
+    reloadRasterOverlay(); return;
+  }
+  const url=_filterRasterClientSide();
+  if(!url||!overlays.raster) return;
+  // Swap the overlay image URL in-place
+  overlays.raster.setUrl(url);
 }
 
 async function reloadRasterOverlay(){
   const filter=getVisibleTypes();
   if(overlays.raster){map.removeLayer(overlays.raster);delete overlays.raster;}
+  _rasterOrigImg=null;_rasterOrigBounds=null;
   showLoading('Re-rendering raster...');
   try{
     const ovl=await loadRasterOverlay(filter);
@@ -1214,6 +1295,13 @@ async function restoreShareResult(data){
           ovl.addTo(map);
           orderLayers();
           applyOpacity(id);
+          // Cache raster overlay image for client-side type filtering
+          if(id==='raster'){
+            const img=new Image();
+            img.crossOrigin='anonymous';
+            img.src=cached.data;
+            img.onload=()=>{_rasterOrigImg=img;_rasterOrigBounds=[[s,w],[n,e]];};
+          }
           continue;
         }catch(err){console.warn('cached overlay restore failed for',id,err);}
       }
@@ -1785,6 +1873,7 @@ document.getElementById('btn-run').onclick=async()=>{
   showLoading('Starting...');
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
+  _rasterOrigImg=null;_rasterOrigBounds=null;
   document.getElementById('legend-types').innerHTML='';
   for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
   for(const k of Object.keys(overlays))delete overlays[k];

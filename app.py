@@ -13,10 +13,12 @@ Endpoints:
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
 import logging
 import os
+import pickle
 import re
 import tempfile
 import threading
@@ -987,6 +989,9 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         if rgb is not None:
             _raster_cache.update({"ortho": rgb, "ortho_key": raster_cache_key})
         log.info("segment: cached results for overlay reuse")
+        # Persist to disk so other gunicorn workers can reuse
+        _seg_cache_save(seg_cache_key, labels, objects, data['mask'],
+                        data['transform'], data['shape'], data.get('ndsm'))
 
         # Filters
         if type_filter:
@@ -1112,6 +1117,95 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 # Cache for last segmentation result so legend filter re-renders are instant
 _seg_cache = {"labels": None, "objects": None, "mask": None,
               "transform": None, "shape": None, "ndsm": None, "key": None}
+
+# File-backed seg cache so all gunicorn workers share segmentation results
+_SEG_CACHE_DIR = Path('/tmp/seg_cache')
+_SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _seg_cache_path(cache_key: str) -> Path:
+    """Deterministic filename for a seg cache key."""
+    h = hashlib.sha256(cache_key.encode()).hexdigest()[:16]
+    return _SEG_CACHE_DIR / f"seg_{h}.pkl"
+
+def _seg_cache_save(cache_key: str, labels, objects, mask, transform, shape_hw, ndsm):
+    """Persist seg cache to disk for cross-worker reuse.
+
+    Uses numpy.savez for arrays + pickle for objects list to avoid
+    duplicating large arrays in memory during serialization.
+    """
+    def _do_save():
+        try:
+            p = _seg_cache_path(cache_key)
+            tmp = p.with_suffix('.tmp')
+            tf_tuple = tuple(transform)[:6] if hasattr(transform, '__iter__') else transform
+            # Save arrays with np.savez (streams to disk, low memory overhead)
+            arrays = {'labels': labels, 'mask': mask}
+            if ndsm is not None:
+                arrays['ndsm'] = ndsm
+            np.savez(str(tmp) + '.npz', **arrays)
+            # Save metadata + objects with pickle (objects are small dataclasses)
+            meta = {
+                'key': cache_key,
+                'objects': objects,
+                'transform': tf_tuple,
+                'shape': shape_hw,
+                'has_ndsm': ndsm is not None,
+                'ts': time.time(),
+            }
+            with open(str(tmp) + '.meta', 'wb') as f:
+                pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+            # Atomic rename both files
+            Path(str(tmp) + '.npz').rename(str(p) + '.npz')
+            Path(str(tmp) + '.meta').rename(str(p) + '.meta')
+            total = (p.with_suffix('.pkl.npz').stat().st_size +
+                     p.with_suffix('.pkl.meta').stat().st_size)
+            log.info("seg_cache: saved to disk (%s, %.1f MB)", p.name, total / 1e6)
+            # Evict old entries (keep at most 3 sets)
+            metas = sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime)
+            for old in metas[:-3]:
+                old.unlink(missing_ok=True)
+                npz = old.with_suffix('.npz')
+                npz.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("seg_cache: disk save failed: %s", e)
+    # Run in background thread to avoid blocking the response
+    threading.Thread(target=_do_save, daemon=True).start()
+
+def _seg_cache_load(cache_key: str):
+    """Try to load seg cache from disk. Returns dict or None."""
+    try:
+        p = _seg_cache_path(cache_key)
+        meta_p = Path(str(p) + '.meta')
+        npz_p = Path(str(p) + '.npz')
+        if not meta_p.exists() or not npz_p.exists():
+            return None
+        # Skip if older than 1 hour
+        if time.time() - meta_p.stat().st_mtime > 3600:
+            meta_p.unlink(missing_ok=True)
+            npz_p.unlink(missing_ok=True)
+            return None
+        with open(meta_p, 'rb') as f:
+            meta = pickle.load(f)
+        if meta.get('key') != cache_key:
+            return None
+        arrs = np.load(str(npz_p))
+        from rasterio.transform import Affine
+        t = meta['transform']
+        data = {
+            'key': cache_key,
+            'labels': arrs['labels'],
+            'objects': meta['objects'],
+            'mask': arrs['mask'],
+            'transform': Affine(*t[:6]) if isinstance(t, (list, tuple)) else t,
+            'shape': meta['shape'],
+            'ndsm': arrs['ndsm'] if meta.get('has_ndsm') and 'ndsm' in arrs else None,
+        }
+        arrs.close()
+        log.info("seg_cache: loaded from disk (%s)", p.name)
+        return data
+    except Exception as e:
+        log.warning("seg_cache: disk load failed: %s", e)
+        return None
 
 # Cache for raster data (DTM/DSM/nDSM/ortho) keyed by (bounds, dataset)
 # so overlay endpoints don't re-fetch from remote after segment has loaded them
@@ -1292,6 +1386,29 @@ def segment_overlay():
                 ndsm=_seg_cache.get("ndsm"),
             )
 
+        # Check file-backed cache (shared across gunicorn workers)
+        _disk = _seg_cache_load(cache_key)
+        if _disk is not None:
+            log.info("segment overlay: loaded from disk cache (filter=%s)", type_filter)
+            # Populate in-process cache for subsequent re-renders
+            _seg_cache.update({
+                "labels": _disk["labels"], "objects": _disk["objects"],
+                "mask": _disk["mask"], "transform": _disk["transform"],
+                "shape": _disk["shape"], "ndsm": _disk.get("ndsm"), "key": cache_key,
+            })
+            if top_n_classes:
+                from collections import Counter
+                _tn = int(top_n_classes)
+                _tc = Counter(o.obj_type for o in _disk["objects"])
+                _top = set(t for t, _ in _tc.most_common(_tn))
+                type_filter = (type_filter & _top) if type_filter else _top
+            return _render_seg_overlay(
+                _disk["labels"], _disk["objects"],
+                _disk["mask"], _disk["transform"],
+                _disk["shape"], type_filter, color_mode,
+                ndsm=_disk.get("ndsm"),
+            )
+
         # Full segmentation pipeline
         # Always load temporal data for stability-based building detection
         dtm_dates, dsm_dates = None, None
@@ -1362,6 +1479,8 @@ def segment_overlay():
             "shape": data['shape'], "ndsm": data['ndsm'], "key": cache_key,
         })
         log.info("segment overlay: full pipeline %.1fs, cached for re-renders", time.time() - t0)
+        _seg_cache_save(cache_key, labels, objects, data['mask'],
+                        data['transform'], data['shape'], data['ndsm'])
 
         if top_n_classes:
             from collections import Counter
@@ -1587,10 +1706,25 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
             objects = None
             cache_key_check = f"{geom_3035.bounds}_{dataset}"
             if _seg_cache.get("labels") is not None and _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
-                log.info("GeoPackage: using cached segmentation")
+                log.info("GeoPackage: using cached segmentation (in-process)")
                 labels = _seg_cache["labels"]
                 objects = _seg_cache["objects"]
             else:
+                # Try file-backed cache (cross-worker)
+                for _mf in sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime, reverse=True):
+                    try:
+                        with open(_mf, 'rb') as _f:
+                            _mc = pickle.load(_f)
+                        if _mc.get('key') and cache_key_check in _mc['key']:
+                            _npz = np.load(str(_mf.with_suffix('.npz')))
+                            log.info("GeoPackage: using cached segmentation (disk)")
+                            labels = _npz['labels']
+                            objects = _mc['objects']
+                            _npz.close()
+                            break
+                    except Exception:
+                        pass
+            if labels is None:
                 spectral = None
                 if rgb is not None:
                     import ortho_io
@@ -1709,6 +1843,10 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
     elif layer_id == 'raster':
         # Segment classification raster — needs segmentation
         import object_segmentation as oseg
+        labels = None
+        objects = None
+        seg_mask = None
+        seg_ndsm = None
         cache_key_check = f"{geom_3035.bounds}_{dataset}"
         if _seg_cache["key"] and cache_key_check in _seg_cache["key"]:
             labels = _seg_cache["labels"]
@@ -1716,6 +1854,24 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
             seg_mask = _seg_cache["mask"]
             seg_ndsm = _seg_cache.get("ndsm")
         else:
+            # Try file-backed cache (cross-worker)
+            for _mf in sorted(_SEG_CACHE_DIR.glob('seg_*.meta'), key=lambda f: f.stat().st_mtime, reverse=True):
+                try:
+                    with open(_mf, 'rb') as _f:
+                        _mc = pickle.load(_f)
+                    if _mc.get('key') and cache_key_check in _mc['key']:
+                        _npz = np.load(str(_mf.with_suffix('.npz')))
+                        from rasterio.transform import Affine
+                        log.info("MBTiles raster: using cached segmentation (disk)")
+                        labels = _npz['labels']
+                        objects = _mc['objects']
+                        seg_mask = _npz['mask']
+                        seg_ndsm = _npz['ndsm'] if _mc.get('has_ndsm') and 'ndsm' in _npz else None
+                        _npz.close()
+                        break
+                except Exception:
+                    pass
+        if not (labels is not None and objects is not None):
             log.info("gpkg raster overlay: running segmentation")
             spectral = None
             try:

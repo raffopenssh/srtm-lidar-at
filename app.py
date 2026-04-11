@@ -3378,12 +3378,50 @@ def _valid_share_id(s):
     return bool(s and _SHARE_ID_RE.match(s))
 
 
+def _share_is_named(path: Path) -> bool:
+    """Check if a share has a user-given name (not auto-generated).
+
+    A share is 'named' if:
+    - It has an explicit name (not auto-save, not equal to share ID), OR
+    - Its ID is a human-readable slug (not a hex hash or auto-save prefix)
+    """
+    try:
+        share_id = path.stem.replace('.json', '')
+        # ID-based check: hex hashes (12 chars) and auto-save IDs are unnamed
+        id_is_hex = bool(re.fullmatch(r'[0-9a-f]{12}', share_id))
+        id_is_auto = share_id.startswith('auto-')
+        if not id_is_hex and not id_is_auto:
+            return True  # user-renamed ID like "Wienwest" or "Scheffau-Test"
+        # Check the name field inside the payload
+        data = json.loads(gzip.decompress(path.read_bytes()))
+        name = data.get('name', '')
+        if not name or name == share_id or name.startswith('Auto-save '):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _share_evict():
-    """Remove oldest share files until total size < SHARE_MAX_BYTES."""
-    files = sorted(SHARE_DIR.glob('*.json.gz'), key=lambda f: f.stat().st_mtime)
-    total = sum(f.stat().st_size for f in files)
-    while total > SHARE_MAX_BYTES and files:
-        victim = files.pop(0)
+    """Remove shares until total size < SHARE_MAX_BYTES.
+
+    Eviction order: unnamed/auto-save shares first (oldest first),
+    then named shares (oldest first). This keeps user-named saves longest.
+    """
+    all_files = list(SHARE_DIR.glob('*.json.gz'))
+    total = sum(f.stat().st_size for f in all_files)
+    if total <= SHARE_MAX_BYTES:
+        return
+    # Partition into named vs unnamed, each sorted oldest-first
+    named, unnamed = [], []
+    for f in all_files:
+        (named if _share_is_named(f) else unnamed).append(f)
+    unnamed.sort(key=lambda f: f.stat().st_mtime)
+    named.sort(key=lambda f: f.stat().st_mtime)
+    # Evict unnamed first, then named
+    evict_order = unnamed + named
+    while total > SHARE_MAX_BYTES and evict_order:
+        victim = evict_order.pop(0)
         total -= victim.stat().st_size
         victim.unlink(missing_ok=True)
         log.info("share: evicted %s (total was %d MB)", victim.name, total // 1_000_000)

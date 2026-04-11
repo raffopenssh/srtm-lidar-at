@@ -84,7 +84,13 @@ Both in `/etc/systemd/system/`. Source copies in repo root.
 | POST | `/api/v1/segment/abort?task_id=` | Cancel running task |
 
 Tasks run in daemon threads. Progress tracked via JSON files in `/tmp/segment_progress/`.
-Results stored gzipped in `/tmp/segment_results/`. Auto-cleaned after 1 hour.
+Results stored gzipped in `/tmp/segment_results/`. Auto-cleaned after 4 hours.
+
+**Auto-save**: When an async segment task completes, the result is automatically saved
+as a share (`auto-<task_id[:8]>` in `data/shares/`). The `auto_share_id` is included
+in the progress response so the frontend can recover results after page refresh.
+The frontend stores the active `taskId` in `localStorage` and on reload resumes
+polling or loads the auto-saved share.
 
 ### Overlays & Exports
 | Method | Path | Purpose |

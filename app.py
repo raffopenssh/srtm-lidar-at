@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, redirect
 from shapely.geometry import mapping, shape, Point, LineString as SLineString
 
 import tile_index as ti
@@ -3345,6 +3345,118 @@ def share_load(share_id):
         return _error(str(e))
 
 
+def _resolve_layer_set(layer_set: set, params: dict, state: dict = None):
+    """Translate UI layer IDs into _gpkg_core params.
+
+    Layer IDs match the UI data-lyr attributes:
+      dtm, segments, raster, hansen,
+      ortho-YYYY, cir-YYYY, dtm-YYYY, dsm-YYYY
+    """
+    if 'dtm' in layer_set:
+        params['include_dtm'] = 'true'
+        layer_set.discard('dtm')
+    if 'segments' in layer_set:
+        params['include_segments'] = 'true'
+        layer_set.discard('segments')
+    layer_set.discard('base')  # basemap tile layer, not exportable
+
+    # ortho-YYYY → ortho_years (raw RGBI raster)
+    ortho_yrs = []
+    for lid in list(layer_set):
+        if lid.startswith('ortho-') and lid[6:].isdigit():
+            ortho_yrs.append(lid[6:])
+            layer_set.discard(lid)
+    if ortho_yrs:
+        params['ortho_years'] = ','.join(sorted(ortho_yrs))
+
+    # Everything else (raster, hansen, dtm-YYYY, dsm-YYYY, cir-YYYY)
+    # goes to raster_layers for RGBA overlay rendering
+    if layer_set:
+        params['raster_layers'] = ','.join(sorted(layer_set))
+
+
+@app.route('/api/v1/share/<share_id>/download.gpkg', methods=['GET'])
+def share_download_gpkg(share_id):
+    """Direct GeoPackage download from a share — usable as QGIS data source URL.
+
+    Reads the share's geometry, runs GPKG export.
+
+    Query params:
+      layers=all         Include DTM/DSM/nDSM + ortho + segments (default)
+      layers=active      Only layers that were active in the share's UI state
+      layers=dtm,ortho-2024,segments,raster,hansen  Comma-separated layer IDs:
+                         dtm        → DTM + DSM + nDSM (raw 1m float32)
+                         segments   → Segment type + height rasters
+                         ortho-YYYY → Orthophoto RGBI for that year
+                         cir-YYYY   → CIR false-colour for that year
+                         raster     → Coloured segment overlay (RGBA)
+                         hansen     → Hansen forest change overlay (RGBA)
+                         dtm-YYYY   → DTM hillshade overlay (RGBA)
+                         dsm-YYYY   → DSM hillshade overlay (RGBA)
+      types=tree,road    Filter segment types
+      color_mode=type    Segment colour mode (type or height)
+    """
+    try:
+        if not _valid_share_id(share_id):
+            return _error('Invalid share ID', 400)
+        p = SHARE_DIR / f'{share_id}.json.gz'
+        if not p.exists():
+            return _error('Share not found', 404)
+        share_data = json.loads(gzip.decompress(p.read_bytes()).decode())
+        state = share_data.get('state', {})
+        geom_str = state.get('geometry', '')
+        if not geom_str:
+            return _error('Share has no geometry', 400)
+
+        # Parse geometry
+        features = geo_parse.parse_input(geom_str)
+        features = geo_parse.union_features(features)
+        for feat in features:
+            geom = feat['geometry']
+            if geom.geom_type not in ('Polygon', 'MultiPolygon'):
+                feat['geometry'] = _non_polygon_to_polygon(geom)
+
+        # --- Resolve layers param ---
+        layers_raw = request.args.get('layers', 'all').strip().lower()
+        params = {}
+
+        if layers_raw == 'all':
+            params['include_dtm'] = 'true'
+            params['include_segments'] = 'true'
+            params['ortho_years'] = str(ti.dataset_to_year(ti.DEFAULT_DATASET))
+
+        elif layers_raw == 'active':
+            # Use only layers the user had enabled in the share's UI
+            active = set(state.get('layers', []))
+            _resolve_layer_set(active, params, state)
+
+        else:
+            # Explicit comma-separated list
+            layer_set = set(l.strip() for l in layers_raw.split(',') if l.strip())
+            _resolve_layer_set(layer_set, params, state)
+
+        # Allow extra query-string overrides
+        for key in ('types', 'color_mode', 'dataset'):
+            val = request.args.get(key)
+            if val is not None:
+                params[key] = val
+
+        tmp_path, table_count, elapsed = _gpkg_core(features, params)
+        if table_count == 0:
+            return _error('No layers produced')
+        log.info("share GPKG download %s: %d tables, %.1fs, layers=%s",
+                 share_id, table_count, elapsed, layers_raw)
+        return send_file(
+            tmp_path, mimetype='application/geopackage+sqlite3',
+            as_attachment=True, download_name=f'{share_id}.gpkg',
+        )
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error("share gpkg download: %s", traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
+
+
 @app.route('/api/v1/share/<old_id>/rename', methods=['POST'])
 def share_rename(old_id):
     """Rename a share: move file from old_id to new slug.
@@ -3379,6 +3491,16 @@ def share_rename(old_id):
 
 @app.route('/')
 def index():
+    # ?share=X&dl=gpkg → redirect to GPKG download
+    share_id = request.args.get('share', '')
+    dl = request.args.get('dl', '').lower()
+    if share_id and dl in ('gpkg', 'geopackage'):
+        qs = '&'.join(f'{k}={v}' for k, v in request.args.items()
+                       if k not in ('share', 'dl'))
+        url = f'/api/v1/share/{share_id}/download.gpkg'
+        if qs:
+            url += '?' + qs
+        return redirect(url)
     return app.send_static_file('index.html')
 
 

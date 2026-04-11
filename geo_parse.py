@@ -8,7 +8,7 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 
 from shapely.geometry import shape, Point, LineString, Polygon, mapping, MultiPolygon, box
-from shapely.ops import unary_union
+from shapely.ops import unary_union, linemerge, polygonize
 import pyproj
 import shapely
 
@@ -130,7 +130,18 @@ def _kml_placemark_to_geom(pm) -> Optional[shapely.geometry.base.BaseGeometry]:
             if g:
                 geoms.append(g)
         if geoms:
-            return unary_union(geoms)
+            merged = unary_union(geoms)
+            # If the union produced lines (e.g. boundary segments), try to
+            # reconstruct polygons via linemerge + polygonize.
+            if merged.geom_type in ('LineString', 'MultiLineString'):
+                rings = linemerge(merged)
+                polys = list(polygonize(rings))
+                if polys:
+                    result = polys[0] if len(polys) == 1 else unary_union(polys)
+                    if not result.is_valid:
+                        result = result.buffer(0)
+                    return result
+            return merged
 
     return None
 

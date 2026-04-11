@@ -1236,8 +1236,24 @@ function restoreShareState(s){
     try{
       const g=JSON.parse(s.geometry);
       drawnItems.clearLayers();
-      const coords=(g.coordinates||[[]])[0].map(c=>[c[1],c[0]]);
-      if(coords.length) L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+      const style={color:'#0d7377',weight:2,fillOpacity:.05};
+      if(g.type==='MultiPolygon'){
+        g.coordinates.forEach(poly=>{
+          const coords=poly[0].map(c=>[c[1],c[0]]);
+          if(coords.length) L.polygon(coords,style).addTo(drawnItems);
+        });
+      }else if(g.type==='Polygon'){
+        const coords=(g.coordinates||[[]])[0].map(c=>[c[1],c[0]]);
+        if(coords.length) L.polygon(coords,style).addTo(drawnItems);
+      }else if(g.type==='MultiLineString'){
+        g.coordinates.forEach(line=>{
+          const coords=line.map(c=>[c[1],c[0]]);
+          if(coords.length>=2) L.polyline(coords,style).addTo(drawnItems);
+        });
+      }else{
+        // Fallback: use Leaflet GeoJSON layer
+        L.geoJSON(g,{style:()=>style}).eachLayer(l=>drawnItems.addLayer(l));
+      }
     }catch(e){}
   }
   // Object type filter

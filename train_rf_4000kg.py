@@ -471,19 +471,27 @@ def process_one_kg(
         dsm_dates = None
     stats["has_temporal"] = dtm_dates is not None and len(dtm_dates) >= 2
 
-    # 3. Read ortho
+    # 3. Read ortho (with timeout — BEV server can be very slow)
+    ORTHO_TIMEOUT = 180  # 3 min max
     t0 = time.time()
     spectral = None
     try:
         import ortho_io
-        rgb, nir = ortho_io.read_ortho_for_als(data)
-        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
-        if rgb is not None:
-            spectral["red"] = rgb[0].astype(np.float32)
-            spectral["green"] = rgb[1].astype(np.float32)
-            spectral["blue"] = rgb[2].astype(np.float32)
-        if nir is not None:
-            spectral["nir"] = nir.astype(np.float32)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+            fut = exe.submit(ortho_io.read_ortho_for_als, data)
+            try:
+                rgb, nir = fut.result(timeout=ORTHO_TIMEOUT)
+                spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+                if rgb is not None:
+                    spectral["red"] = rgb[0].astype(np.float32)
+                    spectral["green"] = rgb[1].astype(np.float32)
+                    spectral["blue"] = rgb[2].astype(np.float32)
+                if nir is not None:
+                    spectral["nir"] = nir.astype(np.float32)
+            except concurrent.futures.TimeoutError:
+                log.warning("KG %s: ortho timed out after %ds, skipping",
+                            kg_code, ORTHO_TIMEOUT)
     except Exception as e:
         log.warning("KG %s: ortho failed: %s", kg_code, e)
     stats["ortho_time"] = round(time.time() - t0, 1)

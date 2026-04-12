@@ -689,11 +689,14 @@ def process_one_kg(
 
 
 def _clear_downloaded_caches():
-    """Delete cached .npz/.tif files from /tmp to reclaim memory."""
+    """Delete cached .npz/.tif files from /tmp to reclaim memory.
+
+    NOTE: Copernicus cache is now permanent (rf_training_data/copernicus_cache)
+    with LRU eviction managed by copernicus.py — don't clear it here.
+    """
     import shutil
     cleared = 0
     for cache_dir in [
-        Path("/tmp/copernicus_cache"),
         Path("/tmp/hansen_cache"),
     ]:
         if cache_dir.exists():

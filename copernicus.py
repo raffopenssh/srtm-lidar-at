@@ -2,7 +2,7 @@
 
 Provides cloud-free NDVI composites, monthly NDVI time series, land cover
 classification, and SAR backscatter data via the Copernicus Data Space
-openEO API.  Results are cached locally in /tmp/copernicus_cache/.
+openEO API.  Results are cached locally with LRU eviction (max 2 GB).
 
 Usage::
 
@@ -48,8 +48,11 @@ CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
 CLIENT_SECRET = "<REDACTED_SECRET>"
 OPENEO_URL = "openeo.dataspace.copernicus.eu"
 
-CACHE_DIR = pathlib.Path("/tmp/copernicus_cache")
+# Permanent cache survives /tmp cleanup and service restarts.
+# LRU eviction keeps total size under CACHE_MAX_BYTES.
+CACHE_DIR = pathlib.Path("/home/exedev/srtm-lidar/rf_training_data/copernicus_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Maximum bbox extent in degrees (~10 km at mid-latitudes ≈ 0.09°)
 MAX_BBOX_SPAN_DEG = 0.12
@@ -110,6 +113,40 @@ def _cache_path(prefix: str, bbox: Dict[str, float], **extra: Any) -> pathlib.Pa
     """Return the cache file path for a given request."""
     h = _bbox_hash(bbox, **extra)
     return CACHE_DIR / f"{prefix}_{h}.tif"
+
+
+def _touch_cache(path: pathlib.Path):
+    """Update atime/mtime on a cache file (for LRU tracking)."""
+    try:
+        path.touch()
+    except Exception:
+        pass
+
+
+def _enforce_cache_limit():
+    """Evict oldest cache files if total size exceeds CACHE_MAX_BYTES."""
+    try:
+        files = []
+        for f in CACHE_DIR.iterdir():
+            if f.is_file():
+                st = f.stat()
+                files.append((st.st_mtime, st.st_size, f))
+        total = sum(s for _, s, _ in files)
+        if total <= CACHE_MAX_BYTES:
+            return
+        # Sort oldest first, evict until under limit
+        files.sort()
+        for mtime, size, f in files:
+            if total <= CACHE_MAX_BYTES:
+                break
+            try:
+                f.unlink()
+                total -= size
+                logger.debug("Cache evict: %s (%d KB)", f.name, size // 1024)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _validate_bbox(bbox: Dict[str, float]) -> Dict[str, float]:
@@ -233,6 +270,7 @@ def _run_datacube(
         import shutil
         shutil.copy2(str(output_dir), str(output_path))
 
+    _enforce_cache_limit()
     return output_path
 
 
@@ -272,6 +310,7 @@ def get_ndvi_composite(
     cache_file = _cache_path("ndvi_composite", bbox, year=year)
     if cache_file.exists():
         logger.info("Cache hit for NDVI composite: %s", cache_file)
+        _touch_cache(cache_file)
         data, transform, crs = _read_geotiff(cache_file)
         return {
             "ndvi": data.astype(np.float32),
@@ -356,6 +395,7 @@ def get_ndvi_timeseries(
     cache_file = _cache_path("ndvi_ts_v2", bbox, start=start_date, end=end_date)
     if cache_file.exists():
         logger.info("Cache hit for NDVI time series v2: %s", cache_file)
+        _touch_cache(cache_file)
         return _parse_timeseries_tiff(cache_file, start_date, end_date)
 
     logger.info(
@@ -403,6 +443,7 @@ def get_ndvi_timeseries(
     for label, m_start, m_end, month_cache in tasks:
         if month_cache.exists():
             logger.debug("Cache hit for %s: %s", label, month_cache)
+            _touch_cache(month_cache)
         else:
             to_download.append((label, m_start, m_end, month_cache))
 
@@ -580,6 +621,7 @@ def get_land_cover(
     cache_file = _cache_path("landcover", bbox)
     if cache_file.exists():
         logger.info("Cache hit for land cover: %s", cache_file)
+        _touch_cache(cache_file)
         data, transform, crs = _read_geotiff(cache_file)
         return {
             "map": data.astype(np.uint8),
@@ -648,6 +690,7 @@ def get_sar_backscatter(
     cache_file = _cache_path("sar", bbox, start=start_date, end=end_date)
     if cache_file.exists():
         logger.info("Cache hit for SAR backscatter: %s", cache_file)
+        _touch_cache(cache_file)
         return _parse_sar_tiff(cache_file, start_date, end_date)
 
     logger.info(

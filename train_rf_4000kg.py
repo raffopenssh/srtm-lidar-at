@@ -874,10 +874,14 @@ def main():
                 import gc; gc.collect()
                 pool = multiprocessing.Pool(processes=1)
                 try:
+                    # Skip slow Copernicus API on tiny windows — 10m
+                    # resolution data isn't useful at 200m/100m and the
+                    # API timeouts eat the entire 20-min budget.
+                    use_cop = attempt_km >= 1.0
                     async_result = pool.apply_async(
                         process_one_kg,
                         args=(kg,),
-                        kwds={"include_copernicus": True,
+                        kwds={"include_copernicus": use_cop,
                               "include_osm": True,
                               "max_km": attempt_km})
                     try:

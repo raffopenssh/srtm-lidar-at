@@ -870,19 +870,23 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
       const d=await r.json();
       const svc=d.service_state||'';
       const modelStr=d.model?`OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`:'no model yet';
-      const failStr=(d.n_failed_kgs>0)?` · ${d.n_failed_kgs} skipped`:'';
+      const nDone=d.n_checkpoints||0;
+      const nFail=d.n_failed_kgs||0;
+      const failPart=nFail>0?`; ${nFail} fail`:'';
+      const toNext=d.to_next_model;
+      const cpPart=(typeof toNext==='number'&&toNext>0)?`; ${toNext} more to model cp ${d.next_model_checkpoint}`:'';
+      const progressStr=`${nDone}/${d.current_kg?d.current_kg.total:'4000'}${failPart}${cpPart}`;
       if(d.running){
-        const kg=d.current_kg?` KG ${d.current_kg.kg_code} (${d.current_kg.kg_name}) [${d.progress}]`:'';
+        const kg=d.current_kg?` KG ${d.current_kg.kg_code} (${d.current_kg.kg_name})`:'';
         const step=d.current_step?` · ${d.current_step}`:'';
         const res=d.ram_mb?` · ${d.ram_mb}MB`:'';
-        const restarts=d.n_restarts?` · ${d.n_restarts} restarts`:'';
-        el.innerHTML=`🟢 RF training:${kg}${step}${res}${restarts}${failStr} · ${modelStr}`;
+        el.innerHTML=`🟢 RF training: ${progressStr}${kg}${step}${res} · ${modelStr}`;
         el.style.color='#2a7';
       } else if(svc==='activating'){
         el.innerHTML=`🟡 RF training restarting...${failStr} · ${modelStr}`;
         el.style.color='#b90';
       } else if(d.n_checkpoints>0){
-        const ckpt=d.n_checkpoints?` ${d.n_checkpoints} KGs done`:'';
+        const ckpt=` ${progressStr}`;
         const stopped=(svc==='failed'||svc==='inactive')?` (${svc})`:''; 
         el.innerHTML=`🔴 RF training stopped${stopped} ·${ckpt}${failStr} · ${modelStr}`;
         el.style.color='#c44';

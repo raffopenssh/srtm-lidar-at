@@ -319,15 +319,24 @@ def training_status():
         except Exception:
             pass
 
-    # Checkpoint count + failed KGs
+    # Checkpoint count + failed KGs + next model checkpoint
+    MODEL_CP_INTERVAL = 10
     ckpt_dir = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/checkpoints')
+    n_success = 0
     if ckpt_dir.exists():
-        result['n_checkpoints'] = len(list(ckpt_dir.glob('kg_*.npz')))
+        n_success = len(list(ckpt_dir.glob('kg_*.npz')))
+        result['n_checkpoints'] = n_success
     failed_file = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/failed_kgs.txt')
+    n_fail = 0
     if failed_file.exists():
         failed = [l.strip() for l in failed_file.read_text().strip().splitlines() if l.strip()]
-        result['n_failed_kgs'] = len(failed)
+        n_fail = len(failed)
+        result['n_failed_kgs'] = n_fail
         result['failed_kgs'] = failed
+    result['n_completed'] = n_success + n_fail
+    next_cp = ((n_success // MODEL_CP_INTERVAL) + 1) * MODEL_CP_INTERVAL
+    result['next_model_checkpoint'] = next_cp
+    result['to_next_model'] = max(0, next_cp - n_success)
 
     # Model info
     meta_path = pathlib.Path('/tmp/learned_classifier/rf_meta.json')

@@ -1794,9 +1794,12 @@ def segment_and_classify(
     evaluation = None
     if building_footprints is not None:
         evaluation = evaluate_against_cadastre(objects, labels, building_footprints)
-        log.info("Cadastre eval: P=%.3f R=%.3f F1=%.3f IoU=%.3f",
-                 evaluation["precision"], evaluation["recall"],
-                 evaluation["f1"], evaluation["iou"])
+        if "precision" in evaluation:
+            log.info("Cadastre eval: P=%.3f R=%.3f F1=%.3f IoU=%.3f",
+                     evaluation["precision"], evaluation["recall"],
+                     evaluation["f1"], evaluation["iou"])
+        else:
+            log.info("Cadastre eval: skipped (%s)", evaluation.get("error", "no data"))
 
     stats = _compute_stats(objects)
     log.info("Done: %d objects (%d man-made, %d natural), %d groups",

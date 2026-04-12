@@ -41,7 +41,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Credentials & configuration
 # ---------------------------------------------------------------------------
-CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
+# Credentials rotate monthly on the 1st. Keep old pair commented for reference.
+# OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
+# OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
+CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
 CLIENT_SECRET = "<REDACTED_SECRET>"
 OPENEO_URL = "openeo.dataspace.copernicus.eu"
 

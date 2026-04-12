@@ -867,10 +867,10 @@ def main():
 
         try:
             # Run with timeout to prevent stuck KGs from blocking forever.
-            # Retry ladder: 3km → 1km → 200m crop window.
+            # Retry ladder: 3km → 1km → 200m → 100m crop window.
             # Uses multiprocessing so the child can be killed cleanly on timeout.
             features, labels, stats = None, None, None
-            for attempt_km in [3.0, 1.0, 0.2]:
+            for attempt_km in [3.0, 1.0, 0.2, 0.1]:
                 import gc; gc.collect()
                 pool = multiprocessing.Pool(processes=1)
                 try:
@@ -890,10 +890,10 @@ def main():
                             KG_TIMEOUT_SECONDS // 60, kg_code, attempt_km)
                         pool.terminate()
                         pool.join()
-                        if attempt_km <= 0.2:
-                            # Already retried at 200m — give up
+                        if attempt_km <= 0.1:
+                            # Already retried at 100m — give up
                             log.error(
-                                "  → TIMEOUT on 200m retry too — skipping KG %s",
+                                "  → TIMEOUT on 100m retry too — skipping KG %s",
                                 kg_code)
                             failed_kgs.add(kg_code)
                             FAILED_KGS_FILE.write_text(
@@ -904,7 +904,7 @@ def main():
                             features = None
                             break
                         else:
-                            next_km = {3.0: 1.0, 1.0: 0.2}[attempt_km]
+                            next_km = {3.0: 1.0, 1.0: 0.2, 0.2: 0.1}[attempt_km]
                             log.info("  → Retrying KG %s with %.0fm window",
                                      kg_code, next_km * 1000)
                             continue

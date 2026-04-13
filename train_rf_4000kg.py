@@ -598,12 +598,12 @@ def process_one_kg(
     kg: dict,
     include_copernicus: bool = True,
     include_osm: bool = True,
-    max_km: float = 3.0,
+    max_km: float = 1.5,
 ) -> tuple[list[dict], list[str], dict]:
     """Process one KG: segment + match to cadastre + OSM.
 
     Args:
-        max_km: crop KG bbox to center NxN km (default 3, use 1 for retry).
+        max_km: crop KG bbox to center NxN km (default 1.5).
 
     Returns (features, labels, stats).
     """
@@ -647,7 +647,7 @@ def process_one_kg(
         cx, cy = (west + east) / 2, (south + north) / 2
         half = (max_km / 2) / 111  # approx degrees
         west, south, east, north = cx - half, cy - half, cx + half, cy + half
-        log.info("KG %s: large (%.1f x %.1f km), cropping to center %.0fkm",
+        log.info("KG %s: large (%.1f x %.1f km), cropping to center %.1fkm",
                  kg_code, dx_km, dy_km, max_km)
 
     stats["bbox"] = [west, south, east, north]
@@ -1057,7 +1057,7 @@ def main():
 
     # --- Load failed KGs (ones that crashed, e.g. OOM) ---
     # On restart, give previously-failed KGs one fresh attempt with the
-    # full retry ladder (3km → 1km → 200m).  KGs that already got a
+    # full retry ladder (1.5km → 0.5km → 200m).  KGs that already got a
     # retry pass and failed again stay permanently skipped.
     failed_kgs = set()
     RETRIED_KGS_FILE = PERMANENT_DIR / "retried_kgs.txt"
@@ -1125,17 +1125,18 @@ def main():
 
         try:
             # Run with timeout to prevent stuck KGs from blocking forever.
-            # Retry ladder: 3km → 1km → 200m → 100m crop window.
-            # Uses multiprocessing so the child can be killed cleanly on timeout.
+            # Retry ladder: 1.5km → 0.5km → 200m → 100m crop window.
+            # 3km almost always timed out (segmentation too slow at that scale)
+            # so we start at 1.5km which completes in ~10min typically.
             features, labels, stats = None, None, None
-            for attempt_km in [3.0, 1.0, 0.2, 0.1]:
+            for attempt_km in [1.5, 0.5, 0.2, 0.1]:
                 import gc; gc.collect()
                 pool = multiprocessing.Pool(processes=1)
                 try:
                     # Skip slow Copernicus API on tiny windows — 10m
                     # resolution data isn't useful at 200m/100m and the
                     # API timeouts eat the entire 20-min budget.
-                    use_cop = attempt_km >= 1.0
+                    use_cop = attempt_km >= 0.5
                     async_result = pool.apply_async(
                         process_one_kg,
                         args=(kg,),
@@ -1166,7 +1167,7 @@ def main():
                             features = None
                             break
                         else:
-                            next_km = {3.0: 1.0, 1.0: 0.2, 0.2: 0.1}[attempt_km]
+                            next_km = {1.5: 0.5, 0.5: 0.2, 0.2: 0.1}[attempt_km]
                             log.info("  → Retrying KG %s with %.0fm window",
                                      kg_code, next_km * 1000)
                             continue

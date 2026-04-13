@@ -100,8 +100,23 @@ Multi-epoch change summary (2022→2023→2024).
 
 #### POST /api/v1/export/geopackage
 All layers in one GPKG. Supports async (async=true → poll → download).
-Params: include_dtm, include_dsm, include_segments, ortho_years, raster_layers, types, color_mode, async
+Params:
+  layers       all (default) | comma-separated layer IDs:
+                 dtm        → DTM + DSM + nDSM (raw 1m float32)
+                 segments   → Segment type + height rasters
+                 ortho-YYYY → Orthophoto RGBI for that year
+                 cir-YYYY   → CIR false-colour for that year
+                 raster     → Coloured segment overlay (RGBA)
+                 hansen     → Hansen forest change overlay (RGBA)
+                 dtm-YYYY   → DTM hillshade overlay (RGBA)
+                 dsm-YYYY   → nDSM height overlay (RGBA)
+  types        Segment type filter (e.g. tree,road)
+  color_mode   type | height (segment colouring)
+  async        true → 202 with {task_id}
 Async download: GET /api/v1/export/geopackage/download/<task_id>
+
+Share shortcut: GET /api/v1/share/<id>/download.gpkg
+  layers=all (default) | active (from share's UI state) | comma-separated IDs
 
 #### POST /api/v1/export/mbtiles
 Single raster layer as MBTiles for offline use.

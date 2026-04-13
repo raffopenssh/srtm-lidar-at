@@ -652,7 +652,7 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/res
 <!-- ==================== EXPORTS ==================== -->
 <h2 id="exports">Exports <a class="anchor-link" href="#exports">#</a></h2>
 
-<div class="endpoint-card">
+<div class="endpoint-card" id="ep-geopackage">
   <div class="ep-header">
     <span class="method method-post">POST</span>
     <span class="endpoint-path">/api/v1/export/geopackage</span>
@@ -664,34 +664,84 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/res
   <table class="param-table">
     <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td>layers</td><td>string</td><td>Comma-separated layer list to include.</td></tr>
-      <tr><td>types</td><td>string</td><td>Comma-separated type filter.</td></tr>
-      <tr><td>color_mode</td><td>string</td><td>Colour scheme for exported features.</td></tr>
-      <tr><td>async</td><td>boolean</td><td>Use async mode. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>layers</td><td>string</td><td><code>all</code> (default) or comma-separated layer IDs — see table below.</td></tr>
+      <tr><td>types</td><td>string</td><td>Segment type filter. Example: <code>"tree,road"</code></td></tr>
+      <tr><td>color_mode</td><td>string</td><td><code>type</code> (default) or <code>height</code> — segment colouring scheme.</td></tr>
+      <tr><td>async</td><td>boolean</td><td>If <code>true</code>, returns 202 with <code>{task_id}</code> for polling. <span class="param-default">Default: <code>false</code></span></td></tr>
     </tbody>
   </table>
   </div>
+
+  <h4 style="margin-top:16px">Available Layers</h4>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Layer ID</th><th>Contents</th><th>Format</th></tr></thead>
+    <tbody>
+      <tr><td><code>dtm</code></td><td>DTM + DSM + nDSM</td><td>Raw 1m float32</td></tr>
+      <tr><td><code>segments</code></td><td>Segment type + height rasters</td><td>Classified raster</td></tr>
+      <tr><td><code>ortho-YYYY</code></td><td>Orthophoto RGBI for that year</td><td>RGBA</td></tr>
+      <tr><td><code>cir-YYYY</code></td><td>CIR false-colour (NIR→R, R→G, G→B)</td><td>RGBA</td></tr>
+      <tr><td><code>raster</code></td><td>Coloured segment overlay</td><td>RGBA</td></tr>
+      <tr><td><code>hansen</code></td><td>Hansen forest change overlay</td><td>RGBA</td></tr>
+      <tr><td><code>dtm-YYYY</code></td><td>DTM hillshade overlay</td><td>RGBA</td></tr>
+      <tr><td><code>dsm-YYYY</code></td><td>nDSM height overlay</td><td>RGBA</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-size:13px;color:#666;margin-top:8px">
+    Replace <code>YYYY</code> with a year, e.g. <code>ortho-2024</code>, <code>dtm-2023</code>.
+    Use <code>layers=all</code> to include everything.
+  </p>
+
+  <h4 style="margin-top:14px">Async download</h4>
+  <p style="font-size:13px;color:#666">
+    <code>GET /api/v1/export/geopackage/download/&lt;task_id&gt;</code> — fetch the completed file.
+  </p>
+
+  <h4 style="margin-top:14px">Share shortcut</h4>
+  <p style="font-size:13px;color:#666">
+    <code>GET /api/v1/share/&lt;id&gt;/download.gpkg</code> — download directly from a saved share.<br>
+    Accepts <code>layers=all</code> (default), <code>active</code> (from share's UI state), or comma-separated IDs.
+  </p>
+
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code><span class="tok-comment"># Export all layers as GeoPackage (async)</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/export/geopackage?async=true&layers=dtm,segments,raster"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span>
+
+<span class="tok-comment"># Download from share (all layers)</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg</span> <span class="tok-flag">-o</span> analysis.gpkg
+
+<span class="tok-comment"># Download from share (specific layers)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg?layers=dtm,ortho-2024"</span> <span class="tok-flag">-o</span> layers.gpkg</code></pre>
+  </div>
 </div>
 
-<div class="endpoint-card">
+<div class="endpoint-card" id="ep-mbtiles">
   <div class="ep-header">
     <span class="method method-post">POST</span>
     <span class="endpoint-path">/api/v1/export/mbtiles</span>
   </div>
   <p class="ep-desc">
-    Export a single raster layer as MBTiles for use in mapping applications.
+    Export a single raster layer as MBTiles for offline use in mapping applications.
   </p>
   <div class="table-wrap">
   <table class="param-table">
     <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td>layer</td><td>string</td><td>Layer to export (e.g. <code>"ortho"</code>, <code>"dtm"</code>).</td></tr>
+      <tr><td>layer</td><td>string</td><td><strong>Required.</strong> Layer ID, e.g. <code>dtm-2024</code>, <code>ortho-2024</code>, <code>raster</code>, <code>hansen</code>.</td></tr>
       <tr><td>min_zoom</td><td>integer</td><td>Minimum zoom level.</td></tr>
       <tr><td>max_zoom</td><td>integer</td><td>Maximum zoom level.</td></tr>
-      <tr><td>async</td><td>boolean</td><td>Use async mode. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>async</td><td>boolean</td><td>If <code>true</code>, returns 202 with <code>{task_id}</code>. <span class="param-default">Default: <code>false</code></span></td></tr>
     </tbody>
   </table>
   </div>
+  <p style="font-size:13px;color:#666;margin-top:8px">
+    Async download: <code>GET /api/v1/export/mbtiles/download/&lt;task_id&gt;</code>
+  </p>
 </div>
 
 <h3>Raw GeoTIFF Downloads</h3>

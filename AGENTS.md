@@ -35,6 +35,7 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 | `cadastre.py` | Building footprint fetcher + ground truth evaluator |
 | `hansen.py` | Hansen Global Forest Change (GFC-2024-v1.12) |
 | `osm_features.py` | OSM road/landcover via Overpass API |
+| `bev_retry.py` | Retry wrapper for rasterio.open() — exponential backoff + proxy rotation |
 | `tile_index.py` | 55-tile grid index, CRS transforms (EPSG:4326 ↔ EPSG:3035) |
 | `geo_parse.py` | KML / GeoJSON / Shapefile / GPX / WKT parser |
 

@@ -86,7 +86,8 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
     for k, v in GDAL_ENV.items():
         os.environ[k] = v
 
-    with rasterio.open(vsicurl) as src:
+    from bev_retry import open_with_retry
+    with open_with_retry(vsicurl, caller=f"Hansen {layer}") as src:
         win = from_bounds(west, south, east, north, src.transform)
         data = src.read(1, window=win)
         tf = src.window_transform(win)

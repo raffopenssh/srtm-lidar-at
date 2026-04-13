@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Documentation — Austrian Landscape Analysis</title>
+<style>
+/* ===== RESET & BASE ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; scroll-padding-top: 80px; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  color: #2c3e50; background: #fff; line-height: 1.65; font-size: 15px;
+}
+
+/* ===== HEADER ===== */
+.site-header {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+  background: #1a1a2e; color: #fff; padding: 0 24px;
+  display: flex; align-items: center; height: 56px;
+  box-shadow: 0 2px 12px rgba(0,0,0,.25);
+}
+.site-header .logo { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+.site-header .logo span { color: #7fdbca; }
+.site-header .version {
+  font-size: 11px; color: #8a8aaf; margin-left: 10px;
+  background: rgba(255,255,255,.08); padding: 2px 8px; border-radius: 10px;
+}
+.header-links { margin-left: auto; display: flex; gap: 16px; align-items: center; flex-shrink: 0; }
+.header-links a {
+  color: #a0a0c0; text-decoration: none; font-size: 13px; transition: color .15s; white-space: nowrap;
+}
+.header-links a:hover { color: #7fdbca; }
+.hamburger {
+  display: none; background: none; border: none; color: #fff;
+  font-size: 22px; cursor: pointer; padding: 4px 8px; margin-right: 12px;
+  border-radius: 4px; transition: background .15s;
+}
+.hamburger:hover { background: rgba(255,255,255,.1); }
+
+/* ===== SIDEBAR ===== */
+.sidebar {
+  position: fixed; top: 56px; left: 0; bottom: 0; width: 240px;
+  background: #f8f9fa; border-right: 1px solid #e5e7eb;
+  overflow-y: auto; padding: 20px 0; z-index: 900;
+  transition: transform .25s ease;
+}
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+.sidebar .nav-group { margin-bottom: 16px; }
+.sidebar .nav-group-title {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .8px; color: #8a8aaf; padding: 0 20px; margin-bottom: 6px;
+}
+.sidebar a {
+  display: block; padding: 5px 20px; font-size: 13px; color: #555;
+  text-decoration: none; transition: all .12s; border-left: 3px solid transparent;
+}
+.sidebar a:hover { color: #0d7377; background: #eef7f7; border-left-color: #0d7377; }
+.sidebar a.active { color: #0d7377; font-weight: 600; background: #e4f3f3; border-left-color: #0d7377; }
+.sidebar .nav-sub a { padding-left: 32px; font-size: 12px; color: #777; }
+
+/* ===== MAIN ===== */
+.main {
+  margin-left: 240px; margin-top: 56px; padding: 40px 48px 80px;
+  max-width: 960px;
+}
+
+/* ===== TYPOGRAPHY ===== */
+h1 { font-size: 32px; font-weight: 800; color: #1a1a2e; margin-bottom: 8px; letter-spacing: -0.5px; }
+.subtitle { font-size: 16px; color: #666; margin-bottom: 32px; line-height: 1.5; }
+h2 {
+  font-size: 22px; font-weight: 700; color: #1a1a2e; margin: 48px 0 16px;
+  padding-bottom: 8px; border-bottom: 2px solid #e5e7eb;
+}
+h2 .anchor-link {
+  color: #ccc; text-decoration: none; font-weight: 400; margin-left: 6px;
+  opacity: 0; transition: opacity .15s;
+}
+h2:hover .anchor-link { opacity: 1; }
+h3 {
+  font-size: 17px; font-weight: 700; color: #2c3e50; margin: 32px 0 10px;
+}
+h4 {
+  font-size: 15px; font-weight: 600; color: #444; margin: 24px 0 8px;
+}
+p { margin-bottom: 14px; }
+ul, ol { margin-bottom: 14px; padding-left: 24px; }
+li { margin-bottom: 4px; }
+a { color: #0d7377; }
+a:hover { color: #14a3a8; }
+strong { font-weight: 600; }
+
+/* ===== METHOD BADGES ===== */
+.method {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 700; font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  letter-spacing: .3px; vertical-align: middle; margin-right: 6px;
+}
+.method-get { background: #dbeafe; color: #1d4ed8; }
+.method-post { background: #d1fae5; color: #065f46; }
+.method-delete { background: #fee2e2; color: #991b1b; }
+
+.endpoint-path {
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  font-size: 14px; font-weight: 600; color: #1a1a2e;
+}
+
+/* ===== ENDPOINT CARD ===== */
+.endpoint-card {
+  background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+  padding: 20px 24px; margin: 16px 0 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+.endpoint-card .ep-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;
+}
+.endpoint-card .ep-desc { color: #555; margin-bottom: 14px; font-size: 14px; }
+
+/* ===== CODE BLOCKS ===== */
+.code-wrap {
+  position: relative; margin: 12px 0 16px; border-radius: 8px;
+  background: #f6f8fa; border: 1px solid #e5e7eb; overflow: hidden;
+}
+.code-wrap .code-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 14px; background: #eef0f2; border-bottom: 1px solid #e5e7eb;
+  font-size: 11px; color: #888; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+}
+.copy-btn {
+  background: none; border: 1px solid #ccc; border-radius: 4px;
+  padding: 2px 10px; font-size: 11px; color: #666; cursor: pointer;
+  transition: all .15s; display: flex; align-items: center; gap: 4px;
+}
+.copy-btn:hover { border-color: #0d7377; color: #0d7377; background: #eef7f7; }
+.copy-btn.copied { border-color: #0d7377; color: #0d7377; background: #d1fae5; }
+pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto; font-size: 13px;
+  line-height: 1.55; font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Fira Code', monospace;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+code {
+  background: #f0f2f4; padding: 1px 5px; border-radius: 3px;
+  font-size: 13px; font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+}
+
+/* Syntax highlights */
+.tok-flag { color: #8250df; }
+.tok-url { color: #0969da; }
+.tok-string { color: #0a3069; }
+.tok-comment { color: #6e7781; font-style: italic; }
+.tok-key { color: #953800; }
+.tok-number { color: #0550ae; }
+
+/* ===== TABLES ===== */
+.table-wrap { overflow-x: auto; margin: 12px 0 20px; border-radius: 8px; border: 1px solid #e5e7eb; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+thead { background: #f6f8fa; }
+th {
+  text-align: left; padding: 10px 14px; font-weight: 600; color: #555;
+  border-bottom: 2px solid #e5e7eb; font-size: 12px;
+  text-transform: uppercase; letter-spacing: .3px;
+}
+td { padding: 9px 14px; border-bottom: 1px solid #f0f0f0; }
+tbody tr:nth-child(even) { background: #fafbfc; }
+tbody tr:hover { background: #f0f8f8; }
+td code { font-size: 12px; }
+
+/* ===== PARAMETER TABLES ===== */
+.param-table th:first-child { width: 180px; }
+.param-table td:first-child { font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 13px; font-weight: 500; color: #1a1a2e; }
+.param-default { color: #888; font-size: 12px; }
+.param-required {
+  display: inline-block; font-size: 9px; font-weight: 700; color: #dc2626;
+  background: #fee2e2; padding: 1px 5px; border-radius: 3px; margin-left: 4px;
+}
+.param-optional {
+  display: inline-block; font-size: 9px; font-weight: 700; color: #666;
+  background: #f0f0f0; padding: 1px 5px; border-radius: 3px; margin-left: 4px;
+}
+
+/* ===== CALLOUT ===== */
+.callout {
+  padding: 14px 18px; border-radius: 8px; margin: 16px 0;
+  font-size: 14px; line-height: 1.55;
+}
+.callout-info { background: #eff6ff; border-left: 4px solid #3b82f6; }
+.callout-warn { background: #fffbeb; border-left: 4px solid #f59e0b; }
+.callout-tip { background: #ecfdf5; border-left: 4px solid #10b981; }
+.callout-title { font-weight: 700; margin-bottom: 4px; }
+
+/* ===== FOOTER ===== */
+.site-footer {
+  margin-left: 240px; padding: 24px 48px;
+  border-top: 1px solid #e5e7eb; color: #999; font-size: 13px;
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+}
+.site-footer a { color: #0d7377; text-decoration: none; }
+.site-footer a:hover { text-decoration: underline; }
+
+/* ===== MOBILE ===== */
+@media (max-width: 860px) {
+  .hamburger { display: block; }
+  .header-links a.hide-mobile { display: none; }
+  .sidebar { transform: translateX(-100%); width: 260px; }
+  .sidebar.open { transform: translateX(0); box-shadow: 4px 0 24px rgba(0,0,0,.15); }
+  .main { margin-left: 0; padding: 28px 20px 60px; }
+  .site-footer { margin-left: 0; padding: 20px; }
+  .sidebar-overlay {
+    display: none; position: fixed; inset: 0; top: 56px;
+    background: rgba(0,0,0,.3); z-index: 899;
+  }
+  .sidebar-overlay.active { display: block; }
+  h1 { font-size: 24px; }
+  h2 { font-size: 19px; }
+}
+@media (max-width: 480px) {
+  .main { padding: 20px 14px 50px; }
+  .endpoint-card { padding: 14px 16px; }
+  pre { font-size: 11.5px; padding: 10px 12px; }
+}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="site-header">
+  <button class="hamburger" onclick="toggleSidebar()" aria-label="Toggle navigation">☰</button>
+  <div class="logo">Austrian Landscape <span>API</span></div>
+  <span class="version">v5.1</span>
+  <div class="header-links">
+    <a href="/" class="hide-mobile">← Back to App</a>
+    <a href="/api/v1/docs/llm.txt">llm.txt</a>
+  </div>
+</header>
+
+<!-- SIDEBAR OVERLAY (mobile) -->
+<div class="sidebar-overlay" onclick="toggleSidebar()"></div>
+
+<!-- SIDEBAR NAV -->
+<nav class="sidebar" id="sidebar">
+  <div class="nav-group">
+    <div class="nav-group-title">Getting Started</div>
+    <a href="#overview">Overview</a>
+    <a href="#quickstart">Quick Start</a>
+    <a href="#geometry-input">Geometry Input</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Endpoints</div>
+    <a href="#analysis">Analysis</a>
+    <div class="nav-sub">
+      <a href="#ep-segment">segment</a>
+      <a href="#ep-elevation">elevation</a>
+      <a href="#ep-terrain">terrain</a>
+      <a href="#ep-changes">changes</a>
+      <a href="#ep-changes-trees">changes/trees</a>
+      <a href="#ep-changes-summary">changes/summary</a>
+    </div>
+    <a href="#async-tasks">Async Tasks</a>
+    <a href="#overlays">Overlays</a>
+    <a href="#exports">Exports</a>
+    <a href="#shares">Shares</a>
+    <a href="#utilities">Utilities</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Reference</div>
+    <a href="#object-types">Object Types (25)</a>
+    <a href="#group-types">Group Types (11)</a>
+    <a href="#data-sources">Data Sources</a>
+    <a href="#response-format">Response Format</a>
+  </div>
+</nav>
+
+<!-- MAIN CONTENT -->
+<main class="main">
+
+<!-- ==================== OVERVIEW ==================== -->
+<h1>Austrian Landscape Analysis API</h1>
+<p class="subtitle">
+  Watershed segmentation + Random Forest classification of Austrian landscape from remote sensing data.
+  Analyse any area in Austria up to 25 km² using 6 data sources, 25 object types, and 11 group types.
+</p>
+
+<h2 id="overview">Overview <a class="anchor-link" href="#overview">#</a></h2>
+
+<p>
+  The Austrian Landscape Analysis API performs automated landscape classification using
+  <strong>watershed segmentation</strong> combined with a <strong>Random Forest classifier</strong>
+  trained on six remote sensing data sources. It identifies <strong>25 distinct object types</strong>
+  (trees, buildings, roads, water, crops, excavations, etc.) and groups them into
+  <strong>11 higher-level group types</strong> (forest, building, road network, cropland, etc.).
+</p>
+<p>
+  The system is focused on distinguishing <strong>man-made vs. natural</strong> features and
+  <strong>detecting terrain modification</strong> over time. Multi-temporal LiDAR data (2022, 2023, 2024)
+  enables change detection for construction, earthworks, tree growth/felling, and more.
+</p>
+
+<div class="callout callout-info">
+  <div class="callout-title">ℹ️ Base URL</div>
+  All endpoints are relative to <code>https://srtm-lidar-at.exe.xyz:8000</code>.<br>
+  All coordinates use <strong>WGS84</strong> (lon/lat). Processing is done in <strong>EPSG:3035</strong>. Maximum analysis area: <strong>25 km²</strong>. Austria only.
+</div>
+
+<!-- ==================== QUICK START ==================== -->
+<h2 id="quickstart">Quick Start <a class="anchor-link" href="#quickstart">#</a></h2>
+
+<p>Run an async landscape analysis, poll for progress, then retrieve the result:</p>
+
+<h4>1. Submit an async analysis</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code><span class="tok-comment"># Start an async segment analysis for a GeoJSON polygon</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?async=true</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+</div>
+
+<div class="code-wrap">
+  <div class="code-header"><span>response — 202</span></div>
+  <pre><code>{
+  <span class="tok-key">"task_id"</span>: <span class="tok-string">"a1b2c3d4-e5f6-..."</span>,
+  <span class="tok-key">"status"</span>: <span class="tok-string">"running"</span>
+}</code></pre>
+</div>
+
+<h4>2. Poll progress</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code>curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/progress?task_id=a1b2c3d4-e5f6-...</span></code></pre>
+</div>
+
+<div class="code-wrap">
+  <div class="code-header"><span>response — 200</span></div>
+  <pre><code>{
+  <span class="tok-key">"active"</span>: <span class="tok-number">true</span>,
+  <span class="tok-key">"step"</span>: <span class="tok-string">"Classifying segments"</span>,
+  <span class="tok-key">"detail"</span>: <span class="tok-string">"Random Forest prediction on 342 segments"</span>,
+  <span class="tok-key">"elapsed"</span>: <span class="tok-number">12.4</span>,
+  <span class="tok-key">"done"</span>: <span class="tok-number">false</span>
+}</code></pre>
+</div>
+
+<h4>3. Retrieve the result</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code><span class="tok-comment"># Once "done": true, fetch the full FeatureCollection</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/result?task_id=a1b2c3d4-e5f6-...</span></code></pre>
+</div>
+
+<div class="callout callout-tip">
+  <div class="callout-title">💡 Tip</div>
+  For small areas, omit <code>?async=true</code> and the result will be returned synchronously in a single request.
+</div>
+
+<!-- ==================== GEOMETRY INPUT ==================== -->
+<h2 id="geometry-input">Geometry Input <a class="anchor-link" href="#geometry-input">#</a></h2>
+
+<p>All <code>POST</code> analysis endpoints accept geometry in the request body in multiple formats:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Format</th><th>Content-Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GeoJSON Geometry</strong></td><td><code>application/json</code></td><td>A bare GeoJSON geometry object (Point, Polygon, MultiPolygon, etc.)</td></tr>
+    <tr><td><strong>GeoJSON + params</strong></td><td><code>application/json</code></td><td><code>{"geometry": &lt;GeoJSON&gt;, "dataset": "...", ...}</code></td></tr>
+    <tr><td><strong>KML string</strong></td><td><code>application/json</code></td><td>Raw KML markup as the request body</td></tr>
+    <tr><td><strong>Coordinate string</strong></td><td><code>text/plain</code></td><td><code>lon,lat</code> (single point) or <code>lon,lat;lon,lat;...</code> (polygon ring)</td></tr>
+    <tr><td><strong>File upload</strong></td><td><code>multipart/form-data</code></td><td>Upload a file: KML, GeoJSON, Shapefile ZIP, GPX, WKT, or GeoPackage</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout callout-warn">
+  <div class="callout-title">⚠️ Constraints</div>
+  <ul style="margin:0; padding-left: 18px;">
+    <li>All coordinates must be <strong>WGS84</strong> (EPSG:4326) — longitude, latitude order.</li>
+    <li>Maximum area: <strong>25 km²</strong>. Requests exceeding this will be rejected.</li>
+    <li><strong>Austria only</strong> — geometries outside Austrian borders will fail.</li>
+    <li>Multi-feature inputs are <strong>unioned</strong> into a single analysis boundary.</li>
+    <li>Point geometries are automatically <strong>buffered to a 100m radius</strong>.</li>
+  </ul>
+</div>
+
+<p><strong>File upload example:</strong></p>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment</span> \
+  <span class="tok-flag">-F</span> <span class="tok-string">"file=@area.kml"</span> \
+  <span class="tok-flag">-F</span> <span class="tok-string">"include_ortho=true"</span></code></pre>
+</div>
+
+
+<!-- ==================== ENDPOINTS: ANALYSIS ==================== -->
+<h2 id="analysis">Analysis Endpoints <a class="anchor-link" href="#analysis">#</a></h2>
+
+<!-- SEGMENT -->
+<div class="endpoint-card" id="ep-segment">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/segment</span>
+    <span style="font-size:12px;color:#0d7377;font-weight:600;margin-left:4px;">← PRIMARY</span>
+  </div>
+  <p class="ep-desc">
+    The main analysis endpoint. Performs watershed segmentation on the input area and classifies every
+    segment into one of 25 object types and 11 group types using a Random Forest classifier.
+  </p>
+  <h4>Parameters</h4>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>dataset</td><td>string</td><td>ALS date to use. <span class="param-default">Default: <code>20240915</code></span></td></tr>
+      <tr><td>min_object_size</td><td>number</td><td>Minimum segment area in m². <span class="param-default">Default: <code>30</code></span></td></tr>
+      <tr><td>felz_scale</td><td>number</td><td>Felzenszwalb scale parameter. <span class="param-default">Default: <code>150</code></span></td></tr>
+      <tr><td>rag_threshold</td><td>number</td><td>RAG merge threshold. <span class="param-default">Default: <code>0.12</code></span></td></tr>
+      <tr><td>include_ortho</td><td>boolean</td><td>Include BEV RGBI orthophoto features (NDVI, NIR, brightness, GLCM texture). <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_temporal</td><td>boolean</td><td>Include 3-date DTM comparison (2022/2023/2024). <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_copernicus</td><td>boolean</td><td>Include Sentinel-2 NDVI + ESA WorldCover + SAR + NDVI harmonics. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_cadastre</td><td>boolean</td><td>Include cadastre building footprint ground truth. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_hansen</td><td>boolean</td><td>Include Hansen Global Forest Change calibration. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>types</td><td>string</td><td>Comma-separated type filter. Example: <code>"roof,tree,road"</code></td></tr>
+      <tr><td>groups</td><td>string</td><td>Comma-separated group filter. Example: <code>"building,forest"</code></td></tr>
+      <tr><td>async</td><td>boolean</td><td>If <code>true</code>, returns 202 with a <code>task_id</code> for polling. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>task_id</td><td>string</td><td>Client-provided UUID for task tracking (optional).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?include_ortho=true&amp;include_temporal=true"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+  </div>
+
+  <p>Returns a <strong>GeoJSON FeatureCollection</strong> — see <a href="#response-format">Response Format</a> for full property list.</p>
+</div>
+
+<!-- ELEVATION -->
+<div class="endpoint-card" id="ep-elevation">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/elevation</span>
+  </div>
+  <p class="ep-desc">
+    Enrich features with DSM (Digital Surface Model) and DTM (Digital Terrain Model) elevation values.
+    Send a GeoJSON geometry or feature collection and receive elevation-annotated features.
+  </p>
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/elevation</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Point","coordinates":[15.43,47.07]}'</span></code></pre>
+  </div>
+</div>
+
+<!-- TERRAIN -->
+<div class="endpoint-card" id="ep-terrain">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/terrain</span>
+  </div>
+  <p class="ep-desc">
+    Terrain characterisation: computes slope, aspect, Terrain Ruggedness Index (TRI),
+    Topographic Position Index (TPI), and curvature for the input geometry.
+  </p>
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/terrain</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+  </div>
+</div>
+
+<!-- CHANGES -->
+<div class="endpoint-card" id="ep-changes">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/changes</span>
+  </div>
+  <p class="ep-desc">
+    Temporal change detection between two ALS dates. Identifies 20 event types including construction,
+    earthworks, vegetation changes, and road modifications.
+  </p>
+  <h4>Parameters</h4>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>date_a</td><td>string</td><td>Earlier ALS date. <span class="param-default">Default: <code>20220915</code></span></td></tr>
+      <tr><td>date_b</td><td>string</td><td>Later ALS date. <span class="param-default">Default: <code>20240915</code></span></td></tr>
+      <tr><td>min_change</td><td>number</td><td>Minimum change threshold in metres. <span class="param-default">Default: <code>1.0</code></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>Event Types (20)</h4>
+  <p style="font-size:13px;color:#555;">
+    <code>tree_growth</code>, <code>tree_felling</code>, <code>new_tree</code>, <code>forest_clearcut</code>,
+    <code>vegetation_growth</code>, <code>vegetation_loss</code>, <code>new_building</code>, <code>demolition</code>,
+    <code>construction</code>, <code>earthwork_fill</code>, <code>earthwork_cut</code>, <code>earthwork_grading</code>,
+    <code>earthwork_dam</code>, <code>earthwork_trench</code>, <code>earthwork_pond</code>,
+    <code>road_new</code>, <code>road_resurfaced</code>, <code>road_widened</code>, <code>surface_change</code>,
+    <code>unclassified_change</code>
+  </p>
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/changes?min_change=0.5"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+  </div>
+</div>
+
+<!-- CHANGES/TREES -->
+<div class="endpoint-card" id="ep-changes-trees">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/changes/trees</span>
+  </div>
+  <p class="ep-desc">
+    Per-tree growth and felling analysis between two ALS dates. Returns individual tree-level change features.
+  </p>
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/trees</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+  </div>
+</div>
+
+<!-- CHANGES/SUMMARY -->
+<div class="endpoint-card" id="ep-changes-summary">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/changes/summary</span>
+  </div>
+  <p class="ep-desc">
+    Multi-epoch change summary across all three LiDAR dates (2022 → 2023 → 2024). Provides an overview
+    of landscape evolution over the full temporal range.
+  </p>
+  <h4>Example</h4>
+  <div class="code-wrap">
+    <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/changes/summary</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
+  </div>
+</div>
+
+<!-- ==================== ASYNC TASKS ==================== -->
+<h2 id="async-tasks">Async Tasks <a class="anchor-link" href="#async-tasks">#</a></h2>
+
+<p>
+  Long-running analyses should be submitted with <code>?async=true</code>. This returns a <code>task_id</code>
+  immediately (HTTP 202). Use the following endpoints to monitor progress, retrieve results, or abort.
+</p>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <span class="endpoint-path">/api/v1/segment/progress</span>
+  </div>
+  <p class="ep-desc">Poll the progress of an async task.</p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>task_id <span class="param-required">required</span></td><td>string</td><td>The task ID returned from the async submit.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-size:13px;color:#555;"><strong>Response fields:</strong>
+    <code>active</code>, <code>step</code>, <code>detail</code>, <code>elapsed</code>,
+    <code>done</code>, <code>error</code>, <code>auto_share_id</code></p>
+</div>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <span class="endpoint-path">/api/v1/segment/result</span>
+  </div>
+  <p class="ep-desc">Retrieve the full result of a completed async task.</p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>task_id <span class="param-required">required</span></td><td>string</td><td>The task ID of the completed analysis.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/segment/abort</span>
+  </div>
+  <p class="ep-desc">Cancel a running async task.</p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>task_id <span class="param-required">required</span></td><td>string</td><td>The task ID to cancel.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+
+<!-- ==================== OVERLAYS ==================== -->
+<h2 id="overlays">Overlays <a class="anchor-link" href="#overlays">#</a></h2>
+
+<p>
+  Overlay endpoints return <strong>PNG images</strong> with geographic bounds in the <code>X-Bounds</code>
+  response header (<code>south,west,north,east</code>). Use these to render raster tiles on a map.
+  All endpoints accept geometry via <code>POST</code>.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/segment/overlay</code></td><td>Segment classification raster — each segment coloured by type</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/dtm/overlay</code></td><td>DTM hillshade visualisation</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/lidar/overlay</code></td><td>nDSM height map (viridis colour ramp)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/ortho/overlay</code></td><td>RGB orthophoto</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/cir/overlay</code></td><td>CIR (Colour Infrared) false-colour composite</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/hansen/overlay</code></td><td>Hansen Global Forest Change visualisation</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Example</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/ortho/overlay</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span> \
+  <span class="tok-flag">-o</span> ortho.png <span class="tok-flag">-D</span> -</code></pre>
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-title">ℹ️ Bounds Header</div>
+  The response includes <code>X-Bounds: south,west,north,east</code> so you can position the image accurately on a map.
+</div>
+
+<!-- ==================== EXPORTS ==================== -->
+<h2 id="exports">Exports <a class="anchor-link" href="#exports">#</a></h2>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/export/geopackage</span>
+  </div>
+  <p class="ep-desc">
+    Export all layers into a single GeoPackage file. Supports async mode for large areas.
+  </p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>layers</td><td>string</td><td>Comma-separated layer list to include.</td></tr>
+      <tr><td>types</td><td>string</td><td>Comma-separated type filter.</td></tr>
+      <tr><td>color_mode</td><td>string</td><td>Colour scheme for exported features.</td></tr>
+      <tr><td>async</td><td>boolean</td><td>Use async mode. <span class="param-default">Default: <code>false</code></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <span class="endpoint-path">/api/v1/export/mbtiles</span>
+  </div>
+  <p class="ep-desc">
+    Export a single raster layer as MBTiles for use in mapping applications.
+  </p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>layer</td><td>string</td><td>Layer to export (e.g. <code>"ortho"</code>, <code>"dtm"</code>).</td></tr>
+      <tr><td>min_zoom</td><td>integer</td><td>Minimum zoom level.</td></tr>
+      <tr><td>max_zoom</td><td>integer</td><td>Maximum zoom level.</td></tr>
+      <tr><td>async</td><td>boolean</td><td>Use async mode. <span class="param-default">Default: <code>false</code></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<h3>Raw GeoTIFF Downloads</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/lidar/geotiff</code></td><td>Download raw DTM, DSM, or nDSM as GeoTIFF</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/ortho/geotiff</code></td><td>Download orthophoto RGBI as GeoTIFF</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Example</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/lidar/geotiff</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span> \
+  <span class="tok-flag">-o</span> lidar.tif</code></pre>
+</div>
+
+<!-- ==================== SHARES ==================== -->
+<h2 id="shares">Shares <a class="anchor-link" href="#shares">#</a></h2>
+
+<p>
+  Save and retrieve analysis results for later use. Shares are automatically created for async tasks,
+  or can be manually saved.
+</p>
+
+<div class="endpoint-card">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <span class="endpoint-path">/api/v1/shares</span>
+  </div>
+  <p class="ep-desc">List saved shares.</p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>limit</td><td>integer</td><td>Maximum number of shares to return. <span class="param-default">Default: <code>20</code></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/share</code></td><td>Save a new share (POST analysis result as body)</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/share/&lt;id&gt;</code></td><td>Load a saved share by ID</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/share/&lt;old_id&gt;/rename</code></td><td>Rename a share</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/share/&lt;id&gt;/download.gpkg</code></td><td>Download share as GeoPackage file</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Example</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code><span class="tok-comment"># List recent shares</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/shares?limit=5</span>
+
+<span class="tok-comment"># Load a share</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/share/abc123</span>
+
+<span class="tok-comment"># Download as GeoPackage</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/share/abc123/download.gpkg</span> <span class="tok-flag">-o</span> result.gpkg</code></pre>
+</div>
+
+<!-- ==================== UTILITIES ==================== -->
+<h2 id="utilities">Utilities <a class="anchor-link" href="#utilities">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/layers?bbox=...</code></td><td>List available data layers for a bounding box</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/info</code></td><td>API version, status, and capabilities</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/parse-geometry</code></td><td>Parse and validate geometry input (useful for debugging)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/classifier/train</code></td><td>Trigger classifier retraining</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/classifier/status</code></td><td>Current classifier status and accuracy metrics</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/training/status</code></td><td>Training data statistics and coverage</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Examples</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code><span class="tok-comment"># Check API info</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/info</span>
+
+<span class="tok-comment"># List layers for a bounding box</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/layers?bbox=15.4,47.0,15.5,47.1"</span>
+
+<span class="tok-comment"># Parse and validate geometry</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/parse-geometry</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Point","coordinates":[15.43,47.07]}'</span></code></pre>
+</div>
+
+
+<!-- ==================== OBJECT TYPES ==================== -->
+<h2 id="object-types">Object Types (25) <a class="anchor-link" href="#object-types">#</a></h2>
+
+<p>
+  The classifier identifies 25 distinct landscape object types. Each segment in the result is assigned a
+  <code>type</code> (name) and <code>type_code</code> (integer). Types are detected based on combinations
+  of height, spectral, textural, and shape features.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:60px">Code</th><th style="width:140px">Type</th><th>Detection Criteria</th></tr></thead>
+  <tbody>
+    <tr><td><code>1</code></td><td><strong>tree</strong></td><td>nDSM &gt; 4m, rough DSM surface, high NDVI</td></tr>
+    <tr><td><code>2</code></td><td><strong>shrub</strong></td><td>nDSM 0.5–4m, high NDVI</td></tr>
+    <tr><td><code>3</code></td><td><strong>grass</strong></td><td>Ground level, moderate+ NDVI, smooth DTM</td></tr>
+    <tr><td><code>4</code></td><td><strong>hedge</strong></td><td>Elongated shrub shape (length/width &gt; 4)</td></tr>
+    <tr><td><code>5</code></td><td><strong>water</strong></td><td>ESA water class, very low NDVI + NIR, flat surface</td></tr>
+    <tr><td><code>10</code></td><td><strong>roof</strong></td><td>Compact elevated area, smooth DSM, low NDVI</td></tr>
+    <tr><td><code>11</code></td><td><strong>greenhouse</strong></td><td>Roof-like shape, high NIR transmittance</td></tr>
+    <tr><td><code>12</code></td><td><strong>solar_panel</strong></td><td>Very smooth, bright, low NDVI on roof surface</td></tr>
+    <tr><td><code>15</code></td><td><strong>fence</strong></td><td>Low height (0.5–2m), thin, elongated shape</td></tr>
+    <tr><td><code>16</code></td><td><strong>wall</strong></td><td>Narrow elevated feature, adjacent to roof</td></tr>
+    <tr><td><code>17</code></td><td><strong>mast</strong></td><td>Tiny footprint (&lt; 10 m²), very tall (&gt; 15m)</td></tr>
+    <tr><td><code>20</code></td><td><strong>road</strong></td><td>Smooth DTM (&lt; 0.04m roughness), elongated, low NDVI</td></tr>
+    <tr><td><code>21</code></td><td><strong>path</strong></td><td>Narrower road (&lt; 3m width)</td></tr>
+    <tr><td><code>22</code></td><td><strong>parking</strong></td><td>Smooth surface, large area, compact shape, low NDVI</td></tr>
+    <tr><td><code>23</code></td><td><strong>bridge</strong></td><td>Elevated road/path segment over a gap</td></tr>
+    <tr><td><code>30</code></td><td><strong>crop</strong></td><td>Flat surface, seasonal NDVI variation, ESA cropland class</td></tr>
+    <tr><td><code>31</code></td><td><strong>orchard</strong></td><td>Regular tree spacing pattern, &lt; 10m height</td></tr>
+    <tr><td><code>32</code></td><td><strong>vineyard</strong></td><td>Low rows (&lt; 3m), detectable row pattern</td></tr>
+    <tr><td><code>33</code></td><td><strong>garden</strong></td><td>Mixed vegetation in proximity to buildings</td></tr>
+    <tr><td><code>40</code></td><td><strong>bare_soil</strong></td><td>Low NDVI, flat to moderate slope</td></tr>
+    <tr><td><code>41</code></td><td><strong>rock</strong></td><td>Steep slope + very rough DTM + low NDVI</td></tr>
+    <tr><td><code>50</code></td><td><strong>excavation</strong></td><td>DTM lowered &gt; 0.20m between dates</td></tr>
+    <tr><td><code>51</code></td><td><strong>fill</strong></td><td>DTM raised &gt; 0.20m between dates</td></tr>
+    <tr><td><code>52</code></td><td><strong>tree_loss</strong></td><td>nDSM dropped &gt; 2m, underlying terrain intact</td></tr>
+    <tr><td><code>53</code></td><td><strong>construction</strong></td><td>New structure or site clearing detected</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ==================== GROUP TYPES ==================== -->
+<h2 id="group-types">Group Types (11) <a class="anchor-link" href="#group-types">#</a></h2>
+
+<p>
+  Object types are aggregated into 11 group types for higher-level analysis. Each segment receives a
+  <code>group_id</code> and <code>group_type</code> property. Filtering by group provides a simplified
+  landscape view.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:60px">Code</th><th style="width:170px">Group</th><th>Member Object Types</th></tr></thead>
+  <tbody>
+    <tr><td><code>101</code></td><td><strong>forest</strong></td><td>tree, shrub, hedge</td></tr>
+    <tr><td><code>102</code></td><td><strong>woodland</strong></td><td>shrub, hedge <em>(sparse cover)</em></td></tr>
+    <tr><td><code>103</code></td><td><strong>hedgerow</strong></td><td>hedge</td></tr>
+    <tr><td><code>106</code></td><td><strong>waterbody</strong></td><td>water</td></tr>
+    <tr><td><code>110</code></td><td><strong>building</strong></td><td>roof, wall, solar_panel, greenhouse</td></tr>
+    <tr><td><code>115</code></td><td><strong>road_network</strong></td><td>road, path, parking</td></tr>
+    <tr><td><code>120</code></td><td><strong>cropland</strong></td><td>crop, grass</td></tr>
+    <tr><td><code>121</code></td><td><strong>pasture</strong></td><td>grass, garden</td></tr>
+    <tr><td><code>122</code></td><td><strong>orchard_grove</strong></td><td>orchard, vineyard</td></tr>
+    <tr><td><code>130</code></td><td><strong>quarry</strong></td><td>excavation, fill</td></tr>
+    <tr><td><code>131</code></td><td><strong>construction_site</strong></td><td>construction, excavation, fill</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ==================== DATA SOURCES ==================== -->
+<h2 id="data-sources">Data Sources <a class="anchor-link" href="#data-sources">#</a></h2>
+
+<p>
+  The system fuses six independent remote sensing data sources at varying resolutions. Each
+  contributes different spectral, structural, or temporal information to the classifier.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:30px">#</th><th>Source</th><th style="width:100px">Resolution</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>1</strong></td><td>BEV ALS DTM + DSM</td><td>1 m</td><td>Airborne laser scanning — 3 dates: 2022, 2023, 2024</td></tr>
+    <tr><td><strong>2</strong></td><td>BEV DOP RGBI Orthophoto</td><td>0.2 m</td><td>4-band (Red, Green, Blue, Near-Infrared) — 47 operates + DOP fallback</td></tr>
+    <tr><td><strong>3</strong></td><td>Sentinel-2 NDVI</td><td>10 m</td><td>Growing-season NDVI composite via openEO</td></tr>
+    <tr><td><strong>4</strong></td><td>ESA WorldCover</td><td>10 m</td><td>Global land cover classification</td></tr>
+    <tr><td><strong>5</strong></td><td>Sentinel-1 SAR</td><td>10 m</td><td>VV + VH polarisation backscatter</td></tr>
+    <tr><td><strong>6</strong></td><td>Austrian Cadastre</td><td>mm-level</td><td>Building footprint ground truth</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ==================== RESPONSE FORMAT ==================== -->
+<h2 id="response-format">Response Format <a class="anchor-link" href="#response-format">#</a></h2>
+
+<p>
+  The primary <code>/api/v1/segment</code> endpoint returns a standard <strong>GeoJSON FeatureCollection</strong>.
+  Each feature represents one classified landscape segment with a polygon geometry and rich properties.
+</p>
+
+<div class="code-wrap">
+  <div class="code-header"><span>json</span></div>
+  <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-string">"FeatureCollection"</span>,
+  <span class="tok-key">"features"</span>: [
+    {
+      <span class="tok-key">"type"</span>: <span class="tok-string">"Feature"</span>,
+      <span class="tok-key">"geometry"</span>: { <span class="tok-key">"type"</span>: <span class="tok-string">"Polygon"</span>, <span class="tok-key">"coordinates"</span>: [...] },
+      <span class="tok-key">"properties"</span>: {
+        <span class="tok-key">"type"</span>: <span class="tok-string">"tree"</span>,
+        <span class="tok-key">"type_code"</span>: <span class="tok-number">1</span>,
+        <span class="tok-key">"group_id"</span>: <span class="tok-number">101</span>,
+        <span class="tok-key">"group_type"</span>: <span class="tok-string">"forest"</span>,
+        <span class="tok-key">"is_manmade"</span>: <span class="tok-number">false</span>,
+        <span class="tok-key">"confidence"</span>: <span class="tok-number">0.92</span>,
+        <span class="tok-comment">// ... more properties below</span>
+      }
+    }
+  ]
+}</code></pre>
+</div>
+
+<h3>Per-Feature Properties</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:200px">Property</th><th style="width:90px">Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>type</code></td><td>string</td><td>Object type name (e.g. <code>"tree"</code>, <code>"roof"</code>)</td></tr>
+    <tr><td><code>type_code</code></td><td>integer</td><td>Numeric type code (see <a href="#object-types">Object Types</a>)</td></tr>
+    <tr><td><code>group_id</code></td><td>integer</td><td>Group code (see <a href="#group-types">Group Types</a>)</td></tr>
+    <tr><td><code>group_type</code></td><td>string</td><td>Group type name (e.g. <code>"forest"</code>, <code>"building"</code>)</td></tr>
+    <tr><td><code>is_manmade</code></td><td>boolean</td><td>Whether the object is man-made</td></tr>
+    <tr><td><code>confidence</code></td><td>float</td><td>Classifier confidence score (0–1)</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Height Metrics</td></tr>
+    <tr><td><code>height_max_m</code></td><td>float</td><td>Maximum nDSM height in metres</td></tr>
+    <tr><td><code>height_mean_m</code></td><td>float</td><td>Mean nDSM height in metres</td></tr>
+    <tr><td><code>height_p90_m</code></td><td>float</td><td>90th percentile nDSM height</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Geometry Metrics</td></tr>
+    <tr><td><code>area_sqm</code></td><td>float</td><td>Segment area in square metres</td></tr>
+    <tr><td><code>compactness</code></td><td>float</td><td>Shape compactness (Polsby-Popper)</td></tr>
+    <tr><td><code>elongation</code></td><td>float</td><td>Length-to-width ratio</td></tr>
+    <tr><td><code>solidity</code></td><td>float</td><td>Area / convex hull area ratio</td></tr>
+    <tr><td><code>extent</code></td><td>float</td><td>Area / bounding box area ratio</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Surface Features</td></tr>
+    <tr><td><code>dsm_edge_strength</code></td><td>float</td><td>DSM edge detection strength</td></tr>
+    <tr><td><code>slope_mean</code></td><td>float</td><td>Mean terrain slope (degrees)</td></tr>
+    <tr><td><code>roughness</code></td><td>float</td><td>DTM surface roughness</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Spectral Features</td></tr>
+    <tr><td><code>ndvi_mean</code></td><td>float</td><td>Mean NDVI from orthophoto</td></tr>
+    <tr><td><code>ndvi_fused</code></td><td>float</td><td>Fused NDVI (ortho + Sentinel-2)</td></tr>
+    <tr><td><code>nir_mean</code></td><td>float</td><td>Mean Near-Infrared reflectance</td></tr>
+    <tr><td><code>brightness_mean</code></td><td>float</td><td>Mean brightness from RGBI</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Temporal Features</td></tr>
+    <tr><td><code>height_change</code></td><td>float</td><td>nDSM change between dates (metres)</td></tr>
+    <tr><td><code>dtm_change</code></td><td>float</td><td>DTM elevation change (metres)</td></tr>
+    <tr><td><code>temporal_stability</code></td><td>float</td><td>Stability score across all dates</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Texture Features</td></tr>
+    <tr><td><code>glcm_entropy</code></td><td>float</td><td>Grey-Level Co-occurrence Matrix entropy</td></tr>
+    <tr><td><code>glcm_homogeneity</code></td><td>float</td><td>GLCM homogeneity</td></tr>
+    <tr><td><code>texture_complexity</code></td><td>float</td><td>Overall texture complexity score</td></tr>
+    <tr><td colspan="3" style="background:#f0f4f8;font-weight:600;color:#555;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Copernicus / SAR Features</td></tr>
+    <tr><td><code>sar_vv</code></td><td>float</td><td>Sentinel-1 VV backscatter</td></tr>
+    <tr><td><code>sar_vh</code></td><td>float</td><td>Sentinel-1 VH backscatter</td></tr>
+    <tr><td><code>harm_amplitude</code></td><td>float</td><td>NDVI harmonic amplitude</td></tr>
+    <tr><td><code>harm_phase</code></td><td>float</td><td>NDVI harmonic phase</td></tr>
+    <tr><td><code>phenology_class</code></td><td>string</td><td>Phenological classification</td></tr>
+  </tbody>
+</table>
+</div>
+
+</main>
+
+<!-- FOOTER -->
+<footer class="site-footer">
+  <span>Austrian Landscape Analysis • API v5.1</span>
+  <span>
+    <a href="/api/v1/docs/llm.txt">Machine-readable docs (llm.txt)</a>
+    &nbsp;·&nbsp;
+    <a href="/">Back to app</a>
+  </span>
+</footer>
+
+<!-- ===== JAVASCRIPT ===== -->
+<script>
+// Sidebar toggle (mobile)
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.querySelector('.sidebar-overlay').classList.toggle('active');
+}
+
+// Close sidebar when clicking a nav link (mobile)
+document.querySelectorAll('.sidebar a').forEach(a => {
+  a.addEventListener('click', () => {
+    if (window.innerWidth <= 860) {
+      document.getElementById('sidebar').classList.remove('open');
+      document.querySelector('.sidebar-overlay').classList.remove('active');
+    }
+  });
+});
+
+// Copy code button
+function copyCode(btn) {
+  const pre = btn.closest('.code-wrap').querySelector('pre');
+  const text = pre.textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.classList.add('copied');
+    btn.innerHTML = '✓ Copied';
+    setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.innerHTML = '📋 Copy';
+    }, 2000);
+  });
+}
+
+// Active nav highlighting on scroll
+const sections = document.querySelectorAll('h2[id]');
+const navLinks = document.querySelectorAll('.sidebar a[href^="#"]');
+
+function updateActiveNav() {
+  let current = '';
+  sections.forEach(section => {
+    const top = section.getBoundingClientRect().top;
+    if (top < 120) current = section.id;
+  });
+  navLinks.forEach(link => {
+    link.classList.remove('active');
+    if (link.getAttribute('href') === '#' + current) {
+      link.classList.add('active');
+    }
+  });
+}
+
+window.addEventListener('scroll', updateActiveNav, { passive: true });
+updateActiveNav();
+</script>
+
+</body>
+</html>

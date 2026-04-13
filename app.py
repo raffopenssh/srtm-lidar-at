@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from flask import Flask, request, jsonify, send_file, Response, redirect
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, redirect
 from shapely.geometry import mapping, shape, Point, LineString as SLineString
 
 import tile_index as ti
@@ -3228,6 +3228,10 @@ def layers_availability():
         log.error("layers endpoint: %s", traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
 
+
+@app.route('/docs')
+def docs_page():
+    return send_from_directory('static', 'docs.html')
 
 @app.route('/api/v1/docs/llm.txt', methods=['GET'])
 def llm_docs():

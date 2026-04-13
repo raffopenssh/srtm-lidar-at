@@ -229,6 +229,259 @@ def _extract_dominant_code(lu_summary: dict) -> int | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Rasterized cadastre labelling (pixel-accurate, height-aware)
+# ---------------------------------------------------------------------------
+
+# Cadastre codes that represent ground-level surface types.
+# Pixels with these codes that have elevated nDSM (tree canopy, etc.)
+# should NOT be used as training labels for their ground type.
+_GROUND_SURFACE_CODES = {
+    # Roads/paths/parking — must be at ground level
+    48, 73,       # Straße (road)
+    74,           # Weg (path)
+    41,           # Baufläche (paved) → parking
+    # Water — must be at ground level
+    70, 71,       # Gewässer, stehende Gewässer
+    96,           # Feuchtgebiet
+    60,           # Sumpf/Moor
+    72,           # Quelle/Brunnen
+    # Agricultural / grass — ground level
+    51, 62,       # Acker (crop)
+    52, 53, 54, 55, 58, 61,  # Wiese/Weide/Alpe/Grünland (grass)
+    63,           # Weingarten (vineyard)
+    64,           # Hausgarten (garden)
+    65,           # Obstgarten (orchard) — allow some height for fruit trees
+}
+
+# Maximum nDSM height (m) per ground-level code category.
+# Pixels above this threshold get cleared to 0 (unlabelled).
+_GROUND_MAX_HEIGHT = {
+    # Transport — very flat
+    48: 1.5, 73: 1.5, 74: 1.5, 41: 1.5,
+    # Water — flat
+    70: 1.0, 71: 1.0, 96: 1.5, 60: 1.5, 72: 1.0,
+    # Crops/grass — low vegetation
+    51: 2.0, 62: 2.0,
+    52: 2.0, 53: 2.0, 54: 2.0, 55: 2.0, 58: 2.0, 61: 2.0,
+    # Gardens/vineyards — some structure allowed
+    63: 3.0, 64: 3.0,
+    # Orchards — fruit trees can be 4-5m
+    65: 6.0,
+}
+
+# Codes that are elevated by nature — skip ground-level masking.
+# Bridge (75) is deliberately excluded from _GROUND_SURFACE_CODES.
+_ELEVATED_CODES = {42, 43, 44, 45, 46, 47, 75}  # buildings + bridge
+
+
+def rasterize_cadastre_labels(
+    cadastre_data: dict,
+    transform,
+    shape_hw: tuple[int, int],
+    ndsm: np.ndarray | None = None,
+    min_building_height: float = 2.0,
+) -> np.ndarray:
+    """Rasterize all cadastre features into a single label raster.
+
+    Returns an int16 array where each pixel is a cadastre code (0 = unlabelled).
+    Priority (highest first): building footprints (code 42), landuse polygons,
+    parcel polygons.
+
+    Height-aware masking:
+    - Building footprint pixels require nDSM >= min_building_height.
+    - Ground-level types (roads, paths, parking, water, grass, crop) require
+      nDSM below a type-specific threshold.  Pixels with tree canopy or other
+      elevated surfaces above these ground features are cleared to 0.
+    - Bridge (code 75) is exempt from ground masking.
+    """
+    from rasterio.features import rasterize as rio_rasterize
+
+    h, w = shape_hw
+    label_raster = np.zeros((h, w), dtype=np.int16)
+
+    # Layer 1 (lowest priority): parcel polygons
+    parcel_pairs = []
+    for p in cadastre_data["parcels"]:
+        code = p.get("landuse_code")
+        geom = p.get("geometry")
+        if code is not None and geom is not None and not geom.is_empty:
+            parcel_pairs.append((geom, int(code)))
+    if parcel_pairs:
+        try:
+            parcel_raster = rio_rasterize(
+                parcel_pairs, out_shape=(h, w), transform=transform,
+                fill=0, dtype=np.int16,
+            )
+            mask = parcel_raster != 0
+            label_raster[mask] = parcel_raster[mask]
+        except Exception as e:
+            log.warning("rasterize_cadastre: parcels failed: %s", e)
+
+    # Layer 2 (medium priority): landuse polygons — overwrite parcels
+    lu_pairs = []
+    for lu in cadastre_data["landuse"]:
+        code = lu.get("code")
+        geom = lu.get("geometry")
+        if code is not None and geom is not None and not geom.is_empty:
+            lu_pairs.append((geom, int(code)))
+    if lu_pairs:
+        try:
+            lu_raster = rio_rasterize(
+                lu_pairs, out_shape=(h, w), transform=transform,
+                fill=0, dtype=np.int16,
+            )
+            mask = lu_raster != 0
+            label_raster[mask] = lu_raster[mask]
+        except Exception as e:
+            log.warning("rasterize_cadastre: landuse failed: %s", e)
+
+    # Layer 3 (highest priority): building footprints — code 42, height-masked
+    bfp_pairs = [(g, 42) for g in cadastre_data["building_footprints"]
+                 if not g.is_empty]
+    if bfp_pairs:
+        try:
+            bfp_raster = rio_rasterize(
+                bfp_pairs, out_shape=(h, w), transform=transform,
+                fill=0, dtype=np.int16, all_touched=True,
+            )
+            bfp_mask = bfp_raster != 0
+            if ndsm is not None:
+                # Only mark as roof where the surface is actually elevated
+                elevated = ndsm >= min_building_height
+                label_raster[bfp_mask & elevated] = 42
+                # Pixels inside footprint but NOT elevated keep their
+                # landuse/parcel label (or stay 0) — this is the key fix:
+                # ground-level segments that happen to overlap a building
+                # footprint will NOT be labelled as roof.
+                n_bfp = int(bfp_mask.sum())
+                n_elev = int((bfp_mask & elevated).sum())
+                log.debug("rasterize_cadastre: %d building px, %d elevated (%.0f%%)",
+                          n_bfp, n_elev, 100 * n_elev / max(n_bfp, 1))
+            else:
+                # No height data — fall back to all footprint pixels
+                label_raster[bfp_mask] = 42
+        except Exception as e:
+            log.warning("rasterize_cadastre: buildings failed: %s", e)
+
+    # Layer 4: Ground-level height masking
+    # Clear pixels where a ground-level cadastre type has elevated nDSM
+    # (e.g. tree canopy over a road, or forest on cadastre grass).
+    if ndsm is not None:
+        n_cleared = 0
+        for code, max_h in _GROUND_MAX_HEIGHT.items():
+            code_mask = label_raster == code
+            if not code_mask.any():
+                continue
+            elevated_mask = code_mask & (ndsm > max_h)
+            n_elev = int(elevated_mask.sum())
+            if n_elev > 0:
+                label_raster[elevated_mask] = 0
+                n_cleared += n_elev
+        if n_cleared > 0:
+            log.info("rasterize_cadastre: cleared %d ground-level px with elevated nDSM",
+                     n_cleared)
+
+    return label_raster
+
+
+# Maximum segment mean height (h_mean) for OSM ground-level type labels.
+# Segments above this are likely tree canopy/structures over the ground feature.
+_OSM_GROUND_TYPE_MAX_HEIGHT = {
+    "road": 1.5, "path": 1.5, "parking": 1.5,
+    "water": 1.0,
+    "grass": 2.0, "crop": 2.0,
+    "vineyard": 3.0, "garden": 3.0,
+    "bare_soil": 1.5,
+}
+
+
+def match_segments_via_raster(
+    features_list: list[dict],
+    labels: np.ndarray,
+    cadastre_raster: np.ndarray,
+    osm_labels: np.ndarray | None,
+    min_overlap_frac: float = 0.15,
+) -> tuple[list[dict], list[str], dict]:
+    """Match segments to ground truth via pixel-level majority vote.
+
+    For each segment (identified by labels == feat['label']), count how many
+    pixels have each cadastre code.  If the dominant code covers at least
+    min_overlap_frac of the segment, use it.  Otherwise fall back to OSM.
+
+    Height-aware: cadastre raster is already height-masked (ground-level px
+    with elevated nDSM cleared to 0).  For OSM fallback, we additionally
+    reject ground-level type labels when the segment's mean height (h_mean)
+    exceeds a type-specific threshold.
+
+    Returns (train_features, train_labels, source_counts).
+    """
+    import learned_classifier as lc
+    train_features = []
+    train_labels = []
+    source_counts = {
+        "cadastre_raster": 0, "osm": 0, "osm_height_rejected": 0,
+        "unmatched": 0,
+    }
+
+    for feat in features_list:
+        seg_id = feat.get("label")
+        if seg_id is None:
+            source_counts["unmatched"] += 1
+            continue
+
+        seg_mask = labels == seg_id
+        seg_px = int(seg_mask.sum())
+        if seg_px < 2:
+            source_counts["unmatched"] += 1
+            continue
+
+        # Extract cadastre codes within this segment
+        codes_in_seg = cadastre_raster[seg_mask]
+        nonzero = codes_in_seg[codes_in_seg != 0]
+
+        if len(nonzero) > 0:
+            # Majority vote
+            unique, counts = np.unique(nonzero, return_counts=True)
+            best_idx = counts.argmax()
+            best_code = int(unique[best_idx])
+            best_frac = counts[best_idx] / seg_px
+
+            if best_frac >= min_overlap_frac and best_code in lc.CADASTRE_TO_TYPE:
+                train_features.append(feat)
+                train_labels.append(lc.CADASTRE_TO_TYPE[best_code])
+                source_counts["cadastre_raster"] += 1
+                continue
+
+        # Fall back to OSM
+        if osm_labels is not None:
+            osm_in_seg = osm_labels[seg_mask]
+            # osm_labels is a string/object array or int-coded; handle both
+            osm_nonzero = osm_in_seg[osm_in_seg != ""]
+            if hasattr(osm_nonzero, 'dtype') and osm_nonzero.dtype.kind in ('i', 'u', 'f'):
+                osm_nonzero = osm_nonzero[osm_nonzero != 0]
+            if len(osm_nonzero) > 0:
+                unique_o, counts_o = np.unique(osm_nonzero, return_counts=True)
+                best_osm = str(unique_o[counts_o.argmax()])
+                if best_osm in lc.TYPE_CLASSES:
+                    # Height check: reject ground-level OSM labels on
+                    # elevated segments (tree canopy over road, etc.)
+                    h_mean = feat.get("h_mean", 0.0)
+                    max_h = _OSM_GROUND_TYPE_MAX_HEIGHT.get(best_osm)
+                    if max_h is not None and h_mean > max_h:
+                        source_counts["osm_height_rejected"] += 1
+                        source_counts["unmatched"] += 1
+                        continue
+                    train_features.append(feat)
+                    train_labels.append(best_osm)
+                    source_counts["osm"] += 1
+                    continue
+
+        source_counts["unmatched"] += 1
+
+    return train_features, train_labels, source_counts
+
+
 def match_segment_to_cadastre(
     feat: dict,
     cadastre_data: dict,
@@ -644,35 +897,24 @@ def process_one_kg(
         stats["error"] = "no segments"
         return [], [], stats
 
-    # 7. Match segments to ground truth: cadastre first, OSM as fallback
+    # 7. Match segments to ground truth via rasterized cadastre + OSM
+    #    Rasterize all cadastre features to 1m grid, mask building pixels
+    #    by nDSM height, then per-segment majority vote.
     t0 = time.time()
-    train_features = []
-    train_labels = []
-    source_counts = {
-        "building_footprint": 0, "landuse_polygon": 0,
-        "landuse_polygon_weak": 0, "parcel": 0,
-        "osm": 0, "unmatched": 0,
-    }
+    seg_labels = result.get("labels")  # segment label array (h, w)
 
-    for feat in features_list:
-        # Try cadastre first (higher precision)
-        code, source = match_segment_to_cadastre(feat, cadastre_data, data["transform"])
-        if code is not None and code in lc.CADASTRE_TO_TYPE:
-            train_features.append(feat)
-            train_labels.append(lc.CADASTRE_TO_TYPE[code])
-            source_counts[source] = source_counts.get(source, 0) + 1
-            continue
+    cadastre_raster = rasterize_cadastre_labels(
+        cadastre_data, data["transform"], data["shape"],
+        ndsm=data.get("ndsm"), min_building_height=2.0,
+    )
+    n_bld_px = int((cadastre_raster == 42).sum())
+    n_lu_px = int(((cadastre_raster != 0) & (cadastre_raster != 42)).sum())
+    log.info("KG %s: rasterized cadastre — %d building px, %d landuse px",
+             kg_code, n_bld_px, n_lu_px)
 
-        # Fall back to OSM ground truth
-        if osm_labels is not None:
-            osm_lbl, osm_src = match_segment_to_osm(feat, osm_labels, data["transform"])
-            if osm_lbl and osm_lbl in lc.TYPE_CLASSES:
-                train_features.append(feat)
-                train_labels.append(osm_lbl)
-                source_counts["osm"] += 1
-                continue
-
-        source_counts["unmatched"] += 1
+    train_features, train_labels, source_counts = match_segments_via_raster(
+        features_list, seg_labels, cadastre_raster, osm_labels,
+    )
 
     stats["match_time"] = round(time.time() - t0, 1)
     stats["n_labelled"] = len(train_features)

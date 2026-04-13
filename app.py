@@ -1372,7 +1372,7 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', nd
         lut = np.zeros((256, 3), dtype=np.uint8)
         for i in range(256):
             lut[i] = _viridis_rgb(i / 255.0)
-        idx = np.clip((np.clip(ndsm / 35.0, 0, 1) * 255).astype(np.uint8), 0, 255)
+        idx = np.clip((np.clip(np.sqrt(np.clip(ndsm, 0, 45) / 45.0), 0, 1) * 255).astype(np.uint8), 0, 255)
         for c in range(3):
             rgba[:, :, c] = lut[idx, c]
         rgba[:, :, 3] = np.where(included & mask, np.where(ndsm > 0.3, 180, 60).astype(np.uint8), 0)
@@ -2558,9 +2558,10 @@ def _dtm_rgba(dtm, mask):
     return rgba
 
 
-def _ndsm_rgba(ndsm, dsm, mask, vmax=35):
+def _ndsm_rgba(ndsm, dsm, mask, vmax=45):
     """Render nDSM as viridis height coloring with DSM hillshade for 3D effect.
 
+    Uses sqrt scaling to better distinguish old-growth forest (25-45m).
     Ground (ndsm < 0.3) is transparent so it can layer over the DTM relief.
     """
     import matplotlib
@@ -2571,10 +2572,11 @@ def _ndsm_rgba(ndsm, dsm, mask, vmax=35):
 
     hs_dsm = _hillshade(dsm, azimuth=315, altitude=40)
 
-    norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
     colormap = cm.get_cmap('viridis')
     ndsm_clamped = np.clip(ndsm, 0, vmax)
-    rgb_float = colormap(norm(ndsm_clamped))[:, :, :3]  # (H,W,3)
+    # sqrt scaling: spreads upper range for better old-growth forest distinction
+    ndsm_sqrt = np.sqrt(ndsm_clamped / vmax)
+    rgb_float = colormap(ndsm_sqrt)[:, :, :3]  # (H,W,3)
 
     # Modulate by DSM hillshade
     for c in range(3):

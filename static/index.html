@@ -929,14 +929,14 @@ function setColorMode(m){
 function updateLegendScale(){
   const d=document.getElementById('legend-scale');
   if(colorMode==='height'){
-    d.innerHTML=`<div class="legend-bar" style="background:${viridisGrad()}"></div><div class="legend-labels"><span>0 m</span><span>10</span><span>20</span><span>30+ m</span></div>`;
+    d.innerHTML=`<div class="legend-bar" style="background:${viridisGrad()}"></div><div class="legend-labels" style="position:relative;height:14px"><span style="position:absolute;left:0">0 m</span><span style="position:absolute;left:47%;transform:translateX(-50%)">10</span><span style="position:absolute;left:67%;transform:translateX(-50%)">20</span><span style="position:absolute;right:0">45+ m</span></div>`;
   } else if(lastEndpoint==='changes'||lastEndpoint==='changes/trees'){
     d.innerHTML=`<div class="legend-bar" style="background:${divGrad()}"></div><div class="legend-labels"><span>−5 m</span><span>0</span><span>+5 m</span></div>`;
   } else d.innerHTML='';
 }
 function markerColor(f){
   const p=f.properties;
-  if(colorMode==='height'){const h=p.height_max_m||p.height_after_m||p.height_max||0;return viridisCSS(Math.min(h/35,1));}
+  if(colorMode==='height'){const h=p.height_max_m||p.height_after_m||p.height_max||0;return viridisCSS(Math.min(Math.sqrt(Math.max(h,0)/45),1));}
   if(lastEndpoint==='changes/trees'){const dh=p.height_change_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
   if(lastEndpoint==='changes'){const dh=p.height_change_mean_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
   return null;

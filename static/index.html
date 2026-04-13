@@ -282,7 +282,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="geo-drop-overlay" id="geo-drop-overlay">📂 Drop file here</div>
     </div>
-    <div style="display:flex;gap:6px;margin-top:6px">
+    <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
       <div style="position:relative;flex:1">
         <button class="btn btn-outline" id="btn-load" style="width:100%">📂 Load</button>
         <div class="load-dropdown" id="load-dropdown"></div>
@@ -290,6 +290,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <button class="btn" id="btn-run" style="flex:1">🚀 Analyse</button>
       <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
+      <div id="area-hint" style="display:none;width:100%;font-size:11px;color:#b87700;background:#fff8e1;padding:5px 8px;border-radius:4px"></div>
     </div>
   </div>
   <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span class="doc-links"><a href="/docs" title="API Documentation">docs</a><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
@@ -378,6 +379,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div class="modal-tab active" data-tab="summary" onclick="switchTab('summary')">Summary</div>
       <div class="modal-tab" data-tab="json" onclick="switchTab('json')">JSON</div>
       <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoPackage</div>
+      <div class="modal-tab" data-tab="kml" onclick="switchTab('kml')">KML</div>
       <div class="modal-tab" data-tab="mbtiles" onclick="switchTab('mbtiles')">MBTiles</div>
     </div>
     <div class="modal-body">
@@ -422,11 +424,47 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
             <label><input type="checkbox" data-gpkg="dsm-2023"> nDSM 2023 overlay</label>
             <label><input type="checkbox" data-gpkg="dsm-2022"> nDSM 2022 overlay</label>
             <div class="gpkg-group">Analysis</div>
-            <label><input type="checkbox" data-gpkg="segments"> Segment types</label>
+            <label><input type="checkbox" data-gpkg="segments"> Segment types (raster)</label>
+            <label><input type="checkbox" data-gpkg="segments-vector" checked> Segment polygons (vector)</label>
             <label><input type="checkbox" data-gpkg="raster"> Segment raster (RGBA)</label>
             <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
           </div>
+          <div style="margin:10px 0">
+            <div class="gpkg-group">Object type filter</div>
+            <div id="gpkg-type-filter" style="display:flex;flex-wrap:wrap;gap:2px 8px;font-size:11px;max-height:100px;overflow-y:auto;margin:4px 0"></div>
+            <div style="display:flex;gap:8px;margin-top:4px">
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=true});" style="font-size:10px">All</a>
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=false});" style="font-size:10px">None</a>
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=!c.checked});" style="font-size:10px">Invert</a>
+            </div>
+          </div>
           <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoPackage</button>
+        </div>
+      </div>
+      <div class="tab-pane" id="tab-kml">
+        <div class="gpkg-info">
+          <p style="font-size:24px;margin-bottom:4px">🌍 KML Export</p>
+          <p>Download analysis features as KML for Google Earth. Requires analysis results.</p>
+          <div style="margin:10px 0">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:6px 0">
+              Group by:
+              <select id="kml-group-by" style="font-size:12px;padding:3px 6px;border-radius:4px;border:1px solid #ddd">
+                <option value="type">Object type</option>
+                <option value="height_class">Height class</option>
+              </select>
+            </label>
+          </div>
+          <div style="margin:10px 0">
+            <div class="gpkg-group">Object type filter</div>
+            <div id="kml-type-filter" style="display:flex;flex-wrap:wrap;gap:2px 8px;font-size:11px;max-height:100px;overflow-y:auto;margin:4px 0"></div>
+            <div style="display:flex;gap:8px;margin-top:4px">
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=true});" style="font-size:10px">All</a>
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=false});" style="font-size:10px">None</a>
+              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=!c.checked});" style="font-size:10px">Invert</a>
+            </div>
+          </div>
+          <button class="btn" id="btn-dl-kml" style="width:100%" disabled>🌍 Download KML</button>
+          <p id="kml-no-results" style="color:#999;font-size:11px;margin-top:6px">Run an analysis first to export features as KML.</p>
         </div>
       </div>
     </div>
@@ -535,7 +573,7 @@ const drawnItems=new L.FeatureGroup().addTo(map);
 const resultLayer=new L.FeatureGroup().addTo(map);
 
 const drawControl=new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:false,marker:false,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
-map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();});
+map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();_showFabIfGeometry();_checkAreaWarning(e.layer);});
 // moveend no longer invalidates share — viewpoint is cosmetic, not part of share identity
 map.on('moveend',_debouncedLayerAvailCheck);
 
@@ -574,6 +612,7 @@ function clearEverything(){
   // Hide legend, download fab, share popup
   document.getElementById('legend').style.display='none';
   document.getElementById('fab-download').style.display='none';
+  document.getElementById('area-hint').style.display='none';
   const sp=document.getElementById('share-link-popup');if(sp)sp.classList.remove('show');
   // Reset legend
   document.getElementById('legend-types').innerHTML='';
@@ -590,6 +629,43 @@ function clearEverything(){
   history.replaceState(null,'',location.pathname);
   // Reset status
   setStatus('Idle');
+}
+
+// ============ FAB VISIBILITY + AREA WARNING ============
+function _showFabIfGeometry(){
+  const geo=document.getElementById('geometry').value.trim();
+  if(geo) document.getElementById('fab-download').style.display='flex';
+}
+function _checkAreaWarning(layer){
+  // Show soft hint if area > 100 ha
+  try{
+    if(!layer) return;
+    let gj = layer.toGeoJSON ? layer.toGeoJSON() : null;
+    if(!gj) return;
+    let area = turf.area(gj);  // m²
+    const ha = area / 10000;
+    const hint = document.getElementById('area-hint');
+    if(ha > 100){
+      hint.textContent = `⚠️ Large area (${Math.round(ha)} ha) — analysis may take several minutes`;
+      hint.style.display = 'block';
+    } else {
+      hint.style.display = 'none';
+    }
+  }catch(e){}
+}
+function _checkAreaWarningFromGeometry(){
+  try{
+    const geo = JSON.parse(document.getElementById('geometry').value);
+    const area = turf.area({type:'Feature',geometry:geo,properties:{}});
+    const ha = area / 10000;
+    const hint = document.getElementById('area-hint');
+    if(ha > 100){
+      hint.textContent = `⚠️ Large area (${Math.round(ha)} ha) — analysis may take several minutes`;
+      hint.style.display = 'block';
+    } else {
+      hint.style.display = 'none';
+    }
+  }catch(e){}
 }
 
 // ============ STATE ============
@@ -676,6 +752,8 @@ function openResultModal(){
   document.getElementById('result-modal').classList.add('open');
   updateModalContent();
   syncGpkgCheckboxes();
+  buildExportTypeFilters();
+  updateKmlState();
 }
 function closeResultModal(){
   document.getElementById('result-modal').classList.remove('open');
@@ -684,19 +762,47 @@ function switchTab(tab){
   document.querySelectorAll('.modal-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+tab));
   if(tab==='gpkg') syncGpkgCheckboxes();
+  if(tab==='kml') updateKmlState();
 }
 function syncGpkgCheckboxes(){
   // Mirror map layer panel state into GeoPackage export checkboxes.
   // Core (dtm/dsm) default to checked; everything else mirrors its map toggle.
   document.querySelectorAll('[data-gpkg]').forEach(cb=>{
     const id=cb.dataset.gpkg;
-    if(id==='dtm'||id==='dsm'){
-      cb.checked=true; // core always on by default
-      return;
-    }
+    if(id==='dtm'||id==='dsm'||id==='segments-vector') return;
     const mapCb=document.querySelector(`[data-lyr="${id}"]`);
-    cb.checked=mapCb?mapCb.checked:false;
+    if(mapCb) cb.checked=mapCb.checked;
   });
+}
+function buildExportTypeFilters(){
+  const types=Object.keys(TYPE_SHAPES);
+  for(const cid of ['gpkg-type-filter','kml-type-filter']){
+    const el=document.getElementById(cid);
+    if(!el||el.children.length>0) continue;
+    for(const t of types){
+      const c=TYPE_SHAPES[t]?.c||'#888';
+      const lbl=document.createElement('label');
+      lbl.style.cssText='display:flex;align-items:center;gap:3px;cursor:pointer';
+      lbl.innerHTML=`<input type="checkbox" value="${t}" checked style="margin:0"><span style="color:${c}">${t.replace(/_/g,' ')}</span>`;
+      el.appendChild(lbl);
+    }
+  }
+}
+function _getExportTypeFilter(containerId){
+  const checks=document.querySelectorAll(`#${containerId} input[type=checkbox]`);
+  const sel=[];let total=0;
+  checks.forEach(cb=>{total++;if(cb.checked)sel.push(cb.value);});
+  if(sel.length===total) return '';
+  return sel.join(',');
+}
+function updateKmlState(){
+  const btn=document.getElementById('btn-dl-kml');
+  const msg=document.getElementById('kml-no-results');
+  if(lastResult && allFeatureData.length>0){
+    btn.disabled=false; msg.style.display='none';
+  }else{
+    btn.disabled=true; msg.style.display='block';
+  }
 }
 // Close on backdrop click
 document.getElementById('result-modal').onclick=e=>{if(e.target===e.currentTarget)closeResultModal();};
@@ -807,6 +913,10 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     url+='&include_dtm='+(sel.dtm||false);
     url+='&include_dsm='+(sel.dsm||false);
     url+='&include_segments='+(sel.segments||false);
+    url+='&include_segments_vector='+(sel['segments-vector']||false);
+    // Type filter from GPKG type filter checkboxes
+    const gpkgTypes=_getExportTypeFilter('gpkg-type-filter');
+    if(gpkgTypes) url+='&types='+encodeURIComponent(gpkgTypes);
     // Ortho years
     const orthoYears=[];
     if(sel['ortho-2024'])orthoYears.push('2024');
@@ -819,7 +929,7 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
       if(sel[id])rasterLayers.push(id);
     });
     if(rasterLayers.length)url+='&raster_layers='+rasterLayers.join(',');
-    if(hiddenTypes.size>0)url+='&types='+Object.keys(TYPE_SHAPES).filter(t=>!hiddenTypes.has(t)).join(',');
+    // (type filter already applied above from gpkg-type-filter)
     url+='&color_mode='+colorMode;
     // Submit async export
     const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
@@ -854,6 +964,35 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     }
     throw new Error('Export timed out after 10 minutes');
   }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoPackage';}
+};
+
+// ============ KML DOWNLOAD ============
+document.getElementById('btn-dl-kml').onclick=async()=>{
+  if(!lastResult || !allFeatureData.length){alert('Run an analysis first');return;}
+  const btn=document.getElementById('btn-dl-kml');
+  btn.disabled=true;btn.textContent='⏳ Generating...';
+  try{
+    const args=getPostArgs();
+    if(!args){alert('Provide geometry first');return;}
+    const groupBy=document.getElementById('kml-group-by').value;
+    const kmlTypes=_getExportTypeFilter('kml-type-filter');
+    // Build request body: include result JSON + geometry
+    const geo=JSON.parse(document.getElementById('geometry').value);
+    const body={geometry:geo, result_json:JSON.stringify(lastResult), group_by:groupBy};
+    if(kmlTypes) body.types=kmlTypes;
+    const resp=await fetch('/api/v1/export/kml'+(kmlTypes?'?types='+encodeURIComponent(kmlTypes):''),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    });
+    if(!resp.ok){const err=await resp.json();throw new Error(err.error||'Export failed');}
+    const blob=await resp.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='landscape_export.kml';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){alert('KML error: '+e.message);}
+  finally{btn.disabled=false;btn.textContent='🌍 Download KML';}
 };
 
 // ============ SPINNER ============
@@ -1037,7 +1176,7 @@ async function handleLayerToggle(id){
       const blob=await resp.blob();
       ovl=L.imageOverlay(URL.createObjectURL(blob),[[s,w],[n,e]],{opacity:.7,interactive:false});
     }
-    if(ovl){overlays[id]=ovl;ovl.addTo(map);orderLayers();applyOpacity(id);}
+    if(ovl){overlays[id]=ovl;ovl.addTo(map);orderLayers();applyOpacity(id);_showFabIfGeometry();}
     else cb.checked=false;
     hideLoading();
   }catch(e){hideLoading(`${id} failed: ${e.message}`);cb.checked=false;}
@@ -1743,6 +1882,9 @@ function updateGeoInputDisplay(label, source){
   else if(source==='drawn') ico.textContent='\u270f\ufe0f';
   else if(geo) ico.textContent='\ud83d\udccd';
   else ico.textContent='\ud83d\udccd';
+  // Show download/share FAB as soon as geometry exists
+  _showFabIfGeometry();
+  _checkAreaWarningFromGeometry();
 }
 // Keep display synced with geometry changes
 const _geoTA=document.getElementById('geometry');
@@ -2451,9 +2593,11 @@ async function buildMBTilesList(){
   }catch(e){console.warn('MBTiles layer check failed:',e);}
   let html='';let lastGroup='';let anyShown=false;
   for(const ly of MBTILES_LAYERS){
-    // Skip analysis layers from availability check (always show if we have results), skip unavailable data layers
-    const isAnalysis=ly.group==='Analysis';
-    if(!isAnalysis && Object.keys(flat).length>0 && flat[ly.id]===false)continue;
+    // Skip unavailable data layers; analysis layers (raster) shown if we have results,
+    // but hansen respects availability since it's a data layer
+    const isRaster=ly.id==='raster';
+    if(!isRaster && Object.keys(flat).length>0 && flat[ly.id]===false)continue;
+    if(isRaster && !lastResult)continue; // raster needs analysis results
     if(ly.group!==lastGroup){html+=`<div style="font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;padding-bottom:2px;border-bottom:1px solid #eee">${ly.group}</div>`;lastGroup=ly.group;}
     html+=`<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px" id="mbt-row-${ly.id}"><span style="flex:1">${ly.name}</span><button class="btn btn-sm btn-outline" onclick="downloadMBTiles('${ly.id}','${ly.name}',this)">Download</button></div>`;
     anyShown=true;

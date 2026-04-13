@@ -98,7 +98,8 @@ polling or loads the auto-saved share.
 |--------|------|----------|
 | POST | `/api/v1/segment/overlay` | Coloured PNG of segmentation |
 | POST | `/api/v1/dtm/overlay`, `lidar/overlay`, `ortho/overlay`, `cir/overlay`, `hansen/overlay` | Tile overlays |
-| POST | `/api/v1/export/geopackage` | All layers in one GPKG |
+| POST | `/api/v1/export/geopackage` | Raster + vector layers in one GPKG |
+| POST | `/api/v1/export/kml` | Features as KML (grouped by type/height_class) |
 | POST | `/api/v1/export/mbtiles` | Single layer as MBTiles (async) |
 | POST | `/api/v1/lidar/geotiff`, `ortho/geotiff` | Raw GeoTIFF download |
 
@@ -133,11 +134,15 @@ Single HTML file (~2100 lines) with all CSS/JS inline. Key components:
 - **Area input**: Compact display bar showing source (drawn/file/share), click to expand raw textarea. File drop/pick via 📎 button inside the bar.
 - **Load dropdown**: `📂 Load` button fetches `/api/v1/shares` and shows recent shares + built-in Sample. Loads share via restoreShareResult().
 - **Analyse**: Submits async task, shows ⏹ Stop button during processing, polls progress
-- **Results**: Point markers on map, segment raster overlay, legend with type filtering, Download modal (Summary/JSON/GeoPackage/MBTiles tabs)
+- **Results**: Point markers on map, segment raster overlay, legend with type filtering, Download modal (Summary/JSON/GeoPackage/KML/MBTiles tabs)
+- **Download/Share**: Visible as soon as geometry exists (draw/file/share). Download modal has type filter per tab.
+- **GeoPackage tab**: Raster layers + vector segment polygons with height_class. Object type filter.
+- **KML tab**: Features grouped by type or height_class, type filter, requires analysis results.
+- **Area warning**: Soft hint when polygon > 100 ha.
 - **Share**: 🔗 Share button saves state + result, generates permalink, supports renaming share ID
 - **Clear**: Bin button (🗑) on draw toolbar clears everything with confirmation dialog
 - **Layer panel**: Checkboxes + opacity sliders. Availability auto-checked via `/api/v1/layers`.
-- **MBTiles tab**: Filters to only available layers using `/api/v1/layers` API.
+- **MBTiles tab**: Filters to only available layers using `/api/v1/layers` API. Hansen respects availability.
 
 ### Key JS Functions
 - `getPostArgs()` — reads geometry textarea, returns `{ct, body}` for fetch

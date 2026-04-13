@@ -49,6 +49,31 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
+
+def _height_class(h):
+    """Classify height (m) into a forestry-relevant height class string."""
+    if h is None or h < 0.5:
+        return 'ground'
+    if h < 2:
+        return 'low (<2m)'
+    if h < 5:
+        return 'shrub (2-5m)'
+    if h < 10:
+        return 'young (5-10m)'
+    if h < 15:
+        return 'pole (10-15m)'
+    if h < 20:
+        return 'mid (15-20m)'
+    if h < 25:
+        return 'mature (20-25m)'
+    if h < 30:
+        return 'tall (25-30m)'
+    if h < 35:
+        return 'very tall (30-35m)'
+    if h < 40:
+        return 'old growth (35-40m)'
+    return 'old growth (40m+)'
+
 # ---------------------------------------------------------------------------
 # Async job + progress tracking (file-backed so all gunicorn workers can read)
 # ---------------------------------------------------------------------------
@@ -495,7 +520,7 @@ def _get_params():
                 'include_hansen', 'color_mode', 'types',
                 'ortho_year', 'min_object_size',
                 'felz_scale', 'rag_threshold', 'groups',
-                'include_dtm', 'include_dsm', 'include_segments',
+                'include_dtm', 'include_dsm', 'include_segments', 'include_segments_vector',
                 'ortho_years', 'raster_layers',
                 'top_n_classes', 'top_n_objects', 'min_height_m',
                 'layer', 'min_zoom', 'max_zoom',
@@ -1660,7 +1685,8 @@ def export_geopackage():
     Query params:
       include_dtm=true       Include DTM/DSM/nDSM bands
       include_dsm=true       (same as above, kept for compat)
-      include_segments=true   Include segment_type + segment_height bands
+      include_segments=true   Include segment_type + segment_height raster bands
+      include_segments_vector=true  Include vector polygon layer with segment outlines
       ortho_years=2024,2023   Ortho RGB(I) for listed years
       raster_layers=dtm-2024,dsm-2023,hansen,raster  RGBA overlay renders
       types=tree,road,...     Segment type filter
@@ -1755,6 +1781,144 @@ def download_gpkg(task_id):
         return _error(f"Download error: {e}", 500)
 
 
+# ---------------------------------------------------------------------------
+# 3c. KML EXPORT
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/export/kml', methods=['POST'])
+def export_kml():
+    """Export segment features as KML with type/height_class folders.
+
+    Query params:
+      types=tree,grass,...    Filter object types (default: all)
+      group_by=type|height_class  Folder grouping (default: type)
+    """
+    try:
+        features = _get_geometry()
+        params = _get_params()
+        result_json = params.get('result_json', '')
+
+        type_filter_str = params.get('types', None)
+        type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
+        group_by = params.get('group_by', 'type')
+
+        # Get features from posted result or from cache
+        if result_json:
+            try:
+                result_data = json.loads(result_json)
+                obj_features = result_data.get('features', [])
+            except Exception:
+                obj_features = []
+        else:
+            obj_features = []
+
+        if not obj_features:
+            return _error('No features to export. Include result_json in the request body.')
+
+        # Filter by type
+        if type_filter:
+            obj_features = [f for f in obj_features
+                           if f.get('properties', {}).get('type') in type_filter]
+
+        # Build KML
+        kml = _build_kml(obj_features, group_by)
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.kml', delete=False, mode='w', encoding='utf-8')
+        tmp.write(kml)
+        tmp.close()
+
+        return send_file(
+            tmp.name, mimetype='application/vnd.google-earth.kml+xml',
+            as_attachment=True, download_name='landscape_export.kml',
+        )
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error("kml export: %s", traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
+
+
+def _build_kml(features, group_by='type'):
+    """Build a KML string from GeoJSON point features, organised into folders."""
+    import xml.etree.ElementTree as ET
+
+    # KML type → color mapping (AABBGGRR format for KML)
+    TYPE_KML_COLORS = {
+        'tree': 'ff006400', 'shrub': 'ff228b22', 'grass': 'ff00fc7c',
+        'hedge': 'ff2e8b57', 'water': 'ffff901e', 'roof': 'ff143cdc',
+        'greenhouse': 'ffb469ff', 'solar_panel': 'ffe16941',
+        'fence': 'ff2d52a0', 'wall': 'ff13458b', 'mast': 'ff404040',
+        'road': 'ff808080', 'path': 'ffa9a9a9', 'parking': 'ff696969',
+        'bridge': 'ff907080', 'crop': 'ff20a5da', 'orchard': 'ff238e6b',
+        'vineyard': 'ffdb7093', 'garden': 'ff71b33c', 'bare_soil': 'ff87b5d2',
+        'rock': 'ff82868b', 'excavation': 'ff00008b', 'fill': 'ff008cff',
+        'tree_loss': 'ffff00ff', 'construction': 'ff0045ff',
+    }
+
+    # Group features
+    groups = {}
+    for f in features:
+        p = f.get('properties', {})
+        h_max = p.get('height_max_m') or p.get('height_after_m') or 0
+        hc = _height_class(h_max)
+        key = p.get('type', 'unknown') if group_by == 'type' else hc
+        groups.setdefault(key, []).append((f, p, hc))
+
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<kml xmlns="http://www.opengis.net/kml/2.2">',
+             '<Document>',
+             '<name>Landscape Analysis Export</name>']
+
+    # Styles
+    for tname, color in TYPE_KML_COLORS.items():
+        lines.append(f'<Style id="style-{tname}"><IconStyle><color>{color}</color>'
+                     '<scale>0.8</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
+                     '</IconStyle></Style>')
+
+    # Default style
+    lines.append('<Style id="style-default"><IconStyle><color>ff888888</color>'
+                 '<scale>0.6</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
+                 '</IconStyle></Style>')
+
+    for group_name in sorted(groups.keys()):
+        items = groups[group_name]
+        lines.append(f'<Folder><name>{_xml_escape(group_name)} ({len(items)})</name>')
+        for feat, props, hc in items:
+            geom = feat.get('geometry', {})
+            coords = geom.get('coordinates', [])
+            if not coords or len(coords) < 2:
+                continue
+            lon, lat = coords[0], coords[1]
+            alt = coords[2] if len(coords) > 2 else 0
+            tname = props.get('type', 'unknown')
+            style_id = f'style-{tname}' if tname in TYPE_KML_COLORS else 'style-default'
+            h_max = props.get('height_max_m', 0)
+            area = props.get('area_sqm', 0)
+            desc_parts = [f'Type: {tname}', f'Height class: {hc}',
+                         f'Height max: {h_max:.1f}m', f'Area: {area:.0f} m\u00b2']
+            if props.get('confidence'):
+                desc_parts.append(f'Confidence: {props["confidence"]:.0%}')
+            if props.get('group_type'):
+                desc_parts.append(f'Group: {props["group_type"]}')
+            desc = '<br/>'.join(desc_parts)
+            name_str = f'{tname} ({h_max:.1f}m, {area:.0f}m\u00b2)'
+            lines.append(f'<Placemark><name>{_xml_escape(name_str)}</name>'
+                         f'<description><![CDATA[{desc}]]></description>'
+                         f'<styleUrl>#{style_id}</styleUrl>'
+                         f'<Point><coordinates>{lon},{lat},{alt}</coordinates></Point>'
+                         '</Placemark>')
+        lines.append('</Folder>')
+
+    lines.append('</Document></kml>')
+    return '\n'.join(lines)
+
+
+def _xml_escape(s):
+    """Escape XML special characters."""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
 def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
     """Core GeoPackage building logic. Returns (tmp_path, table_count, elapsed_s)."""
     t0 = time.time()
@@ -1764,6 +1928,7 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
     _bool = lambda k, d='false': str(params.get(k, d)).lower() in ('true', '1', 'yes')
     include_dtm = _bool('include_dtm', 'true') or _bool('include_dsm', 'true')
     include_segments = _bool('include_segments', 'false')
+    include_segments_vector = _bool('include_segments_vector', 'false')
     include_ortho_legacy = _bool('include_ortho', 'false')
 
     ortho_years_str = params.get('ortho_years', '')
@@ -1905,6 +2070,90 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                 log.info("GeoPackage: skipping segment layers (no segment data available)")
         except Exception as e:
             log.warning("Segments for gpkg failed: %s", e)
+
+    # --- Vector segment polygons ---
+    if include_segments_vector:
+        try:
+            _progress_set(task_id, 'gpkg_vector', 'Vectorising segments…')
+            # Get labels + objects (reuse from raster segments if already loaded)
+            v_labels = None
+            v_objects = None
+            cache_key_check = f"{geom_3035.bounds}_{dataset}"
+            if include_segments and labels is not None:
+                v_labels, v_objects = labels, objects
+            else:
+                if _seg_cache.get('labels') is not None and _seg_cache.get('key') and cache_key_check in _seg_cache['key']:
+                    v_labels = _seg_cache['labels']
+                    v_objects = _seg_cache['objects']
+                else:
+                    _dc = _seg_cache_scan(cache_key_check)
+                    if _dc is not None:
+                        v_labels = _dc['labels']
+                        v_objects = _dc['objects']
+            if v_labels is not None and v_objects is not None:
+                from rasterio.features import shapes as rasterize_shapes
+                import fiona
+                from fiona.crs import from_epsg
+
+                obj_map = {o.obj_id: o for o in v_objects}
+                if type_filter:
+                    filtered_ids = {o.obj_id for o in v_objects if o.obj_type in type_filter}
+                else:
+                    filtered_ids = {o.obj_id for o in v_objects}
+
+                # Vectorise the labels raster
+                label_int = v_labels.astype(np.int32)
+                seg_mask = mask & np.isin(label_int, list(filtered_ids))
+
+                schema = {
+                    'geometry': 'Polygon',
+                    'properties': [
+                        ('id', 'int'),
+                        ('type', 'str'),
+                        ('group_type', 'str'),
+                        ('height_class', 'str'),
+                        ('height_max_m', 'float'),
+                        ('height_mean_m', 'float'),
+                        ('area_sqm', 'float'),
+                        ('confidence', 'float'),
+                        ('is_manmade', 'int'),
+                        ('ndvi_mean', 'float'),
+                    ],
+                }
+                vec_path = tmp_path  # append to same GPKG
+                with fiona.open(vec_path, 'w', driver='GPKG', layer='segments',
+                                schema=schema, crs=from_epsg(3035)) as dst:
+                    written = 0
+                    for geom_dict, val in rasterize_shapes(
+                        label_int, mask=seg_mask, transform=tf,
+                        connectivity=4,
+                    ):
+                        oid = int(val)
+                        obj = obj_map.get(oid)
+                        if obj is None:
+                            continue
+                        dst.write({
+                            'geometry': geom_dict,
+                            'properties': {
+                                'id': oid,
+                                'type': obj.obj_type,
+                                'group_type': obj.group_type or '',
+                                'height_class': _height_class(obj.height_max),
+                                'height_max_m': round(obj.height_max, 2),
+                                'height_mean_m': round(obj.height_mean, 2),
+                                'area_sqm': round(obj.area_sqm, 1),
+                                'confidence': round(obj.confidence, 2),
+                                'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                                'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
+                            },
+                        })
+                        written += 1
+                table_count += 1
+                log.info("GPKG vector layer 'segments': %d polygons", written)
+            else:
+                log.info('GeoPackage: skipping vector segments (no segment data available)')
+        except Exception as e:
+            log.warning('Vector segments for gpkg failed: %s', e)
 
     # --- Rendered RGBA raster overlays ---
     geom_wgs = _extract_single_geom(features)
@@ -2240,59 +2489,74 @@ def _render_overlay_for_mbtiles(layer, data, geom_3035, geom_wgs, dataset, param
     """Render a layer overlay and return (rgba_array, bounds_wgs).
     bounds_wgs = (south, west, north, east)
     """
-    from PIL import Image
+    from rasterio.warp import reproject, Resampling, calculate_default_transform
+    from rasterio.transform import array_bounds
 
-    dtm = data['dtm']
-    dsm = data['dsm']
-    ndsm = data['ndsm']
-    mask = data['mask']
     tf = data['transform']
     h, w_px = data['shape']
+    mask = data['mask']
+
+    def _reproject_rgba_to_wgs84(rgba_3035):
+        """Reproject an (H, W, 4) uint8 RGBA from EPSG:3035 → EPSG:4326.
+
+        Returns (rgba_wgs, bounds_wgs) where bounds_wgs = (south, west, north, east).
+        """
+        src_crs = 'EPSG:3035'
+        dst_crs = 'EPSG:4326'
+        bounds_3035 = array_bounds(h, w_px, tf)
+        dst_transform, dst_w, dst_h = calculate_default_transform(
+            src_crs, dst_crs, w_px, h, *bounds_3035)
+        rgba_wgs = np.zeros((dst_h, dst_w, 4), dtype=np.uint8)
+        for band in range(4):
+            reproject(
+                rgba_3035[:, :, band], rgba_wgs[:, :, band],
+                src_transform=tf, src_crs=src_crs,
+                dst_transform=dst_transform, dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+            )
+        # (left, bottom, right, top) → (south, west, north, east)
+        b = array_bounds(dst_h, dst_w, dst_transform)
+        bounds_wgs = (b[1], b[0], b[3], b[2])
+        return rgba_wgs, bounds_wgs
 
     try:
-        if layer.startswith('dtm-'):
-            rgba = _dtm_rgba(dtm, mask)
-            arrays_result = _reproject_rasters_to_wgs84([dtm], tf, (h, w_px), mask)
-            bounds = arrays_result['bounds']
-            # Reproject rgba to WGS84
-            rgba_3035 = rgba
-            from rasterio.warp import reproject, Resampling, calculate_default_transform
-            import rasterio
-            dst_crs = 'EPSG:4326'
-            bounds_3035 = rasterio.transform.array_bounds(h, w_px, tf)
-            dst_transform, dst_w, dst_h = calculate_default_transform(
-                'EPSG:3035', dst_crs, w_px, h, *bounds_3035)
-            rgba_wgs = np.zeros((dst_h, dst_w, 4), dtype=np.uint8)
-            for band in range(4):
-                reproject(
-                    rgba_3035[:,:,band], rgba_wgs[:,:,band],
-                    src_transform=tf, src_crs='EPSG:3035',
-                    dst_transform=dst_transform, dst_crs=dst_crs,
-                    resampling=Resampling.bilinear
-                )
-            return rgba_wgs, bounds
+        # Extract params needed by _render_overlay_for_gpkg
+        type_filter_str = params.get('types', None)
+        type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
+        color_mode = params.get('color_mode', 'type')
 
-        elif layer.startswith('ortho-') or layer.startswith('cir-'):
-            # Use existing ortho overlay logic
-            is_cir = layer.startswith('cir-')
-            year = int(layer.split('-')[1])
-            rgb, spectral = (None, None)
-            if not is_cir:
-                rgb, spectral = _try_read_ortho(data)
+        # Delegate to _render_overlay_for_gpkg which handles all layer types
+        # in EPSG:3035, then reproject the result to WGS84.
+        rgba_3035 = _render_overlay_for_gpkg(
+            layer, data, geom_3035, geom_wgs, dataset,
+            type_filter, color_mode, params,
+        )
 
-            # Simplified: use the overlay endpoint logic
-            # For now, return DTM as fallback
-            rgba = _dtm_rgba(dtm, mask)
-            arrays_result = _reproject_rasters_to_wgs84([dtm], tf, (h, w_px), mask)
-            bounds = arrays_result['bounds']
-            return rgba, bounds
+        if rgba_3035 is None:
+            # _render_overlay_for_gpkg doesn't handle ortho-* layers;
+            # render them here directly.
+            if layer.startswith('ortho-'):
+                year_str = layer.split('-', 1)[1]
+                year = int(year_str) if year_str.isdigit() else None
+                import ortho_io
+                rgb_arr, nir = ortho_io.read_ortho_for_als(data, year=year)
+                if rgb_arr is None:
+                    log.error("MBTiles render %s: no ortho data", layer)
+                    return None, None
+                rgba_3035 = np.zeros((h, w_px, 4), dtype=np.uint8)
+                rgba_3035[:, :, 0] = rgb_arr[0, :h, :w_px]
+                rgba_3035[:, :, 1] = rgb_arr[1, :h, :w_px]
+                rgba_3035[:, :, 2] = rgb_arr[2, :h, :w_px]
+                rgba_3035[:, :, 3] = np.where(mask[:h, :w_px], 255, 0)
+            else:
+                # Unknown layer – fall back to DTM hillshade
+                log.warning("MBTiles render %s: unknown layer, falling back to DTM", layer)
+                rgba_3035 = _dtm_rgba(data['dtm'], mask)
 
-        else:
-            # Generic: render DTM
-            rgba = _dtm_rgba(dtm, mask)
-            arrays_result = _reproject_rasters_to_wgs84([dtm], tf, (h, w_px), mask)
-            bounds = arrays_result['bounds']
-            return rgba, bounds
+        if rgba_3035 is None:
+            return None, None
+
+        return _reproject_rgba_to_wgs84(rgba_3035)
 
     except Exception as e:
         log.error("MBTiles render %s failed: %s", layer, e)

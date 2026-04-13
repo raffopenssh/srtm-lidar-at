@@ -47,6 +47,20 @@ GDAL_ENV = {
     "GDAL_CACHEMAX": "512",
 }
 
+# ---------------------------------------------------------------------------
+# Webshare proxy rotation for BEV reads (avoids throttling)
+# ---------------------------------------------------------------------------
+import bev_proxy
+
+def _apply_proxy_env():
+    """Set GDAL_HTTP_PROXY env vars to next rotating proxy."""
+    proxy_url = bev_proxy.next_proxy()
+    if proxy_url:
+        os.environ["GDAL_HTTP_PROXY"] = proxy_url
+    else:
+        os.environ.pop("GDAL_HTTP_PROXY", None)
+    os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)  # creds embedded in URL
+
 
 def _apply_gdal_env() -> None:
     for k, v in GDAL_ENV.items():
@@ -303,6 +317,7 @@ def _read_ortho_single_tile(
         "Reading DOP tile N%dE%d window [%.0f,%.0f]-[%.0f,%.0f] @ %.2fm",
         tile[0], tile[1], min_e, min_n, max_e, max_n, resolution,
     )
+    _apply_proxy_env()
 
     with rasterio.open(url) as ds:
         native_res = abs(ds.transform.a)
@@ -623,6 +638,7 @@ def _read_generic_window(
 ) -> tuple[np.ndarray, rasterio.transform.Affine, rasterio.crs.CRS]:
     """Read an arbitrary /vsicurl/ GeoTIFF window, resampled to *resolution*."""
     log.debug("Opening %s", url)
+    _apply_proxy_env()
 
     with rasterio.open(url) as ds:
         native_res = abs(ds.transform.a)
@@ -826,6 +842,7 @@ def _try_read_rgbi_for_bbox(
             nir_url = get_rgbi_url(opid, "NIR", series)
 
             # Read a window from the source in its native CRS
+            _apply_proxy_env()
             with rasterio.open(rgb_url) as ds:
                 win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
                 win = win.intersection(Window(0, 0, ds.width, ds.height))
@@ -850,6 +867,7 @@ def _try_read_rgbi_for_bbox(
             # Read and reproject NIR
             nir = None
             try:
+                _apply_proxy_env()
                 with rasterio.open(nir_url) as ds:
                     win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
                     win = win.intersection(Window(0, 0, ds.width, ds.height))

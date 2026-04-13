@@ -74,8 +74,15 @@ def _read_single_tile(
     min_e: float, min_n: float, max_e: float, max_n: float,
     dataset: str,
 ) -> tuple[np.ndarray, rasterio.transform.Affine, rasterio.crs.CRS]:
+    import bev_proxy as _bp
     url = ti.get_tile_url(layer, tile[0], tile[1], dataset)
     log.info(f"Reading {layer} tile N{tile[0]}E{tile[1]} window [{min_e:.0f},{min_n:.0f}]-[{max_e:.0f},{max_n:.0f}]")
+    _p = _bp.next_proxy()
+    if _p:
+        os.environ["GDAL_HTTP_PROXY"] = _p
+    else:
+        os.environ.pop("GDAL_HTTP_PROXY", None)
+    os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
 
     with rasterio.open(url) as ds:
         window = from_bounds(min_e, min_n, max_e, max_n, ds.transform)

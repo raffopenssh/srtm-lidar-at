@@ -498,7 +498,8 @@ def _get_params():
                 'include_dtm', 'include_dsm', 'include_segments',
                 'ortho_years', 'raster_layers',
                 'top_n_classes', 'top_n_objects', 'min_height_m',
-                'layer', 'min_zoom', 'max_zoom'):
+                'layer', 'min_zoom', 'max_zoom',
+                'share_id'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -1343,20 +1344,28 @@ def _diverging_rgb(t):
         return (int(255 - f * 37), int(255 - f * 192), int(255 - f * 192))
 
 
-def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', ndsm=None):
+def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', ndsm=None, type_overrides=None):
     """Render segmentation labels as RGBA image.
 
     color_mode: 'type' = categorical colors, 'height' = viridis by height
+    type_overrides: optional dict {obj_id: type_name} to override object types
+                    (used when rendering a share's stored result over cached labels)
     """
     h, w = labels.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     obj_map = {o.obj_id: o for o in objects}
 
+    def _effective_type(obj_id, obj):
+        if type_overrides and obj_id in type_overrides:
+            return type_overrides[obj_id]
+        return obj.obj_type
+
     if color_mode == 'height' and ndsm is not None:
         # Per-pixel viridis coloring from actual nDSM values
         included = np.zeros((h, w), dtype=bool)
         for obj_id, obj in obj_map.items():
-            if type_filter and obj.obj_type not in type_filter:
+            etype = _effective_type(obj_id, obj)
+            if type_filter and etype not in type_filter:
                 continue
             included |= (labels == obj_id)
         # Build viridis LUT (256 entries)
@@ -1369,10 +1378,11 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', nd
         rgba[:, :, 3] = np.where(included & mask, np.where(ndsm > 0.3, 180, 60).astype(np.uint8), 0)
     else:
         for obj_id, obj in obj_map.items():
-            if type_filter and obj.obj_type not in type_filter:
+            etype = _effective_type(obj_id, obj)
+            if type_filter and etype not in type_filter:
                 continue
             seg_mask = labels == obj_id
-            color = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+            color = SEGMENT_COLORS.get(etype, (128, 128, 128, 120))
             for c in range(4):
                 rgba[:, :, c][seg_mask] = color[c]
 
@@ -1381,13 +1391,13 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', nd
     return rgba
 
 
-def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None, color_mode='type', ndsm=None):
+def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=None, color_mode='type', ndsm=None, type_overrides=None):
     """Render segmentation as RGBA, reproject to WGS84, return overlay response."""
     from rasterio.warp import calculate_default_transform, reproject as rp, Resampling
     from rasterio.crs import CRS
     from rasterio.transform import array_bounds
 
-    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter, color_mode=color_mode, ndsm=ndsm)
+    rgba_3035 = _segment_rgba(labels, objects, mask, type_filter, color_mode=color_mode, ndsm=ndsm, type_overrides=type_overrides)
 
     src_crs = CRS.from_epsg(3035)
     dst_crs = CRS.from_epsg(4326)
@@ -1412,12 +1422,45 @@ def _render_seg_overlay(labels, objects, mask, transform, shape_hw, type_filter=
     return _send_rgba_overlay(rgba_out, bounds_wgs)
 
 
+def _load_share_type_overrides(share_id: str) -> dict | None:
+    """Load a share's features and return {obj_id: type_name} mapping.
+
+    This lets the overlay endpoint render with the share's stored classification
+    instead of whatever the current model or cache contains.
+    """
+    try:
+        resolved_id, path = _resolve_share(share_id)
+        if not path or not path.exists():
+            log.warning("share type overrides: share %s not found", share_id)
+            return None
+        raw = gzip.decompress(path.read_bytes())
+        share_data = json.loads(raw)
+        result = share_data.get('result', {})
+        features = result.get('features', [])
+        if not features:
+            return None
+        overrides = {}
+        for f in features:
+            props = f.get('properties', {})
+            obj_id = props.get('id')
+            obj_type = props.get('type')
+            if obj_id is not None and obj_type:
+                overrides[int(obj_id)] = obj_type
+        return overrides if overrides else None
+    except Exception as e:
+        log.warning("share type overrides: failed for %s: %s", share_id, e)
+        return None
+
+
 @app.route('/api/v1/segment/overlay', methods=['POST'])
 def segment_overlay():
     """Return segment classification as a coloured PNG overlay (reprojected to WGS84).
 
     First call runs full segmentation and caches the result.
     Subsequent calls with only ?types= changed use the cache for instant re-renders.
+
+    When share_id is provided, the overlay uses the share's stored type assignments
+    instead of the current model's classification, so historical shares render correctly.
     """
     try:
         t0 = time.time()
@@ -1434,6 +1477,15 @@ def segment_overlay():
             type_filter = set(t.strip() for t in type_filter_str.split(','))
         color_mode = params.get('color_mode', 'type')  # 'type' or 'height'
         top_n_classes = params.get('top_n_classes')
+        share_id = params.get('share_id')
+
+        # Build type overrides from share's stored result features
+        type_overrides = None
+        if share_id:
+            type_overrides = _load_share_type_overrides(share_id)
+            if type_overrides:
+                log.info("segment overlay: using type overrides from share %s (%d mappings)",
+                         share_id, len(type_overrides))
 
         feat = features[0]
         geom = feat['geometry']
@@ -1444,6 +1496,31 @@ def segment_overlay():
 
         # Build a cache key from geometry bounds + dataset + analysis options
         cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
+
+        # When share_id is provided, try to find ANY cached labels for this geometry
+        # (regardless of analysis options) — we only need the pixel labels, not the types
+        if type_overrides:
+            bounds_prefix = str(geom_3035.bounds)
+            cached = None
+            # Check in-process cache first (any key with same bounds)
+            if _seg_cache["labels"] is not None and _seg_cache.get("key", "").startswith(bounds_prefix):
+                cached = _seg_cache
+            if cached is None:
+                # Try exact key on disk
+                cached = _seg_cache_load(cache_key)
+            if cached is None:
+                # Scan disk caches for any entry with matching geometry bounds
+                cached = _seg_cache_scan(bounds_prefix)
+            if cached is not None:
+                log.info("segment overlay: rendering with share type overrides (share=%s)", share_id)
+                return _render_seg_overlay(
+                    cached["labels"], cached["objects"],
+                    cached["mask"], cached["transform"],
+                    cached["shape"], type_filter, color_mode,
+                    ndsm=cached.get("ndsm"), type_overrides=type_overrides,
+                )
+            # Fall through to full pipeline if no cached labels found
+            log.info("segment overlay: no cached labels for share %s, running full pipeline", share_id)
 
         if _seg_cache["key"] == cache_key:
             # Re-render from cache — instant
@@ -1458,7 +1535,7 @@ def segment_overlay():
                 _seg_cache["labels"], _seg_cache["objects"],
                 _seg_cache["mask"], _seg_cache["transform"],
                 _seg_cache["shape"], type_filter, color_mode,
-                ndsm=_seg_cache.get("ndsm"),
+                ndsm=_seg_cache.get("ndsm"), type_overrides=type_overrides,
             )
 
         # Check file-backed cache (shared across gunicorn workers)
@@ -1481,7 +1558,7 @@ def segment_overlay():
                 _disk["labels"], _disk["objects"],
                 _disk["mask"], _disk["transform"],
                 _disk["shape"], type_filter, color_mode,
-                ndsm=_disk.get("ndsm"),
+                ndsm=_disk.get("ndsm"), type_overrides=type_overrides,
             )
 
         # Full segmentation pipeline
@@ -1566,7 +1643,7 @@ def segment_overlay():
 
         return _render_seg_overlay(labels, objects, data['mask'],
                                    data['transform'], data['shape'], type_filter, color_mode,
-                                   ndsm=data['ndsm'])
+                                   ndsm=data['ndsm'], type_overrides=type_overrides)
     except Exception as e:
         log.error("segment overlay: %s", traceback.format_exc())
         return _error(str(e))

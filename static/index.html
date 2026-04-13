@@ -1024,7 +1024,7 @@ async function handleLayerToggle(id){
   showLoading(`Loading ${id}...`);
   try{
     let ovl;
-    if(id==='raster'){ovl=await loadRasterOverlay(getVisibleTypes());}
+    if(id==='raster'){ovl=await loadRasterOverlay(getVisibleTypes(), currentShareId||undefined);}
     else{
       const def=LAYER_DEFS[id];
       let url=def.url+'?dataset='+def.ds;
@@ -1108,7 +1108,7 @@ function getVisibleTypes(){
   return vis;
 }
 
-async function loadRasterOverlay(typeFilter){
+async function loadRasterOverlay(typeFilter, shareId){
   const args=getPostArgs();
   if(!args)return null;
   let url='/api/v1/segment/overlay?include_ortho=true&color_mode='+colorMode;
@@ -1118,6 +1118,7 @@ async function loadRasterOverlay(typeFilter){
   const topNC=document.getElementById('top_n_classes').value;
   if(topNC)url+='&top_n_classes='+topNC;
   if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
+  if(shareId)url+='&share_id='+encodeURIComponent(shareId);
   const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
   if(!resp.ok)throw new Error((await resp.json()).error);
   const bs=resp.headers.get('X-Bounds');
@@ -1154,7 +1155,7 @@ async function reloadRasterOverlay(){
   _rasterOrigImg=null;_rasterOrigBounds=null;
   showLoading('Re-rendering raster...');
   try{
-    const ovl=await loadRasterOverlay(filter);
+    const ovl=await loadRasterOverlay(filter, currentShareId||undefined);
     if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
   }catch(e){console.error('reloadRasterOverlay failed:',e);}
   hideLoading();
@@ -1338,7 +1339,20 @@ async function restoreShareResult(data){
         }catch(err){console.warn('cached overlay restore failed for',id,err);}
       }
       // Fall back to re-fetch from server
-      handleLayerToggle(id);
+      // For raster layer, pass share_id so the server uses the share's stored
+      // type assignments instead of the current model's classification
+      if(id==='raster' && currentShareId){
+        (async()=>{
+          showLoading('Loading raster...');
+          try{
+            const ovl=await loadRasterOverlay(getVisibleTypes(), currentShareId);
+            if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
+          }catch(e){console.error('share raster overlay failed:',e);}
+          hideLoading();
+        })();
+      } else {
+        handleLayerToggle(id);
+      }
     }
   }
 }
@@ -1560,8 +1574,8 @@ document.addEventListener('click',(e)=>{
     const data=await resp.json();
     // Use resolved ID from server (follows rename redirects)
     const resolvedId=resp.headers.get('X-Share-Id')||shareId;
+    currentShareId=resolvedId;  // Set before restore so overlay can use share_id
     await restoreShareResult(data);
-    currentShareId=resolvedId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
     // Update URL bar if the share was redirected to a new name
@@ -1605,8 +1619,8 @@ document.addEventListener('click',(e)=>{
         const resp = await fetch('/api/v1/share/'+encodeURIComponent(pj.auto_share_id));
         if(resp.ok){
           const data = await resp.json();
+          currentShareId = pj.auto_share_id;  // Set before restore so overlay can use share_id
           await restoreShareResult(data);
-          currentShareId = pj.auto_share_id;
           currentShareName = data.name || null;
           shareStateHash = computeShareHash(data.state, data.result);
           history.replaceState(null,'',`?share=${encodeURIComponent(pj.auto_share_id)}`);
@@ -1839,8 +1853,8 @@ async function _loadShareById(id, name){
     if(!resp.ok) throw new Error('Share not found');
     const data=await resp.json();
     const resolvedId=resp.headers.get('X-Share-Id')||id;
+    currentShareId=resolvedId;  // Set before restore so overlay can use share_id
     await restoreShareResult(data);
-    currentShareId=resolvedId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
     const displayName=currentShareName||resolvedId;

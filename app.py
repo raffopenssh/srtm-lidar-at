@@ -3150,6 +3150,7 @@ def info():
             "GET /api/v1/docs/llm.txt": "Machine-readable API reference",
         },
         "max_area_sqkm": MAX_AREA_SQM / 1e6,
+        "proxy_pool": __import__('bev_proxy').status(),
     })
 
 

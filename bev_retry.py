@@ -2,7 +2,8 @@
 
 Wraps rasterio.open() calls with exponential backoff + proxy rotation
 so transient HTTP errors (connection reset, 503, timeouts) don't kill
-an entire analysis pipeline.
+an entire analysis pipeline.  Failed proxies go on cooldown so they
+have time to heal before being reused.
 
 Usage:
     from bev_retry import open_with_retry
@@ -58,14 +59,19 @@ def _is_retryable(exc: Exception) -> bool:
     return any(p.lower() in msg.lower() for p in _RETRYABLE_PATTERNS)
 
 
-def _apply_proxy():
-    """Rotate to next proxy (or direct) for the upcoming GDAL open."""
+def _apply_proxy() -> str | None:
+    """Rotate to next healthy proxy for the upcoming GDAL open.
+
+    Returns the proxy URL (or None for direct) so the caller can
+    report success/failure back to bev_proxy.
+    """
     proxy_url = bev_proxy.next_proxy()
     if proxy_url:
         os.environ["GDAL_HTTP_PROXY"] = proxy_url
     else:
         os.environ.pop("GDAL_HTTP_PROXY", None)
     os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
+    return proxy_url
 
 
 @contextmanager
@@ -76,11 +82,13 @@ def open_with_retry(
     base_delay: float = BASE_DELAY,
     caller: str = "",
 ):
-    """Context manager: rasterio.open() with retry + proxy rotation.
+    """Context manager: rasterio.open() with retry + proxy rotation + healing.
 
     On each retry the proxy is rotated (via bev_proxy.next_proxy()) and
-    an exponential backoff delay is applied.  Non-retryable errors
-    (e.g. "file not found", ValueError) are raised immediately.
+    an exponential backoff delay is applied.  Failed proxies are put on
+    cooldown so they can heal.  Successful reads clear the cooldown.
+    Non-retryable errors (e.g. "file not found", ValueError) are raised
+    immediately.
 
     Parameters
     ----------
@@ -97,19 +105,23 @@ def open_with_retry(
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
-        _apply_proxy()
+        used_proxy = _apply_proxy()
         try:
             ds = rasterio.open(url)
             try:
                 yield ds
             finally:
                 ds.close()
-            return  # success
+            # Success — clear any cooldown on this proxy
+            bev_proxy.report_success(used_proxy)
+            return
         except Exception as exc:
             last_exc = exc
             if not _is_retryable(exc):
                 # Not transient — don't waste time retrying
                 raise
+            # Transient failure — put this proxy on cooldown
+            bev_proxy.report_failure(used_proxy)
             if attempt < max_retries:
                 delay = min(base_delay * (2 ** attempt), MAX_DELAY)
                 log.warning(

@@ -1842,17 +1842,10 @@ def _build_kml(features, group_by='type'):
     """Build a KML string from GeoJSON point features, organised into folders."""
     import xml.etree.ElementTree as ET
 
-    # KML type → color mapping (AABBGGRR format for KML)
+    # Derive KML colours (AABBGGRR) from the canonical SEGMENT_COLORS
     TYPE_KML_COLORS = {
-        'tree': 'ff006400', 'shrub': 'ff228b22', 'grass': 'ff00fc7c',
-        'hedge': 'ff2e8b57', 'water': 'ffff901e', 'roof': 'ff143cdc',
-        'greenhouse': 'ffb469ff', 'solar_panel': 'ffe16941',
-        'fence': 'ff2d52a0', 'wall': 'ff13458b', 'mast': 'ff404040',
-        'road': 'ff808080', 'path': 'ffa9a9a9', 'parking': 'ff696969',
-        'bridge': 'ff907080', 'crop': 'ff20a5da', 'orchard': 'ff238e6b',
-        'vineyard': 'ffdb7093', 'garden': 'ff71b33c', 'bare_soil': 'ff87b5d2',
-        'rock': 'ff82868b', 'excavation': 'ff00008b', 'fill': 'ff008cff',
-        'tree_loss': 'ffff00ff', 'construction': 'ff0045ff',
+        t: 'ff{:02x}{:02x}{:02x}'.format(rgba[2], rgba[1], rgba[0])
+        for t, rgba in SEGMENT_COLORS.items()
     }
 
     # Group features
@@ -1869,16 +1862,30 @@ def _build_kml(features, group_by='type'):
              '<Document>',
              '<name>Landscape Analysis Export</name>']
 
-    # Styles
+    # Styles — include IconStyle (points), PolyStyle (fill), LineStyle (outline)
     for tname, color in TYPE_KML_COLORS.items():
-        lines.append(f'<Style id="style-{tname}"><IconStyle><color>{color}</color>'
-                     '<scale>0.8</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
-                     '</IconStyle></Style>')
+        # Semi-transparent fill: replace 'ff' alpha with '80' (~50% opacity)
+        fill_color = '80' + color[2:]
+        lines.append(
+            f'<Style id="style-{tname}">'
+            f'<IconStyle><color>{color}</color><scale>0.8</scale>'
+            '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
+            '</IconStyle>'
+            f'<LineStyle><color>{color}</color><width>1.5</width></LineStyle>'
+            f'<PolyStyle><color>{fill_color}</color></PolyStyle>'
+            '</Style>'
+        )
 
     # Default style
-    lines.append('<Style id="style-default"><IconStyle><color>ff888888</color>'
-                 '<scale>0.6</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
-                 '</IconStyle></Style>')
+    lines.append(
+        '<Style id="style-default">'
+        '<IconStyle><color>ff888888</color><scale>0.6</scale>'
+        '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
+        '</IconStyle>'
+        '<LineStyle><color>ff888888</color><width>1</width></LineStyle>'
+        '<PolyStyle><color>80888888</color></PolyStyle>'
+        '</Style>'
+    )
 
     for group_name in sorted(groups.keys()):
         items = groups[group_name]
@@ -1894,7 +1901,10 @@ def _build_kml(features, group_by='type'):
             style_id = f'style-{tname}' if tname in TYPE_KML_COLORS else 'style-default'
             h_max = props.get('height_max_m', 0)
             area = props.get('area_sqm', 0)
-            desc_parts = [f'Type: {tname}', f'Height class: {hc}',
+            rgba = SEGMENT_COLORS.get(tname, (128, 128, 128, 120))
+            hex_color = '#{:02X}{:02X}{:02X}'.format(rgba[0], rgba[1], rgba[2])
+            desc_parts = [f'Type: {tname}', f'Color: {hex_color}',
+                         f'Height class: {hc}',
                          f'Height max: {h_max:.1f}m', f'Area: {area:.0f} m\u00b2']
             if props.get('confidence'):
                 desc_parts.append(f'Confidence: {props["confidence"]:.0%}')
@@ -1905,6 +1915,10 @@ def _build_kml(features, group_by='type'):
             lines.append(f'<Placemark><name>{_xml_escape(name_str)}</name>'
                          f'<description><![CDATA[{desc}]]></description>'
                          f'<styleUrl>#{style_id}</styleUrl>'
+                         f'<ExtendedData>'
+                         f'<Data name="color"><value>{hex_color}</value></Data>'
+                         f'<Data name="type"><value>{_xml_escape(tname)}</value></Data>'
+                         f'</ExtendedData>'
                          f'<Point><coordinates>{lon},{lat},{alt}</coordinates></Point>'
                          '</Placemark>')
         lines.append('</Folder>')
@@ -2118,6 +2132,8 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                         ('confidence', 'float'),
                         ('is_manmade', 'int'),
                         ('ndvi_mean', 'float'),
+                        ('color', 'str'),
+                        ('color_height', 'str'),
                     ],
                 }
                 vec_path = tmp_path  # append to same GPKG
@@ -2132,6 +2148,12 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                         obj = obj_map.get(oid)
                         if obj is None:
                             continue
+                        # Type-based color
+                        tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+                        hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+                        # Height-based viridis color (sqrt-scaled 0-45m)
+                        hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+                        hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
                         dst.write({
                             'geometry': geom_dict,
                             'properties': {
@@ -2145,11 +2167,18 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                                 'confidence': round(obj.confidence, 2),
                                 'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
                                 'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
+                                'color': hex_type,
+                                'color_height': hex_height,
                             },
                         })
                         written += 1
                 table_count += 1
                 log.info("GPKG vector layer 'segments': %d polygons", written)
+                # Write QGIS layer_styles table for auto-rendering
+                try:
+                    _write_gpkg_categorized_style(tmp_path, 'segments', color_mode)
+                except Exception as e:
+                    log.warning('GPKG style table failed: %s', e)
             else:
                 log.info('GeoPackage: skipping vector segments (no segment data available)')
         except Exception as e:
@@ -2173,6 +2202,69 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
 
     elapsed = round(time.time() - t0, 2)
     return tmp_path, table_count, elapsed
+
+
+def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str, color_mode: str = 'type'):
+    """Write a QGIS-compatible layer_styles table so the GPKG auto-renders.
+
+    Uses the ``color`` (type) or ``color_height`` field as a data-defined
+    fill colour, depending on *color_mode*.
+    """
+    import sqlite3
+    color_field = 'color_height' if color_mode == 'height' else 'color'
+
+    # Build a QML style XML that uses data-defined colour from the color field
+    qml = (
+        '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+        '<qgis version="3.34">'
+        '<renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0">'
+        '<symbols>'
+        '<symbol type="fill" name="0" clip_to_extent="1" alpha="0.7">'
+        '<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
+        '<Option type="Map">'
+        '<Option type="QString" value="solid" name="style"/>'
+        '<Option type="QString" value="0.35,0.35,0.35,255,rgb:0,0,0,1" name="outline_color"/>'
+        '<Option type="QString" value="0.2" name="outline_width"/>'
+        '</Option>'
+        f'<data_defined_properties><Property><Option type="Map">'
+        f'<Option type="Map" name="properties"><Option type="Map" name="fillColor">'
+        f'<Option type="bool" value="true" name="active"/>'
+        f'<Option type="QString" value="&quot;{color_field}&quot;" name="expression"/>'
+        f'<Option type="int" value="3" name="type"/>'
+        f'</Option></Option></Option></Property></data_defined_properties>'
+        '</layer></symbol></symbols></renderer-v2></qgis>'
+    )
+
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+        conn.execute(
+            'INSERT INTO layer_styles '
+            '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+            'VALUES (?, ?, ?, ?, 1, ?)',
+            (layer_name, 'geom', f'Segment {color_mode}', qml,
+             f'Auto-generated colour-by-{color_mode} style'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    log.info('GPKG style written for %s (color_mode=%s)', layer_name, color_mode)
 
 
 def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
@@ -3528,7 +3620,7 @@ def layers_availability():
 
         # RGBI operates per year (needed for CIR; ortho falls back to DOP)
         rgbi_by_year = {}
-        for year in (2024, 2023, 2020):
+        for year in (2024, 2023):
             try:
                 operates = ortho_io.find_rgbi_operates(
                     lat_min, lon_min, lat_max, lon_max, year=year,
@@ -3536,6 +3628,18 @@ def layers_availability():
                 rgbi_by_year[str(year)] = len(operates) > 0
             except Exception:
                 rgbi_by_year[str(year)] = False
+        # The "~2020" slot covers the 20221027 series (years 2018-2021)
+        try:
+            old_ops = ortho_io.find_rgbi_operates(
+                lat_min, lon_min, lat_max, lon_max,
+            )
+            # Filter to operates from the 20221027 series
+            rgbi_by_year["2020"] = any(
+                ortho_io.RGBI_OPERATES[o]["series"] == "20221027"
+                for o in old_ops
+            )
+        except Exception:
+            rgbi_by_year["2020"] = False
 
         # Ortho: RGBI operates preferred, but DOP (2022) is the fallback
         # So ortho is available if tiles exist (DOP covers all Austria)

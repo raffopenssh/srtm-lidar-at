@@ -161,11 +161,25 @@ RGBI_OPERATES: dict[str, dict] = {
 }
 
 
+#: Map publication year hint → series key(s).  The ~2020 slot should match
+#: any operate in the 20221027 series (covers flights 2018-2021).
+YEAR_TO_SERIES: dict[int, list[str]] = {
+    2024: ["20250415"],
+    2023: ["20240625"],
+    2020: ["20221027"],  # "~2020" UI slot covers 2018-2021 flights
+}
+
+
 def find_rgbi_operates(
     lat_min: float, lon_min: float, lat_max: float, lon_max: float,
     *, newest_first: bool = True, year: int | None = None,
 ) -> list[str]:
     """Return operate IDs whose WGS84 bbox overlaps the query bbox.
+
+    *year* acts as a *series* selector when it matches a key in
+    ``YEAR_TO_SERIES`` (e.g. year=2020 returns all operates from the
+    20221027 series — flights 2018-2021).  Otherwise it filters by the
+    4-digit year prefix of the operate ID.
 
     Ordered newest-first by default so callers can pick the freshest imagery.
     """
@@ -175,7 +189,11 @@ def find_rgbi_operates(
         if bb[0] <= lat_max and bb[2] >= lat_min and bb[1] <= lon_max and bb[3] >= lon_min:
             hits.append(opid)
     if year is not None:
-        hits = [o for o in hits if o.startswith(str(year))]
+        allowed_series = YEAR_TO_SERIES.get(year)
+        if allowed_series:
+            hits = [o for o in hits if RGBI_OPERATES[o]["series"] in allowed_series]
+        else:
+            hits = [o for o in hits if o.startswith(str(year))]
     if newest_first:
         hits.sort(key=lambda o: int(o[:4]), reverse=True)
     return hits

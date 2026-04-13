@@ -121,7 +121,7 @@ def open_with_retry(
                 # Not transient — don't waste time retrying
                 raise
             # Transient failure — put this proxy on cooldown
-            bev_proxy.report_failure(used_proxy)
+            bev_proxy.report_failure(used_proxy, error_msg=str(exc))
             if attempt < max_retries:
                 delay = min(base_delay * (2 ** attempt), MAX_DELAY)
                 log.warning(

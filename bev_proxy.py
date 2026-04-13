@@ -1,186 +1,511 @@
-"""Rotating HTTP proxy pool for BEV GeoTIFF reads with healing.
+"""Rotating HTTP proxy pool for BEV GeoTIFF reads with adaptive healing.
 
-Alternates between direct access and Webshare proxies to avoid
-BEV rate-limiting on sustained /vsicurl/ range requests.
+Fetches free proxy lists from GitHub aggregators, validates them against
+BEV, and maintains a pool of working proxies.  Proxies that fail get
+exponentially longer cooldowns (60s up to 3 days).  Successful proxies
+get their failure scores decayed.
 
-Healing: when a proxy (or direct) hits a transient error, it goes on
-cooldown for COOLDOWN_SECS.  next_proxy() skips cooled-down entries so
-they have time to recover before being used again.  If ALL entries are
-on cooldown, the least-recently-failed one is returned anyway (best
-effort).
+Pool is refreshed every REFRESH_INTERVAL (default 30 min) in a background
+thread.  Proxy history is persisted to disk so learned bad proxies stay
+cooled down across restarts.
 
 Usage:
     proxy_url = bev_proxy.next_proxy()   # returns URL or None (direct)
     bev_proxy.report_failure(proxy_url)  # put on cooldown
-    bev_proxy.report_success(proxy_url)  # clear cooldown early
+    bev_proxy.report_success(proxy_url)  # decay failure score
 """
+import concurrent.futures
+import json
 import logging
+import os
+import random
+import subprocess
 import time
 import threading
+import urllib.request
 
 log = logging.getLogger(__name__)
 
-# Webshare proxy credentials
-_PROXY_USER = "mcygpktm"
-_PROXY_PASS = "y8yamkwx20qg"
-
-# Proxy list: (ip, port).  None = direct (no proxy).
-_PROXY_LIST = [
-    None,                           # direct
-    ("31.58.9.4", 6077),            # DE
-    None,                           # direct
-    ("31.59.20.176", 6754),         # GB
-    None,                           # direct
-    ("198.23.239.134", 6540),       # US
-    None,                           # direct
-    ("45.38.107.97", 6014),         # GB
-    None,                           # direct
-    ("107.172.163.27", 6543),       # US
-    None,                           # direct
-    ("198.105.121.200", 6462),      # GB
-    None,                           # direct
-    ("216.10.27.159", 6837),        # US
-    None,                           # direct
-    ("142.111.67.146", 5611),       # JP
-    None,                           # direct
-    ("191.96.254.138", 6185),       # US
-    None,                           # direct
-    ("23.26.71.145", 5628),         # US
+# ---------------------------------------------------------------------------
+# Free proxy list sources (GitHub-hosted, updated periodically)
+# ---------------------------------------------------------------------------
+_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
 ]
 
-# ---------------------------------------------------------------------------
-# Healing configuration
-# ---------------------------------------------------------------------------
-COOLDOWN_SECS = 60          # how long a failed proxy sits out
-MAX_CONSECUTIVE_FAILS = 3   # consecutive fails → longer cooldown
-LONG_COOLDOWN_SECS = 1800   # 30 min cooldown after repeated failures
+# URL used to validate that a proxy supports HTTPS CONNECT to BEV
+_BEV_TEST_URL = "https://data.bev.gv.at/download/ALS/DTM/20220915/ALS_DTM_CRS3035RES50000mN2800000E4750000.tif"
 
+# ---------------------------------------------------------------------------
+# Pool configuration
+# ---------------------------------------------------------------------------
+MIN_POOL_SIZE = 5               # minimum proxies to keep in active pool
+MAX_POOL_SIZE = 30              # cap active pool
+VALIDATION_WORKERS = 60         # parallel validation threads
+VALIDATION_TIMEOUT = 10         # seconds per proxy test
+REFRESH_INTERVAL = 1800         # re-fetch & validate every 30 min
+DIRECT_WEIGHT = 3               # how many "direct" slots in rotation
+
+# ---------------------------------------------------------------------------
+# Healing / cooldown configuration
+# ---------------------------------------------------------------------------
+BASE_COOLDOWN = 60              # initial cooldown (seconds)
+MAX_COOLDOWN = 3 * 86400        # cap at 3 days
+COOLDOWN_EXPONENT = 2.0         # cooldown = BASE * EXPONENT^(fail_score - 1)
+SUCCESS_DECAY = 0.5             # on success, fail_score *= this
+HISTORY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "proxy_history.json"
+)
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
 _lock = threading.Lock()
-_index = 0  # round-robin pointer
+_index = 0                      # round-robin pointer
 
-# Cooldown state: key → {"until": timestamp, "consecutive": int}
-# key is the proxy URL string or "__direct__" for None entries
-_cooldowns: dict[str, dict] = {}
+# Active pool: list of proxy strings ("ip:port") + None entries for direct
+_pool: list[str | None] = [None] * DIRECT_WEIGHT
+
+# Per-proxy state: key -> {"fail_score": float, "cooldown_until": float (monotonic),
+#                          "wall_cooldown_until": float (epoch), "last_fail": float (epoch)}
+_state: dict[str, dict] = {}
+_history_loaded = False
+_refresh_thread: threading.Thread | None = None
+_refresh_started = False
 
 
-def _proxy_key(entry) -> str:
-    """Stable key for a proxy list entry."""
+# ---------------------------------------------------------------------------
+# Proxy key helpers
+# ---------------------------------------------------------------------------
+def _proxy_key(entry: str | None) -> str:
     if entry is None:
         return "__direct__"
-    ip, port = entry
-    return f"{ip}:{port}"
-
-
-def _entry_to_url(entry) -> str | None:
-    """Convert a proxy list entry to a URL or None."""
-    if entry is None:
-        return None
-    ip, port = entry
-    return f"http://{_PROXY_USER}:{_PROXY_PASS}@{ip}:{port}"
+    return entry
 
 
 def _url_to_key(proxy_url: str | None) -> str:
-    """Convert a proxy URL (or None) back to a cooldown key."""
     if proxy_url is None:
         return "__direct__"
-    # Extract ip:port from http://user:pass@ip:port
-    at = proxy_url.rfind("@")
-    if at >= 0:
-        return proxy_url[at + 1:]
-    return proxy_url
+    # Extract ip:port from http://ip:port
+    url = proxy_url
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    url = url.rstrip("/")
+    return url
 
 
+# ---------------------------------------------------------------------------
+# Cooldown math
+# ---------------------------------------------------------------------------
+def _compute_cooldown(fail_score: float) -> float:
+    if fail_score <= 0:
+        return 0
+    duration = BASE_COOLDOWN * (COOLDOWN_EXPONENT ** (fail_score - 1))
+    return min(duration, MAX_COOLDOWN)
+
+
+def _fmt_duration(secs: float) -> str:
+    if secs < 120:
+        return f"{secs:.0f}s"
+    if secs < 7200:
+        return f"{secs / 60:.0f}m"
+    if secs < 172800:
+        return f"{secs / 3600:.1f}h"
+    return f"{secs / 86400:.1f}d"
+
+
+# ---------------------------------------------------------------------------
+# Persistent history
+# ---------------------------------------------------------------------------
+def _ensure_dir():
+    d = os.path.dirname(HISTORY_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _load_history():
+    global _history_loaded
+    if _history_loaded:
+        return
+    _history_loaded = True
+    try:
+        with open(HISTORY_FILE) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+
+    now_mono = time.monotonic()
+    now_wall = time.time()
+
+    for key, info in saved.items():
+        fail_score = info.get("fail_score", 0)
+        wall_until = info.get("wall_cooldown_until", 0)
+        remaining = wall_until - now_wall
+        if remaining > 0:
+            _state[key] = {
+                "fail_score": fail_score,
+                "cooldown_until": now_mono + remaining,
+                "wall_cooldown_until": wall_until,
+                "last_fail": info.get("last_fail", 0),
+            }
+            log.info(
+                "Proxy %s: restored — fail_score=%.1f, cooldown remaining=%s",
+                key, fail_score, _fmt_duration(remaining),
+            )
+        elif fail_score > 0:
+            hours_since = max(0, now_wall - info.get("last_fail", now_wall)) / 3600
+            decayed = fail_score * (0.9 ** hours_since)
+            if decayed > 0.5:
+                _state[key] = {
+                    "fail_score": decayed,
+                    "cooldown_until": 0,
+                    "wall_cooldown_until": 0,
+                    "last_fail": info.get("last_fail", 0),
+                }
+
+
+def _save_history():
+    try:
+        _ensure_dir()
+        to_save = {}
+        for key, info in _state.items():
+            if key == "__direct__":
+                continue
+            if info.get("fail_score", 0) > 0.5:
+                to_save[key] = {
+                    "fail_score": round(info["fail_score"], 2),
+                    "wall_cooldown_until": round(info.get("wall_cooldown_until", 0), 1),
+                    "last_fail": round(info.get("last_fail", 0), 1),
+                }
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(to_save, f, indent=2)
+        os.replace(tmp, HISTORY_FILE)
+    except OSError as e:
+        log.debug("Failed to save proxy history: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Proxy fetching & validation
+# ---------------------------------------------------------------------------
+def _fetch_candidates() -> set[str]:
+    """Fetch proxy candidates from all free-proxy-list sources."""
+    candidates: set[str] = set()
+    for url in _PROXY_SOURCES:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="ignore")
+            for line in data.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("http://"):
+                    line = line[7:]
+                elif line.startswith("https://"):
+                    line = line[8:]
+                # Must be ip:port
+                if ":" in line and "/" not in line and " " not in line:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        try:
+                            int(parts[1])
+                            candidates.add(line)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            log.debug("Failed to fetch %s: %s", url, e)
+    log.info("Fetched %d unique proxy candidates from %d sources",
+             len(candidates), len(_PROXY_SOURCES))
+    return candidates
+
+
+def _validate_proxy(proxy: str) -> tuple[str, bool, float]:
+    """Test if a proxy supports HTTPS CONNECT to BEV. Returns (proxy, ok, latency)."""
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--proxy", f"http://{proxy}",
+             "--range", "0-1023",
+             "--connect-timeout", "5",
+             "--max-time", str(VALIDATION_TIMEOUT),
+             _BEV_TEST_URL],
+            capture_output=True, text=True,
+            timeout=VALIDATION_TIMEOUT + 5,
+        )
+        elapsed = time.time() - t0
+        code = r.stdout.strip()
+        return proxy, code in ("200", "206"), elapsed
+    except Exception:
+        return proxy, False, time.time() - t0
+
+
+def _refresh_pool():
+    """Fetch, validate, and update the active proxy pool."""
+    global _pool
+
+    candidates = _fetch_candidates()
+    if not candidates:
+        log.warning("No proxy candidates fetched — keeping current pool")
+        return
+
+    # Skip proxies that are on long cooldown (known bad)
+    now_wall = time.time()
+    with _lock:
+        _load_history()
+        skip = set()
+        for key, st in _state.items():
+            if key == "__direct__":
+                continue
+            # Skip if cooldown remaining > 10 min
+            remaining = st.get("wall_cooldown_until", 0) - now_wall
+            if remaining > 600:
+                skip.add(key)
+
+    to_test = [p for p in candidates if p not in skip]
+    # Shuffle and cap to avoid testing thousands
+    random.shuffle(to_test)
+    to_test = to_test[:2000]
+
+    log.info("Validating %d proxy candidates (%d skipped on cooldown)...",
+             len(to_test), len(skip))
+
+    # Phase 1: quick HTTPS CONNECT check against httpbin (faster than BEV)
+    def quick_test(proxy: str) -> tuple[str, bool]:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "--proxy", f"http://{proxy}",
+                 "--connect-timeout", "3",
+                 "--max-time", "5",
+                 "https://httpbin.org/ip"],
+                capture_output=True, text=True, timeout=8,
+            )
+            return proxy, r.stdout.strip() == "200"
+        except Exception:
+            return proxy, False
+
+    https_capable = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=VALIDATION_WORKERS) as ex:
+        for proxy, ok in ex.map(quick_test, to_test):
+            if ok:
+                https_capable.append(proxy)
+
+    log.info("Phase 1: %d/%d support HTTPS CONNECT", len(https_capable), len(to_test))
+
+    if not https_capable:
+        log.warning("No HTTPS-capable proxies found — keeping current pool")
+        return
+
+    # Phase 2: validate against BEV specifically
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(30, len(https_capable))) as ex:
+        bev_results = list(ex.map(_validate_proxy, https_capable))
+
+    # Sort by latency, take the best
+    working = [(p, lat) for p, ok, lat in bev_results if ok]
+    working.sort(key=lambda x: x[1])
+
+    log.info("Phase 2: %d/%d work with BEV", len(working), len(https_capable))
+
+    if not working:
+        log.warning("No proxies passed BEV validation — keeping current pool")
+        return
+
+    # Build new pool: direct slots + best proxies
+    new_proxies = [p for p, _ in working[:MAX_POOL_SIZE]]
+    new_pool: list[str | None] = []
+    # Interleave direct and proxy: direct, proxy, proxy, direct, proxy, proxy, ...
+    pi = 0
+    for i in range(len(new_proxies) + DIRECT_WEIGHT):
+        if i % (1 + len(new_proxies) // max(1, DIRECT_WEIGHT)) == 0 and new_pool.count(None) < DIRECT_WEIGHT:
+            new_pool.append(None)
+        elif pi < len(new_proxies):
+            new_pool.append(new_proxies[pi])
+            pi += 1
+    # Add any remaining proxies
+    while pi < len(new_proxies):
+        new_pool.append(new_proxies[pi])
+        pi += 1
+    # Ensure at least one direct
+    if None not in new_pool:
+        new_pool.insert(0, None)
+
+    with _lock:
+        _pool = new_pool
+
+    proxy_count = sum(1 for p in new_pool if p is not None)
+    direct_count = sum(1 for p in new_pool if p is None)
+    log.info(
+        "Pool refreshed: %d proxies + %d direct slots (best latency: %.1fs)",
+        proxy_count, direct_count, working[0][1] if working else 0,
+    )
+    if working:
+        for p, lat in working[:5]:
+            log.info("  %s (%.1fs)", p, lat)
+
+
+def _refresh_loop():
+    """Background thread: refresh pool periodically."""
+    while True:
+        try:
+            _refresh_pool()
+        except Exception as e:
+            log.error("Proxy pool refresh failed: %s", e)
+        time.sleep(REFRESH_INTERVAL)
+
+
+def _ensure_refresh_started():
+    """Start the background refresh thread if not already running."""
+    global _refresh_thread, _refresh_started
+    if _refresh_started:
+        return
+    _refresh_started = True
+    _refresh_thread = threading.Thread(target=_refresh_loop, daemon=True, name="proxy-refresh")
+    _refresh_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def next_proxy() -> str | None:
-    """Return next healthy proxy URL or None for direct access.
-
-    Skips entries that are on cooldown.  If all are on cooldown,
-    returns the one whose cooldown expires soonest.
-    """
+    """Return next healthy proxy URL or None for direct access."""
     global _index
     now = time.monotonic()
-    n = len(_PROXY_LIST)
 
     with _lock:
+        _load_history()
+        _ensure_refresh_started()
+
+        pool = _pool
+        n = len(pool)
+        if n == 0:
+            return None
+
         # Try up to a full rotation to find a healthy entry
         for _ in range(n):
-            entry = _PROXY_LIST[_index % n]
+            entry = pool[_index % n]
             _index = (_index + 1) % n
             key = _proxy_key(entry)
-            cd = _cooldowns.get(key)
-            if cd is None or now >= cd["until"]:
-                # Healthy — clear stale cooldown
-                _cooldowns.pop(key, None)
-                return _entry_to_url(entry)
+            st = _state.get(key)
+            if st is None or now >= st.get("cooldown_until", 0):
+                if entry is None:
+                    return None
+                return f"http://{entry}"
 
-        # All on cooldown — pick the one expiring soonest (best effort)
-        best_entry = _PROXY_LIST[0]
+        # All on cooldown — pick the one expiring soonest
+        best_entry = pool[0]
         best_until = float("inf")
-        for entry in _PROXY_LIST:
+        for entry in pool:
             key = _proxy_key(entry)
-            cd = _cooldowns.get(key)
-            if cd and cd["until"] < best_until:
-                best_until = cd["until"]
+            st = _state.get(key)
+            if st and st.get("cooldown_until", 0) < best_until:
+                best_until = st["cooldown_until"]
                 best_entry = entry
+        remaining = max(0, best_until - now)
         log.warning(
-            "All proxies on cooldown — using least-recently-failed (expires in %.0fs)",
-            max(0, best_until - now),
+            "All proxies on cooldown — using least-recently-failed (expires in %s)",
+            _fmt_duration(remaining),
         )
-        return _entry_to_url(best_entry)
+        if best_entry is None:
+            return None
+        return f"http://{best_entry}"
 
 
-def report_failure(proxy_url: str | None) -> None:
-    """Put a proxy on cooldown after a transient failure."""
+def report_failure(proxy_url: str | None, error_msg: str = "") -> None:
+    """Record a failure and put the proxy on adaptive cooldown.
+
+    CONNECT tunnel / 402 errors bump the score by 2 (known bad proxy),
+    other transient errors by 1.
+    """
     key = _url_to_key(proxy_url)
-    now = time.monotonic()
+    now_mono = time.monotonic()
+    now_wall = time.time()
+
+    is_hard_fail = any(p in error_msg.lower() for p in (
+        "connect tunnel", "response 402", "407", "proxy auth",
+        "bandwidthlimit", "payment required",
+    ))
+    bump = 2.0 if is_hard_fail else 1.0
 
     with _lock:
-        cd = _cooldowns.get(key, {"until": 0, "consecutive": 0})
-        cd["consecutive"] += 1
-        if cd["consecutive"] >= MAX_CONSECUTIVE_FAILS:
-            duration = LONG_COOLDOWN_SECS
-        else:
-            duration = COOLDOWN_SECS
-        cd["until"] = now + duration
-        _cooldowns[key] = cd
+        _load_history()
+        st = _state.get(key, {
+            "fail_score": 0, "cooldown_until": 0,
+            "wall_cooldown_until": 0, "last_fail": 0,
+        })
+        st["fail_score"] = st["fail_score"] + bump
+        st["last_fail"] = now_wall
+        duration = _compute_cooldown(st["fail_score"])
+        st["cooldown_until"] = now_mono + duration
+        st["wall_cooldown_until"] = now_wall + duration
+        _state[key] = st
 
-    label = "direct" if proxy_url is None else key
-    log.info(
-        "Proxy cooldown: %s → %ds (consecutive=%d)",
-        label, duration, cd["consecutive"],
-    )
+        label = "direct" if proxy_url is None else key
+        log.info(
+            "Proxy cooldown: %s → %s (fail_score=%.1f%s)",
+            label, _fmt_duration(duration), st["fail_score"],
+            " [CONNECT/402]" if is_hard_fail else "",
+        )
+
+        _save_history()
 
 
 def report_success(proxy_url: str | None) -> None:
-    """Clear cooldown for a proxy after a successful request."""
+    """Decay fail_score on success and clear cooldown."""
     key = _url_to_key(proxy_url)
     with _lock:
-        if key in _cooldowns:
-            _cooldowns.pop(key)
+        st = _state.get(key)
+        if st is None:
+            return
+        old_score = st["fail_score"]
+        st["fail_score"] = old_score * SUCCESS_DECAY
+        st["cooldown_until"] = 0
+        st["wall_cooldown_until"] = 0
+        if old_score > 0.5:
             label = "direct" if proxy_url is None else key
-            log.debug("Proxy healed: %s", label)
+            log.info(
+                "Proxy healed: %s (fail_score %.1f → %.1f)",
+                label, old_score, st["fail_score"],
+            )
+        if st["fail_score"] < 0.1:
+            _state.pop(key, None)
+        _save_history()
 
 
 def status() -> dict:
     """Return current pool status for diagnostics."""
     now = time.monotonic()
     with _lock:
+        _load_history()
         healthy = 0
         cooling = 0
-        for entry in _PROXY_LIST:
+        entries = []
+        for entry in _pool:
             key = _proxy_key(entry)
-            cd = _cooldowns.get(key)
-            if cd and now < cd["until"]:
+            st = _state.get(key)
+            if st and now < st.get("cooldown_until", 0):
                 cooling += 1
+                remaining = st["cooldown_until"] - now
+                entries.append({
+                    "proxy": key,
+                    "status": "cooldown",
+                    "remaining": _fmt_duration(remaining),
+                    "remaining_secs": round(remaining),
+                    "fail_score": round(st["fail_score"], 1),
+                })
             else:
                 healthy += 1
+                score = st["fail_score"] if st else 0
+                entries.append({
+                    "proxy": key,
+                    "status": "healthy",
+                    "fail_score": round(score, 1),
+                })
         return {
-            "total": len(_PROXY_LIST),
+            "total": len(_pool),
             "healthy": healthy,
             "cooling_down": cooling,
-            "cooldowns": {
-                k: {"remaining": max(0, round(v["until"] - now)),
-                    "consecutive_fails": v["consecutive"]}
-                for k, v in _cooldowns.items()
-                if now < v["until"]
-            },
+            "entries": entries,
         }

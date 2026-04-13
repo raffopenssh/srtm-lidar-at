@@ -267,6 +267,7 @@ td code { font-size: 12px; }
     <a href="#object-types">Object Types (25)</a>
     <a href="#group-types">Group Types (11)</a>
     <a href="#data-sources">Data Sources</a>
+    <a href="#rf-training">RF Training</a>
     <a href="#response-format">Response Format</a>
   </div>
 </nav>
@@ -280,6 +281,22 @@ td code { font-size: 12px; }
   Watershed segmentation + Random Forest classification of Austrian landscape from remote sensing data.
   Analyse any area in Austria up to 25 km² using 6 data sources, 25 object types, and 11 group types.
 </p>
+
+<div class="callout" style="background:linear-gradient(135deg,#f0f7ff 0%,#e8f4f8 100%);border-left:4px solid #0d7377;padding:18px 20px;margin:24px 0;border-radius:0 8px 8px 0;">
+  <div class="callout-title" style="font-size:15px;color:#0d7377;">🛰️ How it works</div>
+  <p style="margin:8px 0 6px;font-size:14px;line-height:1.7;">
+    This API reads <strong>six remote sensing sources</strong> — 1m LiDAR elevation (DTM+DSM), 20cm aerial orthophotos, Sentinel-2 NDVI, ESA WorldCover,
+    Sentinel-1 SAR, and Austrian cadastre footprints — then runs a two-stage pipeline:
+  </p>
+  <ol style="margin:6px 0 10px 20px;font-size:13px;line-height:1.8;color:#334155;">
+    <li><strong>Watershed segmentation</strong> — Felzenszwalb over-segmentation + Region Adjacency Graph merging splits the landscape into homogeneous objects</li>
+    <li><strong>Random Forest classification</strong> — each segment is described by 44 features (height, shape, spectral, texture, SAR, phenology) and classified into one of <a href="#object-types">25 types</a></li>
+  </ol>
+  <p style="margin:0;font-size:13px;color:#555;">
+    The RF model is <a href="#rf-training">continuously trained</a> on cadastre + OSM ground truth across 4,000 Austrian municipalities (Katastralgemeinden).
+    Adjacent compatible segments are grouped into <a href="#group-types">11 higher-level groups</a> (forest, building, road network, etc.).
+  </p>
+</div>
 
 <h2 id="overview">Overview <a class="anchor-link" href="#overview">#</a></h2>
 
@@ -436,6 +453,13 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/res
   </div>
 
   <p>Returns a <strong>GeoJSON FeatureCollection</strong> — see <a href="#response-format">Response Format</a> for full property list.</p>
+
+  <div class="callout callout-tip" style="margin-top:12px">
+    <div class="callout-title">🌳 Random Forest classifier</div>
+    Classification uses a continuously-trained RF model with 44 features per segment.
+    The model learns from cadastre building footprints and OSM ground truth across thousands of Austrian municipalities.
+    See <a href="#rf-training">Random Forest Training</a> for details on the training pipeline, feature importances, and status endpoints.
+  </div>
 </div>
 
 <!-- ELEVATION -->
@@ -937,6 +961,81 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
     <tr><td><strong>6</strong></td><td>Austrian Cadastre</td><td>mm-level</td><td>Building footprint ground truth</td></tr>
   </tbody>
 </table>
+</div>
+
+<!-- ==================== RF TRAINING ==================== -->
+<h2 id="rf-training">Random Forest Training <a class="anchor-link" href="#rf-training">#</a></h2>
+
+<p>
+  The landscape classifier is a <strong>scikit-learn Random Forest</strong> trained on ground truth
+  from Austrian cadastre building footprints and OpenStreetMap features. Training runs continuously
+  as a background service, iterating over <strong>4,000 randomly-selected Katastralgemeinden</strong> (KGs — Austrian cadastral municipalities).
+</p>
+
+<h3>How training works</h3>
+<ol style="margin:10px 0 16px 20px;line-height:1.9;">
+  <li>For each KG, the system fetches cadastre building footprints + OSM road/landcover as <strong>ground truth labels</strong></li>
+  <li>All raster data is read for that area: LiDAR DTM/DSM, orthophoto RGBI, Sentinel-2 NDVI, ESA WorldCover, Sentinel-1 SAR</li>
+  <li>Felzenszwalb segmentation splits the area into objects, and <strong>44 features</strong> are extracted per segment</li>
+  <li>Segments overlapping ground truth polygons are labelled → these become training samples</li>
+  <li>Every 10 KGs, the RF model is retrained on all accumulated samples and saved</li>
+</ol>
+
+<h3>44 Features</h3>
+<p>Each segment is described by features spanning five categories:</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Category</th><th>Features</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Height &amp; shape</strong></td><td>height_max, height_mean, height_p90, area, compactness, elongation, solidity, extent, dsm_edge_strength</td></tr>
+    <tr><td><strong>Terrain</strong></td><td>slope_mean, roughness</td></tr>
+    <tr><td><strong>Spectral</strong></td><td>ndvi_mean, ndvi_fused, nir_mean, brightness_mean</td></tr>
+    <tr><td><strong>Texture</strong></td><td>glcm_entropy, glcm_homogeneity, texture_complexity</td></tr>
+    <tr><td><strong>SAR &amp; phenology</strong></td><td>sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class</td></tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:13px;color:#666;margin-top:6px;">
+  Plus temporal features (height_change, dtm_change, temporal_stability) when multi-date data is enabled,
+  and additional derived features — 44 total.
+</p>
+
+<h3>Checkpointing &amp; restarts</h3>
+<p>
+  Each KG’s training data is checkpointed to <code>rf_training_data/checkpoints/kg_XXXXX.npz</code>.
+  If the service restarts, already-processed KGs are skipped. The trained model is saved to
+  <code>/tmp/learned_classifier/</code> and automatically picked up by the API.
+</p>
+
+<h3>Monitoring</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/training/status</code></td><td>Background training progress: KGs completed, total samples, current KG, OOB score</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/classifier/status</code></td><td>Current model status: trained (bool), n_samples, oob_score, feature importances</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/classifier/train</code></td><td>Manually train on a specific bbox. Params: <code>bbox</code>, <code>n_estimators</code>, <code>max_depth</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Example</h4>
+<div class="code-wrap">
+  <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+  <pre><code><span class="tok-comment"># Check background training progress</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/training/status</span>
+
+<span class="tok-comment"># Check current model quality</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/classifier/status</span>
+
+<span class="tok-comment"># Manually train on a specific area</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/classifier/train?bbox=15.4,47.0,15.5,47.1"</span></code></pre>
+</div>
+
+<div class="callout callout-info" style="margin-top:16px">
+  <div class="callout-title">ℹ️ Live status</div>
+  Training progress is also shown in the <a href="/">app’s status bar</a> (bottom-left of the sidebar).
+  The service runs as <code>rf_train.service</code> — logs at <code>/tmp/rf_train_4000kg.log</code>.
 </div>
 
 <!-- ==================== RESPONSE FORMAT ==================== -->

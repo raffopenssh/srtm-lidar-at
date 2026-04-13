@@ -630,13 +630,14 @@ def process_one_kg(
             hansen=hansen_data,
             ortho_year=obs_year,
             observation_year=obs_year,
+            features_only=True,  # skip RF classification — saves ~1.5GB RAM
         )
     except Exception as e:
         stats["error"] = f"segmentation: {e}"
         return [], [], stats
     stats["segment_time"] = round(time.time() - t0, 1)
 
-    features_list = [obj.features for obj in result["objects"]]
+    features_list = result.get("features", [obj.features for obj in result["objects"]])
     stats["n_segments"] = len(features_list)
 
     if not features_list:
@@ -751,7 +752,13 @@ def train_and_save_model(n_kgs, tag="checkpoint"):
         log.error("Model training [%s] failed: %s", tag, traceback.format_exc())
         return None
     finally:
-        del all_features, all_labels
+        del all_features, all_labels, clf
+        # Clear the cached classifier singleton so the 1.5GB model
+        # doesn't stay resident in the parent process
+        try:
+            lc._cached_classifier = None
+        except Exception:
+            pass
         import gc; gc.collect()
 
 
@@ -863,13 +870,11 @@ def main():
         log.info("[%d/%d] Processing KG %s (%s)",
                  i + 1, len(kgs), kg_code, kg.get("kg_name", ""))
 
-        # Memory check — force GC if RSS > 2.5G before starting a new KG
+        # Memory check — force GC before starting a new KG
+        import gc; gc.collect()
         try:
-            import resource
-            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            if rss_mb > 2500:
-                import gc; gc.collect()
-                log.info("  GC triggered (RSS=%.0f MB)", rss_mb)
+            rss_mb = int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) / 1024
+            log.info("  Parent RSS: %.0f MB", rss_mb)
         except Exception:
             pass
 

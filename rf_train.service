@@ -14,8 +14,10 @@ TimeoutStopSec=60
 TimeoutStartSec=infinity
 Environment=PYTHONUNBUFFERED=1
 # Cap memory to avoid OOM-killing gunicorn and other services
-MemoryMax=5G
-MemoryHigh=4G
+# Note: parent ~1.5GB + spawned child ~2GB = ~3.5GB typical
+# MemoryHigh triggers kernel throttling (stalls) — keep well above typical use
+MemoryMax=6G
+MemoryHigh=5G
 OOMScoreAdjust=-200
 OOMPolicy=continue
 

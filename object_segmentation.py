@@ -1620,8 +1620,12 @@ def segment_and_classify(
     rag_threshold: float = 0.12,
     ortho_year: int | None = None,
     observation_year: int | None = None,
+    features_only: bool = False,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
+
+    If features_only=True, return after feature extraction (Steps 1-3b),
+    skipping classification/calibration/grouping.  Used by RF training.
 
     Parameters
     ----------
@@ -1701,6 +1705,18 @@ def segment_and_classify(
     # Free heavy intermediates before classification
     del cop_resampled
     import gc; gc.collect()
+
+    # --- features_only: return segments + features without classification ---
+    if features_only:
+        log.info("features_only mode: returning %d features (skipping Steps 4-6)",
+                 len(features))
+        return {
+            "objects": [],
+            "features": features,
+            "labels": labels,
+            "stats": {"total_objects": 0, "n_features": len(features)},
+            "evaluation": None,
+        }
 
     # --- Step 4: Classification ---
     # Try learned RF classifier first, fall back to rules

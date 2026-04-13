@@ -3392,6 +3392,26 @@ _SHARE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,80}$')  # hex hashes or named slugs
 def _valid_share_id(s):
     return bool(s and _SHARE_ID_RE.match(s))
 
+def _resolve_share(share_id):
+    """Resolve a share ID, following redirect stubs from renames.
+    Returns (resolved_id, path) or (None, None) if not found."""
+    p = SHARE_DIR / f'{share_id}.json.gz'
+    if not p.exists():
+        return None, None
+    # Check for redirect alias (small file left after rename)
+    if p.stat().st_size < 200:
+        try:
+            stub = json.loads(gzip.decompress(p.read_bytes()))
+            if 'redirect' in stub:
+                new_id = stub['redirect']
+                new_p = SHARE_DIR / f'{new_id}.json.gz'
+                if new_p.exists():
+                    return new_id, new_p
+                return None, None
+        except Exception:
+            pass
+    return share_id, p
+
 
 def _share_is_named(path: Path) -> bool:
     """Check if a share has a user-given name (not auto-generated).
@@ -3453,8 +3473,19 @@ def share_list():
             share_id = f.stem.replace('.json', '')
             try:
                 data = json.loads(gzip.decompress(f.read_bytes()))
+                # Skip redirect stubs (left after rename for old-link compat)
+                if 'redirect' in data and 'state' not in data:
+                    continue
                 state = data.get('state', {})
-                name = data.get('name', '') or share_id
+                stored_name = data.get('name', '')
+                # Prefer share ID as display name if it's a human-readable slug
+                # (i.e. user-renamed, not a hex hash or auto- prefix)
+                id_is_hex = bool(re.fullmatch(r'[0-9a-f]{12}', share_id))
+                id_is_auto = share_id.startswith('auto-')
+                if not id_is_hex and not id_is_auto:
+                    name = share_id  # user-renamed ID IS the name
+                else:
+                    name = stored_name or share_id
                 endpoint = state.get('endpoint', '')
                 has_result = 'result' in data and bool(data['result'])
                 has_geometry = bool(state.get('geometry', ''))
@@ -3585,24 +3616,31 @@ def share_save():
 
 @app.route('/api/v1/share/<share_id>', methods=['GET'])
 def share_load(share_id):
-    """Retrieve a saved share. Serves gzip-compressed if client accepts it."""
+    """Retrieve a saved share. Serves gzip-compressed if client accepts it.
+    
+    Follows redirect aliases: if a share was renamed, the old ID contains
+    a small {"redirect": "new_id"} stub that points to the new location.
+    """
     try:
         if not _valid_share_id(share_id):
             return _error('Invalid share ID', 400)
-        p = SHARE_DIR / f'{share_id}.json.gz'
-        if not p.exists():
+        share_id, p = _resolve_share(share_id)
+        if not p or not p.exists():
             return _error('Share not found', 404)
+        raw = p.read_bytes()
         # Touch file to keep it alive (LRU)
         p.touch()
+        # Header to let the client know the resolved ID (may differ if redirect followed)
+        extra_headers = {'X-Share-Id': share_id}
         # Serve pre-compressed gzip if client accepts it (saves bandwidth, critical for mobile)
         accept_enc = request.headers.get('Accept-Encoding', '')
         if 'gzip' in accept_enc:
-            raw = p.read_bytes()
             return Response(raw, mimetype='application/json',
                             headers={'Content-Encoding': 'gzip',
-                                     'Vary': 'Accept-Encoding'})
-        data = gzip.decompress(p.read_bytes())
-        return Response(data, mimetype='application/json')
+                                     'Vary': 'Accept-Encoding',
+                                     **extra_headers})
+        data = gzip.decompress(raw)
+        return Response(data, mimetype='application/json', headers=extra_headers)
     except Exception as e:
         log.error("share load: %s", traceback.format_exc())
         return _error(str(e))
@@ -3662,8 +3700,8 @@ def share_download_gpkg(share_id):
     try:
         if not _valid_share_id(share_id):
             return _error('Invalid share ID', 400)
-        p = SHARE_DIR / f'{share_id}.json.gz'
-        if not p.exists():
+        share_id, p = _resolve_share(share_id)
+        if not p or not p.exists():
             return _error('Share not found', 404)
         share_data = json.loads(gzip.decompress(p.read_bytes()).decode())
         state = share_data.get('state', {})
@@ -3743,7 +3781,31 @@ def share_rename(old_id):
         new_path = SHARE_DIR / f'{new_id}.json.gz'
         if new_path.exists() and new_id != old_id:
             return _error('Name already taken', 409)
-        old_path.rename(new_path)
+        # Update the name field inside the JSON to match the new ID
+        try:
+            payload = json.loads(gzip.decompress(old_path.read_bytes()))
+            payload['name'] = new_id
+            # Track rename history so old links keep working
+            aliases = payload.get('aliases', [])
+            if old_id not in aliases:
+                aliases.append(old_id)
+            payload['aliases'] = aliases
+            new_data = gzip.compress(json.dumps(payload, separators=(',', ':'), sort_keys=True).encode())
+            new_path.write_bytes(new_data)
+            if old_path != new_path:
+                old_path.unlink()
+        except Exception:
+            # Fallback: just move the file
+            if not new_path.exists():
+                old_path.rename(new_path)
+        # Leave a small redirect file at old path so old links still resolve
+        if old_id != new_id:
+            try:
+                alias_data = json.dumps({'redirect': new_id}, separators=(',', ':'))
+                (SHARE_DIR / f'{old_id}.json.gz').write_bytes(
+                    gzip.compress(alias_data.encode()))
+            except Exception:
+                pass  # best-effort
         new_path.touch()
         log.info("share: renamed %s → %s", old_id, new_id)
         return jsonify({'id': new_id, 'old_id': old_id})

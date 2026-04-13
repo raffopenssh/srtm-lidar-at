@@ -1298,7 +1298,15 @@ async function restoreShareResult(data){
     applyVis();
   }
   // Restore layer checkboxes and load overlays
-  // First restore cached overlay images (instant), then fall back to re-fetch
+  // First: uncheck any default-on layers NOT in saved state
+  const savedLayers=new Set(data.state.layers||[]);
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{
+    if(cb.checked && !savedLayers.has(cb.dataset.lyr)){
+      cb.checked=false;
+      handleLayerToggle(cb.dataset.lyr);  // apply hide
+    }
+  });
+  // Then restore cached overlay images (instant), or fall back to re-fetch
   const cachedOverlays=data.overlays||{};
   if(data.state.layers){
     for(const id of data.state.layers){
@@ -1547,12 +1555,17 @@ document.addEventListener('click',(e)=>{
     const resp=await fetch('/api/v1/share/'+encodeURIComponent(shareId));
     if(!resp.ok) throw new Error('Share not found');
     const data=await resp.json();
+    // Use resolved ID from server (follows rename redirects)
+    const resolvedId=resp.headers.get('X-Share-Id')||shareId;
     await restoreShareResult(data);
-    currentShareId=shareId;
+    currentShareId=resolvedId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
-    const label=currentShareName?` "${currentShareName}"`:'.';    updateGeoInputDisplay(currentShareName||shareId,'share');
-    hideLoading('Shared view restored'+label);
+    // Update URL bar if the share was redirected to a new name
+    if(resolvedId!==shareId) history.replaceState(null,'',`?share=${encodeURIComponent(resolvedId)}`);
+    const displayName=currentShareName||resolvedId;
+    updateGeoInputDisplay(displayName,'share');
+    hideLoading('Shared view restored "'+displayName+'".');
   }catch(e){
     hideLoading('Failed to load share: '+e.message);
     console.error('Share restore failed:',e);
@@ -1822,13 +1835,15 @@ async function _loadShareById(id, name){
     const resp=await fetch('/api/v1/share/'+encodeURIComponent(id));
     if(!resp.ok) throw new Error('Share not found');
     const data=await resp.json();
+    const resolvedId=resp.headers.get('X-Share-Id')||id;
     await restoreShareResult(data);
-    currentShareId=id;
+    currentShareId=resolvedId;
     currentShareName=data.name||null;
     shareStateHash=computeShareHash(data.state,data.result);
-    updateGeoInputDisplay(name||id,'share');
-    history.replaceState(null,'',`?share=${encodeURIComponent(id)}`);
-    hideLoading('Loaded: '+name);
+    const displayName=currentShareName||resolvedId;
+    updateGeoInputDisplay(displayName,'share');
+    history.replaceState(null,'',`?share=${encodeURIComponent(resolvedId)}`);
+    hideLoading('Loaded: '+displayName);
   }catch(e){
     hideLoading('Failed: '+e.message);
   }finally{

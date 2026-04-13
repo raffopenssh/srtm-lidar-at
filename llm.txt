@@ -1,71 +1,202 @@
-# Austrian Landscape Transformation Analysis API — v5.0
-# Base URL: https://srtm-lidar-at.exe.xyz:8000
-# All geometry input in WGS84 (lon/lat). Processing in EPSG:3035.
-# Max query area: 25 km². Territory: Austria only.
+# Austrian Landscape Analysis API — v5.1
+# Base: https://srtm-lidar-at.exe.xyz:8000
+# Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
 
-## Philosophy
+## Overview
 
-This API answers: "How has man shaped this landscape?"
-Watershed-based segmentation classifies 25 individual object types and
-11 hierarchical group types, focused on distinguishing man-made from
-natural and detecting terrain modification.
+Watershed segmentation + Random Forest classifier over 6 remote sensing layers.
+Classifies landscape into 25 object types + 11 group types.
+Focused on distinguishing man-made vs natural and detecting terrain modification.
 
-## Data Sources (6 layers)
+## Data Sources
 
-1. BEV ALS DTM + DSM: 1m resolution, EPSG:3035, 3 dates (2022/2023/2024)
-2. BEV DOP RGBI Orthophoto: 0.2m resolution, 47 operates + DOP RGB fallback
-3. Copernicus Sentinel-2: 10m NDVI growing-season composite (via openEO)
-4. Copernicus ESA WorldCover: 10m land cover classification
-5. Copernicus Sentinel-1 SAR: VV+VH backscatter
-6. Austrian Cadastre: mm-precision building footprint polygons (ground truth)
+| # | Source | Resolution | Notes |
+|---|--------|-----------|-------|
+| 1 | BEV ALS DTM+DSM | 1m | 3 dates: 2022, 2023, 2024 |
+| 2 | BEV DOP RGBI Orthophoto | 0.2m | 47 operates + DOP fallback |
+| 3 | Sentinel-2 NDVI | 10m | Growing-season composite via openEO |
+| 4 | ESA WorldCover | 10m | Land cover classification |
+| 5 | Sentinel-1 SAR | 10m | VV+VH backscatter |
+| 6 | Austrian Cadastre | mm | Building footprint ground truth |
 
-## Step-Change Features (v3.1+)
+## Geometry Input (all POST endpoints)
 
-1. GLCM Texture from 20cm orthophoto (0.5m GLCM → contrast/entropy/homogeneity)
-2. NDVI Harmonic Phenology (monthly → mean + amplitude + phase)
-3. Sentinel-1 SAR Backscatter (VV+VH — orthogonal to optical)
-4. Random Forest Classifier (44-feature vector, cadastre-trained, OOB validation)
+Body accepts: GeoJSON, `{"geometry": <GeoJSON>, ...params}`, KML string,
+coordinate string (`lon,lat` or `lon,lat;lon,lat;...`), or multipart file upload
+(KML, GeoJSON, Shapefile ZIP, GPX, WKT, GeoPackage).
+Multi-feature inputs are unioned. Points are buffered to 100m radius.
 
-## NDVI Fusion
+---
 
-BEV ortho (1m spatial) fused with Copernicus growing-season median (10m):
-  fused = BEV + smoothed(Copernicus_block − BEV_block)
-Result: 1m spatial precision with growing-season absolute levels.
+## Endpoints
 
-## 25 Object Types (individual, /api/v1/segment)
+### Analysis
 
-| Code | Type | How detected |
-|------|------|-------------|
+#### POST /api/v1/segment ← PRIMARY
+Watershed segmentation → 25 object types + 11 group types.
+
+Query/body params:
+  dataset            ALS date (default: 20240915)
+  min_object_size    Min segment area in m² (default: 30)
+  felz_scale         Felzenszwalb scale (default: 150)
+  rag_threshold      RAG merge threshold (default: 0.12)
+  include_ortho      true → BEV RGBI (NDVI, NIR, brightness, GLCM texture)
+  include_temporal   true → 3-date DTM comparison (2022/2023/2024)
+  include_copernicus true → Sentinel-2 NDVI + ESA WorldCover + SAR + NDVI harmonics
+  include_cadastre   true → cadastre building footprint ground truth
+  include_hansen     true → Hansen Global Forest Change calibration
+  types              Comma-separated type filter (e.g. "roof,tree,road")
+  groups             Comma-separated group filter (e.g. "building,forest")
+  async              true → returns 202 with {task_id}, poll for progress
+  task_id            Client-provided UUID for tracking
+
+Async flow:
+  1. POST /api/v1/segment?async=true → 202 {task_id, status: "running"}
+  2. GET  /api/v1/segment/progress?task_id=X → {active, step, detail, elapsed, done, error, auto_share_id}
+  3. GET  /api/v1/segment/result?task_id=X → full result
+  4. POST /api/v1/segment/abort?task_id=X → cancel
+
+Result: FeatureCollection. Per-feature properties:
+  type, type_code, group_id, group_type, is_manmade, confidence,
+  height_max_m, height_mean_m, height_p90_m, area_sqm,
+  compactness, elongation, solidity, extent, dsm_edge_strength,
+  slope_mean, roughness, ndvi_mean, ndvi_fused, nir_mean,
+  brightness_mean, height_change, dtm_change, temporal_stability,
+  glcm_entropy, glcm_homogeneity, texture_complexity,
+  sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class
+
+Completed async tasks are auto-saved as shares (auto-<task_id[:8]>).
+
+#### POST /api/v1/elevation
+Enrich features with DSM/DTM elevation.
+
+#### POST /api/v1/terrain
+Terrain characterisation: slope, aspect, TRI, TPI, curvature.
+
+#### POST /api/v1/changes
+Temporal change detection between two ALS dates.
+Params: date_a (default: 20220915), date_b (default: 20240915), min_change (m, default: 1.0)
+20 event types: tree_growth, tree_felling, new_tree, forest_clearcut,
+vegetation_growth/loss, new_building, demolition, construction,
+earthwork_fill/cut/grading/dam/trench/pond,
+road_new/resurfaced/widened, surface_change, unclassified_change.
+
+#### POST /api/v1/changes/trees
+Per-tree growth/felling analysis between dates.
+
+#### POST /api/v1/changes/summary
+Multi-epoch change summary (2022→2023→2024).
+
+### Overlays (POST, return PNG with X-Bounds header: south,west,north,east)
+
+  /api/v1/segment/overlay  Segment classification raster. Params: types, color_mode (type|height)
+  /api/v1/dtm/overlay      DTM hillshade. Params: dataset
+  /api/v1/lidar/overlay    nDSM height (viridis). Params: dataset
+  /api/v1/ortho/overlay    RGB orthophoto. Params: dataset, ortho_year
+  /api/v1/cir/overlay      CIR false-colour (NIR→R, R→G, G→B). Params: dataset, ortho_year
+  /api/v1/hansen/overlay    Hansen forest change. Params: dataset
+
+### Exports
+
+#### POST /api/v1/export/geopackage
+All layers in one GPKG. Supports async (async=true → poll → download).
+Params: include_dtm, include_dsm, include_segments, ortho_years, raster_layers, types, color_mode, async
+Async download: GET /api/v1/export/geopackage/download/<task_id>
+
+#### POST /api/v1/export/mbtiles
+Single raster layer as MBTiles for offline use.
+Params: layer (required, e.g. dtm-2024, ortho-2024, raster), min_zoom, max_zoom, async
+Async download: GET /api/v1/export/mbtiles/download/<task_id>
+
+### Raw GeoTIFF Downloads (POST)
+
+  /api/v1/lidar/geotiff    DTM/DSM/nDSM as float32 GeoTIFF. Params: dataset, band (dtm|dsm|ndsm)
+  /api/v1/ortho/geotiff    Orthophoto RGBI GeoTIFF. Params: dataset, ortho_year
+
+### Shares
+
+#### GET /api/v1/shares?limit=20
+List saved shares, most recent first.
+Response: [{id, name, description, has_result, has_geometry, endpoint, updated, size_kb}, ...]
+
+#### POST /api/v1/share
+Save analysis state + result for sharing. Content-hash dedup.
+Body: {state, result?, overlays?, name?, reuse_id?}
+Response: {id, url, reused}
+
+#### GET /api/v1/share/<id>
+Load a share. Follows rename redirects (old links keep working).
+Response header X-Share-Id contains the resolved ID.
+Response: {state, result, overlays?, name?, aliases?}
+
+#### POST /api/v1/share/<old_id>/rename
+Rename a share. Old ID becomes a redirect stub so old links still work.
+Body: {new_id: "MySlug"}
+Response: {id, old_id}
+
+#### GET /api/v1/share/<id>/download.gpkg
+Direct GeoPackage download from a share (usable as QGIS data source URL).
+Params: layers (all|active|comma-separated IDs), types, color_mode
+
+### Utilities
+
+#### GET /api/v1/layers?bbox=lon_min,lat_min,lon_max,lat_max
+Data layer availability for a bounding box.
+Response: {ortho: {"2024": bool, ...}, cir: {...}, dtm: {...}, dsm: {...}, hansen: bool}
+
+#### GET /api/v1/info
+Server info: data sources, datasets, object types, endpoints.
+
+#### POST /api/v1/parse-geometry
+Parse uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT).
+Multipart upload with field "file". Returns GeoJSON FeatureCollection.
+
+#### POST /api/v1/classifier/train
+Train RF classifier on cadastre ground truth for a bbox.
+Params: bbox (lon_min,lat_min,lon_max,lat_max), n_estimators, max_depth
+
+#### GET /api/v1/classifier/status
+RF model status: trained, n_samples, oob_score, feature_importances.
+
+#### GET /api/v1/training/status
+Background RF training job progress (4000-KG run).
+
+---
+
+## 25 Object Types
+
+| Code | Type | Detection |
+|------|------|-----------|
 | 1 | tree | nDSM>4m, rough DSM, high NDVI |
-| 2 | shrub | nDSM 0.5-4m, high NDVI |
-| 3 | grass | Ground, moderate+ NDVI, smooth DTM |
+| 2 | shrub | nDSM 0.5–4m, high NDVI |
+| 3 | grass | Ground level, moderate+ NDVI, smooth DTM |
 | 4 | hedge | Elongated shrub (length/width>4) |
 | 5 | water | ESA water class, very low NDVI+NIR, flat |
 | 10 | roof | Compact elevated, smooth DSM, low NDVI |
-| 11 | greenhouse | Roof-like but high NIR transmittance |
+| 11 | greenhouse | Roof-like, high NIR transmittance |
 | 12 | solar_panel | Very smooth, bright, low NDVI on roof |
-| 15 | fence | Low (0.5-2m), thin, elongated |
+| 15 | fence | Low (0.5–2m), thin, elongated |
 | 16 | wall | Narrow elevated, adjacent to roof |
 | 17 | mast | Tiny footprint (<10m²), very tall (>15m) |
 | 20 | road | Smooth DTM (<0.04m roughness), elongated, low NDVI |
-| 21 | path | Narrower road (<3m effective width) |
+| 21 | path | Narrower road (<3m width) |
 | 22 | parking | Smooth, large, compact, low NDVI |
 | 23 | bridge | Elevated road/path over gap |
 | 30 | crop | Flat, seasonal NDVI, ESA cropland |
 | 31 | orchard | Regular tree spacing, <10m height |
 | 32 | vineyard | Low rows, <3m, row pattern |
-| 33 | garden | Mixed veg near buildings |
-| 40 | bare_soil | Low NDVI, flat-moderate slope |
+| 33 | garden | Mixed vegetation near buildings |
+| 40 | bare_soil | Low NDVI, flat-to-moderate slope |
 | 41 | rock | Steep + very rough DTM + low NDVI |
 | 50 | excavation | DTM lowered >0.20m between dates (≥25m²) |
 | 51 | fill | DTM raised >0.20m between dates (≥25m²) |
 | 52 | tree_loss | nDSM dropped >2m, terrain intact (≥8m²) |
 | 53 | construction | New structure or site clearing |
 
-## 11 Group Types (hierarchical merge)
+## 11 Group Types
 
-| Code | Group | Members merged |
-|------|-------|---------------|
+| Code | Group | Members |
+|------|-------|---------|
 | 101 | forest | tree + shrub + hedge |
 | 102 | woodland | shrub + hedge (sparse) |
 | 103 | hedgerow | hedge + hedge |
@@ -78,135 +209,16 @@ Result: 1m spatial precision with growing-season absolute levels.
 | 130 | quarry | excavation + fill |
 | 131 | construction_site | construction + excavation + fill |
 
-## Endpoints
-
-### POST /api/v1/segment  ← PRIMARY
-Watershed segmentation and classification. 25 types + 11 groups.
-Supports async mode for long-running analysis.
-
-Body: GeoJSON, KML, coordinates, or file upload.
-Params:
-  dataset            ALS date (default 20240915)
-  min_object_size    min segment m² (default 30)
-  felz_scale         Felzenszwalb scale (default 150)
-  rag_threshold      RAG merge threshold (default 0.12)
-  include_ortho      "true" for BEV RGBI (NDVI, NIR, brightness)
-  include_temporal   "true" for 3-date LIDAR (2022/2023/2024)
-  include_copernicus "true" for Sentinel-2 NDVI + ESA land cover + SAR
-  include_cadastre   "true" for cadastre building footprints
-  include_hansen     "true" for Hansen Global Forest Change calibration
-  types              comma-separated type filter (e.g. "roof,tree,road")
-  groups             comma-separated group filter (e.g. "building,forest")
-  async              "true" → returns 202 with {task_id}, poll progress
-  task_id            client-provided UUID for progress tracking
-
-Async flow:
-  1. POST /api/v1/segment?async=true → 202 {task_id, status: "running"}
-  2. GET  /api/v1/segment/progress?task_id=... → {active, step, detail, elapsed, done, error}
-  3. GET  /api/v1/segment/result?task_id=...   → full GeoJSON result
-
-Returns: FeatureCollection with per-object properties:
-  type, type_code, group_id, group_type, is_manmade, confidence,
-  height_max_m, height_mean_m, height_p90_m, area_sqm,
-  compactness, elongation, solidity, extent, dsm_edge_strength,
-  slope_mean, roughness, ndvi_mean, ndvi_fused, nir_mean,
-  brightness_mean, height_change, dtm_change, temporal_stability,
-  glcm_entropy, glcm_homogeneity, texture_complexity,
-  sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class
-
-### POST /api/v1/elevation
-Enrich features with DSM/DTM elevation values.
-
-### POST /api/v1/terrain
-Terrain characterisation: slope, aspect, ruggedness, curvature.
-
-### POST /api/v1/changes
-Temporal change detection between two ALS dates.
-20 change event types including earthworks, tree felling, construction.
-
-### POST /api/v1/changes/trees
-Per-tree growth/felling analysis between dates.
-
-### POST /api/v1/changes/summary
-Multi-epoch change summary (2022→2023→2024).
-
-### POST /api/v1/export/geopackage
-Export all layers as a single GeoPackage file.
-Supports async mode (async=true → poll + download).
-Params:
-  include_dtm        DTM/DSM/nDSM bands (default true)
-  include_dsm        same as above
-  include_segments   segment_type + segment_height bands
-  ortho_years        comma-separated (e.g. 2024,2023)
-  raster_layers      comma-separated overlay IDs to render as RGBA
-  types              segment type filter
-  color_mode         type|height
-  async              "true" → 202 with {task_id}
-Async flow:
-  1. POST /api/v1/export/geopackage?async=true → 202 {task_id}
-  2. GET  /api/v1/segment/progress?task_id=... → poll
-  3. GET  /api/v1/export/geopackage/download/{task_id} → binary .gpkg
-
-### POST /api/v1/segment/overlay
-Rendered RGBA PNG overlay of segmentation results.
-Params: types, color_mode (type|height)
-
-### GET /api/v1/layers?bbox=lon_min,lat_min,lon_max,lat_max
-Return which data layers are available for a bounding box.
-Response:
-  {
-    "ortho": {"2024": true, "2023": false, "2020": true},
-    "cir":   {"2024": true, "2023": false, "2020": false},
-    "dtm":   {"2024": true, "2023": true, "2022": true},
-    "dsm":   {"2024": true, "2023": true, "2022": true},
-    "hansen": true
-  }
-Ortho falls back to DOP RGB tiles (~2020/2022 vintage).
-CIR requires RGBI operates with NIR band (no fallback).
-
-### GET /api/v1/info
-Dataset inventory, landscape types, data sources.
-
-### GET /api/v1/training/status
-RF classifier training job status, current KG, model info.
-
-### POST /api/v1/classifier/train
-Train/retrain the Random Forest classifier on cadastre ground truth.
-Params: bbox (lon_min,lat_min,lon_max,lat_max), n_estimators, max_depth
-
-### Overlay endpoints (POST, return PNG with X-Bounds header)
-  /api/v1/dtm/overlay      DTM hillshade
-  /api/v1/dsm/overlay      nDSM height overlay (viridis colormap)
-  /api/v1/ortho/overlay    RGB orthophoto
-  /api/v1/cir/overlay      Color Infrared false-color (NIR→R, R→G, G→B)
-  /api/v1/hansen/overlay    Hansen forest change overlay
-  /api/v1/lidar/overlay     Combined DTM+DSM overlay
-
-### GET /api/v1/lidar/geotiff, /api/v1/ortho/geotiff
-Download raw raster data as GeoTIFF.
-
-## Geometry Input
-
-All POST endpoints accept:
-- GeoJSON Feature or FeatureCollection in body
-- {"geometry": <GeoJSON>, ...params} in body
-- KML string in body
-- Coordinate string: "lon,lat" or "lon,lat;lon,lat;..."
-- File upload (multipart: KML, GeoJSON, Shapefile, GPX)
-
-Multi-feature inputs (FeatureCollection, multi-placemark KML) are
-automatically unioned into a single convex hull boundary.
-Geometries outside Austria (lon 9.5-17.2, lat 46.3-49.0) are rejected.
-Areas exceeding 25 km² are rejected.
-Point inputs are buffered to 100m radius.
+---
 
 ## Examples
 
-# Async watershed segmentation with all data sources
+```bash
+# Async segmentation with all sources
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment?async=true&include_ortho=true&include_temporal=true&include_copernicus=true&include_cadastre=true' \
   -H 'Content-Type: application/json' \
-  -d '{"geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
-# → {"task_id": "...", "status": "running"}
+  -d '{"geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+# → {"task_id":"...","status":"running"}
 
 # Poll progress
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/progress?task_id=...'
@@ -214,10 +226,20 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/progress?task_id=...'
 # Get result
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/result?task_id=...'
 
-# Check layer availability
+# Layer availability
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/layers?bbox=15.1,47.1,15.2,47.2'
 
 # Change detection
-curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/changes \
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/changes' \
   -H 'Content-Type: application/json' \
-  -d '{"date_a": "20220915", "date_b": "20240915", "geometry": {"type": "Polygon", "coordinates": [[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+  -d '{"date_a":"20220915","date_b":"20240915","geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+
+# List shares
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/shares?limit=10'
+
+# Load share (follows rename redirects)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80'
+
+# Direct GPKG download from share
+curl -o analysis.gpkg 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg'
+```

@@ -498,6 +498,7 @@ def extract_object_features(
     bev_nir = _get_spectral_layer(spectral, "nir", h, w)
     bev_red = _get_spectral_layer(spectral, "red", h, w)
     bev_green = _get_spectral_layer(spectral, "green", h, w)
+    bev_blue = _get_spectral_layer(spectral, "blue", h, w)
     bev_green_ratio = _get_spectral_layer(spectral, "green_ratio", h, w)
     bev_rg_index = _get_spectral_layer(spectral, "rg_index", h, w)
 
@@ -617,6 +618,9 @@ def extract_object_features(
         nir_v = f["nir_mean"]
         bri_v = f["brightness_mean"]
         f["nir_brightness_ratio"] = nir_v / max(bri_v, 1.0) if nir_v > 0 else 0.0
+        red_v = f["red_mean"]
+        f["nir_red_ratio"] = nir_v / max(red_v, 1.0) if nir_v > 0 else 0.0
+        f["blue_mean"] = _seg_mean(bev_blue, seg_v)
         f["cop_ndvi_mean"] = _seg_mean(cop_ndvi, seg_v)
         # Fused NDVI: seasonal-corrected 1m (best of both worlds)
         f["fused_ndvi_mean"], f["fused_ndvi_std"], _ = _seg_stats(fused_ndvi, seg_v)

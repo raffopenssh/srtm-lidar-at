@@ -246,6 +246,7 @@ Designed for users on limited/mobile connections. No POST body needed.
 
 Query params:
   bbox=lon_min,lat_min,lon_max,lat_max  Bounding box (required)
+  name=MySave              Save name / share ID (slug, 1-80 chars, [A-Za-z0-9_-])
   min_object_size=10       Min segment area in m² (default: 10)
   include_ortho=true       Orthophoto features (default: true)
   include_temporal=false    Multi-date comparison

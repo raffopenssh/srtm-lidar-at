@@ -978,10 +978,41 @@ def _segment_worker(task_id: str, features: list, params: dict, geometry_text: s
         _progress_error(task_id, str(e))
 
 
+def _unique_share_id(base_name: str) -> str:
+    """Return base_name if unused, otherwise append date + counter (e.g. MyArea-0415-2)."""
+    candidate = base_name
+    if not (SHARE_DIR / f"{candidate}.json.gz").exists():
+        return candidate
+    # Collision — append date stamp
+    date_suffix = time.strftime('%m%d')
+    candidate = f"{base_name}-{date_suffix}"
+    if not (SHARE_DIR / f"{candidate}.json.gz").exists():
+        return candidate
+    # Still collides — add counter
+    for i in range(2, 100):
+        candidate = f"{base_name}-{date_suffix}-{i}"
+        if not (SHARE_DIR / f"{candidate}.json.gz").exists():
+            return candidate
+    # Fallback
+    return f"{base_name}-{date_suffix}-{int(time.time()) % 10000}"
+
+
 def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dict):
     """Auto-save completed analysis as a share for recovery."""
     try:
-        share_id = f"auto-{task_id[:8]}"
+        # Check if onestop meta specifies a custom save name
+        custom_name = None
+        onestop_meta_path = _PROGRESS_DIR / f"{task_id}.onestop.json"
+        if onestop_meta_path.exists():
+            try:
+                meta = json.loads(onestop_meta_path.read_text())
+                custom_name = meta.get('params', {}).get('name')
+            except Exception:
+                pass
+        if custom_name and _valid_share_id(custom_name):
+            share_id = _unique_share_id(custom_name)
+        else:
+            share_id = f"auto-{task_id[:8]}"
         state = {
             'v': 1, 'center': [47.3, 15.3], 'zoom': 14,
             'endpoint': 'segment',
@@ -1009,7 +1040,7 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
                 state['center'] = [round(sum(lats)/len(lats), 6), round(sum(lngs)/len(lngs), 6)]
                 state['zoom'] = 15
 
-        name = f"Auto-save {time.strftime('%Y-%m-%d %H:%M')}"
+        name = custom_name if custom_name and _valid_share_id(custom_name) else f"Auto-save {time.strftime('%Y-%m-%d %H:%M')}"
         payload = {'state': state, 'result': result, 'name': name}
 
         # Tag one-stop shares with their onestop params for direct-download UX
@@ -3807,6 +3838,7 @@ def onestop():
 
     Query params (all via URL):
       bbox=lon_min,lat_min,lon_max,lat_max   Bounding box (required)
+      name=MySave                            Save name / share ID (slug, 1-80 chars, [A-Za-z0-9_-])
       min_object_size=10                     Min segment area in m² (default: 10)
       include_ortho=true                     Include orthophoto (default: true)
       include_temporal=false                 Include temporal analysis

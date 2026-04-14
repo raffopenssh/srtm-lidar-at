@@ -51,6 +51,8 @@ FEATURE_KEYS = [
     "dsm_edge_strength",
     # Spectral (BEV ortho 1m)
     "ndvi_mean", "ndvi_std", "brightness_mean", "nir_mean",
+    "red_mean", "green_mean", "green_ratio", "rg_index",
+    "nir_brightness_ratio",
     # Copernicus spectral
     "cop_ndvi_mean", "fused_ndvi_mean", "fused_ndvi_std",
     # ESA WorldCover

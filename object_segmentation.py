@@ -492,6 +492,10 @@ def extract_object_features(
     bev_ndvi = _get_spectral_layer(spectral, "ndvi", h, w)
     bev_brightness = _get_spectral_layer(spectral, "brightness", h, w)
     bev_nir = _get_spectral_layer(spectral, "nir", h, w)
+    bev_red = _get_spectral_layer(spectral, "red", h, w)
+    bev_green = _get_spectral_layer(spectral, "green", h, w)
+    bev_green_ratio = _get_spectral_layer(spectral, "green_ratio", h, w)
+    bev_rg_index = _get_spectral_layer(spectral, "rg_index", h, w)
 
     # --- Copernicus (resampled to 1m) ---
     cop_ndvi = _get_spectral_layer(cop, "ndvi", h, w) if cop else None
@@ -600,6 +604,15 @@ def extract_object_features(
         f["ndvi_mean"], f["ndvi_std"], f["ndvi_max"] = _seg_stats(bev_ndvi, seg_v)
         f["brightness_mean"] = _seg_mean(bev_brightness, seg_v)
         f["nir_mean"] = _seg_mean(bev_nir, seg_v)
+        f["red_mean"] = _seg_mean(bev_red, seg_v)
+        f["green_mean"] = _seg_mean(bev_green, seg_v)
+        f["green_ratio"] = _seg_mean(bev_green_ratio, seg_v)
+        f["rg_index"] = _seg_mean(bev_rg_index, seg_v)
+        # NIR brightness ratio: coniferous trees reflect less NIR per unit
+        # brightness than deciduous; useful for tree type discrimination.
+        nir_v = f["nir_mean"]
+        bri_v = f["brightness_mean"]
+        f["nir_brightness_ratio"] = nir_v / max(bri_v, 1.0) if nir_v > 0 else 0.0
         f["cop_ndvi_mean"] = _seg_mean(cop_ndvi, seg_v)
         # Fused NDVI: seasonal-corrected 1m (best of both worlds)
         f["fused_ndvi_mean"], f["fused_ndvi_std"], _ = _seg_stats(fused_ndvi, seg_v)

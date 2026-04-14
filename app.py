@@ -4470,6 +4470,16 @@ def parse_geometry_file():
         if not raw:
             return _error('Empty file', 400)
 
+        # Auto-decompress gzipped uploads (client may gzip text files)
+        if fname.endswith('.gz') or (len(raw) >= 2 and raw[:2] == b'\x1f\x8b'):
+            import gzip as _gzip
+            try:
+                raw = _gzip.decompress(raw)
+                if fname.endswith('.gz'):
+                    fname = fname[:-3]
+            except Exception:
+                pass  # not actually gzipped, use raw
+
         features = []
 
         # Content-sniff: detect KML/GeoJSON/WKT regardless of file extension

@@ -2118,12 +2118,16 @@ function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.sli
         const text=await file.text();
         const geojson=textToGeoJSON(text,ext);
         if(geojson){applyGeoJSON(geojson,file.name);return;}
-        // KML/GPX/GML/WKT/TXT: upload to server for parsing
+        // KML/GPX/GML/WKT/TXT: gzip text and upload to server
         showLoading('Parsing '+file.name+'...');
+        const blob=new Blob([text],{type:'text/plain'});
+        const gzBlob=typeof CompressionStream!=='undefined'
+          ?await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob()
+          :blob;
         const fd=new FormData();
-        // Preserve original filename; for .txt sniff content on server
-        fd.append('file',new Blob([text],{type:'text/plain'}),file.name);
+        fd.append('file',gzBlob,file.name+(gzBlob!==blob?'.gz':''));
         const resp=await fetch('/api/v1/parse-geometry',{method:'POST',body:fd});
+        if(!resp.ok){let msg='Server error ('+resp.status+')';try{const j=await resp.json();if(j.error)msg=j.error;}catch(e){}throw new Error(msg);}
         const data=await resp.json();
         if(data.error)throw new Error(data.error);
         applyGeoJSON(data,file.name);

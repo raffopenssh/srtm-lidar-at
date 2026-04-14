@@ -50,6 +50,12 @@ _RETRYABLE_PATTERNS = (
     "transfer closed",
     "Empty reply",
     "Recv failure",
+    "IReadBlock failed",
+    "TIFFReadEncodedTile",
+    "TIFFFillTile",
+    "Read error at row",
+    "Read failed",
+    "response_code=0",
 )
 
 

@@ -30,6 +30,8 @@ GDAL_ENV = {
     "GDAL_HTTP_VERSION": "2",
     "GDAL_HTTP_TIMEOUT": "30",
     "GDAL_HTTP_CONNECTTIMEOUT": "10",
+    "GDAL_HTTP_MAX_RETRY": "3",        # don't let GDAL retry forever internally
+    "GDAL_HTTP_RETRY_DELAY": "2",       # 2s between GDAL-level retries
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
     "VSI_CACHE": "TRUE",

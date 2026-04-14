@@ -385,6 +385,14 @@ def rasterize_cadastre_labels(
     return label_raster
 
 
+# Maximum NDVI for cadastre ground-surface types.
+# Segments above this threshold are vegetated → cadastre label unreliable.
+# Real roads/parking have NDVI < 0.15; at 0.25 it's clearly vegetation.
+_CADASTRE_SURFACE_MAX_NDVI = {
+    "road": 0.25, "path": 0.25, "parking": 0.25,
+    "bare_soil": 0.3,
+}
+
 # Maximum segment mean height (h_mean) for OSM ground-level type labels.
 # Segments above this are likely tree canopy/structures over the ground feature.
 _OSM_GROUND_TYPE_MAX_HEIGHT = {
@@ -420,8 +428,8 @@ def match_segments_via_raster(
     train_features = []
     train_labels = []
     source_counts = {
-        "cadastre_raster": 0, "osm": 0, "osm_height_rejected": 0,
-        "unmatched": 0,
+        "cadastre_raster": 0, "cadastre_ndvi_rejected": 0,
+        "osm": 0, "osm_height_rejected": 0, "unmatched": 0,
     }
 
     for feat in features_list:
@@ -448,10 +456,24 @@ def match_segments_via_raster(
             best_frac = counts[best_idx] / seg_px
 
             if best_frac >= min_overlap_frac and best_code in lc.CADASTRE_TO_TYPE:
-                train_features.append(feat)
-                train_labels.append(lc.CADASTRE_TO_TYPE[best_code])
-                source_counts["cadastre_raster"] += 1
-                continue
+                ctype = lc.CADASTRE_TO_TYPE[best_code]
+                # NDVI sanity: reject hard-surface labels on vegetated segments
+                max_ndvi = _CADASTRE_SURFACE_MAX_NDVI.get(ctype)
+                if max_ndvi is not None:
+                    seg_ndvi = feat.get("ndvi_mean", 0.0)
+                    if seg_ndvi > max_ndvi:
+                        source_counts["cadastre_ndvi_rejected"] += 1
+                        # Don't use — fall through to OSM or unmatched
+                    else:
+                        train_features.append(feat)
+                        train_labels.append(ctype)
+                        source_counts["cadastre_raster"] += 1
+                        continue
+                else:
+                    train_features.append(feat)
+                    train_labels.append(ctype)
+                    source_counts["cadastre_raster"] += 1
+                    continue
 
         # Fall back to OSM
         if osm_labels is not None:

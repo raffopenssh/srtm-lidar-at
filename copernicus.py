@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 # Credentials rotate monthly on the 1st. Keep old pair commented for reference.
 # OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
 # OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
-CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
+# OLD (account 1, out of credits): CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
+# OLD (account 1, out of credits): CLIENT_SECRET = "<REDACTED_SECRET>"
+CLIENT_ID = "sh-8d8c685f-df36-4536-b949-666532d08414"
 CLIENT_SECRET = "<REDACTED_SECRET>"
 OPENEO_URL = "openeo.dataspace.copernicus.eu"
 
@@ -81,6 +83,28 @@ WORLDCOVER_CLASSES: Dict[int, str] = {
 # ---------------------------------------------------------------------------
 
 _connection: Optional[Any] = None
+
+# Global flag: set when Copernicus returns 402 PaymentRequired.
+# Callers (e.g. rf_train) can check this to pause gracefully.
+credits_exhausted: bool = False
+_credits_exhausted_at: Optional[str] = None  # ISO timestamp
+
+
+class CreditsExhaustedError(Exception):
+    """Raised when Copernicus returns 402 PaymentRequired."""
+    pass
+
+
+def _check_credits_error(exc: Exception) -> None:
+    """If *exc* is a 402 PaymentRequired, set the global flag and re-raise
+    as CreditsExhaustedError so callers can handle it distinctly."""
+    global credits_exhausted, _credits_exhausted_at
+    msg = str(exc)
+    if '402' in msg and 'PaymentRequired' in msg:
+        credits_exhausted = True
+        _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+        logger.error("Copernicus credits exhausted — set credits_exhausted flag")
+        raise CreditsExhaustedError(msg) from exc
 
 
 def _get_connection() -> Any:
@@ -237,6 +261,7 @@ def _run_datacube(
                           SYNC_DOWNLOAD_TIMEOUT)
             break
         except Exception as exc:
+            _check_credits_error(exc)  # raises CreditsExhaustedError on 402
             exc_str = str(exc)
             if "429" in exc_str and attempt == 0:
                 logger.warning("Rate limited (429), waiting 10s before retry...")
@@ -491,6 +516,7 @@ def get_ndvi_timeseries(
                     )
                     _time.sleep(wait_secs)
                     continue
+                _check_credits_error(exc)  # raises CreditsExhaustedError on 402
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
         # Should not be reached, but guard anyway

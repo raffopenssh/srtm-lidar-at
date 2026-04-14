@@ -436,6 +436,14 @@ def training_status():
     result['next_model_checkpoint'] = next_cp
     result['to_next_model'] = max(0, next_cp - n_success)
 
+    # Credits paused?
+    pause_file = pathlib.Path('/home/exedev/srtm-lidar/rf_training_data/credits_paused.txt')
+    if pause_file.exists():
+        result['credits_paused'] = True
+        result['credits_paused_since'] = pause_file.read_text().strip().split('\n')[0]
+    else:
+        result['credits_paused'] = False
+
     # Model info
     meta_path = pathlib.Path('/tmp/learned_classifier/rf_meta.json')
     if meta_path.exists():

@@ -825,10 +825,14 @@ def process_one_kg(
                     except concurrent.futures.TimeoutError:
                         log.warning("KG %s: %s timed out after %ds, skipping",
                                     kg_code, name, timeout)
+                    except copernicus.CreditsExhaustedError:
+                        raise  # let it propagate — main loop will pause
                     except Exception as e:
                         log.debug("KG %s: %s failed: %s", kg_code, name, e)
 
             copernicus_data = cop if cop else None
+        except copernicus.CreditsExhaustedError:
+            raise  # propagate to main loop for pause
         except Exception as e:
             log.warning("KG %s: Copernicus: %s", kg_code, e)
         stats["copernicus_time"] = round(time.time() - t0, 1)
@@ -1244,6 +1248,48 @@ def main():
                 if IN_PROGRESS_FILE.exists():
                     IN_PROGRESS_FILE.unlink()
         except Exception as e:
+            # Detect Copernicus credits exhaustion from subprocess
+            if 'CreditsExhaustedError' in type(e).__name__ or \
+               ('402' in str(e) and 'PaymentRequired' in str(e)):
+                log.warning("\n" + "=" * 60)
+                log.warning("COPERNICUS CREDITS EXHAUSTED — PAUSING TRAINING")
+                log.warning("Update credentials in copernicus.py and restart rf_train")
+                log.warning("=" * 60)
+                # Write a marker file so the status endpoint can report it
+                pause_file = PERMANENT_DIR / "credits_paused.txt"
+                pause_file.write_text(
+                    f"{__import__('datetime').datetime.utcnow().isoformat()}\n"
+                    f"Copernicus credits exhausted. Waiting for new credits.\n"
+                )
+                # Don't mark KG as failed — we want to retry it
+                if IN_PROGRESS_FILE.exists():
+                    IN_PROGRESS_FILE.unlink()
+                # Sleep and retry periodically (15 min)
+                import copernicus as _cop
+                while True:
+                    log.info("Credits paused — sleeping 15 min before retry...")
+                    time.sleep(900)
+                    # Try a tiny request to see if credits are back
+                    try:
+                        _cop._connection = None  # force reconnect
+                        _cop.credits_exhausted = False
+                        conn = _cop._get_connection()
+                        cube = conn.load_collection(
+                            'SENTINEL2_L2A',
+                            spatial_extent={'west': 15, 'south': 47,
+                                            'east': 15.01, 'north': 47.01},
+                            temporal_extent=['2024-06-01', '2024-06-15'],
+                            bands=['B04'],
+                        )
+                        cube.max_time().download()
+                        log.info("Credits restored! Resuming training.")
+                        if pause_file.exists():
+                            pause_file.unlink()
+                        break
+                    except Exception:
+                        log.info("Still no credits — will retry in 15 min")
+                # Retry this KG (don't increment i, don't mark failed)
+                continue
             n_fail += 1
             log.error("  → EXCEPTION: %s", traceback.format_exc())
             all_stats.append({"kg_code": kg_code, "error": str(e), "index": i})

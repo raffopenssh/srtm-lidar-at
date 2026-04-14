@@ -1516,7 +1516,7 @@ def _diverging_rgb(t):
         return (int(255 - f * 37), int(255 - f * 192), int(255 - f * 192))
 
 
-def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', ndsm=None, type_overrides=None):
+def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', ndsm=None, type_overrides=None, height_filter=None):
     """Render segmentation labels as RGBA image.
 
     color_mode: 'type' = categorical colors, 'height' = viridis by height
@@ -1539,6 +1539,8 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', nd
             etype = _effective_type(obj_id, obj)
             if type_filter and etype not in type_filter:
                 continue
+            if height_filter and not height_filter(obj.height_max):
+                continue
             included |= (labels == obj_id)
         # Build viridis LUT (256 entries)
         lut = np.zeros((256, 3), dtype=np.uint8)
@@ -1552,6 +1554,8 @@ def _segment_rgba(labels, objects, mask, type_filter=None, color_mode='type', nd
         for obj_id, obj in obj_map.items():
             etype = _effective_type(obj_id, obj)
             if type_filter and etype not in type_filter:
+                continue
+            if height_filter and not height_filter(obj.height_max):
                 continue
             seg_mask = labels == obj_id
             color = SEGMENT_COLORS.get(etype, (128, 128, 128, 120))
@@ -2706,9 +2710,11 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
             seg_mask = mask
             seg_ndsm = data.get('ndsm')
 
+        hf = _parse_height_filter(params) if params else None
         rgba = _segment_rgba(
             labels, objects, seg_mask,
             type_filter, color_mode=color_mode, ndsm=seg_ndsm,
+            height_filter=hf,
         )
         return rgba
 

@@ -467,6 +467,23 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
           <p style="font-size:24px;margin-bottom:4px">📱 MBTiles Export</p>
           <p>Download individual raster layers as MBTiles for offline mobile use (e.g. in QField, Avenza Maps, OSMAND).</p>
           <div id="mbtiles-list" style="margin:12px 0"></div>
+          <div id="mbt-raster-filters" style="display:none;margin:8px 0;padding:10px;border:1px solid #eee;border-radius:8px;background:#fafbfc">
+            <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Segment Raster Filters</div>
+            <div class="export-ot-wrap">
+              <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+              <div id="mbt-ot-select" class="export-ot-select"><span id="mbt-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+              <div id="mbt-ot-dd" class="export-ot-dd"></div>
+            </div>
+            <div class="height-range-wrap" id="mbt-height-wrap">
+              <label>Object Height Range (m)</label>
+              <div class="height-range-track" id="mbt-hr-track">
+                <div class="height-range-fill" id="mbt-hr-fill"></div>
+                <div class="height-range-thumb" id="mbt-hr-min" tabindex="0"></div>
+                <div class="height-range-thumb" id="mbt-hr-max" tabindex="0"></div>
+              </div>
+              <div class="height-range-labels"><span id="mbt-hr-min-val">0 m</span><span id="mbt-hr-max-val">50 m</span></div>
+            </div>
+          </div>
           <p class="hint" style="display:block;color:#888;font-size:11px">Each layer is downloaded as a separate .mbtiles file. Async download — runs in background.</p>
         </div>
       </div>
@@ -1009,12 +1026,12 @@ function _updateHRVisual(prefix){
   lMax.textContent=(s.max>=HR_MAX?'50+ m':s.max.toFixed(1)+' m');
 }
 function buildExportTypeFilters(){
-  _initExportOT('gpkg'); _initExportOT('kml');
-  _initHeightRange('gpkg'); _initHeightRange('kml');
+  _initExportOT('gpkg'); _initExportOT('kml'); _initExportOT('mbt');
+  _initHeightRange('gpkg'); _initHeightRange('kml'); _initHeightRange('mbt');
   // Sync from map selectedTypes
-  _syncExportOTFromMap('gpkg'); _syncExportOTFromMap('kml');
+  _syncExportOTFromMap('gpkg'); _syncExportOTFromMap('kml'); _syncExportOTFromMap('mbt');
   // Sync height range from legend filter
-  _syncHeightRangeFromLegend('gpkg'); _syncHeightRangeFromLegend('kml');
+  _syncHeightRangeFromLegend('gpkg'); _syncHeightRangeFromLegend('kml'); _syncHeightRangeFromLegend('mbt');
 }
 function updateKmlState(){
   const btn=document.getElementById('btn-dl-kml');
@@ -2970,6 +2987,8 @@ function showFABIfGeometry(){
 
 // ============ MBTILES DOWNLOAD ============
 const MBTILES_LAYERS=[
+  {id:'raster',name:'Segment Raster',group:'Analysis'},
+  {id:'hansen',name:'Hansen Forest Δ',group:'Analysis'},
   {id:'dtm-2024',name:'DTM 2024',group:'LiDAR'},
   {id:'dtm-2023',name:'DTM 2023',group:'LiDAR'},
   {id:'dtm-2022',name:'DTM 2022',group:'LiDAR'},
@@ -2982,8 +3001,6 @@ const MBTILES_LAYERS=[
   {id:'cir-2024',name:'CIR ~2024',group:'Ortho'},
   {id:'cir-2023',name:'CIR ~2023',group:'Ortho'},
   {id:'cir-2020',name:'CIR ~2020',group:'Ortho'},
-  {id:'hansen',name:'Hansen Forest Δ',group:'Analysis'},
-  {id:'raster',name:'Segment Raster',group:'Analysis'},
 ];
 async function buildMBTilesList(){
   const el=document.getElementById('mbtiles-list');
@@ -3015,6 +3032,17 @@ async function buildMBTilesList(){
   }
   if(!anyShown)html='<p style="color:#999;font-size:12px">No layers available for the current map view.</p>';
   el.innerHTML=html;
+  // Move raster filter panel right after the Segment Raster row
+  const rasterFilterPanel=document.getElementById('mbt-raster-filters');
+  const rasterRow=document.getElementById('mbt-row-raster');
+  if(rasterFilterPanel){
+    if(rasterRow){
+      rasterRow.after(rasterFilterPanel);
+      rasterFilterPanel.style.display='block';
+    } else {
+      rasterFilterPanel.style.display='none';
+    }
+  }
 }
 async function downloadMBTiles(layerId,layerName,btn){
   const args=getPostArgs();
@@ -3022,7 +3050,16 @@ async function downloadMBTiles(layerId,layerName,btn){
   const origText=btn.textContent;
   btn.disabled=true;btn.textContent='⏳ Starting...';
   try{
-    const url=`/api/v1/export/mbtiles?layer=${layerId}&async=true`;
+    let qs=`layer=${layerId}&async=true`;
+    // For raster layer, pass object type + height filters
+    if(layerId==='raster'){
+      const mbtTypes=_getExportTypeFilter('mbt');
+      if(mbtTypes) qs+='&types='+encodeURIComponent(mbtTypes);
+      const mbtHF=_getHeightFilter('mbt');
+      if(mbtHF.height_min) qs+='&height_min='+mbtHF.height_min;
+      if(mbtHF.height_max) qs+='&height_max='+mbtHF.height_max;
+    }
+    const url=`/api/v1/export/mbtiles?${qs}`;
     const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
     if(!resp.ok)throw new Error((await resp.json()).error);
     const submit=await resp.json();

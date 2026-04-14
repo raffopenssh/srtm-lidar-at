@@ -1368,6 +1368,7 @@ function _applyLegendHeightFilter(){
   const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
   const{lo:hLo,hi:hHi}=_lhfGetRange();
   const fullRange=hLo===0&&hHi===Infinity;
+  // Filter markers
   for(const[t,markers]of Object.entries(markersByType)){
     const typeVis=segOn&&!hiddenTypes.has(t)&&selectedTypes.has(t);
     for(const m of markers){
@@ -1379,6 +1380,52 @@ function _applyLegendHeightFilter(){
       el.style.display=(h>=hLo&&h<=hHi)?'':'none';
     }
   }
+  // Filter raster overlay in height color mode
+  const rasterCb=document.querySelector('[data-lyr=raster]');
+  if(colorMode==='height'&&rasterCb&&rasterCb.checked&&_rasterOrigImg){
+    if(fullRange){_restoreRasterFromOrig();}
+    else{_filterRasterByHeight(hLo,hHi);}
+  }
+}
+function _restoreRasterFromOrig(){
+  if(!_rasterOrigImg||!overlays.raster) return;
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth;c.height=_rasterOrigImg.naturalHeight;
+  c.getContext('2d').drawImage(_rasterOrigImg,0,0);
+  overlays.raster.setUrl(c.toDataURL('image/png'));
+}
+function _filterRasterByHeight(hLo,hHi){
+  if(!_rasterOrigImg||!overlays.raster) return;
+  // Build set of allowed RGB keys from viridis in the height range
+  // Height mapping: t = sqrt(h/45), so h = t²*45
+  const tLo=Math.sqrt(Math.max(0,hLo)/LHF_MAX_M);
+  const tHi=Math.min(1,hHi===Infinity?1:Math.sqrt(hHi/LHF_MAX_M));
+  const allowed=new Set();
+  // Sample viridis at fine resolution across full range, keep those in [tLo,tHi]
+  for(let i=0;i<=500;i++){
+    const t=i/500;
+    if(t>=tLo-0.005&&t<=tHi+0.005){
+      const[r,g,b]=viridis(t);
+      // Add with ±2 tolerance for rounding
+      for(let dr=-2;dr<=2;dr++)for(let dg=-2;dg<=2;dg++)for(let db=-2;db<=2;db++){
+        const rr=r+dr,gg=g+dg,bb=b+db;
+        if(rr>=0&&rr<=255&&gg>=0&&gg<=255&&bb>=0&&bb<=255)
+          allowed.add((rr<<16)|(gg<<8)|bb);
+      }
+    }
+  }
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth;c.height=_rasterOrigImg.naturalHeight;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(_rasterOrigImg,0,0);
+  const imgData=ctx.getImageData(0,0,c.width,c.height);
+  const d=imgData.data;
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]===0) continue;
+    if(!allowed.has((d[i]<<16)|(d[i+1]<<8)|d[i+2])) d[i+3]=0;
+  }
+  ctx.putImageData(imgData,0,0);
+  overlays.raster.setUrl(c.toDataURL('image/png'));
 }
 function markerColor(f){
   const p=f.properties;
@@ -1593,6 +1640,13 @@ async function loadRasterOverlay(typeFilter, shareId){
 }
 
 function applyRasterTypeFilter(){
+  // In height mode, apply height filter instead of type filter
+  if(colorMode==='height'&&_rasterOrigImg){
+    const{lo,hi}=_lhfGetRange();
+    if(lo===0&&hi===Infinity) _restoreRasterFromOrig();
+    else _filterRasterByHeight(lo,hi);
+    return;
+  }
   // Client-side instant filtering: redraw cached overlay with hidden types transparent
   if(colorMode!=='type'||!_rasterOrigImg){
     // Fall back to server-side for height mode or if no cached image

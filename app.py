@@ -1011,6 +1011,14 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
 
         name = f"Auto-save {time.strftime('%Y-%m-%d %H:%M')}"
         payload = {'state': state, 'result': result, 'name': name}
+
+        # Tag one-stop shares with their onestop params for direct-download UX
+        onestop_meta_path = _PROGRESS_DIR / f"{task_id}.onestop.json"
+        if onestop_meta_path.exists():
+            try:
+                payload['onestop'] = json.loads(onestop_meta_path.read_text())
+            except Exception:
+                pass
         data_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
         data = gzip.compress(data_json.encode())
 
@@ -4355,6 +4363,7 @@ def share_list():
                         tags.append(f"{n_features} objects")
                 elif has_geometry:
                     tags.append('geometry only')
+                is_onestop = 'onestop' in data
                 items.append(dict(
                     id=share_id,
                     name=name,
@@ -4364,6 +4373,7 @@ def share_list():
                     endpoint=endpoint,
                     updated=f.stat().st_mtime,
                     size_kb=round(f.stat().st_size / 1024, 1),
+                    onestop=is_onestop,
                 ))
             except Exception:
                 items.append(dict(id=share_id, name=share_id, description='', has_result=False,

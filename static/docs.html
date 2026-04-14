@@ -259,6 +259,7 @@ td code { font-size: 12px; }
     <a href="#async-tasks">Async Tasks</a>
     <a href="#overlays">Overlays</a>
     <a href="#exports">Exports</a>
+    <a href="#one-stop-url">One-Stop URL</a>
     <a href="#shares">Shares</a>
     <a href="#utilities">Utilities</a>
   </div>
@@ -690,6 +691,9 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/segment/res
     <tbody>
       <tr><td>layers</td><td>string</td><td><code>all</code> (default) or comma-separated layer IDs — see table below.</td></tr>
       <tr><td>types</td><td>string</td><td>Segment type filter. Example: <code>"tree,road"</code></td></tr>
+      <tr><td>height_min</td><td>number</td><td>Keep segments with height &ge; this value (metres)</td></tr>
+      <tr><td>height_max</td><td>number</td><td>Keep segments with height &le; this value (metres)</td></tr>
+      <tr><td>height_op</td><td>string</td><td><code>gt</code>, <code>lt</code>, or <code>between</code>. Auto-inferred from min/max if omitted.</td></tr>
       <tr><td>color_mode</td><td>string</td><td><code>type</code> (default) or <code>height</code> — segment colouring scheme.</td></tr>
       <tr><td>async</td><td>boolean</td><td>If <code>true</code>, returns 202 with <code>{task_id}</code> for polling. <span class="param-default">Default: <code>false</code></span></td></tr>
     </tbody>
@@ -787,6 +791,177 @@ curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohl
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span> \
   <span class="tok-flag">-o</span> lidar.tif</code></pre>
+</div>
+
+<!-- ==================== ONE-STOP URL ==================== -->
+<h2 id="one-stop-url">One-Stop URL <a class="anchor-link" href="#one-stop-url">#</a></h2>
+
+<p>
+  A single <strong>bookmarkable GET URL</strong> that triggers segmentation, auto-saves the result,
+  and delivers a downloadable file. Designed for users on limited or mobile connections who want
+  to run an analysis without the web UI.
+</p>
+
+<div class="callout" style="background:linear-gradient(135deg,#f0f7ff 0%,#e8f4f8 100%);border-left:4px solid #0d7377;padding:18px 20px;margin:24px 0;border-radius:0 8px 8px 0;">
+  <div class="callout-title" style="font-size:15px;color:#0d7377;">How it works</div>
+  <ol style="margin:8px 0 0 20px;font-size:13px;line-height:2;color:#334155;">
+    <li><strong>Start:</strong> <code>GET /api/v1/onestop?bbox=...&format=gpkg</code> → returns 202 with <code>task_id</code> and <code>poll_url</code></li>
+    <li><strong>Poll:</strong> Repeat the <code>poll_url</code> every 5–10 seconds until <code>status=done</code></li>
+    <li><strong>Download:</strong> The final poll automatically returns the file (GPKG, KML, or JSON)</li>
+  </ol>
+  <p style="margin:10px 0 0;font-size:12px;color:#666;">The result is auto-saved as a share, so you can re-download later via the Load menu (⬇ icon) or the share URL.</p>
+</div>
+
+<div class="endpoint-card" id="ep-onestop">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <span class="endpoint-path">/api/v1/onestop</span>
+  </div>
+  <p class="ep-desc">
+    Segment a bounding box and download the result in one step. All parameters are in the URL — no POST body needed.
+  </p>
+
+  <h4>URL Parameters</h4>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>bbox</td><td>string</td><td><strong>Required.</strong> Bounding box: <code>lon_min,lat_min,lon_max,lat_max</code> (WGS 84)</td></tr>
+      <tr><td>format</td><td>string</td><td>Output format: <code>json</code> (default), <code>gpkg</code>, or <code>kml</code></td></tr>
+      <tr><td>min_object_size</td><td>integer</td><td>Min segment area in m². <span class="param-default">Default: <code>10</code></span></td></tr>
+      <tr><td>include_ortho</td><td>boolean</td><td>Include 20 cm orthophoto features. <span class="param-default">Default: <code>true</code></span></td></tr>
+      <tr><td>include_temporal</td><td>boolean</td><td>Include 3-date temporal comparison. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_copernicus</td><td>boolean</td><td>Sentinel-2 NDVI + SAR + WorldCover. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_cadastre</td><td>boolean</td><td>Cadastre building footprint ground truth. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>include_hansen</td><td>boolean</td><td>Hansen Global Forest Change. <span class="param-default">Default: <code>false</code></span></td></tr>
+      <tr><td>types</td><td>string</td><td>Object type filter. Example: <code>tree,roof</code></td></tr>
+      <tr><td>height_min</td><td>number</td><td>Keep only objects with height ≥ this value (metres)</td></tr>
+      <tr><td>height_max</td><td>number</td><td>Keep only objects with height ≤ this value (metres)</td></tr>
+      <tr><td>height_op</td><td>string</td><td><code>gt</code>, <code>lt</code>, or <code>between</code>. Auto-inferred from min/max if omitted.</td></tr>
+      <tr><td>layers</td><td>string</td><td>GPKG layers to include. <span class="param-default">Default: <code>segments</code> (raster + vector)</span></td></tr>
+      <tr><td>group_by</td><td>string</td><td>KML folder grouping: <code>type</code> (default) or <code>height_class</code></td></tr>
+      <tr><td>task_id</td><td>string</td><td>Poll a previously started task (omit bbox when using this)</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h4 style="margin-top:20px">Building the URL</h4>
+  <p style="font-size:13px;line-height:1.8;color:#555;">
+    The URL is straightforward to construct — just append query parameters:
+  </p>
+  <div class="code-wrap" style="margin:12px 0;">
+    <pre style="font-size:12px;"><code>https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop
+  ?bbox=<em>lon_min</em>,<em>lat_min</em>,<em>lon_max</em>,<em>lat_max</em>
+  &amp;format=gpkg
+  &amp;types=tree
+  &amp;height_min=20
+  &amp;include_ortho=true</code></pre>
+  </div>
+  <p style="font-size:13px;color:#555;">
+    <strong>Tip:</strong> Get a bounding box from <a href="https://boundingbox.klokantech.com/" target="_blank" rel="noopener">boundingbox.klokantech.com</a>
+    (select CSV format) or from Google Maps by right-clicking two corners.
+    Keep the area under 1 km² for fast results.
+  </p>
+
+  <h4 style="margin-top:20px">Height Filter</h4>
+  <p style="font-size:13px;line-height:1.8;color:#555;">
+    The height filter works like a WHERE clause on <code>height_max_m</code>. It applies to
+    GPKG vector segments, GPKG raster segments, KML placemarks, and JSON features.
+  </p>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>You want</th><th>URL parameters</th></tr></thead>
+    <tbody>
+      <tr><td>Trees &gt; 30 m</td><td><code>types=tree&amp;height_min=30</code></td></tr>
+      <tr><td>Objects &lt; 5 m</td><td><code>height_max=5</code></td></tr>
+      <tr><td>Between 10–25 m</td><td><code>height_min=10&amp;height_max=25</code></td></tr>
+      <tr><td>Roofs 5–15 m</td><td><code>types=roof&amp;height_min=5&amp;height_max=15</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h4 style="margin-top:20px">Timing Estimates (<span style="font-weight:400">&lt; 1 km²</span>)</h4>
+  <div class="table-wrap">
+  <table class="param-table">
+    <thead><tr><th>Configuration</th><th>Est. time</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Ortho only (default)</td><td>~30–60 s</td><td>DTM + DSM + orthophoto</td></tr>
+      <tr><td>Ortho + temporal</td><td>~60–90 s</td><td>+ 3-date comparison</td></tr>
+      <tr><td>All sources</td><td>~90–120 s</td><td>+ Copernicus + cadastre + Hansen</td></tr>
+      <tr><td>GPKG / KML export</td><td>+ 5–10 s</td><td>Added on top of analysis</td></tr>
+      <tr><td>Auto-save</td><td>+ 1–2 s</td><td>Always happens automatically</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-size:12px;color:#888;margin-top:6px;">
+    A 0.5 km² area with ortho takes about 40 s total. A 0.1 km² area about 25 s.
+    On slow mobile connections, GPKG download (1–5 MB) may add 5–30 s.
+  </p>
+
+  <h4 style="margin-top:20px">Processing Queue</h4>
+  <p style="font-size:13px;line-height:1.8;color:#555;">
+    The server limits concurrent analyses to <strong>2 at a time</strong>, with up to <strong>4 in the queue</strong>.
+    If the queue is full, the API returns <code>503 Service Unavailable</code> with <code>retry_after_seconds</code>.
+    Your task will show <code>step: "queued"</code> while waiting for a slot.
+  </p>
+
+  <h4 style="margin-top:20px">Examples</h4>
+
+  <div class="code-wrap">
+    <div class="code-header"><span>Example 1 — Trees &gt; 20 m as GeoPackage</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code><span class="tok-comment"># Start analysis (returns task_id + poll_url)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;height_min=20&amp;format=gpkg'</span>
+
+<span class="tok-comment"># Response:</span>
+<span class="tok-comment"># {"task_id":"abc123...","status":"running","poll_url":"...?task_id=abc123...&amp;format=gpkg","estimated_seconds":35}</span>
+
+<span class="tok-comment"># Poll until done (repeat every 5s)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span>
+
+<span class="tok-comment"># When done: the response IS the .gpkg file — pipe to a file</span>
+curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span></code></pre>
+  </div>
+
+  <div class="code-wrap">
+    <div class="code-header"><span>Example 2 — All objects as KML, grouped by height</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&amp;include_temporal=true&amp;format=kml&amp;group_by=height_class'</span></code></pre>
+  </div>
+
+  <div class="code-wrap">
+    <div class="code-header"><span>Example 3 — Buildings 5–15 m, with ortho + cadastre</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=roof&amp;height_min=5&amp;height_max=15&amp;include_cadastre=true&amp;format=gpkg'</span></code></pre>
+  </div>
+
+  <div class="code-wrap">
+    <div class="code-header"><span>Example 4 — Full automation (shell script)</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code><span class="tok-comment">#!/bin/bash</span>
+<span class="tok-comment"># Analyse a bounding box and download the GPKG when ready</span>
+BASE=<span class="tok-string">"https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop"</span>
+BBOX=<span class="tok-string">"15.40,47.07,15.405,47.076"</span>
+
+<span class="tok-comment"># Start</span>
+RESP=$(curl -s <span class="tok-string">"$BASE?bbox=$BBOX&amp;types=tree&amp;height_min=20&amp;format=gpkg"</span>)
+TASK=$(echo $RESP | python3 -c <span class="tok-string">"import json,sys; print(json.load(sys.stdin)['task_id'])"</span>)
+echo <span class="tok-string">"Task: $TASK"</span>
+
+<span class="tok-comment"># Poll every 5 seconds</span>
+while true; do
+  HTTP_CODE=$(curl -s -o /tmp/result.gpkg -w <span class="tok-string">'%{http_code}'</span> <span class="tok-string">"$BASE?task_id=$TASK&amp;format=gpkg"</span>)
+  if [ <span class="tok-string">"$HTTP_CODE"</span> = <span class="tok-string">"200"</span> ]; then
+    echo <span class="tok-string">"✅ Downloaded /tmp/result.gpkg"</span>
+    break
+  fi
+  echo <span class="tok-string">"⏳ Still processing (HTTP $HTTP_CODE)..."</span>
+  sleep 5
+done</code></pre>
+  </div>
+
+  <h4 style="margin-top:20px">Download from the Load menu</h4>
+  <p style="font-size:13px;line-height:1.8;color:#555;">
+    Results created via one-stop URLs appear in the <strong>📂 Load</strong> dropdown in the web UI.
+    Each one-stop entry shows a <strong>⬇</strong> icon for a quick GeoPackage download — no need to load
+    the full analysis first.
+  </p>
 </div>
 
 <!-- ==================== SHARES ==================== -->

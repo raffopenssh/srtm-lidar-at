@@ -1945,7 +1945,7 @@ _loadBtn.onclick=async()=>{
         const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
         const desc=s.description||'saved share';
         const ago=_timeAgo(s.updated);
-        const dlIcon = s.has_result ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
+        const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
         sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
       }
       area.innerHTML=sh;

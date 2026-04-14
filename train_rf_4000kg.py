@@ -457,10 +457,13 @@ def match_segments_via_raster(
 
             if best_frac >= min_overlap_frac and best_code in lc.CADASTRE_TO_TYPE:
                 ctype = lc.CADASTRE_TO_TYPE[best_code]
-                # NDVI sanity: reject hard-surface labels on vegetated segments
+                # NDVI sanity: reject hard-surface labels on vegetated segments.
+                # Use fused NDVI (season-corrected) when available — BEV NDVI
+                # can be very low in winter orthos even on green pastures.
                 max_ndvi = _CADASTRE_SURFACE_MAX_NDVI.get(ctype)
                 if max_ndvi is not None:
-                    seg_ndvi = feat.get("ndvi_mean", 0.0)
+                    seg_ndvi = feat.get("fused_ndvi_mean", 0.0) or \
+                               feat.get("ndvi_mean", 0.0)
                     if seg_ndvi > max_ndvi:
                         source_counts["cadastre_ndvi_rejected"] += 1
                         # Don't use — fall through to OSM or unmatched

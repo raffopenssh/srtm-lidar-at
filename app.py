@@ -4598,7 +4598,7 @@ def parse_geometry_file():
 
 SHARE_DIR = Path('data/shares')
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
-SHARE_MAX_BYTES = 1_000_000_000  # 1 GB
+SHARE_MAX_BYTES = 2_000_000_000  # 2 GB
 
 _SHARE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,80}$')  # hex hashes or named slugs
 def _valid_share_id(s):

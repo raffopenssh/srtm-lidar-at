@@ -1912,6 +1912,16 @@ function updateGeoInputDisplay(label, source){
       } else txt.textContent=t;
     }catch(e){txt.textContent='Custom geometry';}
   }
+  // Append area estimate
+  try{
+    const geoJ=JSON.parse(geo);
+    const areaM2=turf.area({type:'Feature',geometry:geoJ,properties:{}});
+    if(areaM2>0){
+      const ha=areaM2/10000;
+      const areaStr=ha>=1?`${ha.toFixed(1)} ha`:`${Math.round(areaM2)} m²`;
+      txt.textContent+=`, ${areaStr}`;
+    }
+  }catch(e){/* ignore */}
   if(source==='share') ico.textContent='\ud83d\udd17';
   else if(source==='file') ico.textContent='\ud83d\udcc4';
   else if(source==='drawn') ico.textContent='\u270f\ufe0f';

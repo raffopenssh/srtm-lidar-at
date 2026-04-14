@@ -300,15 +300,18 @@ def calibrate_tree_loss(
             # If was forest but no Hansen loss: could be very recent,
             # keep existing confidence (our LIDAR is more recent than Hansen)
 
-        elif obj.obj_type in ("tree", "shrub", "grass", "bare_soil"):
-            # Vegetation on recent Hansen loss area → possible tree_loss
-            # that has regrown or is being classified as vegetation
-            if recent_frac > 0.5 and forest_frac > 0.5:
-                # Strong Hansen loss signal on former forest
-                # Only reclassify if our temporal data also suggests change
-                h_change = abs(obj.height_change)
-                dtm_change_abs = abs(obj.dtm_change)
-                if h_change > 0.5 or obj.temporal_stability < 0.6:
+        elif obj.obj_type in ("tree", "shrub", "grass", "bare_soil", "crop"):
+            # Vegetation/ground on recent Hansen loss area → possible tree_loss
+            if recent_frac > 0.3 and forest_frac > 0.3:
+                # Strong Hansen loss signal on former forest.
+                # Evidence of clearing: temporal change OR low current canopy
+                # (temporal data may be absent if only one LIDAR date exists).
+                h_change_abs = abs(obj.height_change)
+                has_temporal_evidence = (
+                    h_change_abs > 0.5 or obj.temporal_stability < 0.6
+                )
+                has_height_evidence = obj.height_mean < 3.0  # cleared canopy
+                if has_temporal_evidence or has_height_evidence:
                     from object_segmentation import OBJECT_TYPES
                     obj.obj_type = "tree_loss"
                     obj.type_code = OBJECT_TYPES["tree_loss"]

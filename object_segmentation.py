@@ -185,6 +185,10 @@ class SegmentedObject:
     height_change: float = 0.0  # nDSM change across dates
     dtm_change: float = 0.0    # terrain change (machinery)
     temporal_stability: float = 1.0  # 0=volatile, 1=stable
+    # Volume change (DTM-based, m³ at 1m resolution)
+    volume_change_m3: float = 0.0  # net: +fill, -cut
+    volume_change_abs_m3: float = 0.0  # total disturbed volume
+    dtm_change_max: float = 0.0  # max absolute terrain shift in segment
     # Shape / boundary
     solidity: float = 0.0  # area / convex_hull_area
     extent: float = 0.0    # area / bbox_area
@@ -655,6 +659,11 @@ def extract_object_features(
         f["dtm_change"] = _seg_mean(temporal_dtm_change, seg_v)
         f["dtm_change_abs"] = _seg_mean_abs(temporal_dtm_change, seg_v)
         f["stability"] = 1.0 / (1.0 + f["temporal_h_std"] + f["dtm_change_abs"])
+        # Volume-change features (at 1m res, sum of ΔZ ≈ m³)
+        f["volume_change_m3"] = _seg_sum(temporal_dtm_change, seg_v)
+        f["volume_change_abs_m3"] = _seg_sum(np.abs(temporal_dtm_change) if temporal_dtm_change is not None else None, seg_v)
+        f["dtm_change_max"] = float(np.nanmax(np.abs(temporal_dtm_change[seg_v]))) if temporal_dtm_change is not None and seg_v.any() else 0.0
+        f["dtm_change_frac_03m"] = _seg_frac_above(temporal_dtm_change, seg_v, 0.3)
 
         # Hansen Global Forest Change
         if hansen_tc is not None:
@@ -701,6 +710,26 @@ def _seg_mean_abs(arr: np.ndarray | None, seg: np.ndarray) -> float:
     sv = np.abs(arr[seg])
     valid = np.isfinite(sv)
     return float(np.nanmean(sv[valid])) if valid.any() else 0.0
+
+
+def _seg_sum(arr: np.ndarray | None, seg: np.ndarray) -> float:
+    """Sum of valid pixel values within segment (e.g. for volume = Σ ΔZ m³ at 1m res)."""
+    if arr is None:
+        return 0.0
+    sv = arr[seg]
+    valid = np.isfinite(sv)
+    return float(np.nansum(sv[valid])) if valid.any() else 0.0
+
+
+def _seg_frac_above(arr: np.ndarray | None, seg: np.ndarray, threshold: float) -> float:
+    """Fraction of segment pixels where abs(value) > threshold."""
+    if arr is None:
+        return 0.0
+    sv = arr[seg]
+    valid = np.isfinite(sv)
+    if not valid.any():
+        return 0.0
+    return float(np.sum(np.abs(sv[valid]) > threshold)) / float(valid.sum())
 
 
 def _fuse_ndvi(
@@ -854,6 +883,10 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     dtm_change_abs = feat.get("dtm_change_abs", 0)
     stability = feat.get("stability", 1)
     temporal_h_std = feat.get("temporal_h_std", 0)
+    volume_change = feat.get("volume_change_m3", 0)
+    volume_change_abs = feat.get("volume_change_abs_m3", 0)
+    dtm_change_max = feat.get("dtm_change_max", 0)
+    dtm_change_frac = feat.get("dtm_change_frac_03m", 0)
     solidity = feat.get("solidity", 0)
     extent = feat.get("extent", 0)
     dsm_edge = feat.get("dsm_edge_strength", 0)
@@ -928,11 +961,20 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
     dtm_signal_strong = dtm_change_abs > 0.8  # unambiguous earthwork
     dtm_signal_mod = dtm_change_abs > 0.4     # moderate, needs corroboration
 
-    if big_enough_earthwork and not is_green and (dtm_signal_strong or (dtm_signal_mod and on_ground)):
-        if dtm_change < -0.4:
-            return "excavation", OBJECT_TYPES["excavation"], min(0.4 + dtm_change_abs, 0.95), True
-        if dtm_change > 0.4:
-            return "fill", OBJECT_TYPES["fill"], min(0.4 + dtm_change_abs, 0.95), True
+    # Volume-enhanced detection: dtm_change_frac tells us what portion of
+    # the segment is disturbed; volume_change gives the net m³ moved.
+    # dtm_change_max catches localised deep cuts even when mean is low.
+    has_volume_signal = (volume_change_abs > 50 or dtm_change_max > 1.0 or dtm_change_frac > 0.3)
+
+    if big_enough_earthwork and not is_green and (
+        dtm_signal_strong or (dtm_signal_mod and on_ground) or
+        (has_volume_signal and not is_veg_like and on_ground)
+    ):
+        conf = min(0.4 + dtm_change_abs + 0.1 * min(abs(volume_change) / 100, 1.0), 0.95)
+        if dtm_change < -0.4 or volume_change < -50:
+            return "excavation", OBJECT_TYPES["excavation"], conf, True
+        if dtm_change > 0.4 or volume_change > 50:
+            return "fill", OBJECT_TYPES["fill"], conf, True
 
     # --- nDSM change: something was built, removed, or felled ---
     if abs(h_change) > 2.0 and temporal_h_std > 1.0:
@@ -1791,6 +1833,9 @@ def segment_and_classify(
             height_change=round(feat.get("h_change", 0), 3),
             dtm_change=round(feat.get("dtm_change", 0), 3),
             temporal_stability=round(feat.get("stability", 1), 3),
+            volume_change_m3=round(feat.get("volume_change_m3", 0), 1),
+            volume_change_abs_m3=round(feat.get("volume_change_abs_m3", 0), 1),
+            dtm_change_max=round(feat.get("dtm_change_max", 0), 3),
             solidity=round(feat.get("solidity", 0), 3),
             extent=round(feat.get("extent", 0), 3),
             dsm_edge_strength=round(feat.get("dsm_edge_strength", 0), 3),

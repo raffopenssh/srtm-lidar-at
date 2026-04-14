@@ -1301,6 +1301,9 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             props["height_change"] = obj.height_change
             props["dtm_change"] = obj.dtm_change
             props["temporal_stability"] = obj.temporal_stability
+            props["volume_change_m3"] = obj.volume_change_m3
+            props["volume_change_abs_m3"] = obj.volume_change_abs_m3
+            props["dtm_change_max"] = obj.dtm_change_max
         # Texture features
         if obj.glcm_entropy > 0:
             props["glcm_entropy"] = obj.glcm_entropy

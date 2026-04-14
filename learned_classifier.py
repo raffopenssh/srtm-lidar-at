@@ -61,6 +61,9 @@ FEATURE_KEYS = [
     # Temporal
     "h_change", "dtm_change", "dtm_change_abs",
     "temporal_h_std", "stability",
+    # Volume change (m³ at 1m res)
+    "volume_change_m3", "volume_change_abs_m3",
+    "dtm_change_max", "dtm_change_frac_03m",
     # GLCM texture
     "glcm_contrast", "glcm_homogeneity", "glcm_entropy",
     "glcm_dissimilarity", "glcm_energy", "texture_complexity",

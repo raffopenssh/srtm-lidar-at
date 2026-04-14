@@ -504,6 +504,27 @@ def match_segments_via_raster(
 
         source_counts["unmatched"] += 1
 
+    # Post-pass: relabel tree_loss from Hansen evidence
+    # Cadastre/OSM never label tree_loss, but Hansen + LIDAR height can.
+    # Criteria: strong recent Hansen loss + evidence of cleared canopy.
+    n_relabelled = 0
+    for i, (feat, lbl) in enumerate(zip(train_features, train_labels)):
+        if lbl not in ("tree", "shrub", "grass", "bare_soil", "crop"):
+            continue
+        hrlf = feat.get("hansen_recent_loss_frac", 0.0)
+        tc2000 = feat.get("hansen_treecover2000", 0.0)
+        h_mean = feat.get("h_mean", 0.0)
+        h_change = feat.get("h_change", 0.0)
+        # Must have been forest (tc2000 > 30) with recent Hansen loss
+        if hrlf < 0.3 or tc2000 < 30:
+            continue
+        # Evidence of cleared canopy: low current height OR significant drop
+        if h_mean < 3.0 or h_change < -2.0:
+            train_labels[i] = "tree_loss"
+            n_relabelled += 1
+    if n_relabelled:
+        source_counts["hansen_tree_loss"] = n_relabelled
+
     return train_features, train_labels, source_counts
 
 

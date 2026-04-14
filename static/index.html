@@ -191,13 +191,40 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .summary-table td{padding:4px 8px;border-bottom:1px solid #f0f0f0}
 .summary-table .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
 /* GeoPackage export tab */
-.gpkg-info{padding:12px 0}
-.gpkg-info p{color:#666;font-size:13px;margin:8px 0}
-.gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:8px}
-.gpkg-layers{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;margin:10px 0;font-size:12px}
-.gpkg-layers label{display:flex;align-items:center;gap:5px;cursor:pointer;padding:3px 0}
+.gpkg-info{padding:4px 0}
+.gpkg-info>p{color:#666;font-size:12px;margin:2px 0 6px}
+.gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:6px}
+.gpkg-layers{margin:0 0 4px;font-size:12px}
+.gpkg-layers label{display:flex;align-items:center;gap:5px;cursor:pointer;padding:2px 0}
 .gpkg-layers label input{margin:0}
-.gpkg-layers .gpkg-group{grid-column:1/-1;font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-top:6px;padding-bottom:2px;border-bottom:1px solid #eee}
+.gpkg-layers .gpkg-lyr-group{display:none;grid-template-columns:1fr 1fr;gap:1px 12px;padding:2px 0 2px 4px}
+.gpkg-layers .gpkg-lyr-group.open{display:grid}
+.gpkg-layers .gpkg-group{font-weight:600;font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:4px 0 2px;border-bottom:1px solid #f0f0f0;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}
+.gpkg-layers .gpkg-group:hover{color:#333}
+.gpkg-layers .gpkg-group .gpkg-arrow{font-size:8px;transition:transform .15s}
+.gpkg-layers .gpkg-group.expanded .gpkg-arrow{transform:rotate(90deg)}
+
+/* Export type selector (reuses ot-* pattern) */
+.export-ot-wrap{position:relative;margin:8px 0}
+.export-ot-select{display:flex;align-items:center;padding:6px 10px;border:1px solid #ccc;border-radius:6px;font-size:12px;cursor:pointer;background:#fff;min-height:32px;user-select:none}
+.export-ot-select:hover{border-color:#0d7377}
+.export-ot-dd{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:0 0 6px 6px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:9999;max-height:220px;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0;display:none}
+.export-ot-dd.open{display:block}
+.export-ot-dd .ot-group{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:6px 10px 2px;user-select:none}
+.export-ot-dd label{display:flex;align-items:center;gap:6px;padding:4px 10px;font-size:12px;font-weight:400;cursor:pointer;margin:0}
+.export-ot-dd label:hover{background:#f0f8f8}
+.export-ot-dd label .ot-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.export-ot-dd .ot-actions{display:flex;gap:4px;padding:4px 10px;border-top:1px solid #eee;margin-top:2px}
+.export-ot-dd .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
+.export-ot-dd .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
+/* Height range slider */
+.height-range-wrap{margin:10px 0}
+.height-range-wrap label{font-size:12px;font-weight:600;color:#555;display:block;margin-bottom:4px}
+.height-range-track{position:relative;height:6px;background:#e0e0e0;border-radius:3px;margin:12px 4px 6px}
+.height-range-fill{position:absolute;height:100%;background:#0d7377;border-radius:3px}
+.height-range-thumb{position:absolute;top:50%;width:20px;height:20px;background:#fff;border:2px solid #0d7377;border-radius:50%;transform:translate(-50%,-50%);cursor:grab;touch-action:none;z-index:2;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.height-range-thumb:active{cursor:grabbing;transform:translate(-50%,-50%) scale(1.15)}
+.height-range-labels{display:flex;justify-content:space-between;font-size:11px;color:#666}
 
 /* ===== GPS CONTROL ===== */
 .leaflet-control-gps{display:none}
@@ -233,16 +260,27 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   label{margin:4px 0 2px}
   .btn{padding:6px 10px;font-size:12px}
   .fab-download .btn{padding:8px 14px;font-size:12px}
-  .modal{max-height:90vh;border-radius:8px}
+  .modal{max-height:92vh;border-radius:12px 12px 0 0;margin-top:auto;max-width:100%}
   .modal-header{padding:10px 14px}
+  .modal-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;flex-wrap:nowrap}
+  .modal-tab{padding:8px 8px;font-size:11px;white-space:nowrap;min-width:0}
   .tab-pane{padding:12px 14px}
+  .gpkg-layers{grid-template-columns:1fr;gap:4px 0;font-size:13px}
+  .gpkg-layers label{padding:6px 0;min-height:36px}
+  .gpkg-layers label input[type=checkbox]{width:20px;height:20px}
+  .gpkg-info .btn{width:100%;justify-content:center;padding:14px 20px;font-size:15px}
   .summary-grid{grid-template-columns:1fr}
   .hint{display:none}
+  .export-ot-select{min-height:38px;font-size:13px}
+  .export-ot-dd{max-height:45vh}
+  .export-ot-dd label{padding:6px 10px;font-size:13px;min-height:36px}
+  .height-range-thumb{width:24px;height:24px}
 }
 @media(max-width:600px){
   .controls{max-height:calc(35vh - 60px)}
   .extra-params .row{flex-direction:column;gap:4px}
   .cb-row{gap:6px}
+  .export-ot-dd{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25)}
   .ot-dropdown,.load-dropdown.open{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);min-width:unset}
 }
 </style>
@@ -425,47 +463,57 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="tab-pane" id="tab-gpkg">
         <div class="gpkg-info">
-          <p style="font-size:24px;margin-bottom:4px">📦 GeoPackage Export</p>
-          <p>Select raster layers to include. Active layers are pre-selected.</p>
+          <p style="font-size:18px;margin-bottom:2px">📦 GeoPackage Export</p>
+          <p>Active layers pre-selected. Click headers to expand.</p>
           <div class="gpkg-layers" id="gpkg-layers">
-            <div class="gpkg-group">Core</div>
-            <label><input type="checkbox" data-gpkg="dtm" checked> DTM (terrain)</label>
-            <label><input type="checkbox" data-gpkg="dsm" checked> DSM / nDSM</label>
-            <div class="gpkg-group">Orthophoto</div>
-            <label><input type="checkbox" data-gpkg="ortho-2024"> Ortho ~2024</label>
-            <label><input type="checkbox" data-gpkg="ortho-2023"> Ortho ~2023</label>
-            <label><input type="checkbox" data-gpkg="ortho-2020"> Ortho ~2020</label>
-            <label><input type="checkbox" data-gpkg="cir-2024"> CIR ~2024</label>
-            <label><input type="checkbox" data-gpkg="cir-2023"> CIR ~2023</label>
-            <label><input type="checkbox" data-gpkg="cir-2020"> CIR ~2020</label>
-            <div class="gpkg-group">LiDAR overlays</div>
-            <label><input type="checkbox" data-gpkg="dtm-2024"> DTM 2024 hillshade</label>
-            <label><input type="checkbox" data-gpkg="dtm-2023"> DTM 2023 hillshade</label>
-            <label><input type="checkbox" data-gpkg="dtm-2022"> DTM 2022 hillshade</label>
-            <label><input type="checkbox" data-gpkg="dsm-2024"> nDSM 2024 overlay</label>
-            <label><input type="checkbox" data-gpkg="dsm-2023"> nDSM 2023 overlay</label>
-            <label><input type="checkbox" data-gpkg="dsm-2022"> nDSM 2022 overlay</label>
-            <div class="gpkg-group">Analysis</div>
-            <label><input type="checkbox" data-gpkg="segments"> Segment types (raster)</label>
-            <label><input type="checkbox" data-gpkg="segments-vector" checked> Segment polygons (vector)</label>
-            <label><input type="checkbox" data-gpkg="raster"> Segment raster (RGBA)</label>
-            <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
-          </div>
-          <div style="margin:10px 0">
-            <div class="gpkg-group">Object type filter</div>
-            <div id="gpkg-type-filter" style="display:flex;flex-wrap:wrap;gap:2px 8px;font-size:11px;max-height:100px;overflow-y:auto;margin:4px 0"></div>
-            <div style="display:flex;gap:8px;margin-top:4px">
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=true});" style="font-size:10px">All</a>
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=false});" style="font-size:10px">None</a>
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#gpkg-type-filter input').forEach(c=>{c.checked=!c.checked});" style="font-size:10px">Invert</a>
+            <div class="gpkg-group expanded" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> Core & Analysis</div>
+            <div class="gpkg-lyr-group open">
+              <label><input type="checkbox" data-gpkg="dtm"> DTM (terrain)</label>
+              <label><input type="checkbox" data-gpkg="dsm"> DSM / nDSM</label>
+              <label><input type="checkbox" data-gpkg="segments"> Segments (raster)</label>
+              <label><input type="checkbox" data-gpkg="segments-vector"> Polygons (vector)</label>
+              <label><input type="checkbox" data-gpkg="raster"> RGBA raster</label>
+              <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
             </div>
+            <div class="gpkg-group" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> Orthophoto</div>
+            <div class="gpkg-lyr-group">
+              <label><input type="checkbox" data-gpkg="ortho-2024"> Ortho ~2024</label>
+              <label><input type="checkbox" data-gpkg="ortho-2023"> Ortho ~2023</label>
+              <label><input type="checkbox" data-gpkg="ortho-2020"> Ortho ~2020</label>
+              <label><input type="checkbox" data-gpkg="cir-2024"> CIR ~2024</label>
+              <label><input type="checkbox" data-gpkg="cir-2023"> CIR ~2023</label>
+              <label><input type="checkbox" data-gpkg="cir-2020"> CIR ~2020</label>
+            </div>
+            <div class="gpkg-group" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> LiDAR Overlays</div>
+            <div class="gpkg-lyr-group">
+              <label><input type="checkbox" data-gpkg="dtm-2024"> DTM 2024 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dtm-2023"> DTM 2023 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dtm-2022"> DTM 2022 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dsm-2024"> nDSM 2024 overlay</label>
+              <label><input type="checkbox" data-gpkg="dsm-2023"> nDSM 2023 overlay</label>
+              <label><input type="checkbox" data-gpkg="dsm-2022"> nDSM 2022 overlay</label>
+            </div>
+          </div>
+          <div class="export-ot-wrap">
+            <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+            <div id="gpkg-ot-select" class="export-ot-select"><span id="gpkg-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+            <div id="gpkg-ot-dd" class="export-ot-dd"></div>
+          </div>
+          <div class="height-range-wrap" id="gpkg-height-wrap">
+            <label>Object Height Range (m)</label>
+            <div class="height-range-track" id="gpkg-hr-track">
+              <div class="height-range-fill" id="gpkg-hr-fill"></div>
+              <div class="height-range-thumb" id="gpkg-hr-min" tabindex="0"></div>
+              <div class="height-range-thumb" id="gpkg-hr-max" tabindex="0"></div>
+            </div>
+            <div class="height-range-labels"><span id="gpkg-hr-min-val">0 m</span><span id="gpkg-hr-max-val">50 m</span></div>
           </div>
           <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoPackage</button>
         </div>
       </div>
       <div class="tab-pane" id="tab-kml">
         <div class="gpkg-info">
-          <p style="font-size:24px;margin-bottom:4px">🌍 KML Export</p>
+          <p style="font-size:18px;margin-bottom:2px">🌍 KML Export</p>
           <p>Download analysis features as KML for Google Earth. Requires analysis results.</p>
           <div style="margin:10px 0">
             <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:6px 0">
@@ -476,14 +524,19 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
               </select>
             </label>
           </div>
-          <div style="margin:10px 0">
-            <div class="gpkg-group">Object type filter</div>
-            <div id="kml-type-filter" style="display:flex;flex-wrap:wrap;gap:2px 8px;font-size:11px;max-height:100px;overflow-y:auto;margin:4px 0"></div>
-            <div style="display:flex;gap:8px;margin-top:4px">
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=true});" style="font-size:10px">All</a>
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=false});" style="font-size:10px">None</a>
-              <a href="#" onclick="event.preventDefault();document.querySelectorAll('#kml-type-filter input').forEach(c=>{c.checked=!c.checked});" style="font-size:10px">Invert</a>
+          <div class="export-ot-wrap">
+            <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+            <div id="kml-ot-select" class="export-ot-select"><span id="kml-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+            <div id="kml-ot-dd" class="export-ot-dd"></div>
+          </div>
+          <div class="height-range-wrap" id="kml-height-wrap">
+            <label>Object Height Range (m)</label>
+            <div class="height-range-track" id="kml-hr-track">
+              <div class="height-range-fill" id="kml-hr-fill"></div>
+              <div class="height-range-thumb" id="kml-hr-min" tabindex="0"></div>
+              <div class="height-range-thumb" id="kml-hr-max" tabindex="0"></div>
             </div>
+            <div class="height-range-labels"><span id="kml-hr-min-val">0 m</span><span id="kml-hr-max-val">50 m</span></div>
           </div>
           <button class="btn" id="btn-dl-kml" style="width:100%" disabled>🌍 Download KML</button>
           <p id="kml-no-results" style="color:#999;font-size:11px;margin-top:6px">Run an analysis first to export features as KML.</p>
@@ -797,34 +850,143 @@ function switchTab(tab){
 }
 function syncGpkgCheckboxes(){
   // Mirror map layer panel state into GeoPackage export checkboxes.
-  // Core (dtm/dsm) default to checked; everything else mirrors its map toggle.
+  // Everything mirrors its map toggle. dtm/dsm match their hillshade/overlay counterparts.
   document.querySelectorAll('[data-gpkg]').forEach(cb=>{
     const id=cb.dataset.gpkg;
-    if(id==='dtm'||id==='dsm'||id==='segments-vector') return;
+    if(id==='dtm'){
+      const any=['dtm-2024','dtm-2023','dtm-2022'].some(lid=>{const mc=document.querySelector(`[data-lyr="${lid}"]`);return mc&&mc.checked;});
+      cb.checked=any; return;
+    }
+    if(id==='dsm'){
+      const any=['dsm-2024','dsm-2023','dsm-2022'].some(lid=>{const mc=document.querySelector(`[data-lyr="${lid}"]`);return mc&&mc.checked;});
+      cb.checked=any; return;
+    }
+    if(id==='segments-vector'){
+      const mc=document.querySelector('[data-lyr="segments"]'); cb.checked=mc&&mc.checked; return;
+    }
     const mapCb=document.querySelector(`[data-lyr="${id}"]`);
     if(mapCb) cb.checked=mapCb.checked;
   });
+  // Auto-expand groups that have checked items
+  document.querySelectorAll('.gpkg-lyr-group').forEach(grp=>{
+    const any=[...grp.querySelectorAll('input[type=checkbox]')].some(c=>c.checked);
+    const hdr=grp.previousElementSibling;
+    if(any){grp.classList.add('open');hdr.classList.add('expanded');}
+    else{grp.classList.remove('open');hdr.classList.remove('expanded');}
+  });
 }
-function buildExportTypeFilters(){
-  const types=Object.keys(TYPE_SHAPES);
-  for(const cid of ['gpkg-type-filter','kml-type-filter']){
-    const el=document.getElementById(cid);
-    if(!el||el.children.length>0) continue;
+
+// ============ EXPORT TYPE DROPDOWN + HEIGHT RANGE ============
+const _exportOTState={}; // {prefix: Set}
+function _initExportOT(prefix){
+  const dd=document.getElementById(prefix+'-ot-dd');
+  const sel=document.getElementById(prefix+'-ot-select');
+  const lbl=document.getElementById(prefix+'-ot-label');
+  if(!dd||dd.dataset.init) return;
+  dd.dataset.init='1';
+  _exportOTState[prefix]=new Set(ALL_OBJ_TYPES);
+  let html='<div class="ot-actions"><button data-act="all">All</button><button data-act="none">None</button><button data-act="invert">Invert</button></div>';
+  for(const[group,types]of Object.entries(OT_GROUPS)){
+    html+=`<div class="ot-group">${group}</div>`;
     for(const t of types){
       const c=TYPE_SHAPES[t]?.c||'#888';
-      const lbl=document.createElement('label');
-      lbl.style.cssText='display:flex;align-items:center;gap:3px;cursor:pointer';
-      lbl.innerHTML=`<input type="checkbox" value="${t}" checked style="margin:0"><span style="color:${c}">${t.replace(/_/g,' ')}</span>`;
-      el.appendChild(lbl);
+      html+=`<label><input type="checkbox" value="${t}" checked><span class="ot-swatch" style="background:${c}"></span>${t.replace(/_/g,' ')}</label>`;
     }
   }
+  dd.innerHTML=html;
+  sel.onclick=e=>{e.stopPropagation();dd.classList.toggle('open');};
+  document.addEventListener('click',e=>{if(!dd.contains(e.target)&&!sel.contains(e.target))dd.classList.remove('open');});
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+    cb.onchange=()=>{if(cb.checked)_exportOTState[prefix].add(cb.value);else _exportOTState[prefix].delete(cb.value);_updateExportOTLabel(prefix);};
+  });
+  dd.querySelector('[data-act=all]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=true;_exportOTState[prefix].add(cb.value);});_updateExportOTLabel(prefix);};
+  dd.querySelector('[data-act=none]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=false;_exportOTState[prefix].delete(cb.value);});_updateExportOTLabel(prefix);};
+  dd.querySelector('[data-act=invert]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=!cb.checked;if(cb.checked)_exportOTState[prefix].add(cb.value);else _exportOTState[prefix].delete(cb.value);});_updateExportOTLabel(prefix);};
 }
-function _getExportTypeFilter(containerId){
-  const checks=document.querySelectorAll(`#${containerId} input[type=checkbox]`);
-  const sel=[];let total=0;
-  checks.forEach(cb=>{total++;if(cb.checked)sel.push(cb.value);});
-  if(sel.length===total) return '';
-  return sel.join(',');
+function _syncExportOTFromMap(prefix){
+  // Sync export type dropdown from the main map selectedTypes
+  const st=_exportOTState[prefix]; if(!st) return;
+  const dd=document.getElementById(prefix+'-ot-dd'); if(!dd) return;
+  st.clear();
+  selectedTypes.forEach(t=>st.add(t));
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{cb.checked=st.has(cb.value);});
+  _updateExportOTLabel(prefix);
+}
+function _updateExportOTLabel(prefix){
+  const st=_exportOTState[prefix]; if(!st) return;
+  const lbl=document.getElementById(prefix+'-ot-label'); if(!lbl) return;
+  if(st.size===ALL_OBJ_TYPES.length) lbl.textContent='All types';
+  else if(st.size===0) lbl.textContent='None selected';
+  else if(st.size<=3) lbl.textContent=[...st].map(t=>t.replace(/_/g,' ')).join(', ');
+  else lbl.textContent=`${st.size} of ${ALL_OBJ_TYPES.length} types`;
+}
+function _getExportTypeFilter(prefix){
+  const st=_exportOTState[prefix];
+  if(!st||st.size===ALL_OBJ_TYPES.length) return '';
+  return [...st].join(',');
+}
+
+// ============ HEIGHT RANGE DOUBLE SLIDER ============
+const HR_MIN=0, HR_MAX=50, HR_STEP=0.5;
+const _hrState={}; // {prefix: {min, max}}
+function _initHeightRange(prefix){
+  const track=document.getElementById(prefix+'-hr-track');
+  if(!track||track.dataset.init) return;
+  track.dataset.init='1';
+  _hrState[prefix]={min:HR_MIN,max:HR_MAX};
+  const fill=document.getElementById(prefix+'-hr-fill');
+  const tMin=document.getElementById(prefix+'-hr-min');
+  const tMax=document.getElementById(prefix+'-hr-max');
+  const lMin=document.getElementById(prefix+'-hr-min-val');
+  const lMax=document.getElementById(prefix+'-hr-max-val');
+  function pct(v){return((v-HR_MIN)/(HR_MAX-HR_MIN))*100;}
+  function snap(v){return Math.round(v/HR_STEP)*HR_STEP;}
+  function update(){
+    const s=_hrState[prefix];
+    const p1=pct(s.min), p2=pct(s.max);
+    fill.style.left=p1+'%'; fill.style.width=(p2-p1)+'%';
+    tMin.style.left=p1+'%'; tMax.style.left=p2+'%';
+    lMin.textContent=(s.min===HR_MIN?'0':s.min.toFixed(1))+' m';
+    lMax.textContent=(s.max>=HR_MAX?'50+ m':s.max.toFixed(1)+' m');
+  }
+  update();
+  function startDrag(thumb,isMax){
+    function onMove(ex,ey){
+      const rect=track.getBoundingClientRect();
+      let ratio=Math.max(0,Math.min(1,(ex-rect.left)/rect.width));
+      let val=snap(HR_MIN+ratio*(HR_MAX-HR_MIN));
+      const s=_hrState[prefix];
+      if(isMax){s.max=Math.max(val,s.min+HR_STEP);}else{s.min=Math.min(val,s.max-HR_STEP);}
+      s.min=Math.max(HR_MIN,s.min); s.max=Math.min(HR_MAX,s.max);
+      update();
+    }
+    function onPointerMove(e){e.preventDefault();onMove(e.clientX,e.clientY);}
+    function onTouchMove(e){e.preventDefault();const t=e.touches[0];onMove(t.clientX,t.clientY);}
+    function stop(){document.removeEventListener('pointermove',onPointerMove);document.removeEventListener('pointerup',stop);document.removeEventListener('touchmove',onTouchMove);document.removeEventListener('touchend',stop);}
+    document.addEventListener('pointermove',onPointerMove);
+    document.addEventListener('pointerup',stop);
+    document.addEventListener('touchmove',onTouchMove,{passive:false});
+    document.addEventListener('touchend',stop);
+  }
+  tMin.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(tMin,false);});
+  tMax.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(tMax,true);});
+  tMin.addEventListener('touchstart',e=>{e.preventDefault();startDrag(tMin,false);},{passive:false});
+  tMax.addEventListener('touchstart',e=>{e.preventDefault();startDrag(tMax,true);},{passive:false});
+}
+function _getHeightFilter(prefix){
+  const s=_hrState[prefix];
+  if(!s) return {};
+  const params={};
+  if(s.min>HR_MIN) params.height_min=s.min.toFixed(1);
+  if(s.max<HR_MAX) params.height_max=s.max.toFixed(1);
+  return params;
+}
+
+function buildExportTypeFilters(){
+  _initExportOT('gpkg'); _initExportOT('kml');
+  _initHeightRange('gpkg'); _initHeightRange('kml');
+  // Sync from map selectedTypes
+  _syncExportOTFromMap('gpkg'); _syncExportOTFromMap('kml');
 }
 function updateKmlState(){
   const btn=document.getElementById('btn-dl-kml');
@@ -945,9 +1107,13 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
     url+='&include_dsm='+(sel.dsm||false);
     url+='&include_segments='+(sel.segments||false);
     url+='&include_segments_vector='+(sel['segments-vector']||false);
-    // Type filter from GPKG type filter checkboxes
-    const gpkgTypes=_getExportTypeFilter('gpkg-type-filter');
+    // Type filter from GPKG type dropdown
+    const gpkgTypes=_getExportTypeFilter('gpkg');
     if(gpkgTypes) url+='&types='+encodeURIComponent(gpkgTypes);
+    // Height range filter
+    const gpkgHF=_getHeightFilter('gpkg');
+    if(gpkgHF.height_min) url+='&height_min='+gpkgHF.height_min;
+    if(gpkgHF.height_max) url+='&height_max='+gpkgHF.height_max;
     // Ortho years
     const orthoYears=[];
     if(sel['ortho-2024'])orthoYears.push('2024');
@@ -1006,12 +1172,17 @@ document.getElementById('btn-dl-kml').onclick=async()=>{
     const args=getPostArgs();
     if(!args){alert('Provide geometry first');return;}
     const groupBy=document.getElementById('kml-group-by').value;
-    const kmlTypes=_getExportTypeFilter('kml-type-filter');
+    const kmlTypes=_getExportTypeFilter('kml');
+    const kmlHF=_getHeightFilter('kml');
     // Build request body: include result JSON + geometry
     const geo=JSON.parse(document.getElementById('geometry').value);
     const body={geometry:geo, result_json:JSON.stringify(lastResult), group_by:groupBy};
     if(kmlTypes) body.types=kmlTypes;
-    const resp=await fetch('/api/v1/export/kml'+(kmlTypes?'?types='+encodeURIComponent(kmlTypes):''),{
+    let kmlQS=[];
+    if(kmlTypes) kmlQS.push('types='+encodeURIComponent(kmlTypes));
+    if(kmlHF.height_min) kmlQS.push('height_min='+kmlHF.height_min);
+    if(kmlHF.height_max) kmlQS.push('height_max='+kmlHF.height_max);
+    const resp=await fetch('/api/v1/export/kml'+(kmlQS.length?'?'+kmlQS.join('&'):''),{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)
     });

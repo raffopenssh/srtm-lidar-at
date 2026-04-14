@@ -99,26 +99,37 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 
 /* Layer panel */
 .layer-panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);padding:10px 14px;font-size:12px;min-width:200px;max-height:70vh;overflow-y:auto}
-.layer-panel h3{font-size:12px;margin-bottom:6px;color:#333}
+.layer-panel h3{font-size:12px;margin-bottom:6px;color:#333;display:flex;align-items:center}
+.panel-toggle{margin-left:auto;width:22px;height:22px;display:flex;align-items:center;justify-content:center;border:none;background:#f0f0f0;border-radius:4px;cursor:pointer;font-size:14px;font-weight:700;color:#666;line-height:1;padding:0;flex-shrink:0;transition:background .15s}
+.panel-toggle:hover{background:#ddd;color:#333}
+.layer-panel.collapsed{padding:8px 10px;min-width:auto;overflow:hidden}
+.layer-panel.collapsed .lp-body{display:none}
+.layer-panel.collapsed h3{margin-bottom:0}
 .lp-group{margin:4px 0}
 .lp-group-header{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 2px;cursor:pointer;user-select:none}
 .lp-group-header:hover{color:#333}
 .lp-group-body{display:none}
 .lp-group-body.open{display:block}
-.lyr{display:flex;align-items:center;gap:6px;margin:3px 0}
-.lyr input[type=checkbox]{margin:0}
+.lyr{display:flex;align-items:center;gap:6px;margin:3px 0;min-height:32px}
+.lyr input[type=checkbox]{margin:0;width:20px;height:20px;flex-shrink:0}
 .lyr input[type=range]{width:55px;height:14px}
 .lyr-label{flex:1;font-size:11px}
 
 /* Legend */
 .legend{position:absolute;bottom:24px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:10px 12px;font-size:11px;max-width:260px;max-height:50vh;overflow-y:auto}
+.legend-header{display:flex;align-items:center;margin-bottom:4px}
+.legend-header h4{font-size:11px;color:#333;margin:0}
+.legend-header .panel-toggle{margin-left:auto}
+.legend.collapsed{padding:8px 10px;overflow:hidden;max-height:none}
+.legend.collapsed .legend-body{display:none}
+.legend.collapsed .legend-header{margin-bottom:0}
 .legend h4{font-size:11px;margin-bottom:4px;color:#333}
 .legend-bar{height:14px;border-radius:3px;margin-bottom:2px}
 .legend-labels{display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:6px}
-.legend-item{display:flex;align-items:center;gap:5px;margin:2px 0;font-size:10px;cursor:pointer;user-select:none;padding:1px 2px;border-radius:3px}
+.legend-item{display:flex;align-items:center;gap:6px;margin:2px 0;font-size:11px;cursor:pointer;user-select:none;padding:4px 4px;border-radius:4px;min-height:28px}
 .legend-item:hover{background:#f0f0f0}
 .legend-item.hidden{opacity:.35;text-decoration:line-through}
-.legend-icon{width:14px;height:14px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0}
+.legend-icon{width:16px;height:16px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
 .legend-count{margin-left:auto;color:#999;font-size:9px}
 .color-mode-bar{display:flex;gap:2px;margin:4px 0}
 .color-mode-bar button{flex:1;font-size:10px;padding:3px 6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;border-radius:3px}
@@ -211,8 +222,13 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   .controls{max-height:calc(38vh - 70px);padding:8px 12px}
   #sidebar h1{font-size:14px;padding:8px 12px}
   #map-area{flex:1;min-height:0}
-  .layer-panel{top:4px;right:4px;padding:6px 10px;font-size:11px;max-height:50vh;max-width:220px}
-  .legend{bottom:4px;right:4px;max-height:35vh;max-width:200px;font-size:10px}
+  .layer-panel{top:4px;right:4px;padding:8px 10px;font-size:11px;max-height:50vh;max-width:220px}
+  .lyr{min-height:36px;gap:8px}
+  .lyr input[type=checkbox]{width:22px;height:22px}
+  .legend{bottom:4px;right:4px;max-height:35vh;max-width:220px;font-size:10px}
+  .legend-item{min-height:32px;padding:5px 4px;gap:8px;font-size:11px}
+  .legend-icon{width:18px;height:18px;font-size:13px}
+  .panel-toggle{width:28px;height:28px;font-size:16px}
   textarea{height:36px}
   label{margin:4px 0 2px}
   .btn{padding:6px 10px;font-size:12px}
@@ -304,7 +320,8 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
   <div class="gps-hint" id="gps-hint"></div>
 
   <div class="layer-panel" id="layer-panel">
-    <h3>Layers</h3>
+    <h3>Layers <button class="panel-toggle" id="layer-panel-toggle" onclick="togglePanel('layer-panel')" title="Collapse">−</button></h3>
+    <div class="lp-body" id="layer-panel-body">
     <div class="lp-group">
       <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">LIDAR ▸</div>
       <div class="lp-group-body">
@@ -336,21 +353,24 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
     </div>
     <div class="lyr" style="margin-top:6px;border-top:1px solid #eee;padding-top:4px"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
+    </div><!-- /lp-body -->
   </div>
 
   <div class="legend" id="legend" style="display:none">
+    <div class="legend-header"><h4 id="legend-types-title">Object Types</h4><button class="panel-toggle" id="legend-panel-toggle" onclick="togglePanel('legend')" title="Collapse">−</button></div>
+    <div class="legend-body" id="legend-body">
     <div id="meta-info" class="meta-info" style="display:none"></div>
     <div class="color-mode-bar" id="color-mode-bar">
       <button id="cm-type" class="active" onclick="setColorMode('type')">Type</button>
       <button id="cm-height" onclick="setColorMode('height')">Height</button>
     </div>
     <div id="legend-scale"></div>
-    <h4 id="legend-types-title">Object Types</h4>
     <div id="legend-types"></div>
     <div id="summary-panel" style="display:none;margin-top:6px;padding-top:6px;border-top:1px solid #ddd">
       <h4>Summary</h4>
       <div id="summary-content" style="font-size:10px;margin-top:4px"></div>
     </div>
+    </div><!-- /legend-body -->
   </div>
 
   <!-- Download FAB + Share -->
@@ -477,6 +497,15 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
 <script>
+// ============ PANEL COLLAPSE ============
+function togglePanel(panelId){
+  const panel=document.getElementById(panelId);
+  const btn=panel.querySelector('.panel-toggle');
+  const collapsed=panel.classList.toggle('collapsed');
+  btn.textContent=collapsed?'+':'\u2212';
+  btn.title=collapsed?'Expand':'Collapse';
+}
+
 // ============ COLORMAPS ============
 const VIRIDIS=[[68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],[32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]];
 function viridis(t){t=Math.max(0,Math.min(1,t));const i=t*(VIRIDIS.length-1),lo=Math.floor(i),hi=Math.min(lo+1,VIRIDIS.length-1),f=i-lo;return VIRIDIS[lo].map((v,c)=>Math.round(v+f*(VIRIDIS[hi][c]-v)));}

@@ -688,7 +688,7 @@ function clearEverything(){
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
   lastResult=null;
-  _rasterOrigImg=null;_rasterOrigBounds=null;
+  _rasterOrigImg=null;_rasterOrigBounds=null;_rasterReloadSeq++;
   // Remove all overlays
   for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
   for(const k of Object.keys(overlays))delete overlays[k];
@@ -762,6 +762,8 @@ const overlays={};
 // Client-side raster overlay filtering: cache original image + bounds for instant type toggling
 let _rasterOrigImg=null;  // HTMLImageElement of unfiltered overlay
 let _rasterOrigBounds=null; // LatLngBounds of the overlay
+let _rasterReloadSeq=0;  // sequence counter to discard stale async raster reloads
+let _rasterWanted=false;  // true if raster checkbox is checked (survives async reload gaps)
 
 // Segment overlay RGB colors (must match server SEGMENT_COLORS, alpha ignored — we match by RGB only)
 const SEGMENT_RGB={
@@ -1269,7 +1271,10 @@ function setColorMode(m){
   document.getElementById('cm-'+m).classList.add('active');
   updateLegendScale();
   reRenderMarkers();
-  if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked) reloadRasterOverlay();
+  // Use _rasterWanted to detect if raster should be shown, not overlays.raster
+  // (overlays.raster may be temporarily null during an in-flight reload)
+  const rasterCb=document.querySelector('[data-lyr=raster]');
+  if(rasterCb&&rasterCb.checked) reloadRasterOverlay();
 }
 function updateLegendScale(){
   const d=document.getElementById('legend-scale');
@@ -1495,14 +1500,19 @@ function applyRasterTypeFilter(){
 }
 
 async function reloadRasterOverlay(){
+  const seq=++_rasterReloadSeq;  // bump sequence to invalidate any prior in-flight reload
   const filter=getVisibleTypes();
   if(overlays.raster){map.removeLayer(overlays.raster);delete overlays.raster;}
   _rasterOrigImg=null;_rasterOrigBounds=null;
   showLoading('Re-rendering raster...');
   try{
     const ovl=await loadRasterOverlay(filter, currentShareId||undefined);
+    if(seq!==_rasterReloadSeq){console.log('Discarding stale raster reload',seq,'current',_rasterReloadSeq);hideLoading();return;}
     if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
-  }catch(e){console.error('reloadRasterOverlay failed:',e);}
+  }catch(e){
+    if(seq!==_rasterReloadSeq){hideLoading();return;}
+    console.error('reloadRasterOverlay failed:',e);
+  }
   hideLoading();
 }
 
@@ -2479,7 +2489,7 @@ document.getElementById('btn-run').onclick=async()=>{
   showLoading('Starting...');
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
-  _rasterOrigImg=null;_rasterOrigBounds=null;
+  _rasterOrigImg=null;_rasterOrigBounds=null;_rasterReloadSeq++;
   document.getElementById('legend-types').innerHTML='';
   for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
   for(const k of Object.keys(overlays))delete overlays[k];

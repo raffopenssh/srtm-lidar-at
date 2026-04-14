@@ -84,6 +84,11 @@ Both in `/etc/systemd/system/`. Source copies in repo root.
 | GET | `/api/v1/segment/result?task_id=` | Fetch completed result |
 | POST | `/api/v1/segment/abort?task_id=` | Cancel running task |
 
+### One-Stop URL
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/onestop?bbox=&format=` | Single-URL segment + download (async, queued) |
+
 Tasks run in daemon threads. Progress tracked via JSON files in `/tmp/segment_progress/`.
 Results stored gzipped in `/tmp/segment_results/`. Auto-cleaned after 4 hours.
 
@@ -98,8 +103,8 @@ polling or loads the auto-saved share.
 |--------|------|----------|
 | POST | `/api/v1/segment/overlay` | Coloured PNG of segmentation |
 | POST | `/api/v1/dtm/overlay`, `lidar/overlay`, `ortho/overlay`, `cir/overlay`, `hansen/overlay` | Tile overlays |
-| POST | `/api/v1/export/geopackage` | Raster + vector layers in one GPKG |
-| POST | `/api/v1/export/kml` | Features as KML (grouped by type/height_class) |
+| POST | `/api/v1/export/geopackage` | Raster + vector layers in one GPKG (types/height filter) |
+| POST | `/api/v1/export/kml` | Features as KML (types/height filter, group_by) |
 | POST | `/api/v1/export/mbtiles` | Single layer as MBTiles (async) |
 | POST | `/api/v1/lidar/geotiff`, `ortho/geotiff` | Raw GeoTIFF download |
 

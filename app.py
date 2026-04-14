@@ -49,6 +49,14 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
+# ---------------------------------------------------------------------------
+# Processing queue: limit concurrent heavy tasks (segment, one-stop, etc.)
+# ---------------------------------------------------------------------------
+_TASK_SEMAPHORE = threading.Semaphore(2)   # max 2 concurrent heavy tasks
+_TASK_QUEUE_LOCK = threading.Lock()
+_TASK_QUEUE_SIZE = 0  # current waiting count
+MAX_QUEUE_SIZE = 4    # reject if more than 4 waiting
+
 
 def _height_class(h):
     """Classify height (m) into a forestry-relevant height class string."""
@@ -73,6 +81,71 @@ def _height_class(h):
     if h < 40:
         return 'old growth (35-40m)'
     return 'old growth (40m+)'
+
+def _parse_height_filter(params: dict):
+    """Parse height filter params. Returns a filter function or None.
+
+    Supports:
+      height_min=X          → height >= X  (shorthand: height_op=gt)
+      height_max=X          → height <= X  (shorthand: height_op=lt)
+      height_min=X&height_max=Y → X <= height <= Y  (shorthand: height_op=between)
+      height_op=gt&height_min=X   → height > X  (alias for consistency)
+      height_op=lt&height_max=X   → height < X
+      height_op=between&height_min=X&height_max=Y
+    """
+    h_min = params.get('height_min')
+    h_max = params.get('height_max')
+    h_op = (params.get('height_op') or '').lower().strip()
+
+    if h_min is not None:
+        try:
+            h_min = float(h_min)
+        except (ValueError, TypeError):
+            h_min = None
+    if h_max is not None:
+        try:
+            h_max = float(h_max)
+        except (ValueError, TypeError):
+            h_max = None
+
+    if h_min is None and h_max is None:
+        return None
+
+    # Infer operator from which params are present
+    if not h_op:
+        if h_min is not None and h_max is not None:
+            h_op = 'between'
+        elif h_min is not None:
+            h_op = 'gt'
+        elif h_max is not None:
+            h_op = 'lt'
+
+    if h_op == 'gt' and h_min is not None:
+        return lambda h: (h or 0) >= h_min
+    elif h_op == 'lt' and h_max is not None:
+        return lambda h: (h or 0) <= h_max
+    elif h_op == 'between' and h_min is not None and h_max is not None:
+        return lambda h: h_min <= (h or 0) <= h_max
+    return None
+
+
+def _apply_height_filter_features(features: list, params: dict) -> list:
+    """Apply height filter to a list of GeoJSON feature dicts."""
+    hf = _parse_height_filter(params)
+    if not hf:
+        return features
+    return [f for f in features
+            if hf(f.get('properties', {}).get('height_max_m')
+                  or f.get('properties', {}).get('height_after_m') or 0)]
+
+
+def _apply_height_filter_objects(objects: list, params: dict) -> list:
+    """Apply height filter to a list of segment objects (with .height_max)."""
+    hf = _parse_height_filter(params)
+    if not hf:
+        return objects
+    return [o for o in objects if hf(o.height_max)]
+
 
 # ---------------------------------------------------------------------------
 # Async job + progress tracking (file-backed so all gunicorn workers can read)
@@ -524,7 +597,8 @@ def _get_params():
                 'ortho_years', 'raster_layers',
                 'top_n_classes', 'top_n_objects', 'min_height_m',
                 'layer', 'min_zoom', 'max_zoom',
-                'share_id'):
+                'share_id',
+                'height_min', 'height_max', 'height_op'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -856,6 +930,10 @@ def segment_objects():
     if run_async:
         if not task_id:
             task_id = str(uuid.uuid4())
+        # Queue check: reject early if too many waiting
+        with _TASK_QUEUE_LOCK:
+            if _TASK_QUEUE_SIZE >= MAX_QUEUE_SIZE:
+                return _error('Server busy — too many tasks queued. Try again in a few minutes.', 503)
         _progress_start(task_id)
         _cleanup_old_results()
         thread = threading.Thread(
@@ -864,22 +942,39 @@ def segment_objects():
             daemon=True,
         )
         thread.start()
-        return jsonify({"task_id": task_id, "status": "running"}), 202
+        return jsonify({"task_id": task_id, "status": "running", "queued": _TASK_QUEUE_SIZE}), 202
 
     return _segment_sync(task_id, features, params)
 
 
 def _segment_worker(task_id: str, features: list, params: dict, geometry_text: str = ''):
-    """Background worker for async segment processing."""
+    """Background worker for async segment processing (queue-aware)."""
+    global _TASK_QUEUE_SIZE
+    with _TASK_QUEUE_LOCK:
+        _TASK_QUEUE_SIZE += 1
+    _progress_set(task_id, 'queued', f'Waiting for slot ({_TASK_QUEUE_SIZE} in queue)…')
     try:
-        resp = _segment_core(task_id, features, params)
-        _store_result(task_id, resp)
-        import gc; gc.collect()  # free serialization temporaries
-        share_id = _auto_save_share(task_id, resp, geometry_text, params)
-        _progress_done(task_id, auto_share_id=share_id)
-        log.info("Async segment task %s completed (auto-share=%s)", task_id, share_id)
+        acquired = _TASK_SEMAPHORE.acquire(timeout=300)  # wait up to 5 min for a slot
+        with _TASK_QUEUE_LOCK:
+            _TASK_QUEUE_SIZE = max(0, _TASK_QUEUE_SIZE - 1)
+        if not acquired:
+            _progress_error(task_id, 'Server busy — timed out waiting in queue. Try again later.')
+            return
+        try:
+            resp = _segment_core(task_id, features, params)
+            _store_result(task_id, resp)
+            import gc; gc.collect()
+            share_id = _auto_save_share(task_id, resp, geometry_text, params)
+            _progress_done(task_id, auto_share_id=share_id)
+            log.info("Async segment task %s completed (auto-share=%s)", task_id, share_id)
+        except Exception as e:
+            log.error("Async segment task %s failed: %s", task_id, traceback.format_exc())
+            _progress_error(task_id, str(e))
+        finally:
+            _TASK_SEMAPHORE.release()
     except Exception as e:
-        log.error("Async segment task %s failed: %s", task_id, traceback.format_exc())
+        with _TASK_QUEUE_LOCK:
+            _TASK_QUEUE_SIZE = max(0, _TASK_QUEUE_SIZE - 1)
         _progress_error(task_id, str(e))
 
 
@@ -1690,6 +1785,9 @@ def export_geopackage():
       ortho_years=2024,2023   Ortho RGB(I) for listed years
       raster_layers=dtm-2024,dsm-2023,hansen,raster  RGBA overlay renders
       types=tree,road,...     Segment type filter
+      height_min=X            Filter segments: height >= X metres
+      height_max=X            Filter segments: height <= X metres
+      height_op=gt|lt|between Explicit operator (inferred if omitted)
       color_mode=type|height  Segment raster color mode
       include_ortho=true      Legacy: same as ortho_years=default
       async=true              Return 202 with task_id; poll progress; download via GET
@@ -1792,6 +1890,9 @@ def export_kml():
     Query params:
       types=tree,grass,...    Filter object types (default: all)
       group_by=type|height_class  Folder grouping (default: type)
+      height_min=X            Filter: height >= X metres
+      height_max=X            Filter: height <= X metres
+      height_op=gt|lt|between Explicit operator (inferred from min/max if omitted)
     """
     try:
         features = _get_geometry()
@@ -1819,6 +1920,9 @@ def export_kml():
         if type_filter:
             obj_features = [f for f in obj_features
                            if f.get('properties', {}).get('type') in type_filter]
+
+        # Filter by height
+        obj_features = _apply_height_filter_features(obj_features, params)
 
         # Build KML
         kml = _build_kml(obj_features, group_by)
@@ -2067,9 +2171,11 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
 
             if labels is not None and objects is not None:
                 if type_filter:
-                    filtered_ids = {o.obj_id for o in objects if o.obj_type in type_filter}
+                    seg_filtered = [o for o in objects if o.obj_type in type_filter]
                 else:
-                    filtered_ids = {o.obj_id for o in objects}
+                    seg_filtered = list(objects)
+                seg_filtered = _apply_height_filter_objects(seg_filtered, params)
+                filtered_ids = {o.obj_id for o in seg_filtered}
 
                 type_raster = np.zeros((h, w), dtype=np.float32)
                 obj_map = {o.obj_id: o for o in objects}
@@ -2110,10 +2216,14 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                 from fiona.crs import from_epsg
 
                 obj_map = {o.obj_id: o for o in v_objects}
+                # Apply type filter
                 if type_filter:
-                    filtered_ids = {o.obj_id for o in v_objects if o.obj_type in type_filter}
+                    v_filtered = [o for o in v_objects if o.obj_type in type_filter]
                 else:
-                    filtered_ids = {o.obj_id for o in v_objects}
+                    v_filtered = list(v_objects)
+                # Apply height filter
+                v_filtered = _apply_height_filter_objects(v_filtered, params)
+                filtered_ids = {o.obj_id for o in v_filtered}
 
                 # Vectorise the labels raster
                 label_int = v_labels.astype(np.int32)
@@ -3676,6 +3786,299 @@ def layers_availability():
         return _error(f"Internal error: {e}", 500)
 
 
+# ---------------------------------------------------------------------------
+# ONE-STOP URL: GET /api/v1/onestop — segment + autosave via a single URL
+# ---------------------------------------------------------------------------
+
+@app.route('/api/v1/onestop', methods=['GET'])
+def onestop():
+    """One-stop URL: trigger segmentation and get result/download from a single GET.
+
+    Designed for users on limited connections who want a bookmarkable URL that
+    runs analysis and produces a downloadable result.
+
+    Query params (all via URL):
+      bbox=lon_min,lat_min,lon_max,lat_max   Bounding box (required)
+      min_object_size=10                     Min segment area in m² (default: 10)
+      include_ortho=true                     Include orthophoto (default: true)
+      include_temporal=false                 Include temporal analysis
+      include_copernicus=false               Include Sentinel-2/SAR
+      include_cadastre=false                 Include cadastre
+      include_hansen=false                   Include Hansen forest change
+      types=tree,road                        Object type filter
+      height_min=X                           Height filter: >= X metres
+      height_max=X                           Height filter: <= X metres
+      height_op=gt|lt|between                Height filter operator
+      format=json|gpkg|kml                   Output format (default: json)
+      layers=segments                        GPKG layers (default: segments)
+      include_segments_vector=true            GPKG vector polygons (default: true)
+      group_by=type|height_class             KML folder grouping
+
+    Returns:
+      - If no task running: starts analysis, returns 202 JSON with task_id + poll URL
+      - Poll with same URL + task_id=X or via /api/v1/segment/progress?task_id=X
+      - When done: returns the file (gpkg/kml) or JSON, plus auto_share_id
+      - Add &task_id=X to check/download a previously started task
+
+    The result is auto-saved as a share for later access.
+    Processing is queued (max 2 concurrent, 4 in queue) to prevent overload.
+
+    Timing estimates (< 1 km², ortho=true):
+      ~30-60s with ortho only, ~60-90s with ortho+temporal,
+      ~90-120s with all sources. GPKG/KML adds ~5-10s.
+    """
+    try:
+        bbox_str = request.args.get('bbox', '')
+        task_id = request.args.get('task_id', '')
+        fmt = request.args.get('format', 'json').lower().strip()
+
+        # If task_id provided, check its status
+        if task_id:
+            return _onestop_check(task_id, fmt, dict(request.args))
+
+        # Parse bbox
+        if not bbox_str:
+            return _error('bbox parameter required (lon_min,lat_min,lon_max,lat_max)', 400)
+        parts = [x.strip() for x in bbox_str.split(',')]
+        if len(parts) != 4:
+            return _error('bbox must have 4 values: lon_min,lat_min,lon_max,lat_max', 400)
+        try:
+            lon_min, lat_min, lon_max, lat_max = [float(x) for x in parts]
+        except ValueError:
+            return _error('bbox values must be numbers', 400)
+
+        # Build polygon from bbox
+        from shapely.geometry import box as shapely_box
+        geom = shapely_box(lon_min, lat_min, lon_max, lat_max)
+        features = [{'geometry': geom}]
+        geo_parse.validate_austria_bounds(geom)
+        geom_3035 = ti.geometry_to_3035(geom)
+        _validate_area(geom_3035)
+
+        # Build params
+        params = {}
+        for key in ('dataset', 'min_object_size', 'include_ortho', 'include_temporal',
+                    'include_copernicus', 'include_cadastre', 'include_hansen',
+                    'types', 'groups', 'felz_scale', 'rag_threshold',
+                    'height_min', 'height_max', 'height_op',
+                    'top_n_classes', 'top_n_objects', 'min_height_m'):
+            val = request.args.get(key)
+            if val is not None:
+                params[key] = val
+        # Sensible defaults for one-stop
+        params.setdefault('min_object_size', '10')
+        params.setdefault('include_ortho', 'true')
+
+        geometry_text = json.dumps(mapping(geom))
+
+        # Queue check
+        with _TASK_QUEUE_LOCK:
+            if _TASK_QUEUE_SIZE >= MAX_QUEUE_SIZE:
+                return jsonify({
+                    'error': 'Server busy — too many tasks queued. Try again in a few minutes.',
+                    'queue_size': _TASK_QUEUE_SIZE,
+                    'retry_after_seconds': 120,
+                }), 503
+
+        # Start async task
+        task_id = str(uuid.uuid4())
+        _progress_start(task_id)
+        _cleanup_old_results()
+
+        # Store onestop params so we can produce the right format on completion
+        onestop_meta = {
+            'format': fmt,
+            'params': {k: request.args.get(k) for k in request.args if k != 'task_id'},
+        }
+        (_PROGRESS_DIR / f"{task_id}.onestop.json").write_text(
+            json.dumps(onestop_meta))
+
+        thread = threading.Thread(
+            target=_segment_worker,
+            args=(task_id, features, params, geometry_text),
+            daemon=True,
+        )
+        thread.start()
+
+        host = request.headers.get('X-Forwarded-Host', request.host)
+        proto = request.headers.get('X-Forwarded-Proto', request.scheme)
+        base = f"{proto}://{host}"
+        poll_url = f"{base}/api/v1/onestop?task_id={task_id}&format={fmt}"
+        progress_url = f"{base}/api/v1/segment/progress?task_id={task_id}"
+
+        return jsonify({
+            'task_id': task_id,
+            'status': 'running',
+            'queue_size': _TASK_QUEUE_SIZE,
+            'poll_url': poll_url,
+            'progress_url': progress_url,
+            'estimated_seconds': _estimate_time(geom_3035, params),
+            'message': 'Analysis started. Poll poll_url until status=done, then the final response will contain the download.',
+        }), 202
+
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        log.error("onestop: %s", traceback.format_exc())
+        return _error(f"Internal error: {e}", 500)
+
+
+def _estimate_time(geom_3035, params: dict) -> int:
+    """Rough estimate of processing time in seconds for a given area + options."""
+    area_sqm = geom_3035.area
+    area_ha = area_sqm / 10000
+    base = 20 + area_ha * 0.5  # ~20s base + 0.5s per hectare
+    if str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes'):
+        base += 10 + area_ha * 0.3
+    if str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes'):
+        base += 15 + area_ha * 0.4
+    if str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'):
+        base += 20
+    if str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'):
+        base += 5
+    if str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'):
+        base += 10
+    return int(base)
+
+
+def _onestop_check(task_id: str, fmt: str, url_params: dict):
+    """Check status of a one-stop task. Return result when done."""
+    if not task_id or not re.match(r'^[a-f0-9\-]+$', task_id):
+        return _error('Invalid task_id', 400)
+
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    if not p.exists():
+        return _error('Task not found', 404)
+
+    progress = json.loads(p.read_text())
+    t0 = progress.get('t0', 0)
+    elapsed = round(time.time() - t0) if t0 else 0
+
+    if progress.get('step') == 'error':
+        return jsonify({
+            'task_id': task_id,
+            'status': 'error',
+            'error': progress.get('detail', 'Unknown error'),
+            'elapsed_seconds': elapsed,
+        }), 500
+
+    host = request.headers.get('X-Forwarded-Host', request.host)
+    proto = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{proto}://{host}"
+
+    if progress.get('step') != 'done':
+        return jsonify({
+            'task_id': task_id,
+            'status': 'running',
+            'step': progress.get('step', ''),
+            'detail': progress.get('detail', ''),
+            'elapsed_seconds': elapsed,
+            'poll_url': f"{base}/api/v1/onestop?task_id={task_id}&format={fmt}",
+        }), 202
+
+    # Done! Return result in requested format
+    auto_share_id = progress.get('auto_share_id')
+    result = _get_result(task_id)
+    if not result:
+        if auto_share_id:
+            # Load from auto-save share
+            share_path = SHARE_DIR / f"{auto_share_id}.json.gz"
+            if share_path.exists():
+                share_data = json.loads(gzip.decompress(share_path.read_bytes()))
+                result = share_data.get('result')
+        if not result:
+            return _error('Result expired. Re-run the analysis.', 410)
+
+    share_url = f"{base}/?share={auto_share_id}" if auto_share_id else None
+
+    if fmt == 'json':
+        result['_onestop'] = {
+            'task_id': task_id,
+            'elapsed_seconds': elapsed,
+            'auto_share_id': auto_share_id,
+            'share_url': share_url,
+        }
+        return jsonify(result)
+
+    # For gpkg/kml, we need to build the export from the result
+    obj_features = result.get('features', [])
+
+    # Apply type filter
+    type_filter_str = url_params.get('types')
+    if type_filter_str:
+        type_set = set(t.strip() for t in type_filter_str.split(','))
+        obj_features = [f for f in obj_features
+                       if f.get('properties', {}).get('type') in type_set]
+
+    # Apply height filter
+    obj_features = _apply_height_filter_features(obj_features, url_params)
+
+    if fmt == 'kml':
+        group_by = url_params.get('group_by', 'type')
+        kml = _build_kml(obj_features, group_by)
+        tmp = tempfile.NamedTemporaryFile(suffix='.kml', delete=False, mode='w', encoding='utf-8')
+        tmp.write(kml)
+        tmp.close()
+        resp = send_file(tmp.name, mimetype='application/vnd.google-earth.kml+xml',
+                        as_attachment=True, download_name='onestop_export.kml')
+        resp.headers['X-Auto-Share-Id'] = auto_share_id or ''
+        resp.headers['X-Elapsed-Seconds'] = str(elapsed)
+        return resp
+
+    if fmt == 'gpkg':
+        # Re-run GPKG export using the segment result's geometry
+        try:
+            onestop_meta_path = _PROGRESS_DIR / f"{task_id}.onestop.json"
+            meta_params = {}
+            if onestop_meta_path.exists():
+                meta_params = json.loads(onestop_meta_path.read_text()).get('params', {})
+
+            bbox_str = meta_params.get('bbox', url_params.get('bbox', ''))
+            parts = [float(x.strip()) for x in bbox_str.split(',')]
+            lon_min, lat_min, lon_max, lat_max = parts
+            from shapely.geometry import box as shapely_box
+            geom = shapely_box(lon_min, lat_min, lon_max, lat_max)
+            features = [{'geometry': geom}]
+
+            # Merge: meta_params as defaults, url_params as overrides
+            def _mp(key, default=''):
+                return url_params.get(key) or meta_params.get(key, default)
+
+            gpkg_params = {
+                'include_segments': 'true',
+                'include_segments_vector': _mp('include_segments_vector', 'true'),
+                'include_dtm': _mp('include_dtm', 'false'),
+                'types': _mp('types'),
+                'height_min': _mp('height_min'),
+                'height_max': _mp('height_max'),
+                'height_op': _mp('height_op'),
+                'color_mode': _mp('color_mode', 'type'),
+            }
+            # Override layers param
+            layers_str = _mp('layers', 'segments')
+            if layers_str and layers_str != 'segments':
+                layer_set = set(l.strip() for l in layers_str.split(',') if l.strip())
+                _resolve_layer_set(layer_set, gpkg_params)
+            else:
+                gpkg_params['include_segments'] = 'true'
+                gpkg_params['include_segments_vector'] = 'true'
+
+            tmp_path, table_count, gpkg_elapsed = _gpkg_core(features, gpkg_params)
+            if table_count == 0:
+                return _error('No layers produced')
+
+            resp = send_file(tmp_path, mimetype='application/geopackage+sqlite3',
+                            as_attachment=True, download_name='onestop_export.gpkg')
+            resp.headers['X-Auto-Share-Id'] = auto_share_id or ''
+            resp.headers['X-Elapsed-Seconds'] = str(elapsed)
+            return resp
+        except Exception as e:
+            log.error("onestop gpkg: %s", traceback.format_exc())
+            return _error(f"GPKG export failed: {e}", 500)
+
+    return _error(f"Unknown format: {fmt}. Use json, gpkg, or kml.", 400)
+
+
 @app.route('/docs')
 def docs_page():
     return send_from_directory('static', 'docs.html')
@@ -4188,7 +4591,7 @@ def share_download_gpkg(share_id):
             _resolve_layer_set(layer_set, params, state)
 
         # Allow extra query-string overrides
-        for key in ('types', 'color_mode', 'dataset'):
+        for key in ('types', 'color_mode', 'dataset', 'height_min', 'height_max', 'height_op'):
             val = request.args.get(key)
             if val is not None:
                 params[key] = val

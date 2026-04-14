@@ -1,4 +1,4 @@
-# Austrian Landscape Analysis API — v5.1
+# Austrian Landscape Analysis API — v5.2
 # Base: https://srtm-lidar-at.exe.xyz:8000
 # Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
 
@@ -111,12 +111,25 @@ Params:
                  dtm-YYYY   → DTM hillshade overlay (RGBA)
                  dsm-YYYY   → nDSM height overlay (RGBA)
   types        Segment type filter (e.g. tree,road)
+  height_min   Height filter: keep segments >= X metres
+  height_max   Height filter: keep segments <= X metres
+  height_op    gt | lt | between (inferred from min/max if omitted)
   color_mode   type | height (segment colouring)
   async        true → 202 with {task_id}
 Async download: GET /api/v1/export/geopackage/download/<task_id>
 
 Share shortcut: GET /api/v1/share/<id>/download.gpkg
   layers=all (default) | active (from share's UI state) | comma-separated IDs
+  types, height_min, height_max, height_op → filter segments
+
+#### POST /api/v1/export/kml
+Export segment features as KML with type/height_class folders.
+Params:
+  types          Segment type filter (e.g. tree,grass)
+  group_by       type (default) | height_class — folder grouping
+  height_min     Height filter: keep segments >= X metres
+  height_max     Height filter: keep segments <= X metres
+  height_op      gt | lt | between (inferred from min/max if omitted)
 
 #### POST /api/v1/export/mbtiles
 Single raster layer as MBTiles for offline use.
@@ -223,6 +236,97 @@ Background RF training job progress (4000-KG run).
 | 122 | orchard_grove | orchard + vineyard |
 | 130 | quarry | excavation + fill |
 | 131 | construction_site | construction + excavation + fill |
+
+---
+
+## One-Stop URL (# url)
+
+GET /api/v1/onestop — Trigger segmentation + download from a single bookmarkable URL.
+Designed for users on limited/mobile connections. No POST body needed.
+
+Query params:
+  bbox=lon_min,lat_min,lon_max,lat_max  Bounding box (required)
+  min_object_size=10       Min segment area in m² (default: 10)
+  include_ortho=true       Orthophoto features (default: true)
+  include_temporal=false    Multi-date comparison
+  include_copernicus=false  Sentinel-2/SAR
+  include_cadastre=false    Cadastre ground truth
+  include_hansen=false      Hansen forest change
+  types=tree,road           Object type filter
+  height_min=X              Height filter: >= X metres
+  height_max=X              Height filter: <= X metres
+  height_op=gt|lt|between   Height operator (inferred if omitted)
+  format=json|gpkg|kml      Output format (default: json)
+  layers=segments           GPKG layers (default: segments with vector)
+  include_segments_vector=true  Include vector polygon layer in GPKG
+  group_by=type|height_class    KML folder grouping
+
+Flow:
+  1. GET /api/v1/onestop?bbox=...&format=gpkg  → 202 {task_id, poll_url, estimated_seconds}
+  2. Poll the poll_url (same endpoint + task_id) until status=done
+  3. Final poll returns the file download (GPKG/KML) or JSON result
+  Result is auto-saved as a share for later access (auto_share_id in response).
+
+Processing queue: max 2 concurrent tasks, 4 in queue. Returns 503 if full.
+
+### Timing Estimates (bounding box < 1 km²)
+
+| Configuration              | Est. time  | Notes                            |
+|---------------------------|-----------|----------------------------------|
+| ortho only (default)       | ~30-60s   | DTM+DSM+ortho, fast              |
+| ortho + temporal           | ~60-90s   | +3-date comparison               |
+| ortho + temporal + all     | ~90-120s  | +Copernicus+cadastre+Hansen      |
+| GPKG/KML export            | +5-10s    | Added on top of analysis time    |
+| Auto-save (always happens) | +1-2s     | Gzip-compressed share saved      |
+
+For 0.5 km² with ortho, expect ~40s total. For 0.1 km², ~25s.
+On mobile connections, GPKG download (1-5 MB) may add 5-30s depending on speed.
+
+### Example One-Stop URLs (< 1 km²)
+
+```bash
+# 1. Trees >30m in a forest area near Graz (~0.3 km², ~35s, JSON)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=json'
+# → {"task_id":"...","status":"running","poll_url":"...","estimated_seconds":35}
+
+# 2. Same area, download as GeoPackage with vector polygons (~40s + 5s export)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+# Poll the poll_url until done, then the final request returns the .gpkg file
+
+# 3. All objects in a small village (~0.2 km², ortho+temporal, KML, ~50s)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&include_temporal=true&format=kml'
+
+# 4. Buildings only, height 5-15m, as GPKG (~30s)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=roof&height_min=5&height_max=15&format=gpkg'
+
+# 5. Poll a running task (same URL with task_id)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?task_id=<TASK_ID>&format=gpkg'
+# → 202 while running, then file download when done
+
+# 6. Full pipeline in a shell script:
+TASK=$(curl -s 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg' | jq -r .task_id)
+while true; do
+  RESP=$(curl -s -w '%{http_code}' -o /tmp/result.gpkg "https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?task_id=$TASK&format=gpkg")
+  [ "$RESP" = "200" ] && echo "Downloaded!" && break
+  sleep 5
+done
+```
+
+### Height Filter Examples (work on GPKG, KML, and one-stop)
+
+```bash
+# Trees taller than 30m (height_min=30, operator inferred as >=)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+
+# Objects shorter than 5m
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_max=5&format=kml'
+
+# Objects between 10m and 25m
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_min=10&height_max=25&format=gpkg'
+
+# Height filter on share GPKG download
+curl -o filtered.gpkg 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg?types=tree&height_min=20'
+```
 
 ---
 

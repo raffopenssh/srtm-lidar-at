@@ -1006,7 +1006,9 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
         if onestop_meta_path.exists():
             try:
                 meta = json.loads(onestop_meta_path.read_text())
-                custom_name = meta.get('params', {}).get('name')
+                custom_name = meta.get('params', {}).get('name', '')
+                if custom_name:
+                    custom_name = custom_name.strip().strip("'").strip('"')
             except Exception:
                 pass
         if custom_name and _valid_share_id(custom_name):
@@ -1941,6 +1943,7 @@ def export_kml():
         type_filter_str = params.get('types', None)
         type_filter = set(t.strip() for t in type_filter_str.split(',')) if type_filter_str else None
         group_by = params.get('group_by', 'type')
+        seg_geom = params.get('segment_geometry', 'point').lower().strip()
 
         # Get features from posted result or from cache
         if result_json:
@@ -1963,8 +1966,25 @@ def export_kml():
         # Filter by height
         obj_features = _apply_height_filter_features(obj_features, params)
 
+        # Polygon vectorisation if requested
+        kml_features = obj_features
+        if seg_geom == 'polygon' and features:
+            try:
+                geom_wgs = features[0]['geometry']
+                dataset = params.get('dataset', ti.DEFAULT_DATASET)
+                poly_features = _vectorise_segments_to_geojson(
+                    geom_wgs, dataset, type_filter=type_filter,
+                    height_params=params)
+                if poly_features:
+                    kml_features = poly_features
+                else:
+                    log.warning('kml export polygon: vectorisation returned 0 features, using points')
+            except Exception as e:
+                log.warning('kml export polygon fallback to points: %s', e)
+
         # Build KML
-        kml = _build_kml(obj_features, group_by)
+        style_mode = params.get('segment_geometry_style', 'type').lower().strip()
+        kml = _build_kml(kml_features, group_by, style_mode=style_mode)
 
         tmp = tempfile.NamedTemporaryFile(suffix='.kml', delete=False, mode='w', encoding='utf-8')
         tmp.write(kml)
@@ -1981,8 +2001,104 @@ def export_kml():
         return _error(f"Internal error: {e}", 500)
 
 
-def _build_kml(features, group_by='type'):
-    """Build a KML string from GeoJSON point features, organised into folders."""
+def _vectorise_segments_to_geojson(geom_wgs, dataset: str, type_filter=None,
+                                    height_params: dict = None,
+                                    style_mode: str = 'type') -> list:
+    """Vectorise cached segment labels into GeoJSON polygon features (WGS84).
+
+    Returns a list of GeoJSON Feature dicts with Polygon geometry and rich
+    properties.  Falls back to empty list if segment cache is unavailable.
+    """
+    from shapely.ops import transform as shapely_transform
+    import pyproj
+
+    geom_3035 = ti.geometry_to_3035(geom_wgs)
+    bounds_prefix = f"{geom_3035.bounds}_{dataset}"
+
+    # Try to load from seg cache (in-memory → disk scan)
+    cached = None
+    if (_seg_cache.get('labels') is not None and
+            _seg_cache.get('key') and bounds_prefix in _seg_cache['key']):
+        cached = _seg_cache
+    else:
+        cached = _seg_cache_load(bounds_prefix) or _seg_cache_scan(bounds_prefix)
+    if cached is None or cached.get('labels') is None:
+        return []
+
+    v_labels = cached['labels']
+    v_objects = cached['objects']
+    v_mask = cached['mask']
+    v_tf = cached['transform']
+    from rasterio.transform import Affine
+    if isinstance(v_tf, (list, tuple)):
+        v_tf = Affine(*v_tf[:6])
+
+    obj_map = {o.obj_id: o for o in v_objects}
+    # Apply type filter
+    if type_filter:
+        v_filtered = [o for o in v_objects if o.obj_type in type_filter]
+    else:
+        v_filtered = list(v_objects)
+    # Apply height filter
+    if height_params:
+        v_filtered = _apply_height_filter_objects(v_filtered, height_params)
+    filtered_ids = {o.obj_id for o in v_filtered}
+    if not filtered_ids:
+        return []
+
+    from rasterio.features import shapes as rasterize_shapes
+    label_int = v_labels.astype(np.int32)
+    seg_mask = v_mask & np.isin(label_int, list(filtered_ids))
+
+    # CRS transform: EPSG:3035 → EPSG:4326
+    proj = pyproj.Transformer.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+
+    out_features = []
+    for geom_dict, val in rasterize_shapes(
+        label_int, mask=seg_mask, transform=v_tf, connectivity=4,
+    ):
+        oid = int(val)
+        obj = obj_map.get(oid)
+        if obj is None:
+            continue
+        # Reproject polygon coords 3035→4326
+        from shapely.geometry import shape, mapping
+        poly_3035 = shape(geom_dict)
+        poly_wgs = shapely_transform(proj.transform, poly_3035)
+
+        tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+        hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+        hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+        hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+
+        out_features.append({
+            'type': 'Feature',
+            'geometry': mapping(poly_wgs),
+            'properties': {
+                'id': oid,
+                'type': obj.obj_type,
+                'group_type': obj.group_type or '',
+                'height_class': _height_class(obj.height_max),
+                'height_max_m': round(obj.height_max, 2),
+                'height_mean_m': round(obj.height_mean, 2),
+                'area_sqm': round(obj.area_sqm, 1),
+                'confidence': round(obj.confidence, 2),
+                'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
+                'color': hex_type,
+                'color_height': hex_height,
+            },
+        })
+    log.info('vectorise_to_geojson: %d polygon features', len(out_features))
+    return out_features
+
+
+def _build_kml(features, group_by='type', style_mode='type'):
+    """Build a KML string from GeoJSON features (points or polygons), organised into folders.
+
+    style_mode: 'type' — colour by object type (default)
+                'height' — colour by viridis height ramp
+    """
     import xml.etree.ElementTree as ET
 
     # Derive KML colours (AABBGGRR) from the canonical SEGMENT_COLORS
@@ -2030,20 +2146,51 @@ def _build_kml(features, group_by='type'):
         '</Style>'
     )
 
+    # Height-based viridis styles (10 buckets: 0-5, 5-10, ..., 40-45, 45+)
+    HEIGHT_BUCKETS = 10
+    for i in range(HEIGHT_BUCKETS):
+        t_val = (i + 0.5) / HEIGHT_BUCKETS  # midpoint fraction 0..1
+        rgb = _viridis_rgb(t_val)
+        color = 'ff{:02x}{:02x}{:02x}'.format(rgb[2], rgb[1], rgb[0])  # KML AABBGGRR
+        fill_color = '80' + color[2:]
+        lines.append(
+            f'<Style id="style-h{i}">'
+            f'<IconStyle><color>{color}</color><scale>0.8</scale>'
+            '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>'
+            '</IconStyle>'
+            f'<LineStyle><color>{color}</color><width>1.5</width></LineStyle>'
+            f'<PolyStyle><color>{fill_color}</color></PolyStyle>'
+            '</Style>'
+        )
+
+    def _coords_to_kml_ring(ring_coords):
+        """Convert a GeoJSON ring [[lon,lat], ...] to KML coordinate string."""
+        parts = []
+        for c in ring_coords:
+            lon, lat = c[0], c[1]
+            alt = c[2] if len(c) > 2 else 0
+            parts.append(f'{lon},{lat},{alt}')
+        return ' '.join(parts)
+
     for group_name in sorted(groups.keys()):
         items = groups[group_name]
         lines.append(f'<Folder><name>{_xml_escape(group_name)} ({len(items)})</name>')
         for feat, props, hc in items:
             geom = feat.get('geometry', {})
+            geom_type = geom.get('type', '')
             coords = geom.get('coordinates', [])
-            if not coords or len(coords) < 2:
+            if not coords:
                 continue
-            lon, lat = coords[0], coords[1]
-            alt = coords[2] if len(coords) > 2 else 0
             tname = props.get('type', 'unknown')
-            style_id = f'style-{tname}' if tname in TYPE_KML_COLORS else 'style-default'
-            h_max = props.get('height_max_m', 0)
-            area = props.get('area_sqm', 0)
+            if style_mode == 'height':
+                h_bucket = min(int((h_max / 45.0) ** 0.5 * HEIGHT_BUCKETS),
+                               HEIGHT_BUCKETS - 1)
+                if h_bucket < 0: h_bucket = 0
+                style_id = f'style-h{h_bucket}'
+            else:
+                style_id = f'style-{tname}' if tname in TYPE_KML_COLORS else 'style-default'
+            h_max = props.get('height_max_m', 0) or 0
+            area = props.get('area_sqm', 0) or 0
             rgba = SEGMENT_COLORS.get(tname, (128, 128, 128, 120))
             hex_color = '#{:02X}{:02X}{:02X}'.format(rgba[0], rgba[1], rgba[2])
             desc_parts = [f'Type: {tname}', f'Color: {hex_color}',
@@ -2055,6 +2202,34 @@ def _build_kml(features, group_by='type'):
                 desc_parts.append(f'Group: {props["group_type"]}')
             desc = '<br/>'.join(desc_parts)
             name_str = f'{tname} ({h_max:.1f}m, {area:.0f}m\u00b2)'
+
+            # Build geometry KML
+            if geom_type == 'Polygon' and coords:
+                rings_kml = ''
+                for i, ring in enumerate(coords):
+                    tag = 'outerBoundaryIs' if i == 0 else 'innerBoundaryIs'
+                    rings_kml += (f'<{tag}><LinearRing>'
+                                  f'<coordinates>{_coords_to_kml_ring(ring)}</coordinates>'
+                                  f'</LinearRing></{tag}>')
+                geom_kml = f'<Polygon><tessellate>1</tessellate>{rings_kml}</Polygon>'
+            elif geom_type == 'MultiPolygon' and coords:
+                polys_kml = ''
+                for poly_coords in coords:
+                    rings_kml = ''
+                    for i, ring in enumerate(poly_coords):
+                        tag = 'outerBoundaryIs' if i == 0 else 'innerBoundaryIs'
+                        rings_kml += (f'<{tag}><LinearRing>'
+                                      f'<coordinates>{_coords_to_kml_ring(ring)}</coordinates>'
+                                      f'</LinearRing></{tag}>')
+                    polys_kml += f'<Polygon><tessellate>1</tessellate>{rings_kml}</Polygon>'
+                geom_kml = f'<MultiGeometry>{polys_kml}</MultiGeometry>'
+            elif geom_type == 'Point' and len(coords) >= 2:
+                lon, lat = coords[0], coords[1]
+                alt = coords[2] if len(coords) > 2 else 0
+                geom_kml = f'<Point><coordinates>{lon},{lat},{alt}</coordinates></Point>'
+            else:
+                continue
+
             lines.append(f'<Placemark><name>{_xml_escape(name_str)}</name>'
                          f'<description><![CDATA[{desc}]]></description>'
                          f'<styleUrl>#{style_id}</styleUrl>'
@@ -2062,7 +2237,7 @@ def _build_kml(features, group_by='type'):
                          f'<Data name="color"><value>{hex_color}</value></Data>'
                          f'<Data name="type"><value>{_xml_escape(tname)}</value></Data>'
                          f'</ExtendedData>'
-                         f'<Point><coordinates>{lon},{lat},{alt}</coordinates></Point>'
+                         f'{geom_kml}'
                          '</Placemark>')
         lines.append('</Folder>')
 
@@ -3852,6 +4027,8 @@ def onestop():
       format=json|gpkg|kml                   Output format (default: json)
       layers=segments                        GPKG layers (default: segments)
       include_segments_vector=true            GPKG vector polygons (default: true)
+      segment_geometry=point|polygon         Feature geometry in KML/GPKG (default: point for KML, polygon for GPKG)
+      segment_geometry_style=type|height      Colour scheme: by object type or height ramp (default: type)
       group_by=type|height_class             KML folder grouping
 
     Returns:
@@ -3940,6 +4117,13 @@ def onestop():
         )
         thread.start()
 
+        est_seconds = _estimate_time(geom_3035, params)
+
+        # Browser: return auto-polling HTML page
+        if _wants_html():
+            return _onestop_poll_page(task_id, fmt, step='queued',
+                                     detail='Starting analysis…', est=est_seconds)
+
         host = request.headers.get('X-Forwarded-Host', request.host)
         proto = request.headers.get('X-Forwarded-Proto', request.scheme)
         base = f"{proto}://{host}"
@@ -3952,7 +4136,7 @@ def onestop():
             'queue_size': _TASK_QUEUE_SIZE,
             'poll_url': poll_url,
             'progress_url': progress_url,
-            'estimated_seconds': _estimate_time(geom_3035, params),
+            'estimated_seconds': est_seconds,
             'message': 'Analysis started. Poll poll_url until status=done, then the final response will contain the download.',
         }), 202
 
@@ -3981,6 +4165,90 @@ def _estimate_time(geom_3035, params: dict) -> int:
     return int(base)
 
 
+def _wants_html():
+    """Return True if the client prefers HTML (i.e. a browser)."""
+    accept = request.headers.get('Accept', '')
+    # Browsers send text/html first; curl/programmatic clients send */* or application/json
+    return 'text/html' in accept and 'application/json' not in accept
+
+
+def _onestop_poll_page(task_id: str, fmt: str, step: str = '', detail: str = '',
+                       elapsed: int = 0, est: int = 0):
+    """Return an HTML page that auto-polls onestop and redirects to the download."""
+    host = request.headers.get('X-Forwarded-Host', request.host)
+    proto = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{proto}://{host}"
+    progress_url = f"{base}/api/v1/segment/progress?task_id={task_id}"
+    download_url = f"{base}/api/v1/onestop?task_id={task_id}&format={fmt}"
+    pct = min(95, int(elapsed / max(est, 1) * 100)) if est else 0
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Processing…</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         display: flex; justify-content: center; align-items: center; min-height: 100vh;
+         margin: 0; background: #f5f7fa; color: #333; }}
+  .card {{ background: #fff; border-radius: 12px; padding: 40px 48px; text-align: center;
+           box-shadow: 0 2px 12px rgba(0,0,0,.08); max-width: 480px; width: 90%; }}
+  h2 {{ margin: 0 0 8px; font-size: 20px; }}
+  .sub {{ color: #888; font-size: 14px; margin-bottom: 24px; }}
+  .bar-bg {{ background: #e9ecef; border-radius: 8px; height: 8px; overflow: hidden; margin: 16px 0; }}
+  .bar {{ background: linear-gradient(90deg, #4361ee, #3a86ff); height: 100%; border-radius: 8px;
+          transition: width .5s ease; }}
+  .status {{ font-size: 14px; color: #555; min-height: 20px; }}
+  .elapsed {{ font-size: 12px; color: #aaa; margin-top: 8px; }}
+  .err {{ color: #dc3545; font-weight: 600; }}
+</style>
+</head><body><div class="card">
+  <h2>⚙️ Processing</h2>
+  <p class="sub">Your analysis is running. This page will auto-download when ready.</p>
+  <div class="bar-bg"><div class="bar" id="bar" style="width:{pct}%"></div></div>
+  <div class="status" id="status">{_html_esc(step)}: {_html_esc(detail)}</div>
+  <div class="elapsed" id="elapsed">{elapsed}s elapsed{f' / ~{est}s est.' if est else ''}</div>
+</div>
+<script>
+const progressUrl = "{progress_url}";
+const downloadUrl = "{download_url}";
+const est = {est};
+let t0 = Date.now() - {elapsed * 1000};
+
+async function poll() {{
+  try {{
+    const r = await fetch(progressUrl);
+    const d = await r.json();
+    const el = Math.round((Date.now() - t0) / 1000);
+    document.getElementById('elapsed').textContent = el + 's elapsed' + (est ? ' / ~' + est + 's est.' : '');
+    if (d.error) {{
+      document.getElementById('status').innerHTML = '<span class="err">❌ ' + d.error + '</span>';
+      document.getElementById('bar').style.background = '#dc3545';
+      return;
+    }}
+    if (d.done) {{
+      document.getElementById('bar').style.width = '100%';
+      document.getElementById('status').textContent = 'Downloading…';
+      window.location.href = downloadUrl;
+      setTimeout(function() {{
+        document.querySelector('h2').textContent = '✅ Done';
+        document.getElementById('status').textContent = 'Download started. You can close this page.';
+        document.querySelector('.sub').textContent = el + 's total processing time.';
+      }}, 2000);
+      return;
+    }}
+    const pct = Math.min(95, est ? Math.round(el / est * 100) : 50);
+    document.getElementById('bar').style.width = pct + '%';
+    document.getElementById('status').textContent = (d.step || '') + (d.detail ? ': ' + d.detail : '');
+  }} catch(e) {{ /* retry */ }}
+  setTimeout(poll, 3000);
+}}
+setTimeout(poll, 2000);
+</script></body></html>"""
+    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+def _html_esc(s):
+    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
 def _onestop_check(task_id: str, fmt: str, url_params: dict):
     """Check status of a one-stop task. Return result when done."""
     if not task_id or not re.match(r'^[a-f0-9\-]+$', task_id):
@@ -4007,6 +4275,11 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
     base = f"{proto}://{host}"
 
     if progress.get('step') != 'done':
+        if _wants_html():
+            return _onestop_poll_page(task_id, fmt,
+                                     step=progress.get('step', ''),
+                                     detail=progress.get('detail', ''),
+                                     elapsed=elapsed)
         return jsonify({
             'task_id': task_id,
             'status': 'running',
@@ -4055,7 +4328,35 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
 
     if fmt == 'kml':
         group_by = url_params.get('group_by', 'type')
-        kml = _build_kml(obj_features, group_by)
+        seg_geom = url_params.get('segment_geometry', 'point').lower().strip()
+
+        kml_features = obj_features
+        if seg_geom == 'polygon':
+            # Vectorise segment raster into polygon features
+            try:
+                onestop_meta_path = _PROGRESS_DIR / f"{task_id}.onestop.json"
+                meta_params = {}
+                if onestop_meta_path.exists():
+                    meta_params = json.loads(onestop_meta_path.read_text()).get('params', {})
+                bbox_str = meta_params.get('bbox', url_params.get('bbox', ''))
+                parts = [float(x.strip()) for x in bbox_str.split(',')]
+                lon_min, lat_min, lon_max, lat_max = parts
+                from shapely.geometry import box as shapely_box
+                geom_wgs = shapely_box(lon_min, lat_min, lon_max, lat_max)
+                dataset = meta_params.get('dataset', ti.DEFAULT_DATASET)
+                type_filter = set(t.strip() for t in url_params['types'].split(',')) if url_params.get('types') else None
+                poly_features = _vectorise_segments_to_geojson(
+                    geom_wgs, dataset, type_filter=type_filter,
+                    height_params=url_params)
+                if poly_features:
+                    kml_features = poly_features
+                else:
+                    log.warning('onestop kml polygon: vectorisation returned 0 features, falling back to points')
+            except Exception as e:
+                log.warning('onestop kml polygon fallback to points: %s', e)
+
+        style_mode = url_params.get('segment_geometry_style', 'type').lower().strip()
+        kml = _build_kml(kml_features, group_by, style_mode=style_mode)
         tmp = tempfile.NamedTemporaryFile(suffix='.kml', delete=False, mode='w', encoding='utf-8')
         tmp.write(kml)
         tmp.close()
@@ -4084,15 +4385,20 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
             def _mp(key, default=''):
                 return url_params.get(key) or meta_params.get(key, default)
 
+            # Map segment_geometry / segment_geometry_style to GPKG params
+            seg_geom = _mp('segment_geometry', 'polygon').lower().strip()
+            seg_style = _mp('segment_geometry_style', '') or _mp('color_mode', 'type')
+
             gpkg_params = {
                 'include_segments': 'true',
-                'include_segments_vector': _mp('include_segments_vector', 'true'),
+                'include_segments_vector': _mp('include_segments_vector',
+                    'false' if seg_geom == 'point' else 'true'),
                 'include_dtm': _mp('include_dtm', 'false'),
                 'types': _mp('types'),
                 'height_min': _mp('height_min'),
                 'height_max': _mp('height_max'),
                 'height_op': _mp('height_op'),
-                'color_mode': _mp('color_mode', 'type'),
+                'color_mode': seg_style if seg_style in ('type', 'height') else 'type',
             }
             # Override layers param
             layers_str = _mp('layers', 'segments')
@@ -4101,7 +4407,8 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
                 _resolve_layer_set(layer_set, gpkg_params)
             else:
                 gpkg_params['include_segments'] = 'true'
-                gpkg_params['include_segments_vector'] = 'true'
+                if seg_geom != 'point':
+                    gpkg_params['include_segments_vector'] = 'true'
 
             tmp_path, table_count, gpkg_elapsed = _gpkg_core(features, gpkg_params)
             if table_count == 0:

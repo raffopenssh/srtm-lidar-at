@@ -125,11 +125,13 @@ Share shortcut: GET /api/v1/share/<id>/download.gpkg
 #### POST /api/v1/export/kml
 Export segment features as KML with type/height_class folders.
 Params:
-  types          Segment type filter (e.g. tree,grass)
-  group_by       type (default) | height_class — folder grouping
-  height_min     Height filter: keep segments >= X metres
-  height_max     Height filter: keep segments <= X metres
-  height_op      gt | lt | between (inferred from min/max if omitted)
+  types                    Segment type filter (e.g. tree,grass)
+  group_by                 type (default) | height_class — folder grouping
+  segment_geometry         point (default) | polygon — vectorise segments to polygons
+  segment_geometry_style   type (default) | height — colour by object type or viridis height ramp
+  height_min               Height filter: keep segments >= X metres
+  height_max               Height filter: keep segments <= X metres
+  height_op                gt | lt | between (inferred from min/max if omitted)
 
 #### POST /api/v1/export/mbtiles
 Single raster layer as MBTiles for offline use.
@@ -260,6 +262,8 @@ Query params:
   format=json|gpkg|kml      Output format (default: json)
   layers=segments           GPKG layers (default: segments with vector)
   include_segments_vector=true  Include vector polygon layer in GPKG
+  segment_geometry=point|polygon  Feature geometry (default: point for KML, polygon for GPKG)
+  segment_geometry_style=type|height  Colour scheme: by object type or viridis height ramp
   group_by=type|height_class    KML folder grouping
 
 Flow:
@@ -311,6 +315,25 @@ while true; do
   [ "$RESP" = "200" ] && echo "Downloaded!" && break
   sleep 5
 done
+```
+
+### Segment Geometry Examples (polygon vs point, style modes)
+
+```bash
+# KML with polygon outlines coloured by height (viridis ramp)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&format=kml&segment_geometry=polygon&segment_geometry_style=height&group_by=height_class'
+
+# KML with polygons coloured by object type (default style)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml&segment_geometry=polygon'
+
+# KML with point centroids only (default, fast — no vectorisation)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml'
+
+# GPKG with height-coloured polygons (segment_geometry defaults to polygon for GPKG)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry_style=height'
+
+# GPKG with points only (skip vectorisation, smaller file)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry=point'
 ```
 
 ### Height Filter Examples (work on GPKG, KML, and one-stop)

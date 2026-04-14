@@ -842,6 +842,8 @@ curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohl
       <tr><td>height_max</td><td>number</td><td>Keep only objects with height ≤ this value (metres)</td></tr>
       <tr><td>height_op</td><td>string</td><td><code>gt</code>, <code>lt</code>, or <code>between</code>. Auto-inferred from min/max if omitted.</td></tr>
       <tr><td>layers</td><td>string</td><td>GPKG layers to include. <span class="param-default">Default: <code>segments</code> (raster + vector)</span></td></tr>
+      <tr><td>segment_geometry</td><td>string</td><td>Feature geometry: <code>point</code> (default for KML) or <code>polygon</code> (default for GPKG). Polygons are vectorised from the segment raster.</td></tr>
+      <tr><td>segment_geometry_style</td><td>string</td><td>Colour scheme: <code>type</code> (default) colours by object type, <code>height</code> colours by viridis height ramp.</td></tr>
       <tr><td>group_by</td><td>string</td><td>KML folder grouping: <code>type</code> (default) or <code>height_class</code></td></tr>
       <tr><td>task_id</td><td>string</td><td>Poll a previously started task (omit bbox when using this)</td></tr>
     </tbody>
@@ -946,7 +948,25 @@ curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'https://
   </div>
 
   <div class="code-wrap">
-    <div class="code-header"><span>Example 5 — Full automation (shell script)</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <div class="code-header"><span>Example 5 — Polygon KML coloured by height</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code><span class="tok-comment"># Trees as polygon outlines, coloured by height ramp (viridis), grouped by height class</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;format=kml&amp;segment_geometry=polygon&amp;segment_geometry_style=height&amp;group_by=height_class'</span>
+
+<span class="tok-comment"># Polygons coloured by type (default style)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=polygon'</span>
+
+<span class="tok-comment"># Points only (default, fast — no raster vectorisation)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=point'</span>
+
+<span class="tok-comment"># GPKG with height-coloured polygons (segment_geometry defaults to polygon for GPKG)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry_style=height'</span>
+
+<span class="tok-comment"># GPKG with points only (skip vectorisation, smaller file)</span>
+curl <span class="tok-url">'https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry=point'</span></code></pre>
+  </div>
+
+  <div class="code-wrap">
+    <div class="code-header"><span>Example 6 — Full automation (shell script)</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment">#!/bin/bash</span>
 <span class="tok-comment"># Analyse a bounding box and download the GPKG when ready</span>
 BASE=<span class="tok-string">"https://srtm-lidar-at.exe.xyz:8000/api/v1/onestop"</span>

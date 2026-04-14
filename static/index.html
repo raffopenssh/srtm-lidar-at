@@ -125,6 +125,15 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .legend.collapsed .legend-header{margin-bottom:0}
 .legend h4{font-size:11px;margin-bottom:4px;color:#333}
 .legend-bar{height:14px;border-radius:3px;margin-bottom:2px}
+.legend-scale-wrap{position:relative;user-select:none}
+.legend-scale-wrap .legend-bar{margin-bottom:0;position:relative;overflow:visible}
+.legend-hf-overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;overflow:visible}
+.legend-hf-dim{position:absolute;top:0;bottom:0;background:rgba(255,255,255,.6);pointer-events:none}
+.legend-hf-dim.left{left:0;border-radius:3px 0 0 3px}
+.legend-hf-dim.right{right:0;border-radius:0 3px 3px 0}
+.legend-hf-thumb{position:absolute;top:-3px;width:12px;height:calc(100% + 6px);cursor:ew-resize;pointer-events:auto;touch-action:none;z-index:2;transform:translateX(-50%)}
+.legend-hf-thumb::after{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:3px;height:100%;background:#fff;border-radius:1.5px;box-shadow:0 0 2px rgba(0,0,0,.6)}
+.legend-hf-thumb:hover::after,.legend-hf-thumb:active::after{width:4px;box-shadow:0 0 4px rgba(0,0,0,.8)}
 .legend-labels{display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:6px}
 .legend-item{display:flex;align-items:center;gap:6px;margin:2px 0;font-size:11px;cursor:pointer;user-select:none;padding:4px 4px;border-radius:4px;min-height:28px}
 .legend-item:hover{background:#f0f0f0}
@@ -687,6 +696,7 @@ function clearEverything(){
   // Clear results
   resultLayer.clearLayers();
   markersByType={};allFeatureData=[];hiddenTypes.clear();
+  _lhfLo=0;_lhfHi=1;_lhfUpdateVisual();
   lastResult=null;
   _rasterOrigImg=null;_rasterOrigBounds=null;_rasterReloadSeq++;
   // Remove all overlays
@@ -936,34 +946,22 @@ function _initHeightRange(prefix){
   if(!track||track.dataset.init) return;
   track.dataset.init='1';
   _hrState[prefix]={min:HR_MIN,max:HR_MAX};
-  const fill=document.getElementById(prefix+'-hr-fill');
   const tMin=document.getElementById(prefix+'-hr-min');
   const tMax=document.getElementById(prefix+'-hr-max');
-  const lMin=document.getElementById(prefix+'-hr-min-val');
-  const lMax=document.getElementById(prefix+'-hr-max-val');
-  function pct(v){return((v-HR_MIN)/(HR_MAX-HR_MIN))*100;}
+  _updateHRVisual(prefix);
   function snap(v){return Math.round(v/HR_STEP)*HR_STEP;}
-  function update(){
-    const s=_hrState[prefix];
-    const p1=pct(s.min), p2=pct(s.max);
-    fill.style.left=p1+'%'; fill.style.width=(p2-p1)+'%';
-    tMin.style.left=p1+'%'; tMax.style.left=p2+'%';
-    lMin.textContent=(s.min===HR_MIN?'0':s.min.toFixed(1))+' m';
-    lMax.textContent=(s.max>=HR_MAX?'50+ m':s.max.toFixed(1)+' m');
-  }
-  update();
   function startDrag(thumb,isMax){
-    function onMove(ex,ey){
+    function onMove(ex){
       const rect=track.getBoundingClientRect();
       let ratio=Math.max(0,Math.min(1,(ex-rect.left)/rect.width));
       let val=snap(HR_MIN+ratio*(HR_MAX-HR_MIN));
       const s=_hrState[prefix];
       if(isMax){s.max=Math.max(val,s.min+HR_STEP);}else{s.min=Math.min(val,s.max-HR_STEP);}
       s.min=Math.max(HR_MIN,s.min); s.max=Math.min(HR_MAX,s.max);
-      update();
+      _updateHRVisual(prefix);
     }
-    function onPointerMove(e){e.preventDefault();onMove(e.clientX,e.clientY);}
-    function onTouchMove(e){e.preventDefault();const t=e.touches[0];onMove(t.clientX,t.clientY);}
+    function onPointerMove(e){e.preventDefault();onMove(e.clientX);}
+    function onTouchMove(e){e.preventDefault();onMove(e.touches[0].clientX);}
     function stop(){document.removeEventListener('pointermove',onPointerMove);document.removeEventListener('pointerup',stop);document.removeEventListener('touchmove',onTouchMove);document.removeEventListener('touchend',stop);}
     document.addEventListener('pointermove',onPointerMove);
     document.addEventListener('pointerup',stop);
@@ -984,11 +982,39 @@ function _getHeightFilter(prefix){
   return params;
 }
 
+function _syncHeightRangeFromLegend(prefix){
+  const s=_hrState[prefix]; if(!s) return;
+  const{lo,hi}=_lhfGetRange();
+  // Legend uses sqrt scale 0-45m; export slider is linear 0-50m
+  // If legend is full range, set export to full range too
+  s.min=(lo<=0)?HR_MIN:Math.min(lo,HR_MAX);
+  s.max=(hi===Infinity)?HR_MAX:Math.min(hi,HR_MAX);
+  // Re-render the slider visual
+  const track=document.getElementById(prefix+'-hr-track');
+  if(track&&track.dataset.init) _updateHRVisual(prefix);
+}
+function _updateHRVisual(prefix){
+  const s=_hrState[prefix]; if(!s) return;
+  const fill=document.getElementById(prefix+'-hr-fill');
+  const tMin=document.getElementById(prefix+'-hr-min');
+  const tMax=document.getElementById(prefix+'-hr-max');
+  const lMin=document.getElementById(prefix+'-hr-min-val');
+  const lMax=document.getElementById(prefix+'-hr-max-val');
+  if(!fill) return;
+  const pct=v=>((v-HR_MIN)/(HR_MAX-HR_MIN))*100;
+  const p1=pct(s.min), p2=pct(s.max);
+  fill.style.left=p1+'%'; fill.style.width=(p2-p1)+'%';
+  tMin.style.left=p1+'%'; tMax.style.left=p2+'%';
+  lMin.textContent=(s.min===HR_MIN?'0':s.min.toFixed(1))+' m';
+  lMax.textContent=(s.max>=HR_MAX?'50+ m':s.max.toFixed(1)+' m');
+}
 function buildExportTypeFilters(){
   _initExportOT('gpkg'); _initExportOT('kml');
   _initHeightRange('gpkg'); _initHeightRange('kml');
   // Sync from map selectedTypes
   _syncExportOTFromMap('gpkg'); _syncExportOTFromMap('kml');
+  // Sync height range from legend filter
+  _syncHeightRangeFromLegend('gpkg'); _syncHeightRangeFromLegend('kml');
 }
 function updateKmlState(){
   const btn=document.getElementById('btn-dl-kml');
@@ -1279,10 +1305,80 @@ function setColorMode(m){
 function updateLegendScale(){
   const d=document.getElementById('legend-scale');
   if(colorMode==='height'){
-    d.innerHTML=`<div class="legend-bar" style="background:${viridisGrad()}"></div><div class="legend-labels" style="position:relative;height:14px"><span style="position:absolute;left:0">0 m</span><span style="position:absolute;left:47%;transform:translateX(-50%)">10</span><span style="position:absolute;left:67%;transform:translateX(-50%)">20</span><span style="position:absolute;right:0">45+ m</span></div>`;
+    d.innerHTML=`<div class="legend-scale-wrap"><div class="legend-bar" style="background:${viridisGrad()}"><div class="legend-hf-overlay"><div class="legend-hf-dim left" id="lhf-dim-l"></div><div class="legend-hf-dim right" id="lhf-dim-r"></div><div class="legend-hf-thumb" id="lhf-lo" style="left:0%"></div><div class="legend-hf-thumb" id="lhf-hi" style="left:100%"></div></div></div></div><div class="legend-labels" style="position:relative;height:14px"><span style="position:absolute;left:0" id="lhf-lo-lbl">0 m</span><span style="position:absolute;left:47%;transform:translateX(-50%)">10</span><span style="position:absolute;left:67%;transform:translateX(-50%)">20</span><span style="position:absolute;right:0" id="lhf-hi-lbl">45+ m</span></div>`;
+    _initLegendHeightFilter();
   } else if(lastEndpoint==='changes'||lastEndpoint==='changes/trees'){
     d.innerHTML=`<div class="legend-bar" style="background:${divGrad()}"></div><div class="legend-labels"><span>−5 m</span><span>0</span><span>+5 m</span></div>`;
   } else d.innerHTML='';
+}
+// ============ LEGEND HEIGHT FILTER ============
+const LHF_MAX_M=45; // viridis scale max
+let _lhfLo=0, _lhfHi=1; // 0..1 normalised positions
+let _lhfDebounce=null;
+function _lhfHeightAt(pct){return pct*pct*LHF_MAX_M;} // matches sqrt mapping: pct=sqrt(h/45)
+function _lhfPctAt(h){return Math.sqrt(Math.max(0,h)/LHF_MAX_M);}
+function _initLegendHeightFilter(){
+  const wrap=document.querySelector('.legend-scale-wrap');
+  if(!wrap) return;
+  const bar=wrap.querySelector('.legend-bar');
+  const lo=document.getElementById('lhf-lo'), hi=document.getElementById('lhf-hi');
+  _lhfUpdateVisual();
+  function startDrag(thumb,isHi){
+    function onMove(cx){
+      const rect=bar.getBoundingClientRect();
+      let pct=Math.max(0,Math.min(1,(cx-rect.left)/rect.width));
+      if(isHi){_lhfHi=Math.max(pct,_lhfLo+.02);}else{_lhfLo=Math.min(pct,_lhfHi-.02);}
+      _lhfUpdateVisual();
+      clearTimeout(_lhfDebounce);
+      _lhfDebounce=setTimeout(_applyLegendHeightFilter,120);
+    }
+    function onPtr(e){e.preventDefault();onMove(e.clientX);}
+    function onTouch(e){e.preventDefault();onMove(e.touches[0].clientX);}
+    function stop(){document.removeEventListener('pointermove',onPtr);document.removeEventListener('pointerup',stop);document.removeEventListener('touchmove',onTouch);document.removeEventListener('touchend',stop);}
+    document.addEventListener('pointermove',onPtr);
+    document.addEventListener('pointerup',stop);
+    document.addEventListener('touchmove',onTouch,{passive:false});
+    document.addEventListener('touchend',stop);
+  }
+  lo.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(lo,false);});
+  hi.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(hi,true);});
+  lo.addEventListener('touchstart',e=>{e.preventDefault();startDrag(lo,false);},{passive:false});
+  hi.addEventListener('touchstart',e=>{e.preventDefault();startDrag(hi,true);},{passive:false});
+}
+function _lhfUpdateVisual(){
+  const dimL=document.getElementById('lhf-dim-l'), dimR=document.getElementById('lhf-dim-r');
+  const lo=document.getElementById('lhf-lo'), hi=document.getElementById('lhf-hi');
+  const lblLo=document.getElementById('lhf-lo-lbl'), lblHi=document.getElementById('lhf-hi-lbl');
+  if(!dimL) return;
+  dimL.style.width=(_lhfLo*100)+'%';
+  dimR.style.width=((1-_lhfHi)*100)+'%';
+  lo.style.left=(_lhfLo*100)+'%';
+  hi.style.left=(_lhfHi*100)+'%';
+  const hLo=_lhfHeightAt(_lhfLo), hHi=_lhfHeightAt(_lhfHi);
+  if(lblLo) lblLo.textContent=(_lhfLo<.01?'0':hLo.toFixed(0))+' m';
+  if(lblHi) lblHi.textContent=(_lhfHi>.98?'45+ m':hHi.toFixed(0)+' m');
+}
+function _lhfGetRange(){
+  const lo=_lhfLo<.01?0:_lhfHeightAt(_lhfLo);
+  const hi=_lhfHi>.98?Infinity:_lhfHeightAt(_lhfHi);
+  return{lo,hi};
+}
+function _applyLegendHeightFilter(){
+  const segCb=document.querySelector('[data-lyr="segments"]');
+  const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
+  const{lo:hLo,hi:hHi}=_lhfGetRange();
+  const fullRange=hLo===0&&hHi===Infinity;
+  for(const[t,markers]of Object.entries(markersByType)){
+    const typeVis=segOn&&!hiddenTypes.has(t)&&selectedTypes.has(t);
+    for(const m of markers){
+      const el=m._icon||m.getElement?.();
+      if(!el) continue;
+      if(!typeVis){el.style.display='none';continue;}
+      if(fullRange){el.style.display='';continue;}
+      const h=m._fHeight||0;
+      el.style.display=(h>=hLo&&h<=hHi)?'':'none';
+    }
+  }
 }
 function markerColor(f){
   const p=f.properties;
@@ -1312,9 +1408,18 @@ function applyVis(){
   // Respect the Segments layer checkbox — if unchecked, keep all markers hidden
   const segCb=document.querySelector('[data-lyr="segments"]');
   const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
+  const{lo:hLo,hi:hHi}=_lhfGetRange();
+  const fullRange=hLo===0&&hHi===Infinity;
+  const hFilter=colorMode==='height'&&!fullRange;
   for(const[t,layers]of Object.entries(markersByType)){
-    const vis=segOn&&!hiddenTypes.has(t);
-    for(const lyr of layers){const el=lyr._icon||lyr.getElement?.();if(el)el.style.display=vis?'':'none';}
+    const typeVis=segOn&&!hiddenTypes.has(t);
+    for(const lyr of layers){
+      const el=lyr._icon||lyr.getElement?.();
+      if(!el)continue;
+      if(!typeVis){el.style.display='none';continue;}
+      if(hFilter){const h=lyr._fHeight||0;el.style.display=(h>=hLo&&h<=hHi)?'':'none';}
+      else el.style.display='';
+    }
   }
 }
 
@@ -1550,6 +1655,8 @@ function getShareState(){
     top_n_objects:document.getElementById('top_n_objects').value,
     min_height_m:document.getElementById('min_height_m').value,
     colorMode:colorMode,
+    heightFilterLo:_lhfLo,
+    heightFilterHi:_lhfHi,
     hidden:[...hiddenTypes],
     layers:layers,
     opacities:opacities,
@@ -1631,6 +1738,10 @@ function restoreShareState(s){
   }
   // Color mode
   if(s.colorMode&&s.colorMode!==colorMode) setColorMode(s.colorMode);
+  // Height filter on legend
+  if(s.heightFilterLo!==undefined) _lhfLo=s.heightFilterLo;
+  if(s.heightFilterHi!==undefined) _lhfHi=s.heightFilterHi;
+  _lhfUpdateVisual();
   // Hidden legend types
   hiddenTypes.clear();
   if(s.hidden) s.hidden.forEach(t=>hiddenTypes.add(t));
@@ -2648,6 +2759,7 @@ function showFeaturesOnMap(data){
       const info=typeInfo(t,lastEndpoint);
       const col=markerColor(f);
       const m=L.marker(ll,{icon:mkIcon(info,col)});
+      m._fHeight=p.height_max_m||p.height_after_m||p.height_max||0;
       if(!markersByType[t])markersByType[t]=[];
       markersByType[t].push(m);
       return m;

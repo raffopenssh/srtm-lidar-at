@@ -566,10 +566,7 @@ def curve_eval_status():
             from pathlib import Path
             csv_path = Path('data/oob_curve.csv')
             n_ckpt = len(list(Path('rf_training_data/checkpoints').glob('kg_*.npz')))
-            max_step = n_ckpt  # last step = total checkpoints
-            steps = list(range(5, max_step + 1, 5))
-            if max_step not in steps:
-                steps.append(max_step)
+            steps = list(range(5, n_ckpt + 1, 5))
             total_combos = len(steps) * 5  # 5 seeds
             done_combos = 0
             last_kgs = 0

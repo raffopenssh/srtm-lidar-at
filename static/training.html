@@ -299,9 +299,9 @@ function renderCurveTable(curve) {
     const seeds = r.n_seeds || 1;
     let cls = '';
     let ann = '';
-    if (med === bestMedian) { cls = 'best'; ann = '\u2190 BEST'; }
-    else if (med === troughMedian && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough'; }
-    if (r.n_classes > prevCls && prevCls > 0) { cls = 'new-class'; ann += (ann ? ' ' : '') + '\u2190 +class\u2192' + r.n_classes; }
+    if (r.n_classes > prevCls && prevCls > 0) { ann += '\u2190 +class\u2192' + r.n_classes; }
+    if (med === bestMedian) { cls = 'best'; ann = '\u2190 BEST' + (ann ? ' ' + ann : ''); }
+    else if (med === troughMedian && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough' + (ann ? ' ' + ann : ''); }
     if (prevOob !== null && med > prevOob + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '\u2191'; }
     if (prevOob !== null && med < prevOob - 0.002) { ann += (ann ? ' ' : '') + '\u2193'; }
 

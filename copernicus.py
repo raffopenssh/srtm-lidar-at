@@ -89,6 +89,11 @@ WORLDCOVER_CLASSES: Dict[int, str] = {
 
 _connection: Optional[Any] = None
 
+# Per-credential connection pool — keyed by credential index.
+# Used by _get_connection_for_cred() for parallel workers that each
+# need their own openEO session (1 sync download per client_id).
+_connections: Dict[int, Any] = {}
+
 # Global flag: set when Copernicus returns 402 PaymentRequired.
 # Callers (e.g. rf_train) can check this to pause gracefully.
 credits_exhausted: bool = False
@@ -143,6 +148,30 @@ def _get_connection() -> Any:
     )
     logger.info("Authenticated successfully (client_id=%s)", CLIENT_ID[:16] + "...")
     _connection = conn
+    return conn
+
+
+def _get_connection_for_cred(cred_index: int) -> Any:
+    """Return a cached connection for a specific credential index.
+
+    Each credential gets its own openEO session, allowing parallel sync
+    downloads (openEO limits 1 concurrent sync job per client_id).
+    """
+    if cred_index in _connections:
+        return _connections[cred_index]
+
+    if openeo is None:
+        raise ImportError("The 'openeo' package is required.")
+
+    cid, csecret = _CREDENTIALS[cred_index]
+    logger.info("Connecting to openEO for cred %d/%d (client_id=%s)",
+                cred_index + 1, len(_CREDENTIALS), cid[:16] + "...")
+    conn = openeo.connect(OPENEO_URL)
+    conn.authenticate_oidc_client_credentials(
+        client_id=cid, client_secret=csecret,
+    )
+    logger.info("Authenticated cred %d (client_id=%s)", cred_index + 1, cid[:16] + "...")
+    _connections[cred_index] = conn
     return conn
 
 
@@ -329,6 +358,7 @@ def _run_datacube(
 def get_ndvi_composite(
     bbox_wgs84: Dict[str, float],
     year: int = 2023,
+    _conn: Any = None,
 ) -> Dict[str, Any]:
     """Fetch a cloud-free NDVI composite for a bounding box.
 
@@ -367,7 +397,7 @@ def get_ndvi_composite(
         }
 
     logger.info("Fetching NDVI composite for bbox=%s, year=%d", bbox, year)
-    conn = _get_connection()
+    conn = _conn or _get_connection()
 
     # Load Sentinel-2 L2A with B04 (Red), B08 (NIR), and SCL (Scene Classification)
     s2 = conn.load_collection(
@@ -651,6 +681,7 @@ def _parse_timeseries_tiff(
 
 def get_land_cover(
     bbox_wgs84: Dict[str, float],
+    _conn: Any = None,
 ) -> Dict[str, Any]:
     """Fetch ESA WorldCover 10 m land-use classification.
 
@@ -680,7 +711,7 @@ def get_land_cover(
         }
 
     logger.info("Fetching ESA WorldCover for bbox=%s", bbox)
-    conn = _get_connection()
+    conn = _conn or _get_connection()
 
     # ESA WorldCover 10m 2021 v2 — single band "MAP"
     # Temporal extent is required by openEO even for static datasets
@@ -713,6 +744,7 @@ def get_sar_backscatter(
     bbox_wgs84: Dict[str, float],
     start_date: str,
     end_date: str,
+    _conn: Any = None,
 ) -> Dict[str, Any]:
     """Fetch Sentinel-1 SAR VV+VH backscatter composite.
 
@@ -746,7 +778,7 @@ def get_sar_backscatter(
         "Fetching SAR backscatter for bbox=%s, %s → %s",
         bbox, start_date, end_date,
     )
-    conn = _get_connection()
+    conn = _conn or _get_connection()
 
     s1 = conn.load_collection(
         "SENTINEL1_GRD",

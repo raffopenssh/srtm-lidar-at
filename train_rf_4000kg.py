@@ -829,17 +829,25 @@ def process_one_kg(
             bbox_dict = {"west": west, "south": south, "east": east, "north": north}
             cop = {}
 
-            def _fetch_ndvi():
-                d = copernicus.get_ndvi_composite(bbox_dict, year=obs_year)
+            # Each credential gets its own openEO connection — openEO
+            # limits 1 concurrent sync download per client_id.  With N
+            # credentials we can run N downloads in parallel.
+            n_creds = len(copernicus._CREDENTIALS)
+
+            def _fetch_ndvi(cred_idx):
+                conn = copernicus._get_connection_for_cred(cred_idx)
+                d = copernicus.get_ndvi_composite(bbox_dict, year=obs_year, _conn=conn)
                 return {"ndvi": d["ndvi"], "transform": d["transform"], "crs": d["crs"]}
 
-            def _fetch_landcover():
-                return copernicus.get_land_cover(bbox_dict)
+            def _fetch_landcover(cred_idx):
+                conn = copernicus._get_connection_for_cred(cred_idx)
+                return copernicus.get_land_cover(bbox_dict, _conn=conn)
 
-            def _fetch_sar():
+            def _fetch_sar(cred_idx):
+                conn = copernicus._get_connection_for_cred(cred_idx)
                 sar_start = f"{obs_year}-06-01"
                 sar_end   = f"{obs_year}-09-30"
-                d = copernicus.get_sar_backscatter(bbox_dict, sar_start, sar_end)
+                d = copernicus.get_sar_backscatter(bbox_dict, sar_start, sar_end, _conn=conn)
                 return {"vv": d["vv"], "vh": d["vh"], "sar_transform": d["transform"], "sar_crs": d["crs"]}
 
             def _fetch_harmonics():
@@ -848,6 +856,14 @@ def process_one_kg(
 
             COP_TIMEOUT = 180
             HARM_TIMEOUT = 900
+
+            # Assign each fetch to a credential: round-robin across available creds.
+            # With 2 creds we run 2 in parallel, then the 3rd uses whichever finishes first.
+            fetch_tasks = [
+                ("ndvi",      lambda ci=0 % n_creds: _fetch_ndvi(ci)),
+                ("landcover", lambda ci=1 % n_creds: _fetch_landcover(ci)),
+                ("sar",       lambda ci=0 % n_creds: _fetch_sar(ci)),
+            ]
 
             # --- Circuit breaker: skip Copernicus entirely if openEO is down ---
             # File-based so it persists across forked subprocesses.
@@ -859,14 +875,14 @@ def process_one_kg(
                          _cb["cooldown"] - (_time.time() - _cb["last_failure"]))
                 copernicus_data = None
             else:
-                # Run NDVI + landcover + SAR in parallel (3 workers), then harmonics
-                # This avoids 3×180s sequential timeout stacking.
+                # Run NDVI + landcover + SAR in parallel.
+                # max_workers = n_creds so each worker uses a different client_id,
+                # avoiding "max connections reached: 1" from openEO.
                 cop_success = 0
                 cop_fail = 0
-                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as exe:
-                    # Submit fast trio in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n_creds) as exe:
                     fast_futs = {}
-                    for name, func in [("ndvi", _fetch_ndvi), ("landcover", _fetch_landcover), ("sar", _fetch_sar)]:
+                    for name, func in fetch_tasks:
                         fast_futs[name] = exe.submit(func)
                     for name, fut in fast_futs.items():
                         try:

@@ -52,8 +52,15 @@
 </head>
 <body>
 
-<h1>🌲 RF Training Monitor</h1>
-<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span></div>
+<div style="display:flex;align-items:baseline;gap:16px">
+  <h1>🌲 RF Training Monitor</h1>
+  <span style="font-size:11px;display:flex;gap:10px">
+    <a href="/" style="color:var(--dim);text-decoration:none">← app</a>
+    <a href="/docs" style="color:var(--dim);text-decoration:none">docs</a>
+    <a href="/api/v1/training/status" style="color:var(--dim);text-decoration:none">api</a>
+  </span>
+</div>
+<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span></div>
 
 <div class="grid" id="cards"></div>
 
@@ -303,6 +310,22 @@ async function poll() {
     console.error('Poll error:', e);
   }
 }
+
+function updateNextCron() {
+  const now = new Date();
+  const utcH = now.getUTCHours(), utcM = now.getUTCMinutes();
+  const mins = utcH * 60 + utcM;
+  // Cron runs at 03:00 and 15:00 UTC
+  const slots = [3*60, 15*60, 27*60]; // 27h = next day 03:00
+  let next = slots.find(s => s > mins) || slots[0];
+  let diff = next - mins;
+  if (diff <= 0) diff += 24*60;
+  const h = Math.floor(diff / 60), m = diff % 60;
+  const label = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  document.getElementById('nextCron').textContent = label;
+}
+updateNextCron();
+setInterval(updateNextCron, 60000);
 
 poll();
 setInterval(poll, 15000);

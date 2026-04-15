@@ -212,8 +212,6 @@ def _run_curve_locked(step=5):
             csv.writer(f).writerow(HEADER)
 
     steps = list(range(step, n_total + 1, step))
-    if n_total not in steps:
-        steps.append(n_total)
 
     # Build work list: all (step, seed) combos not yet done
     work = []

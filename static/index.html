@@ -114,6 +114,9 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .lyr input[type=checkbox]{margin:0;width:20px;height:20px;flex-shrink:0}
 .lyr input[type=range]{width:55px;height:14px}
 .lyr-label{flex:1;font-size:11px}
+.basemap-switch{display:flex;gap:2px;margin-bottom:6px;background:#f0f0f0;border-radius:5px;padding:2px;user-select:none}
+.basemap-switch button{flex:1;font-size:10px;font-weight:600;padding:3px 6px;border:none;border-radius:4px;background:transparent;color:#888;cursor:pointer;transition:all .15s}
+.basemap-switch button.active{background:#fff;color:#333;box-shadow:0 1px 3px rgba(0,0,0,.15)}
 
 /* Legend */
 .legend{position:absolute;bottom:24px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:10px 12px;font-size:11px;max-width:260px;max-height:50vh;overflow-y:auto}
@@ -399,7 +402,13 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         <div class="lyr"><input type="checkbox" data-lyr="segments" checked><span class="lyr-label">Segments</span><input type="range" data-op="segments" min="0" max="100" value="90"></div>
       </div>
     </div>
-    <div class="lyr" style="margin-top:6px;border-top:1px solid #eee;padding-top:4px"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
+    <div style="margin-top:6px;border-top:1px solid #eee;padding-top:4px">
+      <div class="basemap-switch" id="basemap-switch">
+        <button class="active" data-basemap="osm">Map</button>
+        <button data-basemap="satellite">Satellite</button>
+      </div>
+      <div class="lyr"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
+    </div>
     </div><!-- /lp-body -->
   </div>
 
@@ -671,7 +680,18 @@ function mkIcon(info,colorOvr){
 
 // ============ MAP ============
 const map=L.map('map').setView([47.137,15.117],14);
-const baseLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}).addTo(map);
+const baseLayers={osm:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}),satellite:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles &copy; Esri',maxZoom:19})};
+let baseLayer=baseLayers.osm.addTo(map);
+function switchBasemap(key){
+  if(baseLayers[key]===baseLayer)return;
+  const op=baseLayer.options.opacity||1;
+  map.removeLayer(baseLayer);
+  baseLayer=baseLayers[key].addTo(map);
+  baseLayer.setOpacity(op);
+  orderLayers();
+  document.querySelectorAll('#basemap-switch button').forEach(b=>b.classList.toggle('active',b.dataset.basemap===key));
+}
+document.addEventListener('click',function(e){if(e.target.matches&&e.target.matches('#basemap-switch button')){switchBasemap(e.target.dataset.basemap);}});
 
 // GPS control as Leaflet control (topleft, leaflet-bar style, mobile only)
 L.Control.GPS=L.Control.extend({

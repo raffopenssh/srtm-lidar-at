@@ -33,6 +33,7 @@ CURVE_CSV = DATA_DIR / "oob_curve.csv"
 MONITOR_STATE = DATA_DIR / "monitor_state.json"
 LIVE_META = Path("/tmp/learned_classifier/rf_meta.json")
 LIVE_MODEL = Path("/tmp/learned_classifier/rf_model.joblib")
+CURVE_LOCKFILE = Path("/tmp/rf_curve_eval.lock")
 
 
 def load_checkpoints():
@@ -113,8 +114,45 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
     }
 
 
+def is_curve_running():
+    """Check if a curve evaluation is already in progress."""
+    import fcntl
+    if not CURVE_LOCKFILE.exists():
+        return False
+    try:
+        fd = os.open(str(CURVE_LOCKFILE), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False  # lock is free → not running
+        except (OSError, IOError):
+            return True  # lock held → running
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return False
+
+
 def run_curve(step=5):
     """Train models at every `step` KGs and write OOB curve."""
+    import fcntl
+    CURVE_LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(CURVE_LOCKFILE), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        log.warning("Curve evaluation already running (lockfile held), skipping.")
+        os.close(lock_fd)
+        return []
+    try:
+        return _run_curve_locked(step)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _run_curve_locked(step=5):
+    """Actual curve evaluation (called with lock held)."""
     checkpoints = load_checkpoints()
     n_total = len(checkpoints)
     log.info("Loaded %d checkpoints", n_total)

@@ -496,6 +496,53 @@ def training_status():
     return jsonify(result)
 
 
+_curve_eval_thread = None
+
+def _is_curve_eval_running():
+    """Check lockfile to see if any curve eval (cron or triggered) is running."""
+    import fcntl
+    from pathlib import Path
+    lockfile = Path('/tmp/rf_curve_eval.lock')
+    if not lockfile.exists():
+        return False
+    try:
+        fd = os.open(str(lockfile), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except (OSError, IOError):
+            return True
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return False
+
+
+@app.route('/api/v1/training/evaluate', methods=['POST'])
+def trigger_curve_eval():
+    """Trigger OOB curve re-evaluation in background."""
+    global _curve_eval_thread
+    if _is_curve_eval_running():
+        return jsonify(running=True, msg='Already running (cron or previous trigger)'), 409
+    import subprocess, threading
+    def _run():
+        subprocess.run(
+            ['python3', 'evaluate_checkpoints.py', 'curve', '--step', '5'],
+            cwd='/home/exedev/srtm-lidar',
+            timeout=3600,
+        )
+    _curve_eval_thread = threading.Thread(target=_run, daemon=True)
+    _curve_eval_thread.start()
+    return jsonify(running=True, msg='Curve evaluation started')
+
+
+@app.route('/api/v1/training/evaluate', methods=['GET'])
+def curve_eval_status():
+    """Check if curve evaluation is running."""
+    return jsonify(running=_is_curve_eval_running())
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

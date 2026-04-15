@@ -60,7 +60,7 @@
     <a href="/api/v1/training/status" style="color:var(--dim);text-decoration:none">api</a>
   </span>
 </div>
-<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span></div>
+<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span> · <a href="#" id="triggerEval" style="color:var(--blue);text-decoration:none" onclick="triggerEval(event)">trigger now</a></div>
 
 <div class="grid" id="cards"></div>
 
@@ -311,6 +311,37 @@ async function poll() {
   }
 }
 
+async function triggerEval(e) {
+  e.preventDefault();
+  const el = document.getElementById('triggerEval');
+  if (el.dataset.busy === '1') return;
+  try {
+    el.textContent = 'starting…'; el.dataset.busy = '1';
+    const r = await fetch('/api/v1/training/evaluate', {method:'POST'});
+    if (r.status === 409) { setEvalState(true); }
+    else { setEvalState(true); }
+  } catch(e) { el.textContent = 'error'; el.style.color = 'var(--red)'; el.dataset.busy = '0'; }
+}
+
+function setEvalState(running) {
+  const el = document.getElementById('triggerEval');
+  if (running) {
+    el.textContent = '● running'; el.style.color = 'var(--green)';
+    el.style.pointerEvents = 'none'; el.dataset.busy = '1';
+  } else {
+    el.textContent = 'trigger now'; el.style.color = 'var(--blue)';
+    el.style.pointerEvents = ''; el.dataset.busy = '0';
+  }
+}
+
+async function checkEvalRunning() {
+  try {
+    const r = await fetch('/api/v1/training/evaluate');
+    const d = await r.json();
+    setEvalState(d.running);
+  } catch(e) {}
+}
+
 function updateNextCron() {
   const now = new Date();
   const utcH = now.getUTCHours(), utcM = now.getUTCMinutes();
@@ -328,7 +359,9 @@ updateNextCron();
 setInterval(updateNextCron, 60000);
 
 poll();
+checkEvalRunning();
 setInterval(poll, 15000);
+setInterval(checkEvalRunning, 15000);
 setInterval(() => {
   countdown--;
   if (countdown <= 0) countdown = 15;

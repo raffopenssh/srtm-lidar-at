@@ -34,6 +34,8 @@ MONITOR_STATE = DATA_DIR / "monitor_state.json"
 LIVE_META = Path("/tmp/learned_classifier/rf_meta.json")
 LIVE_MODEL = Path("/tmp/learned_classifier/rf_model.joblib")
 CURVE_LOCKFILE = Path("/tmp/rf_curve_eval.lock")
+N_SEEDS = 5
+SEEDS = list(range(N_SEEDS))
 
 
 def load_checkpoints():
@@ -55,11 +57,15 @@ def load_checkpoints():
 
 def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
                    min_samples_leaf=5, random_state=42):
-    """Train RF on first `n` checkpoints. Returns stats dict."""
+    """Train RF on `n` checkpoints (shuffled by random_state). Returns stats dict."""
+    import random as _rnd
     from sklearn.ensemble import RandomForestClassifier
     from learned_classifier import FEATURE_KEYS, TYPE_CLASSES, feature_vector
 
-    subset = checkpoints[:n]
+    # Shuffle KG order per seed — measures sensitivity to data composition
+    shuffled = list(checkpoints)
+    _rnd.Random(random_state).shuffle(shuffled)
+    subset = shuffled[:n]
     X_list, y_list = [], []
     for ckpt in subset:
         for feat, label in zip(ckpt["features"], ckpt["labels"]):
@@ -152,59 +158,108 @@ def run_curve(step=5):
 
 
 def _run_curve_locked(step=5):
-    """Actual curve evaluation (called with lock held)."""
+    """Actual curve evaluation (called with lock held).
+
+    Runs N_SEEDS random seeds per KG step. Incremental: reads existing CSV,
+    skips (n_kgs, seed) combos already evaluated, only trains missing ones.
+    """
     checkpoints = load_checkpoints()
     n_total = len(checkpoints)
     log.info("Loaded %d checkpoints", n_total)
 
     CURVE_CSV.parent.mkdir(parents=True, exist_ok=True)
 
-    results = []
+    # CSV columns now include seed
+    HEADER = ["n_kgs", "seed", "n_samples", "n_classes", "oob",
+              "top_feature", "top_importance", "train_time_s"]
+
+    # Read existing rows to know what's done
+    existing = set()  # (n_kgs, seed)
+    if CURVE_CSV.exists():
+        try:
+            with open(CURVE_CSV) as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    seed = int(r["seed"]) if "seed" in r else 0
+                    existing.add((int(r["n_kgs"]), seed))
+        except Exception:
+            pass
+
+    # Migrate old CSV without seed column: rewrite with seed=0
+    if CURVE_CSV.exists() and existing:
+        try:
+            with open(CURVE_CSV) as f:
+                reader = csv.DictReader(f)
+                if "seed" not in (reader.fieldnames or []):
+                    rows = list(csv.DictReader(open(CURVE_CSV)))
+                    log.info("Migrating %d old rows (adding seed=0)", len(rows))
+                    with open(CURVE_CSV, "w", newline="") as wf:
+                        w = csv.writer(wf)
+                        w.writerow(HEADER)
+                        for r in rows:
+                            w.writerow([r["n_kgs"], 0, r["n_samples"],
+                                        r["n_classes"], r["oob"],
+                                        r.get("top_feature", ""),
+                                        r.get("top_importance", ""),
+                                        r.get("train_time_s", "")])
+                    existing = {(int(r["n_kgs"]), 0) for r in rows}
+        except Exception as e:
+            log.warning("Migration check failed: %s", e)
+
+    # Ensure header exists
+    if not CURVE_CSV.exists() or CURVE_CSV.stat().st_size == 0:
+        with open(CURVE_CSV, "w", newline="") as f:
+            csv.writer(f).writerow(HEADER)
+
     steps = list(range(step, n_total + 1, step))
     if n_total not in steps:
         steps.append(n_total)
 
-    # Write CSV header once
-    with open(CURVE_CSV, "w", newline="") as f:
-        csv.writer(f).writerow(["n_kgs", "n_samples", "n_classes", "oob",
-                                "top_feature", "top_importance", "train_time_s"])
-
-    detail_path = DATA_DIR / "oob_curve_detail.json"
-
+    # Build work list: all (step, seed) combos not yet done
+    work = []
     for n in steps:
+        for seed in SEEDS:
+            if (n, seed) not in existing:
+                work.append((n, seed))
+
+    if not work:
+        log.info("All %d steps × %d seeds already evaluated, nothing to do",
+                 len(steps), N_SEEDS)
+        return []
+
+    log.info("%d existing, %d new (step, seed) combos to evaluate",
+             len(existing), len(work))
+
+    results = []
+    for n, seed in work:
         t0 = time.time()
-        stats = train_at_n_kgs(checkpoints, n)
+        stats = train_at_n_kgs(checkpoints, n, random_state=seed)
         dt = time.time() - t0
         if stats is None:
             continue
         stats["train_time_s"] = round(dt, 1)
+        stats["seed"] = seed
         results.append(stats)
-        log.info("n_kgs=%3d  samples=%6d  classes=%2d  OOB=%.4f  (%.1fs)",
-                 n, stats["n_samples"], stats["n_classes"], stats["oob"], dt)
+        log.info("n_kgs=%3d  seed=%d  samples=%6d  classes=%2d  OOB=%.4f  (%.1fs)",
+                 n, seed, stats["n_samples"], stats["n_classes"], stats["oob"], dt)
 
-        # Flush row to CSV immediately
+        # Append row to CSV immediately
         with open(CURVE_CSV, "a", newline="") as f:
             csv.writer(f).writerow([
-                stats["n_kgs"], stats["n_samples"], stats["n_classes"],
+                stats["n_kgs"], seed, stats["n_samples"], stats["n_classes"],
                 f"{stats['oob']:.6f}",
                 stats["top5_features"][0][0],
                 f"{stats['top5_features'][0][1]:.4f}",
                 stats["train_time_s"],
             ])
 
-        # Overwrite detail JSON each step too
-        with open(detail_path, "w") as f:
-            json.dump(results, f, indent=2)
-
     # Summary
     if results:
-        best = max(results, key=lambda r: r["oob"])
         log.info("")
         log.info("=" * 60)
-        log.info("BEST: n_kgs=%d  OOB=%.4f  samples=%d  classes=%d",
-                 best["n_kgs"], best["oob"], best["n_samples"], best["n_classes"])
-        log.info("Curve saved to %s", CURVE_CSV)
-        log.info("Detail saved to %s", detail_path)
+        log.info("Added %d new points.", len(results))
+    else:
+        log.info("No new points added.")
 
     return results
 

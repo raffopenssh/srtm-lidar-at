@@ -458,19 +458,38 @@ def training_status():
         except Exception:
             pass
 
-    # OOB learning curve (from checkpoint evaluation)
+    # OOB learning curve (from checkpoint evaluation, multi-seed)
     curve_path = pathlib.Path('data/oob_curve.csv')
     if curve_path.exists():
         try:
             import csv as _csv
+            from collections import defaultdict
+            import statistics
+            by_kgs = defaultdict(list)
             with open(curve_path) as _f:
                 reader = _csv.DictReader(_f)
-                result['oob_curve'] = [{
-                    'n_kgs': int(r['n_kgs']),
-                    'n_samples': int(r['n_samples']),
-                    'n_classes': int(r['n_classes']),
-                    'oob': float(r['oob']),
-                } for r in reader]
+                for r in reader:
+                    n_kgs = int(r['n_kgs'])
+                    by_kgs[n_kgs].append({
+                        'oob': float(r['oob']),
+                        'n_samples': int(r['n_samples']),
+                        'n_classes': int(r['n_classes']),
+                    })
+            curve = []
+            for n_kgs in sorted(by_kgs):
+                runs = by_kgs[n_kgs]
+                oobs = [r['oob'] for r in runs]
+                curve.append({
+                    'n_kgs': n_kgs,
+                    'n_samples': runs[0]['n_samples'],
+                    'n_classes': runs[0]['n_classes'],
+                    'n_seeds': len(oobs),
+                    'oob_median': round(statistics.median(oobs), 6),
+                    'oob_min': round(min(oobs), 6),
+                    'oob_max': round(max(oobs), 6),
+                    'oob_all': sorted(round(o, 6) for o in oobs),
+                })
+            result['oob_curve'] = curve
         except Exception:
             pass
 

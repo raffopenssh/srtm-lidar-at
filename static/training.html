@@ -165,28 +165,30 @@ function renderChart(curve) {
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
   ctx.scale(2, 2);
 
-  const oobs = curve.map(r => r.oob);
+  const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
+  const mins = curve.map(r => r.oob_min ?? r.oob_median ?? r.oob ?? 0);
+  const maxs = curve.map(r => r.oob_max ?? r.oob_median ?? r.oob ?? 0);
   const kgs = curve.map(r => r.n_kgs);
-  const minOob = Math.floor(Math.min(...oobs) * 1000) / 1000 - 0.005;
-  const maxOob = Math.ceil(Math.max(...oobs) * 1000) / 1000 + 0.005;
+  const allVals = [...mins, ...maxs];
+  const minOob = Math.floor(Math.min(...allVals) * 1000) / 1000 - 0.005;
+  const maxOob = Math.ceil(Math.max(...allVals) * 1000) / 1000 + 0.005;
   const pad = { top: 10, right: 20, bottom: 30, left: 50 };
   const cw = W - pad.left - pad.right;
   const ch = H - pad.top - pad.bottom;
+  const hasSpread = curve.some(r => (r.n_seeds || 1) > 1);
 
-  function x(i) { return pad.left + (i / (curve.length - 1)) * cw; }
+  function x(i) { return pad.left + (i / Math.max(1, curve.length - 1)) * cw; }
   function y(v) { return pad.top + (1 - (v - minOob) / (maxOob - minOob)) * ch; }
 
   // Grid
   ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
-  const nGrid = 6;
-  for (let i = 0; i <= nGrid; i++) {
-    const v = minOob + (maxOob - minOob) * (i / nGrid);
+  for (let i = 0; i <= 6; i++) {
+    const v = minOob + (maxOob - minOob) * (i / 6);
     const yy = y(v);
     ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
     ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
     ctx.fillText((v * 100).toFixed(1) + '%', pad.left - 4, yy + 3);
   }
-  // X labels
   ctx.textAlign = 'center';
   for (let i = 0; i < curve.length; i += Math.max(1, Math.floor(curve.length / 10))) {
     ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace';
@@ -194,32 +196,50 @@ function renderChart(curve) {
   }
   ctx.fillText('KGs', W / 2, H - 4);
 
-  // Find key points
-  const bestIdx = oobs.indexOf(Math.max(...oobs));
-  const troughIdx = oobs.indexOf(Math.min(...oobs.slice(Math.floor(curve.length * 0.3))));
+  // Min-max band
+  if (hasSpread) {
+    ctx.fillStyle = 'rgba(88,166,255,0.10)';
+    ctx.beginPath();
+    curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(maxs[i])) : ctx.lineTo(x(i), y(maxs[i])); });
+    for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(mins[i]));
+    ctx.closePath(); ctx.fill();
+    // Individual seed dots
+    ctx.fillStyle = 'rgba(139,148,158,0.35)';
+    curve.forEach((r, i) => {
+      (r.oob_all || []).forEach(o => {
+        ctx.beginPath(); ctx.arc(x(i), y(o), 1.5, 0, Math.PI * 2); ctx.fill();
+      });
+    });
+  }
 
-  // Line
+  // Key points
+  const bestIdx = medians.indexOf(Math.max(...medians));
+  const halfIdx = Math.floor(curve.length * 0.3);
+  const secondHalf = medians.slice(halfIdx);
+  const troughVal = secondHalf.length ? Math.min(...secondHalf) : medians[0];
+  const troughIdx = halfIdx + secondHalf.indexOf(troughVal);
+
+  // Median line
   ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
   ctx.beginPath();
-  curve.forEach((r, i) => { i === 0 ? ctx.moveTo(x(i), y(r.oob)) : ctx.lineTo(x(i), y(r.oob)); });
+  curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(medians[i])) : ctx.lineTo(x(i), y(medians[i])); });
   ctx.stroke();
 
   // Dots
-  curve.forEach((r, i) => {
-    ctx.beginPath(); ctx.arc(x(i), y(r.oob), 3, 0, Math.PI * 2);
-    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); ctx.beginPath(); ctx.arc(x(i), y(r.oob), 6, 0, Math.PI * 2); ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1.5; ctx.stroke(); }
-    else if (i === troughIdx) { ctx.fillStyle = '#d29922'; ctx.fill(); }
+  curve.forEach((_, i) => {
+    ctx.beginPath(); ctx.arc(x(i), y(medians[i]), 3, 0, Math.PI * 2);
+    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); ctx.beginPath(); ctx.arc(x(i), y(medians[i]), 6, 0, Math.PI * 2); ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1.5; ctx.stroke(); }
+    else if (i === troughIdx && troughIdx !== bestIdx) { ctx.fillStyle = '#d29922'; ctx.fill(); }
     else { ctx.fillStyle = '#58a6ff'; ctx.fill(); }
   });
 
   // Annotations
-  ctx.font = '10px monospace';
-  ctx.fillStyle = '#3fb950';
-  ctx.fillText('Best: ' + (oobs[bestIdx] * 100).toFixed(2) + '% @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(oobs[bestIdx]) - 10);
+  ctx.font = '10px monospace'; ctx.fillStyle = '#3fb950';
+  const lbl = hasSpread ? ' (median)' : '';
+  ctx.fillText('Best: ' + (medians[bestIdx]*100).toFixed(2) + '%' + lbl + ' @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(maxs[bestIdx]) - 10);
   if (troughIdx !== bestIdx) {
     ctx.fillStyle = '#d29922';
-    const label = 'Trough: ' + (oobs[troughIdx] * 100).toFixed(2) + '%';
-    ctx.fillText(label, x(troughIdx), y(oobs[troughIdx]) + 16);
+    ctx.fillText('Trough: ' + (medians[troughIdx]*100).toFixed(2) + '%', x(troughIdx), y(mins[troughIdx]) + 16);
   }
 
   // Class change markers
@@ -230,47 +250,73 @@ function renderChart(curve) {
       ctx.beginPath(); ctx.moveTo(x(i), pad.top); ctx.lineTo(x(i), H - pad.bottom); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = '#bc8cff'; ctx.font = '9px monospace';
-      ctx.fillText('+cls→' + r.n_classes, x(i) + 2, pad.top + 10);
+      ctx.fillText('+cls\u2192' + r.n_classes, x(i) + 2, pad.top + 10);
     }
     prevCls = r.n_classes;
   });
+
+  // Legend
+  if (hasSpread) {
+    const lx = W - pad.right - 160, ly = pad.top + 8;
+    ctx.font = '9px monospace'; ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(88,166,255,0.15)'; ctx.fillRect(lx, ly, 10, 10);
+    ctx.fillStyle = '#8b949e'; ctx.fillText('min\u2013max range', lx + 14, ly + 9);
+    ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(lx, ly + 20); ctx.lineTo(lx + 10, ly + 20); ctx.stroke();
+    ctx.fillStyle = '#8b949e'; ctx.fillText('median', lx + 14, ly + 24);
+    ctx.fillStyle = 'rgba(139,148,158,0.5)';
+    ctx.beginPath(); ctx.arc(lx + 5, ly + 35, 2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#8b949e'; ctx.fillText('individual seeds', lx + 14, ly + 38);
+  }
 }
 
 function renderCurveTable(curve) {
   if (!curve || curve.length === 0) return;
   const tbody = document.querySelector('#curveTable tbody');
-  const oobs = curve.map(r => r.oob);
-  const bestOob = Math.max(...oobs);
-  // Find trough in second half
+  const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
+  const bestMedian = Math.max(...medians);
   const halfIdx = Math.floor(curve.length * 0.3);
-  const secondHalfOobs = oobs.slice(halfIdx);
-  const troughOob = secondHalfOobs.length > 0 ? Math.min(...secondHalfOobs) : -1;
+  const secondHalf = medians.slice(halfIdx);
+  const troughMedian = secondHalf.length > 0 ? Math.min(...secondHalf) : -1;
+  const hasSeeds = curve.some(r => (r.n_seeds || 1) > 1);
+
+  // Update header
+  const thead = document.querySelector('#curveTable thead tr');
+  if (hasSeeds) thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB (median)</th><th>Range</th><th>Seeds</th><th></th>';
+  else thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB</th><th></th>';
 
   let prevCls = 0;
   let prevOob = null;
   let html = '';
-  curve.forEach(r => {
+  curve.forEach((r, idx) => {
+    const med = r.oob_median ?? r.oob ?? 0;
+    const lo = r.oob_min ?? med;
+    const hi = r.oob_max ?? med;
+    const seeds = r.n_seeds || 1;
     let cls = '';
     let ann = '';
-    if (r.oob === bestOob) { cls = 'best'; ann = '← BEST'; }
-    else if (r.oob === troughOob && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '← trough'; }
-    if (r.n_classes > prevCls && prevCls > 0) { cls = 'new-class'; ann += (ann ? ' ' : '') + '← +class→' + r.n_classes; }
-    if (prevOob !== null && r.oob > prevOob + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '↑'; }
-    if (prevOob !== null && r.oob < prevOob - 0.002) { ann += (ann ? ' ' : '') + '↓'; }
+    if (med === bestMedian) { cls = 'best'; ann = '\u2190 BEST'; }
+    else if (med === troughMedian && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough'; }
+    if (r.n_classes > prevCls && prevCls > 0) { cls = 'new-class'; ann += (ann ? ' ' : '') + '\u2190 +class\u2192' + r.n_classes; }
+    if (prevOob !== null && med > prevOob + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '\u2191'; }
+    if (prevOob !== null && med < prevOob - 0.002) { ann += (ann ? ' ' : '') + '\u2193'; }
 
-    // OOB bar
-    const barW = Math.max(5, ((r.oob - 0.70) / 0.20) * 100);
-    const barColor = r.oob === bestOob ? 'var(--green)' : r.oob === troughOob ? 'var(--yellow)' : 'var(--blue)';
+    const barW = Math.max(5, ((med - 0.70) / 0.20) * 100);
+    const barColor = cls === 'best' ? 'var(--green)' : cls === 'trough' ? 'var(--yellow)' : 'var(--blue)';
+    const spread = (hi - lo) * 100;
 
-    html += `<tr class="${cls}">
-      <td>${r.n_kgs}</td>
-      <td>${r.n_samples.toLocaleString()}</td>
-      <td>${r.n_classes}</td>
-      <td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(r.oob * 100).toFixed(2)}%</td>
-      <td><span class="annotation">${ann}</span></td>
-    </tr>`;
+    html += `<tr class="${cls}">`;
+    html += `<td>${r.n_kgs}</td>`;
+    html += `<td>${r.n_samples.toLocaleString()}</td>`;
+    html += `<td>${r.n_classes}</td>`;
+    html += `<td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(med * 100).toFixed(2)}%</td>`;
+    if (hasSeeds) {
+      html += `<td style="color:var(--dim);font-size:11px">${spread > 0 ? '\u00b1' + (spread/2).toFixed(2) + '%' : '\u2014'}</td>`;
+      html += `<td style="color:var(--dim);font-size:11px">${seeds}/5</td>`;
+    }
+    html += `<td><span class="annotation">${ann}</span></td></tr>`;
     prevCls = r.n_classes;
-    prevOob = r.oob;
+    prevOob = med;
   });
   tbody.innerHTML = html;
 }

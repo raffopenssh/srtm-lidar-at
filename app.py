@@ -515,8 +515,6 @@ def training_status():
     return jsonify(result)
 
 
-_curve_eval_thread = None
-
 def _is_curve_eval_running():
     """Check lockfile to see if any curve eval (cron or triggered) is running."""
     import fcntl
@@ -541,18 +539,18 @@ def _is_curve_eval_running():
 @app.route('/api/v1/training/evaluate', methods=['POST'])
 def trigger_curve_eval():
     """Trigger OOB curve re-evaluation in background."""
-    global _curve_eval_thread
     if _is_curve_eval_running():
         return jsonify(running=True, msg='Already running (cron or previous trigger)'), 409
-    import subprocess, threading
-    def _run():
-        subprocess.run(
-            ['python3', 'evaluate_checkpoints.py', 'curve', '--step', '5'],
-            cwd='/home/exedev/srtm-lidar',
-            timeout=3600,
-        )
-    _curve_eval_thread = threading.Thread(target=_run, daemon=True)
-    _curve_eval_thread.start()
+    import subprocess
+    # Detach from gunicorn process group so it survives service restarts
+    subprocess.Popen(
+        ['python3', 'evaluate_checkpoints.py', 'curve', '--step', '5'],
+        cwd='/home/exedev/srtm-lidar',
+        start_new_session=True,
+        stdout=open('/tmp/rf_curve_eval.log', 'a'),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+    )
     return jsonify(running=True, msg='Curve evaluation started')
 
 

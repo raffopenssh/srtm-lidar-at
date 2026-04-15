@@ -392,11 +392,9 @@ function updateNextCron() {
   const now = new Date();
   const utcH = now.getUTCHours(), utcM = now.getUTCMinutes();
   const mins = utcH * 60 + utcM;
-  // Cron runs at 03:00 and 15:00 UTC
-  const slots = [3*60, 15*60, 27*60]; // 27h = next day 03:00
-  let next = slots.find(s => s > mins) || slots[0];
-  let diff = next - mins;
-  if (diff <= 0) diff += 24*60;
+  // Cron runs every hour at :00
+  let diff = 60 - utcM;
+  if (diff <= 0) diff = 60;
   const h = Math.floor(diff / 60), m = diff % 60;
   const label = h > 0 ? `${h}h ${m}m` : `${m}m`;
   document.getElementById('nextCron').textContent = label;

@@ -6,13 +6,13 @@
   "mature_peak_oob": 0.7904688651732206,
   "mature_peak_n_kgs": 10,
   "mature_n_classes": 19,
-  "consecutive_decline": 0,
+  "consecutive_decline": 1,
   "plateau_count": 0,
-  "last_oob": 0.7845098103086963,
-  "last_n_kgs": 30,
+  "last_oob": 0.7842289465083342,
+  "last_n_kgs": 50,
   "last_n_classes": 19,
-  "last_status": "improving",
-  "kgs_since_peak": 20,
+  "last_status": "declining",
+  "kgs_since_peak": 40,
   "should_stop": false,
-  "updated_at": "2026-04-15T11:45:01Z"
+  "updated_at": "2026-04-15T13:15:01Z"
 }

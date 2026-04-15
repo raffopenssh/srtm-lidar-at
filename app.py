@@ -458,6 +458,41 @@ def training_status():
         except Exception:
             pass
 
+    # OOB learning curve (from checkpoint evaluation)
+    curve_path = pathlib.Path('data/oob_curve.csv')
+    if curve_path.exists():
+        try:
+            import csv as _csv
+            with open(curve_path) as _f:
+                reader = _csv.DictReader(_f)
+                result['oob_curve'] = [{
+                    'n_kgs': int(r['n_kgs']),
+                    'n_samples': int(r['n_samples']),
+                    'n_classes': int(r['n_classes']),
+                    'oob': float(r['oob']),
+                } for r in reader]
+        except Exception:
+            pass
+
+    # Live history (monitor cron)
+    hist_path = pathlib.Path('data/oob_history.csv')
+    if hist_path.exists():
+        try:
+            import csv as _csv
+            with open(hist_path) as _f:
+                reader = _csv.DictReader(_f)
+                result['oob_history'] = [dict(r) for r in reader]
+        except Exception:
+            pass
+
+    # Monitor state (convergence tracking)
+    state_path = pathlib.Path('data/monitor_state.json')
+    if state_path.exists():
+        try:
+            result['monitor'] = json.loads(state_path.read_text())
+        except Exception:
+            pass
+
     return jsonify(result)
 
 

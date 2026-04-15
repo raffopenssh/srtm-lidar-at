@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RF Training Monitor</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9;
+          --dim: #8b949e; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+          --blue: #58a6ff; --purple: #bc8cff; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg);
+         color: var(--text); padding: 20px; line-height: 1.5; }
+  h1 { font-size: 18px; color: var(--blue); margin-bottom: 4px; }
+  .subtitle { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .card .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 22px; font-weight: bold; margin-top: 2px; }
+  .card .detail { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .status-running { color: var(--green); }
+  .status-stopped { color: var(--red); }
+  .status-improving { color: var(--green); }
+  .status-plateau { color: var(--yellow); }
+  .status-declining { color: var(--yellow); }
+  .status-degrading { color: var(--red); }
+  .status-converged { color: var(--purple); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-size: 11px; text-transform: uppercase;
+       letter-spacing: 0.5px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+  tr:hover td { background: #1c2128; }
+  tr.best td { color: var(--green); font-weight: bold; }
+  tr.trough td { color: var(--yellow); }
+  tr.new-class td { color: var(--purple); }
+  .annotation { font-size: 11px; color: var(--dim); margin-left: 6px; }
+  .section { margin-bottom: 20px; }
+  .section-title { font-size: 14px; color: var(--blue); margin-bottom: 8px;
+                   border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .chart-container { background: var(--card); border: 1px solid var(--border);
+                     border-radius: 8px; padding: 16px; margin-bottom: 20px; height: 260px; position: relative; }
+  canvas { width: 100% !important; height: 100% !important; }
+  .poll-info { position: fixed; bottom: 12px; right: 16px; font-size: 11px; color: var(--dim);
+               background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--border); margin-top: 4px; }
+  .bar-fill { height: 100%; border-radius: 3px; background: var(--green); transition: width 0.5s; }
+  .live-log { font-size: 12px; color: var(--dim); padding: 8px 12px; background: var(--card);
+              border: 1px solid var(--border); border-radius: 8px; white-space: pre-wrap; max-height: 60px; overflow: hidden; }
+  .oob-bar { display: inline-block; height: 14px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }
+  @media (max-width: 600px) { body { padding: 10px; } .grid { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>🌲 RF Training Monitor</h1>
+<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span></div>
+
+<div class="grid" id="cards"></div>
+
+<div class="section">
+  <div class="section-title">OOB Learning Curve</div>
+  <div class="chart-container"><canvas id="chart"></canvas></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Checkpoint History</div>
+  <div class="card" style="overflow-x:auto; padding:0">
+    <table id="curveTable">
+      <thead><tr><th>KGs</th><th>Samples</th><th>Classes</th><th>OOB</th><th></th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section" id="historySection" style="display:none">
+  <div class="section-title">Live Model History (cron)</div>
+  <div class="card" style="overflow-x:auto; padding:0">
+    <table id="histTable">
+      <thead><tr><th>Time</th><th>KGs</th><th>OOB</th><th>Δ</th><th>Avg5</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="poll-info">Polling <span id="pollCountdown">15</span>s</div>
+
+<script>
+const API = '/api/v1/training/status';
+let chart = null;
+let countdown = 15;
+
+function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
+function pct(v, d=2) { return v != null ? (v * 100).toFixed(d) + '%' : '—'; }
+
+function renderCards(d) {
+  const running = d.running;
+  const m = d.model || {};
+  const mon = d.monitor || {};
+  const pct_done = d.current_kg ? (d.current_kg.index / d.current_kg.total * 100).toFixed(1) : 0;
+  const statusCls = mon.last_status ? 'status-' + mon.last_status : '';
+
+  let html = '';
+  // Service status
+  html += `<div class="card">
+    <div class="label">Service</div>
+    <div class="value ${running ? 'status-running' : 'status-stopped'}">${running ? '● Running' : '○ Stopped'}</div>
+    <div class="detail">${d.service_state || '—'}${d.ram_mb ? ' · ' + d.ram_mb + ' MB' : ''}</div>
+  </div>`;
+
+  // Progress
+  html += `<div class="card">
+    <div class="label">Progress</div>
+    <div class="value">${d.progress || '—'}</div>
+    <div class="bar"><div class="bar-fill" style="width:${pct_done}%"></div></div>
+    <div class="detail">${d.current_kg ? d.current_kg.kg_name + ' (' + d.current_kg.kg_code + ')' : '—'}</div>
+  </div>`;
+
+  // Current OOB
+  html += `<div class="card">
+    <div class="label">Current OOB</div>
+    <div class="value">${m.oob_score ? (m.oob_score * 100).toFixed(2) + '%' : '—'}</div>
+    <div class="detail">${fmt(m.n_train)} samples · ${m.n_classes || '—'} classes</div>
+  </div>`;
+
+  // Best OOB (mature)
+  const bestOob = mon.mature_peak_oob || mon.best_oob;
+  const bestKgs = mon.mature_peak_n_kgs || mon.best_n_kgs;
+  html += `<div class="card">
+    <div class="label">Best OOB (mature)</div>
+    <div class="value status-improving">${bestOob ? (bestOob * 100).toFixed(2) + '%' : '—'}</div>
+    <div class="detail">at ${bestKgs || '—'} KGs${mon.kgs_since_peak ? ' · ' + mon.kgs_since_peak + ' KGs ago' : ''}</div>
+  </div>`;
+
+  // Monitor status
+  html += `<div class="card">
+    <div class="label">Trend</div>
+    <div class="value ${statusCls}">${mon.last_status || '—'}</div>
+    <div class="detail">${mon.should_stop ? '⚠️ Recommend stop' : 'Keep training'}</div>
+  </div>`;
+
+  // Checkpoints
+  html += `<div class="card">
+    <div class="label">Checkpoints</div>
+    <div class="value">${d.n_checkpoints || '—'}</div>
+    <div class="detail">Next model in ${d.to_next_model || '—'} KGs${d.n_failed_kgs ? ' · ' + d.n_failed_kgs + ' failed' : ''}</div>
+  </div>`;
+
+  document.getElementById('cards').innerHTML = html;
+}
+
+function renderChart(curve) {
+  if (!curve || curve.length === 0) return;
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.parentElement.clientWidth - 32;
+  const H = canvas.parentElement.clientHeight - 32;
+  canvas.width = W * 2; canvas.height = H * 2;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.scale(2, 2);
+
+  const oobs = curve.map(r => r.oob);
+  const kgs = curve.map(r => r.n_kgs);
+  const minOob = Math.floor(Math.min(...oobs) * 1000) / 1000 - 0.005;
+  const maxOob = Math.ceil(Math.max(...oobs) * 1000) / 1000 + 0.005;
+  const pad = { top: 10, right: 20, bottom: 30, left: 50 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  function x(i) { return pad.left + (i / (curve.length - 1)) * cw; }
+  function y(v) { return pad.top + (1 - (v - minOob) / (maxOob - minOob)) * ch; }
+
+  // Grid
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+  const nGrid = 6;
+  for (let i = 0; i <= nGrid; i++) {
+    const v = minOob + (maxOob - minOob) * (i / nGrid);
+    const yy = y(v);
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+    ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+    ctx.fillText((v * 100).toFixed(1) + '%', pad.left - 4, yy + 3);
+  }
+  // X labels
+  ctx.textAlign = 'center';
+  for (let i = 0; i < curve.length; i += Math.max(1, Math.floor(curve.length / 10))) {
+    ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace';
+    ctx.fillText(kgs[i], x(i), H - 4);
+  }
+  ctx.fillText('KGs', W / 2, H - 4);
+
+  // Find key points
+  const bestIdx = oobs.indexOf(Math.max(...oobs));
+  const troughIdx = oobs.indexOf(Math.min(...oobs.slice(Math.floor(curve.length * 0.3))));
+
+  // Line
+  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  curve.forEach((r, i) => { i === 0 ? ctx.moveTo(x(i), y(r.oob)) : ctx.lineTo(x(i), y(r.oob)); });
+  ctx.stroke();
+
+  // Dots
+  curve.forEach((r, i) => {
+    ctx.beginPath(); ctx.arc(x(i), y(r.oob), 3, 0, Math.PI * 2);
+    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); ctx.beginPath(); ctx.arc(x(i), y(r.oob), 6, 0, Math.PI * 2); ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1.5; ctx.stroke(); }
+    else if (i === troughIdx) { ctx.fillStyle = '#d29922'; ctx.fill(); }
+    else { ctx.fillStyle = '#58a6ff'; ctx.fill(); }
+  });
+
+  // Annotations
+  ctx.font = '10px monospace';
+  ctx.fillStyle = '#3fb950';
+  ctx.fillText('Best: ' + (oobs[bestIdx] * 100).toFixed(2) + '% @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(oobs[bestIdx]) - 10);
+  if (troughIdx !== bestIdx) {
+    ctx.fillStyle = '#d29922';
+    const label = 'Trough: ' + (oobs[troughIdx] * 100).toFixed(2) + '%';
+    ctx.fillText(label, x(troughIdx), y(oobs[troughIdx]) + 16);
+  }
+
+  // Class change markers
+  let prevCls = curve[0].n_classes;
+  curve.forEach((r, i) => {
+    if (r.n_classes > prevCls) {
+      ctx.strokeStyle = '#bc8cff44'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(x(i), pad.top); ctx.lineTo(x(i), H - pad.bottom); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#bc8cff'; ctx.font = '9px monospace';
+      ctx.fillText('+cls→' + r.n_classes, x(i) + 2, pad.top + 10);
+    }
+    prevCls = r.n_classes;
+  });
+}
+
+function renderCurveTable(curve) {
+  if (!curve || curve.length === 0) return;
+  const tbody = document.querySelector('#curveTable tbody');
+  const oobs = curve.map(r => r.oob);
+  const bestOob = Math.max(...oobs);
+  // Find trough in second half
+  const halfIdx = Math.floor(curve.length * 0.3);
+  const secondHalfOobs = oobs.slice(halfIdx);
+  const troughOob = secondHalfOobs.length > 0 ? Math.min(...secondHalfOobs) : -1;
+
+  let prevCls = 0;
+  let prevOob = null;
+  let html = '';
+  curve.forEach(r => {
+    let cls = '';
+    let ann = '';
+    if (r.oob === bestOob) { cls = 'best'; ann = '← BEST'; }
+    else if (r.oob === troughOob && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '← trough'; }
+    if (r.n_classes > prevCls && prevCls > 0) { cls = 'new-class'; ann += (ann ? ' ' : '') + '← +class→' + r.n_classes; }
+    if (prevOob !== null && r.oob > prevOob + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '↑'; }
+    if (prevOob !== null && r.oob < prevOob - 0.002) { ann += (ann ? ' ' : '') + '↓'; }
+
+    // OOB bar
+    const barW = Math.max(5, ((r.oob - 0.70) / 0.20) * 100);
+    const barColor = r.oob === bestOob ? 'var(--green)' : r.oob === troughOob ? 'var(--yellow)' : 'var(--blue)';
+
+    html += `<tr class="${cls}">
+      <td>${r.n_kgs}</td>
+      <td>${r.n_samples.toLocaleString()}</td>
+      <td>${r.n_classes}</td>
+      <td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(r.oob * 100).toFixed(2)}%</td>
+      <td><span class="annotation">${ann}</span></td>
+    </tr>`;
+    prevCls = r.n_classes;
+    prevOob = r.oob;
+  });
+  tbody.innerHTML = html;
+}
+
+function renderHistory(history) {
+  if (!history || history.length === 0) { document.getElementById('historySection').style.display = 'none'; return; }
+  document.getElementById('historySection').style.display = '';
+  const tbody = document.querySelector('#histTable tbody');
+  let html = '';
+  history.forEach(r => {
+    const statusCls = r.status ? 'status-' + r.status : '';
+    const delta = r.delta_oob ? parseFloat(r.delta_oob) : 0;
+    const deltaStr = delta > 0 ? '+' + (delta * 100).toFixed(2) + '%' : (delta * 100).toFixed(2) + '%';
+    const deltaCls = delta > 0 ? 'status-improving' : delta < -0.005 ? 'status-declining' : '';
+    html += `<tr>
+      <td>${r.trained_at || r.timestamp}</td>
+      <td>${r.n_kgs}</td>
+      <td>${(parseFloat(r.oob) * 100).toFixed(2)}%</td>
+      <td class="${deltaCls}">${deltaStr}</td>
+      <td>${r.rolling_avg_5 ? (parseFloat(r.rolling_avg_5) * 100).toFixed(2) + '%' : '—'}</td>
+      <td class="${statusCls}">${r.status || '—'}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+async function poll() {
+  try {
+    const r = await fetch(API);
+    const d = await r.json();
+    renderCards(d);
+    renderChart(d.oob_curve);
+    renderCurveTable(d.oob_curve);
+    renderHistory(d.oob_history);
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+  } catch(e) {
+    console.error('Poll error:', e);
+  }
+}
+
+poll();
+setInterval(poll, 15000);
+setInterval(() => {
+  countdown--;
+  if (countdown <= 0) countdown = 15;
+  document.getElementById('pollCountdown').textContent = countdown;
+}, 1000);
+</script>
+</body>
+</html>

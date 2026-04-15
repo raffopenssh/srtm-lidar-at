@@ -86,11 +86,15 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
     for k, v in GDAL_ENV.items():
         os.environ[k] = v
 
-    from bev_retry import open_with_retry
-    with open_with_retry(vsicurl, caller=f"Hansen {layer}") as src:
-        win = from_bounds(west, south, east, north, src.transform)
-        data = src.read(1, window=win)
-        tf = src.window_transform(win)
+    from bev_retry import read_with_retry
+    data, tf = read_with_retry(
+        vsicurl,
+        read_fn=lambda src: (
+            src.read(1, window=from_bounds(west, south, east, north, src.transform)),
+            src.window_transform(from_bounds(west, south, east, north, src.transform)),
+        ),
+        caller=f"Hansen {layer}",
+    )
 
     # Cache
     tf_flat = np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])

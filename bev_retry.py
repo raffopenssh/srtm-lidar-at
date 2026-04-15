@@ -80,6 +80,67 @@ def _apply_proxy() -> str | None:
     return proxy_url
 
 
+def read_with_retry(
+    url: str,
+    read_fn,
+    *,
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = BASE_DELAY,
+    caller: str = "",
+):
+    """Open + read in one shot with retry + proxy rotation.
+
+    Unlike the context-manager version, this retries the *entire*
+    open-and-read cycle (including read-phase errors like HTTP range
+    request failures).  Use this when you can express the read as a
+    simple function of the dataset.
+
+    Parameters
+    ----------
+    url : str
+        The /vsicurl/ or local path to open.
+    read_fn : callable(dataset) -> result
+        Called with the open dataset; its return value is returned.
+    max_retries, base_delay, caller : same as open_with_retry.
+    """
+    label = caller or url.rsplit("/", 1)[-1]
+    last_exc: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        used_proxy = _apply_proxy()
+        ds = None
+        try:
+            ds = rasterio.open(url)
+            result = read_fn(ds)
+            bev_proxy.report_success(used_proxy)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc):
+                raise
+            bev_proxy.report_failure(used_proxy, error_msg=str(exc))
+            if attempt < max_retries:
+                delay = min(base_delay * (2 ** attempt), MAX_DELAY)
+                log.warning(
+                    "%s: attempt %d/%d failed (%s), retrying in %.0fs...",
+                    label, attempt + 1, max_retries + 1, exc, delay,
+                )
+                time.sleep(delay)
+            else:
+                log.error(
+                    "%s: all %d attempts exhausted, last error: %s",
+                    label, max_retries + 1, exc,
+                )
+        finally:
+            if ds is not None:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+
+    raise last_exc  # type: ignore[misc]
+
+
 @contextmanager
 def open_with_retry(
     url: str,
@@ -90,11 +151,9 @@ def open_with_retry(
 ):
     """Context manager: rasterio.open() with retry + proxy rotation + healing.
 
-    On each retry the proxy is rotated (via bev_proxy.next_proxy()) and
-    an exponential backoff delay is applied.  Failed proxies are put on
-    cooldown so they can heal.  Successful reads clear the cooldown.
-    Non-retryable errors (e.g. "file not found", ValueError) are raised
-    immediately.
+    Retries transient errors during both the open phase AND read phase.
+    On read-phase failures, the dataset is closed and reopened from scratch
+    with a rotated proxy.
 
     Parameters
     ----------
@@ -112,34 +171,60 @@ def open_with_retry(
 
     for attempt in range(max_retries + 1):
         used_proxy = _apply_proxy()
+        ds = None
         try:
             ds = rasterio.open(url)
-            try:
-                yield ds
-            finally:
-                ds.close()
-            # Success — clear any cooldown on this proxy
-            bev_proxy.report_success(used_proxy)
-            return
         except Exception as exc:
             last_exc = exc
             if not _is_retryable(exc):
-                # Not transient — don't waste time retrying
                 raise
-            # Transient failure — put this proxy on cooldown
             bev_proxy.report_failure(used_proxy, error_msg=str(exc))
             if attempt < max_retries:
                 delay = min(base_delay * (2 ** attempt), MAX_DELAY)
                 log.warning(
-                    "%s: attempt %d/%d failed (%s), retrying in %.0fs...",
+                    "%s: attempt %d/%d open failed (%s), retrying in %.0fs...",
                     label, attempt + 1, max_retries + 1, exc, delay,
                 )
                 time.sleep(delay)
+                continue
             else:
                 log.error(
                     "%s: all %d attempts exhausted, last error: %s",
                     label, max_retries + 1, exc,
                 )
+                break
 
-    # All retries exhausted — re-raise the last exception
+        # Open succeeded — yield and handle read-phase errors
+        try:
+            yield ds
+            # Caller finished successfully
+            bev_proxy.report_success(used_proxy)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc):
+                raise
+            bev_proxy.report_failure(used_proxy, error_msg=str(exc))
+            if attempt < max_retries:
+                delay = min(base_delay * (2 ** attempt), MAX_DELAY)
+                log.warning(
+                    "%s: attempt %d/%d read failed (%s), retrying in %.0fs...",
+                    label, attempt + 1, max_retries + 1, exc, delay,
+                )
+                time.sleep(delay)
+                # Fall through to next iteration — but we already yielded!
+                # A @contextmanager can only yield once, so we must raise
+                # and let the caller retry at a higher level.
+                raise
+            else:
+                log.error(
+                    "%s: all %d attempts exhausted, last error: %s",
+                    label, max_retries + 1, exc,
+                )
+                raise
+        finally:
+            if ds is not None:
+                ds.close()
+
+    # All retries exhausted (open-phase failures only reach here)
     raise last_exc  # type: ignore[misc]

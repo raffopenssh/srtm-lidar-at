@@ -376,7 +376,7 @@ function setEvalState(data) {
   if (running) {
     let label = '● evaluating';
     if (data.done && data.total) {
-      label += ` ${data.done}/${data.total} (${data.last_kgs} KGs, seed ${data.last_seed})`;
+      label += ` ${data.done}/${data.total} (${data.last_kgs} KGs, seed ${+data.last_seed+1}/5)`;
     }
     el.textContent = label; el.style.color = 'var(--green)';
     el.style.pointerEvents = 'none'; el.dataset.busy = '1';

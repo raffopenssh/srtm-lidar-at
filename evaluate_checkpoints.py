@@ -34,6 +34,7 @@ MONITOR_STATE = DATA_DIR / "monitor_state.json"
 LIVE_META = Path("/tmp/learned_classifier/rf_meta.json")
 LIVE_MODEL = Path("/tmp/learned_classifier/rf_model.joblib")
 CURVE_LOCKFILE = Path("/tmp/rf_curve_eval.lock")
+DETAIL_JSONL = DATA_DIR / "oob_curve_detail.jsonl"
 N_SEEDS = 5
 SEEDS = list(range(N_SEEDS))
 
@@ -113,6 +114,7 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
         "n_classes": n_classes,
         "oob": float(rf.oob_score_),
         "top5_features": top5,
+        "all_importances": importances,
         "per_class_oob": per_class,
         "n_estimators": n_estimators,
         "max_depth": max_depth,
@@ -185,6 +187,23 @@ def _run_curve_locked(step=5):
         except Exception:
             pass
 
+    # Also load existing JSONL detail to know what's already saved there
+    existing_detail = set()  # (n_kgs, seed)
+    if DETAIL_JSONL.exists():
+        try:
+            with open(DETAIL_JSONL) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        existing_detail.add((int(obj["n_kgs"]), int(obj["seed"])))
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except Exception:
+            pass
+
     # Migrate old CSV without seed column: rewrite with seed=0
     if CURVE_CSV.exists() and existing:
         try:
@@ -250,6 +269,25 @@ def _run_curve_locked(step=5):
                 f"{stats['top5_features'][0][1]:.4f}",
                 stats["train_time_s"],
             ])
+
+        # Append detail to JSONL (full importances, per-class OOB, hyperparams)
+        if (n, seed) not in existing_detail:
+            detail_row = {
+                "n_kgs": stats["n_kgs"],
+                "seed": seed,
+                "n_samples": stats["n_samples"],
+                "n_classes": stats["n_classes"],
+                "oob": stats["oob"],
+                "n_estimators": stats["n_estimators"],
+                "max_depth": stats["max_depth"],
+                "min_samples_leaf": stats["min_samples_leaf"],
+                "all_importances": stats["all_importances"],
+                "per_class_oob": stats["per_class_oob"],
+                "train_time_s": stats["train_time_s"],
+            }
+            with open(DETAIL_JSONL, "a") as f:
+                f.write(json.dumps(detail_row) + "\n")
+            existing_detail.add((n, seed))
 
     # Summary
     if results:

@@ -47,6 +47,28 @@
   .live-log { font-size: 12px; color: var(--dim); padding: 8px 12px; background: var(--card);
               border: 1px solid var(--border); border-radius: 8px; white-space: pre-wrap; max-height: 60px; overflow: hidden; }
   .oob-bar { display: inline-block; height: 14px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }
+  tr.curve-row { cursor: pointer; }
+  tr.curve-row:hover td { background: #1c2128; }
+  tr.curve-row.expanded td { border-bottom-color: var(--blue); }
+  tr.detail-row td { padding: 0; background: var(--bg); border-bottom: 2px solid var(--border); }
+  .dp { padding: 10px 12px; font-size: 12px; line-height: 1.6; }
+  .dp .dp-meta { color: var(--dim); margin-bottom: 8px; }
+  .dp .dp-meta b { color: var(--text); }
+  .dp .dp-section { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin: 10px 0 4px; }
+  .dp .dp-section:first-of-type { margin-top: 0; }
+  .dp .tags { display: flex; flex-wrap: wrap; gap: 4px; }
+  .dp .tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+             border-radius: 4px; font-size: 11px; border: 1px solid var(--border); background: var(--card); white-space: nowrap; }
+  .dp .tag .tv { font-weight: bold; }
+  .dp .tag.t-great { border-color: #23492e; color: var(--green); }
+  .dp .tag.t-good  { border-color: #1a3a52; color: var(--blue); }
+  .dp .tag.t-ok    { border-color: #3d3019; color: var(--yellow); }
+  .dp .tag.t-poor  { border-color: #3d1f1f; color: var(--red); }
+  .dp .tag.t-miss  { border-color: var(--border); color: #484f58; font-style: italic; }
+  .dp .imps { color: var(--dim); font-size: 11px; line-height: 1.8; }
+  .dp .imps .fi { color: var(--text); }
+  .dp .imps .fv { font-size: 10px; }
+  .not-evaluated { color: var(--dim); font-style: italic; font-size: 12px; padding: 8px 12px; }
   @media (max-width: 600px) { body { padding: 10px; } .grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -272,6 +294,100 @@ function renderChart(curve) {
   }
 }
 
+// Global: detail data from API
+let curveDetailData = {};
+let expandedKgs = null;
+
+const ALL_TYPES = [
+  'tree','shrub','grass','hedge','water','roof','greenhouse','solar_panel','fence','wall','mast',
+  'road','path','parking','bridge','crop','orchard','vineyard','garden','bare_soil','rock',
+  'excavation','fill','tree_loss','construction'
+];
+const TYPE_GROUPS = {
+  'Vegetation': ['tree','shrub','grass','hedge','garden','orchard','vineyard','crop'],
+  'Water': ['water'],
+  'Buildings & Structures': ['roof','greenhouse','solar_panel','fence','wall','mast'],
+  'Transport': ['road','path','parking','bridge'],
+  'Terrain': ['bare_soil','rock','excavation','fill'],
+  'Change': ['tree_loss','construction'],
+};
+
+function tagCls(v) {
+  if (v >= 0.85) return 't-great';
+  if (v >= 0.60) return 't-good';
+  if (v >= 0.35) return 't-ok';
+  return 't-poor';
+}
+
+function buildDetailHTML(nKgs, colSpan) {
+  const d = curveDetailData[String(nKgs)];
+  if (!d) return `<td colspan="${colSpan}"><div class="not-evaluated">Detail not yet evaluated for ${nKgs} KGs — trigger curve eval to populate.</div></td>`;
+
+  let h = `<td colspan="${colSpan}"><div class="dp">`;
+
+  // Meta line
+  h += `<div class="dp-meta"><b>${d.n_estimators}</b> trees · depth <b>${d.max_depth}</b> · min leaf <b>${d.min_samples_leaf}</b> · <b>${d.n_seeds}</b> seed${d.n_seeds>1?'s':''}</div>`;
+
+  // Per-class OOB as tags grouped by category
+  const classOob = d.per_class_oob || {};
+  const present = new Set(d.classes_present || []);
+  for (const [groupName, types] of Object.entries(TYPE_GROUPS)) {
+    h += `<div class="dp-section">${groupName}</div><div class="tags">`;
+    for (const t of types) {
+      const val = classOob[t];
+      if (val !== undefined) {
+        const p = (val * 100).toFixed(0);
+        h += `<span class="tag ${tagCls(val)}">${t} <span class="tv">${p}%</span></span>`;
+      } else {
+        h += `<span class="tag t-miss">${t}</span>`;
+      }
+    }
+    h += `</div>`;
+  }
+
+  // Feature importances as compact text
+  const imps = d.feature_importances || {};
+  const sorted = Object.entries(imps).sort((a, b) => b[1] - a[1]);
+  if (sorted.length > 0) {
+    h += `<div class="dp-section">Top Features</div><div class="imps">`;
+    const top = sorted.slice(0, 15);
+    h += top.map(([k, v]) =>
+      `<span class="fi">${k}</span> <span class="fv">${(v*100).toFixed(1)}%</span>`
+    ).join(' · ');
+    h += `</div>`;
+  }
+
+  h += `</div></td>`;
+  return h;
+}
+
+function toggleDetail(nKgs, row) {
+  const tbody = document.querySelector('#curveTable tbody');
+  const colSpan = document.querySelector('#curveTable thead tr').children.length;
+
+  // Close existing detail row if any
+  const existingDetail = tbody.querySelector('tr.detail-row');
+  const existingExpanded = tbody.querySelector('tr.curve-row.expanded');
+  if (existingExpanded) existingExpanded.classList.remove('expanded');
+  if (existingDetail) {
+    const wasKgs = existingDetail.dataset.kgs;
+    existingDetail.remove();
+    if (String(wasKgs) === String(nKgs)) {
+      expandedKgs = null;
+      return; // toggle off
+    }
+  }
+
+  // Insert new detail row after the clicked row
+  row.classList.add('expanded');
+  const detailTr = document.createElement('tr');
+  detailTr.className = 'detail-row';
+  detailTr.dataset.kgs = nKgs;
+  detailTr.innerHTML = buildDetailHTML(nKgs, colSpan);
+  row.insertAdjacentElement('afterend', detailTr);
+  expandedKgs = nKgs;
+}
+
 function renderCurveTable(curve) {
   if (!curve || curve.length === 0) return;
   const tbody = document.querySelector('#curveTable tbody');
@@ -308,8 +424,9 @@ function renderCurveTable(curve) {
     const barW = Math.max(5, ((med - 0.70) / 0.20) * 100);
     const barColor = cls === 'best' ? 'var(--green)' : cls === 'trough' ? 'var(--yellow)' : 'var(--blue)';
     const spread = (hi - lo) * 100;
+    const expandedCls = (expandedKgs === r.n_kgs) ? ' expanded' : '';
 
-    html += `<tr class="${cls}">`;
+    html += `<tr class="curve-row ${cls}${expandedCls}" data-kgs="${r.n_kgs}">`;
     html += `<td>${r.n_kgs}</td>`;
     html += `<td>${r.n_samples.toLocaleString()}</td>`;
     html += `<td>${r.n_classes}</td>`;
@@ -319,10 +436,25 @@ function renderCurveTable(curve) {
       html += `<td style="color:var(--dim);font-size:11px">${seeds}/5</td>`;
     }
     html += `<td><span class="annotation">${ann}</span></td></tr>`;
+
+    // Re-insert detail row if this was expanded
+    if (expandedKgs === r.n_kgs) {
+      const colSpan = hasSeeds ? 7 : 5;
+      html += `<tr class="detail-row" data-kgs="${r.n_kgs}">${buildDetailHTML(r.n_kgs, colSpan)}</tr>`;
+    }
+
     prevCls = r.n_classes;
     prevOob = med;
   });
   tbody.innerHTML = html;
+
+  // Attach click handlers to curve rows
+  tbody.querySelectorAll('tr.curve-row').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const kgs = parseInt(tr.dataset.kgs);
+      toggleDetail(kgs, tr);
+    });
+  });
 }
 
 function renderHistory(history) {
@@ -353,6 +485,8 @@ async function poll() {
     const d = await r.json();
     renderCards(d);
     renderChart(d.oob_curve);
+    // Store curve_detail before rendering table
+    if (d.curve_detail) curveDetailData = d.curve_detail;
     renderCurveTable(d.oob_curve);
     renderHistory(d.oob_history);
     document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();

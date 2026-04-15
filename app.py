@@ -512,6 +512,64 @@ def training_status():
         except Exception:
             pass
 
+    # Curve detail (per-checkpoint expanded info from JSONL)
+    detail_path = pathlib.Path('data/oob_curve_detail.jsonl')
+    if detail_path.exists():
+        try:
+            import statistics
+            from collections import defaultdict
+            # Parse JSONL: group by n_kgs
+            by_kgs = defaultdict(list)
+            with open(detail_path) as _f:
+                for line in _f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        by_kgs[int(obj['n_kgs'])].append(obj)
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        continue
+            curve_detail = {}
+            for n_kgs in sorted(by_kgs):
+                entries = by_kgs[n_kgs]
+                n_seeds = len(entries)
+                # Hyperparams (same for all seeds, take first)
+                entry0 = entries[0]
+                # Median feature importances across seeds
+                all_feat_keys = set()
+                for e in entries:
+                    all_feat_keys.update(e.get('all_importances', {}).keys())
+                feat_medians = {}
+                for fk in all_feat_keys:
+                    vals = [e['all_importances'][fk] for e in entries
+                            if fk in e.get('all_importances', {})]
+                    if vals:
+                        feat_medians[fk] = round(statistics.median(vals), 6)
+                # Median per-class OOB across seeds (only where class present)
+                all_classes = set()
+                for e in entries:
+                    all_classes.update(e.get('per_class_oob', {}).keys())
+                class_medians = {}
+                classes_present = sorted(all_classes)
+                for cls in all_classes:
+                    vals = [e['per_class_oob'][cls] for e in entries
+                            if cls in e.get('per_class_oob', {})]
+                    if vals:
+                        class_medians[cls] = round(statistics.median(vals), 4)
+                curve_detail[str(n_kgs)] = {
+                    'n_estimators': entry0.get('n_estimators', 200),
+                    'max_depth': entry0.get('max_depth', 20),
+                    'min_samples_leaf': entry0.get('min_samples_leaf', 5),
+                    'feature_importances': feat_medians,
+                    'per_class_oob': class_medians,
+                    'classes_present': classes_present,
+                    'n_seeds': n_seeds,
+                }
+            result['curve_detail'] = curve_detail
+        except Exception:
+            pass
+
     return jsonify(result)
 
 

@@ -60,7 +60,7 @@
     <a href="/api/v1/training/status" style="color:var(--dim);text-decoration:none">api</a>
   </span>
 </div>
-<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span> · <a href="#" id="triggerEval" style="color:var(--blue);text-decoration:none" onclick="triggerEval(event)">trigger now</a></div>
+<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span> · <a href="#" id="triggerEval" style="color:var(--blue);text-decoration:none" onclick="triggerEval(event)">trigger now</a><a href="#" id="stopEval" style="color:var(--red);text-decoration:none;display:none" onclick="stopEval(event)"> · ● stop</a></div>
 
 <div class="grid" id="cards"></div>
 
@@ -371,6 +371,7 @@ async function triggerEval(e) {
 
 function setEvalState(data) {
   const el = document.getElementById('triggerEval');
+  const stopEl = document.getElementById('stopEval');
   const running = data.running;
   if (running) {
     let label = '● evaluating';
@@ -379,10 +380,20 @@ function setEvalState(data) {
     }
     el.textContent = label; el.style.color = 'var(--green)';
     el.style.pointerEvents = 'none'; el.dataset.busy = '1';
+    stopEl.style.display = '';
   } else {
     el.textContent = 'trigger now'; el.style.color = 'var(--blue)';
     el.style.pointerEvents = ''; el.dataset.busy = '0';
+    stopEl.style.display = 'none';
   }
+}
+
+async function stopEval(e) {
+  e.preventDefault();
+  try {
+    await fetch('/api/v1/training/evaluate/stop', {method:'POST'});
+    checkEvalRunning();
+  } catch(e) {}
 }
 
 async function checkEvalRunning() {

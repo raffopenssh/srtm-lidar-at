@@ -590,6 +590,27 @@ def curve_eval_status():
     return jsonify(info)
 
 
+@app.route('/api/v1/training/evaluate/stop', methods=['POST'])
+def stop_curve_eval():
+    """Kill running curve evaluation subprocess."""
+    import signal
+    if not _is_curve_eval_running():
+        return jsonify(running=False, msg='Not running')
+    # Find the evaluate_checkpoints process and kill its process group
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['pgrep', '-f', 'evaluate_checkpoints.py curve'],
+            capture_output=True, text=True
+        )
+        for pid in result.stdout.strip().split('\n'):
+            if pid:
+                os.kill(int(pid), signal.SIGTERM)
+        return jsonify(running=False, msg='Stopped')
+    except Exception as e:
+        return jsonify(running=_is_curve_eval_running(), msg=str(e)), 500
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

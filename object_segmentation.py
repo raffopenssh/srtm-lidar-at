@@ -65,6 +65,8 @@ OBJECT_TYPES = {
     "fence": 15,         # low (0.5-2m), thin, elongated            [detectable]
     "wall": 16,          # narrow elevated, adjacent to roof        [detectable]
     "mast": 17,          # tiny footprint (<10m²), very tall (>15m) [detectable]
+    "wind_turbine": 18,  # wind turbine: very tall (80-200m), small footprint
+    "substation": 19,    # electrical substation: fenced compound with transformers
     # ---- Transportation (smooth DTM + elongated + low NDVI) ----
     "road": 20,          # smooth, elongated, low NDVI             [V 48,73]
     "path": 21,          # narrower road (<3m effective width)      [V(Weg) 74]
@@ -94,7 +96,7 @@ GROUP_TYPES = {
     # Water
     "waterbody": 106,        # water+water  [GW 70,71,96]
     # Infrastructure
-    "building": 110,         # roof+wall+solar_panel+greenhouse  [B 42-47]
+    "building": 110,         # roof+wall+solar_panel+greenhouse+substation  [B 42-47]
     "road_network": 115,     # road+path+parking  [V 48,73,74]
     # Agricultural
     "cropland": 120,         # crop+crop  [A 51,62]
@@ -116,7 +118,7 @@ _COMPAT_MAP = {
     # Buildings
     "roof": 5, "greenhouse": 5, "solar_panel": 5, "wall": 6,
     # Infrastructure
-    "fence": 6, "mast": 6,
+    "fence": 6, "mast": 6, "wind_turbine": 6, "substation": 5,
     # Transportation
     "road": 1, "path": 1, "parking": 1, "bridge": 6,
     # Agricultural
@@ -449,6 +451,8 @@ def extract_object_features(
     # Hansen codes [obs_year-2000-5, obs_year-2000].
     _hansen_recent_start = max(_obs_year - 2000 - 5, 1)   # e.g. 2024→19
     _hansen_recent_end   = min(_obs_year - 2000, 24)       # e.g. 2024→24
+    _hansen_3yr_start = max(_obs_year - 2000 - 2, 1)       # e.g. 2024→22
+    _hansen_3yr_end   = min(_obs_year - 2000, 24)          # e.g. 2024→24
     h, w = dtm.shape
     slope_arr = _slope(dtm)
     dsm_rough = _local_std(dsm, 3)
@@ -675,12 +679,14 @@ def extract_object_features(
             f["hansen_treecover2000"] = float(np.mean(hansen_tc[seg_v])) if n_pix > 0 else 0.0
             f["hansen_loss_frac"] = float(np.sum(hansen_loss[seg_v] > 0)) / n_pix if hansen_loss is not None else 0.0
             f["hansen_recent_loss_frac"] = float(np.sum((hansen_loss[seg_v] >= _hansen_recent_start) & (hansen_loss[seg_v] <= _hansen_recent_end))) / n_pix if hansen_loss is not None else 0.0
+            f["hansen_loss_3yr_frac"] = float(np.sum((hansen_loss[seg_v] >= _hansen_3yr_start) & (hansen_loss[seg_v] <= _hansen_3yr_end))) / n_pix if hansen_loss is not None else 0.0
             f["hansen_gain_frac"] = float(np.sum(hansen_gain[seg_v] > 0)) / n_pix if hansen_gain is not None else 0.0
             f["hansen_current_forest_frac"] = float(np.sum(hansen_current[seg_v])) / n_pix if hansen_current is not None else 0.0
         else:
             f["hansen_treecover2000"] = 0.0
             f["hansen_loss_frac"] = 0.0
             f["hansen_recent_loss_frac"] = 0.0
+            f["hansen_loss_3yr_frac"] = 0.0
             f["hansen_gain_frac"] = 0.0
             f["hansen_current_forest_frac"] = 0.0
 
@@ -1408,10 +1414,11 @@ _MERGE_RULES = {
     "tree": {"tree", "shrub", "hedge"},
     "shrub": {"tree", "shrub", "hedge"},
     "hedge": {"tree", "shrub", "hedge"},
-    "roof": {"roof", "wall", "solar_panel", "greenhouse"},
+    "roof": {"roof", "wall", "solar_panel", "greenhouse", "substation"},
     "wall": {"roof", "wall"},
     "solar_panel": {"roof", "solar_panel"},
     "greenhouse": {"roof", "greenhouse"},
+    "substation": {"roof", "wall", "substation", "fence"},
     "road": {"road", "path", "parking"},
     "path": {"road", "path"},
     "parking": {"road", "parking"},
@@ -1446,6 +1453,10 @@ _GROUP_NAME_MAP: list[tuple[set[str], str]] = [
     ({"roof", "wall", "solar_panel"}, "building"),
     ({"roof", "greenhouse"}, "building"),
     ({"roof", "wall", "solar_panel", "greenhouse"}, "building"),
+    ({"roof", "wall", "solar_panel", "greenhouse", "substation"}, "building"),
+    ({"substation"}, "building"),
+    ({"roof", "substation"}, "building"),
+    ({"roof", "wall", "substation"}, "building"),
     ({"greenhouse"}, "building"),
     # Transportation
     ({"road"}, "road_network"),
@@ -1600,7 +1611,7 @@ def calibrate_with_cadastre(
                 obj.ndvi_fused > 0.55  # overwhelmingly vegetated
             )
 
-            if obj.obj_type in ("roof", "wall", "solar_panel", "greenhouse", "fence"):
+            if obj.obj_type in ("roof", "wall", "solar_panel", "greenhouse", "fence", "substation"):
                 # Already building — just boost confidence
                 obj.confidence = min(obj.confidence + 0.15, 0.95)
             elif not looks_like_canopy and obj.height_mean > 1.5:
@@ -1633,7 +1644,7 @@ def evaluate_against_cadastre(
 
     h, w = labels.shape
     pred = np.zeros((h, w), dtype=bool)
-    _BUILDING_TYPES = {"roof", "wall", "solar_panel", "greenhouse", "construction"}
+    _BUILDING_TYPES = {"roof", "wall", "solar_panel", "greenhouse", "construction", "substation"}
     for obj in objects:
         if obj.obj_type in _BUILDING_TYPES:
             pred |= (labels == obj.obj_id)

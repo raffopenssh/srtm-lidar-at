@@ -289,11 +289,11 @@ def calibrate_tree_loss(
         forest_frac = forest_overlap / seg_pixels
 
         if obj.obj_type == "tree_loss":
-            if loss_frac > 0.3:
+            if loss_frac > 0.15:
                 # Hansen confirms forest loss - boost confidence
                 obj.confidence = min(obj.confidence + 0.15, 0.95)
                 modified += 1
-            elif forest_frac < 0.2:
+            elif forest_frac < 0.1:
                 # Not even forest area according to Hansen → downgrade
                 obj.confidence = max(obj.confidence - 0.2, 0.2)
                 modified += 1
@@ -302,20 +302,28 @@ def calibrate_tree_loss(
 
         elif obj.obj_type in ("tree", "shrub", "grass", "bare_soil", "crop"):
             # Vegetation/ground on recent Hansen loss area → possible tree_loss
-            if recent_frac > 0.3 and forest_frac > 0.3:
-                # Strong Hansen loss signal on former forest.
+            if recent_frac > 0.15 and forest_frac > 0.15:
+                # Hansen loss signal on former forest.
                 # Evidence of clearing: temporal change OR low current canopy
                 # (temporal data may be absent if only one LIDAR date exists).
                 h_change_abs = abs(obj.height_change)
                 has_temporal_evidence = (
                     h_change_abs > 0.5 or obj.temporal_stability < 0.6
                 )
-                has_height_evidence = obj.height_mean < 3.0  # cleared canopy
+                has_height_evidence = obj.height_mean < 5.0  # young regrowth can be up to 5m
                 if has_temporal_evidence or has_height_evidence:
                     from object_segmentation import OBJECT_TYPES
                     obj.obj_type = "tree_loss"
                     obj.type_code = OBJECT_TYPES["tree_loss"]
                     obj.confidence = min(0.6 + recent_frac * 0.2, 0.85)
+                    obj.is_manmade = True
+                    modified += 1
+                elif recent_frac > 0.5:
+                    # Majority Hansen loss — reclassify with lower confidence
+                    from object_segmentation import OBJECT_TYPES
+                    obj.obj_type = "tree_loss"
+                    obj.type_code = OBJECT_TYPES["tree_loss"]
+                    obj.confidence = min(0.45 + recent_frac * 0.15, 0.70)
                     obj.is_manmade = True
                     modified += 1
 

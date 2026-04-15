@@ -72,7 +72,7 @@ FEATURE_KEYS = [
     # NDVI harmonics
     "harm_mean", "harm_amplitude", "harm_phase", "harm_rmse",
     # Hansen Global Forest Change
-    "hansen_treecover2000", "hansen_loss_frac", "hansen_recent_loss_frac",
+    "hansen_treecover2000", "hansen_loss_frac", "hansen_recent_loss_frac", "hansen_loss_3yr_frac",
     "hansen_gain_frac", "hansen_current_forest_frac",
     # Additional discriminators
     "ndvi_max", "slope_max", "h_p10", "perimeter", "esa_dominant_lc",
@@ -132,7 +132,8 @@ TYPE_CLASSES = [
     "tree", "shrub", "grass", "crop", "road", "path", "parking",
     "roof", "water", "bare_soil", "rock", "excavation", "fill",
     "garden", "orchard", "vineyard", "hedge", "fence", "wall",
-    "tree_loss", "construction",
+    "tree_loss", "construction", "wind_turbine", "substation",
+    "solar_panel", "mast",
 ]
 
 

@@ -38,7 +38,7 @@ log = logging.getLogger('rf_train')
 for name in ['rasterio', 'urllib3', 'botocore', 'PIL', 'fiona']:
     logging.getLogger(name).setLevel(logging.WARNING)
 
-N_KGS = 4000
+N_KGS = 300
 MODEL_CHECKPOINT_INTERVAL = 10  # train & save model every N successful KGs
 KG_TIMEOUT_SECONDS = 20 * 60  # 20 min max per KG (prevents stuck segmentation)
 MAX_KG_PIXELS = 10_000_000  # skip KGs with > 10M valid pixels (OOM risk)
@@ -432,6 +432,7 @@ def match_segments_via_raster(
     labels: np.ndarray,
     cadastre_raster: np.ndarray,
     osm_labels: np.ndarray | None,
+    infra_labels: dict | None = None,
     min_overlap_frac: float = 0.15,
 ) -> tuple[list[dict], list[str], dict]:
     """Match segments to ground truth via pixel-level majority vote.
@@ -455,7 +456,7 @@ def match_segments_via_raster(
         "osm": 0, "osm_height_rejected": 0, "unmatched": 0,
     }
 
-    for feat in features_list:
+    for _seg_idx, feat in enumerate(features_list):
         seg_id = feat.get("label")
         if seg_id is None:
             source_counts["unmatched"] += 1
@@ -525,6 +526,14 @@ def match_segments_via_raster(
                     source_counts["osm"] += 1
                     continue
 
+        # Infrastructure labels (power API + OSM power)
+        if infra_labels and _seg_idx in infra_labels:
+            infra_lbl = infra_labels[_seg_idx]
+            train_features.append(feat)
+            train_labels.append(infra_lbl)
+            source_counts["infrastructure"] = source_counts.get("infrastructure", 0) + 1
+            continue
+
         source_counts["unmatched"] += 1
 
     # Post-pass: relabel tree_loss from Hansen evidence
@@ -539,10 +548,10 @@ def match_segments_via_raster(
         h_mean = feat.get("h_mean", 0.0)
         h_change = feat.get("h_change", 0.0)
         # Must have been forest (tc2000 > 30) with recent Hansen loss
-        if hrlf < 0.3 or tc2000 < 30:
+        if hrlf < 0.15 or tc2000 < 20:
             continue
         # Evidence of cleared canopy: low current height OR significant drop
-        if h_mean < 3.0 or h_change < -2.0:
+        if h_mean < 5.0 or h_change < -2.0:
             train_labels[i] = "tree_loss"
             n_relabelled += 1
     if n_relabelled:
@@ -968,6 +977,24 @@ def process_one_kg(
         stats["has_hansen"] = False
     stats["hansen_time"] = round(time.time() - t0, 1)
 
+    # 5c. Power infrastructure points + polygons (matched after segmentation)
+    _infra_points = []
+    _osm_power_polys = []
+    t0 = time.time()
+    try:
+        import power_infrastructure as pi
+        _infra_points = pi.fetch_power_infrastructure((west, south, east, north))
+        _osm_power_polys = pi.fetch_osm_power_polygons((west, south, east, north))
+        stats["has_infrastructure"] = bool(_infra_points or _osm_power_polys)
+        stats["n_infra_points"] = len(_infra_points)
+        stats["n_osm_power_polys"] = len(_osm_power_polys)
+        log.info("KG %s: infrastructure data: %d points, %d polygons",
+                 kg_code, len(_infra_points), len(_osm_power_polys))
+    except Exception as e:
+        log.warning("KG %s: infrastructure data failed: %s", kg_code, e)
+        stats["has_infrastructure"] = False
+    stats["infrastructure_time"] = round(time.time() - t0, 1)
+
     # 5b. OSM ground truth (roads, paths, landcover)
     osm_labels = None
     if include_osm:
@@ -1032,6 +1059,23 @@ def process_one_kg(
         stats["error"] = "no segments"
         return [], [], stats
 
+    # 6b. Match infrastructure points/polygons to segments
+    infra_seg_labels = {}
+    if _infra_points or _osm_power_polys:
+        try:
+            import power_infrastructure as pi
+            seg_labels_arr = result.get("labels")
+            infra_seg_labels = pi.match_infrastructure_to_segments(
+                _infra_points, _osm_power_polys,
+                features_list, seg_labels_arr,
+                data["transform"], ndsm=data.get("ndsm"),
+            )
+            if infra_seg_labels:
+                log.info("KG %s: %d segments matched to infrastructure labels",
+                         kg_code, len(infra_seg_labels))
+        except Exception as e:
+            log.warning("KG %s: infrastructure matching failed: %s", kg_code, e)
+
     # 7. Match segments to ground truth via rasterized cadastre + OSM
     #    Rasterize all cadastre features to 1m grid, mask building pixels
     #    by nDSM height, then per-segment majority vote.
@@ -1049,6 +1093,7 @@ def process_one_kg(
 
     train_features, train_labels, source_counts = match_segments_via_raster(
         features_list, seg_labels, cadastre_raster, osm_labels,
+        infra_labels=infra_seg_labels,
     )
 
     stats["match_time"] = round(time.time() - t0, 1)
@@ -1067,24 +1112,28 @@ def process_one_kg(
 
 
 def _clear_downloaded_caches():
-    """Delete cached .npz/.tif files from /tmp to reclaim memory.
+    """Delete only cached error entries from /tmp caches to reclaim memory.
 
-    NOTE: Copernicus cache is now permanent (rf_training_data/copernicus_cache)
-    with LRU eviction managed by copernicus.py — don't clear it here.
+    Preserves valid cached data (ortho, lidar, Copernicus, Hansen, OSM)
+    so restarts don't re-download everything.  Only removes:
+    - Files smaller than 200 bytes (likely error/empty responses)
+    - Files with 'error' in the name
     """
-    import shutil
     cleared = 0
     for cache_dir in [
         Path("/tmp/hansen_cache"),
+        Path("/tmp/osm_cache"),
+        Path("/tmp/power_infra_cache"),
+        Path("/tmp/cadastre_cache"),
     ]:
         if cache_dir.exists():
             for f in cache_dir.iterdir():
                 try:
-                    if f.is_dir():
-                        shutil.rmtree(f)
-                    else:
-                        f.unlink()
-                    cleared += 1
+                    if f.is_file():
+                        # Only remove tiny files (likely cached errors)
+                        if f.stat().st_size < 200 or 'error' in f.name:
+                            f.unlink()
+                            cleared += 1
                 except Exception:
                     pass
     if cleared:
@@ -1232,6 +1281,23 @@ def main():
     # Process each KG
     for i, kg in enumerate(kgs):
         kg_code = kg["kg_code"]
+
+        # --- Check should_stop flag from monitor cronjob ---
+        _monitor_state_file = Path("data/monitor_state.json")
+        if _monitor_state_file.exists():
+            try:
+                _mstate = json.loads(_monitor_state_file.read_text())
+                if _mstate.get("should_stop"):
+                    log.info("="*60)
+                    log.info("STOPPING: monitor cronjob set should_stop=true")
+                    log.info("  Reason: status=%s, mature_peak_oob=%.4f at %d KGs",
+                             _mstate.get("last_status", "?"),
+                             _mstate.get("mature_peak_oob", 0),
+                             _mstate.get("mature_peak_n_kgs", 0))
+                    log.info("="*60)
+                    break
+            except Exception:
+                pass
 
         if kg_code in completed_kgs:
             log.info("[%d/%d] KG %s — already checkpointed, skipping",

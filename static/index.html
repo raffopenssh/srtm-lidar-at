@@ -594,7 +594,7 @@ function divCSS(t){const n=(t+1)/2;let r,g,b;if(n<.5){const f=n*2;r=33+f*222;g=1
 function divGrad(){const s=[];for(let i=0;i<=10;i++)s.push(divCSS(-1+i*.2)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
 
 // ============ TYPE CONFIG ============
-const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},tree_loss:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'}};
+const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},wind_turbine:{s:'x',l:'⚡',c:'#1565C0'},substation:{s:'sq',l:'⬡',c:'#FF6F00'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},tree_loss:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'}};
 const STATUS_COLORS={grown:{l:'▲',c:'#228B22'},felled:{l:'▼',c:'#DC143C'},new:{l:'★',c:'#00BFFF'},stable:{l:'●',c:'#888'},declined:{l:'▼',c:'#FF8C00'},dead:{l:'✖',c:'#8B0000'}};
 const EVENT_COLORS={tree_growth:{l:'▲',c:'#228B22'},tree_felling:{l:'▼',c:'#DC143C'},new_tree:{l:'★',c:'#00BFFF'},forest_clearcut:{l:'◆',c:'#FF00FF'},vegetation_growth:{l:'▲',c:'#7CFC00'},vegetation_loss:{l:'▼',c:'#FF8C00'},new_building:{l:'■',c:'#DC143C'},demolition:{l:'□',c:'#FF4500'},construction:{l:'■',c:'#FF6347'},earthwork_fill:{l:'◆',c:'#DAA520'},earthwork_cut:{l:'◇',c:'#8B4513'},earthwork_grading:{l:'◆',c:'#A0522D'},earthwork_dam:{l:'█',c:'#696969'},earthwork_trench:{l:'—',c:'#404040'},earthwork_pond:{l:'●',c:'#1E90FF'},road_new:{l:'—',c:'#808080'},road_resurfaced:{l:'—',c:'#A9A9A9'},road_widened:{l:'—',c:'#696969'},surface_change:{l:'×',c:'#D2B48C'},unknown_change:{l:'?',c:'#888'}};
 const DEF={l:'○',c:'#666'};
@@ -605,7 +605,7 @@ const OT_GROUPS={
   'Vegetation':['tree','shrub','grass','hedge'],
   'Water':['water'],
   'Buildings':['roof','greenhouse','solar_panel'],
-  'Infrastructure':['fence','wall','mast'],
+  'Infrastructure':['fence','wall','mast','wind_turbine','substation'],
   'Transportation':['road','path','parking','bridge'],
   'Agricultural':['crop','orchard','vineyard','garden'],
   'Terrain':['bare_soil','rock'],
@@ -796,7 +796,7 @@ let _rasterWanted=false;  // true if raster checkbox is checked (survives async 
 const SEGMENT_RGB={
   tree:[0,100,0],shrub:[34,139,34],grass:[124,252,0],hedge:[46,139,87],water:[30,144,255],
   roof:[220,20,60],greenhouse:[255,105,180],solar_panel:[65,105,225],fence:[160,82,45],
-  wall:[139,69,19],mast:[64,64,64],road:[128,128,128],path:[169,169,169],parking:[105,105,105],
+  wall:[139,69,19],mast:[64,64,64],wind_turbine:[21,101,192],substation:[255,111,0],road:[128,128,128],path:[169,169,169],parking:[105,105,105],
   bridge:[112,128,144],crop:[218,165,32],orchard:[107,142,35],vineyard:[147,112,219],
   garden:[60,179,113],bare_soil:[210,180,140],rock:[139,134,130],excavation:[139,0,0],
   fill:[255,140,0],tree_loss:[255,0,255],construction:[255,69,0]

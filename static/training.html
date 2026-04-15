@@ -230,7 +230,7 @@ function renderChart(curve) {
   // Dots
   curve.forEach((_, i) => {
     ctx.beginPath(); ctx.arc(x(i), y(medians[i]), 3, 0, Math.PI * 2);
-    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); ctx.beginPath(); ctx.arc(x(i), y(medians[i]), 6, 0, Math.PI * 2); ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1.5; ctx.stroke(); }
+    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); }
     else if (i === troughIdx && troughIdx !== bestIdx) { ctx.fillStyle = '#d29922'; ctx.fill(); }
     else { ctx.fillStyle = '#58a6ff'; ctx.fill(); }
   });
@@ -379,8 +379,9 @@ function setEvalState(data) {
   const running = data.running;
   if (running) {
     let label = '● evaluating';
-    if (data.done && data.total) {
-      label += ` ${data.done}/${data.total} (${data.last_kgs} KGs, seed ${+data.last_seed+1}/5)`;
+    if (data.total) {
+      if (data.current_kgs) label += ` ${data.current_kgs} KGs (seed ${+data.current_seed+1}/5)`;
+      else label += ` ${data.done}/${data.total}`;
     }
     el.textContent = label; el.style.color = 'var(--green)';
     el.style.pointerEvents = 'none'; el.dataset.busy = '1';

@@ -568,20 +568,19 @@ def curve_eval_status():
             n_ckpt = len(list(Path('rf_training_data/checkpoints').glob('kg_*.npz')))
             steps = list(range(5, n_ckpt + 1, 5))
             total_combos = len(steps) * 5  # 5 seeds
-            done_combos = 0
-            last_kgs = 0
-            last_seed = 0
+            existing = set()
             if csv_path.exists():
                 with open(csv_path) as f:
-                    rows = list(csv.DictReader(f))
-                    done_combos = len(rows)
-                    if rows:
-                        last_kgs = int(rows[-1].get('n_kgs', 0))
-                        last_seed = int(rows[-1].get('seed', 0))
+                    for r in csv.DictReader(f):
+                        existing.add((int(r['n_kgs']), int(r.get('seed', 0))))
+            # Build work list matching eval script order
+            work = [(n, s) for n in steps for s in range(5) if (n, s) not in existing]
+            done_combos = total_combos - len(work)
+            if work:
+                info['current_kgs'] = work[0][0]
+                info['current_seed'] = work[0][1]
             info['done'] = done_combos
             info['total'] = total_combos
-            info['last_kgs'] = last_kgs
-            info['last_seed'] = last_seed
         except Exception:
             pass
     return jsonify(info)

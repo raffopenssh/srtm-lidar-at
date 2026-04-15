@@ -89,7 +89,7 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
         oob_score=True,
-        n_jobs=2,
+        n_jobs=1,
         random_state=random_state,
         class_weight="balanced",
     )

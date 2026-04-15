@@ -556,8 +556,38 @@ def trigger_curve_eval():
 
 @app.route('/api/v1/training/evaluate', methods=['GET'])
 def curve_eval_status():
-    """Check if curve evaluation is running."""
-    return jsonify(running=_is_curve_eval_running())
+    """Check if curve evaluation is running, with progress detail."""
+    running = _is_curve_eval_running()
+    info = {'running': running}
+    if running:
+        # Read CSV to figure out progress
+        try:
+            import csv
+            from pathlib import Path
+            csv_path = Path('data/oob_curve.csv')
+            n_ckpt = len(list(Path('rf_training_data/checkpoints').glob('kg_*.npz')))
+            max_step = n_ckpt  # last step = total checkpoints
+            steps = list(range(5, max_step + 1, 5))
+            if max_step not in steps:
+                steps.append(max_step)
+            total_combos = len(steps) * 5  # 5 seeds
+            done_combos = 0
+            last_kgs = 0
+            last_seed = 0
+            if csv_path.exists():
+                with open(csv_path) as f:
+                    rows = list(csv.DictReader(f))
+                    done_combos = len(rows)
+                    if rows:
+                        last_kgs = int(rows[-1].get('n_kgs', 0))
+                        last_seed = int(rows[-1].get('seed', 0))
+            info['done'] = done_combos
+            info['total'] = total_combos
+            info['last_kgs'] = last_kgs
+            info['last_seed'] = last_seed
+        except Exception:
+            pass
+    return jsonify(info)
 
 
 # ---------------------------------------------------------------------------

@@ -364,15 +364,20 @@ async function triggerEval(e) {
   try {
     el.textContent = 'starting…'; el.dataset.busy = '1';
     const r = await fetch('/api/v1/training/evaluate', {method:'POST'});
-    if (r.status === 409) { setEvalState(true); }
-    else { setEvalState(true); }
+    if (r.status === 409) { setEvalState({running:true}); }
+    else { setEvalState({running:true}); }
   } catch(e) { el.textContent = 'error'; el.style.color = 'var(--red)'; el.dataset.busy = '0'; }
 }
 
-function setEvalState(running) {
+function setEvalState(data) {
   const el = document.getElementById('triggerEval');
+  const running = data.running;
   if (running) {
-    el.textContent = '● running'; el.style.color = 'var(--green)';
+    let label = '● evaluating';
+    if (data.done && data.total) {
+      label += ` ${data.done}/${data.total} (${data.last_kgs} KGs, seed ${data.last_seed})`;
+    }
+    el.textContent = label; el.style.color = 'var(--green)';
     el.style.pointerEvents = 'none'; el.dataset.busy = '1';
   } else {
     el.textContent = 'trigger now'; el.style.color = 'var(--blue)';
@@ -384,7 +389,7 @@ async function checkEvalRunning() {
   try {
     const r = await fetch('/api/v1/training/evaluate');
     const d = await r.json();
-    setEvalState(d.running);
+    setEvalState(d);
   } catch(e) {}
 }
 

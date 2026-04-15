@@ -60,7 +60,7 @@
     <a href="/api/v1/training/status" style="color:var(--dim);text-decoration:none">api</a>
   </span>
 </div>
-<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span> · <a href="#" id="triggerEval" style="color:var(--blue);text-decoration:none" onclick="triggerEval(event)">trigger now</a><a href="#" id="stopEval" style="color:var(--red);text-decoration:none;display:none" onclick="stopEval(event)"> · ● stop</a></div>
+<div class="subtitle">Auto-refreshes every 15s · <span id="lastUpdate">—</span> · Next curve eval: <span id="nextCron">—</span> · <a href="#" id="triggerEval" style="color:var(--blue);text-decoration:none" onclick="triggerEval(event)">trigger now</a><a href="#" id="stopEval" style="color:var(--red);text-decoration:none;display:none" onclick="stopEval(event)"> · stop</a></div>
 
 <div class="grid" id="cards"></div>
 
@@ -378,7 +378,7 @@ function setEvalState(data) {
   const stopEl = document.getElementById('stopEval');
   const running = data.running;
   if (running) {
-    let label = '● evaluating';
+    let label = 'evaluating';
     if (data.total) {
       if (data.current_kgs) label += ` ${data.current_kgs} KGs (seed ${+data.current_seed+1}/5)`;
       else label += ` ${data.done}/${data.total}`;

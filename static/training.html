@@ -213,7 +213,9 @@ function renderChart(curve) {
   }
 
   // Key points
-  const bestIdx = medians.indexOf(Math.max(...medians));
+  const maxClsChart = Math.max(...curve.map(r => r.n_classes || 0));
+  const matureMeds = medians.map((m, i) => (curve[i].n_classes || 0) >= maxClsChart ? m : -1);
+  const bestIdx = matureMeds.indexOf(Math.max(...matureMeds));
   const halfIdx = Math.floor(curve.length * 0.3);
   const secondHalf = medians.slice(halfIdx);
   const troughVal = secondHalf.length ? Math.min(...secondHalf) : medians[0];
@@ -236,7 +238,7 @@ function renderChart(curve) {
   // Annotations
   ctx.font = '10px monospace'; ctx.fillStyle = '#3fb950';
   const lbl = hasSpread ? ' (median)' : '';
-  ctx.fillText('Best: ' + (medians[bestIdx]*100).toFixed(2) + '%' + lbl + ' @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(maxs[bestIdx]) - 10);
+  ctx.fillText((medians[bestIdx]*100).toFixed(2) + '%' + lbl + ' @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(maxs[bestIdx]) - 10);
   if (troughIdx !== bestIdx) {
     ctx.fillStyle = '#d29922';
     ctx.fillText('Trough: ' + (medians[troughIdx]*100).toFixed(2) + '%', x(troughIdx), y(mins[troughIdx]) + 16);
@@ -274,7 +276,9 @@ function renderCurveTable(curve) {
   if (!curve || curve.length === 0) return;
   const tbody = document.querySelector('#curveTable tbody');
   const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
-  const bestMedian = Math.max(...medians);
+  const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
+  const matureMedians = curve.map(r => (r.n_classes || 0) >= maxCls ? (r.oob_median ?? r.oob ?? 0) : -1);
+  const bestMedian = Math.max(...matureMedians);
   const halfIdx = Math.floor(curve.length * 0.3);
   const secondHalf = medians.slice(halfIdx);
   const troughMedian = secondHalf.length > 0 ? Math.min(...secondHalf) : -1;

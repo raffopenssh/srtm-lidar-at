@@ -57,6 +57,29 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 IN_PROGRESS_FILE = PERMANENT_DIR / "in_progress_kg.txt"
 FAILED_KGS_FILE = PERMANENT_DIR / "failed_kgs.txt"
 
+# Circuit breaker for openEO / Copernicus — file-based so it persists across
+# forked subprocesses. When openEO is returning 503s, skip Copernicus for a
+# cooldown period instead of burning 3×180s timeouts per KG.
+_CIRCUIT_BREAKER_FILE = PERMANENT_DIR / "openeo_circuit.json"
+
+def _read_circuit_breaker() -> dict:
+    """Read circuit breaker state from file."""
+    try:
+        if _CIRCUIT_BREAKER_FILE.exists():
+            import json
+            return json.loads(_CIRCUIT_BREAKER_FILE.read_text())
+    except Exception:
+        pass
+    return {"consecutive_failures": 0, "last_failure": 0.0, "cooldown": 120}
+
+def _write_circuit_breaker(state: dict):
+    """Write circuit breaker state to file."""
+    import json
+    try:
+        _CIRCUIT_BREAKER_FILE.write_text(json.dumps(state))
+    except Exception:
+        pass
+
 # WGS84 <-> EPSG:3035 transformers
 _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -826,35 +849,81 @@ def process_one_kg(
             COP_TIMEOUT = 180
             HARM_TIMEOUT = 900
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
-                for name, func, timeout in [
-                    ("ndvi", _fetch_ndvi, COP_TIMEOUT),
-                    ("landcover", _fetch_landcover, COP_TIMEOUT),
-                    ("sar", _fetch_sar, COP_TIMEOUT),
-                    ("harmonics", _fetch_harmonics, HARM_TIMEOUT),
-                ]:
-                    try:
-                        fut = exe.submit(func)
-                        result = fut.result(timeout=timeout)
-                        if result is not None:
-                            if name == "ndvi":
-                                cop.update(result)
-                            elif name == "landcover":
-                                cop["landcover"] = result
-                            elif name == "sar":
-                                cop.update(result)
-                            elif name == "harmonics":
-                                cop["harmonics"] = result
-                            log.info("KG %s: %s OK", kg_code, name)
-                    except concurrent.futures.TimeoutError:
-                        log.warning("KG %s: %s timed out after %ds, skipping",
-                                    kg_code, name, timeout)
-                    except copernicus.CreditsExhaustedError:
-                        raise  # let it propagate — main loop will pause
-                    except Exception as e:
-                        log.debug("KG %s: %s failed: %s", kg_code, name, e)
+            # --- Circuit breaker: skip Copernicus entirely if openEO is down ---
+            # File-based so it persists across forked subprocesses.
+            import time as _time
+            _cb = _read_circuit_breaker()
+            if _cb["consecutive_failures"] >= 3 and (_time.time() - _cb["last_failure"]) < _cb["cooldown"]:
+                log.info("KG %s: Copernicus circuit breaker OPEN (%d consecutive failures, %.0fs remaining) — skipping all",
+                         kg_code, _cb["consecutive_failures"],
+                         _cb["cooldown"] - (_time.time() - _cb["last_failure"]))
+                copernicus_data = None
+            else:
+                # Run NDVI + landcover + SAR in parallel (3 workers), then harmonics
+                # This avoids 3×180s sequential timeout stacking.
+                cop_success = 0
+                cop_fail = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as exe:
+                    # Submit fast trio in parallel
+                    fast_futs = {}
+                    for name, func in [("ndvi", _fetch_ndvi), ("landcover", _fetch_landcover), ("sar", _fetch_sar)]:
+                        fast_futs[name] = exe.submit(func)
+                    for name, fut in fast_futs.items():
+                        try:
+                            result = fut.result(timeout=COP_TIMEOUT)
+                            if result is not None:
+                                if name == "ndvi":
+                                    cop.update(result)
+                                elif name == "landcover":
+                                    cop["landcover"] = result
+                                elif name == "sar":
+                                    cop.update(result)
+                                log.info("KG %s: %s OK", kg_code, name)
+                                cop_success += 1
+                        except concurrent.futures.TimeoutError:
+                            log.warning("KG %s: %s timed out after %ds, skipping",
+                                        kg_code, name, COP_TIMEOUT)
+                            cop_fail += 1
+                        except copernicus.CreditsExhaustedError:
+                            raise
+                        except Exception as e:
+                            log.debug("KG %s: %s failed: %s", kg_code, name, e)
+                            cop_fail += 1
 
-            copernicus_data = cop if cop else None
+                # Only attempt harmonics if at least one fast layer succeeded
+                if cop_success > 0:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                        try:
+                            fut = exe.submit(_fetch_harmonics)
+                            result = fut.result(timeout=HARM_TIMEOUT)
+                            if result is not None:
+                                cop["harmonics"] = result
+                                log.info("KG %s: harmonics OK", kg_code)
+                        except concurrent.futures.TimeoutError:
+                            log.warning("KG %s: harmonics timed out after %ds, skipping",
+                                        kg_code, HARM_TIMEOUT)
+                        except copernicus.CreditsExhaustedError:
+                            raise
+                        except Exception as e:
+                            log.debug("KG %s: harmonics failed: %s", kg_code, e)
+
+                # Update circuit breaker state
+                if cop_fail >= 3 and cop_success == 0:
+                    _cb["consecutive_failures"] += 1
+                    _cb["last_failure"] = _time.time()
+                    _cb["cooldown"] = min(600, 60 * (2 ** min(_cb["consecutive_failures"], 4)))  # 120s → 600s
+                    log.warning("KG %s: all Copernicus layers failed — circuit breaker count=%d, cooldown=%.0fs",
+                                kg_code, _cb["consecutive_failures"], _cb["cooldown"])
+                    # Rotate credentials for next attempt
+                    try:
+                        copernicus.rotate_credentials()
+                    except Exception:
+                        pass
+                else:
+                    _cb["consecutive_failures"] = 0  # reset on any success
+                _write_circuit_breaker(_cb)
+
+                copernicus_data = cop if cop else None
         except copernicus.CreditsExhaustedError:
             raise  # propagate to main loop for pause
         except Exception as e:

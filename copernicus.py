@@ -41,13 +41,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Credentials & configuration
 # ---------------------------------------------------------------------------
-# Credentials rotate monthly on the 1st. Keep old pair commented for reference.
+# Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
 # OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
 # OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
 # OLD (account 1, out of credits): CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
 # OLD (account 1, out of credits): CLIENT_SECRET = "<REDACTED_SECRET>"
-CLIENT_ID = "sh-8d8c685f-df36-4536-b949-666532d08414"
-CLIENT_SECRET = "<REDACTED_SECRET>"
+_CREDENTIALS = [
+    ("sh-8d8c685f-df36-4536-b949-666532d08414", "<REDACTED_SECRET>"),
+    ("sh-2ed25dbb-857d-4e99-b070-e1954a99a980", "<REDACTED_SECRET>"),
+]
+_credential_index = 0  # current credential pair
+CLIENT_ID = _CREDENTIALS[0][0]
+CLIENT_SECRET = _CREDENTIALS[0][1]
 OPENEO_URL = "openeo.dataspace.copernicus.eu"
 
 # Permanent cache survives /tmp cleanup and service restarts.
@@ -107,6 +112,20 @@ def _check_credits_error(exc: Exception) -> None:
         raise CreditsExhaustedError(msg) from exc
 
 
+def rotate_credentials() -> bool:
+    """Switch to the next credential pair. Returns True if rotated, False if exhausted all."""
+    global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
+    old_idx = _credential_index
+    _credential_index = (_credential_index + 1) % len(_CREDENTIALS)
+    if _credential_index == old_idx and len(_CREDENTIALS) == 1:
+        return False  # only one set of credentials
+    CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+    _connection = None  # force re-auth with new credentials
+    logger.info("Rotated to credential set %d/%d (client_id=%s)",
+                _credential_index + 1, len(_CREDENTIALS), CLIENT_ID[:16] + "...")
+    return _credential_index != old_idx  # True unless we wrapped all the way around
+
+
 def _get_connection() -> Any:
     """Return a cached, authenticated openEO connection."""
     global _connection
@@ -122,7 +141,7 @@ def _get_connection() -> Any:
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
     )
-    logger.info("Authenticated successfully")
+    logger.info("Authenticated successfully (client_id=%s)", CLIENT_ID[:16] + "...")
     _connection = conn
     return conn
 
@@ -263,9 +282,12 @@ def _run_datacube(
         except Exception as exc:
             _check_credits_error(exc)  # raises CreditsExhaustedError on 402
             exc_str = str(exc)
-            if "429" in exc_str and attempt == 0:
-                logger.warning("Rate limited (429), waiting 10s before retry...")
-                _time.sleep(10)
+            if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
+                logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
+                              '429' if '429' in exc_str else '503')
+                rotate_credentials()
+                _time.sleep(5)
+                # Rebuild the datacube with new connection on retry
                 continue
             # If sync fails (e.g. too large), fall back to batch
             logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
@@ -503,7 +525,7 @@ def get_ndvi_timeseries(
                 return label, None
             except Exception as exc:
                 exc_str = str(exc)
-                if "429" in exc_str and attempt < max_retries:
+                if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt < max_retries:
                     # Parse Retry-After from exception string if available
                     retry_match = _re.search(r'Retry-After[":\s]+(\d+)', exc_str, _re.IGNORECASE)
                     if retry_match:
@@ -511,9 +533,10 @@ def get_ndvi_timeseries(
                     else:
                         wait_secs = 10 * (attempt + 1)  # 10s, 20s, 30s
                     logger.warning(
-                        "NDVI %s rate limited (429), retry %d/%d in %ds...",
+                        "NDVI %s rate limited/overloaded, retry %d/%d in %ds (rotating credentials)...",
                         label, attempt + 1, max_retries, wait_secs,
                     )
+                    rotate_credentials()
                     _time.sleep(wait_secs)
                     continue
                 _check_credits_error(exc)  # raises CreditsExhaustedError on 402

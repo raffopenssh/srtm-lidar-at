@@ -91,6 +91,19 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
     y = np.array(y_list)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Break tree_loss label circularity (same fix as learned_classifier.train)
+    _circ_cols = [
+        FEATURE_KEYS.index("hansen_recent_loss_frac"),
+        FEATURE_KEYS.index("hansen_treecover2000"),
+    ]
+    tl_mask = (y == "tree_loss")
+    if tl_mask.any():
+        X[np.ix_(tl_mask, _circ_cols)] = 0.0
+
+    # Downsample dominant classes
+    from learned_classifier import _downsample
+    X, y = _downsample(X, y)
+
     classes = sorted(set(y))
     n_classes = len(classes)
 

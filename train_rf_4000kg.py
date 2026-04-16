@@ -148,6 +148,106 @@ def get_random_kgs(n: int = N_KGS) -> list[dict]:
     return selected
 
 
+def get_infrastructure_kgs(
+    n_solar: int = 20,
+    n_wind: int = 20,
+    n_substation: int = 10,
+) -> list[dict]:
+    """Find KGs containing power infrastructure (solar, wind, substation).
+
+    Queries the austria-power API for infrastructure locations, samples
+    a subset, then reverse-geocodes each to a KG via the cadastre
+    spatial lookup.  Returns KG dicts with {kg_code, kg_name, infra_target}.
+    """
+    try:
+        r = requests.get(
+            "https://austria-power.exe.xyz:8000/api/infrastructure",
+            params={"bbox": "9.5,46.3,17.2,49.0"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        features = r.json().get("features", [])
+    except Exception as e:
+        log.warning("Infrastructure KG fetch failed (power API): %s", e)
+        return []
+
+    TYPE_MAP = {
+        "solar": "solar_panel",
+        "Windmill farm": "wind_turbine",
+        "Windpower plant": "wind_turbine",
+        "windpark": "wind_turbine",
+        "substation": "substation",
+        "substation_380kv": "substation",
+        "transformer_station": "substation",
+    }
+
+    by_label: dict[str, list[tuple[float, float]]] = {}
+    for f in features:
+        t = f["properties"].get("type", "")
+        label = TYPE_MAP.get(t)
+        if not label:
+            continue
+        geom = f["geometry"]
+        try:
+            if geom["type"] == "Point":
+                lon, lat = geom["coordinates"]
+            elif geom["type"] in ("LineString", "MultiPoint"):
+                coords = geom["coordinates"]
+                lon = sum(c[0] for c in coords) / len(coords)
+                lat = sum(c[1] for c in coords) / len(coords)
+            elif geom["type"] == "Polygon":
+                coords = geom["coordinates"][0]
+                lon = sum(c[0] for c in coords) / len(coords)
+                lat = sum(c[1] for c in coords) / len(coords)
+            else:
+                continue
+        except (KeyError, IndexError, ZeroDivisionError):
+            continue
+        by_label.setdefault(label, []).append((lon, lat))
+
+    # Sample locations
+    rng = random.Random(42)
+    sampled: list[tuple[str, float, float]] = []
+    for label, n in [("solar_panel", n_solar), ("wind_turbine", n_wind),
+                     ("substation", n_substation)]:
+        pts = by_label.get(label, [])
+        chosen = rng.sample(pts, min(n, len(pts)))
+        sampled.extend((label, lon, lat) for lon, lat in chosen)
+
+    # Reverse-geocode to KGs
+    HALF = 0.005  # ~500m bbox around each point
+    kgs: dict[str, dict] = {}  # kg_code -> dict
+    for label, lon, lat in sampled:
+        try:
+            r2 = requests.get(
+                f"{CADASTRE_BASE}/spatial/kgs",
+                params={"west": lon - HALF, "south": lat - HALF,
+                        "east": lon + HALF, "north": lat + HALF},
+                timeout=15,
+            )
+            r2.raise_for_status()
+            kg_codes = r2.json().get("data", {}).get("kg_codes", [])
+            if kg_codes:
+                code = kg_codes[0]
+                if code not in kgs:
+                    kgs[code] = {
+                        "kg_code": code,
+                        "kg_name": f"infra-{label}",
+                        "infra_target": label,
+                        "infra_center": (lon, lat),
+                    }
+        except Exception:
+            pass
+
+    result = list(kgs.values())
+    log.info("Infrastructure KGs: %d (solar=%d, wind=%d, sub=%d)",
+             len(result),
+             sum(1 for k in result if k["infra_target"] == "solar_panel"),
+             sum(1 for k in result if k["infra_target"] == "wind_turbine"),
+             sum(1 for k in result if k["infra_target"] == "substation"))
+    return result
+
+
 def fetch_cadastre_layers(kg_code: str) -> dict:
     """Fetch all three cadastre layers for a KG."""
     result = {"parcels": [], "building_footprints": [], "landuse": []}
@@ -719,14 +819,24 @@ def process_one_kg(
             return [], [], stats
 
     # Limit KG size to center max_km x max_km
+    # If an infrastructure target point is provided, center on it instead
+    # of the KG centroid so the feature falls within the analysis window.
     dx_km = (east - west) * 111 * np.cos(np.radians((south + north) / 2))
     dy_km = (north - south) * 111
     if dx_km > max_km or dy_km > max_km:
-        cx, cy = (west + east) / 2, (south + north) / 2
+        infra_center = kg.get("infra_center")  # (lon, lat) or None
+        if infra_center:
+            cx, cy = infra_center
+            # Clamp to KG bbox so we don't drift outside
+            cx = max(west, min(east, cx))
+            cy = max(south, min(north, cy))
+        else:
+            cx, cy = (west + east) / 2, (south + north) / 2
         half = (max_km / 2) / 111  # approx degrees
         west, south, east, north = cx - half, cy - half, cx + half, cy + half
-        log.info("KG %s: large (%.1f x %.1f km), cropping to center %.1fkm",
-                 kg_code, dx_km, dy_km, max_km)
+        log.info("KG %s: large (%.1f x %.1f km), cropping to %.1fkm around %s",
+                 kg_code, dx_km, dy_km, max_km,
+                 "infra target" if infra_center else "center")
 
     stats["bbox"] = [west, south, east, north]
     geom_wgs = box(west, south, east, north)
@@ -1203,7 +1313,19 @@ def main():
     # Get random KGs
     log.info("Fetching KG list from cadastre API...")
     kgs = get_random_kgs(N_KGS)
-    log.info("Selected %d KGs", len(kgs))
+    log.info("Selected %d random KGs", len(kgs))
+
+    # Prepend infrastructure-targeted KGs (solar, wind, substation)
+    # These are placed first so they get processed early, boosting
+    # representation of rare classes.  Duplicates with random KGs are
+    # harmless — the checkpoint-resume logic skips already-processed KGs.
+    infra_kgs = get_infrastructure_kgs()
+    if infra_kgs:
+        existing_codes = {k["kg_code"] for k in kgs}
+        new_infra = [k for k in infra_kgs if k["kg_code"] not in existing_codes]
+        kgs = new_infra + kgs
+        log.info("Prepended %d infrastructure KGs (%d new)",
+                 len(infra_kgs), len(new_infra))
 
     # Save KG list
     kg_list_data = [{"kg_code": k["kg_code"], "kg_name": k.get("kg_name", "")} for k in kgs]

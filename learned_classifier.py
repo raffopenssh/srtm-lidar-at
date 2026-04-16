@@ -142,6 +142,49 @@ def feature_vector(feat: dict) -> np.ndarray:
     return np.array([feat.get(k, 0.0) for k in FEATURE_KEYS], dtype=np.float32)
 
 
+def _downsample(
+    X: np.ndarray,
+    y: np.ndarray,
+    cap_multiplier: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Downsample dominant classes to reduce class imbalance.
+
+    Caps each class at ``cap_multiplier * median_class_count`` samples.
+    Classes below the cap are kept intact.
+
+    Parameters
+    ----------
+    X : (N, F) feature matrix
+    y : (N,) label array
+    cap_multiplier : how many multiples of the median count to allow
+
+    Returns
+    -------
+    X_ds, y_ds : downsampled arrays
+    """
+    classes, counts = np.unique(y, return_counts=True)
+    median_count = int(np.median(counts))
+    cap = cap_multiplier * median_count
+    log.info("Downsample: median class size=%d, cap=%d (x%d)",
+             median_count, cap, cap_multiplier)
+
+    rng = np.random.RandomState(42)
+    keep_idx: list[np.ndarray] = []
+
+    for cls, cnt in zip(classes, counts):
+        idx = np.where(y == cls)[0]
+        if cnt > cap:
+            idx = rng.choice(idx, size=cap, replace=False)
+            log.info("  %s: %d -> %d (-%d)", cls, cnt, cap, cnt - cap)
+        keep_idx.append(idx)
+
+    keep = np.concatenate(keep_idx)
+    keep.sort()  # preserve original ordering
+    log.info("Downsample: %d -> %d samples (%.0f%% kept)",
+             len(y), len(keep), 100 * len(keep) / len(y))
+    return X[keep], y[keep]
+
+
 class LearnedClassifier:
     """Random Forest classifier trained on cadastre ground truth."""
 
@@ -187,6 +230,35 @@ class LearnedClassifier:
 
         # Replace NaN/inf with 0
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ------------------------------------------------------------------
+        # Break label circularity for tree_loss samples.
+        #
+        # tree_loss labels are created in train_rf_4000kg.py using
+        # hansen_recent_loss_frac and hansen_treecover2000 as the labelling
+        # criteria.  If the RF sees these same features alongside the label
+        # it just learns "hansen_recent_loss_frac > 0.15 → tree_loss" —
+        # circular, hence the inflated 99.6% OOB.  Zero out only the two
+        # criteria features for tree_loss rows so the model must learn from
+        # independent signals (height drop, NDVI change, spectral, etc.).
+        # Other Hansen features (loss_frac, loss_3yr_frac, gain_frac,
+        # current_forest_frac) are NOT zeroed — they are independent.
+        # ------------------------------------------------------------------
+        _CIRCULAR_HANSEN_COLS = [
+            FEATURE_KEYS.index("hansen_recent_loss_frac"),
+            FEATURE_KEYS.index("hansen_treecover2000"),
+        ]
+        tree_loss_mask = (y == "tree_loss")
+        n_tl = int(tree_loss_mask.sum())
+        if n_tl > 0:
+            X[np.ix_(tree_loss_mask, _CIRCULAR_HANSEN_COLS)] = 0.0
+            log.info(
+                "Label-circularity fix: zeroed hansen_recent_loss_frac & "
+                "hansen_treecover2000 for %d tree_loss samples", n_tl,
+            )
+
+        # Downsample dominant classes to reduce imbalance
+        X, y = _downsample(X, y)
 
         log.info("Training RF: %d samples, %d features, %d classes",
                  len(X), X.shape[1], len(set(y)))

@@ -142,7 +142,6 @@ function renderCards(d) {
   const running = d.running;
   const m = d.model || {};
   const mon = d.monitor || {};
-  const pct_done = d.current_kg ? (d.current_kg.index / d.current_kg.total * 100).toFixed(1) : 0;
   const statusCls = mon.last_status ? 'status-' + mon.last_status : '';
 
   let html = '';
@@ -153,12 +152,22 @@ function renderCards(d) {
     <div class="detail">${d.service_state || '—'}${d.ram_mb ? ' · ' + d.ram_mb + ' MB' : ''}</div>
   </div>`;
 
-  // Progress
+  // Progress — use n_checkpoints (successful KGs) like the main app does
+  const nDone = d.n_checkpoints || 0;
+  const nTotal = d.current_kg ? d.current_kg.total : 4000;
+  const nFail = d.n_failed_kgs || 0;
+  const failPart = nFail > 0 ? `; ${nFail} fail` : '';
+  const toNext = d.to_next_model;
+  const cpPart = (typeof toNext === 'number' && toNext > 0) ? `; ${toNext} to cp ${d.next_model_checkpoint}` : '';
+  const pctDoneReal = nTotal > 0 ? (nDone / nTotal * 100).toFixed(1) : 0;
+  const kgInfo = d.current_kg ? d.current_kg.kg_name + ' (' + d.current_kg.kg_code + ')' : '—';
+  const stepInfo = d.current_step ? d.current_step : '';
   html += `<div class="card">
     <div class="label">Progress</div>
-    <div class="value">${d.progress || '—'}</div>
-    <div class="bar"><div class="bar-fill" style="width:${pct_done}%"></div></div>
-    <div class="detail">${d.current_kg ? d.current_kg.kg_name + ' (' + d.current_kg.kg_code + ')' : '—'}</div>
+    <div class="value">${nDone}/${nTotal}</div>
+    <div class="bar"><div class="bar-fill" style="width:${pctDoneReal}%"></div></div>
+    <div class="detail">${kgInfo}${failPart}${cpPart}</div>
+    ${stepInfo ? '<div class="detail" style="margin-top:4px;font-size:10px;opacity:0.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + stepInfo + '</div>' : ''}
   </div>`;
 
   // Current OOB

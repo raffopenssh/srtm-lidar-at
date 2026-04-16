@@ -434,7 +434,8 @@ function renderCurveTable(curve) {
     if (hasSeeds) {
       html += `<td style="color:var(--dim);font-size:11px">${spread > 0 ? '\u00b1' + (spread/2).toFixed(2) + '%' : '\u2014'}</td>`;
       const target = r.n_kgs <= 30 ? 5 : r.n_kgs <= 60 ? 3 : 1;
-      html += `<td style="color:var(--dim);font-size:11px">${seeds}/${target}</td>`;
+      const denom = seeds >= target ? seeds : target;
+      html += `<td style="color:var(--dim);font-size:11px">${seeds}/${denom}</td>`;
     }
     html += `<td><span class="annotation">${ann}</span></td></tr>`;
 

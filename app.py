@@ -618,27 +618,27 @@ def curve_eval_status():
     running = _is_curve_eval_running()
     info = {'running': running}
     if running:
-        # Read CSV to figure out progress
+        # Read CSV to figure out progress (adaptive seed count)
         try:
             import csv
             from pathlib import Path
+            from evaluate_checkpoints import seeds_for_n_kgs
             csv_path = Path('data/oob_curve.csv')
             n_ckpt = len(list(Path('rf_training_data/checkpoints').glob('kg_*.npz')))
             steps = list(range(5, n_ckpt + 1, 5))
-            total_combos = len(steps) * 5  # 5 seeds
+            all_combos = [(n, s) for n in steps for s in seeds_for_n_kgs(n)]
             existing = set()
             if csv_path.exists():
                 with open(csv_path) as f:
                     for r in csv.DictReader(f):
                         existing.add((int(r['n_kgs']), int(r.get('seed', 0))))
-            # Build work list matching eval script order
-            work = [(n, s) for n in steps for s in range(5) if (n, s) not in existing]
-            done_combos = total_combos - len(work)
+            work = [(n, s) for n, s in all_combos if (n, s) not in existing]
+            done_combos = len(all_combos) - len(work)
             if work:
                 info['current_kgs'] = work[0][0]
                 info['current_seed'] = work[0][1]
             info['done'] = done_combos
-            info['total'] = total_combos
+            info['total'] = len(all_combos)
         except Exception:
             pass
     return jsonify(info)

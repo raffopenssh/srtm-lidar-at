@@ -433,7 +433,8 @@ function renderCurveTable(curve) {
     html += `<td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(med * 100).toFixed(2)}%</td>`;
     if (hasSeeds) {
       html += `<td style="color:var(--dim);font-size:11px">${spread > 0 ? '\u00b1' + (spread/2).toFixed(2) + '%' : '\u2014'}</td>`;
-      html += `<td style="color:var(--dim);font-size:11px">${seeds}/5</td>`;
+      const target = r.n_kgs <= 30 ? 5 : r.n_kgs <= 60 ? 3 : 1;
+      html += `<td style="color:var(--dim);font-size:11px">${seeds}/${target}</td>`;
     }
     html += `<td><span class="annotation">${ann}</span></td></tr>`;
 
@@ -514,7 +515,7 @@ function setEvalState(data) {
   if (running) {
     let label = 'evaluating';
     if (data.total) {
-      if (data.current_kgs) label += ` ${data.current_kgs} KGs (seed ${+data.current_seed+1}/5)`;
+      if (data.current_kgs) { const t = data.current_kgs <= 30 ? 5 : data.current_kgs <= 60 ? 3 : 1; label += ` ${data.current_kgs} KGs (seed ${+data.current_seed+1}/${t})`; }
       else label += ` ${data.done}/${data.total}`;
     }
     el.textContent = label; el.style.color = 'var(--green)';

@@ -35,8 +35,16 @@ LIVE_META = Path("/tmp/learned_classifier/rf_meta.json")
 LIVE_MODEL = Path("/tmp/learned_classifier/rf_model.joblib")
 CURVE_LOCKFILE = Path("/tmp/rf_curve_eval.lock")
 DETAIL_JSONL = DATA_DIR / "oob_curve_detail.jsonl"
-N_SEEDS = 5
+N_SEEDS = 5  # max seeds (used for early KGs)
 SEEDS = list(range(N_SEEDS))
+
+def seeds_for_n_kgs(n_kgs):
+    """Fewer seeds as spread narrows with more data."""
+    if n_kgs <= 30:
+        return list(range(5))
+    if n_kgs <= 60:
+        return list(range(3))
+    return [0]
 
 
 def load_checkpoints():
@@ -232,16 +240,15 @@ def _run_curve_locked(step=5):
 
     steps = list(range(step, n_total + 1, step))
 
-    # Build work list: all (step, seed) combos not yet done
+    # Build work list: adaptive seed count per step
     work = []
     for n in steps:
-        for seed in SEEDS:
+        for seed in seeds_for_n_kgs(n):
             if (n, seed) not in existing:
                 work.append((n, seed))
 
     if not work:
-        log.info("All %d steps × %d seeds already evaluated, nothing to do",
-                 len(steps), N_SEEDS)
+        log.info("All steps already evaluated, nothing to do")
         return []
 
     log.info("%d existing, %d new (step, seed) combos to evaluate",

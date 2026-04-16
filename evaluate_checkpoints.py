@@ -47,6 +47,7 @@ def seeds_for_n_kgs(n_kgs):
     return [0]
 
 
+
 def load_checkpoints():
     """Load all checkpoint files, return list of (kg_code, features, labels)."""
     checkpoints = []
@@ -380,7 +381,13 @@ def monitor():
     # Early checkpoints with fewer classes have inflated OOB; don't compare.
     mature_n_classes = state.get("mature_n_classes", n_classes)
     if n_classes > mature_n_classes:
+        # Class count grew — previous peak was with fewer classes (inflated OOB).
+        # Reset mature peak so we only compare like-for-like.
+        log.info("Mature class count grew %d → %d, resetting mature peak",
+                 mature_n_classes, n_classes)
         mature_n_classes = n_classes
+        state["mature_peak_oob"] = 0.0
+        state["mature_peak_n_kgs"] = 0
 
     # Compare only against same-class-count history
     mature_oobs = [float(r["oob"]) for r in existing_rows[-10:]

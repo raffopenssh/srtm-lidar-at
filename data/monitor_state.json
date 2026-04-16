@@ -1,18 +1,18 @@
 {
-  "best_oob": 0.7904688651732206,
-  "best_n_kgs": 10,
+  "best_oob": 0.752703,
+  "best_n_kgs": 90,
   "peak_oob": 0.7904688651732206,
   "peak_n_kgs": 10,
-  "mature_peak_oob": 0.7904688651732206,
-  "mature_peak_n_kgs": 10,
-  "mature_n_classes": 19,
+  "mature_peak_oob": 0.752703,
+  "mature_peak_n_kgs": 90,
+  "mature_n_classes": 20,
   "consecutive_decline": 1,
   "plateau_count": 0,
-  "last_oob": 0.7842289465083342,
-  "last_n_kgs": 50,
-  "last_n_classes": 19,
+  "last_oob": 0.7376620379274532,
+  "last_n_kgs": 120,
+  "last_n_classes": 20,
   "last_status": "declining",
-  "kgs_since_peak": 40,
+  "kgs_since_peak": 30,
   "should_stop": false,
-  "updated_at": "2026-04-15T13:15:01Z"
+  "updated_at": "2026-04-16T03:25:01Z"
 }

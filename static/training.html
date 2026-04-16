@@ -121,6 +121,23 @@ let countdown = 15;
 function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
 function pct(v, d=2) { return v != null ? (v * 100).toFixed(d) + '%' : '—'; }
 
+// Best OOB from checkpoint curve (mature class count only)
+let _bestFromCurve = {oob: null, kgs: null};
+function computeBestFromCurve(curve) {
+  if (!curve || !curve.length) return;
+  const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
+  let best = {oob: null, kgs: null};
+  curve.forEach(r => {
+    if ((r.n_classes || 0) < maxCls) return;
+    const med = r.oob_median ?? r.oob ?? 0;
+    if (best.oob === null || med > best.oob) {
+      best.oob = med;
+      best.kgs = r.n_kgs;
+    }
+  });
+  _bestFromCurve = best;
+}
+
 function renderCards(d) {
   const running = d.running;
   const m = d.model || {};
@@ -151,13 +168,15 @@ function renderCards(d) {
     <div class="detail">${fmt(m.n_train)} samples · ${m.n_classes || '—'} classes</div>
   </div>`;
 
-  // Best OOB (mature)
-  const bestOob = mon.mature_peak_oob || mon.best_oob;
-  const bestKgs = mon.mature_peak_n_kgs || mon.best_n_kgs;
+  // Best OOB (mature) — derived from checkpoint curve, not monitor state
+  const bestCurve = _bestFromCurve;
+  const bestOob = bestCurve.oob || mon.mature_peak_oob || mon.best_oob;
+  const bestKgs = bestCurve.kgs || mon.mature_peak_n_kgs || mon.best_n_kgs;
+  const kgsSincePeak = bestKgs && mon.last_n_kgs ? mon.last_n_kgs - bestKgs : mon.kgs_since_peak;
   html += `<div class="card">
     <div class="label">Best OOB (mature)</div>
     <div class="value status-improving">${bestOob ? (bestOob * 100).toFixed(2) + '%' : '—'}</div>
-    <div class="detail">at ${bestKgs || '—'} KGs${mon.kgs_since_peak ? ' · ' + mon.kgs_since_peak + ' KGs ago' : ''}</div>
+    <div class="detail">at ${bestKgs || '—'} KGs${kgsSincePeak ? ' · ' + kgsSincePeak + ' KGs ago' : ''}</div>
   </div>`;
 
   // Monitor status
@@ -485,6 +504,7 @@ async function poll() {
   try {
     const r = await fetch(API);
     const d = await r.json();
+    computeBestFromCurve(d.oob_curve);
     renderCards(d);
     renderChart(d.oob_curve);
     // Store curve_detail before rendering table

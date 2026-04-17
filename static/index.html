@@ -333,6 +333,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div class="cb-row">
         <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
         <label><input id="include_hansen" type="checkbox"> Hansen</label>
+        <label><input id="include_infra" type="checkbox" checked> Infra</label>
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin:4px 0 2px">
@@ -1654,6 +1655,7 @@ async function loadRasterOverlay(typeFilter, shareId){
   if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
   if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
+  if(document.getElementById('include_infra').checked)url+='&include_infra=true';
   const topNC=document.getElementById('top_n_classes').value;
   if(topNC)url+='&top_n_classes='+topNC;
   if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
@@ -1742,6 +1744,7 @@ function getShareState(){
     copernicus:document.getElementById('include_copernicus').checked,
     cadastre:document.getElementById('include_cadastre').checked,
     hansen:document.getElementById('include_hansen').checked,
+    infra:document.getElementById('include_infra').checked,
     top_n_classes:document.getElementById('top_n_classes').value,
     top_n_objects:document.getElementById('top_n_objects').value,
     min_height_m:document.getElementById('min_height_m').value,
@@ -1789,6 +1792,7 @@ function restoreShareState(s){
   if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
   if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
+  if(s.infra!==undefined) document.getElementById('include_infra').checked=s.infra;
   if(s.top_n_classes) document.getElementById('top_n_classes').value=s.top_n_classes;
   if(s.top_n_objects) document.getElementById('top_n_objects').value=s.top_n_objects;
   if(s.min_height_m) document.getElementById('min_height_m').value=s.min_height_m;
@@ -2714,6 +2718,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
   if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
+  if(document.getElementById('include_infra').checked)params.set('include_infra','true');
 
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);

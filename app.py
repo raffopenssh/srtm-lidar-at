@@ -852,7 +852,7 @@ def _get_params():
                 'object_types', 'resolution', 'format',
                 'include_ortho', 'include_temporal',
                 'include_copernicus', 'include_cadastre',
-                'include_hansen', 'color_mode', 'types',
+                'include_hansen', 'include_infra', 'color_mode', 'types',
                 'ortho_year', 'min_object_size',
                 'felz_scale', 'rag_threshold', 'groups',
                 'include_dtm', 'include_dsm', 'include_segments', 'include_segments_vector',
@@ -1361,6 +1361,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
+    include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
     type_filter = params.get('types', None)
     if isinstance(type_filter, str):
         type_filter = [t.strip() for t in type_filter.split(',')]
@@ -1438,17 +1439,18 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
         # Infrastructure lookup (for rule-based solar/wind/substation/mast)
         _infra_lookup = None
-        try:
-            from infrastructure_lookup import InfrastructureLookup
-            from pyproj import Transformer as _Tx
-            _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-            bounds_3035 = geom.bounds  # (minx, miny, maxx, maxy) in EPSG:3035
-            w4, s4 = _tx.transform(bounds_3035[0], bounds_3035[1])
-            e4, n4 = _tx.transform(bounds_3035[2], bounds_3035[3])
-            _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
-            log.info('Infrastructure lookup: %d features', len(_infra_lookup))
-        except Exception as _ie:
-            log.warning('Infrastructure lookup failed: %s', _ie)
+        if include_infra:
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                from pyproj import Transformer as _Tx
+                _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                bounds_3035 = geom.bounds  # (minx, miny, maxx, maxy) in EPSG:3035
+                w4, s4 = _tx.transform(bounds_3035[0], bounds_3035[1])
+                e4, n4 = _tx.transform(bounds_3035[2], bounds_3035[3])
+                _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
+                log.info('Infrastructure lookup: %d features', len(_infra_lookup))
+            except Exception as _ie:
+                log.warning('Infrastructure lookup failed: %s', _ie)
 
         # Run segmentation pipeline
         _prog('Segmenting & classifying', 'watershed + classification')
@@ -1485,7 +1487,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
                 log.warning("Hansen calibration failed: %s", e)
 
         # Populate seg_cache so overlay/gpkg endpoints can reuse results
-        seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
+        seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_temporal"
         _seg_cache.update({
             "labels": labels, "objects": objects,
             "mask": data['mask'], "transform": data['transform'],
@@ -1609,6 +1611,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "include_copernicus": include_copernicus,
             "include_cadastre": include_cadastre,
             "include_hansen": include_hansen,
+            "include_infra": include_infra,
             "processing_time_s": round(time.time() - t0, 2),
             **_rf_model_meta(),
         },
@@ -1918,6 +1921,7 @@ def segment_overlay():
         include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
+        include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
         type_filter_str = params.get('types', None)
         type_filter = None
         if type_filter_str:
@@ -1942,7 +1946,7 @@ def segment_overlay():
         _validate_area(geom_3035)
 
         # Build a cache key from geometry bounds + dataset + analysis options
-        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_temporal"
+        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_temporal"
 
         # When share_id is provided, try to find ANY cached labels for this geometry
         # (regardless of analysis options) — we only need the pixel labels, not the types
@@ -2050,16 +2054,17 @@ def segment_overlay():
             hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
         _infra_lookup = None
-        try:
-            from infrastructure_lookup import InfrastructureLookup
-            from pyproj import Transformer as _Tx
-            _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-            b = geom.bounds
-            w4, s4 = _tx.transform(b[0], b[1])
-            e4, n4 = _tx.transform(b[2], b[3])
-            _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
-        except Exception:
-            pass
+        if include_infra:
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                from pyproj import Transformer as _Tx
+                _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                b = geom.bounds
+                w4, s4 = _tx.transform(b[0], b[1])
+                e4, n4 = _tx.transform(b[2], b[3])
+                _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
+            except Exception:
+                pass
 
         obs_year = ti.dataset_to_year(dataset)
         result = seg.segment_and_classify(
@@ -2676,16 +2681,18 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                     if nir_arr is not None:
                         spectral["nir"] = nir_arr.astype(np.float32)
                 _il = None
-                try:
-                    from infrastructure_lookup import InfrastructureLookup
-                    from pyproj import Transformer as _Tx2
-                    _tx2 = _Tx2.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-                    _b = geom_3035.bounds
-                    _w4, _s4 = _tx2.transform(_b[0], _b[1])
-                    _e4, _n4 = _tx2.transform(_b[2], _b[3])
-                    _il = InfrastructureLookup.for_bbox(_w4, _s4, _e4, _n4)
-                except Exception:
-                    pass
+                _incl_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
+                if _incl_infra:
+                    try:
+                        from infrastructure_lookup import InfrastructureLookup
+                        from pyproj import Transformer as _Tx2
+                        _tx2 = _Tx2.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                        _b = geom_3035.bounds
+                        _w4, _s4 = _tx2.transform(_b[0], _b[1])
+                        _e4, _n4 = _tx2.transform(_b[2], _b[3])
+                        _il = InfrastructureLookup.for_bbox(_w4, _s4, _e4, _n4)
+                    except Exception:
+                        pass
                 result = seg.segment_and_classify(
                     dtm, dsm, mask, tf, spectral=spectral,
                     observation_year=ti.dataset_to_year(dataset),
@@ -2998,16 +3005,18 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
             except Exception:
                 pass
             _il2 = None
-            try:
-                from infrastructure_lookup import InfrastructureLookup
-                from pyproj import Transformer as _Tx3
-                _tx3 = _Tx3.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-                _b2 = geom_3035.bounds
-                _w42, _s42 = _tx3.transform(_b2[0], _b2[1])
-                _e42, _n42 = _tx3.transform(_b2[2], _b2[3])
-                _il2 = InfrastructureLookup.for_bbox(_w42, _s42, _e42, _n42)
-            except Exception:
-                pass
+            _incl_infra2 = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
+            if _incl_infra2:
+                try:
+                    from infrastructure_lookup import InfrastructureLookup
+                    from pyproj import Transformer as _Tx3
+                    _tx3 = _Tx3.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                    _b2 = geom_3035.bounds
+                    _w42, _s42 = _tx3.transform(_b2[0], _b2[1])
+                    _e42, _n42 = _tx3.transform(_b2[2], _b2[3])
+                    _il2 = InfrastructureLookup.for_bbox(_w42, _s42, _e42, _n42)
+                except Exception:
+                    pass
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], mask, tf, spectral=spectral,
                 observation_year=ti.dataset_to_year(dataset),
@@ -4075,16 +4084,18 @@ def train_classifier():
 
         # Infrastructure lookup
         _il3 = None
-        try:
-            from infrastructure_lookup import InfrastructureLookup
-            from pyproj import Transformer as _Tx4
-            _tx4 = _Tx4.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-            _b3 = geom.bounds
-            _w43, _s43 = _tx4.transform(_b3[0], _b3[1])
-            _e43, _n43 = _tx4.transform(_b3[2], _b3[3])
-            _il3 = InfrastructureLookup.for_bbox(_w43, _s43, _e43, _n43)
-        except Exception:
-            pass
+        include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
+        if include_infra:
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                from pyproj import Transformer as _Tx4
+                _tx4 = _Tx4.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                _b3 = geom.bounds
+                _w43, _s43 = _tx4.transform(_b3[0], _b3[1])
+                _e43, _n43 = _tx4.transform(_b3[2], _b3[3])
+                _il3 = InfrastructureLookup.for_bbox(_w43, _s43, _e43, _n43)
+            except Exception:
+                pass
 
         # Segment (feature extraction) — pass ALL data sources
         result = oc.segment_and_classify(
@@ -4367,6 +4378,7 @@ def onestop():
       include_copernicus=false               Include Sentinel-2/SAR
       include_cadastre=false                 Include cadastre
       include_hansen=false                   Include Hansen forest change
+      include_infra=true                     Include infrastructure spatial match
       types=tree,road                        Object type filter
       height_min=X                           Height filter: >= X metres
       height_max=X                           Height filter: <= X metres
@@ -4422,7 +4434,7 @@ def onestop():
         # Build params
         params = {}
         for key in ('dataset', 'min_object_size', 'include_ortho', 'include_temporal',
-                    'include_copernicus', 'include_cadastre', 'include_hansen',
+                    'include_copernicus', 'include_cadastre', 'include_hansen', 'include_infra',
                     'types', 'groups', 'felz_scale', 'rag_threshold',
                     'height_min', 'height_max', 'height_op',
                     'top_n_classes', 'top_n_objects', 'min_height_m'):

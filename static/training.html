@@ -129,7 +129,7 @@ function computeBestFromCurve(curve) {
   let best = {oob: null, composite: null, kgs: null, mean_cls: null, min_cls: null};
   curve.forEach(r => {
     if ((r.n_classes || 0) < maxCls) return;
-    const comp = r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0;
+    const comp = r.composite_median ?? r.oob_median ?? r.oob ?? 0;
     if (best.composite === null || comp > best.composite) {
       best.composite = comp;
       best.oob = r.oob_median ?? r.oob ?? 0;
@@ -466,10 +466,10 @@ function renderCurveTable(curve) {
   if (!curve || curve.length === 0) return;
   const tbody = document.querySelector('#curveTable tbody');
   const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
-  const composites = curve.map(r => r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0);
+  const composites = curve.map(r => r.composite_median ?? r.oob_median ?? r.oob ?? 0);
   const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
-  // BEST = highest composite at max class count
-  const matureComps = curve.map(r => (r.n_classes || 0) >= maxCls ? (r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0) : -1);
+  // BEST = highest composite median at max class count
+  const matureComps = curve.map(r => (r.n_classes || 0) >= maxCls ? (r.composite_median ?? r.oob_median ?? r.oob ?? 0) : -1);
   const bestComp = Math.max(...matureComps);
   const halfIdx = Math.floor(curve.length * 0.3);
   const secondHalf = composites.slice(halfIdx);

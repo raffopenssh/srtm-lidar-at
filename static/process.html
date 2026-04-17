@@ -342,6 +342,8 @@ const POLL = 5;
 let cd = POLL;
 let map, mapMarkers;
 let tileDotsLayer;
+let copLayer, hanLayer;
+let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
 let kgTimerInterval = null;
@@ -380,7 +382,15 @@ function initMap() {
   map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
+  copLayer = L.layerGroup().addTo(map);
+  hanLayer = L.layerGroup().addTo(map);
   tileDotsLayer = L.layerGroup().addTo(map);
+  L.control.layers(null, {
+    'Tile dots': tileDotsLayer,
+    'Copernicus tiles (0.1°)': copLayer,
+    'Hansen tiles (0.5°)': hanLayer,
+  }, {collapsed: true, position: 'topright'}).addTo(map);
+  fetchTileOverlays();
 }
 
 function updateMap(d) {
@@ -423,7 +433,7 @@ function updateTileDots(d) {
     } else {
       col = '#484f58'; opacity = 0.5; // queued / unknown
     }
-    const opts = { radius: 2, fillColor: col, fillOpacity: opacity,
+    const opts = { radius: 1.5, fillColor: col, fillOpacity: opacity,
                    stroke: false };
     opts.className = cls ? 'tile-dot ' + cls : 'tile-dot';
     const m = L.circleMarker([t.lat, t.lng], opts);
@@ -791,6 +801,37 @@ async function retryKg(code) {
   } catch(e) { console.error(e); }
 }
 
+// ── Cache Tile Overlays ─────────────────────────────────────────
+async function fetchTileOverlays() {
+  lastTileFetch = Date.now();
+  try {
+    const r = await fetch('/api/v1/processing/tiles');
+    if (!r.ok) return;
+    renderTileOverlays(await r.json());
+  } catch(e) { console.error('tiles:', e); }
+}
+function renderTileOverlays(d) {
+  if (!map) return;
+  copLayer.clearLayers();
+  (d.copernicus || []).forEach(t => {
+    const bounds = [[t.s, t.w], [t.n, t.e]];
+    const ev = t.status === 'evicted';
+    copLayer.addLayer(L.rectangle(bounds, {
+      color: ev ? '#f85149' : '#58a6ff', weight: ev ? 0.8 : 1,
+      fillOpacity: 0, interactive: false, dashArray: ev ? '4 3' : null,
+    }));
+  });
+  hanLayer.clearLayers();
+  (d.hansen || []).forEach(t => {
+    const bounds = [[t.s, t.w], [t.n, t.e]];
+    const ev = t.status === 'evicted';
+    hanLayer.addLayer(L.rectangle(bounds, {
+      color: ev ? '#d29922' : '#3fb950', weight: ev ? 0.8 : 1.5,
+      fillOpacity: 0, interactive: false, dashArray: ev ? '6 4' : null,
+    }));
+  });
+}
+
 // ── Zenodo Manifest ─────────────────────────────────────────────
 let lastManFetch = 0;
 async function fetchManifest() {
@@ -841,7 +882,7 @@ async function poll() {
     updateTileDots(d);
     updateLastKg(d);
     // Refresh tile overlays every 10s
-
+    if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     const commitHash = d.git_commit || '';
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString()

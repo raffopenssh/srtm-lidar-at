@@ -53,7 +53,7 @@ VERSION = "v1"
 DATA_DIR = Path("data/austria_processor")
 MANIFEST_PATH = DATA_DIR / "zenodo_manifest.json"
 JSON_DIR = DATA_DIR / "json"
-GPKG_DIR = Path("/tmp/austria_processor/gpkg")
+GPKG_DIR = DATA_DIR / "gpkg"  # persistent storage — survives /tmp cleanup
 LOG_DIR = DATA_DIR / "logs"
 PROGRESS_FILE = DATA_DIR / "progress.json"
 KG_LIST_FILE = DATA_DIR / "kg_list.json"
@@ -62,10 +62,10 @@ IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 
-MAX_KG_PIXELS = 15_000_000
+MAX_KG_PIXELS = 4_000_000
 KG_TIMEOUT_SECONDS = 30 * 60
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
-MAX_KG_AREA_KM = 3.0  # crop KG bbox if wider
+MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 
 # Tile caches — initialised lazily in subprocess
 _cop_cache = None
@@ -172,10 +172,12 @@ class ProgressTracker:
                 "step": step, "started_at": datetime.now(timezone.utc).isoformat(),
             }
 
-    def set_step(self, step: str):
+    def set_step(self, step: str, detail: str = ""):
         with self._lock:
             if self._state["current_kg"]:
                 self._state["current_kg"]["step"] = step
+                if detail:
+                    self._state["current_kg"]["step_detail"] = detail
 
     def add_log(self, level: str, msg: str, kg: str = ""):
         with self._lock:
@@ -768,9 +770,278 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
 # GPKG builders
 # ---------------------------------------------------------------------------
 
+SEGMENT_COLORS = {
+    "tree":         (0, 100, 0, 180),
+    "shrub":        (34, 139, 34, 180),
+    "grass":        (124, 252, 0, 150),
+    "hedge":        (46, 139, 87, 170),
+    "water":        (30, 144, 255, 180),
+    "roof":         (220, 20, 60, 200),
+    "greenhouse":   (255, 105, 180, 180),
+    "solar_panel":  (65, 105, 225, 200),
+    "fence":        (160, 82, 45, 170),
+    "wall":         (139, 69, 19, 170),
+    "mast":         (64, 64, 64, 200),
+    "wind_turbine": (21, 101, 192, 200),
+    "substation":   (255, 111, 0, 200),
+    "road":         (128, 128, 128, 160),
+    "path":         (169, 169, 169, 150),
+    "parking":      (105, 105, 105, 160),
+    "bridge":       (112, 128, 144, 170),
+    "crop":         (218, 165, 32, 160),
+    "orchard":      (107, 142, 35, 170),
+    "vineyard":     (147, 112, 219, 170),
+    "garden":       (60, 179, 113, 160),
+    "bare_soil":    (210, 180, 140, 140),
+    "rock":         (139, 134, 130, 160),
+    "excavation":   (139, 0, 0, 200),
+    "fill":         (255, 140, 0, 200),
+    "tree_loss":    (255, 0, 255, 200),
+    "construction": (255, 69, 0, 200),
+}
+
+
+def _height_class(h):
+    """Classify height (m) into a forestry-relevant height class string."""
+    if h is None or h < 0.5:
+        return 'ground'
+    if h < 2:
+        return 'low (<2m)'
+    if h < 5:
+        return 'shrub (2-5m)'
+    if h < 10:
+        return 'young (5-10m)'
+    if h < 15:
+        return 'pole (10-15m)'
+    if h < 20:
+        return 'mid (15-20m)'
+    if h < 25:
+        return 'mature (20-25m)'
+    if h < 30:
+        return 'tall (25-30m)'
+    return 'emergent (30m+)'
+
+
+def _viridis_rgb(t):
+    """Return (R,G,B) for t in [0,1] on the viridis scale."""
+    VIRIDIS = [
+        (68,1,84),(72,35,116),(64,67,135),(52,94,141),(41,120,142),
+        (32,144,140),(34,167,132),(68,190,112),(121,209,81),(189,222,38),(253,231,37)
+    ]
+    t = max(0.0, min(1.0, t))
+    idx = t * (len(VIRIDIS) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(VIRIDIS) - 1)
+    f = idx - lo
+    return tuple(int(VIRIDIS[lo][c] + f * (VIRIDIS[hi][c] - VIRIDIS[lo][c])) for c in range(3))
+
+
+def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
+                                   color_mode: str = 'type'):
+    """Write a QGIS-compatible layer_styles table for auto-rendering."""
+    import sqlite3
+    color_field = 'color_height' if color_mode == 'height' else 'color'
+    qml = (
+        '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+        '<qgis version="3.34">'
+        '<renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0">'
+        '<symbols>'
+        '<symbol type="fill" name="0" clip_to_extent="1" alpha="0.7">'
+        '<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
+        '<Option type="Map">'
+        '<Option type="QString" value="solid" name="style"/>'
+        '<Option type="QString" value="0.35,0.35,0.35,255,rgb:0,0,0,1" name="outline_color"/>'
+        '<Option type="QString" value="0.2" name="outline_width"/>'
+        '</Option>'
+        f'<data_defined_properties><Property><Option type="Map">'
+        f'<Option type="Map" name="properties"><Option type="Map" name="fillColor">'
+        f'<Option type="bool" value="true" name="active"/>'
+        f'<Option type="QString" value="&quot;{color_field}&quot;" name="expression"/>'
+        f'<Option type="int" value="3" name="type"/>'
+        f'</Option></Option></Option></Property></data_defined_properties>'
+        '</layer></symbol></symbols></renderer-v2></qgis>'
+    )
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+        conn.execute(
+            'INSERT INTO layer_styles '
+            '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+            'VALUES (?, ?, ?, ?, 1, ?)',
+            (layer_name, 'geom', f'Segment {color_mode}', qml,
+             f'Auto-generated colour-by-{color_mode} style'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
+                           objects: list, mask: np.ndarray,
+                           transform, layer_name: str = 'segments',
+                           obs_year: int = 0):
+    """Write vectorised segment polygons with full attributes to a GPKG.
+
+    Includes all SegmentedObject attributes: height, shape, spectral,
+    temporal change, texture, SAR, harmonics, phenology, and
+    observation period metadata.
+    """
+    from rasterio.features import shapes as rasterize_shapes
+    import fiona
+    from fiona.crs import from_epsg
+
+    obj_map = {o.obj_id: o for o in objects}
+    label_int = labels.astype(np.int32)
+
+    schema = {
+        'geometry': 'Polygon',
+        'properties': [
+            # Identity
+            ('id', 'int'),
+            ('type', 'str'),
+            ('type_code', 'int'),
+            ('group_type', 'str'),
+            ('height_class', 'str'),
+            # Geometry
+            ('area_sqm', 'float'),
+            ('perimeter_m', 'float'),
+            ('compactness', 'float'),
+            ('elongation', 'float'),
+            ('solidity', 'float'),
+            ('extent', 'float'),
+            # Height
+            ('height_max_m', 'float'),
+            ('height_mean_m', 'float'),
+            ('height_p90_m', 'float'),
+            ('height_std_m', 'float'),
+            # Surface
+            ('slope_mean_deg', 'float'),
+            ('roughness', 'float'),
+            ('dsm_edge_strength', 'float'),
+            # Spectral
+            ('ndvi_mean', 'float'),
+            ('ndvi_std', 'float'),
+            ('ndvi_fused', 'float'),
+            ('brightness_mean', 'float'),
+            ('nir_mean', 'float'),
+            # Temporal change
+            ('height_change_m', 'float'),
+            ('dtm_change_m', 'float'),
+            ('temporal_stability', 'float'),
+            ('volume_change_m3', 'float'),
+            ('volume_change_abs_m3', 'float'),
+            ('dtm_change_max_m', 'float'),
+            # Texture (GLCM)
+            ('glcm_entropy', 'float'),
+            ('glcm_homogeneity', 'float'),
+            ('texture_complexity', 'float'),
+            # SAR
+            ('sar_vv', 'float'),
+            ('sar_vh', 'float'),
+            # Phenology
+            ('harm_amplitude', 'float'),
+            ('harm_phase', 'float'),
+            ('phenology_class', 'str'),
+            # Classification
+            ('confidence', 'float'),
+            ('is_manmade', 'int'),
+            # Rendering
+            ('color', 'str'),
+            ('color_height', 'str'),
+            # Observation period
+            ('obs_year', 'int'),
+        ],
+    }
+    with fiona.open(gpkg_path, 'w', driver='GPKG', layer=layer_name,
+                    schema=schema, crs=from_epsg(3035)) as dst:
+        written = 0
+        for geom_dict, val in rasterize_shapes(
+            label_int, mask=mask, transform=transform, connectivity=4,
+        ):
+            oid = int(val)
+            obj = obj_map.get(oid)
+            if obj is None:
+                continue
+            tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+            hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+            hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+            hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+            dst.write({
+                'geometry': geom_dict,
+                'properties': {
+                    'id': oid,
+                    'type': obj.obj_type,
+                    'type_code': obj.type_code,
+                    'group_type': obj.group_type or '',
+                    'height_class': _height_class(obj.height_max),
+                    'area_sqm': round(obj.area_sqm, 1),
+                    'perimeter_m': round(obj.perimeter_m, 1),
+                    'compactness': round(obj.compactness, 3),
+                    'elongation': round(obj.elongation, 2),
+                    'solidity': round(obj.solidity, 3),
+                    'extent': round(obj.extent, 3),
+                    'height_max_m': round(obj.height_max, 2),
+                    'height_mean_m': round(obj.height_mean, 2),
+                    'height_p90_m': round(obj.height_p90, 2),
+                    'height_std_m': round(obj.height_std, 2),
+                    'slope_mean_deg': round(obj.slope_mean, 1),
+                    'roughness': round(obj.roughness, 3),
+                    'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'ndvi_mean': round(obj.ndvi_mean, 4),
+                    'ndvi_std': round(obj.ndvi_std, 4),
+                    'ndvi_fused': round(obj.ndvi_fused, 4),
+                    'brightness_mean': round(obj.brightness_mean, 1),
+                    'nir_mean': round(obj.nir_mean, 1),
+                    'height_change_m': round(obj.height_change, 3),
+                    'dtm_change_m': round(obj.dtm_change, 3),
+                    'temporal_stability': round(obj.temporal_stability, 3),
+                    'volume_change_m3': round(obj.volume_change_m3, 1),
+                    'volume_change_abs_m3': round(obj.volume_change_abs_m3, 1),
+                    'dtm_change_max_m': round(obj.dtm_change_max, 3),
+                    'glcm_entropy': round(obj.glcm_entropy, 4),
+                    'glcm_homogeneity': round(obj.glcm_homogeneity, 4),
+                    'texture_complexity': round(obj.texture_complexity, 4),
+                    'sar_vv': round(obj.sar_vv, 4),
+                    'sar_vh': round(obj.sar_vh, 4),
+                    'harm_amplitude': round(obj.harm_amplitude, 4),
+                    'harm_phase': round(obj.harm_phase, 1),
+                    'phenology_class': obj.phenology_class or '',
+                    'confidence': round(obj.confidence, 3),
+                    'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'color': hex_type,
+                    'color_height': hex_height,
+                    'obs_year': obs_year or 0,
+                },
+            })
+            written += 1
+    log.info("GPKG vector layer '%s': %d polygons", layer_name, written)
+
+    try:
+        _write_gpkg_categorized_style(gpkg_path, layer_name, 'type')
+    except Exception as e:
+        log.warning('GPKG style table failed: %s', e)
+
+
 def build_full_gpkg(kg_code: str, data: dict, spectral: dict,
                     labels: np.ndarray, objects: list,
-                    mask: np.ndarray, transform) -> str:
+                    mask: np.ndarray, transform,
+                    obs_year: int = 0) -> str:
     """Build full GeoPackage with all raster layers."""
     import rasterio
 
@@ -841,13 +1112,32 @@ def build_full_gpkg(kg_code: str, data: dict, spectral: dict,
         _write_table('segment_height', [height_raster],
                      descriptions=['Object height (m)'])
 
+        # Vector segments with full attributes + QGIS style
+        try:
+            _write_segment_vectors(out_path, labels, objects, mask, transform,
+                                   obs_year=obs_year)
+        except Exception as e:
+            log.warning("Full GPKG vector segments failed: %s", e)
+
+    # Validate
+    found_layers = []
+    try:
+        import rasterio
+        with rasterio.open(out_path) as ds:
+            found_layers = ds.descriptions or []
+        fsize = os.path.getsize(out_path)
+        log.info("  FULL_GPKG: %.1f MB, %d tables", fsize / 1e6, table_count)
+    except Exception:
+        pass
+
     return out_path
 
 
 def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                      objects: list, mask: np.ndarray, transform,
                      cadastre_data: dict, ndsm: np.ndarray,
-                     new_buildings: list, infrastructure: list) -> str:
+                     new_buildings: list, infrastructure: list,
+                     obs_year: int = 0) -> str:
     """Build lightweight GeoPackage with segmentation + enriched cadastre."""
     import rasterio
     import fiona
@@ -887,42 +1177,13 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
             type_raster[labels == obj.obj_id] = obj.type_code
         _write_raster('segment_type', [type_raster], descriptions=['Object type code'])
 
-    # Segmentation vector
+    # Segmentation vector (full attributes + QGIS style)
     if labels is not None and objects:
-        from rasterio.features import shapes as rasterize_shapes
-        obj_map = {o.obj_id: o for o in objects}
-        label_int = labels.astype(np.int32)
-
-        schema = {
-            'geometry': 'Polygon',
-            'properties': [
-                ('id', 'int'), ('type', 'str'), ('group_type', 'str'),
-                ('height_max_m', 'float'), ('height_mean_m', 'float'),
-                ('area_sqm', 'float'), ('confidence', 'float'),
-                ('ndvi_mean', 'float'),
-            ],
-        }
-        with fiona.open(out_path, 'w', driver='GPKG', layer='segments',
-                        schema=schema, crs=from_epsg(3035)) as dst:
-            for geom_dict, val in rasterize_shapes(
-                label_int, mask=mask, transform=transform, connectivity=4,
-            ):
-                oid = int(val)
-                obj = obj_map.get(oid)
-                if obj is None:
-                    continue
-                dst.write({
-                    'geometry': geom_dict,
-                    'properties': {
-                        'id': oid, 'type': obj.obj_type,
-                        'group_type': obj.group_type or '',
-                        'height_max_m': round(obj.height_max, 2),
-                        'height_mean_m': round(obj.height_mean, 2),
-                        'area_sqm': round(obj.area_sqm, 1),
-                        'confidence': round(obj.confidence, 2),
-                        'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
-                    },
-                })
+        try:
+            _write_segment_vectors(out_path, labels, objects, mask, transform,
+                                   obs_year=obs_year)
+        except Exception as e:
+            log.warning("Light GPKG vector segments failed: %s", e)
 
     # Parcels with heights
     dtm = data["dtm"]
@@ -1074,9 +1335,14 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "total_area_sqm": int(mask.sum()),  # valid pixels = m2 at 1m res
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "observation_period": {
+            "primary_year": obs_year,
             "start": f"{obs_year}-01-01",
             "end": f"{obs_year}-12-31",
             "lidar_dataset": ti.DEFAULT_DATASET,
+            "all_lidar_datasets": sorted(ti.DATASETS.keys()),
+            "sentinel2": f"Sentinel-2 L2A {obs_year}",
+            "hansen": "Hansen GFC-2024-v1.12 (2000-2024)",
+            "cadastre": "BEV INSPIRE cadastre (current)",
         },
     }
 
@@ -1164,8 +1430,16 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
                 pass
             summary["top_10_objects"].append({
                 "type": o.obj_type,
-                "height_m": round(o.height_max, 2),
+                "height_max_m": round(o.height_max, 2),
+                "height_mean_m": round(o.height_mean, 2),
+                "area_sqm": round(o.area_sqm, 1),
                 "coordinate": c_wgs,
+                "confidence": round(o.confidence, 3),
+                "is_manmade": o.is_manmade,
+                "slope_mean_deg": round(o.slope_mean, 1),
+                "ndvi_mean": round(o.ndvi_mean, 4),
+                "height_change_m": round(o.height_change, 3),
+                "observation_year": obs_year,
             })
 
     # --- Top 10 tallest trees ---
@@ -1183,8 +1457,14 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             summary["top_10_trees"].append({
                 "height_m": round(t.height_max, 2),
                 "canopy_height_m": round(t.height_mean, 2),
+                "height_p90_m": round(t.height_p90, 2),
                 "coordinate": c_wgs,
                 "area_sqm": round(t.area_sqm, 1),
+                "ndvi_mean": round(t.ndvi_mean, 4),
+                "ndvi_fused": round(t.ndvi_fused, 4),
+                "height_change_m": round(t.height_change, 3),
+                "phenology_class": t.phenology_class or '',
+                "observation_year": obs_year,
             })
 
         # Tree stats
@@ -1231,6 +1511,66 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             ndvi_info["copernicus_mean"] = round(float(np.nanmean(valid_c)), 4)
             ndvi_info["method_copernicus"] = f"Sentinel-2 L2A NDVI composite, {obs_year}"
     summary["ndvi"] = ndvi_info
+
+    # --- SAR backscatter ---
+    sar_info = {}
+    if copernicus_data:
+        for band in ['vv', 'vh']:
+            arr = copernicus_data.get(band)
+            if arr is not None:
+                valid = arr[np.isfinite(arr)]
+                if len(valid) > 0:
+                    sar_info[f"{band}_mean_db"] = round(float(np.nanmean(valid)), 2)
+                    sar_info[f"{band}_std_db"] = round(float(np.nanstd(valid)), 2)
+        if sar_info:
+            sar_info["method"] = f"Sentinel-1 IW GRD, VV+VH, summer {obs_year}"
+    summary["sar"] = sar_info
+
+    # --- NDVI harmonics (phenology) ---
+    harmonics_info = {}
+    if copernicus_data and copernicus_data.get("harmonics"):
+        harm = copernicus_data["harmonics"]
+        for key in ['h_mean', 'h_amplitude', 'h_phase', 'h_rmse']:
+            arr = harm.get(key)
+            if arr is not None:
+                valid = arr[np.isfinite(arr)]
+                if len(valid) > 0:
+                    harmonics_info[key.replace('h_', '') + '_mean'] = round(float(np.nanmean(valid)), 4)
+        harmonics_info["method"] = f"1st-order harmonic fit to monthly Sentinel-2 NDVI, {obs_year}"
+    summary["ndvi_harmonics"] = harmonics_info
+
+    # --- Temporal change summary ---
+    temporal_info = {}
+    if objects:
+        changes = [(o.dtm_change, o.height_change, o.volume_change_m3,
+                    o.volume_change_abs_m3, o.temporal_stability) for o in objects]
+        dtm_ch = [c[0] for c in changes if abs(c[0]) > 0.01]
+        h_ch = [c[1] for c in changes if abs(c[1]) > 0.01]
+        vol_net = sum(c[2] for c in changes)
+        vol_abs = sum(c[3] for c in changes)
+        stab = [c[4] for c in changes]
+        if dtm_ch:
+            temporal_info["dtm_change_mean_m"] = round(float(np.mean(dtm_ch)), 3)
+            temporal_info["dtm_change_max_abs_m"] = round(float(np.max(np.abs(dtm_ch))), 3)
+            temporal_info["n_changed_segments"] = len(dtm_ch)
+        if h_ch:
+            temporal_info["height_change_mean_m"] = round(float(np.mean(h_ch)), 3)
+        temporal_info["net_volume_change_m3"] = round(vol_net, 1)
+        temporal_info["total_disturbed_volume_m3"] = round(vol_abs, 1)
+        if stab:
+            temporal_info["mean_stability"] = round(float(np.mean(stab)), 3)
+        temporal_info["datasets_compared"] = sorted(ti.DATASETS.keys())
+        temporal_info["method"] = "DTM/DSM difference across BEV ALS dates (2022-2024)"
+    summary["temporal_change"] = temporal_info
+
+    # --- Phenology class distribution ---
+    if objects:
+        pheno_counts = Counter(o.phenology_class for o in objects if o.phenology_class)
+        if pheno_counts:
+            summary["phenology"] = {
+                "distribution": {k: v for k, v in pheno_counts.most_common()},
+                "method": "1st-order harmonic fit: mean+amplitude+phase → class",
+            }
 
     # --- Hansen forest loss ---
     hansen_summary = {}
@@ -1418,13 +1758,19 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
     # --- Methods ---
     summary["methods"] = {
         "segmentation": "Felzenszwalb over-segmentation + RAG merge on fused gradient (DTM+DSM+RGBI+NDVI), 1m resolution",
-        "classification": "Random Forest (44 features, cadastre+OSM trained) with rule-based fallback",
+        "classification": "Random Forest (44 features, cadastre+OSM trained) with rule-based fallback + cadastre calibration",
+        "calibration": "Building footprints from cadastre used for confidence boosting and missed-building reclassification",
         "height": "BEV ALS DTM/DSM 1m, nDSM = DSM - DTM",
+        "temporal_change": "DTM/DSM differencing across all available BEV ALS dates (" + ", ".join(sorted(ti.DATASETS.keys())) + ")",
         "ortho": "BEV DOP RGBI 0.2m, resampled to 1m for spectral indices",
         "ndvi_bev": "(NIR - Red) / (NIR + Red) from BEV DOP RGBI",
         "ndvi_copernicus": "Sentinel-2 L2A B08/B04, openEO, 10m resampled to 1m",
+        "ndvi_harmonics": "1st-order harmonic fit (mean + amplitude·cos(2πt/12 - phase)) to monthly Sentinel-2 NDVI",
+        "sar": "Sentinel-1 IW GRD, VV+VH polarisation, summer composite via openEO",
         "terrain": "Slope (Sobel), aspect, TRI, TPI, curvature from DTM",
+        "texture": "GLCM contrast/homogeneity/entropy from BEV ortho greyscale",
         "hansen": "Hansen GFC-2024-v1.12, 30m, treecover2000 + lossyear + gain",
+        "infrastructure": "austria-power API (wind turbines, solar, substations, masts)",
         "roof_type": "flat = DSM std < 1.5m within footprint, pitched otherwise",
         "stories_est": "max_object_height / 3m, rounded",
         "stem_volume": "Rough cone estimate: 0.3 * canopy_area * height / 3",
@@ -1432,15 +1778,17 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "earthwork_volume": "mean(|nDSM|) * polygon_area",
         "fragmentation": "Shannon diversity index on segment type fractions",
         "edge_density": "Total segment perimeter / total area",
+        "phenology": "Harmonic amplitude+phase → crop/deciduous/evergreen/bare classes",
         "cadastre_source": "BEV INSPIRE cadastre via cadastre-process-api.exe.xyz",
         "data_sources": [
-            "BEV ALS DTM/DSM 1m (2022-2024)",
+            "BEV ALS DTM/DSM 1m (2022, 2023, 2024)",
             "BEV DOP RGBI 0.2m (2022-2024)",
-            "Sentinel-2 L2A 10m (openEO)",
+            "Sentinel-2 L2A 10m NDVI composites + monthly time series (openEO)",
             "ESA WorldCover 10m",
-            "Sentinel-1 SAR 10m (openEO)",
+            "Sentinel-1 SAR IW GRD 10m VV/VH (openEO)",
             "Hansen GFC-2024-v1.12 30m",
             "Austrian Cadastre (BEV INSPIRE)",
+            "Austria Power Infrastructure API",
         ],
     }
 
@@ -1451,7 +1799,7 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
 # Core per-KG processing (runs in subprocess)
 # ---------------------------------------------------------------------------
 
-def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
+def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None) -> dict:
     """Process a single KG. Returns dict with file paths + stats.
 
     This function runs in a subprocess for memory isolation.
@@ -1463,6 +1811,17 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
 
     kg_code = kg["kg_code"]
     result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
+
+    def _report_step(step, detail=""):
+        """Write current step to temp file for parent to read."""
+        try:
+            step_file = DATA_DIR / "current_step.json"
+            import json as _json
+            _json.dump({"step": step, "detail": detail, "ts": datetime.now(timezone.utc).isoformat()},
+                       open(str(step_file) + ".tmp", "w"))
+            os.rename(str(step_file) + ".tmp", str(step_file))
+        except Exception:
+            pass
 
     try:
         # --- Determine bbox ---
@@ -1483,14 +1842,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
             west, south = bb["min_lon"], bb["min_lat"]
             east, north = bb["max_lon"], bb["max_lat"]
 
-        # Limit size
+        # Limit size — use max_km override if provided (retry ladder)
+        crop_km = max_km if max_km is not None else MAX_KG_AREA_KM
         dx_km = (east - west) * 111 * np.cos(np.radians((south + north) / 2))
         dy_km = (north - south) * 111
-        if dx_km > MAX_KG_AREA_KM or dy_km > MAX_KG_AREA_KM:
+        if dx_km > crop_km or dy_km > crop_km:
             cx, cy = (west + east) / 2, (south + north) / 2
-            half = (MAX_KG_AREA_KM / 2) / 111
+            half = (crop_km / 2) / 111
             west, south, east, north = cx - half, cy - half, cx + half, cy + half
-            log.info("KG %s: cropped to %.1fkm window", kg_code, MAX_KG_AREA_KM)
+            log.info("KG %s: cropped to %.1fkm window", kg_code, crop_km)
 
         geom_wgs = box(west, south, east, north)
         geom_3035 = transform_to_3035(geom_wgs)
@@ -1498,46 +1858,108 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
 
         # --- 1. Cadastre ---
         result["step"] = "cadastre"
+        _report_step("cadastre")
         cadastre_data = fetch_cadastre_data(kg_code)
         result["n_parcels"] = len(cadastre_data["parcels"])
         result["n_buildings"] = len(cadastre_data["building_footprints"])
+        _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, {len(cadastre_data['building_footprints'])} buildings")
 
         # --- 2. LiDAR ---
         result["step"] = "lidar"
+        _report_step("lidar")
         data = raster_io.read_dtm_dsm(geom_3035, ti.DEFAULT_DATASET)
         h, w = data["shape"]
         valid_px = int(data["mask"].sum())
-        if valid_px > MAX_KG_PIXELS:
-            result["error"] = f"too large: {valid_px} px"
+        # Scale pixel limit with crop window (smaller window = fewer pixels needed)
+        effective_max_px = MAX_KG_PIXELS if max_km is None else int((max_km * 1000) ** 2)
+        if valid_px > effective_max_px:
+            result["error"] = f"too large: {valid_px} px (limit {effective_max_px})"
             return result
         if valid_px < 100:
             result["error"] = f"too few valid pixels: {valid_px}"
             return result
+        _report_step("lidar", f"{h}x{w}, {valid_px} valid px")
 
         ndsm = data["ndsm"]
         mask = data["mask"]
         transform = data["transform"]
 
-        # --- 3. Orthophoto ---
+        # --- 2b. Multi-date DTM/DSM (temporal change features) ---
+        # The RF model uses temporal features (14.7% importance) so we
+        # need all available dates for accurate classification.
+        dtm_dates = None
+        dsm_dates = None
+        try:
+            other_dates = sorted(d for d in ti.DATASETS if d != ti.DEFAULT_DATASET)
+            if other_dates:
+                dtm_dates = {}
+                dsm_dates = {}
+                ref_h, ref_w = h, w
+                for date_key in other_dates:
+                    try:
+                        d2 = raster_io.read_dtm_dsm(geom_3035, date_key)
+                        mh = min(ref_h, d2["shape"][0])
+                        mw = min(ref_w, d2["shape"][1])
+                        dtm_dates[date_key] = d2["dtm"][:mh, :mw]
+                        dsm_dates[date_key] = d2["dsm"][:mh, :mw]
+                    except Exception as e:
+                        log.warning("KG %s: multi-date %s failed: %s",
+                                    kg_code, date_key, e)
+                if dtm_dates:
+                    # Align all arrays to the smallest common extent
+                    mh = min(ref_h, *(a.shape[0] for a in dtm_dates.values()))
+                    mw = min(ref_w, *(a.shape[1] for a in dtm_dates.values()))
+                    dtm_dates[ti.DEFAULT_DATASET] = data["dtm"][:mh, :mw]
+                    dsm_dates[ti.DEFAULT_DATASET] = data["dsm"][:mh, :mw]
+                    for dk in list(dtm_dates):
+                        dtm_dates[dk] = dtm_dates[dk][:mh, :mw]
+                        dsm_dates[dk] = dsm_dates[dk][:mh, :mw]
+                    log.info("KG %s: loaded %d temporal dates: %s",
+                             kg_code, len(dtm_dates), sorted(dtm_dates))
+                    _report_step("lidar",
+                                 f"{h}x{w}, {valid_px} px, {len(dtm_dates)} dates")
+                else:
+                    dtm_dates = None
+                    dsm_dates = None
+        except Exception as e:
+            log.warning("KG %s: multi-date read failed: %s", kg_code, e)
+            dtm_dates = None
+            dsm_dates = None
+
+        # --- 3. Orthophoto (with timeout protection) ---
         result["step"] = "ortho"
+        _report_step("ortho")
+        ORTHO_TIMEOUT = 180  # 3 min max
         spectral = None
         try:
             import ortho_io
-            rgb, nir = ortho_io.read_ortho_for_als(data)
-            spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
-            if rgb is not None:
-                spectral["red"] = rgb[0].astype(np.float32)
-                spectral["green"] = rgb[1].astype(np.float32)
-                spectral["blue"] = rgb[2].astype(np.float32)
-            if nir is not None:
-                spectral["nir"] = nir.astype(np.float32)
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                fut = exe.submit(ortho_io.read_ortho_for_als, data)
+                try:
+                    rgb, nir = fut.result(timeout=ORTHO_TIMEOUT)
+                    spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+                    if rgb is not None:
+                        spectral["red"] = rgb[0].astype(np.float32)
+                        spectral["green"] = rgb[1].astype(np.float32)
+                        spectral["blue"] = rgb[2].astype(np.float32)
+                    if nir is not None:
+                        spectral["nir"] = nir.astype(np.float32)
+                except concurrent.futures.TimeoutError:
+                    log.warning("KG %s: ortho timed out after %ds",
+                                kg_code, ORTHO_TIMEOUT)
         except Exception as e:
             log.warning("KG %s: ortho failed: %s", kg_code, e)
+        if spectral:
+            _report_step("ortho", f"RGBI loaded, {len(spectral)} bands")
+        else:
+            _report_step("ortho", "skipped/failed")
 
         # --- 4. Copernicus (tile-cached) ---
         copernicus_data = None
         if include_copernicus:
             result["step"] = "copernicus"
+            _report_step("copernicus")
             cb = _read_circuit_breaker()
             if cb["consecutive_failures"] >= 3 and \
                (time.time() - cb["last_failure"]) < cb["cooldown"]:
@@ -1565,6 +1987,30 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                         if "transform" in sar:
                             cop["sar_transform"] = sar["transform"]
 
+                    # NDVI harmonics (6.7% of RF feature importance)
+                    # Only attempt if at least one Copernicus layer succeeded
+                    if cop:
+                        try:
+                            import ndvi_harmonics
+                            HARM_TIMEOUT = 300  # 5 min
+                            import concurrent.futures as _cf
+                            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                                _hfut = _ex.submit(
+                                    ndvi_harmonics.get_harmonic_features,
+                                    bbox_dict, obs_year)
+                                try:
+                                    harm = _hfut.result(timeout=HARM_TIMEOUT)
+                                    if harm is not None:
+                                        cop["harmonics"] = harm
+                                        log.info("KG %s: harmonics OK", kg_code)
+                                except _cf.TimeoutError:
+                                    log.warning("KG %s: harmonics timed out after %ds",
+                                                kg_code, HARM_TIMEOUT)
+                                except Exception as he:
+                                    log.debug("KG %s: harmonics failed: %s", kg_code, he)
+                        except Exception:
+                            pass
+
                     copernicus_data = cop if cop else None
 
                     # Update circuit breaker
@@ -1574,6 +2020,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                         cb["consecutive_failures"] += 1
                         cb["last_failure"] = time.time()
                         cb["cooldown"] = min(600, 60 * (2 ** min(cb["consecutive_failures"], 4)))
+                        # Rotate credentials for next attempt
+                        try:
+                            import copernicus as _cop_mod
+                            _cop_mod.rotate_credentials()
+                        except Exception:
+                            pass
                     _write_circuit_breaker(cb)
                 except Exception as e:
                     from copernicus import CreditsExhaustedError
@@ -1591,8 +2043,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                     cb["last_failure"] = time.time()
                     _write_circuit_breaker(cb)
 
+        if copernicus_data:
+            bands = [k for k in copernicus_data.keys() if k not in ('transform','crs','sar_transform')]
+            _report_step("copernicus", f"loaded: {', '.join(bands)}")
+        else:
+            _report_step("copernicus", "skipped (circuit breaker or failed)")
+
         # --- 5. Hansen (tile-cached) ---
         result["step"] = "hansen"
+        _report_step("hansen")
         hansen_data = None
         try:
             hc = _get_hansen_cache()
@@ -1600,9 +2059,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                 (west, south, east, north), transform, (h, w))
         except Exception as e:
             log.warning("KG %s: Hansen failed: %s", kg_code, e)
+        if hansen_data:
+            _report_step("hansen", "loaded")
+        else:
+            _report_step("hansen", "skipped/failed")
 
         # --- 6. Segmentation ---
         result["step"] = "segment"
+        _report_step("segment")
 
         # Building footprint mask
         building_fp_mask = None
@@ -1619,27 +2083,45 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
             except Exception:
                 pass
 
+        # Infrastructure lookup for rule-based detection of
+        # wind turbines, solar panels, substations, masts
+        infra = None
+        try:
+            from infrastructure_lookup import InfrastructureLookup
+            infra = InfrastructureLookup.for_bbox(west, south, east, north)
+            if len(infra) > 0:
+                log.info("KG %s: %d infrastructure features loaded",
+                         kg_code, len(infra))
+        except Exception as e:
+            log.debug("KG %s: infrastructure lookup failed: %s", kg_code, e)
+
         seg_result = oc.segment_and_classify(
             data["dtm"], data["dsm"], mask, transform,
+            dtm_dates=dtm_dates, dsm_dates=dsm_dates,
             spectral=spectral, copernicus=copernicus_data,
             building_footprints=building_fp_mask,
             hansen=hansen_data,
             observation_year=obs_year,
+            infra_lookup=infra,
         )
         objects = seg_result["objects"]
         labels = seg_result["labels"]
         result["n_segments"] = len(objects)
+        _report_step("segment", f"{len(objects)} objects, {result.get('n_segments',0)} segments")
 
         # --- 7. Terrain ---
         result["step"] = "terrain"
+        _report_step("terrain")
         terrain_stats = {}
         try:
             terrain_stats = ta.characterise_terrain(data["dtm"], mask)
         except Exception as e:
             log.warning("KG %s: terrain failed: %s", kg_code, e)
+        _report_step("terrain", "done")
 
         # --- 8. Vectorise unmatched buildings & infrastructure ---
         result["step"] = "vectorise"
+        _report_step("vectorise")
         new_buildings = []
         infrastructure_vec = []
         try:
@@ -1655,22 +2137,28 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
 
         result["n_new_buildings"] = len(new_buildings)
         result["n_infrastructure"] = len(infrastructure_vec)
+        _report_step("vectorise", f"{len(new_buildings)} new buildings, {len(infrastructure_vec)} infrastructure")
 
         # --- 9. Build full GPKG ---
         result["step"] = "gpkg_full"
+        _report_step("gpkg_full")
         full_gpkg = build_full_gpkg(
-            kg_code, data, spectral, labels, objects, mask, transform)
+            kg_code, data, spectral, labels, objects, mask, transform,
+            obs_year=obs_year)
         result["files"]["full_gpkg"] = full_gpkg
 
         # --- 10. Build light GPKG ---
         result["step"] = "gpkg_light"
+        _report_step("gpkg_light")
         light_gpkg = build_light_gpkg(
             kg_code, data, labels, objects, mask, transform,
-            cadastre_data, ndsm, new_buildings, infrastructure_vec)
+            cadastre_data, ndsm, new_buildings, infrastructure_vec,
+            obs_year=obs_year)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 11. Build JSON summary ---
         result["step"] = "json"
+        _report_step("json")
         json_summary = build_json_summary(
             kg_code, kg, data, labels, objects, cadastre_data,
             terrain_stats, spectral, hansen_data, copernicus_data,
@@ -1689,7 +2177,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
         result["traceback"] = traceback.format_exc()
         log.error("KG %s failed at step %s: %s", kg_code, result["step"], e)
 
-    # Force GC
+    # Explicitly free large arrays before returning to parent
+    for _var in ('data', 'labels', 'objects', 'ndsm', 'spectral',
+                 'copernicus_data', 'hansen_data', 'cadastre_data',
+                 'new_buildings', 'infrastructure_vec', 'dtm_dates', 'dsm_dates',
+                 'building_fp_mask', 'seg_result', 'terrain_stats'):
+        try:
+            del locals()[_var]  # noqa
+        except (KeyError, NameError):
+            pass
     gc.collect()
     return result
 
@@ -1997,7 +2493,75 @@ def cleanup_json_dir():
 # Main loop
 # ---------------------------------------------------------------------------
 
+# Retry ladder: on timeout, shrink the crop window and retry.
+# Disable Copernicus on tiny windows (10m resolution useless at 200m).
+RETRY_LADDER = [1.5, 0.5, 0.2]  # km — first attempt uses MAX_KG_AREA_KM
+RETRIED_KGS_FILE = DATA_DIR / "retried_kgs.json"
+
+# Graceful shutdown flag
+_shutdown_requested = False
+
+
+def _load_failed_kgs() -> set:
+    """Load permanently-failed KG codes from file."""
+    try:
+        if FAILED_KGS_FILE.exists():
+            return set(json.loads(FAILED_KGS_FILE.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_failed_kgs(codes: set):
+    """Save permanently-failed KG codes."""
+    try:
+        FAILED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
+    except Exception:
+        pass
+
+
+def _load_retried_kgs() -> set:
+    """Load KG codes that already got a retry pass (so we don't retry again)."""
+    try:
+        if RETRIED_KGS_FILE.exists():
+            return set(json.loads(RETRIED_KGS_FILE.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_retried_kgs(codes: set):
+    try:
+        RETRIED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
+    except Exception:
+        pass
+
+
+def _copernicus_probe() -> bool:
+    """Try a tiny Copernicus request to check if credits are back."""
+    try:
+        import copernicus
+        copernicus.credits_exhausted = False
+        copernicus._connection = None
+        for k in list(copernicus._connections.keys()):
+            copernicus._connections.pop(k, None)
+        conn = copernicus._get_connection()
+        cube = conn.load_collection(
+            'SENTINEL2_L2A',
+            spatial_extent={'west': 15, 'south': 47,
+                            'east': 15.01, 'north': 47.01},
+            temporal_extent=['2024-06-01', '2024-06-15'],
+            bands=['B04'],
+        )
+        cube.max_time().download()
+        return True
+    except Exception:
+        return False
+
+
 def main():
+    global _shutdown_requested
+
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")
     parser.add_argument("--kg", help="Process single KG code")
     parser.add_argument("--state", help="Process KGs in one state")
@@ -2013,6 +2577,24 @@ def main():
         multiprocessing.set_start_method("spawn")
     except RuntimeError:
         pass
+
+    # --- Signal handling for graceful shutdown ---
+    def _handle_signal(signum, frame):
+        global _shutdown_requested
+        sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        log.warning("Received %s — will finish current KG then exit", sig_name)
+        _shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    # --- GDAL config for large raster I/O ---
+    os.environ.setdefault('GDAL_CACHEMAX', '256')
+    os.environ.setdefault('VSI_CACHE', 'TRUE')
+    os.environ.setdefault('VSI_CACHE_SIZE', '33554432')  # 32 MB
+    os.environ.setdefault('GDAL_HTTP_MULTIPLEX', 'YES')
+    os.environ.setdefault('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
+    os.environ.setdefault('CPL_VSIL_CURL_ALLOWED_EXTENSIONS', '.tif,.tiff')
 
     log.info("=" * 70)
     log.info("🇦🇹 Austria Landscape Processor starting")
@@ -2049,30 +2631,65 @@ def main():
 
     # --- Filter ---
     if args.retry_failed:
-        # Only process KGs that have errors in manifest
         failed_keys = set()
         for key in manifest.keys():
-            entry = manifest.get(key)
-            # We'll store failure info with key "KG_error"
             if key.endswith("_error"):
                 failed_keys.add(key.replace("_error", ""))
         kgs = [kg for kg in kgs if kg["kg_code"] in failed_keys]
         log.info("Retry mode: %d failed KGs to reprocess", len(kgs))
 
-    # Skip already completed
+    # --- Determine already-completed KGs (Zenodo manifest + local JSON) ---
     completed_codes = set()
     for key in manifest.keys():
         if key.endswith("_json"):
             completed_codes.add(key.replace("_json", ""))
-    pending = [kg for kg in kgs if kg["kg_code"] not in completed_codes]
+    # Also count local JSONs not yet uploaded (e.g. upload failed but JSON exists)
+    for jf in JSON_DIR.glob("*.json"):
+        completed_codes.add(jf.stem)
+    log.info("Already completed: %d (manifest + local JSON)", len(completed_codes))
+
+    # --- Load failed KGs + handle crash recovery ---
+    failed_kgs = _load_failed_kgs()
+    retried_kgs = _load_retried_kgs()
+
+    # On restart, give previously-failed KGs one fresh attempt.
+    # KGs that already got a retry pass stay permanently skipped.
+    prev_failed = failed_kgs.copy()
+    to_retry = prev_failed - retried_kgs
+    if to_retry:
+        log.info("Clearing %d previously-failed KGs for retry: %s",
+                 len(to_retry), sorted(to_retry)[:10])
+        retried_kgs |= to_retry
+        failed_kgs -= to_retry
+        _save_retried_kgs(retried_kgs)
+        _save_failed_kgs(failed_kgs)
+
+    # Crash recovery: check IN_PROGRESS_FILE for interrupted KG
+    if IN_PROGRESS_FILE.exists():
+        interrupted_kg = IN_PROGRESS_FILE.read_text().strip()
+        if interrupted_kg:
+            log.info("Previous run interrupted during KG %s — will retry "
+                     "(not marking as failed)", interrupted_kg)
+            # Make sure it's not in the failed set so it gets retried
+            failed_kgs.discard(interrupted_kg)
+            completed_codes.discard(interrupted_kg)
+        IN_PROGRESS_FILE.unlink()
+
+    if failed_kgs:
+        log.info("Skipping %d permanently-failed KGs: %s",
+                 len(failed_kgs), sorted(failed_kgs)[:20])
+
+    pending = [kg for kg in kgs
+               if kg["kg_code"] not in completed_codes
+               and kg["kg_code"] not in failed_kgs]
 
     # Sort geographically for tile-cache locality
     from tile_cache import sort_kgs_geographically
     pending = sort_kgs_geographically(pending)
     log.info("KGs sorted geographically for cache locality")
 
-    log.info("Total KGs: %d, already completed: %d, pending: %d",
-             len(kgs), len(completed_codes), len(pending))
+    log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
+             len(kgs), len(completed_codes), len(failed_kgs), len(pending))
 
     if args.dry_run:
         for kg in pending[:20]:
@@ -2094,6 +2711,11 @@ def main():
     include_cop = not args.no_copernicus
 
     for i, kg in enumerate(pending):
+        # --- Check graceful shutdown ---
+        if _shutdown_requested:
+            log.info("Shutdown requested — stopping after %d KGs", i)
+            break
+
         kg_code = kg["kg_code"]
         kg_name = kg.get("kg_name", "")
         kg_state = kg.get("state_name", "")
@@ -2116,31 +2738,118 @@ def main():
 
         IN_PROGRESS_FILE.write_text(kg_code)
 
+        # Start background thread to monitor subprocess step reporting
+        import threading
+        _step_monitor_stop = threading.Event()
+
+        def _monitor_step_file(_stop=_step_monitor_stop, _code=kg_code):
+            step_file = DATA_DIR / "current_step.json"
+            last_step = ""
+            while not _stop.is_set():
+                try:
+                    if step_file.exists():
+                        sd = json.loads(step_file.read_text())
+                        s = sd.get("step", "")
+                        detail = sd.get("detail", "")
+                        if s and s != last_step:
+                            last_step = s
+                            progress.set_step(s)
+                            if detail:
+                                progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)
+                            progress.save()
+                except Exception:
+                    pass
+                _stop.wait(2)
+
+        _step_monitor_stop.clear()
+        step_thread = threading.Thread(target=_monitor_step_file, daemon=True)
+        step_thread.start()
+
         t_kg = time.time()
+        result = None
+        kg_succeeded = False
+
         try:
-            pool = multiprocessing.Pool(processes=1)
-            try:
-                async_result = pool.apply_async(
-                    process_one_kg, args=(kg,),
-                    kwds={"include_copernicus": include_cop})
-                result = async_result.get(timeout=KG_TIMEOUT_SECONDS)
-            except multiprocessing.TimeoutError:
-                log.error("KG %s: TIMEOUT after %d min", kg_code,
-                          KG_TIMEOUT_SECONDS // 60)
-                pool.terminate()
-                pool.join()
-                progress.add_failure(kg_code, kg_name,
-                                     "timeout", "unknown")
-                progress.add_log("error", f"KG {kg_code} timed out", kg_code)
-                progress.save()
-                continue
-            finally:
-                pool.close()
-                pool.join()
+            # ---- Retry ladder: 1.5km (default) → 0.5km → 0.2km ----
+            # On timeout, shrink window and retry. Disable Copernicus
+            # on tiny windows (10m resolution not useful at 200m).
+            attempt_windows = [None] + RETRY_LADDER  # None = use MAX_KG_AREA_KM
+            for attempt_idx, attempt_km in enumerate(attempt_windows):
+                if attempt_idx > 0:
+                    gc.collect()
+                    log.info("  → Retrying KG %s with %.0fm window",
+                             kg_code, attempt_km * 1000)
+                    progress.add_log("info",
+                                     f"Retry KG {kg_code} at {attempt_km*1000:.0f}m window",
+                                     kg_code)
+                    progress.save()
 
-            elapsed_kg = time.time() - t_kg
+                # Skip slow Copernicus on tiny windows — 10m data
+                # isn't useful at 200m and API timeouts eat the budget.
+                use_cop = include_cop and (attempt_km is None or attempt_km >= 0.5)
 
-            if result.get("success"):
+                pool = multiprocessing.Pool(processes=1)
+                try:
+                    async_result = pool.apply_async(
+                        process_one_kg, args=(kg,),
+                        kwds={"include_copernicus": use_cop,
+                              "max_km": attempt_km})
+                    try:
+                        result = async_result.get(timeout=KG_TIMEOUT_SECONDS)
+                        break  # success — exit retry ladder
+                    except multiprocessing.TimeoutError:
+                        _step_monitor_stop.set()
+                        step_thread.join(timeout=3)
+                        # Read last step from file
+                        last_step = "unknown"
+                        try:
+                            sd = json.loads((DATA_DIR / "current_step.json").read_text())
+                            last_step = sd.get("step", "unknown")
+                        except Exception:
+                            pass
+                        pool.terminate()
+                        pool.join()
+
+                        if attempt_idx >= len(attempt_windows) - 1:
+                            # Exhausted all retries
+                            log.error("KG %s: TIMEOUT at step %s after all retries — permanent fail",
+                                      kg_code, last_step)
+                            failed_kgs.add(kg_code)
+                            _save_failed_kgs(failed_kgs)
+                            progress.add_failure(kg_code, kg_name,
+                                                 f"timeout at {last_step} (all retries)",
+                                                 last_step)
+                            progress.add_log("error",
+                                             f"KG {kg_code} timed out at {last_step} after all retries",
+                                             kg_code)
+                            progress.save()
+                            result = None
+                            break
+                        else:
+                            next_km = attempt_windows[attempt_idx + 1]
+                            log.warning("  → TIMEOUT after %d min at step %s (%.1fkm) — will retry at %.0fm",
+                                        KG_TIMEOUT_SECONDS // 60, last_step,
+                                        attempt_km or MAX_KG_AREA_KM, next_km * 1000)
+                            # Reset step monitor for next attempt
+                            _step_monitor_stop.clear()
+                            step_thread = threading.Thread(target=_monitor_step_file, daemon=True)
+                            step_thread.start()
+                            continue
+                finally:
+                    pool.close()
+                    pool.join()
+
+            # Stop step monitor
+            _step_monitor_stop.set()
+            step_thread.join(timeout=3)
+
+            if result is None:
+                # All retries exhausted or permanent failure — already logged
+                pass
+            elif result.get("success"):
+                elapsed_kg = time.time() - t_kg
+                kg_succeeded = True
+
                 # --- Validate outputs ---
                 progress.set_step("validate")
                 progress.save()
@@ -2184,33 +2893,43 @@ def main():
                     kg_code,
                 )
             else:
-                progress.add_failure(
-                    kg_code, kg_name,
-                    result.get("error", "unknown"),
-                    result.get("step", "unknown"),
-                )
-                progress.add_log(
-                    "error",
-                    f"KG {kg_code} failed at {result.get('step')}: {result.get('error')}",
-                    kg_code,
-                )
-                # Record failure in manifest for retry tracking
-                from zenodo_client import Entry
-                manifest.set(f"{kg_code}_error", Entry(
-                    key=f"{kg_code}_error",
-                    depo_id=0, bucket_url="", filename="",
-                    size=0, checksum="",
-                    uploaded_at=datetime.now(timezone.utc).isoformat(),
-                    version=json.dumps({
-                        "error": result.get("error", ""),
-                        "step": result.get("step", ""),
-                        "traceback": result.get("traceback", "")[:500],
-                    }),
-                ))
-                manifest.save()
+                # --- Copernicus credits exhausted? Don't mark as permanently failed ---
+                is_credits_issue = (result.get("copernicus_exhausted")
+                                    or '402' in str(result.get("error", ""))
+                                    or 'PaymentRequired' in str(result.get("error", "")))
+                if is_credits_issue:
+                    log.warning("KG %s: Copernicus credits issue — will retry after credits restored", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: credits exhausted — not marking failed",
+                                     kg_code)
+                else:
+                    progress.add_failure(
+                        kg_code, kg_name,
+                        result.get("error", "unknown"),
+                        result.get("step", "unknown"),
+                    )
+                    progress.add_log(
+                        "error",
+                        f"KG {kg_code} failed at {result.get('step')}: {result.get('error')}",
+                        kg_code,
+                    )
+                    # Record failure in manifest for retry tracking
+                    from zenodo_client import Entry
+                    manifest.set(f"{kg_code}_error", Entry(
+                        key=f"{kg_code}_error",
+                        depo_id=0, bucket_url="", filename="",
+                        size=0, checksum="",
+                        uploaded_at=datetime.now(timezone.utc).isoformat(),
+                        version=json.dumps({
+                            "error": result.get("error", ""),
+                            "step": result.get("step", ""),
+                            "traceback": result.get("traceback", "")[:500],
+                        }),
+                    ))
+                    manifest.save()
 
-                log.warning("KG %s: FAILED at %s: %s",
-                            kg_code, result.get("step"), result.get("error"))
+                    log.warning("KG %s: FAILED at %s: %s",
+                                kg_code, result.get("step"), result.get("error"))
 
         except Exception as e:
             progress.add_failure(kg_code, kg_name, str(e), "exception")
@@ -2228,19 +2947,51 @@ def main():
 
         gc.collect()
 
-        # --- Copernicus pause check ---
+        # Explicitly free large subprocess data
+        del result
+        gc.collect()
+
+        # --- Copernicus pause: auto-probe every 15 min instead of just waiting ---
         if COPERNICUS_PAUSE_FILE.exists():
             log.warning("⏸ Copernicus credits exhausted — PAUSING.")
-            log.warning("  Update credentials in copernicus.py and delete %s to resume.",
-                        COPERNICUS_PAUSE_FILE)
             progress.update(state="paused_copernicus")
             progress.add_log("warning",
                              "Paused: Copernicus credits exhausted. "
-                             "Provide new creds & delete pause file.", "")
+                             "Will auto-probe every 15 min or delete pause file to resume.", "")
             progress.save()
+
+            # Try credential rotation first
+            try:
+                import copernicus
+                if copernicus.rotate_credentials():
+                    log.info("Rotated to next Copernicus credential set")
+            except Exception:
+                pass
+
+            probe_count = 0
             while COPERNICUS_PAUSE_FILE.exists():
-                time.sleep(30)
-            # Reset copernicus module flag so fresh creds are tried
+                probe_count += 1
+                time.sleep(900)  # 15 min
+                if _shutdown_requested:
+                    break
+                log.info("Credits paused — probe #%d: testing Copernicus...", probe_count)
+                if _copernicus_probe():
+                    log.info("Credits restored! Removing pause file and resuming.")
+                    try:
+                        COPERNICUS_PAUSE_FILE.unlink()
+                    except Exception:
+                        pass
+                    break
+                else:
+                    log.info("Still no credits — will retry in 15 min")
+                    # Try rotating to another credential on each probe
+                    try:
+                        import copernicus
+                        copernicus.rotate_credentials()
+                    except Exception:
+                        pass
+
+            # Reset copernicus module for fresh connections
             try:
                 import copernicus
                 copernicus.credits_exhausted = False
@@ -2249,7 +3000,7 @@ def main():
                     copernicus._connections.pop(k, None)
             except Exception:
                 pass
-            log.info("▶ Copernicus pause file removed — RESUMING.")
+            log.info("▶ Copernicus resumed.")
             progress.update(state="running")
             progress.add_log("info", "Resumed after Copernicus pause", "")
             progress.save()
@@ -2265,13 +3016,18 @@ def main():
                      s["eta_seconds"] / 3600 if s["eta_seconds"] else 0)
 
     # Done
-    progress.update(state="complete", current_kg=None)
+    if _shutdown_requested:
+        progress.update(state="stopped", current_kg=None)
+        log.info("Graceful shutdown complete.")
+    else:
+        progress.update(state="complete", current_kg=None)
     progress.save()
 
     elapsed = time.time() - t_start
     s = progress.get()
     log.info("=" * 70)
-    log.info("Processing complete: %d success, %d failed in %.1f hours",
+    log.info("Processing %s: %d success, %d failed in %.1f hours",
+             "stopped" if _shutdown_requested else "complete",
              s["success"], s["failed"], elapsed / 3600)
     log.info("=" * 70)
 

@@ -317,10 +317,11 @@ function fmtT(iso) {
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Step pipeline
-const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','gpkg_full','gpkg_light','json','upload','done'];
+const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','terrain','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
 const STEP_LBL = {cadastre:'Cadastre',lidar:'LiDAR',ortho:'Ortho',copernicus:'Copernicus',
-  hansen:'Hansen',segment:'Segment',gpkg_full:'GPKG Full',gpkg_light:'GPKG Light',
-  json:'JSON',upload:'Upload',done:'Done'};
+  hansen:'Hansen',segment:'Segment',terrain:'Terrain',vectorise:'Vectorise',
+  gpkg_full:'GPKG Full',gpkg_light:'GPKG Light',json:'JSON',validate:'Validate',
+  upload:'Upload',done:'Done'};
 
 // ── Map ─────────────────────────────────────────────────────────
 function initMap() {
@@ -494,10 +495,11 @@ function updateKgCard(d) {
   }
 
   document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
+  const stepDetail = kg.step_detail ? ' — ' + kg.step_detail : '';
   document.getElementById('kgSub').textContent =
-    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + (kg.step || '?');
+    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + (kg.step || '?') + stepDetail;
 
-  // Steps pipeline
+  // Steps pipeline with detail tooltip on active step
   const curIdx = STEPS.indexOf(kg.step);
   let sh = '';
   STEPS.forEach((st, i) => {
@@ -506,7 +508,8 @@ function updateKgCard(d) {
     else if (i === curIdx) cls += ' act';
     else cls += ' pend';
     const pre = (i === curIdx) ? '<span class="spin"></span>' : '';
-    sh += '<span class="' + cls + '">' + pre + (STEP_LBL[st]||st) + '</span>';
+    const tip = (i === curIdx && kg.step_detail) ? ' title="' + esc(kg.step_detail) + '"' : '';
+    sh += '<span class="' + cls + '"' + tip + '>' + pre + (STEP_LBL[st]||st) + '</span>';
   });
   document.getElementById('kgSteps').innerHTML = sh;
 }

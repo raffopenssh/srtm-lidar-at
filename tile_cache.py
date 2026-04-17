@@ -39,8 +39,12 @@ def _atomic_savez(path: Path, **arrays) -> None:
     """Write an .npz file atomically via a temp file + rename.
 
     Prevents corrupt 0-byte cache files if the process is interrupted.
+    np.savez_compressed appends '.npz' if the path doesn't already end
+    with '.npz', so we use a '.tmp.npz' suffix to keep numpy happy and
+    then rename to the final path.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Use .tmp.npz so numpy doesn't append another .npz
+    tmp = path.with_suffix(".tmp.npz")
     try:
         np.savez_compressed(str(tmp), **arrays)
         tmp.rename(path)

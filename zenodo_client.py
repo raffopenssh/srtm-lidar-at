@@ -247,6 +247,10 @@ def landscape_metadata(
     kg_name: str,
     version: str,
     file_type: str = "GeoTIFF",
+    quality_score: float = 0.0,
+    quality_grade: str = "",
+    available_layers: list = None,
+    missing_layers: list = None,
 ) -> Dict[str, Any]:
     """Zenodo metadata for an Austrian landscape / cadastral unit upload.
 
@@ -260,7 +264,28 @@ def landscape_metadata(
         Version tag, typically a date like ``"2024-09-15"``.
     file_type:
         Description of file format.
+    quality_score:
+        Data quality score 0.0–1.0.
+    quality_grade:
+        Quality grade letter (A/B/C/D/F).
+    available_layers:
+        List of data layers available for all tiles.
+    missing_layers:
+        List of data layers missing from all tiles.
     """
+    avail = available_layers or []
+    miss = missing_layers or []
+
+    quality_line = ""
+    if quality_grade:
+        quality_line = (
+            f"\n<b>Data Quality:</b> {quality_score:.0%} (Grade {quality_grade})."
+        )
+        if avail:
+            quality_line += f"\nAvailable layers: {', '.join(avail)}."
+        if miss:
+            quality_line += f"\nMissing layers: {', '.join(miss)}."
+
     return {
         "metadata": {
             "title": f"Austria Landscape \u2014 KG {kg_code} {kg_name} ({file_type})",
@@ -271,7 +296,8 @@ def landscape_metadata(
                 f"Contains: segmentation raster/vectors, DTM/DSM/nDSM, cadastre parcels "
                 f"with elevation, buildings with heights, new building detections, "
                 f"infrastructure analysis, terrain stats, NDVI, SAR, phenology.\n"
-                f"Format: {file_type}, version {version}.\n"
+                f"Format: {file_type}, version {version}."
+                f"{quality_line}\n"
                 f"Derived from BEV ALS LIDAR (DTM/DSM), Basemap.at orthophoto, "
                 f"Sentinel-2 NDVI, Sentinel-1 SAR, ESA WorldCover, Hansen GFC."
             ),

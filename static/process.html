@@ -582,10 +582,17 @@ function updateLog(d) {
   sorted.forEach(e => {
     const lvl = e.level || 'info';
     const cls = 'log-row log-' + lvl;
+    let msg = esc(e.msg);
+    // Highlight quality badge in success messages
+    msg = msg.replace(/quality=(\d+)% ([A-F])/g, function(m, pct, grade) {
+      const colors = {A:'#3fb950',B:'#58a6ff',C:'#d29922',D:'#f0883e',F:'#f85149'};
+      const c = colors[grade] || '#8b949e';
+      return '<span style="background:' + c + '22;color:' + c + ';padding:1px 5px;border-radius:3px;font-weight:600">Q:' + pct + '% ' + grade + '</span>';
+    });
     h += '<div class="' + cls + '">' +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
       (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +
-      '<span class="log-msg">' + esc(e.msg) + '</span></div>';
+      '<span class="log-msg">' + msg + '</span></div>';
   });
   area.innerHTML = h;
   if (document.getElementById('autoScroll').checked) area.scrollTop = 0;

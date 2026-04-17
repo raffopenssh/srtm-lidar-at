@@ -1907,11 +1907,115 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Data quality score computation
+# ---------------------------------------------------------------------------
+
+# Weight each data source by its contribution to segmentation quality.
+# DTM+DSM are essential (segmentation fails without them).
+# Ortho and Copernicus NDVI provide spectral features for RF classification.
+# SAR, harmonics, worldcover, and hansen are supplementary.
+_QUALITY_WEIGHTS = {
+    "dtm":              0.15,
+    "dsm":              0.15,
+    "ortho":            0.15,
+    "copernicus_ndvi":  0.12,
+    "sar":              0.08,
+    "worldcover":       0.06,
+    "harmonics":        0.06,
+    "hansen":           0.05,
+    "multi_date_dtm":   0.05,
+    "terrain":          0.03,
+    "cadastre_buildings": 0.05,
+    "infrastructure":   0.02,
+    "segmentation":     0.03,
+}
+
+
+def compute_data_quality(tile_data_availability: list[dict]) -> dict:
+    """Compute data quality score and summary from per-tile availability.
+
+    Returns a dict with:
+      - quality_score: 0.0–1.0 (pixel-weighted across tiles)
+      - quality_grade: A/B/C/D/F
+      - layers_summary: per-layer fraction of tiles that had it
+      - tiles: per-tile availability list
+      - missing_layers: layers that were absent from ALL tiles
+      - available_layers: layers present in ALL tiles
+      - partial_layers: layers present in some but not all tiles
+    """
+    if not tile_data_availability:
+        return {
+            "quality_score": 0.0, "quality_grade": "F",
+            "layers_summary": {}, "tiles": [],
+            "missing_layers": list(_QUALITY_WEIGHTS.keys()),
+            "available_layers": [], "partial_layers": [],
+        }
+
+    layer_keys = list(_QUALITY_WEIGHTS.keys())
+    total_weight = sum(_QUALITY_WEIGHTS.values())
+
+    # Pixel-weighted quality: tiles with more valid pixels count more
+    total_pixels = sum(t.get("valid_pixels", 0) for t in tile_data_availability)
+    if total_pixels == 0:
+        total_pixels = len(tile_data_availability)  # fallback: equal weight
+
+    weighted_score = 0.0
+    layer_counts = {k: 0 for k in layer_keys}
+    n_active_tiles = 0  # tiles that actually had data (valid_pixels > 0 or segmentation)
+
+    for t in tile_data_availability:
+        px = t.get("valid_pixels", 0)
+        if px == 0 and not t.get("segmentation"):
+            continue  # skip empty/skipped tiles for scoring
+        n_active_tiles += 1
+        tile_weight = px / total_pixels if total_pixels > 0 else 1.0 / len(tile_data_availability)
+        tile_score = 0.0
+        for k in layer_keys:
+            if t.get(k):
+                tile_score += _QUALITY_WEIGHTS[k]
+                layer_counts[k] += 1
+        weighted_score += (tile_score / total_weight) * tile_weight
+
+    n_tiles_denom = max(n_active_tiles, 1)
+    layers_summary = {k: round(v / n_tiles_denom, 3) for k, v in layer_counts.items()}
+
+    # Classify layers
+    missing = [k for k, v in layers_summary.items() if v == 0]
+    available = [k for k, v in layers_summary.items() if v >= 1.0]
+    partial = [k for k, v in layers_summary.items() if 0 < v < 1.0]
+
+    score = round(min(1.0, weighted_score), 3)
+    if score >= 0.9:
+        grade = "A"
+    elif score >= 0.75:
+        grade = "B"
+    elif score >= 0.55:
+        grade = "C"
+    elif score >= 0.35:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {
+        "quality_score": score,
+        "quality_grade": grade,
+        "quality_weights": {k: round(v / total_weight, 3) for k, v in _QUALITY_WEIGHTS.items()},
+        "layers_summary": layers_summary,
+        "tiles": tile_data_availability,
+        "n_active_tiles": n_active_tiles,
+        "n_total_tiles": len(tile_data_availability),
+        "missing_layers": missing,
+        "available_layers": available,
+        "partial_layers": partial,
+    }
+
+
 def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                              cadastre_data, terrain_stats, spectral_info,
                              copernicus_info, hansen_info, new_buildings,
                              infrastructure, obs_year, n_tiles=1, tile_km=1.5,
-                             total_seg_pixels=0):
+                             total_seg_pixels=0, tile_data_availability=None):
     """Build JSON summary from tiled segmentation results."""
     import tile_index as ti
     objects = all_objects
@@ -2188,6 +2292,9 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "parcel_segmentation_coverage_pct": round(100*nwa/max(len(parcel_details),1), 1),
         "building_height_coverage_pct": round(100*nbh/max(len(bld_details),1), 1),
         "note": "Full KG tiled segmentation; every parcel/building has elevation + segmentation data."}
+    # --- Data quality ---
+    dq = compute_data_quality(tile_data_availability or [])
+    summary["data_quality"] = dq
     # --- Segment summary (counts only; full points are in GPKG) ---
     seg_type_counts = Counter(obj.obj_type for obj in objects)
     summary["segments"] = {
@@ -2488,6 +2595,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         all_copernicus_info = {}  # for JSON sar/harmonics
         all_hansen_info = {}      # for JSON hansen section
         tile_seg_results = []     # (tile_bbox_3035, labels, objects, transform, shape, ndsm, mask)
+        tile_data_availability = []  # per-tile data source tracking
         total_seg_pixels = 0
         next_obj_id = 1           # global unique obj_id counter
 
@@ -2496,6 +2604,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tile_label = f"tile {tile_idx+1}/{n_tiles}"
             result["step"] = f"tile_{tile_idx+1}"
             _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
+
+            # Per-tile data availability tracker
+            tile_avail = {
+                "tile_index": tile_idx + 1,
+                "bbox_wgs": [round(tw, 5), round(ts, 5), round(te, 5), round(tn, 5)],
+                "dtm": False, "dsm": False, "multi_date_dtm": False,
+                "ortho": False, "copernicus_ndvi": False,
+                "worldcover": False, "sar": False, "harmonics": False,
+                "hansen": False, "cadastre_buildings": False,
+                "infrastructure": False, "terrain": False,
+                "segmentation": False, "n_objects": 0,
+                "valid_pixels": 0,
+            }
 
             tile_geom_wgs = box(tw, ts, te, tn)
             tile_geom_3035 = transform_to_3035(tile_geom_wgs)
@@ -2506,22 +2627,28 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 tdata = raster_io.read_dtm_dsm(tile_geom_3035, ti.DEFAULT_DATASET)
             except Exception as e:
                 log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
+                tile_data_availability.append(tile_avail)
                 continue
             th, tw_ = tdata["shape"]
             tvalid = int(tdata["mask"].sum())
             if tvalid < 100:
                 log.info("KG %s %s: skipping (only %d valid px)", kg_code, tile_label, tvalid)
+                tile_data_availability.append(tile_avail)
                 continue
 
             t_transform = tdata["transform"]
             t_mask = tdata["mask"]
             t_ndsm = tdata["ndsm"]
+            tile_avail["dtm"] = True
+            tile_avail["dsm"] = True
+            tile_avail["valid_pixels"] = tvalid
 
             # --- 3b. Terrain stats for this tile ---
             _report_step("terrain", tile_label)
             try:
                 t_terrain = ta.characterise_terrain(tdata["dtm"], t_mask)
                 terrain_stats_list.append((t_terrain, tvalid))
+                tile_avail["terrain"] = True
             except Exception as e:
                 log.warning("KG %s %s: terrain failed: %s", kg_code, tile_label, e)
 
@@ -2554,6 +2681,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         dtm_dates = dsm_dates = None
             except Exception:
                 dtm_dates = dsm_dates = None
+            if dtm_dates and len(dtm_dates) > 1:
+                tile_avail["multi_date_dtm"] = True
 
             # --- 3d. Orthophoto ---
             _report_step("ortho", tile_label)
@@ -2577,6 +2706,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         log.warning("KG %s %s: ortho timed out", kg_code, tile_label)
             except Exception as e:
                 log.warning("KG %s %s: ortho failed: %s", kg_code, tile_label, e)
+            if spectral is not None:
+                tile_avail["ortho"] = True
 
             # Accumulate spectral info for JSON
             if spectral and spectral.get("ndvi") is not None:
@@ -2651,8 +2782,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         c_breaker["last_failure"] = time.time()
                         _write_circuit_breaker(c_breaker)
 
-            # Accumulate Copernicus info
+            # Accumulate Copernicus info + track availability
             if copernicus_data:
+                if copernicus_data.get("ndvi") is not None:
+                    tile_avail["copernicus_ndvi"] = True
+                if copernicus_data.get("landcover") is not None:
+                    tile_avail["worldcover"] = True
+                if copernicus_data.get("vv") is not None or copernicus_data.get("vh") is not None:
+                    tile_avail["sar"] = True
+                if copernicus_data.get("harmonics") is not None:
+                    tile_avail["harmonics"] = True
                 for band in ['vv', 'vh']:
                     arr = copernicus_data.get(band)
                     if arr is not None:
@@ -2687,6 +2826,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 log.warning("KG %s %s: Hansen failed: %s", kg_code, tile_label, e)
             # Accumulate Hansen
             if hansen_data:
+                tile_avail["hansen"] = True
                 ly = hansen_data.get("loss_year")
                 if ly is not None:
                     all_hansen_info.setdefault("loss_years", []).append(ly)
@@ -2713,6 +2853,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             pairs, out_shape=(th, tw_), transform=t_transform,
                             fill=0, dtype=np.uint8, all_touched=True,
                         ).astype(bool)
+                        tile_avail["cadastre_buildings"] = True
                 except Exception:
                     pass
 
@@ -2720,6 +2861,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             try:
                 from infrastructure_lookup import InfrastructureLookup
                 infra = InfrastructureLookup.for_bbox(tw, ts, te, tn)
+                if infra and len(infra) > 0:
+                    tile_avail["infrastructure"] = True
             except Exception:
                 pass
 
@@ -2735,10 +2878,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 )
             except Exception as e:
                 log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
+                tile_data_availability.append(tile_avail)
                 continue
 
             t_objects = seg_result["objects"]
             t_labels = seg_result["labels"]
+            tile_avail["segmentation"] = True
+            tile_avail["n_objects"] = len(t_objects)
 
             # Remap obj_ids to global unique range
             id_remap = {}
@@ -2818,6 +2964,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             del building_fp_mask, t_mask, t_ndsm
             gc.collect()
 
+            # Record tile data availability
+            tile_data_availability.append(tile_avail)
+
             log.info("KG %s %s: done (%d objects, %d core)",
                      kg_code, tile_label, len(id_remap), len(core_objects))
             _report_step(f"tile_{tile_idx+1}",
@@ -2857,7 +3006,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             all_spectral_info, all_copernicus_info, all_hansen_info,
             all_new_buildings, all_infrastructure, obs_year,
             n_tiles=n_tiles, tile_km=tile_km,
-            total_seg_pixels=total_seg_pixels)
+            total_seg_pixels=total_seg_pixels,
+            tile_data_availability=tile_data_availability)
+
+        # Store quality info in result for logging / Zenodo
+        dq = json_summary.get("data_quality", {})
+        result["quality_score"] = dq.get("quality_score", 0)
+        result["quality_grade"] = dq.get("quality_grade", "F")
+        result["available_layers"] = dq.get("available_layers", [])
+        result["missing_layers"] = dq.get("missing_layers", [])
 
         json_path = str(JSON_DIR / f"{kg_code}.json")
         with open(json_path, 'w') as f:
@@ -2976,6 +3133,7 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                 "temporal_change", "phenology",
                 "hansen", "new_buildings", "infrastructure",
                 "parcels", "building_footprints", "methods", "coverage",
+                "data_quality",
             ]
             for k in required_keys:
                 if k not in js:
@@ -3199,6 +3357,14 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
     pheno = js.get("phenology", {})
     if pheno:
         log.info("  phenology: %s", dict(pheno))
+    # Data quality
+    dq = js.get("data_quality", {})
+    if dq:
+        log.info("  quality: %.1f%% grade=%s | available=%s | missing=%s",
+                 (dq.get("quality_score", 0)) * 100,
+                 dq.get("quality_grade", "?"),
+                 ",".join(dq.get("available_layers", [])) or "none",
+                 ",".join(dq.get("missing_layers", [])) or "none")
 
 
 # ---------------------------------------------------------------------------
@@ -3206,12 +3372,18 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
 # ---------------------------------------------------------------------------
 
 def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
-                        manifest) -> dict:
+                        manifest, quality_score: float = 0.0,
+                        quality_grade: str = "",
+                        available_layers: list = None,
+                        missing_layers: list = None) -> dict:
     """Upload KG files to Zenodo, verify, delete local GPKGs."""
     from zenodo_client import Client, landscape_metadata
 
     client = Client(token=ZENODO_TOKEN)
     upload_stats = {"uploaded": [], "errors": [], "total_bytes": 0}
+
+    _avail = available_layers or []
+    _miss = missing_layers or []
 
     for file_key, local_path in files.items():
         if not local_path or not os.path.exists(local_path):
@@ -3220,8 +3392,11 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
         zenodo_key = f"{kg_code}_{file_key}"
         file_type = "gpkg" if file_key.endswith("gpkg") else "json"
 
-        meta_func = lambda k, fn, v, _kg=kg_code, _name=kg_name, _ft=file_type: \
-            landscape_metadata(_kg, _name, v, _ft)
+        meta_func = lambda k, fn, v, _kg=kg_code, _name=kg_name, _ft=file_type, \
+            _qs=quality_score, _qg=quality_grade, _al=_avail, _ml=_miss: \
+            landscape_metadata(_kg, _name, v, _ft,
+                               quality_score=_qs, quality_grade=_qg,
+                               available_layers=_al, missing_layers=_ml)
 
         try:
             fsize = os.path.getsize(local_path)
@@ -3686,7 +3861,11 @@ def main():
                 progress.save()
 
                 upload_stats = upload_kg_to_zenodo(
-                    kg_code, kg_name, result["files"], manifest)
+                    kg_code, kg_name, result["files"], manifest,
+                    quality_score=result.get("quality_score", 0),
+                    quality_grade=result.get("quality_grade", ""),
+                    available_layers=result.get("available_layers"),
+                    missing_layers=result.get("missing_layers"))
 
                 if upload_stats["errors"]:
                     for err in upload_stats["errors"]:
@@ -3701,12 +3880,15 @@ def main():
                     n_new_buildings=result.get("n_new_buildings", 0),
                     n_infrastructure=result.get("n_infrastructure", 0),
                 )
+                _qg = result.get('quality_grade', '')
+                _qs = result.get('quality_score', 0)
                 progress.add_log(
                     "success",
                     f"KG {kg_code} done in {elapsed_kg:.0f}s "
                     f"({result.get('n_segments', 0)} segs, "
                     f"{result.get('n_parcels', 0)} par, "
-                    f"{result.get('n_buildings', 0)} bldg)",
+                    f"{result.get('n_buildings', 0)} bldg, "
+                    f"quality={_qs:.0%} {_qg})",
                     kg_code,
                 )
             else:

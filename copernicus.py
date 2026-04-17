@@ -447,10 +447,19 @@ def _read_geotiff(path: Union[str, pathlib.Path]) -> Tuple[np.ndarray, Any, Any]
         path = tifs[0]
         logger.debug("Using GeoTIFF from directory: %s", path)
 
-    with rasterio.open(str(path)) as ds:
-        data = ds.read()  # (bands, H, W)
-        transform = ds.transform
-        crs = ds.crs
+    import logging as _logging
+    # Suppress harmless GDAL warnings about Photometric/ExtraSamples mismatch
+    # in Copernicus-produced multi-band TIFFs (VV+VH SAR, etc.)
+    _rasterio_logger = _logging.getLogger('rasterio._env')
+    _prev_level = _rasterio_logger.level
+    _rasterio_logger.setLevel(_logging.ERROR)
+    try:
+        with rasterio.open(str(path)) as ds:
+            data = ds.read()  # (bands, H, W)
+            transform = ds.transform
+            crs = ds.crs
+    finally:
+        _rasterio_logger.setLevel(_prev_level)
 
     if data.shape[0] == 1:
         data = data[0]  # squeeze to (H, W)
@@ -463,11 +472,14 @@ def _run_datacube(
     output_path: pathlib.Path,
     title: str = "copernicus_job",
     format: str = "GTiff",
+    bbox: Optional[Dict[str, float]] = None,
 ) -> pathlib.Path:
     """Download a datacube result to *output_path*.
 
     Uses synchronous ``download()`` for small cubes and batch-job
-    ``execute_batch()`` for larger ones.
+    ``execute_batch()`` for larger ones.  When *bbox* is provided,
+    sync is skipped if the area exceeds ``SYNC_AREA_THRESHOLD``
+    (avoids a 3-minute timeout that always fails for grid tiles).
 
     Downloads go to a temp file first and are atomically renamed on
     success.  This prevents 0-byte / partial files from poisoning
@@ -484,6 +496,15 @@ def _run_datacube(
         except OSError:
             pass
 
+    # Skip sync for large areas — always times out, wastes 3 minutes
+    skip_sync = False
+    if bbox is not None:
+        area = _bbox_area_deg(bbox)
+        if area > SYNC_AREA_THRESHOLD:
+            logger.info("Bbox area %.4f° > threshold %.4f° — skipping sync, going straight to batch for %s",
+                        area, SYNC_AREA_THRESHOLD, title)
+            skip_sync = True
+
     # Try synchronous download first (faster for small areas)
     # Retry once on 429 Too Many Requests
     # Use a thread with timeout to avoid blocking workers indefinitely
@@ -491,41 +512,42 @@ def _run_datacube(
     import concurrent.futures
     SYNC_DOWNLOAD_TIMEOUT = 180  # 3 minutes max for synchronous download
 
-    for attempt in range(2):
-        logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
-                    output_path, SYNC_DOWNLOAD_TIMEOUT)
-        try:
-            _cleanup_tmp()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(datacube.download, str(tmp_path), format)
-                future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
-            # Verify non-empty before committing
-            if tmp_path.exists() and tmp_path.stat().st_size > 0:
-                tmp_path.rename(output_path)
-                logger.info("Synchronous download complete: %s", output_path)
-                return output_path
-            else:
+    if not skip_sync:
+        for attempt in range(2):
+            logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
+                        output_path, SYNC_DOWNLOAD_TIMEOUT)
+            try:
                 _cleanup_tmp()
-                logger.warning("Synchronous download produced empty file, falling back to batch job")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(datacube.download, str(tmp_path), format)
+                    future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+                # Verify non-empty before committing
+                if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                    tmp_path.rename(output_path)
+                    logger.info("Synchronous download complete: %s", output_path)
+                    return output_path
+                else:
+                    _cleanup_tmp()
+                    logger.warning("Synchronous download produced empty file, falling back to batch job")
+                    break
+            except concurrent.futures.TimeoutError:
+                _cleanup_tmp()
+                logger.warning("Synchronous download timed out after %ds, falling back to batch job",
+                              SYNC_DOWNLOAD_TIMEOUT)
                 break
-        except concurrent.futures.TimeoutError:
-            _cleanup_tmp()
-            logger.warning("Synchronous download timed out after %ds, falling back to batch job",
-                          SYNC_DOWNLOAD_TIMEOUT)
-            break
-        except Exception as exc:
-            _cleanup_tmp()
-            _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
-            exc_str = str(exc)
-            if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
-                logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
-                              '429' if '429' in exc_str else '503')
-                rotate_credentials()
-                _time.sleep(5)
-                continue
-            # If sync fails (e.g. too large), fall back to batch
-            logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
-            break
+            except Exception as exc:
+                _cleanup_tmp()
+                _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
+                exc_str = str(exc)
+                if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
+                    logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
+                                  '429' if '429' in exc_str else '503')
+                    rotate_credentials()
+                    _time.sleep(5)
+                    continue
+                # If sync fails (e.g. too large), fall back to batch
+                logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
+                break
 
     # Batch job fallback
     logger.info("Submitting batch job: %s", title)
@@ -635,7 +657,7 @@ def get_ndvi_composite(
 
     # Download
     try:
-        _run_datacube(ndvi_composite, cache_file, title=f"NDVI composite {year}")
+        _run_datacube(ndvi_composite, cache_file, title=f"NDVI composite {year}", bbox=bbox)
     except Exception as exc:
         logger.error("Failed to download NDVI composite: %s", exc)
         raise RuntimeError(f"NDVI composite download failed: {exc}") from exc
@@ -1101,7 +1123,7 @@ def get_land_cover(
     lc_flat = lc.reduce_dimension(dimension="t", reducer="first")
 
     try:
-        _run_datacube(lc_flat, cache_file, title="ESA WorldCover")
+        _run_datacube(lc_flat, cache_file, title="ESA WorldCover", bbox=bbox)
     except Exception as exc:
         logger.error("Failed to download land cover: %s", exc)
         raise RuntimeError(f"Land cover download failed: {exc}") from exc
@@ -1185,7 +1207,7 @@ def get_sar_backscatter(
     )
 
     try:
-        _run_datacube(sar_composite, cache_file, title="SAR backscatter")
+        _run_datacube(sar_composite, cache_file, title="SAR backscatter", bbox=bbox)
     except Exception as exc:
         logger.error("Failed to download SAR backscatter: %s", exc)
         raise RuntimeError(f"SAR backscatter download failed: {exc}") from exc
@@ -1202,10 +1224,17 @@ def _parse_sar_tiff(
     if rasterio is None:
         raise ImportError("rasterio is required")
 
-    with rasterio.open(str(path)) as ds:
-        data = ds.read()  # (bands, H, W)
-        transform = ds.transform
-        crs = ds.crs
+    import logging as _logging
+    _rasterio_logger = _logging.getLogger('rasterio._env')
+    _prev_level = _rasterio_logger.level
+    _rasterio_logger.setLevel(_logging.ERROR)
+    try:
+        with rasterio.open(str(path)) as ds:
+            data = ds.read()  # (bands, H, W)
+            transform = ds.transform
+            crs = ds.crs
+    finally:
+        _rasterio_logger.setLevel(_prev_level)
 
     # Bands: VV=0, VH=1
     vv = data[0].astype(np.float32) if data.ndim == 3 and data.shape[0] >= 1 else data.astype(np.float32)

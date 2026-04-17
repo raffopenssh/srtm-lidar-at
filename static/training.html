@@ -121,18 +121,21 @@ let countdown = 15;
 function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
 function pct(v, d=2) { return v != null ? (v * 100).toFixed(d) + '%' : '—'; }
 
-// Best OOB from checkpoint curve (mature class count only)
-let _bestFromCurve = {oob: null, kgs: null};
+// Best from checkpoint curve: uses composite score (mature class count only)
+let _bestFromCurve = {oob: null, composite: null, kgs: null};
 function computeBestFromCurve(curve) {
   if (!curve || !curve.length) return;
   const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
-  let best = {oob: null, kgs: null};
+  let best = {oob: null, composite: null, kgs: null, mean_cls: null, min_cls: null};
   curve.forEach(r => {
     if ((r.n_classes || 0) < maxCls) return;
-    const med = r.oob_median ?? r.oob ?? 0;
-    if (best.oob === null || med > best.oob) {
-      best.oob = med;
+    const comp = r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0;
+    if (best.composite === null || comp > best.composite) {
+      best.composite = comp;
+      best.oob = r.oob_median ?? r.oob ?? 0;
       best.kgs = r.n_kgs;
+      best.mean_cls = r.mean_class_median ?? null;
+      best.min_cls = r.min_class_median ?? null;
     }
   });
   _bestFromCurve = best;
@@ -177,15 +180,18 @@ function renderCards(d) {
     <div class="detail">${fmt(m.n_train)} samples · ${m.n_classes || '—'} classes</div>
   </div>`;
 
-  // Best OOB (mature) — derived from checkpoint curve, not monitor state
+  // Best (mature) — uses composite score from checkpoint curve
   const bestCurve = _bestFromCurve;
+  const bestComp = bestCurve.composite;
   const bestOob = bestCurve.oob || mon.mature_peak_oob || mon.best_oob;
   const bestKgs = bestCurve.kgs || mon.mature_peak_n_kgs || mon.best_n_kgs;
   const kgsSincePeak = bestKgs && mon.last_n_kgs ? mon.last_n_kgs - bestKgs : mon.kgs_since_peak;
+  const meanClsStr = bestCurve.mean_cls ? ` · avg ${(bestCurve.mean_cls * 100).toFixed(1)}%` : '';
+  const minClsStr = bestCurve.min_cls ? ` · worst ${(bestCurve.min_cls * 100).toFixed(1)}%` : '';
   html += `<div class="card">
-    <div class="label">Best OOB (mature)</div>
-    <div class="value status-improving">${bestOob ? (bestOob * 100).toFixed(2) + '%' : '—'}</div>
-    <div class="detail">at ${bestKgs || '—'} KGs${kgsSincePeak ? ' · ' + kgsSincePeak + ' KGs ago' : ''}</div>
+    <div class="label">Best Composite (mature)</div>
+    <div class="value status-improving">${bestComp ? (bestComp * 100).toFixed(2) + '%' : bestOob ? (bestOob * 100).toFixed(2) + '%' : '—'}</div>
+    <div class="detail">OOB ${bestOob ? (bestOob * 100).toFixed(2) + '%' : '—'} at ${bestKgs || '—'} KGs${meanClsStr}${minClsStr}</div>
   </div>`;
 
   // Monitor status
@@ -215,25 +221,31 @@ function renderChart(curve) {
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
   ctx.scale(2, 2);
 
-  const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
-  const mins = curve.map(r => r.oob_min ?? r.oob_median ?? r.oob ?? 0);
-  const maxs = curve.map(r => r.oob_max ?? r.oob_median ?? r.oob ?? 0);
+  // Data arrays
+  const compMeds = curve.map(r => r.composite_median ?? r.oob_median ?? r.oob ?? 0);
+  const compMins = curve.map(r => r.composite_min ?? r.composite_median ?? compMeds[0]);
+  const compMaxs = curve.map(r => r.composite_max ?? r.composite_median ?? compMeds[0]);
+  const oobMeds = curve.map(r => r.oob_median ?? r.oob ?? 0);
+  const oobMins = curve.map(r => r.oob_min ?? oobMeds[0]);
+  const oobMaxs = curve.map(r => r.oob_max ?? oobMeds[0]);
   const kgs = curve.map(r => r.n_kgs);
-  const allVals = [...mins, ...maxs];
-  const minOob = Math.floor(Math.min(...allVals) * 1000) / 1000 - 0.005;
-  const maxOob = Math.ceil(Math.max(...allVals) * 1000) / 1000 + 0.005;
+  const hasSpread = curve.some(r => (r.n_seeds || 1) > 1);
+
+  // Y-axis scale: encompass both metrics with all seed spread
+  const allVals = [...compMins, ...compMaxs, ...oobMins, ...oobMaxs];
+  const minVal = Math.floor(Math.min(...allVals) * 1000) / 1000 - 0.01;
+  const maxVal = Math.ceil(Math.max(...allVals) * 1000) / 1000 + 0.01;
   const pad = { top: 10, right: 20, bottom: 30, left: 50 };
   const cw = W - pad.left - pad.right;
   const ch = H - pad.top - pad.bottom;
-  const hasSpread = curve.some(r => (r.n_seeds || 1) > 1);
 
   function x(i) { return pad.left + (i / Math.max(1, curve.length - 1)) * cw; }
-  function y(v) { return pad.top + (1 - (v - minOob) / (maxOob - minOob)) * ch; }
+  function y(v) { return pad.top + (1 - (v - minVal) / (maxVal - minVal)) * ch; }
 
   // Grid
   ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
   for (let i = 0; i <= 6; i++) {
-    const v = minOob + (maxOob - minOob) * (i / 6);
+    const v = minVal + (maxVal - minVal) * (i / 6);
     const yy = y(v);
     ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
     ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
@@ -246,15 +258,15 @@ function renderChart(curve) {
   }
   ctx.fillText('KGs', W / 2, H - 4);
 
-  // Min-max band
+  // --- OOB seed spread band (yellow) ---
   if (hasSpread) {
-    ctx.fillStyle = 'rgba(88,166,255,0.10)';
+    ctx.fillStyle = 'rgba(210,153,34,0.10)';
     ctx.beginPath();
-    curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(maxs[i])) : ctx.lineTo(x(i), y(maxs[i])); });
-    for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(mins[i]));
+    curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(oobMaxs[i])) : ctx.lineTo(x(i), y(oobMaxs[i])); });
+    for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(oobMins[i]));
     ctx.closePath(); ctx.fill();
-    // Individual seed dots
-    ctx.fillStyle = 'rgba(139,148,158,0.35)';
+    // OOB seed dots
+    ctx.fillStyle = 'rgba(210,153,34,0.30)';
     curve.forEach((r, i) => {
       (r.oob_all || []).forEach(o => {
         ctx.beginPath(); ctx.arc(x(i), y(o), 1.5, 0, Math.PI * 2); ctx.fill();
@@ -262,36 +274,60 @@ function renderChart(curve) {
     });
   }
 
-  // Key points
+  // --- Composite seed spread band (green) ---
+  if (hasSpread) {
+    ctx.fillStyle = 'rgba(63,185,80,0.12)';
+    ctx.beginPath();
+    curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(compMaxs[i])) : ctx.lineTo(x(i), y(compMaxs[i])); });
+    for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(compMins[i]));
+    ctx.closePath(); ctx.fill();
+    // Composite seed dots
+    ctx.fillStyle = 'rgba(63,185,80,0.30)';
+    curve.forEach((r, i) => {
+      (r.composite_all || []).forEach(c => {
+        ctx.beginPath(); ctx.arc(x(i), y(c), 1.5, 0, Math.PI * 2); ctx.fill();
+      });
+    });
+  }
+
+  // Key points (based on composite median at max class count)
   const maxClsChart = Math.max(...curve.map(r => r.n_classes || 0));
-  const matureMeds = medians.map((m, i) => (curve[i].n_classes || 0) >= maxClsChart ? m : -1);
-  const bestIdx = matureMeds.indexOf(Math.max(...matureMeds));
+  const matureComps = compMeds.map((c, i) => (curve[i].n_classes || 0) >= maxClsChart ? c : -1);
+  const bestIdx = matureComps.indexOf(Math.max(...matureComps));
   const halfIdx = Math.floor(curve.length * 0.3);
-  const secondHalf = medians.slice(halfIdx);
-  const troughVal = secondHalf.length ? Math.min(...secondHalf) : medians[0];
+  const secondHalf = compMeds.slice(halfIdx);
+  const troughVal = secondHalf.length ? Math.min(...secondHalf) : compMeds[0];
   const troughIdx = halfIdx + secondHalf.indexOf(troughVal);
 
-  // Median line
-  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
+  // OOB median line (solid yellow)
+  ctx.strokeStyle = '#d29922'; ctx.lineWidth = 2;
   ctx.beginPath();
-  curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(medians[i])) : ctx.lineTo(x(i), y(medians[i])); });
+  curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(oobMeds[i])) : ctx.lineTo(x(i), y(oobMeds[i])); });
   ctx.stroke();
 
-  // Dots
+  // Composite median line (solid green, main)
+  ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  curve.forEach((_, i) => { i === 0 ? ctx.moveTo(x(i), y(compMeds[i])) : ctx.lineTo(x(i), y(compMeds[i])); });
+  ctx.stroke();
+
+  // Dots on composite median
   curve.forEach((_, i) => {
-    ctx.beginPath(); ctx.arc(x(i), y(medians[i]), 3, 0, Math.PI * 2);
-    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; ctx.fill(); }
-    else if (i === troughIdx && troughIdx !== bestIdx) { ctx.fillStyle = '#d29922'; ctx.fill(); }
-    else { ctx.fillStyle = '#58a6ff'; ctx.fill(); }
+    ctx.beginPath(); ctx.arc(x(i), y(compMeds[i]), 3, 0, Math.PI * 2);
+    if (i === bestIdx) { ctx.fillStyle = '#3fb950'; }
+    else if (i === troughIdx && troughIdx !== bestIdx) { ctx.fillStyle = '#d29922'; }
+    else { ctx.fillStyle = '#58a6ff'; }
+    ctx.fill();
   });
 
   // Annotations
-  ctx.font = '10px monospace'; ctx.fillStyle = '#3fb950';
-  const lbl = hasSpread ? ' (median)' : '';
-  ctx.fillText((medians[bestIdx]*100).toFixed(2) + '%' + lbl + ' @ ' + kgs[bestIdx] + ' KGs', x(bestIdx), y(maxs[bestIdx]) - 10);
+  ctx.font = '10px monospace'; ctx.textAlign = 'center';
+  ctx.fillStyle = '#3fb950';
+  ctx.fillText('comp ' + (compMeds[bestIdx]*100).toFixed(2) + '% / OOB ' + (oobMeds[bestIdx]*100).toFixed(2) + '% @ ' + kgs[bestIdx] + ' KGs',
+    x(bestIdx), y(compMaxs[bestIdx]) - 10);
   if (troughIdx !== bestIdx) {
     ctx.fillStyle = '#d29922';
-    ctx.fillText('Trough: ' + (medians[troughIdx]*100).toFixed(2) + '%', x(troughIdx), y(mins[troughIdx]) + 16);
+    ctx.fillText('Trough: ' + (compMeds[troughIdx]*100).toFixed(2) + '%', x(troughIdx), y(compMins[troughIdx]) + 16);
   }
 
   // Class change markers
@@ -308,17 +344,23 @@ function renderChart(curve) {
   });
 
   // Legend
+  const lx = W - pad.right - 180, ly = pad.top + 8;
+  ctx.font = '9px monospace'; ctx.textAlign = 'left';
+  // Composite
+  ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(lx, ly + 5); ctx.lineTo(lx + 12, ly + 5); ctx.stroke();
+  ctx.fillStyle = '#8b949e'; ctx.fillText('composite median', lx + 16, ly + 9);
+  // OOB
+  ctx.strokeStyle = '#d29922'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(lx, ly + 20); ctx.lineTo(lx + 12, ly + 20); ctx.stroke();
+  ctx.fillStyle = '#8b949e'; ctx.fillText('OOB median', lx + 16, ly + 24);
   if (hasSpread) {
-    const lx = W - pad.right - 160, ly = pad.top + 8;
-    ctx.font = '9px monospace'; ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgba(88,166,255,0.15)'; ctx.fillRect(lx, ly, 10, 10);
-    ctx.fillStyle = '#8b949e'; ctx.fillText('min\u2013max range', lx + 14, ly + 9);
-    ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(lx, ly + 20); ctx.lineTo(lx + 10, ly + 20); ctx.stroke();
-    ctx.fillStyle = '#8b949e'; ctx.fillText('median', lx + 14, ly + 24);
-    ctx.fillStyle = 'rgba(139,148,158,0.5)';
-    ctx.beginPath(); ctx.arc(lx + 5, ly + 35, 2, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#8b949e'; ctx.fillText('individual seeds', lx + 14, ly + 38);
+    // Composite band
+    ctx.fillStyle = 'rgba(63,185,80,0.20)'; ctx.fillRect(lx, ly + 31, 12, 8);
+    ctx.fillStyle = '#8b949e'; ctx.fillText('composite seed range', lx + 16, ly + 39);
+    // OOB band
+    ctx.fillStyle = 'rgba(210,153,34,0.18)'; ctx.fillRect(lx, ly + 46, 12, 8);
+    ctx.fillStyle = '#8b949e'; ctx.fillText('OOB seed range', lx + 16, ly + 54);
   }
 }
 
@@ -328,15 +370,16 @@ let expandedKgs = null;
 
 const ALL_TYPES = [
   'tree','shrub','grass','hedge','water','roof','greenhouse','solar_panel','fence','wall','mast',
+  'wind_turbine','substation',
   'road','path','parking','bridge','crop','orchard','vineyard','garden','bare_soil','rock',
-  'excavation','fill','tree_loss','construction'
+  'earthwork','excavation','fill','tree_loss','construction'
 ];
 const TYPE_GROUPS = {
   'Vegetation': ['tree','shrub','grass','hedge','garden','orchard','vineyard','crop'],
   'Water': ['water'],
-  'Buildings & Structures': ['roof','greenhouse','solar_panel','fence','wall','mast'],
+  'Buildings & Structures': ['roof','greenhouse','solar_panel','fence','wall','mast','wind_turbine','substation'],
   'Transport': ['road','path','parking','bridge'],
-  'Terrain': ['bare_soil','rock','excavation','fill'],
+  'Terrain': ['bare_soil','rock','earthwork','excavation','fill'],
   'Change': ['tree_loss','construction'],
 };
 
@@ -353,8 +396,11 @@ function buildDetailHTML(nKgs, colSpan) {
 
   let h = `<td colspan="${colSpan}"><div class="dp">`;
 
-  // Meta line
-  h += `<div class="dp-meta"><b>${d.n_estimators}</b> trees · depth <b>${d.max_depth}</b> · min leaf <b>${d.min_samples_leaf}</b> · <b>${d.n_seeds}</b> seed${d.n_seeds>1?'s':''}</div>`;
+  // Meta line with composite breakdown
+  const compStr = d.composite != null ? ` · composite <b>${(d.composite*100).toFixed(2)}%</b>` : '';
+  const meanClsStr = d.mean_class_oob != null ? ` · mean cls <b>${(d.mean_class_oob*100).toFixed(1)}%</b>` : '';
+  const minClsStr = d.min_class_oob != null ? ` · worst cls <b>${(d.min_class_oob*100).toFixed(1)}%</b>` : '';
+  h += `<div class="dp-meta"><b>${d.n_estimators}</b> trees · depth <b>${d.max_depth}</b> · min leaf <b>${d.min_samples_leaf}</b> · <b>${d.n_seeds}</b> seed${d.n_seeds>1?'s':''}${compStr}${meanClsStr}${minClsStr}</div>`;
 
   // Per-class OOB as tags grouped by category
   const classOob = d.per_class_oob || {};
@@ -420,36 +466,41 @@ function renderCurveTable(curve) {
   if (!curve || curve.length === 0) return;
   const tbody = document.querySelector('#curveTable tbody');
   const medians = curve.map(r => r.oob_median ?? r.oob ?? 0);
+  const composites = curve.map(r => r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0);
   const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
-  const matureMedians = curve.map(r => (r.n_classes || 0) >= maxCls ? (r.oob_median ?? r.oob ?? 0) : -1);
-  const bestMedian = Math.max(...matureMedians);
+  // BEST = highest composite at max class count
+  const matureComps = curve.map(r => (r.n_classes || 0) >= maxCls ? (r.composite_max ?? r.composite_median ?? r.oob_median ?? r.oob ?? 0) : -1);
+  const bestComp = Math.max(...matureComps);
   const halfIdx = Math.floor(curve.length * 0.3);
-  const secondHalf = medians.slice(halfIdx);
-  const troughMedian = secondHalf.length > 0 ? Math.min(...secondHalf) : -1;
+  const secondHalf = composites.slice(halfIdx);
+  const troughComp = secondHalf.length > 0 ? Math.min(...secondHalf) : -1;
   const hasSeeds = curve.some(r => (r.n_seeds || 1) > 1);
 
   // Update header
   const thead = document.querySelector('#curveTable thead tr');
-  if (hasSeeds) thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB (median)</th><th>Range</th><th>Seeds</th><th></th>';
-  else thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB</th><th></th>';
+  if (hasSeeds) thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB (median)</th><th>Composite</th><th>Avg/Worst cls</th><th>Range</th><th>Seeds</th><th></th>';
+  else thead.innerHTML = '<th>KGs</th><th>Samples</th><th>Cls</th><th>OOB</th><th>Composite</th><th></th>';
 
   let prevCls = 0;
-  let prevOob = null;
+  let prevComp = null;
   let html = '';
   curve.forEach((r, idx) => {
     const med = r.oob_median ?? r.oob ?? 0;
+    const comp = composites[idx];
     const lo = r.oob_min ?? med;
     const hi = r.oob_max ?? med;
     const seeds = r.n_seeds || 1;
+    const meanCls = r.mean_class_median;
+    const minCls = r.min_class_median;
     let cls = '';
     let ann = '';
     if (r.n_classes > prevCls && prevCls > 0) { ann += '\u2190 +class\u2192' + r.n_classes; }
-    if (med === bestMedian) { cls = 'best'; ann = '\u2190 BEST' + (ann ? ' ' + ann : ''); }
-    else if (med === troughMedian && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough' + (ann ? ' ' + ann : ''); }
-    if (prevOob !== null && med > prevOob + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '\u2191'; }
-    if (prevOob !== null && med < prevOob - 0.002) { ann += (ann ? ' ' : '') + '\u2193'; }
+    if (comp === bestComp && (r.n_classes || 0) >= maxCls) { cls = 'best'; ann = '\u2190 BEST' + (ann ? ' ' + ann : ''); }
+    else if (comp === troughComp && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough' + (ann ? ' ' + ann : ''); }
+    if (prevComp !== null && comp > prevComp + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '\u2191'; }
+    if (prevComp !== null && comp < prevComp - 0.002) { ann += (ann ? ' ' : '') + '\u2193'; }
 
-    const barW = Math.max(5, ((med - 0.70) / 0.20) * 100);
+    const barW = Math.max(5, ((comp - 0.50) / 0.30) * 100);
     const barColor = cls === 'best' ? 'var(--green)' : cls === 'trough' ? 'var(--yellow)' : 'var(--blue)';
     const spread = (hi - lo) * 100;
     const expandedCls = (expandedKgs === r.n_kgs) ? ' expanded' : '';
@@ -458,8 +509,11 @@ function renderCurveTable(curve) {
     html += `<td>${r.n_kgs}</td>`;
     html += `<td>${r.n_samples.toLocaleString()}</td>`;
     html += `<td>${r.n_classes}</td>`;
-    html += `<td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(med * 100).toFixed(2)}%</td>`;
+    html += `<td>${(med * 100).toFixed(2)}%</td>`;
+    html += `<td><span class="oob-bar" style="width:${barW}px;background:${barColor}"></span>${(comp * 100).toFixed(2)}%</td>`;
     if (hasSeeds) {
+      const clsDetail = meanCls != null ? `${(meanCls*100).toFixed(1)}% / ${minCls != null ? (minCls*100).toFixed(1)+'%' : '\u2014'}` : '\u2014';
+      html += `<td style="color:var(--dim);font-size:11px">${clsDetail}</td>`;
       html += `<td style="color:var(--dim);font-size:11px">${spread > 0 ? '\u00b1' + (spread/2).toFixed(2) + '%' : '\u2014'}</td>`;
       const target = r.n_kgs <= 30 ? 5 : r.n_kgs <= 60 ? 3 : 1;
       const denom = seeds >= target ? seeds : target;
@@ -469,12 +523,12 @@ function renderCurveTable(curve) {
 
     // Re-insert detail row if this was expanded
     if (expandedKgs === r.n_kgs) {
-      const colSpan = hasSeeds ? 7 : 5;
+      const colSpan = hasSeeds ? 9 : 6;
       html += `<tr class="detail-row" data-kgs="${r.n_kgs}">${buildDetailHTML(r.n_kgs, colSpan)}</tr>`;
     }
 
     prevCls = r.n_classes;
-    prevOob = med;
+    prevComp = comp;
   });
   tbody.innerHTML = html;
 

@@ -47,6 +47,23 @@ def seeds_for_n_kgs(n_kgs):
     return [0]
 
 
+def composite_score(oob, per_class_oob):
+    """Composite quality score: rewards balanced per-class accuracy.
+
+    Formula: 0.4 * OOB + 0.35 * mean_per_class + 0.25 * worst_class
+
+    A model with 75% OOB but all classes >= 50% beats one with 77% OOB
+    where rock/earthwork are 0%. The worst-class term penalises models
+    that sacrifice rare classes for overall accuracy.
+    """
+    if not per_class_oob:
+        return oob  # fallback to raw OOB
+    vals = list(per_class_oob.values())
+    mean_cls = sum(vals) / len(vals)
+    min_cls = min(vals)
+    return 0.4 * oob + 0.35 * mean_cls + 0.25 * min_cls
+
+
 
 def load_checkpoints():
     """Load all checkpoint files, return list of (kg_code, features, labels)."""
@@ -136,11 +153,17 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
         if mask.sum() > 0:
             per_class[c] = float((pred_labels[mask] == c).mean())
 
+    oob_val = float(rf.oob_score_)
+    comp = composite_score(oob_val, per_class)
+
     return {
         "n_kgs": n,
         "n_samples": len(X),
         "n_classes": n_classes,
-        "oob": float(rf.oob_score_),
+        "oob": oob_val,
+        "composite": comp,
+        "mean_class_oob": sum(per_class.values()) / len(per_class) if per_class else 0.0,
+        "min_class_oob": min(per_class.values()) if per_class else 0.0,
         "top5_features": top5,
         "all_importances": importances,
         "per_class_oob": per_class,
@@ -204,6 +227,10 @@ def _save_best_model(rf, stats, seed):
         'classes': stats['classes'],
         'n_train': stats['n_samples'],
         'oob_score': stats['oob'],
+        'composite_score': stats['composite'],
+        'mean_class_oob': stats['mean_class_oob'],
+        'min_class_oob': stats['min_class_oob'],
+        'per_class_oob': stats['per_class_oob'],
         'feature_importances': stats['all_importances'],
         'feature_keys': FEATURE_KEYS,
         'trained_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'),
@@ -211,8 +238,8 @@ def _save_best_model(rf, stats, seed):
         'best_seed': seed,
     }
     META_PATH.write_text(json.dumps(meta, indent=2))
-    log.info('  Saved live model to %s (OOB=%.4f, %d KGs, seed=%d)',
-             MODEL_PATH, stats['oob'], stats['n_kgs'], seed)
+    log.info('  Saved live model to %s (composite=%.4f, OOB=%.4f, %d KGs, seed=%d)',
+             MODEL_PATH, stats['composite'], stats['oob'], stats['n_kgs'], seed)
 
     # Backup copy
     shutil.copy2(MODEL_PATH, BEST_DIR / 'rf_model.joblib')
@@ -221,8 +248,10 @@ def _save_best_model(rf, stats, seed):
     # Append to best.log
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     with open(BEST_DIR / 'best.log', 'a') as f:
-        f.write(f"{now} NEW BEST: OOB={stats['oob']:.6f} kgs={stats['n_kgs']} "
-                f"samples={stats['n_samples']} classes={stats['n_classes']} seed={seed}\n")
+        f.write(f"{now} NEW BEST: composite={stats['composite']:.6f} OOB={stats['oob']:.6f} "
+                f"mean_cls={stats['mean_class_oob']:.4f} min_cls={stats['min_class_oob']:.4f} "
+                f"kgs={stats['n_kgs']} samples={stats['n_samples']} "
+                f"classes={stats['n_classes']} seed={seed}\n")
     log.info('  Backup saved to %s/', BEST_DIR)
 
 
@@ -239,8 +268,9 @@ def _run_curve_locked(step=5):
 
     CURVE_CSV.parent.mkdir(parents=True, exist_ok=True)
 
-    # CSV columns now include seed
+    # CSV columns now include seed, composite, per-class summary
     HEADER = ["n_kgs", "seed", "n_samples", "n_classes", "oob",
+              "composite", "mean_class_oob", "min_class_oob",
               "top_feature", "top_importance", "train_time_s"]
 
     # Read existing rows to know what's done
@@ -272,24 +302,29 @@ def _run_curve_locked(step=5):
         except Exception:
             pass
 
-    # Migrate old CSV without seed column: rewrite with seed=0
+    # Migrate old CSV without seed or composite columns: rewrite
     if CURVE_CSV.exists() and existing:
         try:
             with open(CURVE_CSV) as f:
                 reader = csv.DictReader(f)
-                if "seed" not in (reader.fieldnames or []):
+                fields = reader.fieldnames or []
+                if "seed" not in fields or "composite" not in fields:
                     rows = list(csv.DictReader(open(CURVE_CSV)))
-                    log.info("Migrating %d old rows (adding seed=0)", len(rows))
+                    log.info("Migrating %d old rows (adding missing columns)", len(rows))
                     with open(CURVE_CSV, "w", newline="") as wf:
                         w = csv.writer(wf)
                         w.writerow(HEADER)
                         for r in rows:
-                            w.writerow([r["n_kgs"], 0, r["n_samples"],
-                                        r["n_classes"], r["oob"],
-                                        r.get("top_feature", ""),
-                                        r.get("top_importance", ""),
-                                        r.get("train_time_s", "")])
-                    existing = {(int(r["n_kgs"]), 0) for r in rows}
+                            w.writerow([
+                                r["n_kgs"], r.get("seed", 0), r["n_samples"],
+                                r["n_classes"], r["oob"],
+                                r.get("composite", r["oob"]),  # fallback
+                                r.get("mean_class_oob", ""),
+                                r.get("min_class_oob", ""),
+                                r.get("top_feature", ""),
+                                r.get("top_importance", ""),
+                                r.get("train_time_s", "")])
+                    existing = {(int(r["n_kgs"]), int(r.get("seed", 0))) for r in rows}
         except Exception as e:
             log.warning("Migration check failed: %s", e)
 
@@ -314,8 +349,9 @@ def _run_curve_locked(step=5):
     log.info("%d existing, %d new (step, seed) combos to evaluate",
              len(existing), len(work))
 
-    # Best-model tracking: highest OOB at maximum class count (same logic as training.html)
-    best_oob = 0.0
+    # Best-model tracking: highest COMPOSITE score at maximum class count.
+    # Composite = 0.4*OOB + 0.35*mean_class + 0.25*min_class — rewards balance.
+    best_composite = 0.0
     best_n_classes = 0
     best_stats = None
     best_model = None
@@ -323,9 +359,6 @@ def _run_curve_locked(step=5):
 
     # Seed from existing CSV data so we don't regress
     if existing:
-        for row_key in existing:
-            pass  # existing is just (n_kgs, seed) tuples without OOB
-        # Re-read CSV to find historical best at max class count
         try:
             max_cls_seen = 0
             with open(CURVE_CSV) as f:
@@ -336,13 +369,13 @@ def _run_curve_locked(step=5):
             with open(CURVE_CSV) as f:
                 for r in csv.DictReader(f):
                     nc = int(r['n_classes'])
-                    oob_val = float(r['oob'])
-                    if nc >= max_cls_seen and oob_val > best_oob:
-                        best_oob = oob_val
+                    comp = float(r.get('composite', r['oob']))  # fallback
+                    if nc >= max_cls_seen and comp > best_composite:
+                        best_composite = comp
                         best_n_classes = nc
-            if best_oob > 0:
-                log.info("Historical best from CSV: OOB=%.4f at %d classes",
-                         best_oob, best_n_classes)
+            if best_composite > 0:
+                log.info("Historical best from CSV: composite=%.4f at %d classes",
+                         best_composite, best_n_classes)
         except Exception:
             pass
 
@@ -356,24 +389,26 @@ def _run_curve_locked(step=5):
         stats["train_time_s"] = round(dt, 1)
         stats["seed"] = seed
         results.append(stats)
-        log.info("n_kgs=%3d  seed=%d  samples=%6d  classes=%2d  OOB=%.4f  (%.1fs)",
-                 n, seed, stats["n_samples"], stats["n_classes"], stats["oob"], dt)
+        log.info("n_kgs=%3d  seed=%d  samples=%6d  classes=%2d  OOB=%.4f  composite=%.4f  mean_cls=%.4f  min_cls=%.4f  (%.1fs)",
+                 n, seed, stats["n_samples"], stats["n_classes"], stats["oob"],
+                 stats["composite"], stats["mean_class_oob"], stats["min_class_oob"], dt)
 
-        # Best-model check: only compare at max class count (ignore inflated
-        # early OOB from fewer classes — same logic as training.html)
+        # Best-model check: compare COMPOSITE score at max class count.
+        # Composite rewards balanced per-class accuracy, not just overall OOB.
         nc = stats["n_classes"]
+        comp = stats["composite"]
         if nc > best_n_classes:
             # New max class count — reset best (previous was inflated)
             log.info("  Class count grew %d → %d, resetting best", best_n_classes, nc)
-            best_oob = 0.0
+            best_composite = 0.0
             best_n_classes = nc
-        if nc >= best_n_classes and stats["oob"] > best_oob:
-            best_oob = stats["oob"]
+        if nc >= best_n_classes and comp > best_composite:
+            best_composite = comp
             best_stats = stats
             best_model = stats["model"]
             best_seed = seed
-            log.info("  🏆 NEW BEST: OOB=%.4f (%d KGs, seed=%d, %d classes)",
-                     best_oob, n, seed, nc)
+            log.info("  🏆 NEW BEST: composite=%.4f OOB=%.4f mean_cls=%.4f min_cls=%.4f (%d KGs, seed=%d, %d classes)",
+                     comp, stats["oob"], stats["mean_class_oob"], stats["min_class_oob"], n, seed, nc)
             _save_best_model(best_model, best_stats, best_seed)
 
         # Free the model from stats to avoid holding all models in memory
@@ -384,6 +419,9 @@ def _run_curve_locked(step=5):
             csv.writer(f).writerow([
                 stats["n_kgs"], seed, stats["n_samples"], stats["n_classes"],
                 f"{stats['oob']:.6f}",
+                f"{stats['composite']:.6f}",
+                f"{stats['mean_class_oob']:.6f}",
+                f"{stats['min_class_oob']:.6f}",
                 stats["top5_features"][0][0],
                 f"{stats['top5_features'][0][1]:.4f}",
                 stats["train_time_s"],
@@ -397,6 +435,9 @@ def _run_curve_locked(step=5):
                 "n_samples": stats["n_samples"],
                 "n_classes": stats["n_classes"],
                 "oob": stats["oob"],
+                "composite": stats["composite"],
+                "mean_class_oob": stats["mean_class_oob"],
+                "min_class_oob": stats["min_class_oob"],
                 "n_estimators": stats["n_estimators"],
                 "max_depth": stats["max_depth"],
                 "min_samples_leaf": stats["min_samples_leaf"],
@@ -414,8 +455,8 @@ def _run_curve_locked(step=5):
         log.info("=" * 60)
         log.info("Added %d new points.", len(results))
         if best_stats:
-            log.info("Best model: OOB=%.4f at %d KGs (seed=%d, %d classes)",
-                     best_oob, best_stats["n_kgs"], best_seed, best_n_classes)
+            log.info("Best model: composite=%.4f OOB=%.4f at %d KGs (seed=%d, %d classes)",
+                     best_composite, best_stats["oob"], best_stats["n_kgs"], best_seed, best_n_classes)
     else:
         log.info("No new points added.")
 

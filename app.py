@@ -472,6 +472,9 @@ def training_status():
                     n_kgs = int(r['n_kgs'])
                     by_kgs[n_kgs].append({
                         'oob': float(r['oob']),
+                        'composite': float(r['composite']) if 'composite' in r and r['composite'] else float(r['oob']),
+                        'mean_class_oob': float(r['mean_class_oob']) if r.get('mean_class_oob') else None,
+                        'min_class_oob': float(r['min_class_oob']) if r.get('min_class_oob') else None,
                         'n_samples': int(r['n_samples']),
                         'n_classes': int(r['n_classes']),
                     })
@@ -479,7 +482,10 @@ def training_status():
             for n_kgs in sorted(by_kgs):
                 runs = by_kgs[n_kgs]
                 oobs = [r['oob'] for r in runs]
-                curve.append({
+                comps = [r['composite'] for r in runs]
+                mean_cls = [r['mean_class_oob'] for r in runs if r['mean_class_oob'] is not None]
+                min_cls = [r['min_class_oob'] for r in runs if r['min_class_oob'] is not None]
+                entry = {
                     'n_kgs': n_kgs,
                     'n_samples': runs[0]['n_samples'],
                     'n_classes': runs[0]['n_classes'],
@@ -488,7 +494,16 @@ def training_status():
                     'oob_min': round(min(oobs), 6),
                     'oob_max': round(max(oobs), 6),
                     'oob_all': sorted(round(o, 6) for o in oobs),
-                })
+                    'composite_median': round(statistics.median(comps), 6),
+                    'composite_min': round(min(comps), 6),
+                    'composite_max': round(max(comps), 6),
+                    'composite_all': sorted(round(c, 6) for c in comps),
+                }
+                if mean_cls:
+                    entry['mean_class_median'] = round(statistics.median(mean_cls), 6)
+                if min_cls:
+                    entry['min_class_median'] = round(statistics.median(min_cls), 6)
+                curve.append(entry)
             result['oob_curve'] = curve
         except Exception:
             pass
@@ -557,6 +572,10 @@ def training_status():
                             if cls in e.get('per_class_oob', {})]
                     if vals:
                         class_medians[cls] = round(statistics.median(vals), 4)
+                # Composite stats across seeds
+                comp_vals = [e.get('composite', e.get('oob', 0)) for e in entries]
+                mean_cls_vals = [e.get('mean_class_oob') for e in entries if e.get('mean_class_oob') is not None]
+                min_cls_vals = [e.get('min_class_oob') for e in entries if e.get('min_class_oob') is not None]
                 curve_detail[str(n_kgs)] = {
                     'n_estimators': entry0.get('n_estimators', 200),
                     'max_depth': entry0.get('max_depth', 20),
@@ -565,6 +584,9 @@ def training_status():
                     'per_class_oob': class_medians,
                     'classes_present': classes_present,
                     'n_seeds': n_seeds,
+                    'composite': round(statistics.median(comp_vals), 6) if comp_vals else None,
+                    'mean_class_oob': round(statistics.median(mean_cls_vals), 6) if mean_cls_vals else None,
+                    'min_class_oob': round(statistics.median(min_cls_vals), 6) if min_cls_vals else None,
                 }
             result['curve_detail'] = curve_detail
         except Exception:
@@ -1386,6 +1408,20 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             _prog('Loading Hansen', 'forest change data')
             hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
+        # Infrastructure lookup (for rule-based solar/wind/substation/mast)
+        _infra_lookup = None
+        try:
+            from infrastructure_lookup import InfrastructureLookup
+            from pyproj import Transformer as _Tx
+            _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+            bounds_3035 = geom.bounds  # (minx, miny, maxx, maxy) in EPSG:3035
+            w4, s4 = _tx.transform(bounds_3035[0], bounds_3035[1])
+            e4, n4 = _tx.transform(bounds_3035[2], bounds_3035[3])
+            _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
+            log.info('Infrastructure lookup: %d features', len(_infra_lookup))
+        except Exception as _ie:
+            log.warning('Infrastructure lookup failed: %s', _ie)
+
         # Run segmentation pipeline
         _prog('Segmenting & classifying', 'watershed + classification')
         obs_year = ti.dataset_to_year(dataset)
@@ -1401,6 +1437,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             felz_scale=felz_scale,
             rag_threshold=rag_threshold,
             observation_year=obs_year,
+            infra_lookup=_infra_lookup,
         )
 
         objects = result['objects']
@@ -1984,6 +2021,18 @@ def segment_overlay():
         if include_hansen:
             hansen_data = _try_hansen(geom, data['transform'], data['shape'])
 
+        _infra_lookup = None
+        try:
+            from infrastructure_lookup import InfrastructureLookup
+            from pyproj import Transformer as _Tx
+            _tx = _Tx.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+            b = geom.bounds
+            w4, s4 = _tx.transform(b[0], b[1])
+            e4, n4 = _tx.transform(b[2], b[3])
+            _infra_lookup = InfrastructureLookup.for_bbox(w4, s4, e4, n4)
+        except Exception:
+            pass
+
         obs_year = ti.dataset_to_year(dataset)
         result = seg.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
@@ -1994,6 +2043,7 @@ def segment_overlay():
             building_footprints=building_footprints,
             hansen=hansen_data,
             observation_year=obs_year,
+            infra_lookup=_infra_lookup,
         )
 
         objects = result['objects']
@@ -2597,9 +2647,21 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                     spectral["blue"] = rgb[2].astype(np.float32)
                     if nir_arr is not None:
                         spectral["nir"] = nir_arr.astype(np.float32)
+                _il = None
+                try:
+                    from infrastructure_lookup import InfrastructureLookup
+                    from pyproj import Transformer as _Tx2
+                    _tx2 = _Tx2.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                    _b = geom_3035.bounds
+                    _w4, _s4 = _tx2.transform(_b[0], _b[1])
+                    _e4, _n4 = _tx2.transform(_b[2], _b[3])
+                    _il = InfrastructureLookup.for_bbox(_w4, _s4, _e4, _n4)
+                except Exception:
+                    pass
                 result = seg.segment_and_classify(
                     dtm, dsm, mask, tf, spectral=spectral,
                     observation_year=ti.dataset_to_year(dataset),
+                    infra_lookup=_il,
                 )
                 objects = result['objects']
                 labels = result['labels']
@@ -2907,9 +2969,21 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
                         spectral["nir"] = nir.astype(np.float32)
             except Exception:
                 pass
+            _il2 = None
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                from pyproj import Transformer as _Tx3
+                _tx3 = _Tx3.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+                _b2 = geom_3035.bounds
+                _w42, _s42 = _tx3.transform(_b2[0], _b2[1])
+                _e42, _n42 = _tx3.transform(_b2[2], _b2[3])
+                _il2 = InfrastructureLookup.for_bbox(_w42, _s42, _e42, _n42)
+            except Exception:
+                pass
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], mask, tf, spectral=spectral,
                 observation_year=ti.dataset_to_year(dataset),
+                infra_lookup=_il2,
             )
             labels = result['labels']
             objects = result['objects']
@@ -3971,6 +4045,19 @@ def train_classifier():
         # Building footprints from cadastre (for calibration features)
         building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
 
+        # Infrastructure lookup
+        _il3 = None
+        try:
+            from infrastructure_lookup import InfrastructureLookup
+            from pyproj import Transformer as _Tx4
+            _tx4 = _Tx4.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+            _b3 = geom.bounds
+            _w43, _s43 = _tx4.transform(_b3[0], _b3[1])
+            _e43, _n43 = _tx4.transform(_b3[2], _b3[3])
+            _il3 = InfrastructureLookup.for_bbox(_w43, _s43, _e43, _n43)
+        except Exception:
+            pass
+
         # Segment (feature extraction) — pass ALL data sources
         result = oc.segment_and_classify(
             data['dtm'], data['dsm'], data['mask'], data['transform'],
@@ -3982,6 +4069,7 @@ def train_classifier():
             hansen=hansen_data,
             ortho_year=obs_year,
             observation_year=obs_year,
+            infra_lookup=_il3,
         )
         objects = result['objects']
         labels_arr = result['labels']

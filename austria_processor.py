@@ -2495,6 +2495,52 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     kg_code = kg["kg_code"]
     result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
 
+    # --- Tile checkpoint cache for resume-on-restart ---
+    _tile_ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+    _tile_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_tile_checkpoint(tile_idx, seg_result_entry, core_objects,
+                              new_buildings, infra_objects, tile_avail_entry,
+                              terrain_entry, spectral_accum, cop_accum,
+                              hansen_accum, seg_pixels):
+        """Persist a completed tile to disk for crash recovery."""
+        import pickle as _pkl
+        ckpt = {
+            "seg_result": seg_result_entry,
+            "core_objects": core_objects,
+            "new_buildings": new_buildings,
+            "infrastructure": infra_objects,
+            "tile_avail": tile_avail_entry,
+            "terrain": terrain_entry,      # (stats, n_px) or None
+            "spectral_accum": spectral_accum,  # partial spectral_info entries
+            "copernicus_accum": cop_accum,      # partial copernicus_info entries
+            "hansen_accum": hansen_accum,        # partial hansen_info entries
+            "seg_pixels": seg_pixels,
+        }
+        tmp = _tile_ckpt_dir / f"tile_{tile_idx}.pkl.tmp"
+        dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
+        with open(tmp, "wb") as f:
+            _pkl.dump(ckpt, f, protocol=_pkl.HIGHEST_PROTOCOL)
+        tmp.rename(dst)
+
+    def _load_tile_checkpoint(tile_idx):
+        """Load a cached tile result. Returns dict or None."""
+        import pickle as _pkl
+        dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
+        if not dst.exists():
+            return None
+        try:
+            with open(dst, "rb") as f:
+                return _pkl.load(f)
+        except Exception:
+            dst.unlink(missing_ok=True)
+            return None
+
+    def _clear_tile_checkpoints():
+        """Remove all checkpoints for this KG (after successful completion)."""
+        import shutil
+        shutil.rmtree(_tile_ckpt_dir, ignore_errors=True)
+
     _prev_step = [None, None]  # [step_name, start_time]
     _step_times = {}           # step_name → seconds
 
@@ -2611,6 +2657,43 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             result["step"] = f"tile_{tile_idx+1}"
             _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
 
+            # --- Check for cached tile checkpoint ---
+            cached_tile = _load_tile_checkpoint(tile_idx)
+            if cached_tile is not None:
+                log.info("KG %s %s: restored from checkpoint", kg_code, tile_label)
+                if cached_tile["seg_result"] is not None:
+                    tile_seg_results.append(cached_tile["seg_result"])
+                all_objects.extend(cached_tile.get("core_objects", []))
+                # Remap obj_ids to avoid collisions with fresh tiles
+                for obj in cached_tile["core_objects"]:
+                    obj.obj_id = next_obj_id
+                    next_obj_id += 1
+                all_new_buildings.extend(cached_tile.get("new_buildings", []))
+                all_infrastructure.extend(cached_tile.get("infrastructure", []))
+                tile_data_availability.append(cached_tile["tile_avail"])
+                t_terrain_entry = cached_tile.get("terrain")
+                if t_terrain_entry is not None:
+                    terrain_stats_list.append(t_terrain_entry)
+                total_seg_pixels += cached_tile.get("seg_pixels", 0)
+                # Merge accumulated info dicts
+                for k, v in cached_tile.get("spectral_accum", {}).items():
+                    all_spectral_info.setdefault(k, []).extend(v)
+                for k, v in cached_tile.get("copernicus_accum", {}).items():
+                    all_copernicus_info.setdefault(k, []).extend(v)
+                for k, v in cached_tile.get("hansen_accum", {}).items():
+                    if k in ("loss_years",):
+                        all_hansen_info.setdefault(k, []).extend(v)
+                    elif k == "cf_sum":
+                        all_hansen_info.setdefault("cf_sum", [0])
+                        all_hansen_info["cf_sum"][0] += v[0] if v else 0
+                    else:
+                        all_hansen_info.setdefault(k, []).extend(v)
+                # Remap labels in seg_result to match new obj_ids
+                # (not needed — labels are per-tile and used by
+                # build_*_tiled with their own obj_map)
+                _report_step(f"tile_{tile_idx+1}", f"restored from cache")
+                continue
+
             # Per-tile data availability tracker
             tile_avail = {
                 "tile_index": tile_idx + 1,
@@ -2623,6 +2706,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 "segmentation": False, "n_objects": 0,
                 "valid_pixels": 0,
             }
+
+            # Per-tile accumulator snapshots (for checkpoint)
+            _tile_spectral = {}
+            _tile_copernicus = {}
+            _tile_hansen = {}
 
             tile_geom_wgs = box(tw, ts, te, tn)
             tile_geom_3035 = transform_to_3035(tile_geom_wgs)
@@ -2640,6 +2728,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             if tvalid < 100:
                 log.info("KG %s %s: skipping (only %d valid px)", kg_code, tile_label, tvalid)
                 tile_data_availability.append(tile_avail)
+                # Cache empty tiles — deterministic, no point retrying
+                _save_tile_checkpoint(tile_idx, None, [], [], [], tile_avail, None, {}, {}, {}, 0)
                 continue
 
             t_transform = tdata["transform"]
@@ -2651,9 +2741,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
             # --- 3b. Terrain stats for this tile ---
             _report_step("terrain", tile_label)
+            _tile_terrain_entry = None
             try:
                 t_terrain = ta.characterise_terrain(tdata["dtm"], t_mask)
-                terrain_stats_list.append((t_terrain, tvalid))
+                _tile_terrain_entry = (t_terrain, tvalid)
+                terrain_stats_list.append(_tile_terrain_entry)
                 tile_avail["terrain"] = True
             except Exception as e:
                 log.warning("KG %s %s: terrain failed: %s", kg_code, tile_label, e)
@@ -2721,8 +2813,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 v = ndvi_arr[t_mask[:ndvi_arr.shape[0], :ndvi_arr.shape[1]]]
                 v = v[np.isfinite(v)]
                 if len(v) > 0:
-                    all_spectral_info.setdefault("_vals", []).extend(
-                        v[::max(1, len(v)//5000)].tolist())  # subsample
+                    subsample = v[::max(1, len(v)//5000)].tolist()
+                    all_spectral_info.setdefault("_vals", []).extend(subsample)
+                    _tile_spectral.setdefault("_vals", []).extend(subsample)
 
             # --- 3e. Copernicus ---
             _report_step("copernicus", tile_label)
@@ -2803,14 +2896,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     if arr is not None:
                         v = arr[np.isfinite(arr)]
                         if len(v) > 0:
-                            all_copernicus_info.setdefault(f"{band}_vals", []).extend(
-                                v[::max(1, len(v)//2000)].tolist())
+                            ss = v[::max(1, len(v)//2000)].tolist()
+                            all_copernicus_info.setdefault(f"{band}_vals", []).extend(ss)
+                            _tile_copernicus.setdefault(f"{band}_vals", []).extend(ss)
                 if copernicus_data.get("ndvi") is not None:
                     cv = copernicus_data["ndvi"]
                     cv = cv[np.isfinite(cv)]
                     if len(cv) > 0:
-                        all_copernicus_info.setdefault("cop_ndvi_vals", []).extend(
-                            cv[::max(1, len(cv)//2000)].tolist())
+                        ss = cv[::max(1, len(cv)//2000)].tolist()
+                        all_copernicus_info.setdefault("cop_ndvi_vals", []).extend(ss)
+                        _tile_copernicus.setdefault("cop_ndvi_vals", []).extend(ss)
                 if copernicus_data.get("harmonics"):
                     harm = copernicus_data["harmonics"]
                     for hk in ['h_mean', 'h_amplitude', 'h_phase', 'h_rmse']:
@@ -2818,8 +2913,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         if arr is not None:
                             v = arr[np.isfinite(arr)]
                             if len(v) > 0:
-                                all_copernicus_info.setdefault(f"{hk}_vals", []).extend(
-                                    v[::max(1, len(v)//2000)].tolist())
+                                ss = v[::max(1, len(v)//2000)].tolist()
+                                all_copernicus_info.setdefault(f"{hk}_vals", []).extend(ss)
+                                _tile_copernicus.setdefault(f"{hk}_vals", []).extend(ss)
 
             # --- 3f. Hansen ---
             _report_step("hansen", tile_label)
@@ -2836,14 +2932,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 ly = hansen_data.get("loss_year")
                 if ly is not None:
                     all_hansen_info.setdefault("loss_years", []).append(ly)
+                    _tile_hansen.setdefault("loss_years", []).append(ly)
                 tc = hansen_data.get("treecover2000")
                 if tc is not None:
-                    all_hansen_info.setdefault("tc_vals", []).extend(
-                        tc[np.isfinite(tc)].ravel()[::max(1, tc.size//2000)].tolist())
+                    ss = tc[np.isfinite(tc)].ravel()[::max(1, tc.size//2000)].tolist()
+                    all_hansen_info.setdefault("tc_vals", []).extend(ss)
+                    _tile_hansen.setdefault("tc_vals", []).extend(ss)
                 cf = hansen_data.get("current_forest")
                 if cf is not None:
+                    cf_val = int(cf.sum())
                     all_hansen_info.setdefault("cf_sum", [0])
-                    all_hansen_info["cf_sum"][0] += int(cf.sum())
+                    all_hansen_info["cf_sum"][0] += cf_val
+                    _tile_hansen["cf_sum"] = [cf_val]
 
             # --- 3g. Segmentation ---
             _report_step("segment", tile_label)
@@ -2950,28 +3050,45 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
             # --- 3h. Vectorise new buildings & infrastructure (this tile) ---
             _report_step("vectorise", tile_label)
+            _tile_nb = []
+            _tile_iv = []
             try:
-                nb = vectorise_unmatched_buildings(
+                _tile_nb = vectorise_unmatched_buildings(
                     t_objects, t_labels, t_mask, t_transform,
                     building_fp_mask, t_ndsm)
-                all_new_buildings.extend(nb)
+                all_new_buildings.extend(_tile_nb)
             except Exception as e:
                 log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)
             try:
-                iv = vectorise_infrastructure(
+                _tile_iv = vectorise_infrastructure(
                     t_objects, t_labels, t_mask, t_transform, t_ndsm, tdata["dtm"])
-                all_infrastructure.extend(iv)
+                all_infrastructure.extend(_tile_iv)
             except Exception as e:
                 log.warning("KG %s %s: infrastructure failed: %s", kg_code, tile_label, e)
+
+            # Record tile data availability
+            tile_data_availability.append(tile_avail)
+
+            # Save tile checkpoint for crash recovery
+            _save_tile_checkpoint(
+                tile_idx,
+                seg_result_entry=tile_seg_results[-1],
+                core_objects=core_objects,
+                new_buildings=_tile_nb,
+                infra_objects=_tile_iv,
+                tile_avail_entry=tile_avail,
+                terrain_entry=_tile_terrain_entry,
+                spectral_accum=_tile_spectral,
+                cop_accum=_tile_copernicus,
+                hansen_accum=_tile_hansen,
+                seg_pixels=tvalid,
+            )
 
             # Free tile memory
             del tdata, t_labels, t_objects, seg_result, spectral
             del copernicus_data, hansen_data, dtm_dates, dsm_dates
             del building_fp_mask, t_mask, t_ndsm
             gc.collect()
-
-            # Record tile data availability
-            tile_data_availability.append(tile_avail)
 
             log.info("KG %s %s: done (%d objects, %d core)",
                      kg_code, tile_label, len(id_remap), len(core_objects))
@@ -3029,6 +3146,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         result["success"] = True
         result["step"] = "done"
+        # Clean up tile checkpoints on success
+        _clear_tile_checkpoints()
 
     except Exception as e:
         result["error"] = str(e)

@@ -2578,6 +2578,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "level": "error" if record.levelno >= logging.ERROR else "warning",
                     "msg": self.format(record),
+                    "step": _prev_step[0] or "",
                 }) + "\n"
                 with open(self._path, "a") as f:
                     f.write(entry)
@@ -4087,11 +4088,12 @@ def main():
                                     f"KG {_code}: {entry.get('msg', '')}",
                                     _code,
                                 )
-                                # Attribute warning/error to current step
-                                if last_step:
-                                    cur = _step_issues.get(last_step, "")
+                                # Attribute warning/error to the step that emitted it
+                                warn_step = entry.get("step") or last_step
+                                if warn_step:
+                                    cur = _step_issues.get(warn_step, "")
                                     if lvl == "error" or cur != "error":
-                                        _step_issues[last_step] = lvl
+                                        _step_issues[warn_step] = lvl
                             except json.JSONDecodeError:
                                 pass
                         if new_lines:

@@ -82,13 +82,16 @@
   /* Map */
   #kgMap { height: 200px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px; }
   .leaflet-container { background: var(--bg) !important; }
+  .tile-dot {
+    filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
+  }
   .tile-dot-current {
     animation: tilePulse 2s ease-in-out infinite;
-    filter: drop-shadow(0 0 6px #58a6ff) drop-shadow(0 0 12px #58a6ff);
+    filter: drop-shadow(0 0 4px rgba(255,255,255,0.9)) drop-shadow(0 0 8px #58a6ff);
   }
   @keyframes tilePulse {
     0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.5; transform: scale(1.6); }
+    50% { opacity: 0.4; transform: scale(1.5); }
   }
 
   /* Log */
@@ -338,9 +341,7 @@ const API = '/api/v1/processing/status';
 const POLL = 5;
 let cd = POLL;
 let map, mapMarkers;
-let copLayer, hanLayer;
 let tileDotsLayer;
-let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
 let kgTimerInterval = null;
@@ -379,15 +380,7 @@ function initMap() {
   map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
-  copLayer = L.layerGroup().addTo(map);
-  hanLayer = L.layerGroup().addTo(map);
   tileDotsLayer = L.layerGroup().addTo(map);
-  L.control.layers(null, {
-    'Tile dots': tileDotsLayer,
-    'Copernicus tiles (0.1°)': copLayer,
-    'Hansen tiles (0.5°)': hanLayer,
-  }, {collapsed: true, position: 'topright'}).addTo(map);
-  fetchTileOverlays();
 }
 
 function updateMap(d) {
@@ -406,17 +399,17 @@ function updateTileDots(d) {
   const allDone = tiles.every(t => t.status === 'done' || t.status === 'skip');
 
   tiles.forEach(t => {
-    let col, radius = 4, opacity = 0.85, cls = '';
+    let col, opacity = 0.85, cls = '';
     if (t.status === 'current') {
-      col = '#58a6ff'; radius = 6; cls = 'tile-dot-current';
+      col = '#58a6ff'; cls = 'tile-dot-current';
     } else if (t.status === 'skip') {
-      col = '#30363d'; radius = 2; opacity = 0.4;
+      col = '#30363d'; opacity = 0.4;
     } else if (t.status === 'error') {
-      col = '#f85149'; radius = 5;
+      col = '#f85149';
     } else if (t.status === 'done') {
       if (allDone) {
         // KG complete — all dots turn bright green
-        col = '#3fb950'; radius = 4; opacity = 0.9;
+        col = '#3fb950'; opacity = 0.9;
       } else {
         // Grade by layer availability
         const iss = t.issues || {};
@@ -428,13 +421,11 @@ function updateTileDots(d) {
         else col = '#f0883e';
       }
     } else {
-      col = '#484f58'; radius = 3; opacity = 0.5; // queued / unknown
+      col = '#484f58'; opacity = 0.5; // queued / unknown
     }
-    if (t.subtile) radius = Math.max(2, radius - 1);
-    const opts = { radius, fillColor: col, fillOpacity: opacity,
-                   stroke: t.status === 'current', color: col,
-                   weight: 1, opacity: 0.6 };
-    if (cls) opts.className = cls;
+    const opts = { radius: 2, fillColor: col, fillOpacity: opacity,
+                   stroke: false };
+    opts.className = cls ? 'tile-dot ' + cls : 'tile-dot';
     const m = L.circleMarker([t.lat, t.lng], opts);
     // Tooltip
     let tip = 'Tile ' + t.idx;
@@ -850,7 +841,7 @@ async function poll() {
     updateTileDots(d);
     updateLastKg(d);
     // Refresh tile overlays every 10s
-    if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
+
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     const commitHash = d.git_commit || '';
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString()
@@ -952,48 +943,7 @@ function renderLastKg(js) {
 }
 
 // ── Tile Cache Overlays ─────────────────────────────────────────
-async function fetchTileOverlays() {
-  lastTileFetch = Date.now();
-  try {
-    const r = await fetch('/api/v1/processing/tiles');
-    if (!r.ok) return;
-    const d = await r.json();
-    renderTileOverlays(d);
-  } catch(e) { console.error('tiles:', e); }
-}
-function renderTileOverlays(d) {
-  if (!map) return;
-  // Copernicus 0.1° tiles — blue outlines
-  copLayer.clearLayers();
-  (d.copernicus || []).forEach(t => {
-    const bounds = [[t.s, t.w], [t.n, t.e]];
-    const evicted = t.status === 'evicted';
-    const rect = L.rectangle(bounds, {
-      color: evicted ? '#f85149' : '#58a6ff',
-      weight: evicted ? 1 : 1.5,
-      fillOpacity: evicted ? 0.03 : 0.06,
-      fillColor: evicted ? '#f85149' : '#58a6ff',
-      dashArray: evicted ? '4 3' : null,
-      interactive: false,
-    });
-    copLayer.addLayer(rect);
-  });
-  // Hansen 0.5° tiles — green outlines
-  hanLayer.clearLayers();
-  (d.hansen || []).forEach(t => {
-    const bounds = [[t.s, t.w], [t.n, t.e]];
-    const evicted = t.status === 'evicted';
-    const rect = L.rectangle(bounds, {
-      color: evicted ? '#d29922' : '#3fb950',
-      weight: evicted ? 1 : 2,
-      fillOpacity: evicted ? 0.02 : 0.04,
-      fillColor: evicted ? '#d29922' : '#3fb950',
-      dashArray: evicted ? '6 4' : null,
-      interactive: false,
-    });
-    hanLayer.addLayer(rect);
-  });
-}
+
 
 // ── Init ────────────────────────────────────────────────────────
 initMap();

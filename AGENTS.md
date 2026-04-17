@@ -233,10 +233,35 @@ Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask
 ### Austria Processor
 | File | Purpose |
 |------|----------|
-| `austria_processor.py` | Main processor: iterates KGs, segments, builds GPKGs + JSON, uploads to Zenodo |
+| `austria_processor.py` | Main processor: iterates KGs, tiles, segments, builds GPKGs + JSON, uploads to Zenodo |
 | `zenodo_client.py` | Python Zenodo API client (port of Go zenodo-mirror-go-pkg) |
 | `austria_processor.service` | systemd unit for background processing |
 | `static/process.html` | Processing dashboard (status, map, controls, Zenodo manifest) |
+
+### Tiled Full-KG Processing
+
+`process_one_kg()` tiles the **entire KG** into overlapping 1.5km windows, processes each
+tile through the full pipeline, and merges results for complete KG coverage.
+
+**Flow:**
+1. Fetch cadastre → compute full KG bbox from geometry union (make_valid)
+2. `_compute_tile_grid()`: 1.5km tiles, 100m overlap
+3. **Per tile**: LiDAR (3 dates) + ortho + Copernicus + Hansen + Felzenszwalb segmentation + RF classify
+4. Remap obj_ids to global unique range; dedup at tile boundaries via centroid-ownership (core zone = tile shrunk by 50m on overlap sides)
+5. `_merge_terrain_stats()`: pixel-weighted merge across tiles
+6. `build_full_gpkg_tiled()`: per-tile DTM/DSM/nDSM + segment_type rasters, segment vectors
+7. `build_light_gpkg_tiled()`: segment rasters + all parcels/buildings enriched from their covering tile
+8. `build_json_summary_tiled()`: every parcel gets elevation + area_summary + height_distribution
+
+**Memory**: one 1.5km tile (~90MB) in memory at a time. Works for KGs up to 27km (Matrei: ~324 tiles).
+
+**Retry ladder**: `RETRY_LADDER = [1.5, 0.5, 0.2]` km — on timeout, shrink tile size and retry.
+
+**Key helpers:**
+- `_find_tile_for_point(e, n, tiles)` — find which tile covers a point (for parcel enrichment)
+- `_read_dtm_for_tile(tr)` — re-read DTM from BEV cache (instant, no HTTP)
+- `_segment_touches_edge(seg_mask)` — detect truncated segments at tile boundary
+- `edge_clipped` flag on new_buildings/infrastructure vectors
 
 ### Austria Processor Data
 | Path | Purpose |
@@ -244,8 +269,9 @@ Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask
 | `data/austria_processor/zenodo_manifest.json` | Tracks all Zenodo uploads + failures |
 | `data/austria_processor/json/` | Per-KG JSON summaries (kept under 4GB) |
 | `data/austria_processor/progress.json` | Live progress state for dashboard |
-| `data/austria_processor/kg_list.json` | Cached list of all ~7850 Austrian KGs |
-| `/tmp/austria_processor/gpkg/` | Temp GPKG files (deleted after Zenodo upload) |
+| `data/austria_processor/kg_list.json` | Cached list of all ~8440 Austrian KGs |
+| `data/austria_processor/bev_tile_cache/` | Cached BEV DTM/DSM windowed reads (fast re-read) |
+| `data/austria_processor/gpkg/` | Temp GPKG files (deleted after Zenodo upload) |
 
 ### Austria Processor API Endpoints
 | Method | Path | Purpose |
@@ -263,6 +289,8 @@ Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask
 | GET | `/api/v1/parcel/<parcel_id>` | Parcel lookup via KG JSON |
 
 ### Per-KG Outputs
-1. **Full GPKG** (`{kg}_full.gpkg`): DTM, DSM, nDSM, Ortho RGBI, CIR, segment_type, segment_height
-2. **Light GPKG** (`{kg}_light.gpkg`): segment raster+vector, parcels w/ DTM heights, buildings w/ object heights, new buildings, infrastructure
-3. **JSON summary** (`{kg}.json`): area summary, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, methods
+1. **Full GPKG** (`{kg}_full.gpkg`): per-tile DTM/DSM/nDSM + segment_type rasters, segment vector polygons
+2. **Light GPKG** (`{kg}_light.gpkg`): segment raster+vector, **all** parcels w/ DTM heights, **all** buildings w/ object heights, new buildings, infrastructure
+3. **JSON summary** (`{kg}.json`): area summary, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, coverage stats, methods
+
+JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, `parcel_segmentation_coverage_pct`, `building_height_coverage_pct`.

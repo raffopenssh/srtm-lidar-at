@@ -70,7 +70,7 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
     """Train RF on `n` checkpoints (shuffled by random_state). Returns stats dict."""
     import random as _rnd
     from sklearn.ensemble import RandomForestClassifier
-    from learned_classifier import FEATURE_KEYS, TYPE_CLASSES, feature_vector
+    from learned_classifier import FEATURE_KEYS, TYPE_CLASSES, feature_vector, RF_EXCLUDED_CLASSES
 
     # Shuffle KG order per seed — measures sensitivity to data composition
     shuffled = list(checkpoints)
@@ -79,6 +79,12 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
     X_list, y_list = [], []
     for ckpt in subset:
         for feat, label in zip(ckpt["features"], ckpt["labels"]):
+            # Remap excavation/fill → earthwork
+            if label in ("excavation", "fill"):
+                label = "earthwork"
+            # Drop RF-excluded classes
+            if label in RF_EXCLUDED_CLASSES:
+                continue
             if label not in TYPE_CLASSES:
                 continue
             X_list.append(feature_vector(feat))
@@ -141,6 +147,8 @@ def train_at_n_kgs(checkpoints, n, n_estimators=200, max_depth=20,
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "min_samples_leaf": min_samples_leaf,
+        "model": rf,
+        "classes": classes,
     }
 
 
@@ -181,11 +189,49 @@ def run_curve(step=5):
         os.close(lock_fd)
 
 
+def _save_best_model(rf, stats, seed):
+    """Save RF model as live model and backup best."""
+    import joblib
+    import datetime
+    from learned_classifier import MODEL_PATH, META_PATH, FEATURE_KEYS
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Save live model
+    joblib.dump(rf, MODEL_PATH)
+    meta = {
+        'classes': stats['classes'],
+        'n_train': stats['n_samples'],
+        'oob_score': stats['oob'],
+        'feature_importances': stats['all_importances'],
+        'feature_keys': FEATURE_KEYS,
+        'trained_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'),
+        'n_kgs': stats['n_kgs'],
+        'best_seed': seed,
+    }
+    META_PATH.write_text(json.dumps(meta, indent=2))
+    log.info('  Saved live model to %s (OOB=%.4f, %d KGs, seed=%d)',
+             MODEL_PATH, stats['oob'], stats['n_kgs'], seed)
+
+    # Backup copy
+    shutil.copy2(MODEL_PATH, BEST_DIR / 'rf_model.joblib')
+    shutil.copy2(META_PATH, BEST_DIR / 'rf_meta.json')
+
+    # Append to best.log
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    with open(BEST_DIR / 'best.log', 'a') as f:
+        f.write(f"{now} NEW BEST: OOB={stats['oob']:.6f} kgs={stats['n_kgs']} "
+                f"samples={stats['n_samples']} classes={stats['n_classes']} seed={seed}\n")
+    log.info('  Backup saved to %s/', BEST_DIR)
+
+
 def _run_curve_locked(step=5):
     """Actual curve evaluation (called with lock held).
 
     Runs N_SEEDS random seeds per KG step. Incremental: reads existing CSV,
     skips (n_kgs, seed) combos already evaluated, only trains missing ones.
+    Also tracks the best model (highest OOB at max class count) and saves it.
     """
     checkpoints = load_checkpoints()
     n_total = len(checkpoints)
@@ -268,6 +314,38 @@ def _run_curve_locked(step=5):
     log.info("%d existing, %d new (step, seed) combos to evaluate",
              len(existing), len(work))
 
+    # Best-model tracking: highest OOB at maximum class count (same logic as training.html)
+    best_oob = 0.0
+    best_n_classes = 0
+    best_stats = None
+    best_model = None
+    best_seed = None
+
+    # Seed from existing CSV data so we don't regress
+    if existing:
+        for row_key in existing:
+            pass  # existing is just (n_kgs, seed) tuples without OOB
+        # Re-read CSV to find historical best at max class count
+        try:
+            max_cls_seen = 0
+            with open(CURVE_CSV) as f:
+                for r in csv.DictReader(f):
+                    nc = int(r['n_classes'])
+                    if nc > max_cls_seen:
+                        max_cls_seen = nc
+            with open(CURVE_CSV) as f:
+                for r in csv.DictReader(f):
+                    nc = int(r['n_classes'])
+                    oob_val = float(r['oob'])
+                    if nc >= max_cls_seen and oob_val > best_oob:
+                        best_oob = oob_val
+                        best_n_classes = nc
+            if best_oob > 0:
+                log.info("Historical best from CSV: OOB=%.4f at %d classes",
+                         best_oob, best_n_classes)
+        except Exception:
+            pass
+
     results = []
     for n, seed in work:
         t0 = time.time()
@@ -280,6 +358,26 @@ def _run_curve_locked(step=5):
         results.append(stats)
         log.info("n_kgs=%3d  seed=%d  samples=%6d  classes=%2d  OOB=%.4f  (%.1fs)",
                  n, seed, stats["n_samples"], stats["n_classes"], stats["oob"], dt)
+
+        # Best-model check: only compare at max class count (ignore inflated
+        # early OOB from fewer classes — same logic as training.html)
+        nc = stats["n_classes"]
+        if nc > best_n_classes:
+            # New max class count — reset best (previous was inflated)
+            log.info("  Class count grew %d → %d, resetting best", best_n_classes, nc)
+            best_oob = 0.0
+            best_n_classes = nc
+        if nc >= best_n_classes and stats["oob"] > best_oob:
+            best_oob = stats["oob"]
+            best_stats = stats
+            best_model = stats["model"]
+            best_seed = seed
+            log.info("  🏆 NEW BEST: OOB=%.4f (%d KGs, seed=%d, %d classes)",
+                     best_oob, n, seed, nc)
+            _save_best_model(best_model, best_stats, best_seed)
+
+        # Free the model from stats to avoid holding all models in memory
+        stats.pop("model", None)
 
         # Append row to CSV immediately
         with open(CURVE_CSV, "a", newline="") as f:
@@ -315,6 +413,9 @@ def _run_curve_locked(step=5):
         log.info("")
         log.info("=" * 60)
         log.info("Added %d new points.", len(results))
+        if best_stats:
+            log.info("Best model: OOB=%.4f at %d KGs (seed=%d, %d classes)",
+                     best_oob, best_stats["n_kgs"], best_seed, best_n_classes)
     else:
         log.info("No new points added.")
 
@@ -448,13 +549,13 @@ def monitor():
             shutil.copy2(LIVE_MODEL, BEST_DIR / "rf_model.joblib")
         shutil.copy2(LIVE_META, BEST_DIR / "rf_meta.json")
         # Append to best.log
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with open(BEST_DIR / "best.log", "a") as f:
             f.write(f"{now} NEW BEST: OOB={oob:.6f} kgs={n_kgs} "
                     f"samples={n_train} classes={n_classes}\n")
 
     # Write history row
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(HISTORY_CSV, "a", newline="") as f:
         csv.writer(f).writerow([
             now, f"{oob:.6f}", n_train, n_kgs, n_classes,

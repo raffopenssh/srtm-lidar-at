@@ -38,6 +38,11 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_PATH = MODEL_DIR / "rf_model.joblib"
 META_PATH = MODEL_DIR / "rf_meta.json"
 
+# Best model from curve evaluation (preferred over live training model)
+BEST_MODEL_DIR = pathlib.Path("data/best_model")
+BEST_MODEL_PATH = BEST_MODEL_DIR / "rf_model.joblib"
+BEST_META_PATH = BEST_MODEL_DIR / "rf_meta.json"
+
 # Features used by the RF.  Order matters (must match training).
 # These are the per-segment features from extract_object_features().
 FEATURE_KEYS = [
@@ -119,22 +124,28 @@ CADASTRE_TO_TYPE = {
     59: "bare_soil",  # Ödland
     60: "water",      # Sumpf/Moor (wetland)
     72: "water",      # Quelle/Brunnen (spring)
-    80: "excavation", # Abbaufläche (quarry)
-    81: "fill",       # Deponie
+    80: "earthwork",  # Abbaufläche (quarry)
+    81: "earthwork",  # Deponie
     83: "rock",       # Felsen (rock)
     84: "rock",       # Geröll (scree)
     90: "bare_soil",  # sonstige Fläche
-    93: "excavation", # Abbaufläche
+    93: "earthwork",  # Abbaufläche
 }
 
-# Simplified target classes for the RF (merge rare types)
+# Simplified target classes for the RF (merge rare types).
+# Dropped (unlearnable, rule-based only): wind_turbine, substation, solar_panel.
+# Merged: excavation + fill → earthwork.
 TYPE_CLASSES = [
     "tree", "shrub", "grass", "crop", "road", "path", "parking",
-    "roof", "water", "bare_soil", "rock", "excavation", "fill",
-    "garden", "orchard", "vineyard", "hedge", "fence", "wall",
-    "tree_loss", "construction", "wind_turbine", "substation",
-    "solar_panel", "mast",
+    "roof", "water", "bare_soil", "rock", "earthwork",
+    "garden", "orchard", "vineyard",
+    "tree_loss",
 ]
+
+# Classes excluded from RF training — detected by rule-based logic instead.
+# Keep in CADASTRE_TO_TYPE so they're still recognised during ground truth
+# extraction, but filter them out before training.
+RF_EXCLUDED_CLASSES = {"wind_turbine", "substation", "solar_panel"}
 
 
 def feature_vector(feat: dict) -> np.ndarray:
@@ -145,7 +156,7 @@ def feature_vector(feat: dict) -> np.ndarray:
 def _downsample(
     X: np.ndarray,
     y: np.ndarray,
-    cap_multiplier: int = 10,
+    cap_multiplier: int = 5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Downsample dominant classes to reduce class imbalance.
 
@@ -378,25 +389,42 @@ class LearnedClassifier:
         return results
 
     @classmethod
-    def load(cls) -> "LearnedClassifier":
-        """Load a previously trained model, or return empty classifier."""
+    def load(cls, model_path=None, meta_path=None) -> "LearnedClassifier":
+        """Load a previously trained model, or return empty classifier.
+
+        Prefers the best model from curve evaluation (data/best_model/)
+        over the live training model (/tmp/learned_classifier/) when
+        available, since the curve eval selects the checkpoint count
+        and seed that maximise composite score.
+        """
         inst = cls()
-        if MODEL_PATH.exists() and META_PATH.exists():
-            try:
-                import joblib
-                inst.model = joblib.load(MODEL_PATH)
-                meta = json.loads(META_PATH.read_text())
-                inst.classes = meta.get("classes", [])
-                inst.n_train = meta.get("n_train", 0)
-                inst.oob_score = meta.get("oob_score", 0)
-                inst.feature_importances = meta.get("feature_importances", {})
-                inst.trained_at = meta.get("trained_at", "")
-                inst.n_kgs = meta.get("n_kgs", 0)
-                log.info("Loaded RF model: %d classes, OOB=%.3f, n=%d, kgs=%d, trained=%s",
-                         len(inst.classes), inst.oob_score, inst.n_train,
-                         inst.n_kgs, inst.trained_at)
-            except Exception as e:
-                log.warning("Failed to load RF model: %s", e)
+
+        # Determine which model to load: best_model > live
+        if model_path and meta_path:
+            mp, mtp = pathlib.Path(model_path), pathlib.Path(meta_path)
+        elif BEST_MODEL_PATH.exists() and BEST_META_PATH.exists():
+            mp, mtp = BEST_MODEL_PATH, BEST_META_PATH
+        elif MODEL_PATH.exists() and META_PATH.exists():
+            mp, mtp = MODEL_PATH, META_PATH
+        else:
+            return inst
+
+        try:
+            import joblib
+            inst.model = joblib.load(mp)
+            meta = json.loads(mtp.read_text())
+            inst.classes = meta.get("classes", [])
+            inst.n_train = meta.get("n_train", 0)
+            inst.oob_score = meta.get("oob_score", 0)
+            inst.feature_importances = meta.get("feature_importances", {})
+            inst.trained_at = meta.get("trained_at", "")
+            inst.n_kgs = meta.get("n_kgs", 0)
+            source = "best_model" if mp == BEST_MODEL_PATH else "live"
+            log.info("Loaded RF model (%s): %d classes, OOB=%.3f, n=%d, kgs=%d, trained=%s",
+                     source, len(inst.classes), inst.oob_score, inst.n_train,
+                     inst.n_kgs, inst.trained_at)
+        except Exception as e:
+            log.warning("Failed to load RF model from %s: %s", mp, e)
         return inst
 
     @property
@@ -413,12 +441,22 @@ _cached_model_mtime: float = 0.0
 
 
 def get_classifier() -> LearnedClassifier:
-    """Get or load the singleton classifier.  Reloads when model file changes."""
+    """Get or load the singleton classifier.  Reloads when model file changes.
+
+    Watches both data/best_model/ and /tmp/learned_classifier/ — prefers
+    whichever has the newer mtime (best_model is updated by curve eval,
+    live model by the training service).
+    """
     global _cached_classifier, _cached_model_mtime
     try:
-        mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else 0.0
+        best_mtime = BEST_MODEL_PATH.stat().st_mtime if BEST_MODEL_PATH.exists() else 0.0
     except OSError:
-        mtime = 0.0
+        best_mtime = 0.0
+    try:
+        live_mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else 0.0
+    except OSError:
+        live_mtime = 0.0
+    mtime = max(best_mtime, live_mtime)
     if _cached_classifier is None or mtime != _cached_model_mtime:
         _cached_classifier = LearnedClassifier.load()
         _cached_model_mtime = mtime
@@ -450,14 +488,20 @@ def classify_with_rf(
     clf = get_classifier()
     if clf.is_trained:
         pred, conf = clf.predict(feat)
-        if pred and conf >= min_confidence and pred in OBJECT_TYPES:
-            code = OBJECT_TYPES[pred]
-            is_mm = pred in {
-                "road", "path", "parking", "roof", "wall", "fence",
-                "mast", "greenhouse", "solar_panel", "bridge",
-                "excavation", "fill", "construction",
-            }
-            return pred, code, conf, is_mm
+        if pred and conf >= min_confidence:
+            # Post-split: earthwork → excavation or fill based on dtm_change sign
+            if pred == "earthwork":
+                dtm_ch = feat.get("dtm_change", 0.0)
+                pred = "excavation" if dtm_ch < 0 else "fill"
+            if pred in OBJECT_TYPES:
+                code = OBJECT_TYPES[pred]
+                is_mm = pred in {
+                    "road", "path", "parking", "roof", "wall", "fence",
+                    "mast", "greenhouse", "solar_panel", "bridge",
+                    "excavation", "fill", "construction", "substation",
+                    "wind_turbine",
+                }
+                return pred, code, conf, is_mm
 
     # Fallback to rule-based
     if fallback_fn:
@@ -492,14 +536,22 @@ def classify_with_rf_batch(
     MANMADE_TYPES = {
         "road", "path", "parking", "roof", "wall", "fence",
         "mast", "greenhouse", "solar_panel", "bridge",
-        "excavation", "fill", "construction",
+        "excavation", "fill", "construction", "substation",
+        "wind_turbine",
     }
 
     for feat, (pred, conf) in zip(features, batch_preds):
-        if pred and conf >= min_confidence and pred in OBJECT_TYPES:
-            code = OBJECT_TYPES[pred]
-            is_mm = pred in MANMADE_TYPES
-            results[feat["label"]] = (pred, code, conf, is_mm)
+        if pred and conf >= min_confidence:
+            # Post-split: earthwork → excavation or fill based on dtm_change
+            if pred == "earthwork":
+                dtm_ch = feat.get("dtm_change", 0.0)
+                pred = "excavation" if dtm_ch < 0 else "fill"
+            if pred in OBJECT_TYPES:
+                code = OBJECT_TYPES[pred]
+                is_mm = pred in MANMADE_TYPES
+                results[feat["label"]] = (pred, code, conf, is_mm)
+            else:
+                results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
         else:
             # Fall back to rule-based for low-confidence predictions
             results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)

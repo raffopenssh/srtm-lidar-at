@@ -4142,6 +4142,13 @@ def classifier_status():
     try:
         import learned_classifier as lc
         clf = lc.get_classifier()
+        # Report which model source is active
+        if lc.BEST_MODEL_PATH.exists() and lc.BEST_META_PATH.exists():
+            model_source = "best_model"
+        elif lc.MODEL_PATH.exists():
+            model_source = "live"
+        else:
+            model_source = "none"
         return jsonify({
             "trained": clf.is_trained,
             "trained_at": clf.trained_at,
@@ -4150,6 +4157,7 @@ def classifier_status():
             "oob_score": clf.oob_score,
             "n_classes": len(clf.classes),
             "classes": clf.classes,
+            "model_source": model_source,
             "top_features": dict(sorted(
                 clf.feature_importances.items(),
                 key=lambda x: -x[1]

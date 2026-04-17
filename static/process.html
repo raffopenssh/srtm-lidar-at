@@ -58,6 +58,10 @@
   .stp.act { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.08);
              animation: pulse 1.5s ease-in-out infinite; }
   .stp.pend { opacity: 0.35; }
+  .tile-bar { margin-top: 6px; display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--dim); }
+  .tile-track { flex: 1; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; position: relative; }
+  .tile-fill { height: 100%; background: var(--blue); border-radius: 3px; transition: width 0.5s ease; }
+  .tile-lbl { white-space: nowrap; min-width: 70px; }
   @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.55; } }
   .spin { display: inline-block; width: 8px; height: 8px; border: 1.5px solid var(--border);
           border-top-color: var(--blue); border-radius: 50%; animation: sp .7s linear infinite;
@@ -222,6 +226,11 @@
       <span class="kg-sub" id="kgSub"></span>
     </div>
     <div class="kg-sub" id="kgTimer">—</div>
+  </div>
+  <div class="tile-bar" id="tileBar" style="display:none">
+    <span class="tile-lbl" id="tileLbl">tile 0/0</span>
+    <div class="tile-track"><div class="tile-fill" id="tileFill" style="width:0%"></div></div>
+    <span id="tilePct" style="min-width:32px;text-align:right">0%</span>
   </div>
   <div class="steps" id="kgSteps"></div>
 </div>
@@ -528,13 +537,44 @@ function updateKgCard(d) {
   }
 
   document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
+
+  // Tile progress bar
+  const ct = kg.current_tile || 0;
+  const nt = kg.n_tiles || 0;
+  const tileBar = document.getElementById('tileBar');
+  if (nt > 0) {
+    tileBar.style.display = 'flex';
+    document.getElementById('tileLbl').textContent = 'tile ' + ct + '/' + nt;
+    const pct = Math.round(100 * Math.max(0, ct - 1) / nt); // ct-1 = completed tiles
+    document.getElementById('tileFill').style.width = pct + '%';
+    document.getElementById('tilePct').textContent = pct + '%';
+  } else {
+    tileBar.style.display = 'none';
+  }
+
+  // Resolve actual pipeline step: tile_N steps map to their sub-step
+  let pipelineStep = kg.step || '?';
+  const tileStepMatch = pipelineStep.match(/^tile_(\d+)$/);
+  if (tileStepMatch) {
+    // The sub-step name is in step_detail like "processing tile 3/12" or comes
+    // from the step_times keys — use the last known pipeline step from step_times
+    pipelineStep = 'segment'; // default during tile processing
+  }
+  // Check step_times for the most recent pipeline step within the current tile
+  const stepTimes = kg.step_times || {};
+  const tileKeys = Object.keys(stepTimes).filter(k => !k.startsWith('tile_') && k !== 'tiles' && k !== 'cadastre');
+  if (tileKeys.length > 0 && tileStepMatch) {
+    // Use the last pipeline sub-step that has time recorded
+    const last = tileKeys[tileKeys.length - 1];
+    if (STEPS.indexOf(last) >= 0) pipelineStep = last;
+  }
+
   const stepDetail = kg.step_detail ? ' — ' + kg.step_detail : '';
   document.getElementById('kgSub').textContent =
-    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + (kg.step || '?') + stepDetail;
+    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail;
 
   // Steps pipeline with elapsed time per step
-  const curIdx = STEPS.indexOf(kg.step);
-  const stepTimes = kg.step_times || {};
+  const curIdx = STEPS.indexOf(pipelineStep);
   let sh = '';
   STEPS.forEach((st, i) => {
     let cls = 'stp';

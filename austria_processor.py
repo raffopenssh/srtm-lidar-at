@@ -2498,6 +2498,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     _prev_step = [None, None]  # [step_name, start_time]
     _step_times = {}           # step_name → seconds
 
+    _tile_progress = [0, 0]  # [current_tile_idx, n_tiles]
+
     def _report_step(step, detail=""):
         try:
             now = time.time()
@@ -2512,7 +2514,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             step_file = DATA_DIR / "current_step.json"
             import json as _json
             _json.dump({"step": step, "detail": detail,
-                        "ts": now_iso, "step_times": _step_times},
+                        "ts": now_iso, "step_times": _step_times,
+                        "current_tile": _tile_progress[0],
+                        "n_tiles": _tile_progress[1]},
                        open(str(step_file) + ".tmp", "w"))
             os.rename(str(step_file) + ".tmp", str(step_file))
         except Exception:
@@ -2584,6 +2588,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         log.info("KG %s: %d tiles (%.1fkm each) covering %.4f,%.4f → %.4f,%.4f",
                  kg_code, n_tiles, tile_km,
                  full_west, full_south, full_east, full_north)
+        _tile_progress[1] = n_tiles
         _report_step("tiles", f"{n_tiles} tiles @ {tile_km}km")
 
         # --- Accumulators for merging tile results ---
@@ -2601,6 +2606,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 3. Process each tile ---
         for tile_idx, (tw, ts, te, tn) in enumerate(tiles_wgs):
+            _tile_progress[0] = tile_idx + 1
             tile_label = f"tile {tile_idx+1}/{n_tiles}"
             result["step"] = f"tile_{tile_idx+1}"
             _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
@@ -3733,12 +3739,23 @@ def main():
                         sd = json.loads(step_file.read_text())
                         s = sd.get("step", "")
                         detail = sd.get("detail", "")
-                        # Always merge step_times from subprocess
+                        # Always merge step_times + tile progress from subprocess
                         sub_times = sd.get("step_times", {})
-                        if sub_times:
-                            with progress._lock:
-                                if progress._state["current_kg"]:
-                                    progress._state["current_kg"]["step_times"] = sub_times
+                        with progress._lock:
+                            ckg = progress._state.get("current_kg")
+                            if ckg:
+                                if sub_times:
+                                    ckg["step_times"] = sub_times
+                                ct = sd.get("current_tile", 0)
+                                nt = sd.get("n_tiles", 0)
+                                if nt > 0:
+                                    ckg["current_tile"] = ct
+                                    ckg["n_tiles"] = nt
+                                # Pass detail through for display
+                                if detail:
+                                    ckg["step_detail"] = detail
+                                else:
+                                    ckg.pop("step_detail", None)
                         if s and s != last_step:
                             last_step = s
                             progress.set_step(s)

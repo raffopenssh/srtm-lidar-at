@@ -444,17 +444,21 @@ def training_status():
     else:
         result['credits_paused'] = False
 
-    # Model info
-    meta_path = pathlib.Path('/tmp/learned_classifier/rf_meta.json')
-    if meta_path.exists():
+    # Model info (prefer best_model from curve eval)
+    from learned_classifier import BEST_META_PATH
+    active_meta_path = BEST_META_PATH if BEST_META_PATH.exists() else pathlib.Path('/tmp/learned_classifier/rf_meta.json')
+    if active_meta_path.exists():
         try:
-            meta = json.loads(meta_path.read_text())
+            meta = json.loads(active_meta_path.read_text())
             result['model'] = dict(
                 oob_score=round(meta.get('oob_score', 0), 4),
+                composite_score=round(meta.get('composite_score', 0), 4),
                 n_train=meta.get('n_train', 0),
                 n_kgs=meta.get('n_kgs', 0),
+                best_seed=meta.get('best_seed'),
                 n_classes=len(meta.get('classes', [])),
-                trained_at=meta.get('trained_at', ''))
+                trained_at=meta.get('trained_at', ''),
+                source='best_model' if active_meta_path == BEST_META_PATH else 'live')
         except Exception:
             pass
 
@@ -589,6 +593,30 @@ def training_status():
                     'min_class_oob': round(statistics.median(min_cls_vals), 6) if min_cls_vals else None,
                 }
             result['curve_detail'] = curve_detail
+
+            # Expose the exact deployed model's detail (specific seed)
+            if result.get('model') and result['model'].get('best_seed') is not None:
+                dep_kgs = result['model']['n_kgs']
+                dep_seed = result['model']['best_seed']
+                for e in by_kgs.get(dep_kgs, []):
+                    if e.get('seed') == dep_seed:
+                        result['deployed_detail'] = {
+                            'n_kgs': dep_kgs,
+                            'seed': dep_seed,
+                            'n_samples': e.get('n_samples'),
+                            'n_classes': e.get('n_classes'),
+                            'oob': e.get('oob'),
+                            'composite': e.get('composite'),
+                            'mean_class_oob': e.get('mean_class_oob'),
+                            'min_class_oob': e.get('min_class_oob'),
+                            'n_estimators': e.get('n_estimators', 200),
+                            'max_depth': e.get('max_depth', 20),
+                            'min_samples_leaf': e.get('min_samples_leaf', 5),
+                            'per_class_oob': e.get('per_class_oob', {}),
+                            'feature_importances': e.get('all_importances', {}),
+                            'classes_present': sorted(e.get('per_class_oob', {}).keys()),
+                        }
+                        break
         except Exception:
             pass
 

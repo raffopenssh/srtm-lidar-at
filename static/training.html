@@ -69,6 +69,13 @@
   .dp .imps .fi { color: var(--text); }
   .dp .imps .fv { font-size: 10px; }
   .not-evaluated { color: var(--dim); font-style: italic; font-size: 12px; padding: 8px 12px; }
+  .modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100; align-items:center; justify-content:center; }
+  .modal-overlay.open { display:flex; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px; max-width:640px; width:90vw; max-height:85vh; overflow-y:auto; position:relative; }
+  .modal-close { position:absolute; top:8px; right:12px; background:none; border:none; color:var(--dim); font-size:18px; cursor:pointer; }
+  .modal-close:hover { color:var(--text); }
+  .modal h2 { font-size:15px; color:var(--blue); margin-bottom:4px; }
+  .modal .modal-sub { font-size:11px; color:var(--dim); margin-bottom:12px; }
   @media (max-width: 600px) { body { padding: 10px; } .grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -111,6 +118,15 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="deployedModal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('deployedModal').classList.remove('open')">&times;</button>
+    <h2>⭐ Deployed Model</h2>
+    <div class="modal-sub" id="deployedModalSub"></div>
+    <div id="deployedModalBody" class="dp"></div>
+  </div>
+</div>
+
 <div class="poll-info">Polling <span id="pollCountdown">15</span>s</div>
 
 <script>
@@ -123,6 +139,8 @@ function pct(v, d=2) { return v != null ? (v * 100).toFixed(d) + '%' : '—'; }
 
 // Best from checkpoint curve: uses composite score (mature class count only)
 let _bestFromCurve = {oob: null, composite: null, kgs: null};
+let _deployedModel = {n_kgs: null, best_seed: null, composite: null};
+let _deployedDetail = null;
 function computeBestFromCurve(curve) {
   if (!curve || !curve.length) return;
   const maxCls = Math.max(...curve.map(r => r.n_classes || 0));
@@ -495,6 +513,7 @@ function renderCurveTable(curve) {
     let cls = '';
     let ann = '';
     if (r.n_classes > prevCls && prevCls > 0) { ann += '\u2190 +class\u2192' + r.n_classes; }
+    const isDeployed = (_deployedModel.n_kgs === r.n_kgs);
     if (comp === bestComp && (r.n_classes || 0) >= maxCls) { cls = 'best'; ann = '\u2190 BEST' + (ann ? ' ' + ann : ''); }
     else if (comp === troughComp && r.n_kgs > curve[0].n_kgs) { cls = 'trough'; ann = '\u2190 trough' + (ann ? ' ' + ann : ''); }
     if (prevComp !== null && comp > prevComp + 0.002 && r.n_kgs > 30) { ann += (ann ? ' ' : '') + '\u2191'; }
@@ -519,7 +538,8 @@ function renderCurveTable(curve) {
       const denom = seeds >= target ? seeds : target;
       html += `<td style="color:var(--dim);font-size:11px">${seeds}/${denom}</td>`;
     }
-    html += `<td><span class="annotation">${ann}</span></td></tr>`;
+    const starHtml = isDeployed ? ' <span class="deployed-star" title="Deployed model (seed ' + _deployedModel.best_seed + ', composite ' + (_deployedModel.composite*100).toFixed(2) + '%)" onclick="event.stopPropagation();showDeployedModal()" style="cursor:pointer">⭐</span>' : '';
+    html += `<td><span class="annotation">${ann}${starHtml}</span></td></tr>`;
 
     // Re-insert detail row if this was expanded
     if (expandedKgs === r.n_kgs) {
@@ -563,11 +583,61 @@ function renderHistory(history) {
   tbody.innerHTML = html;
 }
 
+function showDeployedModal() {
+  const d = _deployedDetail;
+  if (!d) { alert('Deployed model detail not yet available — run curve eval first.'); return; }
+  const sub = document.getElementById('deployedModalSub');
+  sub.textContent = `${d.n_kgs} KGs · seed ${d.seed} · ${(d.n_samples||0).toLocaleString()} samples · ${d.n_classes} classes · trained at ${_deployedModel.trained_at || '—'}`;
+
+  let h = '';
+  // Meta
+  h += `<div class="dp-meta">`;
+  h += `<b>${d.n_estimators}</b> trees · depth <b>${d.max_depth}</b> · min leaf <b>${d.min_samples_leaf}</b>`;
+  h += ` · composite <b>${(d.composite*100).toFixed(2)}%</b>`;
+  h += ` · OOB <b>${(d.oob*100).toFixed(2)}%</b>`;
+  h += ` · mean cls <b>${(d.mean_class_oob*100).toFixed(1)}%</b>`;
+  h += ` · worst cls <b>${(d.min_class_oob*100).toFixed(1)}%</b>`;
+  h += `</div>`;
+
+  // Per-class OOB by group
+  const classOob = d.per_class_oob || {};
+  for (const [groupName, types] of Object.entries(TYPE_GROUPS)) {
+    h += `<div class="dp-section">${groupName}</div><div class="tags">`;
+    for (const t of types) {
+      const val = classOob[t];
+      if (val !== undefined) {
+        h += `<span class="tag ${tagCls(val)}">${t} <span class="tv">${(val*100).toFixed(0)}%</span></span>`;
+      } else {
+        h += `<span class="tag t-miss">${t}</span>`;
+      }
+    }
+    h += `</div>`;
+  }
+
+  // Feature importances
+  const imps = d.feature_importances || {};
+  const sorted = Object.entries(imps).sort((a, b) => b[1] - a[1]);
+  if (sorted.length > 0) {
+    h += `<div class="dp-section">Top Features</div><div class="imps">`;
+    h += sorted.slice(0, 20).map(([k, v]) =>
+      `<span class="fi">${k}</span> <span class="fv">${(v*100).toFixed(1)}%</span>`
+    ).join(' · ');
+    h += `</div>`;
+  }
+
+  document.getElementById('deployedModalBody').innerHTML = h;
+  document.getElementById('deployedModal').classList.add('open');
+}
+
 async function poll() {
   try {
     const r = await fetch(API);
     const d = await r.json();
     computeBestFromCurve(d.oob_curve);
+    if (d.model) {
+      _deployedModel = { n_kgs: d.model.n_kgs, best_seed: d.model.best_seed, composite: d.model.composite_score };
+    }
+    if (d.deployed_detail) _deployedDetail = d.deployed_detail;
     renderCards(d);
     renderChart(d.oob_curve);
     // Store curve_detail before rendering table

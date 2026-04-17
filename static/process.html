@@ -176,6 +176,8 @@
   .poll-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green);
               animation: blink 5s linear infinite; }
   @keyframes blink { 0%,90% { opacity:1; } 95% { opacity:0.3; } 100% { opacity:1; } }
+  @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
+  .anim-dots::after { content: ''; animation: dots 1.5s steps(1) infinite; }
 
   /* Circuit badge */
   .badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; text-transform: uppercase;
@@ -697,8 +699,10 @@ function updateKgCard(d) {
   }
 
   const stepDetail = kg.step_detail ? ' — ' + kg.step_detail : '';
-  document.getElementById('kgSub').textContent =
-    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail;
+  const isActive = d.state === 'running' && pipelineStep !== 'done';
+  document.getElementById('kgSub').innerHTML =
+    esc((kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail)
+    + (isActive ? '<span class="anim-dots"></span>' : '');
 
   // Steps pipeline with elapsed time per step
   const curIdx = STEPS.indexOf(pipelineStep);

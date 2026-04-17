@@ -4089,7 +4089,7 @@ def main():
                         if step_changed:
                             prev_step = last_step
                             last_step = s
-                            progress.set_step(s)
+                            progress.set_step(s, detail)
                             # Log the NEW step starting
                             if detail:
                                 progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)

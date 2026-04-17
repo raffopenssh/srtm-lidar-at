@@ -229,3 +229,40 @@ systemctl status rf_train srv          # check both services
 ```
 
 Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask, gunicorn, openeo, requests
+
+### Austria Processor
+| File | Purpose |
+|------|----------|
+| `austria_processor.py` | Main processor: iterates KGs, segments, builds GPKGs + JSON, uploads to Zenodo |
+| `zenodo_client.py` | Python Zenodo API client (port of Go zenodo-mirror-go-pkg) |
+| `austria_processor.service` | systemd unit for background processing |
+| `static/process.html` | Processing dashboard (status, map, controls, Zenodo manifest) |
+
+### Austria Processor Data
+| Path | Purpose |
+|------|----------|
+| `data/austria_processor/zenodo_manifest.json` | Tracks all Zenodo uploads + failures |
+| `data/austria_processor/json/` | Per-KG JSON summaries (kept under 4GB) |
+| `data/austria_processor/progress.json` | Live progress state for dashboard |
+| `data/austria_processor/kg_list.json` | Cached list of all ~7850 Austrian KGs |
+| `/tmp/austria_processor/gpkg/` | Temp GPKG files (deleted after Zenodo upload) |
+
+### Austria Processor API Endpoints
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/processing/status` | Processor progress (polled by process.html) |
+| POST | `/api/v1/processing/start` | Start processor (optional: state=, kg=) |
+| POST | `/api/v1/processing/pause` | Pause processor (SIGSTOP) |
+| POST | `/api/v1/processing/resume` | Resume processor (SIGCONT) |
+| POST | `/api/v1/processing/stop` | Stop processor (SIGTERM) |
+| POST | `/api/v1/processing/single?kg=X` | Process single KG |
+| POST | `/api/v1/processing/retry?kg=X` | Retry failed KG |
+| GET | `/api/v1/processing/log` | Recent processor log lines |
+| GET | `/api/v1/processing/manifest` | Zenodo manifest entries |
+| GET | `/api/v1/kg/<kg_code>` | KG JSON summary (local or Zenodo link) |
+| GET | `/api/v1/parcel/<parcel_id>` | Parcel lookup via KG JSON |
+
+### Per-KG Outputs
+1. **Full GPKG** (`{kg}_full.gpkg`): DTM, DSM, nDSM, Ortho RGBI, CIR, segment_type, segment_height
+2. **Light GPKG** (`{kg}_light.gpkg`): segment raster+vector, parcels w/ DTM heights, buildings w/ object heights, new buildings, infrastructure
+3. **JSON summary** (`{kg}.json`): area summary, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, methods

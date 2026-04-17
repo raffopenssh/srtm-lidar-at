@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Austria Landscape Processor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9;
+          --dim: #8b949e; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+          --blue: #58a6ff; --purple: #bc8cff; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg);
+         color: var(--text); padding: 20px; line-height: 1.5; }
+  h1 { font-size: 18px; color: var(--blue); margin-bottom: 4px; }
+  .subtitle { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .subtitle b { color: var(--text); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .card .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 22px; font-weight: bold; margin-top: 2px; }
+  .card .detail { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .section { margin-bottom: 20px; }
+  .section-title { font-size: 14px; color: var(--blue); margin-bottom: 8px;
+                   border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .bar { height: 8px; border-radius: 4px; background: var(--border); margin-top: 6px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+  .bar-fill.green { background: var(--green); }
+  .bar-fill.yellow { background: var(--yellow); }
+  .bar-fill.red { background: var(--red); }
+  .state-idle { color: var(--dim); }
+  .state-running { color: var(--green); }
+  .state-paused { color: var(--yellow); }
+  .state-complete { color: var(--purple); }
+  .state-error { color: var(--red); }
+
+  /* Step indicator */
+  .steps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .step { font-size: 10px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border);
+          background: var(--card); color: var(--dim); white-space: nowrap; transition: all 0.3s; }
+  .step.done { border-color: #23492e; color: var(--green); background: #0d2818; }
+  .step.active { border-color: var(--blue); color: var(--blue); background: #0d1f3c; animation: pulse 1.5s infinite; }
+  .step.pending { opacity: 0.4; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+  /* Log area */
+  .log-area { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+              padding: 10px 12px; max-height: 260px; overflow-y: auto; font-size: 12px; }
+  .log-entry { padding: 2px 0; border-bottom: 1px solid #21262d; display: flex; gap: 8px; }
+  .log-entry:last-child { border-bottom: none; }
+  .log-ts { color: var(--dim); white-space: nowrap; flex-shrink: 0; font-size: 11px; }
+  .log-msg { flex: 1; }
+  .log-info .log-msg { color: var(--dim); }
+  .log-success .log-msg { color: var(--green); }
+  .log-error .log-msg { color: var(--red); }
+  .log-warn .log-msg { color: var(--yellow); }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-size: 11px; text-transform: uppercase;
+       letter-spacing: 0.5px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+  tr:hover td { background: #1c2128; }
+
+  /* Controls */
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .btn { font-family: inherit; font-size: 12px; padding: 6px 16px; border-radius: 6px;
+         border: 1px solid var(--border); background: var(--card); color: var(--text);
+         cursor: pointer; transition: all 0.2s; }
+  .btn:hover { background: #1c2128; border-color: var(--dim); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-green { border-color: #23492e; color: var(--green); }
+  .btn-green:hover { background: #0d2818; }
+  .btn-yellow { border-color: #3d3019; color: var(--yellow); }
+  .btn-yellow:hover { background: #1a1a0d; }
+  .btn-red { border-color: #3d1f1f; color: var(--red); }
+  .btn-red:hover { background: #1f0d0d; }
+  .input-field { font-family: inherit; font-size: 12px; padding: 6px 10px; border-radius: 6px;
+                 border: 1px solid var(--border); background: var(--card); color: var(--text);
+                 width: 100px; outline: none; }
+  .input-field:focus { border-color: var(--blue); }
+
+  /* Collapsible */
+  .collapsible-header { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  .collapsible-header .arrow { transition: transform 0.2s; font-size: 10px; }
+  .collapsible-header.open .arrow { transform: rotate(90deg); }
+  .collapsible-body { display: none; margin-top: 8px; }
+  .collapsible-body.open { display: block; }
+
+  /* Map */
+  #kgMap { height: 280px; border-radius: 8px; border: 1px solid var(--border); }
+  .leaflet-container { background: var(--bg) !important; }
+
+  .poll-info { position: fixed; bottom: 12px; right: 16px; font-size: 11px; color: var(--dim);
+               background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; }
+  .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--border);
+             border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } body { padding: 10px; } .grid { grid-template-columns: 1fr 1fr; } }
+  .auto-scroll-toggle { font-size: 11px; color: var(--dim); cursor: pointer; user-select: none; }
+  .auto-scroll-toggle input { margin-right: 4px; }
+</style>
+</head>
+<body>
+
+<div style="display:flex;align-items:baseline;gap:16px;flex-wrap:wrap">
+  <h1>🇦🇹 Austria Landscape Processor</h1>
+  <span style="font-size:11px;display:flex;gap:10px">
+    <a href="/" style="color:var(--dim);text-decoration:none">← app</a>
+    <a href="/training" style="color:var(--dim);text-decoration:none">training</a>
+    <a href="/api/v1/processing/status" style="color:var(--dim);text-decoration:none">api</a>
+  </span>
+</div>
+<div class="subtitle" id="subtitle">Processing <b>—</b>/<b>—</b> KGs • <b>—</b> uploaded • <b>—</b> failed</div>
+
+<!-- Progress Section -->
+<div class="section">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div>
+        <span class="label">Overall Progress</span>
+        <span id="progressPct" style="margin-left:8px;font-size:14px;font-weight:bold;color:var(--green)">0%</span>
+      </div>
+      <div style="display:flex;gap:16px;font-size:12px">
+        <span>State: <span id="stateLabel" class="state-idle">idle</span></span>
+        <span>Elapsed: <span id="elapsed" style="color:var(--text)">—</span></span>
+        <span>ETA: <span id="eta" style="color:var(--text)">—</span></span>
+        <span>Rate: <span id="rate" style="color:var(--text)">—</span> KG/h</span>
+        <span>Avg: <span id="avgTime" style="color:var(--text)">—</span>/KG</span>
+      </div>
+    </div>
+    <div class="bar"><div class="bar-fill green" id="progressBar" style="width:0%"></div></div>
+  </div>
+</div>
+
+<!-- Current KG Card + Stats Cards -->
+<div class="two-col">
+  <div class="section">
+    <div class="section-title">Current KG</div>
+    <div class="card" id="currentKgCard">
+      <div style="color:var(--dim);font-size:12px">No KG currently processing</div>
+    </div>
+  </div>
+  <div class="section">
+    <div class="section-title">Statistics</div>
+    <div class="grid" id="statsCards" style="margin-bottom:0">
+      <div class="card"><div class="label">Processed</div><div class="value" id="statProcessed">—</div><div class="detail" id="statProcessedDetail">—</div></div>
+      <div class="card"><div class="label">Uploaded</div><div class="value" id="statUploaded">—</div><div class="detail" id="statUploadedDetail">—</div></div>
+      <div class="card"><div class="label">Parcels</div><div class="value" id="statParcels">—</div><div class="detail">total parcels processed</div></div>
+      <div class="card"><div class="label">Buildings</div><div class="value" id="statBuildings">—</div><div class="detail">total buildings detected</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Controls -->
+<div class="section">
+  <div class="section-title">Controls</div>
+  <div class="card">
+    <div class="controls">
+      <button class="btn btn-green" id="btnStart" onclick="sendCmd('start')">▶ Start</button>
+      <button class="btn btn-yellow" id="btnPause" onclick="sendCmd('pause')" disabled>⏸ Pause</button>
+      <button class="btn btn-green" id="btnResume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
+      <span style="color:var(--border)">│</span>
+      <span style="font-size:12px;color:var(--dim)">Single KG:</span>
+      <input type="text" class="input-field" id="singleKgInput" placeholder="e.g. 63349">
+      <button class="btn" onclick="processSingleKg()">Process</button>
+    </div>
+  </div>
+</div>
+
+<!-- Log + Map -->
+<div class="two-col">
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div class="section-title" style="border:none;margin:0;padding:0">Recent Activity</div>
+      <label class="auto-scroll-toggle"><input type="checkbox" id="autoScroll" checked> auto-scroll</label>
+    </div>
+    <div class="log-area" id="logArea"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">KG Map</div>
+    <div id="kgMap"></div>
+  </div>
+</div>
+
+<!-- Failed KGs -->
+<div class="section">
+  <div class="collapsible-header" id="failedHeader" onclick="toggleFailed()">
+    <span class="arrow">▶</span>
+    <span class="section-title" style="border:none;margin:0;padding:0">Failed KGs (<span id="failedCount">0</span>)</span>
+  </div>
+  <div class="collapsible-body" id="failedBody">
+    <div class="card" style="overflow-x:auto;padding:0">
+      <table id="failedTable">
+        <thead><tr><th>KG Code</th><th>Name</th><th>Step</th><th>Error</th><th>Time</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Zenodo Manifest -->
+<div class="section">
+  <div class="collapsible-header" id="zenodoHeader" onclick="toggleZenodo()">
+    <span class="arrow">▶</span>
+    <span class="section-title" style="border:none;margin:0;padding:0">Zenodo Manifest (<span id="zenodoCount">0</span> entries, <span id="zenodoSize">0 B</span>)</span>
+  </div>
+  <div class="collapsible-body" id="zenodoBody">
+    <div class="card" style="overflow-x:auto;padding:0">
+      <table id="zenodoTable" style="font-size:12px">
+        <thead><tr><th>Key</th><th>Depo ID</th><th>Filename</th><th>Size</th><th>MD5</th><th>Uploaded</th><th>Version</th><th>URL</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="poll-info">Polling <span id="pollCountdown">5</span>s</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = '/api/v1/processing/status';
+const POLL_INTERVAL = 5;
+let countdown = POLL_INTERVAL;
+let map = null;
+let mapMarkers = L.layerGroup();
+let lastLogCount = 0;
+
+const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','gpkg_full','gpkg_light','json','upload','done'];
+const STEP_LABELS = { cadastre:'Cadastre', lidar:'LiDAR', ortho:'Ortho', copernicus:'Copernicus',
+  hansen:'Hansen', segment:'Segment', gpkg_full:'GPKG Full', gpkg_light:'GPKG Light',
+  json:'JSON', upload:'Upload', done:'Done' };
+
+function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
+
+function fmtDuration(secs) {
+  if (secs == null || secs <= 0) return '—';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+function fmtBytes(bytes) {
+  if (bytes == null || bytes === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
+}
+
+function initMap() {
+  map = L.map('kgMap', { zoomControl: true, attributionControl: false }).setView([47.5, 13.5], 7);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 18, subdomains: 'abcd'
+  }).addTo(map);
+  mapMarkers.addTo(map);
+}
+
+function updateSubtitle(d) {
+  const el = document.getElementById('subtitle');
+  el.innerHTML = `Processing <b>${fmt(d.completed || 0)}</b>/<b>${fmt(d.total_kgs || 0)}</b> KGs • <b>${fmt(d.uploaded || 0)}</b> uploaded • <b>${fmt(d.failed || 0)}</b> failed`;
+}
+
+function updateProgress(d) {
+  const pct = d.total_kgs > 0 ? ((d.completed || 0) / d.total_kgs * 100) : 0;
+  document.getElementById('progressPct').textContent = pct.toFixed(1) + '%';
+  const bar = document.getElementById('progressBar');
+  bar.style.width = pct + '%';
+  bar.className = 'bar-fill ' + (d.failed > d.completed * 0.1 ? 'yellow' : 'green');
+
+  const stateEl = document.getElementById('stateLabel');
+  const state = d.state || 'idle';
+  stateEl.textContent = state;
+  stateEl.className = 'state-' + state;
+
+  document.getElementById('elapsed').textContent = fmtDuration(d.elapsed_seconds);
+  document.getElementById('eta').textContent = fmtDuration(d.eta_seconds);
+  document.getElementById('rate').textContent = d.rate_kgs_per_hour != null ? d.rate_kgs_per_hour.toFixed(1) : '—';
+  document.getElementById('avgTime').textContent = fmtDuration(d.avg_seconds_per_kg);
+
+  // Control button states
+  const btnStart = document.getElementById('btnStart');
+  const btnPause = document.getElementById('btnPause');
+  const btnResume = document.getElementById('btnResume');
+  if (state === 'running') {
+    btnStart.disabled = true; btnPause.disabled = false;
+    btnResume.style.display = 'none'; btnPause.style.display = '';
+  } else if (state === 'paused') {
+    btnStart.disabled = true; btnPause.style.display = 'none';
+    btnResume.style.display = ''; btnResume.disabled = false;
+  } else if (state === 'complete') {
+    btnStart.disabled = true; btnPause.disabled = true;
+    btnResume.style.display = 'none';
+  } else {
+    btnStart.disabled = false; btnPause.disabled = true;
+    btnResume.style.display = 'none';
+  }
+}
+
+function updateCurrentKg(d) {
+  const card = document.getElementById('currentKgCard');
+  const kg = d.current_kg;
+  if (!kg) {
+    const msg = d.state === 'complete' ? 'Processing complete ✓' :
+                d.state === 'paused' ? 'Processing paused' : 'No KG currently processing';
+    card.innerHTML = `<div style="color:var(--dim);font-size:12px">${msg}</div>`;
+    return;
+  }
+
+  const elapsed = kg.started_at ? Math.floor((Date.now() - new Date(kg.started_at).getTime()) / 1000) : 0;
+  const currentStepIdx = STEPS.indexOf(kg.step);
+
+  let stepsHtml = '<div class="steps">';
+  STEPS.forEach((s, i) => {
+    let cls = 'step';
+    if (i < currentStepIdx) cls += ' done';
+    else if (i === currentStepIdx) cls += ' active';
+    else cls += ' pending';
+    stepsHtml += `<span class="${cls}">${i === currentStepIdx ? '<span class="spinner"></span> ' : ''}${STEP_LABELS[s] || s}</span>`;
+  });
+  stepsHtml += '</div>';
+
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap">
+      <div>
+        <span style="font-size:16px;font-weight:bold;color:var(--text)">${kg.code}</span>
+        <span style="color:var(--dim);margin-left:6px">${kg.name || ''}</span>
+        <span style="color:var(--dim);font-size:11px;margin-left:6px">${kg.state || ''}</span>
+      </div>
+      <div style="font-size:12px;color:var(--dim)">⏱ ${fmtDuration(elapsed)}</div>
+    </div>
+    ${stepsHtml}
+  `;
+}
+
+function updateStats(d) {
+  document.getElementById('statProcessed').textContent = fmt(d.completed || 0);
+  document.getElementById('statProcessedDetail').textContent =
+    `${fmt(d.success || 0)} success / ${fmt(d.failed || 0)} failed`;
+
+  document.getElementById('statUploaded').textContent = fmt(d.uploaded || 0);
+  document.getElementById('statUploadedDetail').textContent = fmtBytes(d.upload_size_bytes || 0);
+
+  document.getElementById('statParcels').textContent = fmt(d.parcels_total || 0);
+  document.getElementById('statBuildings').textContent = fmt(d.buildings_total || 0);
+}
+
+function updateLog(d) {
+  const log = d.recent_log || [];
+  if (log.length === lastLogCount) return;
+  lastLogCount = log.length;
+
+  const area = document.getElementById('logArea');
+  let html = '';
+  // Show newest first (sort by timestamp descending)
+  const sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  sorted.forEach(entry => {
+    const lvl = entry.level || 'info';
+    const cls = lvl === 'error' ? 'log-error' : lvl === 'success' ? 'log-success' :
+                lvl === 'warn' || lvl === 'warning' ? 'log-warn' : 'log-info';
+    const ts = fmtTime(entry.ts);
+    const kgTag = entry.kg ? `[${entry.kg}] ` : '';
+    html += `<div class="log-entry ${cls}"><span class="log-ts">${ts}</span><span class="log-msg">${kgTag}${escHtml(entry.msg)}</span></div>`;
+  });
+  area.innerHTML = html;
+
+  if (document.getElementById('autoScroll').checked) {
+    area.scrollTop = 0;
+  }
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function updateFailed(d) {
+  const failed = d.failed_kgs || [];
+  document.getElementById('failedCount').textContent = failed.length;
+  const tbody = document.querySelector('#failedTable tbody');
+  if (failed.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:12px">No failed KGs</td></tr>';
+    return;
+  }
+  let html = '';
+  failed.forEach(f => {
+    html += `<tr>
+      <td style="color:var(--text);font-weight:bold">${f.code}</td>
+      <td>${f.name || '—'}</td>
+      <td><span class="step" style="display:inline-block">${STEP_LABELS[f.step] || f.step || '—'}</span></td>
+      <td style="color:var(--red);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(f.error)}">${escHtml(f.error) || '—'}</td>
+      <td style="white-space:nowrap">${fmtTime(f.ts)}</td>
+      <td><button class="btn btn-yellow" style="padding:2px 10px;font-size:11px" onclick="retryKg('${f.code}')">↻ Retry</button></td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+function updateMap(d) {
+  if (!map) return;
+  // We only update map if we have KG centroid data in the response
+  // For now, show failed KGs and current KG if coordinates are available
+  // The map will be populated if the API provides kg_centroids array
+  const centroids = d.kg_centroids;
+  if (!centroids || centroids.length === 0) return;
+
+  mapMarkers.clearLayers();
+  centroids.forEach(c => {
+    const color = c.status === 'success' ? '#3fb950' :
+                  c.status === 'failed' ? '#f85149' :
+                  c.status === 'current' ? '#58a6ff' : '#30363d';
+    const marker = L.circleMarker([c.lat, c.lng], {
+      radius: 3, fillColor: color, fillOpacity: 0.7,
+      stroke: false
+    });
+    if (c.code) marker.bindTooltip(`${c.code} ${c.name || ''}`, { className: 'dark-tooltip' });
+    mapMarkers.addLayer(marker);
+  });
+}
+
+function toggleFailed() {
+  const header = document.getElementById('failedHeader');
+  const body = document.getElementById('failedBody');
+  header.classList.toggle('open');
+  body.classList.toggle('open');
+}
+
+function toggleZenodo() {
+  const header = document.getElementById('zenodoHeader');
+  const body = document.getElementById('zenodoBody');
+  const wasOpen = header.classList.contains('open');
+  header.classList.toggle('open');
+  body.classList.toggle('open');
+  if (!wasOpen) fetchManifest();
+}
+
+let lastManifestFetch = 0;
+async function fetchManifest() {
+  // Rate-limit: max once per 10s
+  if (Date.now() - lastManifestFetch < 10000) return;
+  lastManifestFetch = Date.now();
+  try {
+    const r = await fetch('/api/v1/processing/manifest');
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('zenodoCount').textContent = fmt(d.count || 0);
+    document.getElementById('zenodoSize').textContent = fmtBytes(d.total_size_bytes || 0);
+    const tbody = document.querySelector('#zenodoTable tbody');
+    const entries = d.entries || {};
+    const keys = Object.keys(entries).sort();
+    // Show most recent first (by uploaded_at), limit to 200 rows
+    const sorted = keys.map(k => ({key: k, ...entries[k]}))
+      .sort((a, b) => (b.uploaded_at || '').localeCompare(a.uploaded_at || ''))
+      .slice(0, 200);
+    tbody.innerHTML = sorted.map(e => {
+      const bucketUrl = e.bucket_url || '';
+      const fileUrl = bucketUrl ? `${bucketUrl}/${e.filename || ''}` : '';
+      const md5Short = (e.checksum || '').substring(0, 12);
+      const ts = e.uploaded_at ? new Date(e.uploaded_at).toLocaleString() : '—';
+      const isError = e.key && e.key.endsWith('_error');
+      const rowStyle = isError ? ' style="color:var(--red)"' : '';
+      return `<tr${rowStyle}>
+        <td>${esc(e.key || '')}</td>
+        <td>${e.depo_id || '—'}</td>
+        <td>${esc(e.filename || '—')}</td>
+        <td>${fmtBytes(e.size || 0)}</td>
+        <td title="${esc(e.checksum || '')}">${md5Short || '—'}</td>
+        <td>${ts}</td>
+        <td>${esc(e.version || '—')}</td>
+        <td>${fileUrl ? `<a href="${esc(fileUrl)}" target="_blank" style="color:var(--blue)">link</a>` : '—'}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) { console.error('Manifest fetch error:', e); }
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function sendCmd(action) {
+  try {
+    const r = await fetch(`/api/v1/processing/${action}`, { method: 'POST' });
+    if (!r.ok) {
+      const t = await r.text();
+      console.error(`${action} failed:`, t);
+    }
+    setTimeout(poll, 500);
+  } catch (e) { console.error(`${action} error:`, e); }
+}
+
+async function processSingleKg() {
+  const input = document.getElementById('singleKgInput');
+  const kg = input.value.trim();
+  if (!kg) return;
+  try {
+    const r = await fetch(`/api/v1/processing/single?kg=${encodeURIComponent(kg)}`, { method: 'POST' });
+    if (!r.ok) {
+      const t = await r.text();
+      alert(`Failed: ${t}`);
+    } else {
+      input.value = '';
+    }
+    setTimeout(poll, 500);
+  } catch (e) { console.error('Single KG error:', e); }
+}
+
+async function retryKg(code) {
+  try {
+    const r = await fetch(`/api/v1/processing/retry?kg=${encodeURIComponent(code)}`, { method: 'POST' });
+    if (!r.ok) {
+      const t = await r.text();
+      alert(`Retry failed: ${t}`);
+    }
+    setTimeout(poll, 500);
+  } catch (e) { console.error('Retry error:', e); }
+}
+
+async function poll() {
+  try {
+    const r = await fetch(API);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+
+    updateSubtitle(d);
+    updateProgress(d);
+    updateCurrentKg(d);
+    updateStats(d);
+    updateLog(d);
+    updateFailed(d);
+    updateMap(d);
+    // Auto-refresh manifest if section is open
+    if (document.getElementById('zenodoHeader').classList.contains('open')) fetchManifest();
+  } catch (e) {
+    console.error('Poll error:', e);
+  }
+}
+
+function initPage() {
+  initMap();
+  poll();
+  setInterval(poll, POLL_INTERVAL * 1000);
+  setInterval(() => {
+    countdown--;
+    if (countdown <= 0) countdown = POLL_INTERVAL;
+    document.getElementById('pollCountdown').textContent = countdown;
+  }, 1000);
+}
+
+initPage();
+</script>
+</body>
+</html>

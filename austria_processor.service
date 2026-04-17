@@ -1,0 +1,21 @@
+[Unit]
+Description=Austria Landscape Processor
+After=network.target srv.service
+
+[Service]
+Type=simple
+User=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+ExecStart=/usr/bin/python3 austria_processor.py
+Restart=on-failure
+RestartSec=60
+MemoryMax=4G
+OOMPolicy=stop
+
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=append:/home/exedev/srtm-lidar/data/austria_processor/logs/processor.log
+StandardError=append:/home/exedev/srtm-lidar/data/austria_processor/logs/processor.log
+
+[Install]
+WantedBy=multi-user.target

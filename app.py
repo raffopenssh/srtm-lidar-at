@@ -716,6 +716,221 @@ def stop_curve_eval():
 
 
 # ---------------------------------------------------------------------------
+# Austria Processor endpoints
+# ---------------------------------------------------------------------------
+
+_processor_process = None  # subprocess.Popen for the processor
+
+@app.route('/api/v1/processing/status')
+def processing_status():
+    """Return Austria processor progress (read from progress.json)."""
+    progress_file = Path('data/austria_processor/progress.json')
+    if not progress_file.exists():
+        return jsonify({
+            'state': 'idle', 'total_kgs': 0, 'completed': 0,
+            'success': 0, 'failed': 0, 'uploaded': 0,
+            'upload_size_bytes': 0, 'current_kg': None,
+            'rate_kgs_per_hour': 0, 'avg_seconds_per_kg': 0,
+            'elapsed_seconds': 0, 'eta_seconds': 0,
+            'recent_log': [], 'failed_kgs': [],
+            'parcels_total': 0, 'buildings_total': 0, 'started_at': None,
+        })
+    try:
+        data = json.loads(progress_file.read_text())
+        # Check if processor is actually running
+        global _processor_process
+        if _processor_process is not None and _processor_process.poll() is not None:
+            data['state'] = 'stopped'
+            _processor_process = None
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/processing/start', methods=['POST'])
+def processing_start():
+    """Start the Austria processor as a background process."""
+    global _processor_process
+    if _processor_process is not None and _processor_process.poll() is None:
+        return jsonify({'error': 'Processor already running', 'pid': _processor_process.pid}), 409
+
+    args = [sys.executable, 'austria_processor.py']
+    state = request.args.get('state') or request.json.get('state', '') if request.is_json else ''
+    kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
+    no_cop = request.args.get('no_copernicus', 'false').lower() in ('true', '1')
+
+    if kg:
+        args.extend(['--kg', kg])
+    elif state:
+        args.extend(['--state', state])
+    if no_cop:
+        args.append('--no-copernicus')
+
+    log_file = Path('data/austria_processor/logs/processor.log')
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_fd = open(log_file, 'a')
+
+    import subprocess
+    _processor_process = subprocess.Popen(
+        args, stdout=log_fd, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    log.info('Austria processor started: PID %d, args=%s', _processor_process.pid, args)
+    return jsonify({'status': 'started', 'pid': _processor_process.pid})
+
+
+@app.route('/api/v1/processing/pause', methods=['POST'])
+def processing_pause():
+    """Pause the processor (sends SIGSTOP)."""
+    global _processor_process
+    if _processor_process is None or _processor_process.poll() is not None:
+        return jsonify({'error': 'Processor not running'}), 404
+    import signal as _sig
+    os.kill(_processor_process.pid, _sig.SIGSTOP)
+    # Update progress file
+    pf = Path('data/austria_processor/progress.json')
+    if pf.exists():
+        d = json.loads(pf.read_text())
+        d['state'] = 'paused'
+        pf.write_text(json.dumps(d, indent=2, default=str))
+    return jsonify({'status': 'paused', 'pid': _processor_process.pid})
+
+
+@app.route('/api/v1/processing/resume', methods=['POST'])
+def processing_resume():
+    """Resume the processor (sends SIGCONT)."""
+    global _processor_process
+    if _processor_process is None or _processor_process.poll() is not None:
+        return jsonify({'error': 'Processor not running'}), 404
+    import signal as _sig
+    os.kill(_processor_process.pid, _sig.SIGCONT)
+    pf = Path('data/austria_processor/progress.json')
+    if pf.exists():
+        d = json.loads(pf.read_text())
+        d['state'] = 'running'
+        pf.write_text(json.dumps(d, indent=2, default=str))
+    return jsonify({'status': 'resumed', 'pid': _processor_process.pid})
+
+
+@app.route('/api/v1/processing/stop', methods=['POST'])
+def processing_stop():
+    """Stop the processor (sends SIGTERM)."""
+    global _processor_process
+    if _processor_process is None or _processor_process.poll() is not None:
+        return jsonify({'error': 'Processor not running'}), 404
+    import signal as _sig
+    os.kill(_processor_process.pid, _sig.SIGTERM)
+    _processor_process = None
+    pf = Path('data/austria_processor/progress.json')
+    if pf.exists():
+        d = json.loads(pf.read_text())
+        d['state'] = 'stopped'
+        pf.write_text(json.dumps(d, indent=2, default=str))
+    return jsonify({'status': 'stopped'})
+
+
+@app.route('/api/v1/processing/single', methods=['POST'])
+def processing_single():
+    """Process a single KG (async in background)."""
+    kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
+    if not kg:
+        return jsonify({'error': 'kg parameter required'}), 400
+    return processing_start()  # reuse start with kg param
+
+
+@app.route('/api/v1/processing/retry', methods=['POST'])
+def processing_retry():
+    """Retry a specific failed KG."""
+    kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
+    if not kg:
+        return jsonify({'error': 'kg parameter required'}), 400
+    # Remove error entry from manifest so it will be reprocessed
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    if manifest_path.exists():
+        try:
+            from zenodo_client import Manifest
+            m = Manifest(str(manifest_path))
+            m.delete(f'{kg}_error')
+            m.save()
+        except Exception:
+            pass
+    return processing_start()  # start with that KG
+
+
+@app.route('/api/v1/processing/log')
+def processing_log():
+    """Return recent processor log lines."""
+    log_file = Path('data/austria_processor/logs/processor.log')
+    n = int(request.args.get('lines', 200))
+    if not log_file.exists():
+        return jsonify({'lines': [], 'total': 0})
+    try:
+        lines = log_file.read_text().splitlines()[-n:]
+        return jsonify({'lines': lines, 'total': len(lines)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/processing/manifest')
+def processing_manifest():
+    """Return the Zenodo manifest for the processor."""
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    if not manifest_path.exists():
+        return jsonify({'entries': {}, 'count': 0})
+    try:
+        data = json.loads(manifest_path.read_text())
+        entries = data.get('entries', {})
+        return jsonify({
+            'count': len(entries),
+            'entries': entries,
+            'total_size_bytes': sum(e.get('size', 0) for e in entries.values()),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>')
+def api_kg(kg_code):
+    """Return the JSON summary for a KG."""
+    json_path = Path(f'data/austria_processor/json/{kg_code}.json')
+    if json_path.exists():
+        return send_file(str(json_path), mimetype='application/json')
+    # Check Zenodo manifest for download link
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    if manifest_path.exists():
+        try:
+            data = json.loads(manifest_path.read_text())
+            entry = data.get('entries', {}).get(f'{kg_code}_json')
+            if entry:
+                return jsonify({
+                    'available': True, 'source': 'zenodo',
+                    'download_url': f"{entry.get('bucket_url', '')}/{entry.get('filename', '')}",
+                    'depo_id': entry.get('depo_id'),
+                })
+        except Exception:
+            pass
+    return jsonify({'error': f'KG {kg_code} not found'}), 404
+
+
+@app.route('/api/v1/parcel/<parcel_id>')
+def api_parcel(parcel_id):
+    """Return JSON summary for the KG containing a parcel."""
+    # parcel_id format: "KGCODE-GNR" e.g. "75414-1314/1"
+    if '-' not in parcel_id:
+        return jsonify({'error': 'Invalid parcel_id format, expected KGCODE-GNR'}), 400
+    kg_code = parcel_id.split('-')[0]
+    json_path = Path(f'data/austria_processor/json/{kg_code}.json')
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text())
+            data['_query_parcel_id'] = parcel_id
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'error': f'KG {kg_code} not processed yet'}), 404
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

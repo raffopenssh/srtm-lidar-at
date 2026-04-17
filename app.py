@@ -767,11 +767,26 @@ def processing_status():
             data['system']['disk_used_pct'] = round(100*(1 - fg/tg), 1)
             # CPU
             data['system']['cpu_pct'] = round(100 * os.getloadavg()[0] / max(os.cpu_count() or 1, 1), 1)
-            # Processor PID check
+            # Processor PID check — try managed process first, then find via systemd/pidfile
+            _proc_pid = None
             if _processor_process and _processor_process.poll() is None:
-                data['system']['proc_pid'] = _processor_process.pid
+                _proc_pid = _processor_process.pid
+            else:
+                # Find processor started via systemd
                 try:
-                    rss_kb = int(open(f'/proc/{_processor_process.pid}/status').read().split('VmRSS:')[1].split()[0])
+                    import subprocess as _sp
+                    _pids = _sp.check_output(
+                        ['pgrep', '-f', 'austria_processor.py'],
+                        text=True, timeout=2
+                    ).strip().split('\n')
+                    if _pids and _pids[0]:
+                        _proc_pid = int(_pids[0])
+                except Exception:
+                    pass
+            if _proc_pid:
+                data['system']['proc_pid'] = _proc_pid
+                try:
+                    rss_kb = int(open(f'/proc/{_proc_pid}/status').read().split('VmRSS:')[1].split()[0])
                     data['system']['proc_ram_mb'] = rss_kb // 1024
                 except Exception:
                     pass

@@ -47,8 +47,9 @@ logger = logging.getLogger(__name__)
 # OLD (account 1, out of credits): CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
 # OLD (account 1, out of credits): CLIENT_SECRET = "<REDACTED_SECRET>"
 _CREDENTIALS = [
-    ("sh-8d8c685f-df36-4536-b949-666532d08414", "<REDACTED_SECRET>"),
-    ("sh-2ed25dbb-857d-4e99-b070-e1954a99a980", "<REDACTED_SECRET>"),
+    ("sh-f36653c6-5d8c-48a1-b86d-476c50eb389c", "<REDACTED_SECRET>"),  # fresh 2026-04
+    ("sh-8d8c685f-df36-4536-b949-666532d08414", "<REDACTED_SECRET>"),  # renews 2026-05-01
+    ("sh-2ed25dbb-857d-4e99-b070-e1954a99a980", "<REDACTED_SECRET>"),  # renews 2026-05-01
 ]
 _credential_index = 0  # current credential pair
 CLIENT_ID = _CREDENTIALS[0][0]

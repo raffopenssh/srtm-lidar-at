@@ -126,6 +126,7 @@ def compute_texture_per_segment(
     resolution: float = DEFAULT_TEXTURE_RES,
     year: int | None = None,
     max_pixels: int = 4_000_000,
+    grey_image: np.ndarray | None = None,
 ) -> dict[int, dict[str, float]]:
     """Compute GLCM texture features per labelled segment.
 
@@ -139,12 +140,17 @@ def compute_texture_per_segment(
     resolution : texture working resolution (default 0.5m).
     year : ortho year override.
     max_pixels : skip if image too large.
+    grey_image : pre-loaded greyscale image (avoids re-reading ortho).
 
     Returns
     -------
     dict mapping label → texture feature dict.
     """
-    grey = read_ortho_for_texture(als_result, resolution=resolution, year=year)
+    if grey_image is not None:
+        grey = grey_image
+        log.info("Using pre-loaded grey image for texture (%dx%d)", grey.shape[1], grey.shape[0])
+    else:
+        grey = read_ortho_for_texture(als_result, resolution=resolution, year=year)
     if grey is None:
         log.info("No ortho available for texture features")
         return {}

@@ -156,6 +156,10 @@ class CopernicusTileCache:
             return result
         except Exception as e:
             self._stats["errors"] += 1
+            from copernicus import CreditsExhaustedError
+            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                log.error("Copernicus NDVI: credits exhausted — pausing")
+                raise
             log.warning("Copernicus NDVI tile fetch failed: %s", e)
             return None
 
@@ -183,6 +187,10 @@ class CopernicusTileCache:
             return result
         except Exception as e:
             self._stats["errors"] += 1
+            from copernicus import CreditsExhaustedError
+            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                log.error("Copernicus WorldCover: credits exhausted — pausing")
+                raise
             log.warning("Copernicus WorldCover tile fetch failed: %s", e)
             return None
 
@@ -221,6 +229,10 @@ class CopernicusTileCache:
             return result
         except Exception as e:
             self._stats["errors"] += 1
+            from copernicus import CreditsExhaustedError
+            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                log.error("Copernicus SAR: credits exhausted — pausing")
+                raise
             log.warning("Copernicus SAR tile fetch failed: %s", e)
             return None
 

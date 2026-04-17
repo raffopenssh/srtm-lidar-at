@@ -85,6 +85,7 @@ OBJECT_TYPES = {
     "fill": 51,          # DTM raised between dates                 [Dep 81]
     "tree_loss": 52,     # logging/timber harvest: was tall, now ground, terrain intact
     "construction": 53,  # new structure, or site clearing (tree_loss + earthworks)
+    "earthwork": 54,      # merged excavation+fill (RF training only; split back at inference)
 }
 
 # Group types (merge adjacent compatible individuals)
@@ -127,6 +128,7 @@ _COMPAT_MAP = {
     "bare_soil": 9, "rock": 9,
     # Disturbance
     "excavation": 3, "fill": 4, "tree_loss": 10, "construction": 10,
+    "earthwork": 3,
 }
 
 # Map cadastre land-use codes → our detectable types (for cross-validation)
@@ -857,12 +859,107 @@ def _phenology_class(feat: dict) -> str:
     return "unknown"
 
 
-def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int, float, bool]:
+def _classify_infrastructure(
+    feat: dict,
+    nearby_infra: list,
+    h_mean: float, h_max: float, h_std: float,
+    area: float, compact: float,
+    best_ndvi: float, have_ndvi: bool, dsm_rough: float,
+    brightness: float, has_spectral: bool,
+    ndvi: float, nir: float,
+) -> tuple[str, int, float, bool] | None:
+    """Try to classify segment using nearby infrastructure data.
+
+    Returns (type_name, type_code, confidence, is_manmade) or None if
+    no infrastructure match is confident enough.
+    """
+    # Bucket nearby features by category
+    wind = [f for f in nearby_infra if f["category"] == "wind_energy"]
+    solar = [f for f in nearby_infra if f["category"] == "solar_energy"]
+    subs = [f for f in nearby_infra if f["category"] == "substation"]
+    telecom = [f for f in nearby_infra if f["category"] == "telecom"]
+    structure = [f for f in nearby_infra if f["category"] == "structure"]
+    mast_candidates = telecom + [s for s in structure
+                                  if s.get("type") in ("Mast", "Pole", "Tower", "Antenna")]
+
+    # --- Wind turbine: extremely tall, tiny footprint, near known location ---
+    if wind:
+        nearest_wind = wind[0]  # sorted by distance
+        dist = nearest_wind["distance_m"]
+        if dist < 150 and h_mean > 40 and area < 100:
+            return "wind_turbine", OBJECT_TYPES["wind_turbine"], 0.95, True
+        if dist < 200 and h_mean > 60 and area < 50:
+            return "wind_turbine", OBJECT_TYPES["wind_turbine"], 0.85, True
+
+    # Wind turbine without API match: extremely distinctive signature
+    if not wind and h_mean > 60 and area < 50 and compact < 0.3:
+        if have_ndvi and best_ndvi < 0.1:
+            return "wind_turbine", OBJECT_TYPES["wind_turbine"], 0.70, True
+
+    # --- Solar panel: two signatures (rooftop vs ground-mount) ---
+    if solar:
+        nearest_solar = solar[0]
+        dist = nearest_solar["distance_m"]
+        known_area = nearest_solar.get("area_sqm") or 0
+
+        # Ground-mount solar farm (large, near known location)
+        if dist < 100 and area > 500 and best_ndvi < 0.1 and dsm_rough < 0.5 and h_mean < 5:
+            return "solar_panel", OBJECT_TYPES["solar_panel"], 0.90, True
+        if dist < 100 and area > 100 and best_ndvi < 0.15 and dsm_rough < 0.5 and h_mean < 5:
+            return "solar_panel", OBJECT_TYPES["solar_panel"], 0.80, True
+
+        # Rooftop solar (building-like, near known location)
+        if dist < 50 and dsm_rough < 0.3 and h_std < 0.5:
+            if have_ndvi and best_ndvi < 0.05:
+                return "solar_panel", OBJECT_TYPES["solar_panel"], 0.85, True
+            if has_spectral and brightness > 120 and ndvi < 0.1:
+                return "solar_panel", OBJECT_TYPES["solar_panel"], 0.75, True
+
+    # Solar without API match: ground-mount (very strict)
+    if not solar and area > 1000 and best_ndvi < 0.05 and dsm_rough < 0.3:
+        if h_std < 0.3 and h_mean < 3 and has_spectral and brightness > 100:
+            return "solar_panel", OBJECT_TYPES["solar_panel"], 0.40, True
+
+    # --- Substation: fenced compound with equipment ---
+    if subs:
+        nearest_sub = subs[0]
+        dist = nearest_sub["distance_m"]
+        if dist < 150 and area > 200 and best_ndvi < 0.15 and 1 <= h_mean <= 15:
+            return "substation", OBJECT_TYPES["substation"], 0.85, True
+        if dist < 100 and area > 100 and best_ndvi < 0.2:
+            return "substation", OBJECT_TYPES["substation"], 0.70, True
+
+    # --- Mast / antenna: tall narrow structure ---
+    if mast_candidates:
+        nearest_mast = mast_candidates[0]
+        dist = nearest_mast["distance_m"]
+        if dist < 50 and h_mean > 20 and area < 15:
+            return "mast", OBJECT_TYPES["mast"], 0.85, True
+        if dist < 80 and h_mean > 15 and area < 20 and compact < 0.5:
+            return "mast", OBJECT_TYPES["mast"], 0.70, True
+
+    # Mast without API match: very strict physical signature
+    if not mast_candidates and h_mean > 25 and area < 10 and compact < 0.3:
+        if have_ndvi and best_ndvi < 0.1:
+            return "mast", OBJECT_TYPES["mast"], 0.60, True
+
+    return None
+
+
+def classify_object(feat: dict, *, has_spectral: bool = False, nearby_infra: list | None = None) -> tuple[str, int, float, bool]:
     """Classify a single object from its feature vector.
 
     Returns (type_name, type_code, confidence, is_manmade).
 
+    Parameters
+    ----------
+    nearby_infra : list of infrastructure feature dicts from
+        InfrastructureLookup.find_nearby(), or None if unavailable.
+        Used for early-exit detection of wind_turbine, solar_panel,
+        substation, and mast.
+
     Decision tree ordered by discriminative power:
+    0. Infrastructure spatial match (early exit for known locations)
     1. Temporal disturbance (highest priority — recent changes)
     2. Height separates ground from elevated
     3. Among elevated: roughness + shape + NDVI separate building from tree
@@ -943,6 +1040,21 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         best_ndvi = 0
         have_ndvi = False
         ndvi_is_coarse = False
+
+    # ---------------------------------------------------------------
+    # 0. INFRASTRUCTURE SPATIAL MATCH (early exit for known locations)
+    #    Uses austria-power API data via InfrastructureLookup.
+    #    Highest priority — if we have a known infrastructure feature
+    #    nearby AND the physical signature matches, return immediately.
+    # ---------------------------------------------------------------
+    if nearby_infra:
+        _infra_result = _classify_infrastructure(
+            feat, nearby_infra, h_mean, h_max, h_std, area, compact,
+            best_ndvi, have_ndvi, dsm_rough, brightness, has_spectral,
+            ndvi, nir,
+        )
+        if _infra_result is not None:
+            return _infra_result
 
     # ---------------------------------------------------------------
     # DISTURBANCE (highest priority — recent changes)
@@ -1170,7 +1282,11 @@ def classify_object(feat: dict, *, has_spectral: bool = False) -> tuple[str, int
         bld_thresh = 5.5 if have_ndvi else 7.0
 
         # --- Mast: tiny footprint, very tall, isolated ---
-        if area < 10 and h_mean > 15 and compact < 0.5:
+        # Raised threshold from h_mean>15 to >25 to avoid confusing with
+        # tree crowns (15-25m common for Austrian trees).  Infrastructure
+        # rules in _classify_infrastructure() handle known locations at
+        # lower heights.
+        if area < 10 and h_mean > 25 and compact < 0.3 and best_ndvi < 0.15:
             return "mast", OBJECT_TYPES["mast"], 0.6, True
 
         # --- Solar panel: building-like + very smooth + bright ---
@@ -1691,6 +1807,7 @@ def segment_and_classify(
     ortho_year: int | None = None,
     observation_year: int | None = None,
     features_only: bool = False,
+    infra_lookup=None,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
 
@@ -1709,6 +1826,8 @@ def segment_and_classify(
     min_object_size : Felzenszwalb min_size (pixels = m² at 1m)
     felz_scale : Felzenszwalb scale (higher = fewer segments)
     rag_threshold : RAG merge threshold (lower = less merging)
+    infra_lookup : InfrastructureLookup instance (or None) for
+        rule-based infrastructure detection (solar, wind, etc.)
 
     Returns
     -------
@@ -1756,8 +1875,20 @@ def segment_and_classify(
     try:
         from texture_features import compute_texture_per_segment
         als_result_dict = {"transform": transform, "shape": (h, w)}
+        # Build grey image from already-loaded spectral data (avoids re-reading ortho)
+        _grey_pre = None
+        if spectral is not None:
+            _r = spectral.get("red")
+            _g = spectral.get("green")
+            _b = spectral.get("blue")
+            if _r is not None and _g is not None and _b is not None:
+                _grey_pre = (0.299 * _r.astype(np.float32)
+                             + 0.587 * _g.astype(np.float32)
+                             + 0.114 * _b.astype(np.float32))
+                log.info("Step 3b: Using pre-loaded spectral for texture (no re-read)")
         tex_by_label = compute_texture_per_segment(
             labels, als_result_dict, year=ortho_year,
+            grey_image=_grey_pre,
         )
         if tex_by_label:
             log.info("Step 3b: Merging texture features for %d segments", len(tex_by_label))
@@ -1817,11 +1948,35 @@ def segment_and_classify(
 
     objects = []
     for feat in features:
+        # Infrastructure lookup per segment (early-exit rules)
+        _nearby = None
+        if infra_lookup is not None and len(infra_lookup) > 0:
+            ce = feat.get("centroid_e", 0)
+            cn = feat.get("centroid_n", 0)
+            if ce and cn:
+                _nearby = infra_lookup.find_nearby(ce, cn, radius_m=200)
+
         if use_rf and feat["label"] in rf_results:
             type_name, type_code, conf, is_mm = rf_results[feat["label"]]
+            # Even with RF result, check infrastructure for dropped classes
+            # (wind_turbine, solar_panel, substation are not RF-predicted)
+            if _nearby:
+                _infra_result = _classify_infrastructure(
+                    feat, _nearby,
+                    feat.get("h_mean", 0), feat.get("h_max", 0),
+                    feat.get("h_std", 0), feat.get("area", 0),
+                    feat.get("compactness", 0),
+                    feat.get("fused_ndvi_mean", 0) or feat.get("ndvi_mean", 0),
+                    bool(feat.get("fused_ndvi_mean") or feat.get("ndvi_mean")),
+                    feat.get("dsm_roughness", 0),
+                    feat.get("brightness_mean", 0), has_spectral,
+                    feat.get("ndvi_mean", 0), feat.get("nir_mean", 0),
+                )
+                if _infra_result is not None:
+                    type_name, type_code, conf, is_mm = _infra_result
         else:
             type_name, type_code, conf, is_mm = classify_object(
-                feat, has_spectral=has_spectral,
+                feat, has_spectral=has_spectral, nearby_infra=_nearby,
             )
         obj = SegmentedObject(
             obj_id=feat["label"],

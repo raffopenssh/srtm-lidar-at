@@ -87,6 +87,7 @@ def read_with_retry(
     max_retries: int = MAX_RETRIES,
     base_delay: float = BASE_DELAY,
     caller: str = "",
+    direct_first: bool = True,
 ):
     """Open + read in one shot with retry + proxy rotation.
 
@@ -102,12 +103,22 @@ def read_with_retry(
     read_fn : callable(dataset) -> result
         Called with the open dataset; its return value is returned.
     max_retries, base_delay, caller : same as open_with_retry.
+    direct_first : bool
+        If True, attempt 0 uses direct connection (no proxy);
+        proxies are only used on retries. Good for non-BEV sources
+        like Google Storage (Hansen) that work fine direct but
+        fail through random proxies.
     """
     label = caller or url.rsplit("/", 1)[-1]
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
-        used_proxy = _apply_proxy()
+        if direct_first and attempt == 0:
+            os.environ.pop("GDAL_HTTP_PROXY", None)
+            os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
+            used_proxy = None
+        else:
+            used_proxy = _apply_proxy()
         ds = None
         try:
             ds = rasterio.open(url)
@@ -170,7 +181,13 @@ def open_with_retry(
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
-        used_proxy = _apply_proxy()
+        if attempt == 0:
+            # First attempt: direct (no proxy)
+            os.environ.pop("GDAL_HTTP_PROXY", None)
+            os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
+            used_proxy = None
+        else:
+            used_proxy = _apply_proxy()
         ds = None
         try:
             ds = rasterio.open(url)

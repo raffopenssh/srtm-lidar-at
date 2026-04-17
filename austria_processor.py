@@ -60,6 +60,7 @@ KG_LIST_FILE = DATA_DIR / "kg_list.json"
 FAILED_KGS_FILE = DATA_DIR / "failed_kgs.json"
 IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
+COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 
 MAX_KG_PIXELS = 15_000_000
 KG_TIMEOUT_SECONDS = 30 * 60
@@ -1453,7 +1454,17 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                         cb["cooldown"] = min(600, 60 * (2 ** min(cb["consecutive_failures"], 4)))
                     _write_circuit_breaker(cb)
                 except Exception as e:
-                    log.warning("KG %s: Copernicus failed: %s", kg_code, e)
+                    from copernicus import CreditsExhaustedError
+                    if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                        log.error("KG %s: Copernicus credits exhausted — signalling pause", kg_code)
+                        result["copernicus_exhausted"] = True
+                        # Write pause file so main loop can detect it
+                        COPERNICUS_PAUSE_FILE.write_text(
+                            f"Credits exhausted at {datetime.now(timezone.utc).isoformat()}\n"
+                            f"Provide new credentials in copernicus.py and delete this file to resume.\n"
+                        )
+                    else:
+                        log.warning("KG %s: Copernicus failed: %s", kg_code, e)
                     cb["consecutive_failures"] += 1
                     cb["last_failure"] = time.time()
                     _write_circuit_breaker(cb)
@@ -1846,6 +1857,32 @@ def main():
         cleanup_json_dir()
 
         gc.collect()
+
+        # --- Copernicus pause check ---
+        if COPERNICUS_PAUSE_FILE.exists():
+            log.warning("⏸ Copernicus credits exhausted — PAUSING.")
+            log.warning("  Update credentials in copernicus.py and delete %s to resume.",
+                        COPERNICUS_PAUSE_FILE)
+            progress.update(state="paused_copernicus")
+            progress.add_log("warning",
+                             "Paused: Copernicus credits exhausted. "
+                             "Provide new creds & delete pause file.", "")
+            progress.save()
+            while COPERNICUS_PAUSE_FILE.exists():
+                time.sleep(30)
+            # Reset copernicus module flag so fresh creds are tried
+            try:
+                import copernicus
+                copernicus.credits_exhausted = False
+                copernicus._connection = None
+                for k in list(copernicus._connections.keys()):
+                    copernicus._connections.pop(k, None)
+            except Exception:
+                pass
+            log.info("▶ Copernicus pause file removed — RESUMING.")
+            progress.update(state="running")
+            progress.add_log("info", "Resumed after Copernicus pause", "")
+            progress.save()
 
         if (i + 1) % 10 == 0:
             elapsed = time.time() - t_start

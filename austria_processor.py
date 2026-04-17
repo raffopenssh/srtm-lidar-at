@@ -2910,6 +2910,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 log.warning("KG %s %s: terrain failed: %s", kg_code, tile_label, e)
 
             # --- 3c. Multi-date DTM/DSM ---
+            _report_step("lidar", f"{tile_label} — multi-date")
             dtm_dates = None
             dsm_dates = None
             try:
@@ -2977,7 +2978,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     _tile_spectral.setdefault("_vals", []).extend(subsample)
 
             # --- 3e. Copernicus ---
-            _report_step("copernicus", tile_label)
+            _report_step("copernicus", f"{tile_label} — NDVI")
             copernicus_data = None
             if include_copernicus:
                 c_breaker = _read_circuit_breaker()
@@ -2988,20 +2989,23 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         cop_cache = _get_cop_cache()
                         cop = {}
                         nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
-                        lc = cop_cache.get_landcover(bbox_dict)
-                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
                         if nd and nd.get("ndvi") is not None:
                             cop["ndvi"] = nd["ndvi"]
                             cop["transform"] = nd.get("transform")
                             cop["crs"] = nd.get("crs")
+                        _report_step("copernicus", f"{tile_label} — WorldCover")
+                        lc = cop_cache.get_landcover(bbox_dict)
                         if lc:
                             cop["landcover"] = lc
+                        _report_step("copernicus", f"{tile_label} — SAR")
+                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
                         if sar:
                             cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
                             if "transform" in sar:
                                 cop["sar_transform"] = sar["transform"]
                         if cop:
                             try:
+                                _report_step("copernicus", f"{tile_label} — harmonics")
                                 import ndvi_harmonics
                                 import concurrent.futures as _cf
                                 with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
@@ -3105,7 +3109,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     _tile_hansen["cf_sum"] = [cf_val]
 
             # --- 3g. Segmentation ---
-            _report_step("segment", tile_label)
+            _report_step("segment", f"{tile_label} — rasterise cadastre")
 
             building_fp_mask = None
             if cadastre_data["building_footprints"]:
@@ -3131,6 +3135,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except Exception:
                 pass
 
+            _report_step("segment", f"{tile_label} — classify")
             try:
                 seg_result = oc.segment_and_classify(
                     tdata["dtm"], tdata["dsm"], t_mask, t_transform,
@@ -3208,7 +3213,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             all_objects.extend(core_objects)
 
             # --- 3h. Vectorise new buildings & infrastructure (this tile) ---
-            _report_step("vectorise", tile_label)
+            _report_step("vectorise", f"{tile_label} — new buildings")
             _tile_nb = []
             _tile_iv = []
             try:
@@ -3218,6 +3223,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 all_new_buildings.extend(_tile_nb)
             except Exception as e:
                 log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)
+            _report_step("vectorise", f"{tile_label} — infrastructure")
             try:
                 _tile_iv = vectorise_infrastructure(
                     t_objects, t_labels, t_mask, t_transform, t_ndsm, tdata["dtm"])
@@ -3272,14 +3278,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
-        _report_step("gpkg_full")
+        _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
         full_gpkg = build_full_gpkg_tiled(
             kg_code, tile_seg_results, all_objects, obs_year)
         result["files"]["full_gpkg"] = full_gpkg
 
         # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"
-        _report_step("gpkg_light")
+        _report_step("gpkg_light", f"{len(cadastre_data['parcels'])} parcels, {len(all_new_buildings)} new bldg")
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
@@ -3288,7 +3294,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 7. Build JSON summary ---
         result["step"] = "json"
-        _report_step("json")
+        _report_step("json", "building summary")
         json_summary = build_json_summary_tiled(
             kg_code, kg, tile_seg_results, all_objects,
             cadastre_data, terrain_stats,

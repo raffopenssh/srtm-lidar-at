@@ -2546,6 +2546,37 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
     _tile_progress = [0, 0]  # [current_tile_idx, n_tiles]
 
+    # --- Subprocess warning/error relay ---
+    # Write WARNING+ log records to a JSONL file so the parent process
+    # step-monitor thread can relay them to progress.add_log().
+    _warnings_file = DATA_DIR / "subprocess_warnings.jsonl"
+    try:
+        _warnings_file.write_text("")  # truncate on start
+    except Exception:
+        pass
+
+    class _WarningRelayHandler(logging.Handler):
+        """Logging handler that appends WARNING+ records to a JSONL file."""
+        def __init__(self, path):
+            super().__init__(level=logging.WARNING)
+            self._path = path
+        def emit(self, record):
+            try:
+                import json as _j
+                entry = _j.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "error" if record.levelno >= logging.ERROR else "warning",
+                    "msg": self.format(record),
+                }) + "\n"
+                with open(self._path, "a") as f:
+                    f.write(entry)
+            except Exception:
+                pass
+
+    _relay_handler = _WarningRelayHandler(str(_warnings_file))
+    _relay_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    logging.getLogger().addHandler(_relay_handler)
+
     def _report_step(step, detail=""):
         try:
             now = time.time()
@@ -3153,6 +3184,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["error"] = str(e)
         result["traceback"] = traceback.format_exc()
         log.error("KG %s failed at step %s: %s", kg_code, result["step"], e)
+
+    # Clean up the warning relay handler
+    try:
+        logging.getLogger().removeHandler(_relay_handler)
+    except Exception:
+        pass
 
     gc.collect()
     return result
@@ -3851,7 +3888,9 @@ def main():
 
         def _monitor_step_file(_stop=_step_monitor_stop, _code=kg_code):
             step_file = DATA_DIR / "current_step.json"
+            warnings_file = DATA_DIR / "subprocess_warnings.jsonl"
             last_step = ""
+            _warn_offset = 0  # track read position in warnings file
             while not _stop.is_set():
                 try:
                     if step_file.exists():
@@ -3880,6 +3919,30 @@ def main():
                             progress.set_step(s)
                             if detail:
                                 progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)
+                            progress.save()
+                except Exception:
+                    pass
+                # --- Relay subprocess warnings/errors to dashboard ---
+                try:
+                    if warnings_file.exists():
+                        with open(warnings_file, "r") as wf:
+                            wf.seek(_warn_offset)
+                            new_lines = wf.readlines()
+                            _warn_offset = wf.tell()
+                        for line in new_lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                                progress.add_log(
+                                    entry.get("level", "warning"),
+                                    f"KG {_code}: {entry.get('msg', '')}",
+                                    _code,
+                                )
+                            except json.JSONDecodeError:
+                                pass
+                        if new_lines:
                             progress.save()
                 except Exception:
                     pass

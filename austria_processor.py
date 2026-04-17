@@ -1242,320 +1242,363 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
         log.warning('GPKG style table failed: %s', e)
 
 
-def build_full_gpkg(kg_code: str, data: dict, spectral: dict,
-                    labels: np.ndarray, objects: list,
-                    mask: np.ndarray, transform,
-                    obs_year: int = 0) -> str:
-    """Build full GeoPackage with all raster layers."""
+
+def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
+    """Compute overlapping tiles covering the full KG bbox. Returns [(w,s,e,n)]."""
+    cos_lat = np.cos(np.radians((south + north) / 2))
+    dx_deg = tile_km / (111 * cos_lat)
+    dy_deg = tile_km / 111
+    step_x = (tile_km - overlap_km) / (111 * cos_lat)
+    step_y = (tile_km - overlap_km) / 111
+    tiles = []
+    y = south
+    while y < north:
+        x = west
+        while x < east:
+            tiles.append((x, y, min(x + dx_deg, east + dx_deg), min(y + dy_deg, north + dy_deg)))
+            x += step_x
+        y += step_y
+    return tiles
+
+
+def _merge_terrain_stats(stats_list):
+    """Merge terrain stats from tiles via pixel-weighted averages."""
+    if not stats_list:
+        return {}
+    if len(stats_list) == 1:
+        return stats_list[0][0]
+    total_px = sum(n for _, n in stats_list)
+    if total_px == 0:
+        return stats_list[0][0]
+
+    def _wmean(kp):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in kp:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None: break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append((v, n))
+        return round(sum(v*w for v,w in vals)/sum(w for _,w in vals), 3) if vals else None
+
+    def _extreme(kp, fn):
+        vals = []
+        for s, _ in stats_list:
+            v = s
+            for k in kp:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None: break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append(v)
+        return round(fn(vals), 2) if vals else None
+
+    merged = {
+        "elevation": {
+            "min": _extreme(["elevation","min"], min),
+            "max": _extreme(["elevation","max"], max),
+            "mean": _wmean(["elevation","mean"]),
+            "std": _wmean(["elevation","std"]),
+            "range": None,
+            "p10": _wmean(["elevation","p10"]),
+            "p50": _wmean(["elevation","p50"]),
+            "p90": _wmean(["elevation","p90"]),
+        },
+        "slope_deg": {
+            "min": _extreme(["slope_deg","min"], min),
+            "max": _extreme(["slope_deg","max"], max),
+            "mean": _wmean(["slope_deg","mean"]),
+            "std": _wmean(["slope_deg","std"]),
+        },
+        "slope_classes_pct": {}, "aspect_distribution_pct": {},
+        "ruggedness_tri": {
+            "mean": _wmean(["ruggedness_tri","mean"]),
+            "max": _extreme(["ruggedness_tri","max"], max),
+            "classification": None,
+        },
+        "area_sqm": total_px,
+        "area_ha": round(total_px / 10000, 2),
+    }
+    em, ex = merged["elevation"]["min"], merged["elevation"]["max"]
+    if em is not None and ex is not None:
+        merged["elevation"]["range"] = round(ex - em, 2)
+    for cls_key in ["slope_classes_pct", "aspect_distribution_pct"]:
+        all_keys = set()
+        for s, _ in stats_list:
+            all_keys.update(s.get(cls_key, {}).keys())
+        for k in all_keys:
+            merged[cls_key][k] = round(
+                sum(s.get(cls_key, {}).get(k, 0) * n for s, n in stats_list) / total_px, 1)
+    tri_mean = merged["ruggedness_tri"]["mean"]
+    if tri_mean is not None:
+        for thr, lbl in [(0.1,"level"),(0.3,"nearly level"),(1.0,"slightly rugged"),
+                         (3.0,"intermediately rugged"),(10.0,"moderately rugged")]:
+            if tri_mean < thr:
+                merged["ruggedness_tri"]["classification"] = lbl
+                break
+        else:
+            merged["ruggedness_tri"]["classification"] = "highly rugged"
+    return merged
+
+
+def _find_tile_for_point(e3035, n3035, tile_seg_results):
+    """Find tile containing point (e, n) EPSG:3035."""
+    for tr in tile_seg_results:
+        left, bottom, right, top = tr["bounds_3035"]
+        if left <= e3035 <= right and bottom <= n3035 <= top:
+            return tr
+    return None
+
+
+def _read_dtm_for_tile(tr):
+    """Re-read DTM/DSM for a tile (BEV cache makes this fast)."""
+    import raster_io as _rio
+    import tile_index as _ti
+    return _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+
+
+# ---------------------------------------------------------------------------
+# Tiled GPKG + JSON builders
+# ---------------------------------------------------------------------------
+
+def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
+    """Full GPKG: per-tile raster layers + segment vectors."""
     import rasterio
-
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
-    if os.path.exists(out_path):
-        os.unlink(out_path)
+    if os.path.exists(out_path): os.unlink(out_path)
+    if not tile_seg_results:
+        open(out_path, 'w').close()
+        return out_path
 
-    h, w = data["shape"]
-    dtm = data["dtm"]
-    dsm = data["dsm"]
-    ndsm = data["ndsm"]
     table_count = 0
-
-    def _write_table(name, arrays, dtype='float32', descriptions=None):
+    def _write_table(name, arrays, h, w, tf, dtype='float32', descs=None):
         nonlocal table_count
-        opts = dict(
-            driver='GPKG', width=w, height=h, count=len(arrays),
-            dtype=dtype, crs='EPSG:3035', transform=transform,
-            RASTER_TABLE=name, RASTER_IDENTIFIER=name,
-        )
-        if dtype == 'float32':
-            opts['nodata'] = float('nan')
-        if table_count > 0:
-            opts['APPEND_SUBDATASET'] = 'YES'
+        opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
+                    dtype=dtype, crs='EPSG:3035', transform=tf,
+                    RASTER_TABLE=name, RASTER_IDENTIFIER=name)
+        if dtype == 'float32': opts['nodata'] = float('nan')
+        if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
             for i, arr in enumerate(arrays, 1):
-                out = arr[:h, :w] if arr.shape[0] >= h and arr.shape[1] >= w else arr
-                dst.write(out, i)
-                if descriptions and i <= len(descriptions):
-                    dst.set_band_description(i, descriptions[i - 1])
+                dst.write(arr[:h, :w], i)
+                if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
         table_count += 1
 
-    # Core DTM/DSM/nDSM
-    _write_table('DTM', [dtm.astype(np.float32)])
-    _write_table('DSM', [dsm.astype(np.float32)])
-    _write_table('nDSM', [ndsm.astype(np.float32)])
+    obj_map = {o.obj_id: o for o in all_objects}
+    multi = len(tile_seg_results) > 1
 
-    # Ortho
-    if spectral is not None:
-        bands = []
-        descs = []
-        for ch in ['red', 'green', 'blue']:
-            if ch in spectral:
-                bands.append(spectral[ch].astype(np.uint8) if spectral[ch].max() > 1
-                             else (spectral[ch] * 255).astype(np.uint8))
-                descs.append(ch.capitalize())
-        if 'nir' in spectral and spectral['nir'] is not None:
-            nir = spectral['nir']
-            bands.append(nir.astype(np.uint8) if nir.max() > 1
-                         else (nir * 255).astype(np.uint8))
-            descs.append('NIR')
-        if bands:
-            _write_table('Ortho', bands, dtype='uint8', descriptions=descs)
-            # CIR = NIR, Red, Green
-            if len(bands) >= 4:
-                _write_table('CIR', [bands[3], bands[0], bands[1]],
-                             dtype='uint8', descriptions=['NIR', 'Red', 'Green'])
-
-    # Segmentation rasters
-    if labels is not None and objects:
-        obj_map = {o.obj_id: o for o in objects}
-        type_raster = np.zeros((h, w), dtype=np.uint8)
-        height_raster = np.clip(ndsm, 0, 255).astype(np.float32)
-        for obj in objects:
-            type_raster[labels == obj.obj_id] = obj.type_code
-        _write_table('segment_type', [type_raster], dtype='uint8',
-                     descriptions=['Object type code'])
-        _write_table('segment_height', [height_raster],
-                     descriptions=['Object height (m)'])
-
-        # Vector segments with full attributes + QGIS style
+    for ti_idx, tr in enumerate(tile_seg_results):
+        th, tw = tr["shape"]
+        tf = tr["transform"]
+        sfx = f"_t{ti_idx+1}" if multi else ""
         try:
-            _write_segment_vectors(out_path, labels, objects, mask, transform,
-                                   obs_year=obs_year)
+            tdata = _read_dtm_for_tile(tr)
+            _write_table(f'DTM{sfx}', [tdata["dtm"].astype(np.float32)], th, tw, tf)
+            _write_table(f'DSM{sfx}', [tdata["dsm"].astype(np.float32)], th, tw, tf)
+            _write_table(f'nDSM{sfx}', [tdata["ndsm"].astype(np.float32)], th, tw, tf)
+            del tdata
         except Exception as e:
-            log.warning("Full GPKG vector segments failed: %s", e)
+            log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx+1, e)
+        if tr.get("labels") is not None:
+            labels = tr["labels"]
+            type_raster = np.zeros((th, tw), dtype=np.uint8)
+            for uid in np.unique(labels):
+                if uid == 0: continue
+                obj = obj_map.get(int(uid))
+                if obj: type_raster[labels == uid] = obj.type_code
+            _write_table(f'segment_type{sfx}', [type_raster], th, tw, tf,
+                         dtype='uint8', descs=['Object type code'])
 
-    # Validate
-    found_layers = []
-    try:
-        import rasterio
-        with rasterio.open(out_path) as ds:
-            found_layers = ds.descriptions or []
-        fsize = os.path.getsize(out_path)
-        log.info("  FULL_GPKG: %.1f MB, %d tables", fsize / 1e6, table_count)
-    except Exception:
-        pass
+    # Segment vectors — one layer combining all tiles
+    if all_objects and tile_seg_results:
+        for ti_idx, tr in enumerate(tile_seg_results):
+            try:
+                lname = f"segments_t{ti_idx+1}" if multi else "segments"
+                _write_segment_vectors(
+                    out_path, tr["labels"], all_objects,
+                    tr.get("mask", np.ones(tr["shape"], dtype=bool)),
+                    tr["transform"], layer_name=lname, obs_year=obs_year)
+            except Exception as e:
+                log.warning("Full GPKG vectors tile %d failed: %s", ti_idx+1, e)
 
+    fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
+             fsize/1e6, table_count, len(tile_seg_results))
     return out_path
 
 
-def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
-                     objects: list, mask: np.ndarray, transform,
-                     cadastre_data: dict, ndsm: np.ndarray,
-                     new_buildings: list, infrastructure: list,
-                     obs_year: int = 0,
-                     full_data: dict = None) -> str:
-    """Build lightweight GeoPackage with segmentation + enriched cadastre.
-
-    When *full_data* is provided (full-KG DTM/DSM/nDSM), parcels and buildings
-    are enriched against the full-KG raster so every feature gets heights,
-    even those outside the segmentation window.
-    """
-    import rasterio
-    import fiona
+def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
+                           cadastre_data, new_buildings, infrastructure,
+                           obs_year=0):
+    """Light GPKG: segment raster per tile + enriched cadastre vectors."""
+    import rasterio, fiona
     from fiona.crs import from_epsg
 
     out_path = str(GPKG_DIR / f"{kg_code}_light.gpkg")
-    if os.path.exists(out_path):
-        os.unlink(out_path)
+    if os.path.exists(out_path): os.unlink(out_path)
 
-    h, w = data["shape"]
     table_count = 0
-
-    def _write_raster(name, arrays, dtype='uint8', descriptions=None):
+    def _write_raster(name, arrays, h, w, tf, dtype='uint8', descs=None):
         nonlocal table_count
-        opts = dict(
-            driver='GPKG', width=w, height=h, count=len(arrays),
-            dtype=dtype, crs='EPSG:3035', transform=transform,
-            RASTER_TABLE=name, RASTER_IDENTIFIER=name,
-        )
-        if dtype == 'float32':
-            opts['nodata'] = float('nan')
-        if table_count > 0:
-            opts['APPEND_SUBDATASET'] = 'YES'
+        opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
+                    dtype=dtype, crs='EPSG:3035', transform=tf,
+                    RASTER_TABLE=name, RASTER_IDENTIFIER=name)
+        if dtype == 'float32': opts['nodata'] = float('nan')
+        if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
             for i, arr in enumerate(arrays, 1):
-                out = arr[:h, :w]
-                dst.write(out, i)
-                if descriptions and i <= len(descriptions):
-                    dst.set_band_description(i, descriptions[i - 1])
+                dst.write(arr[:h, :w], i)
+                if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
         table_count += 1
 
-    # Segmentation raster
-    if labels is not None and objects:
-        obj_map = {o.obj_id: o for o in objects}
-        type_raster = np.zeros((h, w), dtype=np.uint8)
-        for obj in objects:
-            type_raster[labels == obj.obj_id] = obj.type_code
-        _write_raster('segment_type', [type_raster], descriptions=['Object type code'])
+    obj_map = {o.obj_id: o for o in all_objects}
+    multi = len(tile_seg_results) > 1
 
-    # Segmentation vector (full attributes + QGIS style)
-    if labels is not None and objects:
+    for ti_idx, tr in enumerate(tile_seg_results):
+        th, tw = tr["shape"]
+        tf = tr["transform"]
+        sfx = f"_t{ti_idx+1}" if multi else ""
+        if tr.get("labels") is not None:
+            labels = tr["labels"]
+            type_raster = np.zeros((th, tw), dtype=np.uint8)
+            for uid in np.unique(labels):
+                if uid == 0: continue
+                obj = obj_map.get(int(uid))
+                if obj: type_raster[labels == uid] = obj.type_code
+            _write_raster(f'segment_type{sfx}', [type_raster], th, tw, tf,
+                          descs=['Object type code'])
+        # Segment vectors
         try:
-            _write_segment_vectors(out_path, labels, objects, mask, transform,
-                                   obs_year=obs_year)
-        except Exception as e:
-            log.warning("Light GPKG vector segments failed: %s", e)
+            lname = f"segments_t{ti_idx+1}" if multi else "segments"
+            _write_segment_vectors(
+                out_path, tr["labels"], all_objects,
+                tr.get("mask", np.ones(tr["shape"], dtype=bool)),
+                tr["transform"], layer_name=lname, obs_year=obs_year)
+        except Exception:
+            pass
 
-    # Parcels with heights — use full-KG DTM if available
-    enrich_dtm = full_data["dtm"] if full_data else data["dtm"]
-    enrich_tf = full_data["transform"] if full_data else transform
-    enriched_parcels = enrich_parcels_with_heights(
-        cadastre_data["parcels"], enrich_dtm, enrich_tf)
-    if enriched_parcels:
-        schema_p = {
-            'geometry': 'MultiPolygon',
-            'properties': [
-                ('parcel_id', 'str'), ('area_sqm', 'float'),
-                ('centroid_dtm_m', 'float'),
-                ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-            ],
-        }
+    # --- Parcels (enriched from tiles) ---
+    parcels = cadastre_data["parcels"]
+    if parcels:
+        schema_p = {'geometry': 'MultiPolygon', 'properties': [
+            ('parcel_id', 'str'), ('area_sqm', 'float'),
+            ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='parcels',
                         schema=schema_p, crs=from_epsg(4326)) as dst:
-            for ep in enriched_parcels:
-                geom_wgs = ep["geometry_wgs"]
-                p = ep["properties"]
-                dst.write({
-                    'geometry': _to_multi(mapping(geom_wgs)),
-                    'properties': {
-                        'parcel_id': ep["parcel_id"],
-                        'area_sqm': ep["area_sqm"],
-                        'centroid_dtm_m': p.get('centroid_dtm_m'),
-                        'centroid_lon': p.get('centroid_lon'),
-                        'centroid_lat': p.get('centroid_lat'),
-                    },
-                })
+            for p in parcels:
+                geom_wgs = p["geometry_wgs"]
+                props = {"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
+                         "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None}
+                try:
+                    c3 = p["geometry"].centroid
+                    c_wgs = transform_to_wgs(c3)
+                    props["centroid_lon"] = round(c_wgs.x, 7)
+                    props["centroid_lat"] = round(c_wgs.y, 7)
+                    tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
+                    if tr:
+                        tdata = _read_dtm_for_tile(tr)
+                        tf = tdata["transform"]
+                        col = int((c3.x - tf.c) / tf.a)
+                        row = int((tf.f - c3.y) / abs(tf.e))
+                        dh, dw = tdata["dtm"].shape
+                        if 0 <= row < dh and 0 <= col < dw:
+                            val = float(tdata["dtm"][row, col])
+                            if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
+                        del tdata
+                except Exception:
+                    pass
+                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
 
-    # Building footprints with heights — use full-KG rasters if available
-    enrich_dsm = full_data["dsm"] if full_data else data["dsm"]
-    enrich_ndsm = full_data["ndsm"] if full_data else ndsm
-    enriched_bldgs = enrich_buildings_with_heights(
-        cadastre_data["building_footprints"], enrich_dtm, enrich_dsm, enrich_ndsm, enrich_tf)
-    if enriched_bldgs:
-        schema_b = {
-            'geometry': 'MultiPolygon',
-            'properties': [
-                ('max_height_m', 'float'), ('mean_height_m', 'float'),
-                ('dsm_std', 'float'), ('roof_type_hint', 'str'),
-                ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
-                ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-            ],
-        }
+    # --- Buildings (enriched from tiles) ---
+    bldgs = cadastre_data["building_footprints"]
+    if bldgs:
+        from rasterio.features import rasterize as rio_rasterize
+        schema_b = {'geometry': 'MultiPolygon', 'properties': [
+            ('max_height_m', 'float'), ('mean_height_m', 'float'),
+            ('dsm_std', 'float'), ('roof_type_hint', 'str'),
+            ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='buildings',
                         schema=schema_b, crs=from_epsg(4326)) as dst:
-            for eb in enriched_bldgs:
-                p = eb["properties"]
-                dst.write({
-                    'geometry': _to_multi(mapping(eb["geometry_wgs"])),
-                    'properties': {
-                        'max_height_m': p.get('max_height_m'),
-                        'mean_height_m': p.get('mean_height_m'),
-                        'dsm_std': p.get('dsm_std'),
-                        'roof_type_hint': p.get('roof_type_hint', ''),
-                        'stories_est': p.get('stories_est'),
-                        'footprint_area_sqm': p.get('footprint_area_sqm'),
-                        'centroid_lon': p.get('centroid_lon'),
-                        'centroid_lat': p.get('centroid_lat'),
-                    },
-                })
+            for b in bldgs:
+                geom_3035 = b["geometry"]
+                geom_wgs = b["geometry_wgs"]
+                props = {"max_height_m": None, "mean_height_m": None, "dsm_std": None,
+                         "roof_type_hint": "", "stories_est": None,
+                         "footprint_area_sqm": round(float(geom_3035.area), 1),
+                         "centroid_lon": None, "centroid_lat": None}
+                try:
+                    c3 = geom_3035.centroid
+                    c_wgs = transform_to_wgs(c3)
+                    props["centroid_lon"] = round(c_wgs.x, 7)
+                    props["centroid_lat"] = round(c_wgs.y, 7)
+                    tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
+                    if tr:
+                        tdata = _read_dtm_for_tile(tr)
+                        dh, dw = tdata["shape"]
+                        fp = rio_rasterize(
+                            [(geom_3035, 1)], out_shape=(dh, dw),
+                            transform=tdata["transform"],
+                            fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                        oh = tdata["ndsm"][fp]; oh = oh[np.isfinite(oh)]
+                        dv = tdata["dsm"][fp]; dv = dv[np.isfinite(dv)]
+                        if len(oh) > 0:
+                            mh = float(np.nanmax(oh))
+                            props["max_height_m"] = round(mh, 2)
+                            props["mean_height_m"] = round(float(np.nanmean(oh)), 2)
+                            props["dsm_std"] = round(float(np.std(dv)), 2) if len(dv) > 0 else 0.0
+                            props["roof_type_hint"] = "flat" if props["dsm_std"] < 1.5 else "pitched"
+                            props["stories_est"] = max(1, round(mh / 3.0))
+                        del tdata
+                except Exception:
+                    pass
+                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
 
-    # New buildings (not in cadastre)
+    # --- New buildings ---
     if new_buildings:
-        schema_nb = {
-            'geometry': 'MultiPolygon',
-            'properties': [
-                ('type', 'str'), ('area_sqm', 'float'),
-                ('max_height_m', 'float'), ('stories_est', 'int'),
-                ('roof_type_hint', 'str'), ('confidence', 'float'),
-                ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-                ('edge_clipped', 'bool'),
-            ],
-        }
+        schema_nb = {'geometry': 'MultiPolygon', 'properties': [
+            ('type', 'str'), ('area_sqm', 'float'), ('max_height_m', 'float'),
+            ('stories_est', 'int'), ('roof_type_hint', 'str'), ('confidence', 'float'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'), ('edge_clipped', 'bool')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='new_buildings',
                         schema=schema_nb, crs=from_epsg(4326)) as dst:
             for nb in new_buildings:
-                dst.write({
-                    'geometry': _to_multi(nb["geometry_wgs"]),
-                    'properties': {
-                        'type': nb.get('type', 'roof'),
-                        'area_sqm': nb.get('area_sqm', 0),
-                        'max_height_m': nb.get('max_height_m', 0),
-                        'stories_est': nb.get('stories_est', 1),
-                        'roof_type_hint': nb.get('roof_type_hint', ''),
-                        'confidence': nb.get('confidence', 0),
-                        'centroid_lon': nb.get('centroid_lon'),
-                        'centroid_lat': nb.get('centroid_lat'),
-                        'edge_clipped': nb.get('edge_clipped', False),
-                    },
-                })
+                dst.write({'geometry': _to_multi(nb["geometry_wgs"]), 'properties': {
+                    'type': nb.get('type','roof'), 'area_sqm': nb.get('area_sqm',0),
+                    'max_height_m': nb.get('max_height_m',0), 'stories_est': nb.get('stories_est',1),
+                    'roof_type_hint': nb.get('roof_type_hint',''), 'confidence': nb.get('confidence',0),
+                    'centroid_lon': nb.get('centroid_lon'), 'centroid_lat': nb.get('centroid_lat'),
+                    'edge_clipped': nb.get('edge_clipped', False)}})
 
-    # Infrastructure
+    # --- Infrastructure ---
     if infrastructure:
-        schema_infra = {
-            'geometry': 'MultiPolygon',
-            'properties': [
-                ('type', 'str'), ('area_sqm', 'float'),
-                ('volume_m3', 'float'), ('max_height_m', 'float'),
-                ('est_parking_spots', 'int'), ('confidence', 'float'),
-                ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-                ('edge_clipped', 'bool'),
-            ],
-        }
+        schema_i = {'geometry': 'MultiPolygon', 'properties': [
+            ('type', 'str'), ('area_sqm', 'float'), ('volume_m3', 'float'),
+            ('max_height_m', 'float'), ('est_parking_spots', 'int'),
+            ('confidence', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('edge_clipped', 'bool')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='infrastructure',
-                        schema=schema_infra, crs=from_epsg(4326)) as dst:
+                        schema=schema_i, crs=from_epsg(4326)) as dst:
             for inf in infrastructure:
-                dst.write({
-                    'geometry': _to_multi(inf["geometry_wgs"]),
-                    'properties': {
-                        'type': inf.get('type', ''),
-                        'area_sqm': inf.get('area_sqm', 0),
-                        'volume_m3': inf.get('volume_m3'),
-                        'max_height_m': inf.get('max_height_m'),
-                        'est_parking_spots': inf.get('est_parking_spots'),
-                        'confidence': inf.get('confidence', 0),
-                        'centroid_lon': inf.get('centroid_lon'),
-                        'centroid_lat': inf.get('centroid_lat'),
-                        'edge_clipped': inf.get('edge_clipped', False),
-                    },
-                })
+                dst.write({'geometry': _to_multi(inf["geometry_wgs"]), 'properties': {
+                    'type': inf.get('type',''), 'area_sqm': inf.get('area_sqm',0),
+                    'volume_m3': inf.get('volume_m3'), 'max_height_m': inf.get('max_height_m'),
+                    'est_parking_spots': inf.get('est_parking_spots'),
+                    'confidence': inf.get('confidence',0),
+                    'centroid_lon': inf.get('centroid_lon'), 'centroid_lat': inf.get('centroid_lat'),
+                    'edge_clipped': inf.get('edge_clipped', False)}})
 
     return out_path
 
 
-# ---------------------------------------------------------------------------
-# JSON summary builder
-# ---------------------------------------------------------------------------
-
-def build_json_summary(kg_code: str, kg_info: dict, data: dict,
-                       labels: np.ndarray, objects: list,
-                       cadastre_data: dict, terrain_stats: dict,
-                       spectral: dict, hansen_data: dict,
-                       copernicus_data: dict, new_buildings: list,
-                       infrastructure: list, ndsm: np.ndarray,
-                       obs_year: int,
-                       full_data: dict = None,
-                       seg_window_km: float = None) -> dict:
-    """Build comprehensive JSON summary for a KG.
-
-    When *full_data* is provided, parcel/building enrichment uses the full-KG
-    DTM/DSM so every feature gets elevation, even those outside the
-    segmentation window.  *seg_window_km* records the window size used.
-    """
+def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
+                             cadastre_data, terrain_stats, spectral_info,
+                             copernicus_info, hansen_info, new_buildings,
+                             infrastructure, obs_year, n_tiles=1, tile_km=1.5,
+                             total_seg_pixels=0):
+    """Build JSON summary from tiled segmentation results."""
     import tile_index as ti
-    import rasterio
-
-    mask = data["mask"]
-    dtm = data["dtm"]
-    h, w = data["shape"]
-
-    # Full-KG rasters for enrichment (fall back to windowed data)
-    full_dtm = full_data["dtm"] if full_data else dtm
-    full_dsm = full_data["dsm"] if full_data else data["dsm"]
-    full_ndsm = full_data["ndsm"] if full_data else ndsm
-    full_mask = full_data["mask"] if full_data else mask
-    full_tf = full_data["transform"] if full_data else data["transform"]
-    full_h, full_w = full_data["shape"] if full_data else (h, w)
-
-    # --- KG info ---
+    objects = all_objects
     summary = {
         "version": VERSION,
         "kg_code": kg_code,
@@ -1564,12 +1607,10 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "gemeinde": kg_info.get("gemeinde_name", ""),
         "district": kg_info.get("district_name", ""),
         "bbox": kg_info.get("bbox", {}),
-        "total_area_sqm": int(full_mask.sum()),  # full-KG valid pixels = m2 at 1m res
+        "total_area_sqm": total_seg_pixels,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "observation_period": {
-            "primary_year": obs_year,
-            "start": f"{obs_year}-01-01",
-            "end": f"{obs_year}-12-31",
+            "primary_year": obs_year, "start": f"{obs_year}-01-01", "end": f"{obs_year}-12-31",
             "lidar_dataset": ti.DEFAULT_DATASET,
             "all_lidar_datasets": sorted(ti.DATASETS.keys()),
             "sentinel2": f"Sentinel-2 L2A {obs_year}",
@@ -1577,554 +1618,443 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             "cadastre": "BEV INSPIRE cadastre (current)",
         },
     }
-
-    # --- Area summary by type ---
+    # --- Area summary ---
     type_counts = Counter()
     type_heights = defaultdict(list)
-    if objects:
-        obj_map = {o.obj_id: o for o in objects}
-        for obj in objects:
-            seg_px = int((labels == obj.obj_id).sum())
-            type_counts[obj.obj_type] += seg_px
-            type_heights[obj.obj_type].append({
-                "h_max": round(obj.height_max, 2),
-                "h_mean": round(obj.height_mean, 2),
-            })
-
-    area_summary = {}
-    for t, px in type_counts.most_common():
-        heights = [h["h_max"] for h in type_heights[t]]
-        area_summary[t] = {
-            "pixels": px,
-            "area_sqm": px,  # 1m resolution → 1 pixel = 1 m²
-            "fraction": round(px / max(int(mask.sum()), 1), 4),
+    for obj in objects:
+        type_counts[obj.obj_type] += int(obj.area_sqm)
+        type_heights[obj.obj_type].append(round(obj.height_max, 2))
+    total_px = max(total_seg_pixels, 1)
+    summary["area_summary"] = {
+        t: {"pixels": px, "area_sqm": px, "fraction": round(px/total_px, 4),
             "n_objects": len(type_heights[t]),
-            "observation_period": f"{obs_year}-01-01 to {obs_year}-12-31",
-        }
-    summary["area_summary"] = area_summary
-
-    # --- Height distribution per type ---
-    height_dist = {}
-    for t, hlist in type_heights.items():
-        heights = [h["h_max"] for h in hlist]
-        if heights:
-            height_dist[t] = {
-                "min": round(min(heights), 2),
-                "max": round(max(heights), 2),
-                "mean": round(sum(heights) / len(heights), 2),
-                "p90": round(float(np.percentile(heights, 90)), 2),
-                "count": len(heights),
-            }
-    summary["height_distribution"] = height_dist
-
-    # --- Landscape characterisation ---
+            "observation_period": f"{obs_year}-01-01 to {obs_year}-12-31"}
+        for t, px in type_counts.most_common()
+    }
+    summary["height_distribution"] = {
+        t: {"min": round(min(hs),2), "max": round(max(hs),2),
+            "mean": round(sum(hs)/len(hs),2),
+            "p90": round(float(np.percentile(hs,90)),2), "count": len(hs)}
+        for t, hs in type_heights.items() if hs
+    }
+    # --- Landscape ---
     landscape = {}
-    if terrain_stats:
-        landscape["terrain"] = terrain_stats
-
-    # Fragmentation: edge density (perimeter of all segments / total area)
+    if terrain_stats: landscape["terrain"] = terrain_stats
     if objects:
-        total_perimeter = sum(getattr(o, 'perimeter', 0) or 0 for o in objects)
-        total_area = max(int(mask.sum()), 1)
-        landscape["edge_density"] = round(total_perimeter / total_area, 4)
+        total_perim = sum(getattr(o,'perimeter_m', getattr(o,'perimeter',0)) or 0 for o in objects)
+        landscape["edge_density"] = round(total_perim / total_px, 4)
         landscape["n_segments"] = len(objects)
-        landscape["mean_segment_area_sqm"] = round(total_area / len(objects), 1)
-
-        # Shannon diversity of types
-        type_fracs = [c / total_area for c in type_counts.values()]
-        shannon = -sum(f * np.log(f) for f in type_fracs if f > 0)
-        landscape["shannon_diversity"] = round(float(shannon), 3)
-
-        # Dominant type
-        if type_counts:
-            landscape["dominant_type"] = type_counts.most_common(1)[0][0]
-
-        # % vegetated
-        veg_types = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard',
-                     'vineyard', 'garden'}
-        veg_px = sum(v for k, v in type_counts.items() if k in veg_types)
-        landscape["vegetated_fraction"] = round(veg_px / total_area, 4)
-        landscape["is_vegetated"] = veg_px / total_area > 0.5
-
+        landscape["mean_segment_area_sqm"] = round(total_px / len(objects), 1)
+        tf_ = [c/total_px for c in type_counts.values()]
+        landscape["shannon_diversity"] = round(float(-sum(f*np.log(f) for f in tf_ if f > 0)), 3)
+        if type_counts: landscape["dominant_type"] = type_counts.most_common(1)[0][0]
+        veg = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
+        vp = sum(v for k,v in type_counts.items() if k in veg)
+        landscape["vegetated_fraction"] = round(vp/total_px, 4)
+        landscape["is_vegetated"] = vp/total_px > 0.5
     summary["landscape"] = landscape
-
-    # --- Top 10 highest objects ---
+    # --- Top 10 objects/trees ---
     if objects:
-        sorted_by_h = sorted(objects, key=lambda o: o.height_max, reverse=True)[:10]
         summary["top_10_objects"] = []
-        for o in sorted_by_h:
-            c_wgs = None
+        for o in sorted(objects, key=lambda o: o.height_max, reverse=True)[:10]:
+            c = None
             try:
-                ce, cn = o.centroid_e, o.centroid_n
-                lon, lat = _tx_to_wgs.transform(ce, cn)
-                c_wgs = {"lon": round(lon, 7), "lat": round(lat, 7)}
-            except Exception:
-                pass
+                lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                c = {"lon": round(lon,7), "lat": round(lat,7)}
+            except Exception: pass
             summary["top_10_objects"].append({
-                "type": o.obj_type,
-                "height_max_m": round(o.height_max, 2),
-                "height_mean_m": round(o.height_mean, 2),
-                "area_sqm": round(o.area_sqm, 1),
-                "coordinate": c_wgs,
-                "confidence": round(o.confidence, 3),
-                "is_manmade": o.is_manmade,
-                "slope_mean_deg": round(o.slope_mean, 1),
-                "ndvi_mean": round(o.ndvi_mean, 4),
-                "height_change_m": round(o.height_change, 3),
-                "observation_year": obs_year,
-            })
-
-    # --- Top 10 tallest trees ---
-    if objects:
+                "type": o.obj_type, "height_max_m": round(o.height_max,2),
+                "height_mean_m": round(o.height_mean,2), "area_sqm": round(o.area_sqm,1),
+                "coordinate": c, "confidence": round(o.confidence,3),
+                "is_manmade": o.is_manmade, "observation_year": obs_year})
         trees = [o for o in objects if o.obj_type == 'tree']
-        sorted_trees = sorted(trees, key=lambda o: o.height_max, reverse=True)[:10]
         summary["top_10_trees"] = []
-        for t in sorted_trees:
-            c_wgs = None
+        for t in sorted(trees, key=lambda o: o.height_max, reverse=True)[:10]:
+            c = None
             try:
                 lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
-                c_wgs = {"lon": round(lon, 7), "lat": round(lat, 7)}
-            except Exception:
-                pass
+                c = {"lon": round(lon,7), "lat": round(lat,7)}
+            except Exception: pass
             summary["top_10_trees"].append({
-                "height_m": round(t.height_max, 2),
-                "canopy_height_m": round(t.height_mean, 2),
-                "height_p90_m": round(t.height_p90, 2),
-                "coordinate": c_wgs,
-                "area_sqm": round(t.area_sqm, 1),
-                "ndvi_mean": round(t.ndvi_mean, 4),
-                "ndvi_fused": round(t.ndvi_fused, 4),
-                "height_change_m": round(t.height_change, 3),
-                "phenology_class": t.phenology_class or '',
-                "observation_year": obs_year,
-            })
-
-        # Tree stats
+                "height_m": round(t.height_max,2), "canopy_height_m": round(t.height_mean,2),
+                "height_p90_m": round(t.height_p90,2), "coordinate": c,
+                "area_sqm": round(t.area_sqm,1), "ndvi_mean": round(t.ndvi_mean,4),
+                "ndvi_fused": round(t.ndvi_fused,4), "height_change_m": round(t.height_change,3),
+                "phenology_class": t.phenology_class or '', "observation_year": obs_year})
         if trees:
             summary["tree_stats"] = {
                 "count": len(trees),
                 "total_canopy_sqm": round(sum(t.area_sqm for t in trees), 1),
-                "mean_height_m": round(sum(t.height_max for t in trees) / len(trees), 2),
-                "est_stem_volume_m3": round(
-                    sum(0.3 * t.area_sqm * t.height_max / 3 for t in trees), 1
-                ),  # rough cone estimate
-            }
-
+                "mean_height_m": round(sum(t.height_max for t in trees)/len(trees), 2),
+                "est_stem_volume_m3": round(sum(0.3*t.area_sqm*t.height_max/3 for t in trees), 1)}
     # --- Terrain ---
     summary["terrain"] = {}
     if terrain_stats:
-        ts = terrain_stats
-        elev = ts.get("elevation", {})
-        slope = ts.get("slope_deg", {})
-        tri = ts.get("ruggedness_tri", {})
-        curv = ts.get("curvature", {})
-        aspect_dist = ts.get("aspect_distribution_pct", {})
-        # Find dominant aspect
-        dominant_aspect = max(aspect_dist, key=aspect_dist.get) if aspect_dist else ""
+        ts = terrain_stats; elev = ts.get("elevation",{}); sl = ts.get("slope_deg",{})
+        tri = ts.get("ruggedness_tri",{}); ad = ts.get("aspect_distribution_pct",{})
         summary["terrain"] = {
-            "steepness_mean_deg": slope.get("mean"),
-            "steepness_max_deg": slope.get("max"),
-            "aspect_dominant": dominant_aspect,
-            "aspect_distribution_pct": aspect_dist,
-            "slope_classes_pct": ts.get("slope_classes_pct", {}),
-            "roughness_mean": tri.get("mean"),
-            "curvature_mean": curv.get("mean") if isinstance(curv, dict) else None,
-            "elevation_min_m": elev.get("min"),
-            "elevation_max_m": elev.get("max"),
-            "elevation_range_m": elev.get("range"),
-            "elevation_mean_m": elev.get("mean"),
-            "method": "DTM Sobel slope + aspect, BEV ALS 1m",
-        }
-
+            "steepness_mean_deg": sl.get("mean"), "steepness_max_deg": sl.get("max"),
+            "aspect_dominant": max(ad, key=ad.get) if ad else "",
+            "aspect_distribution_pct": ad, "slope_classes_pct": ts.get("slope_classes_pct",{}),
+            "roughness_mean": tri.get("mean"), "curvature_mean": None,
+            "elevation_min_m": elev.get("min"), "elevation_max_m": elev.get("max"),
+            "elevation_range_m": elev.get("range"), "elevation_mean_m": elev.get("mean"),
+            "method": "DTM slope/aspect/TRI, BEV ALS 1m, tiled"}
     # --- NDVI ---
     ndvi_info = {}
-    if spectral and spectral.get("ndvi") is not None:
-        ndvi = spectral["ndvi"]
-        valid = ndvi[mask[:ndvi.shape[0], :ndvi.shape[1]]] if mask is not None else ndvi.ravel()
-        valid = valid[np.isfinite(valid)]
-        if len(valid) > 0:
-            ndvi_info["bev_nir_mean"] = round(float(np.nanmean(valid)), 4)
-            ndvi_info["bev_nir_std"] = round(float(np.nanstd(valid)), 4)
-            ndvi_info["method_bev"] = f"BEV DOP RGBI 0.2m, {obs_year}"
-    if copernicus_data and copernicus_data.get("ndvi") is not None:
-        cop_ndvi = copernicus_data["ndvi"]
-        valid_c = cop_ndvi[np.isfinite(cop_ndvi)]
-        if len(valid_c) > 0:
-            ndvi_info["copernicus_mean"] = round(float(np.nanmean(valid_c)), 4)
-            ndvi_info["method_copernicus"] = f"Sentinel-2 L2A NDVI composite, {obs_year}"
+    bv = spectral_info.get("_vals",[])
+    if bv: ndvi_info["bev_nir_mean"] = round(float(np.mean(bv)),4); ndvi_info["bev_nir_std"] = round(float(np.std(bv)),4); ndvi_info["method_bev"] = f"BEV DOP RGBI 0.2m, {obs_year}"
+    cv = copernicus_info.get("cop_ndvi_vals",[])
+    if cv: ndvi_info["copernicus_mean"] = round(float(np.mean(cv)),4); ndvi_info["method_copernicus"] = f"Sentinel-2 L2A, {obs_year}"
     summary["ndvi"] = ndvi_info
-
-    # --- SAR backscatter ---
+    # --- SAR ---
     sar_info = {}
-    if copernicus_data:
-        for band in ['vv', 'vh']:
-            arr = copernicus_data.get(band)
-            if arr is not None:
-                valid = arr[np.isfinite(arr)]
-                if len(valid) > 0:
-                    sar_info[f"{band}_mean_db"] = round(float(np.nanmean(valid)), 2)
-                    sar_info[f"{band}_std_db"] = round(float(np.nanstd(valid)), 2)
-        if sar_info:
-            sar_info["method"] = f"Sentinel-1 IW GRD, VV+VH, summer {obs_year}"
+    for band in ['vv','vh']:
+        vs = copernicus_info.get(f"{band}_vals",[])
+        if vs: sar_info[f"{band}_mean_db"] = round(float(np.mean(vs)),2); sar_info[f"{band}_std_db"] = round(float(np.std(vs)),2)
+    if sar_info: sar_info["method"] = f"Sentinel-1 IW GRD, VV+VH, summer {obs_year}"
     summary["sar"] = sar_info
-
-    # --- NDVI harmonics (phenology) ---
-    harmonics_info = {}
-    if copernicus_data and copernicus_data.get("harmonics"):
-        harm = copernicus_data["harmonics"]
-        for key in ['h_mean', 'h_amplitude', 'h_phase', 'h_rmse']:
-            arr = harm.get(key)
-            if arr is not None:
-                valid = arr[np.isfinite(arr)]
-                if len(valid) > 0:
-                    harmonics_info[key.replace('h_', '') + '_mean'] = round(float(np.nanmean(valid)), 4)
-        harmonics_info["method"] = f"1st-order harmonic fit to monthly Sentinel-2 NDVI, {obs_year}"
-    summary["ndvi_harmonics"] = harmonics_info
-
-    # --- Temporal change summary ---
-    temporal_info = {}
+    # --- Harmonics ---
+    harm_info = {}
+    for hk in ['h_mean','h_amplitude','h_phase','h_rmse']:
+        vs = copernicus_info.get(f"{hk}_vals",[])
+        if vs: harm_info[hk.replace('h_','')+'_mean'] = round(float(np.mean(vs)),4)
+    if harm_info: harm_info["method"] = f"Harmonic fit to monthly Sentinel-2 NDVI, {obs_year}"
+    summary["ndvi_harmonics"] = harm_info
+    # --- Temporal change ---
+    temp = {}
     if objects:
-        changes = [(o.dtm_change, o.height_change, o.volume_change_m3,
-                    o.volume_change_abs_m3, o.temporal_stability) for o in objects]
-        dtm_ch = [c[0] for c in changes if abs(c[0]) > 0.01]
-        h_ch = [c[1] for c in changes if abs(c[1]) > 0.01]
-        vol_net = sum(c[2] for c in changes)
-        vol_abs = sum(c[3] for c in changes)
-        stab = [c[4] for c in changes]
-        if dtm_ch:
-            temporal_info["dtm_change_mean_m"] = round(float(np.mean(dtm_ch)), 3)
-            temporal_info["dtm_change_max_abs_m"] = round(float(np.max(np.abs(dtm_ch))), 3)
-            temporal_info["n_changed_segments"] = len(dtm_ch)
-        if h_ch:
-            temporal_info["height_change_mean_m"] = round(float(np.mean(h_ch)), 3)
-        temporal_info["net_volume_change_m3"] = round(vol_net, 1)
-        temporal_info["total_disturbed_volume_m3"] = round(vol_abs, 1)
-        if stab:
-            temporal_info["mean_stability"] = round(float(np.mean(stab)), 3)
-        temporal_info["datasets_compared"] = sorted(ti.DATASETS.keys())
-        temporal_info["method"] = "DTM/DSM difference across BEV ALS dates (2022-2024)"
-    summary["temporal_change"] = temporal_info
-
-    # --- Phenology class distribution ---
+        dc = [o.dtm_change for o in objects if abs(o.dtm_change) > 0.01]
+        hc = [o.height_change for o in objects if abs(o.height_change) > 0.01]
+        if dc: temp["dtm_change_mean_m"] = round(float(np.mean(dc)),3); temp["dtm_change_max_abs_m"] = round(float(np.max(np.abs(dc))),3); temp["n_changed_segments"] = len(dc)
+        if hc: temp["height_change_mean_m"] = round(float(np.mean(hc)),3)
+        temp["net_volume_change_m3"] = round(sum(o.volume_change_m3 for o in objects),1)
+        temp["total_disturbed_volume_m3"] = round(sum(o.volume_change_abs_m3 for o in objects),1)
+        stab = [o.temporal_stability for o in objects]
+        if stab: temp["mean_stability"] = round(float(np.mean(stab)),3)
+        temp["datasets_compared"] = sorted(ti.DATASETS.keys())
+        temp["method"] = "DTM/DSM differencing across BEV ALS dates"
+    summary["temporal_change"] = temp
+    # --- Phenology ---
     if objects:
-        pheno_counts = Counter(o.phenology_class for o in objects if o.phenology_class)
-        if pheno_counts:
-            summary["phenology"] = {
-                "distribution": {k: v for k, v in pheno_counts.most_common()},
-                "method": "1st-order harmonic fit: mean+amplitude+phase → class",
-            }
-
-    # --- Hansen forest loss ---
-    hansen_summary = {}
-    if hansen_data:
-        loss_year = hansen_data.get("loss_year")
-        if loss_year is not None:
+        pc = Counter(o.phenology_class for o in objects if o.phenology_class)
+        if pc: summary["phenology"] = {"distribution": dict(pc.most_common()), "method": "harmonic fit"}
+    # --- Hansen ---
+    hs = {}
+    if hansen_info:
+        loss_years = hansen_info.get("loss_years",[])
+        if loss_years:
             per_year = {}
-            for yr in range(1, 25):  # 1=2001 ... 24=2024
-                n = int((loss_year == yr).sum())
-                if n > 0:
-                    per_year[f"{2000 + yr}"] = {"pixels": n, "area_sqm": n * 900}  # 30m res
-            hansen_summary["loss_by_year"] = per_year
-            hansen_summary["total_loss_pixels"] = int((loss_year > 0).sum())
-        tc2000 = hansen_data.get("treecover2000")
-        if tc2000 is not None:
-            hansen_summary["mean_treecover2000_pct"] = round(float(np.nanmean(tc2000)), 1)
-        cf = hansen_data.get("current_forest")
-        if cf is not None:
-            hansen_summary["current_forest_pixels"] = int(cf.sum())
-        hansen_summary["method"] = "Hansen GFC-2024-v1.12, 30m, University of Maryland"
-    summary["hansen"] = hansen_summary
-
-    # --- New buildings ---
+            for ly in loss_years:
+                for yr in range(1,25):
+                    n = int((ly==yr).sum())
+                    if n > 0:
+                        k = f"{2000+yr}"
+                        per_year.setdefault(k, {"pixels":0,"area_sqm":0})
+                        per_year[k]["pixels"] += n; per_year[k]["area_sqm"] += n*900
+            if per_year: hs["loss_by_year"] = per_year; hs["total_loss_pixels"] = sum(v["pixels"] for v in per_year.values())
+        tc = hansen_info.get("tc_vals",[])
+        if tc: hs["mean_treecover2000_pct"] = round(float(np.mean(tc)),1)
+        cf = hansen_info.get("cf_sum",[0])
+        if cf[0] > 0: hs["current_forest_pixels"] = cf[0]
+        if hs: hs["method"] = "Hansen GFC-2024-v1.12, 30m"
+    summary["hansen"] = hs
+    # --- New buildings + infrastructure ---
     summary["new_buildings"] = {
         "count": len(new_buildings),
-        "features": [{
-            "type": nb.get("type"),
-            "area_sqm": nb.get("area_sqm"),
-            "max_height_m": nb.get("max_height_m"),
-            "stories_est": nb.get("stories_est"),
-            "roof_type_hint": nb.get("roof_type_hint"),
-            "centroid_lon": nb.get("centroid_lon"),
-            "centroid_lat": nb.get("centroid_lat"),
-            "confidence": nb.get("confidence"),
-            "edge_clipped": nb.get("edge_clipped", False),
-        } for nb in new_buildings],
-    }
-
-    # --- Infrastructure ---
-    infra_by_type = defaultdict(list)
-    for inf in infrastructure:
-        infra_by_type[inf["type"]].append(inf)
+        "features": [{"type": nb.get("type"), "area_sqm": nb.get("area_sqm"),
+                      "max_height_m": nb.get("max_height_m"), "stories_est": nb.get("stories_est"),
+                      "roof_type_hint": nb.get("roof_type_hint"),
+                      "centroid_lon": nb.get("centroid_lon"), "centroid_lat": nb.get("centroid_lat"),
+                      "confidence": nb.get("confidence"), "edge_clipped": nb.get("edge_clipped", False)}
+                     for nb in new_buildings]}
+    ibt = defaultdict(list)
+    for inf in infrastructure: ibt[inf["type"]].append(inf)
     summary["infrastructure"] = {
         "total": len(infrastructure),
-        "by_type": {
-            t: {
-                "count": len(items),
-                "total_area_sqm": round(sum(i.get("area_sqm", 0) for i in items), 1),
-                "features": [{
-                    k: v for k, v in i.items()
-                    if k != "geometry_wgs"
-                } for i in items],
-            }
-            for t, items in infra_by_type.items()
-        },
-    }
-
+        "by_type": {t: {"count": len(items), "total_area_sqm": round(sum(i.get("area_sqm",0) for i in items),1),
+                        "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
+                   for t, items in ibt.items()}}
     # --- Per-parcel detail ---
-    # Use full-KG DTM for elevation so ALL parcels get heights.
-    # Segmentation labels only cover the windowed area.
-    seg_transform = data["transform"]
     parcel_details = []
     obj_map = {o.obj_id: o for o in objects} if objects else {}
-    seg_geom_3035 = None
-    if seg_window_km is not None:
-        # Build segmentation window polygon for inside/outside test
-        seg_bounds = rasterio.transform.array_bounds(h, w, seg_transform)
-        seg_geom_3035 = box(*seg_bounds)
-    n_inside_window = 0
     for p in cadastre_data["parcels"]:
-        pd = {
-            "parcel_id": p["parcel_id"],
-            "area_sqm": round(p.get("area_sqm", 0), 1),
-        }
+        pd = {"parcel_id": p["parcel_id"], "area_sqm": round(p.get("area_sqm",0), 1)}
         geom_3035 = p["geometry"]
-        # Centroid
         try:
-            c_wgs = transform_to_wgs(geom_3035.centroid)
-            pd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
-        except Exception:
-            pass
-        # DTM elevation at centroid — use full-KG DTM (with neighborhood fallback)
+            cw = transform_to_wgs(geom_3035.centroid)
+            pd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
+        except Exception: pass
         try:
             c3 = geom_3035.centroid
-            col = int((c3.x - full_tf.c) / full_tf.a)
-            row = int((full_tf.f - c3.y) / abs(full_tf.e))
-            if 0 <= row < full_h and 0 <= col < full_w:
-                val = float(full_dtm[row, col])
-                if np.isfinite(val):
-                    pd["elevation_m"] = round(val, 2)
-                else:
-                    # Try 5x5 neighborhood
-                    r0, r1 = max(0, row-2), min(full_h, row+3)
-                    c0, c1 = max(0, col-2), min(full_w, col+3)
-                    patch = full_dtm[r0:r1, c0:c1]
-                    valid = patch[np.isfinite(patch)]
-                    if len(valid) > 0:
-                        pd["elevation_m"] = round(float(np.nanmean(valid)), 2)
-        except Exception:
-            pass
-        # Check if parcel is inside the segmentation window.
-        # Use overlap fraction, not bare intersects, so parcels with
-        # only a sliver inside the window don't get misleading area_summary.
-        parcel_in_window = True
-        seg_coverage_frac = 1.0
-        if seg_geom_3035 is not None:
-            try:
-                if not seg_geom_3035.intersects(geom_3035):
-                    parcel_in_window = False
-                    seg_coverage_frac = 0.0
-                else:
-                    isect = seg_geom_3035.intersection(geom_3035)
-                    parcel_area = max(geom_3035.area, 1e-6)
-                    seg_coverage_frac = isect.area / parcel_area
-                    # Require ≥50% of parcel inside window for segmentation data
-                    parcel_in_window = seg_coverage_frac >= 0.5
-            except Exception:
-                parcel_in_window = False
-                seg_coverage_frac = 0.0
-        pd["segmented"] = parcel_in_window
-        pd["seg_coverage_frac"] = round(seg_coverage_frac, 3)
-        if parcel_in_window:
-            n_inside_window += 1
-        # Segment type breakdown within parcel (only if ≥50% inside window)
-        if parcel_in_window and labels is not None and objects:
-            try:
-                from rasterio.features import rasterize as rio_rasterize
-                p_mask = rio_rasterize(
-                    [(geom_3035, 1)], out_shape=(h, w), transform=seg_transform,
-                    fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-                p_labels = labels[p_mask]
-                p_ndsm = ndsm[p_mask]
-                tc = Counter()
-                th = defaultdict(list)
-                for lbl in np.unique(p_labels):
-                    obj = obj_map.get(int(lbl))
-                    if obj is None:
-                        continue
-                    n_px = int((p_labels == lbl).sum())
-                    tc[obj.obj_type] += n_px
-                    th[obj.obj_type].append(obj.height_max)
-                if tc:
-                    pd["area_summary"] = {
-                        t: {"area_sqm": px, "fraction": round(px / max(int(p_mask.sum()), 1), 4)}
-                        for t, px in tc.most_common()
-                    }
-                    pd["height_distribution"] = {
-                        t: {"min": round(min(hs), 2), "max": round(max(hs), 2),
-                            "mean": round(sum(hs)/len(hs), 2)}
-                        for t, hs in th.items() if hs
-                    }
-                # Vegetated fraction
-                veg_types = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
-                veg_px = sum(v for k, v in tc.items() if k in veg_types)
-                total_px = max(int(p_mask.sum()), 1)
-                pd["vegetated_fraction"] = round(veg_px / total_px, 4)
-                pd["is_vegetated"] = veg_px / total_px > 0.5
-                # Elevation stats from nDSM
-                valid_h = p_ndsm[np.isfinite(p_ndsm)]
-                if len(valid_h) > 0:
-                    pd["ndsm_max_m"] = round(float(np.max(valid_h)), 2)
-                    pd["ndsm_mean_m"] = round(float(np.mean(valid_h)), 2)
-            except Exception:
-                pass
+            tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
+            if tr:
+                tdata = _read_dtm_for_tile(tr)
+                dtm = tdata["dtm"]; tf = tdata["transform"]
+                col = int((c3.x - tf.c)/tf.a); row = int((tf.f - c3.y)/abs(tf.e))
+                dh, dw = dtm.shape
+                if 0 <= row < dh and 0 <= col < dw:
+                    val = float(dtm[row,col])
+                    if np.isfinite(val): pd["elevation_m"] = round(val,2)
+                    else:
+                        patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
+                        v = patch[np.isfinite(patch)]
+                        if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
+                if tr.get("labels") is not None and objects:
+                    from rasterio.features import rasterize as rio_rasterize
+                    pm = rio_rasterize([(geom_3035,1)], out_shape=tr["shape"],
+                                       transform=tr["transform"], fill=0, dtype=np.uint8,
+                                       all_touched=True).astype(bool)
+                    pl = tr["labels"][pm]; pn = tdata["ndsm"][pm]
+                    tc_ = Counter(); th_ = defaultdict(list)
+                    for lbl in np.unique(pl):
+                        obj = obj_map.get(int(lbl))
+                        if obj: npx = int((pl==lbl).sum()); tc_[obj.obj_type] += npx; th_[obj.obj_type].append(obj.height_max)
+                    if tc_:
+                        pd["area_summary"] = {t: {"area_sqm": px, "fraction": round(px/max(int(pm.sum()),1),4)} for t, px in tc_.most_common()}
+                        pd["height_distribution"] = {t: {"min": round(min(hs_),2), "max": round(max(hs_),2), "mean": round(sum(hs_)/len(hs_),2)} for t, hs_ in th_.items() if hs_}
+                    veg = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
+                    vpx = sum(v for k,v in tc_.items() if k in veg); tpx = max(int(pm.sum()),1)
+                    pd["vegetated_fraction"] = round(vpx/tpx, 4); pd["is_vegetated"] = vpx/tpx > 0.5
+                    vh = pn[np.isfinite(pn)]
+                    if len(vh) > 0: pd["ndsm_max_m"] = round(float(np.max(vh)),2); pd["ndsm_mean_m"] = round(float(np.mean(vh)),2)
+                del tdata
+        except Exception: pass
         parcel_details.append(pd)
-
     summary["parcels"] = {
         "count": len(cadastre_data["parcels"]),
-        "total_area_sqm": round(sum(p.get("area_sqm", 0) for p in cadastre_data["parcels"]), 1),
-        "parcels_in_seg_window": n_inside_window,
-        "details": parcel_details,
-    }
-
-    # --- Per-building-footprint detail ---
-    # Use full-KG rasters for height so ALL buildings get data.
-    building_details = []
+        "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
+        "details": parcel_details}
+    # --- Per-building detail ---
+    bld_details = []
     for b in cadastre_data["building_footprints"]:
-        bd = {}
-        geom_3035 = b["geometry"]
-        props = b.get("properties", {})
-        bd["building_id"] = props.get("building_id", props.get("id", ""))
+        bd = {}; geom_3035 = b["geometry"]; props = b.get("properties",{})
+        bd["building_id"] = props.get("building_id", props.get("id",""))
         bd["footprint_area_sqm"] = round(float(geom_3035.area), 1)
-        # Centroid
         try:
-            c_wgs = transform_to_wgs(geom_3035.centroid)
-            bd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
-        except Exception:
-            pass
-        # Height stats from full-KG nDSM
+            cw = transform_to_wgs(geom_3035.centroid)
+            bd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
+        except Exception: pass
         try:
-            from rasterio.features import rasterize as rio_rasterize
-            b_mask_full = rio_rasterize(
-                [(geom_3035, 1)], out_shape=(full_h, full_w), transform=full_tf,
-                fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-            oh = full_ndsm[b_mask_full]
-            oh = oh[np.isfinite(oh)]
-            dsm_vals = full_dsm[b_mask_full]
-            dsm_vals = dsm_vals[np.isfinite(dsm_vals)]
-            if len(oh) > 0:
-                max_h = float(np.max(oh))
-                bd["max_height_m"] = round(max_h, 2)
-                bd["mean_height_m"] = round(float(np.mean(oh)), 2)
-                bd["dsm_std"] = round(float(np.std(dsm_vals)), 2) if len(dsm_vals) > 0 else 0.0
-                bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
-                bd["stories_est"] = max(1, round(max_h / 3.0))
-        except Exception:
-            pass
-        # Check if building is inside segmentation window (same 50% rule)
-        bld_in_window = True
-        if seg_geom_3035 is not None:
-            try:
-                if not seg_geom_3035.intersects(geom_3035):
-                    bld_in_window = False
-                else:
-                    isect = seg_geom_3035.intersection(geom_3035)
-                    bld_in_window = isect.area / max(geom_3035.area, 1e-6) >= 0.5
-            except Exception:
-                bld_in_window = False
-        bd["segmented"] = bld_in_window
-        # Segment types within footprint (only if inside window)
-        if bld_in_window and labels is not None and objects:
-            try:
-                b_mask_seg = rio_rasterize(
-                    [(geom_3035, 1)], out_shape=(h, w), transform=seg_transform,
-                    fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-                b_labels = labels[b_mask_seg]
-                tc = Counter()
-                for lbl in np.unique(b_labels):
-                    obj = obj_map.get(int(lbl))
-                    if obj:
-                        tc[obj.obj_type] += int((b_labels == lbl).sum())
-                if tc:
-                    bd["segment_types"] = {t: px for t, px in tc.most_common()}
-            except Exception:
-                pass
-        building_details.append(bd)
-
-    summary["building_footprints"] = {
-        "count": len(cadastre_data["building_footprints"]),
-        "details": building_details,
-    }
-
+            c3 = geom_3035.centroid
+            tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
+            if tr:
+                from rasterio.features import rasterize as rio_rasterize
+                tdata = _read_dtm_for_tile(tr)
+                dh, dw = tdata["shape"]
+                bm = rio_rasterize([(geom_3035,1)], out_shape=(dh,dw), transform=tdata["transform"],
+                                   fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                oh = tdata["ndsm"][bm]; oh = oh[np.isfinite(oh)]
+                dv = tdata["dsm"][bm]; dv = dv[np.isfinite(dv)]
+                if len(oh) > 0:
+                    mh = float(np.nanmax(oh))
+                    bd["max_height_m"] = round(mh,2); bd["mean_height_m"] = round(float(np.nanmean(oh)),2)
+                    bd["dsm_std"] = round(float(np.std(dv)),2) if len(dv) > 0 else 0.0
+                    bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
+                    bd["stories_est"] = max(1, round(mh/3.0))
+                if tr.get("labels") is not None and objects:
+                    bl = tr["labels"][bm]; tc_ = Counter()
+                    for lbl in np.unique(bl):
+                        obj = obj_map.get(int(lbl))
+                        if obj: tc_[obj.obj_type] += int((bl==lbl).sum())
+                    if tc_: bd["segment_types"] = {t:px for t,px in tc_.most_common()}
+                del tdata
+        except Exception: pass
+        bld_details.append(bd)
+    summary["building_footprints"] = {"count": len(cadastre_data["building_footprints"]), "details": bld_details}
     # --- Coverage ---
-    # Segmentation window vs full KG extent
-    seg_area_sqm = int(mask.sum())
-    full_area_sqm = int(full_mask.sum())
-    seg_coverage_pct = round(100 * seg_area_sqm / max(full_area_sqm, 1), 1)
-    n_parcels_total = len(cadastre_data["parcels"])
-    n_parcels_with_elev = sum(1 for pd in parcel_details if pd.get("elevation_m") is not None)
-    n_buildings_total = len(cadastre_data["building_footprints"])
-    n_buildings_with_h = sum(1 for bd in building_details if bd.get("max_height_m") is not None)
+    nwe = sum(1 for p in parcel_details if p.get("elevation_m") is not None)
+    nwa = sum(1 for p in parcel_details if p.get("area_summary"))
+    nbh = sum(1 for b in bld_details if b.get("max_height_m") is not None)
     summary["coverage"] = {
-        "segmentation_window_km": seg_window_km,
-        "segmentation_area_sqm": seg_area_sqm,
-        "full_kg_area_sqm": full_area_sqm,
-        "segmentation_coverage_pct": seg_coverage_pct,
-        "parcel_coverage_pct": round(100 * n_parcels_with_elev / max(n_parcels_total, 1), 1),
-        "building_coverage_pct": round(100 * n_buildings_with_h / max(n_buildings_total, 1), 1),
-        "parcels_in_seg_window": n_inside_window,
-        "parcels_total": n_parcels_total,
-        "buildings_total": n_buildings_total,
-        "note": "Segmentation+classification covers the central window; DTM elevation covers all parcels/buildings in the full KG.",
-    }
-
+        "n_tiles": n_tiles, "tile_km": tile_km, "total_segmented_area_sqm": total_seg_pixels,
+        "parcel_elevation_coverage_pct": round(100*nwe/max(len(parcel_details),1), 1),
+        "parcel_segmentation_coverage_pct": round(100*nwa/max(len(parcel_details),1), 1),
+        "building_height_coverage_pct": round(100*nbh/max(len(bld_details),1), 1),
+        "note": "Full KG tiled segmentation; every parcel/building has elevation + segmentation data."}
     # --- Methods ---
     summary["methods"] = {
-        "segmentation": "Felzenszwalb over-segmentation + RAG merge on fused gradient (DTM+DSM+RGBI+NDVI), 1m resolution",
-        "classification": "Random Forest (44 features, cadastre+OSM trained) with rule-based fallback + cadastre calibration",
-        "calibration": "Building footprints from cadastre used for confidence boosting and missed-building reclassification",
+        "segmentation": f"Felzenszwalb+RAG on {n_tiles} overlapping {tile_km}km tiles, centroid-dedup",
+        "classification": "Random Forest (44 features, cadastre+OSM trained) + rule-based fallback",
+        "calibration": "Cadastre footprints for confidence boosting",
         "height": "BEV ALS DTM/DSM 1m, nDSM = DSM - DTM",
-        "temporal_change": "DTM/DSM differencing across all available BEV ALS dates (" + ", ".join(sorted(ti.DATASETS.keys())) + ")",
-        "ortho": "BEV DOP RGBI 0.2m, resampled to 1m for spectral indices",
-        "ndvi_bev": "(NIR - Red) / (NIR + Red) from BEV DOP RGBI",
-        "ndvi_copernicus": "Sentinel-2 L2A B08/B04, openEO, 10m resampled to 1m",
-        "ndvi_harmonics": "1st-order harmonic fit (mean + amplitude·cos(2πt/12 - phase)) to monthly Sentinel-2 NDVI",
-        "sar": "Sentinel-1 IW GRD, VV+VH polarisation, summer composite via openEO",
-        "terrain": "Slope (Sobel), aspect, TRI, TPI, curvature from full-KG DTM",
-        "texture": "GLCM contrast/homogeneity/entropy from BEV ortho greyscale",
-        "hansen": "Hansen GFC-2024-v1.12, 30m, treecover2000 + lossyear + gain",
-        "infrastructure": "austria-power API (wind turbines, solar, substations, masts)",
-        "roof_type": "flat = DSM std < 1.5m within footprint, pitched otherwise",
-        "stories_est": "max_object_height / 3m, rounded",
-        "stem_volume": "Rough cone estimate: 0.3 * canopy_area * height / 3",
-        "parking_spots": "Area / 12.5 m² (standard parking spot size)",
-        "earthwork_volume": "mean(|nDSM|) * polygon_area",
-        "fragmentation": "Shannon diversity index on segment type fractions",
-        "edge_density": "Total segment perimeter / total area",
-        "phenology": "Harmonic amplitude+phase → crop/deciduous/evergreen/bare classes",
-        "top_10_objects": "Tallest objects within the segmentation window (not full KG)",
-        "coverage": "Full-KG DTM read for parcel/building elevation; segmentation limited to central window to prevent timeouts",
+        "temporal_change": "DTM/DSM differencing, " + ", ".join(sorted(ti.DATASETS.keys())),
+        "ortho": "BEV DOP RGBI 0.2m", "ndvi_bev": "(NIR-Red)/(NIR+Red) from BEV DOP",
+        "ndvi_copernicus": "Sentinel-2 L2A, openEO, 10m",
+        "ndvi_harmonics": "Harmonic fit to monthly Sentinel-2 NDVI",
+        "sar": "Sentinel-1 IW GRD, VV+VH, openEO",
+        "terrain": "Slope/aspect/TRI from DTM, tiled",
+        "texture": "GLCM from ortho greyscale",
+        "hansen": "Hansen GFC-2024-v1.12, 30m",
+        "infrastructure": "austria-power API",
+        "roof_type": "DSM std < 1.5m = flat", "stories_est": "max_h/3m",
+        "stem_volume": "0.3*canopy_area*height/3", "parking_spots": "area/12.5m\u00b2",
+        "earthwork_volume": "mean(|nDSM|)*area",
+        "fragmentation": "Shannon diversity", "edge_density": "perimeter/area",
+        "phenology": "harmonic amplitude+phase \u2192 class",
         "cadastre_source": "BEV INSPIRE cadastre via cadastre-process-api.exe.xyz",
         "data_sources": [
-            "BEV ALS DTM/DSM 1m (2022, 2023, 2024)",
-            "BEV DOP RGBI 0.2m (2022-2024)",
-            "Sentinel-2 L2A 10m NDVI composites + monthly time series (openEO)",
-            "ESA WorldCover 10m",
-            "Sentinel-1 SAR IW GRD 10m VV/VH (openEO)",
-            "Hansen GFC-2024-v1.12 30m",
-            "Austrian Cadastre (BEV INSPIRE)",
-            "Austria Power Infrastructure API",
-        ],
-    }
-
+            "BEV ALS DTM/DSM 1m (2022-2024)", "BEV DOP RGBI 0.2m",
+            "Sentinel-2 L2A 10m NDVI (openEO)", "ESA WorldCover 10m",
+            "Sentinel-1 SAR IW GRD 10m (openEO)", "Hansen GFC-2024-v1.12 30m",
+            "Austrian Cadastre (BEV INSPIRE)", "Austria Power Infrastructure API"]}
     return summary
 
 
 # ---------------------------------------------------------------------------
-# Core per-KG processing (runs in subprocess)
+# Core per-KG processing — tiled for full-KG coverage
 # ---------------------------------------------------------------------------
 
+def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
+    """Compute a grid of overlapping tiles covering the full KG bbox.
+
+    Returns list of (w, s, e, n) bboxes in WGS84.
+    Tiles overlap by *overlap_km* so edge objects are fully contained
+    in at least one tile.
+    """
+    cos_lat = np.cos(np.radians((south + north) / 2))
+    dx_deg = tile_km / (111 * cos_lat)
+    dy_deg = tile_km / 111
+    step_x = (tile_km - overlap_km) / (111 * cos_lat)
+    step_y = (tile_km - overlap_km) / 111
+
+    tiles = []
+    y = south
+    while y < north:
+        x = west
+        while x < east:
+            tw = x
+            ts = y
+            te = min(x + dx_deg, east + dx_deg)  # allow overshoot
+            tn = min(y + dy_deg, north + dy_deg)
+            tiles.append((tw, ts, te, tn))
+            x += step_x
+        y += step_y
+    return tiles
+
+
+def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
+    """Merge terrain stats from multiple tiles.
+
+    Each entry is (stats_dict, n_valid_pixels).  Numeric stats are
+    merged via pixel-weighted averages; min/max take the extremes;
+    percentile-based fields use weighted means (approximate but fine
+    for summary stats).
+    """
+    if not stats_list:
+        return {}
+    if len(stats_list) == 1:
+        return stats_list[0][0]
+
+    total_px = sum(n for _, n in stats_list)
+    if total_px == 0:
+        return stats_list[0][0]
+
+    def _wmean(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append((v, n))
+        if not vals:
+            return None
+        return round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 3)
+
+    def _wmin(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append(v)
+        return round(min(vals), 2) if vals else None
+
+    def _wmax(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append(v)
+        return round(max(vals), 2) if vals else None
+
+    merged = {
+        "elevation": {
+            "min": _wmin(["elevation", "min"]),
+            "max": _wmax(["elevation", "max"]),
+            "mean": _wmean(["elevation", "mean"]),
+            "std": _wmean(["elevation", "std"]),
+            "range": None,  # recompute
+            "p10": _wmean(["elevation", "p10"]),
+            "p50": _wmean(["elevation", "p50"]),
+            "p90": _wmean(["elevation", "p90"]),
+        },
+        "slope_deg": {
+            "min": _wmin(["slope_deg", "min"]),
+            "max": _wmax(["slope_deg", "max"]),
+            "mean": _wmean(["slope_deg", "mean"]),
+            "std": _wmean(["slope_deg", "std"]),
+        },
+        "slope_classes_pct": {},
+        "aspect_distribution_pct": {},
+        "ruggedness_tri": {
+            "mean": _wmean(["ruggedness_tri", "mean"]),
+            "max": _wmax(["ruggedness_tri", "max"]),
+            "classification": None,
+        },
+        "area_sqm": total_px,
+        "area_ha": round(total_px / 10000, 2),
+    }
+    emin = merged["elevation"]["min"]
+    emax = merged["elevation"]["max"]
+    if emin is not None and emax is not None:
+        merged["elevation"]["range"] = round(emax - emin, 2)
+
+    # Weighted-average slope classes and aspect distribution
+    for cls_key in ["slope_classes_pct", "aspect_distribution_pct"]:
+        all_keys = set()
+        for s, _ in stats_list:
+            all_keys.update(s.get(cls_key, {}).keys())
+        for k in all_keys:
+            merged[cls_key][k] = round(
+                sum(s.get(cls_key, {}).get(k, 0) * n for s, n in stats_list) / total_px, 1)
+
+    # TRI classification from merged mean
+    tri_mean = merged["ruggedness_tri"]["mean"]
+    if tri_mean is not None:
+        if tri_mean < 0.1:
+            merged["ruggedness_tri"]["classification"] = "level"
+        elif tri_mean < 0.3:
+            merged["ruggedness_tri"]["classification"] = "nearly level"
+        elif tri_mean < 1.0:
+            merged["ruggedness_tri"]["classification"] = "slightly rugged"
+        elif tri_mean < 3.0:
+            merged["ruggedness_tri"]["classification"] = "intermediately rugged"
+        elif tri_mean < 10.0:
+            merged["ruggedness_tri"]["classification"] = "moderately rugged"
+        else:
+            merged["ruggedness_tri"]["classification"] = "highly rugged"
+
+    return merged
+
+
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None) -> dict:
-    """Process a single KG. Returns dict with file paths + stats.
+    """Process a single KG with tiled segmentation for full coverage.
+
+    The full KG is divided into overlapping 1.5km tiles.  Each tile
+    undergoes the full pipeline (multi-date LiDAR, ortho, Copernicus,
+    Hansen, segmentation, classification).  Results are merged into
+    one set of vectors/stats covering the entire KG.
 
     This function runs in a subprocess for memory isolation.
     """
@@ -2137,11 +2067,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
 
     def _report_step(step, detail=""):
-        """Write current step to temp file for parent to read."""
         try:
             step_file = DATA_DIR / "current_step.json"
             import json as _json
-            _json.dump({"step": step, "detail": detail, "ts": datetime.now(timezone.utc).isoformat()},
+            _json.dump({"step": step, "detail": detail,
+                        "ts": datetime.now(timezone.utc).isoformat()},
                        open(str(step_file) + ".tmp", "w"))
             os.rename(str(step_file) + ".tmp", str(step_file))
         except Exception:
@@ -2166,7 +2096,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             west, south = bb["min_lon"], bb["min_lat"]
             east, north = bb["max_lon"], bb["max_lat"]
 
-        # Store the API bbox as the "full KG" bbox (may be refined below)
         full_west, full_south, full_east, full_north = west, south, east, north
         obs_year = ti.dataset_to_year(ti.DEFAULT_DATASET)
 
@@ -2176,10 +2105,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         cadastre_data = fetch_cadastre_data(kg_code)
         result["n_parcels"] = len(cadastre_data["parcels"])
         result["n_buildings"] = len(cadastre_data["building_footprints"])
-        _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, {len(cadastre_data['building_footprints'])} buildings")
+        _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, "
+                     f"{len(cadastre_data['building_footprints'])} buildings")
 
-        # --- 1b. Compute full KG bbox from cadastre geometry union ---
-        # The API bbox can be inaccurate; use the actual geometry extent.
+        # --- 1b. Refine bbox from cadastre geometry union ---
         all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
                          + [b["geometry"] for b in cadastre_data["building_footprints"]])
         if all_cad_geoms:
@@ -2194,376 +2123,401 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         valid_geoms.append(g.buffer(0))
                 cad_union_3035 = _unary_union(valid_geoms)
                 cad_union_wgs = transform_to_wgs(cad_union_3035)
-                cb = cad_union_wgs.bounds  # (minx, miny, maxx, maxy)
-                # Use the wider of API bbox and cadastre bbox
+                cb = cad_union_wgs.bounds
                 full_west = min(full_west, cb[0])
                 full_south = min(full_south, cb[1])
                 full_east = max(full_east, cb[2])
                 full_north = max(full_north, cb[3])
-                log.info("KG %s: full KG bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
+                log.info("KG %s: full bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
                          kg_code, full_west, full_south, full_east, full_north)
             except Exception as e:
-                log.warning("KG %s: cadastre union failed, using API bbox: %s", kg_code, e)
+                log.warning("KG %s: cadastre union failed, using API bbox: %s",
+                            kg_code, e)
 
-        full_geom_wgs = box(full_west, full_south, full_east, full_north)
-        full_geom_3035 = transform_to_3035(full_geom_wgs)
+        # --- 2. Compute tile grid ---
+        tile_km = max_km if max_km is not None else MAX_KG_AREA_KM
+        tiles_wgs = _compute_tile_grid(
+            full_west, full_south, full_east, full_north,
+            tile_km=tile_km, overlap_km=0.1)
+        n_tiles = len(tiles_wgs)
+        log.info("KG %s: %d tiles (%.1fkm each) covering %.4f,%.4f → %.4f,%.4f",
+                 kg_code, n_tiles, tile_km,
+                 full_west, full_south, full_east, full_north)
+        _report_step("tiles", f"{n_tiles} tiles @ {tile_km}km")
 
-        # --- 2. Full-KG LiDAR (default date only, for height enrichment) ---
-        result["step"] = "lidar_full"
-        _report_step("lidar_full", "reading full-KG DTM/DSM")
-        full_data = raster_io.read_dtm_dsm(full_geom_3035, ti.DEFAULT_DATASET)
-        full_h, full_w = full_data["shape"]
-        full_valid_px = int(full_data["mask"].sum())
-        if full_valid_px < 100:
-            result["error"] = f"too few valid pixels in full KG: {full_valid_px}"
-            return result
-        full_dtm = full_data["dtm"]
-        full_dsm = full_data["dsm"]
-        full_ndsm = full_data["ndsm"]
-        full_mask = full_data["mask"]
-        full_transform = full_data["transform"]
-        log.info("KG %s: full-KG DTM/DSM %dx%d, %d valid px",
-                 kg_code, full_h, full_w, full_valid_px)
-        _report_step("lidar_full", f"full KG {full_h}x{full_w}, {full_valid_px} px")
+        # --- Accumulators for merging tile results ---
+        all_objects = []          # SegmentedObject list
+        all_new_buildings = []    # vectorised new buildings
+        all_infrastructure = []   # vectorised infrastructure
+        terrain_stats_list = []   # (stats, n_px) for merging
+        all_spectral_info = {}    # for JSON ndvi section
+        all_copernicus_info = {}  # for JSON sar/harmonics
+        all_hansen_info = {}      # for JSON hansen section
+        tile_seg_results = []     # (tile_bbox_3035, labels, objects, transform, shape, ndsm, mask)
+        total_seg_pixels = 0
+        next_obj_id = 1           # global unique obj_id counter
 
-        # --- 2b. Terrain analysis on full-KG DTM ---
-        result["step"] = "terrain_full"
-        _report_step("terrain_full", "full-KG terrain analysis")
-        terrain_stats = {}
-        try:
-            terrain_stats = ta.characterise_terrain(full_dtm, full_mask)
-        except Exception as e:
-            log.warning("KG %s: full-KG terrain failed: %s", kg_code, e)
-        _report_step("terrain_full", "done")
+        # --- 3. Process each tile ---
+        for tile_idx, (tw, ts, te, tn) in enumerate(tiles_wgs):
+            tile_label = f"tile {tile_idx+1}/{n_tiles}"
+            result["step"] = f"tile_{tile_idx+1}"
+            _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
 
-        # --- 3. Crop to segmentation window for expensive operations ---
-        crop_km = max_km if max_km is not None else MAX_KG_AREA_KM
-        dx_km = (full_east - full_west) * 111 * np.cos(np.radians((full_south + full_north) / 2))
-        dy_km = (full_north - full_south) * 111
-        seg_cropped = False
-        if dx_km > crop_km or dy_km > crop_km:
-            cx, cy = (full_west + full_east) / 2, (full_south + full_north) / 2
-            half = (crop_km / 2) / 111
-            west, south, east, north = cx - half, cy - half, cx + half, cy + half
-            log.info("KG %s: segmentation window cropped to %.1fkm", kg_code, crop_km)
-            seg_cropped = True
-        else:
-            west, south, east, north = full_west, full_south, full_east, full_north
+            tile_geom_wgs = box(tw, ts, te, tn)
+            tile_geom_3035 = transform_to_3035(tile_geom_wgs)
 
-        geom_wgs = box(west, south, east, north)
-        geom_3035 = transform_to_3035(geom_wgs)
+            # --- 3a. LiDAR (default date) ---
+            try:
+                tdata = raster_io.read_dtm_dsm(tile_geom_3035, ti.DEFAULT_DATASET)
+            except Exception as e:
+                log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
+                continue
+            th, tw_ = tdata["shape"]
+            tvalid = int(tdata["mask"].sum())
+            if tvalid < 100:
+                log.info("KG %s %s: skipping (only %d valid px)", kg_code, tile_label, tvalid)
+                continue
 
-        # --- 3b. Windowed LiDAR for segmentation ---
-        result["step"] = "lidar"
-        _report_step("lidar", "reading windowed DTM/DSM for segmentation")
-        if seg_cropped:
-            data = raster_io.read_dtm_dsm(geom_3035, ti.DEFAULT_DATASET)
-        else:
-            # No crop needed — reuse full-KG data
-            data = full_data
-        h, w = data["shape"]
-        valid_px = int(data["mask"].sum())
-        # Scale pixel limit with crop window (smaller window = fewer pixels needed)
-        effective_max_px = MAX_KG_PIXELS if max_km is None else int((max_km * 1000) ** 2)
-        if valid_px > effective_max_px:
-            result["error"] = f"too large: {valid_px} px (limit {effective_max_px})"
-            return result
-        if valid_px < 100:
-            result["error"] = f"too few valid pixels: {valid_px}"
-            return result
-        _report_step("lidar", f"{h}x{w}, {valid_px} valid px")
+            t_transform = tdata["transform"]
+            t_mask = tdata["mask"]
+            t_ndsm = tdata["ndsm"]
 
-        ndsm = data["ndsm"]
-        mask = data["mask"]
-        transform = data["transform"]
+            # --- 3b. Terrain stats for this tile ---
+            try:
+                t_terrain = ta.characterise_terrain(tdata["dtm"], t_mask)
+                terrain_stats_list.append((t_terrain, tvalid))
+            except Exception as e:
+                log.warning("KG %s %s: terrain failed: %s", kg_code, tile_label, e)
 
-        # --- 2b. Multi-date DTM/DSM (temporal change features) ---
-        # The RF model uses temporal features (14.7% importance) so we
-        # need all available dates for accurate classification.
-        dtm_dates = None
-        dsm_dates = None
-        try:
-            other_dates = sorted(d for d in ti.DATASETS if d != ti.DEFAULT_DATASET)
-            if other_dates:
-                dtm_dates = {}
-                dsm_dates = {}
-                ref_h, ref_w = h, w
-                for date_key in other_dates:
-                    try:
-                        d2 = raster_io.read_dtm_dsm(geom_3035, date_key)
-                        mh = min(ref_h, d2["shape"][0])
-                        mw = min(ref_w, d2["shape"][1])
-                        dtm_dates[date_key] = d2["dtm"][:mh, :mw]
-                        dsm_dates[date_key] = d2["dsm"][:mh, :mw]
-                    except Exception as e:
-                        log.warning("KG %s: multi-date %s failed: %s",
-                                    kg_code, date_key, e)
-                if dtm_dates:
-                    # Align all arrays to the smallest common extent
-                    mh = min(ref_h, *(a.shape[0] for a in dtm_dates.values()))
-                    mw = min(ref_w, *(a.shape[1] for a in dtm_dates.values()))
-                    dtm_dates[ti.DEFAULT_DATASET] = data["dtm"][:mh, :mw]
-                    dsm_dates[ti.DEFAULT_DATASET] = data["dsm"][:mh, :mw]
-                    for dk in list(dtm_dates):
-                        dtm_dates[dk] = dtm_dates[dk][:mh, :mw]
-                        dsm_dates[dk] = dsm_dates[dk][:mh, :mw]
-                    log.info("KG %s: loaded %d temporal dates: %s",
-                             kg_code, len(dtm_dates), sorted(dtm_dates))
-                    _report_step("lidar",
-                                 f"{h}x{w}, {valid_px} px, {len(dtm_dates)} dates")
-                else:
-                    dtm_dates = None
-                    dsm_dates = None
-        except Exception as e:
-            log.warning("KG %s: multi-date read failed: %s", kg_code, e)
+            # --- 3c. Multi-date DTM/DSM ---
             dtm_dates = None
             dsm_dates = None
-
-        # --- 3. Orthophoto (with timeout protection) ---
-        result["step"] = "ortho"
-        _report_step("ortho")
-        ORTHO_TIMEOUT = 180  # 3 min max
-        spectral = None
-        try:
-            import ortho_io
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
-                fut = exe.submit(ortho_io.read_ortho_for_als, data)
-                try:
-                    rgb, nir = fut.result(timeout=ORTHO_TIMEOUT)
-                    spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
-                    if rgb is not None:
-                        spectral["red"] = rgb[0].astype(np.float32)
-                        spectral["green"] = rgb[1].astype(np.float32)
-                        spectral["blue"] = rgb[2].astype(np.float32)
-                    if nir is not None:
-                        spectral["nir"] = nir.astype(np.float32)
-                except concurrent.futures.TimeoutError:
-                    log.warning("KG %s: ortho timed out after %ds",
-                                kg_code, ORTHO_TIMEOUT)
-        except Exception as e:
-            log.warning("KG %s: ortho failed: %s", kg_code, e)
-        if spectral:
-            _report_step("ortho", f"RGBI loaded, {len(spectral)} bands")
-        else:
-            _report_step("ortho", "skipped/failed")
-
-        # --- 4. Copernicus (tile-cached) ---
-        copernicus_data = None
-        if include_copernicus:
-            result["step"] = "copernicus"
-            _report_step("copernicus")
-            cb = _read_circuit_breaker()
-            if cb["consecutive_failures"] >= 3 and \
-               (time.time() - cb["last_failure"]) < cb["cooldown"]:
-                log.info("KG %s: Copernicus circuit breaker OPEN, skipping", kg_code)
-            else:
-                try:
-                    bbox_dict = {"west": west, "south": south,
-                                 "east": east, "north": north}
-                    cop_cache = _get_cop_cache()
-                    cop = {}
-                    # NDVI (grid-snapped tile cache)
-                    nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
-                    if nd and nd.get("ndvi") is not None:
-                        cop["ndvi"] = nd["ndvi"]
-                        cop["transform"] = nd.get("transform")
-                        cop["crs"] = nd.get("crs")
-                    # WorldCover (grid-snapped tile cache)
-                    lc = cop_cache.get_landcover(bbox_dict)
-                    if lc:
-                        cop["landcover"] = lc
-                    # SAR (grid-snapped tile cache)
-                    sar = cop_cache.get_sar(bbox_dict, year=obs_year)
-                    if sar:
-                        cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
-                        if "transform" in sar:
-                            cop["sar_transform"] = sar["transform"]
-
-                    # NDVI harmonics (6.7% of RF feature importance)
-                    # Only attempt if at least one Copernicus layer succeeded
-                    if cop:
-                        try:
-                            import ndvi_harmonics
-                            HARM_TIMEOUT = 300  # 5 min
-                            import concurrent.futures as _cf
-                            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                                _hfut = _ex.submit(
-                                    ndvi_harmonics.get_harmonic_features,
-                                    bbox_dict, obs_year)
-                                try:
-                                    harm = _hfut.result(timeout=HARM_TIMEOUT)
-                                    if harm is not None:
-                                        cop["harmonics"] = harm
-                                        log.info("KG %s: harmonics OK", kg_code)
-                                except _cf.TimeoutError:
-                                    log.warning("KG %s: harmonics timed out after %ds",
-                                                kg_code, HARM_TIMEOUT)
-                                except Exception as he:
-                                    log.debug("KG %s: harmonics failed: %s", kg_code, he)
-                        except Exception:
-                            pass
-
-                    copernicus_data = cop if cop else None
-
-                    # Update circuit breaker
-                    if copernicus_data:
-                        cb["consecutive_failures"] = 0
-                    else:
-                        cb["consecutive_failures"] += 1
-                        cb["last_failure"] = time.time()
-                        cb["cooldown"] = min(600, 60 * (2 ** min(cb["consecutive_failures"], 4)))
-                        # Rotate credentials for next attempt
-                        try:
-                            import copernicus as _cop_mod
-                            _cop_mod.rotate_credentials()
-                        except Exception:
-                            pass
-                    _write_circuit_breaker(cb)
-                except Exception as e:
-                    from copernicus import CreditsExhaustedError
-                    if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
-                        log.error("KG %s: Copernicus credits exhausted — signalling pause", kg_code)
-                        result["copernicus_exhausted"] = True
-                        # Write pause file so main loop can detect it
-                        COPERNICUS_PAUSE_FILE.write_text(
-                            f"Credits exhausted at {datetime.now(timezone.utc).isoformat()}\n"
-                            f"Provide new credentials in copernicus.py and delete this file to resume.\n"
-                        )
-                    else:
-                        log.warning("KG %s: Copernicus failed: %s", kg_code, e)
-                    cb["consecutive_failures"] += 1
-                    cb["last_failure"] = time.time()
-                    _write_circuit_breaker(cb)
-
-        if copernicus_data:
-            bands = [k for k in copernicus_data.keys() if k not in ('transform','crs','sar_transform')]
-            _report_step("copernicus", f"loaded: {', '.join(bands)}")
-        else:
-            _report_step("copernicus", "skipped (circuit breaker or failed)")
-
-        # --- 5. Hansen (tile-cached) ---
-        result["step"] = "hansen"
-        _report_step("hansen")
-        hansen_data = None
-        try:
-            hc = _get_hansen_cache()
-            hansen_data = hc.get_forest_prior(
-                (west, south, east, north), transform, (h, w))
-        except Exception as e:
-            log.warning("KG %s: Hansen failed: %s", kg_code, e)
-        if hansen_data:
-            _report_step("hansen", "loaded")
-        else:
-            _report_step("hansen", "skipped/failed")
-
-        # --- 6. Segmentation ---
-        result["step"] = "segment"
-        _report_step("segment")
-
-        # Building footprint mask
-        building_fp_mask = None
-        if cadastre_data["building_footprints"]:
             try:
-                from rasterio.features import rasterize as rio_rasterize
-                pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
-                         if not b["geometry"].is_empty]
-                if pairs:
-                    building_fp_mask = rio_rasterize(
-                        pairs, out_shape=(h, w), transform=transform,
-                        fill=0, dtype=np.uint8, all_touched=True,
-                    ).astype(bool)
+                other_dates = sorted(d for d in ti.DATASETS if d != ti.DEFAULT_DATASET)
+                if other_dates:
+                    dtm_dates = {}
+                    dsm_dates = {}
+                    for date_key in other_dates:
+                        try:
+                            d2 = raster_io.read_dtm_dsm(tile_geom_3035, date_key)
+                            mh = min(th, d2["shape"][0])
+                            mw = min(tw_, d2["shape"][1])
+                            dtm_dates[date_key] = d2["dtm"][:mh, :mw]
+                            dsm_dates[date_key] = d2["dsm"][:mh, :mw]
+                        except Exception:
+                            pass
+                    if dtm_dates:
+                        mh = min(th, *(a.shape[0] for a in dtm_dates.values()))
+                        mw = min(tw_, *(a.shape[1] for a in dtm_dates.values()))
+                        dtm_dates[ti.DEFAULT_DATASET] = tdata["dtm"][:mh, :mw]
+                        dsm_dates[ti.DEFAULT_DATASET] = tdata["dsm"][:mh, :mw]
+                        for dk in list(dtm_dates):
+                            dtm_dates[dk] = dtm_dates[dk][:mh, :mw]
+                            dsm_dates[dk] = dsm_dates[dk][:mh, :mw]
+                    else:
+                        dtm_dates = dsm_dates = None
+            except Exception:
+                dtm_dates = dsm_dates = None
+
+            # --- 3d. Orthophoto ---
+            spectral = None
+            try:
+                import ortho_io
+                import concurrent.futures
+                ORTHO_TIMEOUT = 180
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                    fut = exe.submit(ortho_io.read_ortho_for_als, tdata)
+                    try:
+                        rgb, nir = fut.result(timeout=ORTHO_TIMEOUT)
+                        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+                        if rgb is not None:
+                            spectral["red"] = rgb[0].astype(np.float32)
+                            spectral["green"] = rgb[1].astype(np.float32)
+                            spectral["blue"] = rgb[2].astype(np.float32)
+                        if nir is not None:
+                            spectral["nir"] = nir.astype(np.float32)
+                    except concurrent.futures.TimeoutError:
+                        log.warning("KG %s %s: ortho timed out", kg_code, tile_label)
+            except Exception as e:
+                log.warning("KG %s %s: ortho failed: %s", kg_code, tile_label, e)
+
+            # Accumulate spectral info for JSON
+            if spectral and spectral.get("ndvi") is not None:
+                ndvi_arr = spectral["ndvi"]
+                v = ndvi_arr[t_mask[:ndvi_arr.shape[0], :ndvi_arr.shape[1]]]
+                v = v[np.isfinite(v)]
+                if len(v) > 0:
+                    all_spectral_info.setdefault("_vals", []).extend(
+                        v[::max(1, len(v)//5000)].tolist())  # subsample
+
+            # --- 3e. Copernicus ---
+            copernicus_data = None
+            if include_copernicus:
+                c_breaker = _read_circuit_breaker()
+                if c_breaker["consecutive_failures"] < 3 or \
+                   (time.time() - c_breaker["last_failure"]) >= c_breaker["cooldown"]:
+                    try:
+                        bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
+                        cop_cache = _get_cop_cache()
+                        cop = {}
+                        nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+                        if nd and nd.get("ndvi") is not None:
+                            cop["ndvi"] = nd["ndvi"]
+                            cop["transform"] = nd.get("transform")
+                            cop["crs"] = nd.get("crs")
+                        lc = cop_cache.get_landcover(bbox_dict)
+                        if lc:
+                            cop["landcover"] = lc
+                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
+                        if sar:
+                            cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
+                            if "transform" in sar:
+                                cop["sar_transform"] = sar["transform"]
+                        if cop:
+                            try:
+                                import ndvi_harmonics
+                                import concurrent.futures as _cf
+                                with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                                    _hfut = _ex.submit(
+                                        ndvi_harmonics.get_harmonic_features,
+                                        bbox_dict, obs_year)
+                                    try:
+                                        harm = _hfut.result(timeout=300)
+                                        if harm is not None:
+                                            cop["harmonics"] = harm
+                                    except (_cf.TimeoutError, Exception):
+                                        pass
+                            except Exception:
+                                pass
+                        copernicus_data = cop if cop else None
+                        # Update circuit breaker
+                        if copernicus_data:
+                            c_breaker["consecutive_failures"] = 0
+                        else:
+                            c_breaker["consecutive_failures"] += 1
+                            c_breaker["last_failure"] = time.time()
+                            c_breaker["cooldown"] = min(600, 60 * (2 ** min(c_breaker["consecutive_failures"], 4)))
+                        _write_circuit_breaker(c_breaker)
+                    except Exception as e:
+                        from copernicus import CreditsExhaustedError
+                        if isinstance(e, CreditsExhaustedError) or \
+                           isinstance(e.__cause__, CreditsExhaustedError):
+                            log.error("KG %s: Copernicus credits exhausted", kg_code)
+                            result["copernicus_exhausted"] = True
+                            COPERNICUS_PAUSE_FILE.write_text(
+                                f"Credits exhausted at {datetime.now(timezone.utc).isoformat()}\n")
+                        else:
+                            log.warning("KG %s %s: Copernicus failed: %s",
+                                        kg_code, tile_label, e)
+                        c_breaker["consecutive_failures"] += 1
+                        c_breaker["last_failure"] = time.time()
+                        _write_circuit_breaker(c_breaker)
+
+            # Accumulate Copernicus info
+            if copernicus_data:
+                for band in ['vv', 'vh']:
+                    arr = copernicus_data.get(band)
+                    if arr is not None:
+                        v = arr[np.isfinite(arr)]
+                        if len(v) > 0:
+                            all_copernicus_info.setdefault(f"{band}_vals", []).extend(
+                                v[::max(1, len(v)//2000)].tolist())
+                if copernicus_data.get("ndvi") is not None:
+                    cv = copernicus_data["ndvi"]
+                    cv = cv[np.isfinite(cv)]
+                    if len(cv) > 0:
+                        all_copernicus_info.setdefault("cop_ndvi_vals", []).extend(
+                            cv[::max(1, len(cv)//2000)].tolist())
+                if copernicus_data.get("harmonics"):
+                    harm = copernicus_data["harmonics"]
+                    for hk in ['h_mean', 'h_amplitude', 'h_phase', 'h_rmse']:
+                        arr = harm.get(hk)
+                        if arr is not None:
+                            v = arr[np.isfinite(arr)]
+                            if len(v) > 0:
+                                all_copernicus_info.setdefault(f"{hk}_vals", []).extend(
+                                    v[::max(1, len(v)//2000)].tolist())
+
+            # --- 3f. Hansen ---
+            hansen_data = None
+            try:
+                hc = _get_hansen_cache()
+                hansen_data = hc.get_forest_prior(
+                    (tw, ts, te, tn), t_transform, (th, tw_))
+            except Exception as e:
+                log.warning("KG %s %s: Hansen failed: %s", kg_code, tile_label, e)
+            # Accumulate Hansen
+            if hansen_data:
+                ly = hansen_data.get("loss_year")
+                if ly is not None:
+                    all_hansen_info.setdefault("loss_years", []).append(ly)
+                tc = hansen_data.get("treecover2000")
+                if tc is not None:
+                    all_hansen_info.setdefault("tc_vals", []).extend(
+                        tc[np.isfinite(tc)].ravel()[::max(1, tc.size//2000)].tolist())
+                cf = hansen_data.get("current_forest")
+                if cf is not None:
+                    all_hansen_info.setdefault("cf_sum", [0])
+                    all_hansen_info["cf_sum"][0] += int(cf.sum())
+
+            # --- 3g. Segmentation ---
+            _report_step(f"tile_{tile_idx+1}", f"segmenting {tile_label}")
+
+            building_fp_mask = None
+            if cadastre_data["building_footprints"]:
+                try:
+                    from rasterio.features import rasterize as rio_rasterize
+                    pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
+                             if not b["geometry"].is_empty]
+                    if pairs:
+                        building_fp_mask = rio_rasterize(
+                            pairs, out_shape=(th, tw_), transform=t_transform,
+                            fill=0, dtype=np.uint8, all_touched=True,
+                        ).astype(bool)
+                except Exception:
+                    pass
+
+            infra = None
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                infra = InfrastructureLookup.for_bbox(tw, ts, te, tn)
             except Exception:
                 pass
 
-        # Infrastructure lookup for rule-based detection of
-        # wind turbines, solar panels, substations, masts
-        infra = None
-        try:
-            from infrastructure_lookup import InfrastructureLookup
-            infra = InfrastructureLookup.for_bbox(west, south, east, north)
-            if len(infra) > 0:
-                log.info("KG %s: %d infrastructure features loaded",
-                         kg_code, len(infra))
-        except Exception as e:
-            log.debug("KG %s: infrastructure lookup failed: %s", kg_code, e)
-
-        seg_result = oc.segment_and_classify(
-            data["dtm"], data["dsm"], mask, transform,
-            dtm_dates=dtm_dates, dsm_dates=dsm_dates,
-            spectral=spectral, copernicus=copernicus_data,
-            building_footprints=building_fp_mask,
-            hansen=hansen_data,
-            observation_year=obs_year,
-            infra_lookup=infra,
-        )
-        objects = seg_result["objects"]
-        labels = seg_result["labels"]
-        result["n_segments"] = len(objects)
-        _report_step("segment", f"{len(objects)} objects, {result.get('n_segments',0)} segments")
-
-        # --- 7. Terrain (already done on full-KG DTM in step 2b) ---
-
-        # --- 8. Vectorise unmatched buildings & infrastructure ---
-        result["step"] = "vectorise"
-        _report_step("vectorise")
-        new_buildings = []
-        infrastructure_vec = []
-        try:
-            new_buildings = vectorise_unmatched_buildings(
-                objects, labels, mask, transform, building_fp_mask, ndsm)
-        except Exception as e:
-            log.warning("KG %s: new buildings vectorise failed: %s", kg_code, e)
-        try:
-            infrastructure_vec = vectorise_infrastructure(
-                objects, labels, mask, transform, ndsm, data["dtm"])
-        except Exception as e:
-            log.warning("KG %s: infrastructure vectorise failed: %s", kg_code, e)
-
-        result["n_new_buildings"] = len(new_buildings)
-        result["n_infrastructure"] = len(infrastructure_vec)
-        _report_step("vectorise", f"{len(new_buildings)} new buildings, {len(infrastructure_vec)} infrastructure")
-
-        # --- 8b. Resolve edge-clipped features against full-KG nDSM ---
-        if seg_cropped and (new_buildings or infrastructure_vec):
-            result["step"] = "resolve_edges"
-            _report_step("resolve_edges")
             try:
-                new_buildings, infrastructure_vec = resolve_edge_clipped_features(
-                    new_buildings, infrastructure_vec,
-                    full_ndsm, full_dsm, full_mask, full_transform)
-                n_resolved = (sum(1 for x in new_buildings if x.get('edge_resolved'))
-                              + sum(1 for x in infrastructure_vec if x.get('edge_resolved')))
-                _report_step("resolve_edges", f"{n_resolved} features resolved")
+                seg_result = oc.segment_and_classify(
+                    tdata["dtm"], tdata["dsm"], t_mask, t_transform,
+                    dtm_dates=dtm_dates, dsm_dates=dsm_dates,
+                    spectral=spectral, copernicus=copernicus_data,
+                    building_footprints=building_fp_mask,
+                    hansen=hansen_data,
+                    observation_year=obs_year,
+                    infra_lookup=infra,
+                )
             except Exception as e:
-                log.warning("KG %s: edge resolution failed: %s", kg_code, e)
+                log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
+                continue
 
-        # --- 9. Build full GPKG ---
+            t_objects = seg_result["objects"]
+            t_labels = seg_result["labels"]
+
+            # Remap obj_ids to global unique range
+            id_remap = {}
+            for obj in t_objects:
+                old_id = obj.obj_id
+                obj.obj_id = next_obj_id
+                id_remap[old_id] = next_obj_id
+                next_obj_id += 1
+            # Remap label array
+            new_labels = np.zeros_like(t_labels)
+            for old_id, new_id in id_remap.items():
+                new_labels[t_labels == old_id] = new_id
+            t_labels = new_labels
+
+            # Store tile segmentation result for parcel enrichment
+            tile_bounds_3035 = raster_io.read_window_bbox.__wrapped__ if False else None
+            # Compute tile bounds in EPSG:3035 from transform + shape
+            import rasterio.transform
+            t_bounds_3035 = rasterio.transform.array_bounds(th, tw_, t_transform)
+            tile_seg_results.append({
+                "bounds_3035": t_bounds_3035,  # (left, bottom, right, top)
+                "labels": t_labels,
+                "objects": t_objects,
+                "transform": t_transform,
+                "shape": (th, tw_),
+                "ndsm": t_ndsm,
+                "mask": t_mask,
+                "bbox_wgs": (tw, ts, te, tn),
+            })
+            total_seg_pixels += tvalid
+
+            # Filter objects: keep only those whose centroid is inside
+            # the non-overlap core of this tile (avoid double-counting
+            # at tile boundaries).
+            # Core = tile shrunk by half the overlap on each side.
+            core_shrink = 50  # 50m = half of 100m overlap
+            core_left = t_bounds_3035[0] + core_shrink
+            core_bottom = t_bounds_3035[1] + core_shrink
+            core_right = t_bounds_3035[2] - core_shrink
+            core_top = t_bounds_3035[3] - core_shrink
+            # For edge tiles (first/last row/col), don't shrink outward
+            if tile_idx == 0 or tw <= full_west + 0.0001:
+                core_left = t_bounds_3035[0]
+            if tile_idx == 0 or ts <= full_south + 0.0001:
+                core_bottom = t_bounds_3035[1]
+            if te >= full_east - 0.0001:
+                core_right = t_bounds_3035[2]
+            if tn >= full_north - 0.0001:
+                core_top = t_bounds_3035[3]
+
+            core_objects = []
+            for obj in t_objects:
+                if (core_left <= obj.centroid_e <= core_right and
+                        core_bottom <= obj.centroid_n <= core_top):
+                    core_objects.append(obj)
+            all_objects.extend(core_objects)
+
+            # --- 3h. Vectorise new buildings & infrastructure (this tile) ---
+            try:
+                nb = vectorise_unmatched_buildings(
+                    t_objects, t_labels, t_mask, t_transform,
+                    building_fp_mask, t_ndsm)
+                all_new_buildings.extend(nb)
+            except Exception as e:
+                log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)
+            try:
+                iv = vectorise_infrastructure(
+                    t_objects, t_labels, t_mask, t_transform, t_ndsm, tdata["dtm"])
+                all_infrastructure.extend(iv)
+            except Exception as e:
+                log.warning("KG %s %s: infrastructure failed: %s", kg_code, tile_label, e)
+
+            # Free tile memory
+            del tdata, t_labels, t_objects, seg_result, spectral
+            del copernicus_data, hansen_data, dtm_dates, dsm_dates
+            del building_fp_mask, t_mask, t_ndsm
+            gc.collect()
+
+            log.info("KG %s %s: done (%d objects, %d core)",
+                     kg_code, tile_label, len(id_remap), len(core_objects))
+            _report_step(f"tile_{tile_idx+1}",
+                         f"done: {len(core_objects)} objects")
+
+        # --- 4. Merge terrain stats ---
+        terrain_stats = _merge_terrain_stats(terrain_stats_list)
+        result["n_segments"] = len(all_objects)
+        result["n_new_buildings"] = len(all_new_buildings)
+        result["n_infrastructure"] = len(all_infrastructure)
+        log.info("KG %s: merged %d objects from %d tiles, %d new buildings, %d infra",
+                 kg_code, len(all_objects), n_tiles,
+                 len(all_new_buildings), len(all_infrastructure))
+
+        # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full")
-        full_gpkg = build_full_gpkg(
-            kg_code, data, spectral, labels, objects, mask, transform,
-            obs_year=obs_year)
+        full_gpkg = build_full_gpkg_tiled(
+            kg_code, tile_seg_results, all_objects, obs_year)
         result["files"]["full_gpkg"] = full_gpkg
 
-        # --- 10. Build light GPKG ---
+        # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"
         _report_step("gpkg_light")
-        light_gpkg = build_light_gpkg(
-            kg_code, data, labels, objects, mask, transform,
-            cadastre_data, ndsm, new_buildings, infrastructure_vec,
-            obs_year=obs_year, full_data=full_data)
+        light_gpkg = build_light_gpkg_tiled(
+            kg_code, tile_seg_results, all_objects,
+            cadastre_data, all_new_buildings, all_infrastructure,
+            obs_year=obs_year)
         result["files"]["light_gpkg"] = light_gpkg
 
-        # --- 11. Build JSON summary ---
+        # --- 7. Build JSON summary ---
         result["step"] = "json"
         _report_step("json")
-        json_summary = build_json_summary(
-            kg_code, kg, data, labels, objects, cadastre_data,
-            terrain_stats, spectral, hansen_data, copernicus_data,
-            new_buildings, infrastructure_vec, ndsm, obs_year,
-            full_data=full_data,
-            seg_window_km=crop_km if seg_cropped else None)
+        json_summary = build_json_summary_tiled(
+            kg_code, kg, tile_seg_results, all_objects,
+            cadastre_data, terrain_stats,
+            all_spectral_info, all_copernicus_info, all_hansen_info,
+            all_new_buildings, all_infrastructure, obs_year,
+            n_tiles=n_tiles, tile_km=tile_km,
+            total_seg_pixels=total_seg_pixels)
 
         json_path = str(JSON_DIR / f"{kg_code}.json")
         with open(json_path, 'w') as f:
@@ -2578,19 +2532,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["traceback"] = traceback.format_exc()
         log.error("KG %s failed at step %s: %s", kg_code, result["step"], e)
 
-    # Explicitly free large arrays before returning to parent
-    for _var in ('data', 'full_data', 'full_dtm', 'full_dsm', 'full_ndsm',
-                 'labels', 'objects', 'ndsm', 'spectral',
-                 'copernicus_data', 'hansen_data', 'cadastre_data',
-                 'new_buildings', 'infrastructure_vec', 'dtm_dates', 'dsm_dates',
-                 'building_fp_mask', 'seg_result', 'terrain_stats'):
-        try:
-            del locals()[_var]  # noqa
-        except (KeyError, NameError):
-            pass
     gc.collect()
     return result
-
 
 # ---------------------------------------------------------------------------
 # Output validation

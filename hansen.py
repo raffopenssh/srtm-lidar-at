@@ -110,6 +110,7 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
     tf_flat = np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
     try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(str(tmp_path), data=data, transform=tf_flat)
         tmp_path.rename(cache_path)
     except BaseException:

@@ -756,7 +756,9 @@ async function poll() {
     // Refresh tile overlays every 10s
     if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
-    document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString();
+    const commitHash = d.git_commit || '';
+    document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString()
+      + (commitHash ? ' · ' + commitHash : '');
     dot.style.background = 'var(--green)';
   } catch(e) {
     console.error('poll:', e);

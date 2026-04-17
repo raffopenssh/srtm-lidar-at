@@ -721,6 +721,16 @@ def stop_curve_eval():
 
 _processor_process = None  # subprocess.Popen for the processor
 
+# Git commit hash (read once at startup)
+try:
+    import subprocess as _sp
+    _GIT_COMMIT = _sp.check_output(
+        ['git', 'rev-parse', '--short', 'HEAD'],
+        cwd=str(Path(__file__).parent), stderr=_sp.DEVNULL
+    ).decode().strip()
+except Exception:
+    _GIT_COMMIT = 'unknown'
+
 @app.route('/api/v1/processing/status')
 def processing_status():
     """Return Austria processor progress (read from progress.json)."""
@@ -807,6 +817,7 @@ def processing_status():
                 }
         except Exception:
             pass
+        data['git_commit'] = _GIT_COMMIT
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

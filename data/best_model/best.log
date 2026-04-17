@@ -1,0 +1,5 @@
+2026-04-17T05:44:14Z NEW BEST: composite=0.445156 OOB=0.674569 mean_cls=0.5009 min_cls=0.0000 kgs=5 samples=5273 classes=16 seed=0
+2026-04-17T05:44:41Z NEW BEST: composite=0.566323 OOB=0.716599 mean_cls=0.6404 min_cls=0.2222 kgs=5 samples=6609 classes=16 seed=4
+2026-04-17T05:45:42Z NEW BEST: composite=0.571371 OOB=0.710350 mean_cls=0.6312 min_cls=0.2653 kgs=10 samples=16589 classes=16 seed=3
+2026-04-17T05:47:26Z NEW BEST: composite=0.583894 OOB=0.689313 mean_cls=0.6369 min_cls=0.3410 kgs=15 samples=20989 classes=16 seed=3
+2026-04-17T06:20:56Z NEW BEST: composite=0.589869 OOB=0.699106 mean_cls=0.6504 min_cls=0.3303 kgs=55 samples=87496 classes=16 seed=2

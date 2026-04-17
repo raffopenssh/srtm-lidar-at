@@ -3,3 +3,13 @@ __pycache__/
 rf_training_data/checkpoints/
 
 data/shares/
+
+# Large uncompressed model files (keep .xz compressed version)
+data/best_model/rf_model.joblib
+data/best_model/rf_model_pre_infra.joblib
+
+# Training runtime data
+rf_training_data/copernicus_cache/
+rf_training_data/checkpoints_pre_infra_backup/
+rf_training_data/in_progress_kg.txt
+rf_training_data/openeo_circuit.json

@@ -1287,10 +1287,132 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         },
     }
 
-    # --- Parcels summary ---
+    # --- Per-parcel detail ---
+    transform = data["transform"]
+    dtm = data["dtm"]
+    parcel_details = []
+    obj_map = {o.obj_id: o for o in objects} if objects else {}
+    for p in cadastre_data["parcels"]:
+        pd = {
+            "parcel_id": p["parcel_id"],
+            "area_sqm": round(p.get("area_sqm", 0), 1),
+        }
+        geom_3035 = p["geometry"]
+        # Centroid
+        try:
+            c_wgs = transform_to_wgs(geom_3035.centroid)
+            pd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
+        except Exception:
+            pass
+        # DTM elevation at centroid
+        try:
+            c3 = geom_3035.centroid
+            col = int((c3.x - transform.c) / transform.a)
+            row = int((transform.f - c3.y) / abs(transform.e))
+            if 0 <= row < h and 0 <= col < w:
+                pd["elevation_m"] = round(float(dtm[row, col]), 2)
+        except Exception:
+            pass
+        # Segment type breakdown within parcel
+        if labels is not None and objects:
+            try:
+                from rasterio.features import rasterize as rio_rasterize
+                p_mask = rio_rasterize(
+                    [(geom_3035, 1)], out_shape=(h, w), transform=transform,
+                    fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                p_labels = labels[p_mask]
+                p_ndsm = ndsm[p_mask]
+                tc = Counter()
+                th = defaultdict(list)
+                for lbl in np.unique(p_labels):
+                    obj = obj_map.get(int(lbl))
+                    if obj is None:
+                        continue
+                    n_px = int((p_labels == lbl).sum())
+                    tc[obj.obj_type] += n_px
+                    th[obj.obj_type].append(obj.height_max)
+                if tc:
+                    pd["area_summary"] = {
+                        t: {"area_sqm": px, "fraction": round(px / max(int(p_mask.sum()), 1), 4)}
+                        for t, px in tc.most_common()
+                    }
+                    pd["height_distribution"] = {
+                        t: {"min": round(min(hs), 2), "max": round(max(hs), 2),
+                            "mean": round(sum(hs)/len(hs), 2)}
+                        for t, hs in th.items() if hs
+                    }
+                # Vegetated fraction
+                veg_types = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
+                veg_px = sum(v for k, v in tc.items() if k in veg_types)
+                total_px = max(int(p_mask.sum()), 1)
+                pd["vegetated_fraction"] = round(veg_px / total_px, 4)
+                pd["is_vegetated"] = veg_px / total_px > 0.5
+                # Elevation stats from nDSM
+                valid_h = p_ndsm[np.isfinite(p_ndsm)]
+                if len(valid_h) > 0:
+                    pd["ndsm_max_m"] = round(float(np.max(valid_h)), 2)
+                    pd["ndsm_mean_m"] = round(float(np.mean(valid_h)), 2)
+            except Exception:
+                pass
+        parcel_details.append(pd)
+
     summary["parcels"] = {
         "count": len(cadastre_data["parcels"]),
         "total_area_sqm": round(sum(p.get("area_sqm", 0) for p in cadastre_data["parcels"]), 1),
+        "details": parcel_details,
+    }
+
+    # --- Per-building-footprint detail ---
+    building_details = []
+    for b in cadastre_data["building_footprints"]:
+        bd = {}
+        geom_3035 = b["geometry"]
+        props = b.get("properties", {})
+        bd["building_id"] = props.get("building_id", props.get("id", ""))
+        bd["footprint_area_sqm"] = round(float(geom_3035.area), 1)
+        # Centroid
+        try:
+            c_wgs = transform_to_wgs(geom_3035.centroid)
+            bd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
+        except Exception:
+            pass
+        # Height stats from nDSM
+        try:
+            from rasterio.features import rasterize as rio_rasterize
+            b_mask = rio_rasterize(
+                [(geom_3035, 1)], out_shape=(h, w), transform=transform,
+                fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+            oh = ndsm[b_mask]
+            oh = oh[np.isfinite(oh)]
+            dsm_vals = data["dsm"][b_mask]
+            dsm_vals = dsm_vals[np.isfinite(dsm_vals)]
+            if len(oh) > 0:
+                max_h = float(np.max(oh))
+                bd["max_height_m"] = round(max_h, 2)
+                bd["mean_height_m"] = round(float(np.mean(oh)), 2)
+                bd["dsm_std"] = round(float(np.std(dsm_vals)), 2) if len(dsm_vals) > 0 else 0.0
+                bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
+                bd["stories_est"] = max(1, round(max_h / 3.0))
+        except Exception:
+            pass
+        # Segment types within footprint
+        if labels is not None and objects:
+            try:
+                b_labels = labels[b_mask]
+                tc = Counter()
+                for lbl in np.unique(b_labels):
+                    obj = obj_map.get(int(lbl))
+                    if obj:
+                        tc[obj.obj_type] += int((b_labels == lbl).sum())
+                if tc:
+                    bd["segment_types"] = {t: px for t, px in tc.most_common()}
+            except Exception:
+                pass
+        building_details.append(bd)
+
+    summary["building_footprints"] = {
+        "count": len(cadastre_data["building_footprints"]),
+        "details": building_details,
     }
 
     # --- Methods ---
@@ -1573,6 +1695,237 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Output validation
+# ---------------------------------------------------------------------------
+
+def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
+    """Validate all KG output products. Returns list of issues (empty = all OK)."""
+    issues = []
+
+    # --- Full GPKG ---
+    full_path = files.get("full_gpkg", "")
+    if not full_path or not os.path.exists(full_path):
+        issues.append("FULL_GPKG: missing")
+    else:
+        try:
+            import rasterio
+            expected_layers = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
+            found_layers = set()
+            ds_list = rasterio.open(full_path).subdatasets if hasattr(rasterio.open(full_path), 'subdatasets') else []
+            # Try listing GPKG raster tables
+            try:
+                import sqlite3
+                conn = sqlite3.connect(full_path)
+                tables = [r[0] for r in conn.execute(
+                    "SELECT table_name FROM gpkg_contents WHERE data_type='tiles'").fetchall()]
+                conn.close()
+                found_layers = set(tables)
+            except Exception:
+                pass
+            for layer in expected_layers:
+                if layer not in found_layers:
+                    issues.append(f"FULL_GPKG: missing raster layer '{layer}'")
+            if "Ortho" not in found_layers:
+                issues.append("FULL_GPKG: missing Ortho layer (ortho read may have failed)")
+            fsize = os.path.getsize(full_path)
+            if fsize < 10_000:
+                issues.append(f"FULL_GPKG: suspiciously small ({fsize} bytes)")
+            log.info("  FULL_GPKG: %.1f MB, layers=%s", fsize/1e6, sorted(found_layers))
+        except Exception as e:
+            issues.append(f"FULL_GPKG: cannot open: {e}")
+
+    # --- Light GPKG ---
+    light_path = files.get("light_gpkg", "")
+    if not light_path or not os.path.exists(light_path):
+        issues.append("LIGHT_GPKG: missing")
+    else:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(light_path)
+            # Raster tables
+            raster_tables = [r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents WHERE data_type='tiles'").fetchall()]
+            # Vector tables
+            vector_tables = [r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
+            conn.close()
+
+            if "segment_type" not in raster_tables:
+                issues.append("LIGHT_GPKG: missing segment_type raster")
+
+            expected_vectors = ["segments", "parcels"]
+            for v in expected_vectors:
+                if v not in vector_tables:
+                    issues.append(f"LIGHT_GPKG: missing vector layer '{v}'")
+
+            # Count features in vector layers
+            try:
+                import fiona
+                for vt in vector_tables:
+                    with fiona.open(light_path, layer=vt) as src:
+                        n = len(src)
+                        log.info("  LIGHT_GPKG: layer '%s' → %d features", vt, n)
+                        if n == 0:
+                            issues.append(f"LIGHT_GPKG: layer '{vt}' is empty")
+            except Exception as e:
+                issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
+
+            fsize = os.path.getsize(light_path)
+            log.info("  LIGHT_GPKG: %.1f MB, rasters=%s, vectors=%s",
+                     fsize/1e6, raster_tables, vector_tables)
+        except Exception as e:
+            issues.append(f"LIGHT_GPKG: cannot open: {e}")
+
+    # --- JSON summary ---
+    json_path = files.get("json", "")
+    if not json_path or not os.path.exists(json_path):
+        issues.append("JSON: missing")
+    else:
+        try:
+            with open(json_path) as f:
+                js = json.load(f)
+
+            # Required top-level keys
+            required_keys = [
+                "version", "kg_code", "kg_name", "bbox", "total_area_sqm",
+                "observation_period", "area_summary", "height_distribution",
+                "landscape", "top_10_objects", "top_10_trees", "terrain",
+                "ndvi", "hansen", "new_buildings", "infrastructure",
+                "parcels", "building_footprints", "methods",
+            ]
+            for k in required_keys:
+                if k not in js:
+                    issues.append(f"JSON: missing top-level key '{k}'")
+
+            # Check area_summary not empty
+            area_sum = js.get("area_summary", {})
+            if not area_sum:
+                issues.append("JSON: area_summary is empty")
+
+            # Check total_area_sqm > 0
+            if js.get("total_area_sqm", 0) <= 0:
+                issues.append("JSON: total_area_sqm is zero or negative")
+
+            # Check parcels have details
+            parcels = js.get("parcels", {})
+            p_details = parcels.get("details", [])
+            if parcels.get("count", 0) > 0 and not p_details:
+                issues.append("JSON: parcels.details is empty despite count>0")
+            else:
+                # Spot-check first parcel
+                if p_details:
+                    p0 = p_details[0]
+                    if not p0.get("parcel_id"):
+                        issues.append("JSON: first parcel missing parcel_id")
+                    if not p0.get("centroid"):
+                        issues.append("JSON: first parcel missing centroid")
+                    if not p0.get("area_summary") and p0.get("area_sqm", 0) > 100:
+                        issues.append("JSON: first parcel missing area_summary")
+
+            # Check building_footprints have details
+            bfp = js.get("building_footprints", {})
+            bf_details = bfp.get("details", [])
+            if bfp.get("count", 0) > 0 and not bf_details:
+                issues.append("JSON: building_footprints.details empty despite count>0")
+            else:
+                if bf_details:
+                    b0 = bf_details[0]
+                    if not b0.get("centroid"):
+                        issues.append("JSON: first building missing centroid")
+                    if b0.get("max_height_m") is None:
+                        issues.append("JSON: first building missing max_height_m")
+
+            # Check for NaN/None in critical numeric fields
+            for t, vals in js.get("height_distribution", {}).items():
+                for fk in ["min", "max", "mean"]:
+                    v = vals.get(fk)
+                    if v is None or (isinstance(v, float) and (v != v)):  # NaN check
+                        issues.append(f"JSON: height_distribution[{t}].{fk} is NaN/None")
+
+            # Check terrain populated
+            terrain = js.get("terrain", {})
+            if not terrain or terrain.get("steepness_mean_deg") is None:
+                issues.append("JSON: terrain stats missing/empty")
+
+            # Check methods present
+            methods = js.get("methods", {})
+            if len(methods) < 5:
+                issues.append(f"JSON: methods section sparse ({len(methods)} entries)")
+
+            # Summary stats
+            n_parcel_details = len(p_details)
+            n_bfp_details = len(bf_details)
+            n_types = len(area_sum)
+            log.info("  JSON: %.1f KB, %d types, %d parcel details, %d building details",
+                     os.path.getsize(json_path)/1024, n_types,
+                     n_parcel_details, n_bfp_details)
+
+        except json.JSONDecodeError as e:
+            issues.append(f"JSON: parse error: {e}")
+        except Exception as e:
+            issues.append(f"JSON: validation error: {e}")
+
+    return issues
+
+
+def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
+    """Read the output JSON and log key stats. Keeps log concise."""
+    try:
+        with open(json_path) as f:
+            js = json.load(f)
+    except Exception as e:
+        log.warning("KG %s: cannot read JSON for stats: %s", kg_code, e)
+        return
+
+    parcels = js.get("parcels", {})
+    bfp = js.get("building_footprints", {})
+    landscape = js.get("landscape", {})
+    terrain = js.get("terrain", {})
+    area_sum = js.get("area_summary", {})
+    tree_stats = js.get("tree_stats", {})
+    top_obj = js.get("top_10_objects", [{}])
+    top_tree = js.get("top_10_trees", [{}])
+    hansen = js.get("hansen", {})
+    ndvi = js.get("ndvi", {})
+    new_b = js.get("new_buildings", {})
+    infra = js.get("infrastructure", {})
+
+    n_seg = landscape.get("n_segments", 0)
+    n_par = parcels.get("count", 0)
+    n_bld = bfp.get("count", 0)
+    n_new = new_b.get("count", 0)
+    n_inf = infra.get("total", 0)
+
+    log.info("KG %s: SUCCESS in %.0fs", kg_code, elapsed)
+    log.info("  %d segments | %d parcels | %d buildings | %d new buildings | %d infrastructure",
+             n_seg, n_par, n_bld, n_new, n_inf)
+    log.info("  area=%.0f m\u00b2 | dominant=%s | vegetated=%.0f%% | shannon=%.2f",
+             js.get("total_area_sqm", 0),
+             landscape.get("dominant_type", "?"),
+             (landscape.get("vegetated_fraction", 0) or 0) * 100,
+             landscape.get("shannon_diversity", 0) or 0)
+    top5 = list(area_sum.items())[:5]
+    if top5:
+        log.info("  top types: %s",
+                 ", ".join(f"{t}={v.get('area_sqm',0)}m\u00b2" for t, v in top5))
+    log.info("  tallest=%.1fm | tallest_tree=%.1fm | trees=%d | stem_vol=%.0f m\u00b3",
+             top_obj[0].get("height_m", 0) if top_obj else 0,
+             top_tree[0].get("height_m", 0) if top_tree else 0,
+             tree_stats.get("count", 0),
+             tree_stats.get("est_stem_volume_m3", 0) or 0)
+    log.info("  elev=[%.0f,%.0f]m range=%.0fm | slope=%.1f\u00b0 | aspect=%s",
+             terrain.get("elevation_min_m") or 0,
+             terrain.get("elevation_max_m") or 0,
+             terrain.get("elevation_range_m") or 0,
+             terrain.get("steepness_mean_deg") or 0,
+             terrain.get("aspect_dominant", "?"))
+    log.info("  ndvi: bev=%.3f cop=%.3f | hansen_loss=%d px",
+             ndvi.get("bev_nir_mean", 0) or 0,
+             ndvi.get("copernicus_mean", 0) or 0,
+             hansen.get("total_loss_pixels", 0) or 0)
+
+
+# ---------------------------------------------------------------------------
 # Zenodo upload
 # ---------------------------------------------------------------------------
 
@@ -1788,7 +2141,25 @@ def main():
             elapsed_kg = time.time() - t_kg
 
             if result.get("success"):
-                # Upload to Zenodo
+                # --- Validate outputs ---
+                progress.set_step("validate")
+                progress.save()
+                issues = validate_kg_outputs(kg_code, result["files"])
+                if issues:
+                    for iss in issues:
+                        log.warning("KG %s VALIDATION: %s", kg_code, iss)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: {len(issues)} validation issue(s)",
+                                     kg_code)
+                else:
+                    log.info("KG %s: all outputs validated OK", kg_code)
+
+                # --- Log stats from JSON ---
+                json_path = result["files"].get("json", "")
+                if json_path and os.path.exists(json_path):
+                    log_kg_stats_from_json(kg_code, json_path, elapsed_kg)
+
+                # --- Upload to Zenodo ---
                 progress.set_step("upload")
                 progress.save()
 
@@ -1806,13 +2177,12 @@ def main():
                 )
                 progress.add_log(
                     "success",
-                    f"KG {kg_code} completed in {elapsed_kg:.0f}s "
-                    f"({result.get('n_segments', 0)} segments, "
-                    f"{result.get('n_new_buildings', 0)} new buildings)",
+                    f"KG {kg_code} done in {elapsed_kg:.0f}s "
+                    f"({result.get('n_segments', 0)} segs, "
+                    f"{result.get('n_parcels', 0)} par, "
+                    f"{result.get('n_buildings', 0)} bldg)",
                     kg_code,
                 )
-                log.info("KG %s: SUCCESS in %.0fs (%d segments)",
-                         kg_code, elapsed_kg, result.get("n_segments", 0))
             else:
                 progress.add_failure(
                     kg_code, kg_name,

@@ -19,9 +19,32 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from shapely.geometry import box, mapping
 import shapely
 
+import hashlib
+from pathlib import Path
+
 import tile_index as ti
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Disk cache for windowed reads — avoids repeated HTTP range requests to BEV
+# for the same (layer, tile, window).  Especially useful for the processor
+# where retries / restarts would otherwise re-fetch everything.
+# ---------------------------------------------------------------------------
+
+BEV_CACHE_DIR = Path("data/austria_processor/bev_tile_cache")
+BEV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_key(layer: str, tile: tuple, min_e: float, min_n: float,
+               max_e: float, max_n: float, dataset: str) -> str:
+    """Deterministic cache key for a windowed tile read."""
+    raw = f"{layer}|N{tile[0]}E{tile[1]}|{dataset}|{min_e:.0f},{min_n:.0f},{max_e:.0f},{max_n:.0f}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _cache_path(key: str) -> Path:
+    return BEV_CACHE_DIR / f"{key}.npz"
 
 # GDAL env settings for efficient remote reads
 GDAL_ENV = {
@@ -78,6 +101,21 @@ def _read_single_tile(
     min_e: float, min_n: float, max_e: float, max_n: float,
     dataset: str,
 ) -> tuple[np.ndarray, rasterio.transform.Affine, rasterio.crs.CRS]:
+    # --- Check disk cache first ---
+    ck = _cache_key(layer, tile, min_e, min_n, max_e, max_n, dataset)
+    cp = _cache_path(ck)
+    if cp.exists():
+        try:
+            cached = np.load(str(cp), allow_pickle=False)
+            tf_arr = cached["transform"]
+            tf = rasterio.transform.Affine(*tf_arr[:6])
+            log.info("%s N%dE%d window [%.0f,%.0f]-[%.0f,%.0f] → cache hit",
+                     layer, tile[0], tile[1], min_e, min_n, max_e, max_n)
+            return cached["data"], tf, rasterio.crs.CRS.from_epsg(3035)
+        except Exception as e:
+            log.warning("Corrupt BEV cache %s: %s", cp.name, e)
+            cp.unlink(missing_ok=True)
+
     from bev_retry import open_with_retry
     url = ti.get_tile_url(layer, tile[0], tile[1], dataset)
     label = f"{layer} N{tile[0]}E{tile[1]}"
@@ -92,6 +130,15 @@ def _read_single_tile(
         nodata = ds.nodata
         if nodata is not None:
             data[data == nodata] = np.nan
+
+        # --- Save to disk cache ---
+        try:
+            tf_arr = np.array([transform.a, transform.b, transform.c,
+                               transform.d, transform.e, transform.f])
+            np.savez_compressed(str(cp), data=data, transform=tf_arr)
+        except Exception as e:
+            log.warning("Failed to cache %s: %s", label, e)
+
         return data, transform, ds.crs
 
 

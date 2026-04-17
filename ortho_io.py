@@ -28,7 +28,16 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_origin as transform_from_origin
 from rasterio.windows import Window, from_bounds
 
+import hashlib
+from pathlib import Path
+
 import tile_index as ti
+
+# ---------------------------------------------------------------------------
+# Disk cache for ortho windowed reads
+# ---------------------------------------------------------------------------
+ORTHO_CACHE_DIR = Path("data/austria_processor/ortho_tile_cache")
+ORTHO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger(__name__)
 
@@ -804,6 +813,22 @@ def _try_read_rgbi_for_bbox(
     Both arrays are reprojected and aligned to the target EPSG:3035 grid
     (h, w) at *resolution*.
     """
+    # --- Check disk cache first ---
+    _ck_raw = f"rgbi|{min_e:.0f},{min_n:.0f},{max_e:.0f},{max_n:.0f}|{resolution}|{year}"
+    _ck = hashlib.md5(_ck_raw.encode()).hexdigest()
+    _cp = ORTHO_CACHE_DIR / f"{_ck}.npz"
+    if _cp.exists():
+        try:
+            cached = np.load(str(_cp), allow_pickle=False)
+            rgb = cached["rgb"]
+            nir = cached["nir"] if "nir" in cached and cached["nir"].shape[0] > 0 else None
+            log.info("Ortho RGBI cache hit for [%.0f,%.0f]-[%.0f,%.0f] @ %.1fm",
+                     min_e, min_n, max_e, max_n, resolution)
+            return rgb, nir
+        except Exception as e:
+            log.warning("Corrupt ortho cache %s: %s", _cp.name, e)
+            _cp.unlink(missing_ok=True)
+
     import pyproj
     from rasterio.warp import reproject as rio_reproject, Resampling as RioResampling
     from rasterio.crs import CRS
@@ -900,6 +925,13 @@ def _try_read_rgbi_for_bbox(
                 "yes" if nir is not None else "no",
                 coverage * 100,
             )
+            # --- Save to disk cache ---
+            try:
+                save_dict = {"rgb": rgb}
+                save_dict["nir"] = nir if nir is not None else np.array([], dtype=np.uint8)
+                np.savez_compressed(str(_cp), **save_dict)
+            except Exception as e:
+                log.warning("Failed to cache ortho: %s", e)
             return rgb, nir
 
         except Exception as e:

@@ -4040,12 +4040,15 @@ def main():
             _warn_offset = 0  # track read position in warnings file
             # Track per-step worst issue level: {step: "warning"|"error"}
             _step_issues = {}
+            _last_detail = ""  # track detail changes for save
             while not _stop.is_set():
                 try:
                     if step_file.exists():
                         sd = json.loads(step_file.read_text())
                         s = sd.get("step", "")
                         detail = sd.get("detail", "")
+                        step_changed = bool(s and s != last_step)
+                        detail_changed = (detail != _last_detail)
                         # Always merge step_times + tile progress from subprocess
                         sub_times = sd.get("step_times", {})
                         with progress._lock:
@@ -4075,7 +4078,7 @@ def main():
                                 ts_list = sd.get("tile_statuses")
                                 if ts_list is not None:
                                     ckg["tile_statuses"] = ts_list
-                        if s and s != last_step:
+                        if step_changed:
                             prev_step = last_step
                             last_step = s
                             progress.set_step(s)
@@ -4094,6 +4097,9 @@ def main():
                                     f"KG {_code}: {step_label}{time_str} completed with {issue_lvl}s",
                                     _code,
                                 )
+                        # Save whenever step or detail changed
+                        if step_changed or detail_changed:
+                            _last_detail = detail
                             progress.save()
                 except Exception:
                     pass

@@ -4,10 +4,10 @@
 
 We're training a Random Forest classifier for Austrian landscape segmentation from remote sensing data (LiDAR DTM/DSM, orthophotos, Sentinel-2 NDVI, ESA WorldCover, SAR, Hansen GFC). The model currently trains on cadastre + OSM ground truth across random Austrian Katastralgemeinden (KGs).
 
-**Current state** (180 KGs, 460k raw samples, 20 classes):
-- Live model OOB: **63.2%** — and the learning curve has flatlined from 130→180 KGs
+**Current state** (251 KGs, 647k raw samples, 20 classes):
+- Live model OOB: **61.8%** at 250 KGs — curve still slowly declining (was 63.5% at 180 KGs)
 - Downsampling (10× median cap on tree/grass) slowed the decline but didn't stop it
-- The curve is now flat — more KGs won't help
+- Eval curve: 62.0-62.2% at 225-240 KGs — no sign of recovery
 
 **Root problem**: 3 classes are unlearnable (19/81/174 samples), 2 rare classes should merge, and the downsample cap is too generous.
 
@@ -47,26 +47,27 @@ In `learned_classifier.py`, function `_downsample()` (line ~145):
 - Change `cap_multiplier` default from `10` to `5`
 - This will cap tree/grass more aggressively, giving minority classes more relative weight
 
-Current class distribution (460k total):
+Current class distribution (647k total, 251 checkpoints):
 ```
-tree:        208,578 (45.3%) — currently capped to ~59k, will become ~30k
-grass:       100,968 (21.9%) — currently capped to ~59k, will become ~30k  
-roof:         33,192 (7.2%)
-crop:         23,316 (5.1%)
-road:         23,113 (5.0%)
-vineyard:     17,973 (3.9%)
-shrub:        13,394 (2.9%)
-orchard:       9,161 (2.0%)
-water:         7,695 (1.7%)
-garden:        5,934 (1.3%) ← median
-rock:          5,080 (1.1%)
-tree_loss:     4,053 (0.9%)
-path:          4,037 (0.9%)
-bare_soil:     1,542 (0.3%)
-earthwork:       874 (0.2%) ← merged excavation+fill
-parking:         880 (0.2%)
+tree:        301,280 (46.6%) — currently capped to ~93k, will become ~46k with 5x cap
+grass:       134,189 (20.7%) — currently capped to ~93k, will become ~46k with 5x cap
+roof:         44,227 (6.8%)
+road:         41,799 (6.5%)
+crop:         27,010 (4.2%)
+vineyard:     22,758 (3.5%)
+shrub:        17,910 (2.8%)
+orchard:      12,565 (1.9%)
+garden:       10,578 (1.6%)
+water:         9,289 (1.4%) ← median
+rock:          6,535 (1.0%)
+tree_loss:     6,064 (0.9%)
+path:          4,737 (0.7%)
+parking:       3,918 (0.6%)
+bare_soil:     2,919 (0.5%)
+earthwork:     1,090 (0.2%) ← merged excavation(559)+fill(531)
 ```
 
+With 5x median cap: 5 × 9,289 = **46,445**. Only tree and grass exceed this.
 After dropping 3 classes and merging, we go from 20 → 16 classes.
 
 ### 4. Stop the training job
@@ -74,7 +75,7 @@ After dropping 3 classes and merging, we go from 20 → 16 classes.
 The learning curve is flat from 130→180 KGs. More data won't help.
 
 - Stop the `rf_train` systemd service: `sudo systemctl stop rf_train && sudo systemctl disable rf_train`
-- The existing 188 checkpoints in `rf_training_data/checkpoints/` are sufficient
+- The existing 251 checkpoints in `rf_training_data/checkpoints/` are sufficient
 - After applying changes 1-3, trigger a single retrain using the existing checkpoints (call the `/api/v1/classifier/train` endpoint or invoke `learned_classifier.LearnedClassifier().train()` directly from a script)
 - Also stop the curve eval cron if it exists (check crontab)
 
@@ -151,14 +152,14 @@ This gives OSM-based ground truth for these types during training label assignme
 
 After all changes:
 1. Stop rf_train service
-2. Retrain model once from existing 188 checkpoints: write a small script that loads all checkpoints, applies the label remapping (drop 3 + merge), calls `LearnedClassifier().train(X, y)` 
+2. Retrain model once from existing 251 checkpoints: write a small script that loads all checkpoints, applies the label remapping (drop 3 + merge), calls `LearnedClassifier().train(X, y)` 
 3. Check new model: should have 16 classes, OOB should be ~66-68%
 4. Test an analysis on a known area with solar panels / wind turbines to verify rule-based detection works
 5. Restart the srv service
 
 ## Important Notes
 
-- **Do NOT delete the old model** — back up `/tmp/learned_classifier/rf_model.joblib` to `/tmp/learned_classifier/rf_model_20cls.joblib.bak` before retraining
+- **Do NOT delete the old model** — back up `/tmp/learned_classifier/rf_model.joblib` to `/tmp/learned_classifier/rf_model_20cls_251kg.joblib.bak` before retraining
 - The eval curve cron job should be stopped too (check `crontab -l` and any systemd timers)
 - The training status API (`/api/v1/training/status`) and UI (`training.html`) will show the job as stopped — that's expected
 - The live model meta (`rf_meta.json`) will update after retrain with the new class list

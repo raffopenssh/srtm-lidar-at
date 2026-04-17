@@ -4078,8 +4078,11 @@ def main():
                                 # Pass detail through for display
                                 if detail:
                                     ckg["step_detail"] = detail
+                                    if detail_changed:
+                                        ckg["step_detail_ts"] = sd.get("ts") or datetime.now(timezone.utc).isoformat()
                                 else:
                                     ckg.pop("step_detail", None)
+                                    ckg.pop("step_detail_ts", None)
                                 # Expose step issues to frontend
                                 ckg["step_issues"] = dict(_step_issues)
                                 # Relay per-tile statuses for map dots

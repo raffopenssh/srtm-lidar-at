@@ -700,8 +700,16 @@ function updateKgCard(d) {
 
   const stepDetail = kg.step_detail ? ' — ' + kg.step_detail : '';
   const isActive = d.state === 'running' && pipelineStep !== 'done';
+  let elapsedStr = '';
+  if (isActive) {
+    const ts = kg.step_detail_ts || kg.step_started_at;
+    if (ts) {
+      const secs = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
+      elapsedStr = ' (' + secs + 's)';
+    }
+  }
   document.getElementById('kgSub').innerHTML =
-    esc((kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail)
+    esc((kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail + elapsedStr)
     + (isActive ? '<span class="anim-dots"></span>' : '');
 
   // Steps pipeline with elapsed time per step

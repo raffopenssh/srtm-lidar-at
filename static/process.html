@@ -86,12 +86,31 @@
     filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
   }
   .tile-dot-current {
-    animation: tilePulse 2s ease-in-out infinite;
+    transform-box: fill-box;
+    transform-origin: center;
     filter: drop-shadow(0 0 4px rgba(255,255,255,0.9)) drop-shadow(0 0 8px #58a6ff);
   }
-  @keyframes tilePulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(1.5); }
+  .pulse-ring {
+    position: absolute;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: rgba(88,166,255,0.35);
+    transform: translate(-50%,-50%);
+    animation: pulseRing 2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  .pulse-core {
+    position: absolute;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #58a6ff;
+    transform: translate(-50%,-50%);
+    box-shadow: 0 0 6px 2px rgba(88,166,255,0.7);
+    pointer-events: none;
+  }
+  @keyframes pulseRing {
+    0%, 100% { transform: translate(-50%,-50%) scale(1); opacity: 0.7; }
+    50% { transform: translate(-50%,-50%) scale(2.2); opacity: 0; }
   }
 
   /* Log */
@@ -343,6 +362,10 @@ let cd = POLL;
 let map, mapMarkers;
 let tileDotsLayer;
 let copLayer, hanLayer;
+let pulseMarker = null;
+let _lastPulseKey = null;
+let _tilesFitted = false;
+let _fittedKgCode = null;
 let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
@@ -402,26 +425,31 @@ function updateTileDots(d) {
   if (!map || !tileDotsLayer) return;
   const kg = d.current_kg;
   const tiles = kg && kg.tile_statuses;
-  if (!tiles || !tiles.length) { tileDotsLayer.clearLayers(); return; }
+  if (!tiles || !tiles.length) {
+    tileDotsLayer.clearLayers();
+    if (pulseMarker) { map.removeLayer(pulseMarker); pulseMarker = null; _lastPulseKey = null; }
+    _tilesFitted = false;
+    return;
+  }
   tileDotsLayer.clearLayers();
 
   // Detect if all tiles of the KG are done (none "current")
   const allDone = tiles.every(t => t.status === 'done' || t.status === 'skip');
+  let currentTile = null;
 
   tiles.forEach(t => {
     let col, opacity = 0.85, cls = '';
     if (t.status === 'current') {
       col = '#58a6ff'; cls = 'tile-dot-current';
+      currentTile = t;
     } else if (t.status === 'skip') {
       col = '#30363d'; opacity = 0.4;
     } else if (t.status === 'error') {
       col = '#f85149';
     } else if (t.status === 'done') {
       if (allDone) {
-        // KG complete — all dots turn bright green
         col = '#3fb950'; opacity = 0.9;
       } else {
-        // Grade by layer availability
         const iss = t.issues || {};
         const layers = ['lidar','ortho','copernicus_ndvi','worldcover','sar','hansen'];
         const ok = layers.filter(l => iss[l] === 'ok').length;
@@ -431,13 +459,12 @@ function updateTileDots(d) {
         else col = '#f0883e';
       }
     } else {
-      col = '#484f58'; opacity = 0.5; // queued / unknown
+      col = '#484f58'; opacity = 0.5;
     }
     const opts = { radius: 1.5, fillColor: col, fillOpacity: opacity,
                    stroke: false };
     opts.className = cls ? 'tile-dot ' + cls : 'tile-dot';
     const m = L.circleMarker([t.lat, t.lng], opts);
-    // Tooltip
     let tip = 'Tile ' + t.idx;
     if (t.subtile) tip += ' (sub ' + t.subtile.sub + '/' + t.subtile.n_sub + ' @ ' + t.subtile.km + 'km)';
     tip += ' — ' + t.status;
@@ -450,6 +477,35 @@ function updateTileDots(d) {
     tileDotsLayer.addLayer(m);
   });
 
+  // Auto-fit map to tile bounds on first load or KG change
+  const kgCode = kg && kg.code;
+  if (kgCode !== _fittedKgCode) { _tilesFitted = false; _fittedKgCode = kgCode; }
+  if (!_tilesFitted) {
+    const lats = tiles.map(t => t.lat);
+    const lngs = tiles.map(t => t.lng);
+    const bounds = L.latLngBounds(
+      [Math.min(...lats) - 0.005, Math.min(...lngs) - 0.008],
+      [Math.max(...lats) + 0.005, Math.max(...lngs) + 0.008]
+    );
+    map.fitBounds(bounds, {maxZoom: 14});
+    _tilesFitted = true;
+  }
+
+  // Pulse marker for current tile — only recreate when tile changes
+  const pulseKey = currentTile ? (currentTile.lat + ',' + currentTile.lng) : null;
+  if (pulseKey !== _lastPulseKey) {
+    if (pulseMarker) { map.removeLayer(pulseMarker); pulseMarker = null; }
+    if (currentTile) {
+      const icon = L.divIcon({
+        className: '',
+        html: '<div class="pulse-ring"></div><div class="pulse-core"></div>',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10]
+      });
+      pulseMarker = L.marker([currentTile.lat, currentTile.lng], {icon: icon, interactive: false, pane: 'markerPane'}).addTo(map);
+    }
+    _lastPulseKey = pulseKey;
+  }
 }
 
 // ── Collapsible ─────────────────────────────────────────────────

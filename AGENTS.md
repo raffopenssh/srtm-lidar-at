@@ -5,6 +5,9 @@
 - **Live**: https://srtm-lidar-at.exe.xyz:8000/
 - **Stack**: Python 3.12 / Flask / gunicorn / Leaflet
 - **Restart**: `sudo systemctl restart srv` (app) or `sudo systemctl restart rf_train` (training)
+- **Austria Processor**: `sudo systemctl kill -s SIGKILL austria_processor && sleep 2 && sudo systemctl start austria_processor`
+- **Processor log**: `tail -f data/austria_processor/logs/processor.log`
+- **Processor dashboard**: https://srtm-lidar-at.exe.xyz:8000/process.html
 - **Logs**: `journalctl -u srv -f` or `tail -f /tmp/rf_train_4000kg.log`
 - **API docs**: `/api/v1/docs/llm.txt`
 - **Cadastre API**: https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt
@@ -227,6 +230,56 @@ sudo systemctl restart rf_train        # restart RF training
 tail -f /tmp/rf_train_4000kg.log       # training logs
 systemctl status rf_train srv          # check both services
 ```
+
+### Austria Processor Operations
+
+The processor runs as `austria_processor.service`. It processes KGs sequentially,
+each tiled into 1.5km windows. It resumes from where it left off on restart
+(no KG data is lost — incomplete KGs are retried).
+
+```bash
+# --- Logs (primary source of truth) ---
+tail -f data/austria_processor/logs/processor.log     # live log
+tail -100 data/austria_processor/logs/processor.log   # recent history
+grep -i "warning\|error\|failed" data/austria_processor/logs/processor.log | tail -20  # problems
+
+# --- Status ---
+curl -s http://localhost:8000/api/v1/processing/status | python3 -m json.tool
+# Key fields: state, completed, failed, current_kg.{code,step}, system.{ram_pct,disk_free_gb,proc_pid}
+
+# --- Restart (SIGKILL needed — graceful stop waits for current tile to finish) ---
+sudo systemctl kill -s SIGKILL austria_processor
+sleep 2
+sudo systemctl start austria_processor
+# Note: RestartSec=60 in the unit file, so systemd waits 60s between stop and start.
+# The `start` command may block ~60s while systemd enforces this.
+
+# --- Dashboard ---
+# https://srtm-lidar-at.exe.xyz:8000/process.html
+# Shows: service card (PID/RAM), progress, rate, system resources, current KG
+# pipeline steps, map of processed KGs, live log, Zenodo manifest.
+```
+
+**Common issues to check in logs:**
+- `WARNING copernicus: Synchronous download timed out` → normal, falls back to batch job
+- `WARNING tile_cache: Copernicus SAR tile fetch failed` → SAR download failed, skipped (non-fatal)
+- `WARNING tile_cache: Hansen resample failed` → Hansen tile missing for bbox (western Vorarlberg)
+- `ERROR copernicus: credits exhausted` → all Copernicus credentials used up, processor pauses
+- `RuntimeWarning: Mean of empty slice` → should be fixed; if seen, check terrain_analysis.py
+
+**Key files:**
+- `data/austria_processor/logs/processor.log` — full log (stdout+stderr)
+- `data/austria_processor/progress.json` — live state (read by dashboard API)
+- `data/austria_processor/in_progress_kg.txt` — current KG code (for crash recovery)
+- `data/austria_processor/zenodo_manifest.json` — upload tracking
+- `data/austria_processor/copernicus_tiles/` — grid-snapped Copernicus cache (.npz)
+- `data/austria_processor/hansen_tiles/` — grid-snapped Hansen cache (.npz)
+- `data/austria_processor/bev_tile_cache/` — BEV DTM/DSM windowed read cache
+- `rf_training_data/copernicus_cache/` — per-bbox Copernicus cache (.tif, from RF training)
+
+**Cache corruption:** Downloads use atomic writes (temp file + rename). If you see
+0-byte `.tif` or `.npz` files in cache dirs, delete them — they're leftovers from
+interrupted downloads before the atomic write fix.
 
 Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask, gunicorn, openeo, requests
 

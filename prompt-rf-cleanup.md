@@ -81,71 +81,114 @@ The learning curve is flat from 130→180 KGs. More data won't help.
 
 ### 5. Improved rule-based detection for dropped classes
 
-The 3 dropped classes need better rule-based detection in `classify_object()` (in `object_segmentation.py`). Currently:
+The 3 dropped classes need better rule-based detection in `classify_object()` (`object_segmentation.py`). Currently:
 - `solar_panel`: Detected at line ~1179 with a crude heuristic (building-like + smooth + bright). Works poorly.
 - `wind_turbine`: **No rule-based detection at all** — only the RF predicted it.
 - `substation`: **No rule-based detection at all** — only the RF predicted it.
+- `mast`: Detected at line ~1174 with `area < 10 and h_mean > 15 and compact < 0.5`. Too simple — confuses with tree crowns.
 
-**New approach: Use the austria-power.exe.xyz API for spatial lookup.**
+**New approach: Spatial lookup from austria-power API + better physical heuristics.**
 
-The API at `https://austria-power.exe.xyz:8000/api/infrastructure` provides:
-- 3,513 solar plants (points with `area_sqm`)
-- ~3,000 wind turbines (points with `height_agl_m`, `rotor_diameter_m`, `hub_height_m`)
-- 513 substations (points with `voltage_kv`)
+We have rich infrastructure data at `https://austria-power.exe.xyz:8000/api/infrastructure`. Query with `?bbox=min_lon,min_lat,max_lon,max_lat&categories=...` for per-tile enrichment. Data available:
 
-**Implementation plan:**
+| Category | Count | Key properties |
+|----------|-------|---------|
+| `solar_energy` | 3,513 | `area_sqm` (74–132k sqm; 803 rooftop <1k, 1148 ground 1k-10k, 1562 utility >10k) |
+| `wind_energy` | 3,001 | `height_agl_m` (65–285m, median 186m), `hub_height_m` (31–161m, median 105m), `rotor_diameter_m` (20–163m, median 101m), `capacity_mw`, `year` |
+| `substation` | 513 | `voltage_kv` (220–380kV), `capacity_mw` (0–88MW, median 6.7), 429 transformer_stations + 44 OSM + 40 380kV nodes |
+| `telecom` | 1,713 | `height_agl_m` (22–164m, median 39m), all type "Antenna" |
+| `structure` | 193 | Poles(70), Masts(30), Towers(16), Stacks(30), Buildings(68) — `height_agl_m` (1–251m, median 86m) |
 
-Create a new module `infrastructure_lookup.py` that:
+#### Implementation: `infrastructure_lookup.py` (new module)
 
-1. **On startup / first call**: Fetches all infrastructure from the API, builds a spatial index (rtree or scipy.spatial.cKDTree on WGS84 coords converted to EPSG:3035)
-2. **Cache**: Store the full dataset in `/tmp/infrastructure_cache/all.json` with a 24h TTL
-3. **Query function**: `find_nearby_infrastructure(bbox_3035, buffer_m=100) → list[dict]` returns infrastructure features whose coordinates fall within the buffered bbox
-4. **Per-category queries**:
-   - `find_solar(bbox_3035, buffer_m=50) → list[Point]`
-   - `find_wind_turbines(bbox_3035, buffer_m=100) → list[Point]`  
-   - `find_substations(bbox_3035, buffer_m=100) → list[Point]`
+1. **On first call per analysis**: Fetch infrastructure for the analysis bbox (+500m buffer) from the API, convert coords to EPSG:3035, build a scipy `cKDTree` spatial index.
+2. **Cache**: `/tmp/infrastructure_cache/` — cache the full nationwide dataset on first fetch (24h TTL), then query from it locally.
+3. **API**: `find_nearby(centroid_3035, radius_m, categories) → list[dict]` — used per-segment in `classify_object()`.
 
-Then integrate into the segmentation pipeline in `object_segmentation.py`:
+#### Physical signatures & rules
 
-**For `solar_panel`**: After the RF classification (or in rule-based path), if a segment:
-- Overlaps with a known solar plant location (within 50m)
-- Has building-like characteristics (low NDVI, flat, smooth DSM)
-- → Classify as `solar_panel` with high confidence
+**Wind turbine** — the most distinctive feature in LiDAR:
+- In DSM: a single extremely tall point (65–285m AGL, median 186m) with tiny footprint
+- The turbine tower is ~4–6m diameter → single 1m pixel column in DSM
+- As a segment: h_mean 50–200m, h_max 80–285m, area 5–50m², very low compactness
+- **Every turbine has surrounding infrastructure**: access road (gravel, ~4m wide, shows as `road` or `path`), assembly/crane pad (flat bare_soil, 30×50m), and cable trench to substation
+- Rotor blades may appear as ghost artefacts in DSM (moving during capture)
+- Rules:
+  - IF near known wind turbine location (±150m) AND h_mean > 40m AND area < 100m² → `wind_turbine` (conf 0.95)
+  - IF no API match but h_mean > 60m AND area < 50m² AND compact < 0.3 AND NDVI < 0.1 → `wind_turbine` (conf 0.7)
+  - Current `mast` rule (h_mean > 15, area < 10) catches these at wrong threshold; raise to h_mean > 50 for wind_turbine, keep mast at 15–50m range
 
-**For `wind_turbine`**: If a segment:
-- Is within 100m of a known wind turbine location
-- Has very tall height (h_mean > 50m or h_max > 80m)
-- Has small footprint (area < 50m²)
-- → Classify as `wind_turbine`
-- Alternatively, even without API match: if h_mean > 60m AND area < 30m² AND compact < 0.3 → likely wind turbine (the mast rule at line ~1175 catches some of these but the threshold is too low at 15m)
+**Solar panel** — two very different signatures:
 
-**For `substation`**: If a segment:
-- Is within 100m of a known substation location
-- Has building-like characteristics OR is a fenced compound (low vegetation, structured)
-- → Classify as `substation`
+*Rooftop solar* (<1000 sqm, 803 known):
+- Sits on existing building roof, 2–8m above ground
+- In LiDAR: nearly identical to roof (h_mean 3–10m), very smooth DSM (roughness < 0.3), flat (h_std < 0.5)
+- In orthophoto: dark blue/black, very low NDVI (<0.05), high brightness (reflective), uniform texture
+- Distinguished from plain roof by: lower NDVI, smoother surface, more uniform colour
+- Current rule (bld_score + smooth + bright) is on the right track but too crude
+- Rules:
+  - IF building-like (bld_score ≥ threshold) AND dsm_rough < 0.3 AND h_std < 0.5 AND NDVI < 0.05 AND near known solar location (±50m) → `solar_panel` (conf 0.85)
+  - Without API match: same physical criteria but require brightness > 130 AND blue_mean > red_mean (solar panels are blue-ish) → `solar_panel` (conf 0.5)
 
-The infrastructure lookup should be called once per analysis bbox (not per segment) and the results cached for the duration of the analysis. Pass the nearby infrastructure list into `classify_object()` or apply as a post-classification overlay.
+*Ground-mounted solar farm* (1k–132k sqm, 2710 known):
+- Ground level or on 1–3m stilts, vast area, extremely flat and uniform
+- In LiDAR: h_mean 0.5–3m, near-zero h_std, near-zero slope, very low DSM roughness
+- In orthophoto: dark/reflective rows, extremely low NDVI (<0.05), regular grid pattern
+- GLCM texture: very low contrast, very high homogeneity (uniform panels)
+- Distinguished from parking/road by: lower NDVI, more uniform, near-zero height
+- Rules:
+  - IF near known solar location (±100m) AND area > 500m² AND NDVI < 0.1 AND dsm_rough < 0.5 AND h_mean < 5m → `solar_panel` (conf 0.90)
+  - Without API match: area > 1000m² AND NDVI < 0.05 AND dsm_rough < 0.3 AND h_std < 0.3 AND brightness > 100 → `solar_panel` (conf 0.4)
 
-**Also enhance OSM queries** in `osm_features.py`: Add a `"power"` query to `_query_all()`:
+**Substation / transformer station** — fenced compound:
+- 429 transformer stations (distribution level, 6.7 MW median) + 44 OSM + 40 major 380kV nodes
+- Physical: rectangular fenced compound (50×50m to 200×200m), contains transformers (metal boxes 3–8m tall), busbars, gravel ground
+- In LiDAR: mix of heights (0–10m), moderate DSM roughness (equipment), relatively flat DTM
+- In orthophoto: grey/metallic, very low NDVI, visible geometric structure
+- Distinguished from building by: larger footprint, lower compactness (not a solid rectangle), gravel ground between equipment
+- Rules:
+  - IF near known substation (±150m) AND area > 200m² AND NDVI < 0.15 AND h_mean 1–15m → `substation` (conf 0.85)
+  - Without API match: very hard to detect — leave as `roof` (which groups into `building` anyway)
+
+**Mast / antenna** — tall narrow structures:
+- 1,713 telecom antennas (22–164m, median 39m) + 30 named masts + 70 poles + 16 towers
+- Physical: steel lattice or concrete tower, 2–6m diameter, very tall
+- In LiDAR: single tall spike, tiny footprint (<10m²), very low compactness
+- Current rule works but threshold (h_mean > 15) is too low — many trees are 15–25m
+- Rules:
+  - IF near known telecom/structure location (±50m) AND h_mean > 20m AND area < 15m² → `mast` (conf 0.85)
+  - IF no API match AND h_mean > 25m AND area < 10m² AND compact < 0.3 AND NDVI < 0.1 → `mast` (conf 0.6)
+  - Separate from wind_turbine by height: mast typically 22–164m but area <15m²; wind turbine h_mean >60m
+  - The overlap zone (25–60m, tiny footprint) should default to `mast` unless near a known wind turbine
+
+#### Integration into pipeline
+
+The infrastructure lookup should be called **once per analysis bbox** at the start of `segment_landscape()` in `object_segmentation.py`. Store the results as a list passed through to `classify_object()` via a new parameter `nearby_infra=None`. Each segment's centroid is checked against nearby infrastructure during classification.
+
+The rules above integrate into the existing `classify_object()` flow — they go BEFORE the RF prediction (or replace it for these types, since RF no longer predicts them). The infrastructure check is an early-exit: if a segment is near known infrastructure and its physical signature matches, return immediately with the infrastructure type.
+
+#### Also enhance OSM queries
+
+In `osm_features.py`, add a `"power"` query to `_query_all()`:
 ```python
 "power": f'[out:json][timeout:60]{bb};(way["power"];node["power"="generator"];node["power"="tower"];);out geom;',
 ```
 And add to `_LANDCOVER_MAP`:
 ```python
-_LANDCOVER_MAP[("power", "generator")] = "solar_panel"  # with solar check
+_LANDCOVER_MAP[("power", "generator")] = "solar_panel"  # needs additional solar check
 _LANDCOVER_MAP[("power", "substation")] = "substation"
 _LANDCOVER_MAP[("power", "plant")] = "substation"
 ```
-This gives OSM-based ground truth for these types during training label assignment too (even though RF won't predict them, the rule-based path benefits).
+This provides OSM-based ground truth for rule-based detection during both training and inference.
 
 ## File Reference
 
 | File | What to change |
 |------|---------------|
 | `learned_classifier.py` | Drop 3 classes from TYPE_CLASSES, merge excavation+fill→earthwork in CADASTRE_TYPE_MAP, change cap_multiplier 10→5 |
-| `object_segmentation.py` | Add earthwork→excavation/fill post-split, integrate infrastructure_lookup for solar/wind/substation rule detection |
+| `object_segmentation.py` | Add earthwork→excavation/fill post-split, integrate infrastructure_lookup into classify_object() for solar/wind/substation/mast rules, accept `nearby_infra` param, call lookup once in segment_landscape() |
 | `train_rf_4000kg.py` | Filter out dropped classes in _label_segments(), remap excavation/fill→earthwork |
-| `infrastructure_lookup.py` | **NEW FILE** — spatial index over austria-power API data |
+| `infrastructure_lookup.py` | **NEW FILE** — fetch + cache austria-power API, cKDTree spatial index, `find_nearby(centroid_3035, radius_m, categories)` |
 | `osm_features.py` | Add "power" query to _query_all(), add power→label mappings |
 
 ## Testing
@@ -169,16 +212,24 @@ After all changes:
 
 ```
 Base: https://austria-power.exe.xyz:8000
-GET /api/infrastructure?bbox=min_lon,min_lat,max_lon,max_lat&categories=solar_energy,wind_energy,substation
-
-Returns GeoJSON FeatureCollection. Key properties:
-- category: solar_energy | wind_energy | substation
-- type: solar | Windmill farm | windpark | Windpower plant | transformer_station | substation_380kv
-- height_agl_m, rotor_diameter_m, hub_height_m (wind)
-- area_sqm (solar, wind)
-- voltage_kv (substations)
-- Coordinates in EPSG:4326
+Docs: https://austria-power.exe.xyz:8000/llm.txt
+GET /api/infrastructure?bbox=min_lon,min_lat,max_lon,max_lat&categories=...
+GET /api/infrastructure/stats
 ```
+
+Returns GeoJSON FeatureCollection. Filter by `categories` and/or `layers`.
+
+**Categories relevant to us**: `solar_energy` (3513), `wind_energy` (3001), `substation` (513), `telecom` (1713), `structure` (193)
+
+**Key properties by category**:
+- `solar_energy`: `area_sqm` (74–132k; rooftop<1k, ground 1k-10k, utility >10k), `name`, `capacity_mw`
+- `wind_energy`: `height_agl_m` (65–285m, med 186), `hub_height_m` (31–161, med 105), `rotor_diameter_m` (20–163, med 101), `capacity_mw` (0.1–7.5, med 3.0), `year`, `turbine_model`, `area_sqm`
+- `substation`: `voltage_kv` (220–380), `capacity_mw` (0–88, med 6.7), `operator`, types: transformer_station(429)/substation(44)/substation_380kv(40)
+- `telecom`: `height_agl_m` (22–164m, med 39m), all type "Antenna"
+- `structure`: types Pole(70)/Mast(30)/Tower(16)/Stack(30)/Building(68), `height_agl_m` (1–251m, med 86m)
+
+All coordinates in EPSG:4326. Use `?bbox=` for per-tile queries.  
+Cache the full nationwide dataset locally (24h TTL) to avoid repeated large fetches.
 
 ## Cadastre API Reference (for context)
 

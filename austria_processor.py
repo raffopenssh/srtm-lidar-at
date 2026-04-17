@@ -2185,7 +2185,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         if all_cad_geoms:
             try:
                 from shapely.ops import unary_union as _unary_union
-                cad_union_3035 = _unary_union(all_cad_geoms)
+                from shapely.validation import make_valid
+                valid_geoms = []
+                for g in all_cad_geoms:
+                    try:
+                        valid_geoms.append(make_valid(g) if not g.is_valid else g)
+                    except Exception:
+                        valid_geoms.append(g.buffer(0))
+                cad_union_3035 = _unary_union(valid_geoms)
                 cad_union_wgs = transform_to_wgs(cad_union_3035)
                 cb = cad_union_wgs.bounds  # (minx, miny, maxx, maxy)
                 # Use the wider of API bbox and cadastre bbox

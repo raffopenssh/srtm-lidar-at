@@ -5248,53 +5248,76 @@ def _resolve_share(share_id):
     return share_id, p
 
 
-def _share_is_named(path: Path) -> bool:
-    """Check if a share has a user-given name (not auto-generated).
+def _share_eviction_tier(path: Path) -> int:
+    """Classify a share into eviction tiers (lower = evicted first).
 
-    A share is 'named' if:
-    - It has an explicit name (not auto-save, not equal to share ID), OR
-    - Its ID is a human-readable slug (not a hex hash or auto-save prefix)
+    Tier 0: unnamed auto-saves and hex-hash shares (evict first)
+    Tier 1: redirect stubs (tiny, but keep them to preserve old links)
+    Tier 2: shares with a user-set name inside the payload (e.g. name='Westbahnhof')
+    Tier 3: shares with a user-renamed ID (e.g. 'Wienwest', 'Kohlschwarz90') — evict last
     """
     try:
         share_id = path.stem.replace('.json', '')
-        # ID-based check: hex hashes (12 chars) and auto-save IDs are unnamed
+        sz = path.stat().st_size
         id_is_hex = bool(re.fullmatch(r'[0-9a-f]{12}', share_id))
         id_is_auto = share_id.startswith('auto-')
+
+        # Redirect stubs: small files that alias old IDs → new named share.
+        # Protect them (tier 1) so old links keep working.
+        if sz < 200:
+            try:
+                stub = json.loads(gzip.decompress(path.read_bytes()))
+                if 'redirect' in stub:
+                    return 1
+            except Exception:
+                pass
+            # Other tiny files (empty state etc.) are low-value
+            return 0
+
+        # User-renamed ID: the share filename is a human-readable slug.
+        # These are the most valuable — user deliberately chose the name.
         if not id_is_hex and not id_is_auto:
-            return True  # user-renamed ID like "Wienwest" or "Scheffau-Test"
-        # Check the name field inside the payload
-        data = json.loads(gzip.decompress(path.read_bytes()))
-        name = data.get('name', '')
-        if not name or name == share_id or name.startswith('Auto-save '):
-            return False
-        return True
+            return 3
+
+        # Check the name field inside the payload (only first ~2KB for speed)
+        # Shares that have a name set but still have hex/auto IDs (user set name
+        # but didn't rename the ID).
+        try:
+            raw = gzip.decompress(path.read_bytes())
+            data = json.loads(raw)
+            name = data.get('name', '')
+            if name and name != share_id and not name.startswith('Auto-save '):
+                return 2
+        except Exception:
+            pass
+
+        return 0
     except Exception:
-        return False
+        return 0
 
 
 def _share_evict():
     """Remove shares until total size < SHARE_MAX_BYTES.
 
-    Eviction order: unnamed/auto-save shares first (oldest first),
-    then named shares (oldest first). This keeps user-named saves longest.
+    Eviction tiers (lower evicted first):
+      0: unnamed auto-saves and hex-hash shares
+      1: redirect stubs (preserve old links)
+      2: shares with user-set name field
+      3: shares with user-renamed ID slug (most protected)
+    Within each tier, oldest (by mtime) evicted first.
     """
     all_files = list(SHARE_DIR.glob('*.json.gz'))
     total = sum(f.stat().st_size for f in all_files)
     if total <= SHARE_MAX_BYTES:
         return
-    # Partition into named vs unnamed, each sorted oldest-first
-    named, unnamed = [], []
-    for f in all_files:
-        (named if _share_is_named(f) else unnamed).append(f)
-    unnamed.sort(key=lambda f: f.stat().st_mtime)
-    named.sort(key=lambda f: f.stat().st_mtime)
-    # Evict unnamed first, then named
-    evict_order = unnamed + named
+    # Sort by (tier, mtime) — lowest tier and oldest files evicted first
+    evict_order = sorted(all_files, key=lambda f: (_share_eviction_tier(f), f.stat().st_mtime))
     while total > SHARE_MAX_BYTES and evict_order:
         victim = evict_order.pop(0)
+        tier = _share_eviction_tier(victim)
         total -= victim.stat().st_size
         victim.unlink(missing_ok=True)
-        log.info("share: evicted %s (total was %d MB)", victim.name, total // 1_000_000)
+        log.info("share: evicted %s (tier %d, total now %d MB)", victim.name, tier, total // 1_000_000)
 
 
 @app.route('/api/v1/shares', methods=['GET'])

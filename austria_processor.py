@@ -139,6 +139,11 @@ class ProgressTracker:
             "parcels_total": 0,
             "buildings_total": 0,
             "started_at": None,
+            "last_kg_code": None,
+            "last_kg_seconds": 0,
+            "n_new_buildings_total": 0,
+            "n_infrastructure_total": 0,
+            "kg_centroids": [],
         }
         self._load()
 
@@ -195,7 +200,9 @@ class ProgressTracker:
             self._state["failed"] += 1
             self._state["completed"] += 1
 
-    def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0):
+    def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0,
+                        last_kg_code: str = None, last_kg_seconds: float = 0,
+                        n_new_buildings: int = 0, n_infrastructure: int = 0):
         with self._lock:
             self._state["success"] += 1
             self._state["completed"] += 1
@@ -203,6 +210,11 @@ class ProgressTracker:
             self._state["upload_size_bytes"] += upload_bytes
             self._state["parcels_total"] += parcels
             self._state["buildings_total"] += buildings
+            if last_kg_code is not None:
+                self._state["last_kg_code"] = last_kg_code
+            self._state["last_kg_seconds"] = last_kg_seconds
+            self._state["n_new_buildings_total"] += n_new_buildings
+            self._state["n_infrastructure_total"] += n_infrastructure
 
     def update_rates(self, started_at: float):
         elapsed = time.time() - started_at
@@ -2285,8 +2297,10 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             required_keys = [
                 "version", "kg_code", "kg_name", "bbox", "total_area_sqm",
                 "observation_period", "area_summary", "height_distribution",
-                "landscape", "top_10_objects", "top_10_trees", "terrain",
-                "ndvi", "hansen", "new_buildings", "infrastructure",
+                "landscape", "top_10_objects", "top_10_trees", "tree_stats",
+                "terrain", "ndvi", "sar", "ndvi_harmonics",
+                "temporal_change", "phenology",
+                "hansen", "new_buildings", "infrastructure",
                 "parcels", "building_footprints", "methods",
             ]
             for k in required_keys:
@@ -2343,10 +2357,66 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             if not terrain or terrain.get("steepness_mean_deg") is None:
                 issues.append("JSON: terrain stats missing/empty")
 
+            # Check new enriched sections (SAR, harmonics, temporal, phenology)
+            sar = js.get("sar", {})
+            if not sar:
+                issues.append("JSON: sar section missing/empty (Copernicus may have been skipped)")
+            else:
+                if sar.get("vv_mean_db") is None and sar.get("method"):
+                    issues.append("JSON: sar has method but no vv_mean_db")
+
+            harmonics = js.get("ndvi_harmonics", {})
+            if not harmonics:
+                issues.append("JSON: ndvi_harmonics section missing/empty")
+            else:
+                for hk in ["mean_mean", "amplitude_mean", "phase_mean"]:
+                    v = harmonics.get(hk)
+                    if v is not None and isinstance(v, float) and v != v:
+                        issues.append(f"JSON: ndvi_harmonics.{hk} is NaN")
+
+            temporal = js.get("temporal_change", {})
+            if not temporal:
+                issues.append("JSON: temporal_change section missing/empty")
+
+            phenology = js.get("phenology", {})
+            # Phenology may be empty if no vegetated objects — not an error, just note
+            if not phenology:
+                log.info("  JSON: phenology section empty (may be ok for non-vegetated KGs)")
+
+            # Check tree_stats
+            tree_stats = js.get("tree_stats", {})
+            if not tree_stats:
+                issues.append("JSON: tree_stats section missing")
+
+            # Check observation_period
+            obs = js.get("observation_period", {})
+            if not obs or not obs.get("start"):
+                issues.append("JSON: observation_period missing/empty")
+
+            # Deep NaN scan on all numeric values
+            def _scan_nan(obj, path=""):
+                nan_paths = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        nan_paths.extend(_scan_nan(v, f"{path}.{k}"))
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj[:5]):  # sample first 5
+                        nan_paths.extend(_scan_nan(v, f"{path}[{i}]"))
+                elif isinstance(obj, float) and obj != obj:
+                    nan_paths.append(path)
+                return nan_paths
+            nan_paths = _scan_nan(js)
+            if nan_paths:
+                issues.append(f"JSON: NaN found at {len(nan_paths)} path(s): {', '.join(nan_paths[:5])}")
+
             # Check methods present
             methods = js.get("methods", {})
             if len(methods) < 5:
                 issues.append(f"JSON: methods section sparse ({len(methods)} entries)")
+            # Check new method keys exist
+            for mk in ["sar", "ndvi_harmonics", "temporal_change", "phenology"]:
+                if mk not in methods:
+                    issues.append(f"JSON: methods missing '{mk}' key")
 
             # Summary stats
             n_parcel_details = len(p_details)
@@ -2419,6 +2489,32 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
              ndvi.get("bev_nir_mean", 0) or 0,
              ndvi.get("copernicus_mean", 0) or 0,
              hansen.get("total_loss_pixels", 0) or 0)
+    # New enriched sections
+    sar = js.get("sar", {})
+    if sar:
+        log.info("  sar: VV=%.1fdB VH=%.1fdB",
+                 sar.get("vv_mean_db", 0) or 0,
+                 sar.get("vh_mean_db", 0) or 0)
+    else:
+        log.info("  sar: (empty)")
+    harm = js.get("ndvi_harmonics", {})
+    if harm:
+        log.info("  harmonics: mean=%.4f amp=%.4f phase=%.4f",
+                 harm.get("mean_mean", 0) or 0,
+                 harm.get("amplitude_mean", 0) or 0,
+                 harm.get("phase_mean", 0) or 0)
+    else:
+        log.info("  harmonics: (empty)")
+    temporal = js.get("temporal_change", {})
+    if temporal:
+        log.info("  temporal: %d event types, dtm_dates=%s",
+                 len(temporal.get("events", [])),
+                 temporal.get("dtm_dates", []))
+    else:
+        log.info("  temporal: (empty)")
+    pheno = js.get("phenology", {})
+    if pheno:
+        log.info("  phenology: %s", dict(pheno))
 
 
 # ---------------------------------------------------------------------------
@@ -2883,6 +2979,10 @@ def main():
                     parcels=result.get("n_parcels", 0),
                     buildings=result.get("n_buildings", 0),
                     upload_bytes=upload_stats["total_bytes"],
+                    last_kg_code=kg_code,
+                    last_kg_seconds=elapsed_kg,
+                    n_new_buildings=result.get("n_new_buildings", 0),
+                    n_infrastructure=result.get("n_infrastructure", 0),
                 )
                 progress.add_log(
                     "success",

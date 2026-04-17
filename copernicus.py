@@ -95,27 +95,104 @@ _connection: Optional[Any] = None
 # need their own openEO session (1 sync download per client_id).
 _connections: Dict[int, Any] = {}
 
-# Global flag: set when Copernicus returns 402 PaymentRequired.
+# Global flag: set when Copernicus returns 402 PaymentRequired on ALL credentials.
 # Callers (e.g. rf_train) can check this to pause gracefully.
 credits_exhausted: bool = False
 _credits_exhausted_at: Optional[str] = None  # ISO timestamp
+_exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 
 
 class CreditsExhaustedError(Exception):
-    """Raised when Copernicus returns 402 PaymentRequired."""
+    """Raised when ALL Copernicus credentials return 402 PaymentRequired."""
+    pass
+
+
+class CredentialRotatedError(Exception):
+    """Raised when a 402 was handled by rotating to a fresh credential.
+    Callers should rebuild their connection/datacube and retry."""
     pass
 
 
 def _check_credits_error(exc: Exception) -> None:
-    """If *exc* is a 402 PaymentRequired, set the global flag and re-raise
-    as CreditsExhaustedError so callers can handle it distinctly."""
-    global credits_exhausted, _credits_exhausted_at
+    """If *exc* is a 402 PaymentRequired, mark current credential as exhausted
+    and rotate to the next one.
+
+    - If a fresh credential is available: raise ``CredentialRotatedError``
+      so callers can rebuild their datacube and retry.
+    - If ALL credentials are exhausted: raise ``CreditsExhaustedError``.
+    - If the exception is not a 402: do nothing (return silently).
+    """
+    global credits_exhausted, _credits_exhausted_at, _credential_index
     msg = str(exc)
-    if '402' in msg and 'PaymentRequired' in msg:
+    if '402' not in msg or 'PaymentRequired' not in msg:
+        return
+
+    # Mark current credential as exhausted
+    _exhausted_cred_indices.add(_credential_index)
+    logger.warning("Credential %d/%d got 402 PaymentRequired (client_id=%s)",
+                   _credential_index + 1, len(_CREDENTIALS),
+                   CLIENT_ID[:16] + "...")
+
+    if len(_exhausted_cred_indices) >= len(_CREDENTIALS):
+        # ALL credentials exhausted
         credits_exhausted = True
         _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
-        logger.error("Copernicus credits exhausted — set credits_exhausted flag")
+        logger.error("ALL %d Copernicus credentials exhausted", len(_CREDENTIALS))
         raise CreditsExhaustedError(msg) from exc
+    else:
+        # Rotate to a non-exhausted credential
+        for _ in range(len(_CREDENTIALS)):
+            rotate_credentials()
+            if _credential_index not in _exhausted_cred_indices:
+                logger.info("Rotated to fresh credential %d/%d (client_id=%s)",
+                            _credential_index + 1, len(_CREDENTIALS),
+                            CLIENT_ID[:16] + "...")
+                raise CredentialRotatedError(
+                    f"Rotated to credential {_credential_index + 1}/{len(_CREDENTIALS)}"
+                ) from exc
+        # Shouldn't reach here but just in case
+        credits_exhausted = True
+        _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+        raise CreditsExhaustedError(msg) from exc
+
+
+def reset_exhausted_credentials():
+    """Clear the exhausted-credential tracking.  Call after providing new
+    credentials or when credits have been replenished."""
+    global credits_exhausted, _credits_exhausted_at
+    _exhausted_cred_indices.clear()
+    credits_exhausted = False
+    _credits_exhausted_at = None
+    logger.info("Reset exhausted-credential tracking for %d credentials",
+                len(_CREDENTIALS))
+
+
+def _retry_on_rotation(fn):
+    """Decorator: retry the whole function when credentials are rotated on 402.
+
+    Catches ``CredentialRotatedError`` (meaning a fresh credential is now
+    active) and reruns the function from scratch so it builds a new
+    connection + datacube with the fresh credential.  Gives up after
+    ``len(_CREDENTIALS)`` rotations.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _connection
+        for attempt in range(len(_CREDENTIALS) + 1):
+            try:
+                return fn(*args, **kwargs)
+            except CredentialRotatedError:
+                _connection = None  # force new connection on retry
+                logger.info("Credential rotated — retrying %s (attempt %d/%d)",
+                            fn.__name__, attempt + 2, len(_CREDENTIALS) + 1)
+                continue
+            except CreditsExhaustedError:
+                raise  # all credentials exhausted — propagate
+        # Should not reach here, but just in case
+        raise CreditsExhaustedError("All credential rotation attempts failed")
+    return wrapper
 
 
 def rotate_credentials() -> bool:
@@ -310,14 +387,13 @@ def _run_datacube(
                           SYNC_DOWNLOAD_TIMEOUT)
             break
         except Exception as exc:
-            _check_credits_error(exc)  # raises CreditsExhaustedError on 402
+            _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
             exc_str = str(exc)
             if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
                 logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
                               '429' if '429' in exc_str else '503')
                 rotate_credentials()
                 _time.sleep(5)
-                # Rebuild the datacube with new connection on retry
                 continue
             # If sync fails (e.g. too large), fall back to batch
             logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
@@ -356,6 +432,7 @@ def _run_datacube(
 # ---------------------------------------------------------------------------
 
 
+@_retry_on_rotation
 def get_ndvi_composite(
     bbox_wgs84: Dict[str, float],
     year: int = 2023,
@@ -440,6 +517,7 @@ def get_ndvi_composite(
     }
 
 
+@_retry_on_rotation
 def get_ndvi_timeseries(
     bbox_wgs84: Dict[str, float],
     start_date: str,
@@ -570,7 +648,7 @@ def get_ndvi_timeseries(
                     rotate_credentials()
                     _time.sleep(wait_secs)
                     continue
-                _check_credits_error(exc)  # raises CreditsExhaustedError on 402
+                _check_credits_error(exc)  # raises on 402 (rotated or exhausted)
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
         # Should not be reached, but guard anyway
@@ -680,6 +758,7 @@ def _parse_timeseries_tiff(
     }
 
 
+@_retry_on_rotation
 def get_land_cover(
     bbox_wgs84: Dict[str, float],
     _conn: Any = None,
@@ -741,6 +820,7 @@ def get_land_cover(
     }
 
 
+@_retry_on_rotation
 def get_sar_backscatter(
     bbox_wgs84: Dict[str, float],
     start_date: str,

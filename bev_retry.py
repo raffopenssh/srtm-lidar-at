@@ -88,6 +88,7 @@ def read_with_retry(
     base_delay: float = BASE_DELAY,
     caller: str = "",
     direct_first: bool = True,
+    direct_retries: int = 1,
 ):
     """Open + read in one shot with retry + proxy rotation.
 
@@ -104,16 +105,20 @@ def read_with_retry(
         Called with the open dataset; its return value is returned.
     max_retries, base_delay, caller : same as open_with_retry.
     direct_first : bool
-        If True, attempt 0 uses direct connection (no proxy);
-        proxies are only used on retries. Good for non-BEV sources
-        like Google Storage (Hansen) that work fine direct but
-        fail through random proxies.
+        If True, the first ``direct_retries`` attempts use a direct
+        connection (no proxy); proxies are only used after that.
+        Good for non-BEV sources like Google Storage (Hansen) that
+        work fine direct but fail through random proxies.
+    direct_retries : int
+        How many consecutive direct attempts before switching to proxies
+        (default 1, only the first attempt).  Set higher for sources
+        where direct access is strongly preferred.
     """
     label = caller or url.rsplit("/", 1)[-1]
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
-        if direct_first and attempt == 0:
+        if direct_first and attempt < direct_retries:
             os.environ.pop("GDAL_HTTP_PROXY", None)
             os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
             used_proxy = None

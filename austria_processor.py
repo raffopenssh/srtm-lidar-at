@@ -813,6 +813,13 @@ SEGMENT_COLORS = {
 }
 
 
+def _to_multi(geom_dict: dict) -> dict:
+    """Promote a Polygon geometry dict to MultiPolygon for fiona schema compat."""
+    if geom_dict and geom_dict.get('type') == 'Polygon':
+        return {'type': 'MultiPolygon', 'coordinates': [geom_dict['coordinates']]}
+    return geom_dict
+
+
 def _height_class(h):
     """Classify height (m) into a forestry-relevant height class string."""
     if h is None or h < 0.5:
@@ -922,7 +929,7 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
     label_int = labels.astype(np.int32)
 
     schema = {
-        'geometry': 'Polygon',
+        'geometry': 'MultiPolygon',
         'properties': [
             # Identity
             ('id', 'int'),
@@ -995,7 +1002,7 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
             hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
             dst.write({
-                'geometry': geom_dict,
+                'geometry': _to_multi(geom_dict),
                 'properties': {
                     'id': oid,
                     'type': obj.obj_type,
@@ -1203,7 +1210,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
         cadastre_data["parcels"], dtm, transform)
     if enriched_parcels:
         schema_p = {
-            'geometry': 'Polygon',
+            'geometry': 'MultiPolygon',
             'properties': [
                 ('parcel_id', 'str'), ('area_sqm', 'float'),
                 ('centroid_dtm_m', 'float'),
@@ -1216,7 +1223,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                 geom_wgs = ep["geometry_wgs"]
                 p = ep["properties"]
                 dst.write({
-                    'geometry': mapping(geom_wgs),
+                    'geometry': _to_multi(mapping(geom_wgs)),
                     'properties': {
                         'parcel_id': ep["parcel_id"],
                         'area_sqm': ep["area_sqm"],
@@ -1232,7 +1239,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
         cadastre_data["building_footprints"], dtm, dsm, ndsm, transform)
     if enriched_bldgs:
         schema_b = {
-            'geometry': 'Polygon',
+            'geometry': 'MultiPolygon',
             'properties': [
                 ('max_height_m', 'float'), ('mean_height_m', 'float'),
                 ('dsm_std', 'float'), ('roof_type_hint', 'str'),
@@ -1245,7 +1252,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
             for eb in enriched_bldgs:
                 p = eb["properties"]
                 dst.write({
-                    'geometry': mapping(eb["geometry_wgs"]),
+                    'geometry': _to_multi(mapping(eb["geometry_wgs"])),
                     'properties': {
                         'max_height_m': p.get('max_height_m'),
                         'mean_height_m': p.get('mean_height_m'),
@@ -1261,7 +1268,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
     # New buildings (not in cadastre)
     if new_buildings:
         schema_nb = {
-            'geometry': 'Polygon',
+            'geometry': 'MultiPolygon',
             'properties': [
                 ('type', 'str'), ('area_sqm', 'float'),
                 ('max_height_m', 'float'), ('stories_est', 'int'),
@@ -1273,7 +1280,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                         schema=schema_nb, crs=from_epsg(4326)) as dst:
             for nb in new_buildings:
                 dst.write({
-                    'geometry': nb["geometry_wgs"],
+                    'geometry': _to_multi(nb["geometry_wgs"]),
                     'properties': {
                         'type': nb.get('type', 'roof'),
                         'area_sqm': nb.get('area_sqm', 0),
@@ -1289,7 +1296,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
     # Infrastructure
     if infrastructure:
         schema_infra = {
-            'geometry': 'Polygon',
+            'geometry': 'MultiPolygon',
             'properties': [
                 ('type', 'str'), ('area_sqm', 'float'),
                 ('volume_m3', 'float'), ('max_height_m', 'float'),
@@ -1301,7 +1308,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                         schema=schema_infra, crs=from_epsg(4326)) as dst:
             for inf in infrastructure:
                 dst.write({
-                    'geometry': inf["geometry_wgs"],
+                    'geometry': _to_multi(inf["geometry_wgs"]),
                     'properties': {
                         'type': inf.get('type', ''),
                         'area_sqm': inf.get('area_sqm', 0),

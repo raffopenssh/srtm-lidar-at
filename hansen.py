@@ -94,6 +94,9 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
             src.window_transform(from_bounds(west, south, east, north, src.transform)),
         ),
         caller=f"Hansen {layer}",
+        max_retries=7,          # 8 total attempts — Hansen is critical for tree loss
+        direct_first=True,      # try our IP first (Google Storage works best direct)
+        direct_retries=3,       # first 3 attempts use direct, then rotate proxies
     )
 
     # Cache

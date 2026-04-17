@@ -552,7 +552,13 @@ function updateKgCard(d) {
   const tileBar = document.getElementById('tileBar');
   if (nt > 0) {
     tileBar.style.display = 'flex';
-    document.getElementById('tileLbl').textContent = 'tile ' + ct + '/' + nt;
+    // Build tile label, including sub-tile info when present
+    const st = kg.subtile;
+    let tileTxt = 'tile ' + ct + '/' + nt;
+    if (st && st.n_sub > 1) {
+      tileTxt += ' (sub-tile ' + st.sub_idx + '/' + st.n_sub + ' of orig ' + st.orig_tile + ' @ ' + st.sub_km + 'km)';
+    }
+    document.getElementById('tileLbl').textContent = tileTxt;
     const pct = Math.round(100 * Math.max(0, ct - 1) / nt); // ct-1 = completed tiles
     document.getElementById('tileFill').style.width = pct + '%';
     document.getElementById('tilePct').textContent = pct + '%';

@@ -19,6 +19,7 @@ import logging
 import os
 import pathlib
 import tempfile
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -103,10 +104,16 @@ credits_exhausted: bool = False
 _credits_exhausted_at: Optional[str] = None  # ISO timestamp
 _exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 
+# Threading lock for credential state — protects _credential_index,
+# _exhausted_cred_indices, credits_exhausted, CLIENT_ID, CLIENT_SECRET,
+# and _connection during concurrent access from parallel download workers.
+_cred_lock = threading.Lock()
+
 
 def FUNCTIONING_CREDENTIALS() -> list:
     """Return the list of credential indices that haven't been exhausted (402)."""
-    return [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
+    with _cred_lock:
+        return [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
 
 
 class CreditsExhaustedError(Exception):
@@ -120,9 +127,45 @@ class CredentialRotatedError(Exception):
     pass
 
 
-def _check_credits_error(exc: Exception) -> None:
-    """If *exc* is a 402 PaymentRequired, mark current credential as exhausted
+def _probe_credential(cred_index: int) -> bool:
+    """Lightweight probe to check if a credential is actually exhausted.
+
+    Attempts to authenticate with the given credential.  If auth succeeds
+    the credential likely still has credits and the 402 was a transient
+    rate-limit.  Returns True if the credential appears healthy.
+    """
+    try:
+        cid, csecret = _CREDENTIALS[cred_index]
+        logger.info("Probing credential %d (client_id=%s) ...", cred_index + 1, cid[:16] + "...")
+        conn = openeo.connect(OPENEO_URL)
+        conn.authenticate_oidc_client_credentials(client_id=cid, client_secret=csecret)
+        # If auth succeeds, credential is likely still valid
+        logger.info("Probe OK — credential %d is still valid", cred_index + 1)
+        # Refresh the cached connection
+        _connections[cred_index] = conn
+        return True
+    except Exception as probe_exc:
+        probe_msg = str(probe_exc)
+        if '402' in probe_msg and 'PaymentRequired' in probe_msg:
+            logger.warning("Probe confirmed credential %d is exhausted", cred_index + 1)
+            return False
+        # Other errors (network, 5xx) — give benefit of the doubt
+        logger.info("Probe inconclusive for credential %d (%s) — treating as healthy",
+                    cred_index + 1, probe_exc)
+        return True
+
+
+def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
+    """If *exc* is a 402 PaymentRequired, mark the credential as exhausted
     and rotate to the next one.
+
+    Parameters
+    ----------
+    exc : Exception
+        The exception to inspect.
+    cred_index : int or None
+        The credential index that caused the 402.  If None, uses the
+        global ``_credential_index``.
 
     - If a fresh credential is available: raise ``CredentialRotatedError``
       so callers can rebuild their datacube and retry.
@@ -134,42 +177,58 @@ def _check_credits_error(exc: Exception) -> None:
     if '402' not in msg or 'PaymentRequired' not in msg:
         return
 
-    # Mark current credential as exhausted
-    _exhausted_cred_indices.add(_credential_index)
-    logger.warning("Credential %d/%d got 402 PaymentRequired (client_id=%s)",
-                   _credential_index + 1, len(_CREDENTIALS),
-                   CLIENT_ID[:16] + "...")
+    # Determine which credential hit the 402
+    with _cred_lock:
+        idx = cred_index if cred_index is not None else _credential_index
 
-    if len(_exhausted_cred_indices) >= len(_CREDENTIALS):
-        # ALL credentials exhausted
-        credits_exhausted = True
-        _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
-        logger.error("ALL %d Copernicus credentials exhausted", len(_CREDENTIALS))
-        raise CreditsExhaustedError(msg) from exc
-    else:
-        # Rotate to a non-exhausted credential
-        for _ in range(len(_CREDENTIALS)):
-            rotate_credentials()
-            if _credential_index not in _exhausted_cred_indices:
-                logger.info("Rotated to fresh credential %d/%d (client_id=%s)",
-                            _credential_index + 1, len(_CREDENTIALS),
-                            CLIENT_ID[:16] + "...")
-                raise CredentialRotatedError(
-                    f"Rotated to credential {_credential_index + 1}/{len(_CREDENTIALS)}"
-                ) from exc
-        # Shouldn't reach here but just in case
-        credits_exhausted = True
-        _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
-        raise CreditsExhaustedError(msg) from exc
+    # Probe OUTSIDE the lock (network call — don't block other threads)
+    if openeo is not None and _probe_credential(idx):
+        # Credential is still healthy — don't mark exhausted.
+        # Invalidate the cached connection for this cred so it reconnects.
+        with _cred_lock:
+            _connections.pop(idx, None)
+        logger.info("Credential %d probe passed — not marking exhausted (transient 402)",
+                    idx + 1)
+        return  # caller should retry
+
+    # Probe failed — mark as exhausted under the lock
+    with _cred_lock:
+        _exhausted_cred_indices.add(idx)
+        logger.warning("Credential %d/%d confirmed exhausted (402 PaymentRequired, client_id=%s)",
+                       idx + 1, len(_CREDENTIALS),
+                       _CREDENTIALS[idx][0][:16] + "...")
+
+        if len(_exhausted_cred_indices) >= len(_CREDENTIALS):
+            # ALL credentials exhausted
+            credits_exhausted = True
+            _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+            logger.error("ALL %d Copernicus credentials exhausted", len(_CREDENTIALS))
+            raise CreditsExhaustedError(msg) from exc
+        else:
+            # Rotate to a non-exhausted credential
+            for _ in range(len(_CREDENTIALS)):
+                rotate_credentials(_locked=True)
+                if _credential_index not in _exhausted_cred_indices:
+                    logger.info("Rotated to fresh credential %d/%d (client_id=%s)",
+                                _credential_index + 1, len(_CREDENTIALS),
+                                CLIENT_ID[:16] + "...")
+                    raise CredentialRotatedError(
+                        f"Rotated to credential {_credential_index + 1}/{len(_CREDENTIALS)}"
+                    ) from exc
+            # Shouldn't reach here but just in case
+            credits_exhausted = True
+            _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+            raise CreditsExhaustedError(msg) from exc
 
 
 def reset_exhausted_credentials():
     """Clear the exhausted-credential tracking.  Call after providing new
     credentials or when credits have been replenished."""
     global credits_exhausted, _credits_exhausted_at
-    _exhausted_cred_indices.clear()
-    credits_exhausted = False
-    _credits_exhausted_at = None
+    with _cred_lock:
+        _exhausted_cred_indices.clear()
+        credits_exhausted = False
+        _credits_exhausted_at = None
     logger.info("Reset exhausted-credential tracking for %d credentials",
                 len(_CREDENTIALS))
 
@@ -202,18 +261,33 @@ def _retry_on_rotation(fn):
     return wrapper
 
 
-def rotate_credentials() -> bool:
-    """Switch to the next credential pair. Returns True if rotated, False if exhausted all."""
+def rotate_credentials(_locked: bool = False) -> bool:
+    """Switch to the next credential pair. Returns True if rotated, False if exhausted all.
+
+    Parameters
+    ----------
+    _locked : bool
+        If True, the caller already holds ``_cred_lock`` — skip acquiring it.
+    """
     global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
-    old_idx = _credential_index
-    _credential_index = (_credential_index + 1) % len(_CREDENTIALS)
-    if _credential_index == old_idx and len(_CREDENTIALS) == 1:
-        return False  # only one set of credentials
-    CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
-    _connection = None  # force re-auth with new credentials
-    logger.info("Rotated to credential set %d/%d (client_id=%s)",
-                _credential_index + 1, len(_CREDENTIALS), CLIENT_ID[:16] + "...")
-    return _credential_index != old_idx  # True unless we wrapped all the way around
+
+    def _do_rotate():
+        global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
+        old_idx = _credential_index
+        _credential_index = (_credential_index + 1) % len(_CREDENTIALS)
+        if _credential_index == old_idx and len(_CREDENTIALS) == 1:
+            return False  # only one set of credentials
+        CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+        _connection = None  # force re-auth with new credentials
+        logger.info("Rotated to credential set %d/%d (client_id=%s)",
+                    _credential_index + 1, len(_CREDENTIALS), CLIENT_ID[:16] + "...")
+        return _credential_index != old_idx  # True unless we wrapped all the way around
+
+    if _locked:
+        return _do_rotate()
+    else:
+        with _cred_lock:
+            return _do_rotate()
 
 
 def _get_connection() -> Any:
@@ -510,6 +584,11 @@ def get_ndvi_composite(
         ``{"ndvi": np.ndarray (H,W), "transform": Affine, "crs": CRS,
         "date_range": str}``
     """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping NDVI composite — all Copernicus credentials exhausted")
+        return None
+
     bbox = _validate_bbox(bbox_wgs84)
     start_date = f"{year}-04-01"
     end_date = f"{year}-09-30"
@@ -595,6 +674,11 @@ def get_ndvi_timeseries(
         ``{"monthly_ndvi": {"2023-01": ndarray, ...},
         "transform": Affine, "crs": CRS}``
     """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping NDVI time series — all Copernicus credentials exhausted")
+        return None
+
     from datetime import datetime
     import calendar
 
@@ -657,14 +741,21 @@ def get_ndvi_timeseries(
             to_download.append((label, m_start, m_end, month_cache))
 
     # Download missing months in parallel (one credential per worker)
+    # Tracks consecutive 402 hits per credential to distinguish transient
+    # rate-limits from genuine credit exhaustion.
+    _consecutive_402: Dict[int, int] = {}  # cred_idx -> consecutive 402 count
+    _402_THRESHOLD = 3  # mark exhausted only after this many consecutive 402s
+
     def _download_month(args):
         import re as _re
         import time as _time
         label, m_start, m_end, month_cache, cred_idx = args
         logger.info("Fetching NDVI for %s (%s → %s) [cred %d]", label, m_start, m_end, cred_idx + 1)
-        max_retries = 3
+        max_retries = 4  # increased to give room for 402 retries
         for attempt in range(max_retries + 1):
             try:
+                # Invalidate stale connection for this cred (may have been
+                # cleared by a probe or rotation on another thread)
                 c = _get_connection_for_cred(cred_idx)
                 s2 = c.load_collection(
                     "SENTINEL2_L2A",
@@ -693,10 +784,81 @@ def get_ndvi_timeseries(
                 except Exception:
                     tmp_month.unlink(missing_ok=True)
                     raise
+                # Success — reset consecutive 402 counter for this cred
+                with _cred_lock:
+                    _consecutive_402.pop(cred_idx, None)
                 logger.info("NDVI %s downloaded OK", label)
                 return label, None
+            except CredentialRotatedError:
+                # _check_credits_error rotated us — pick up the new cred
+                with _cred_lock:
+                    cred_idx = _credential_index
+                logger.info("NDVI %s: credential rotated, retrying with cred %d",
+                            label, cred_idx + 1)
+                continue
+            except CreditsExhaustedError as exc:
+                # All credentials gone; signal to orchestrator
+                logger.error("NDVI %s: all credentials exhausted", label)
+                return label, exc
             except Exception as exc:
                 exc_str = str(exc)
+
+                # --- Handle 402 with backoff (treat like 429 initially) ---
+                if '402' in exc_str and 'PaymentRequired' in exc_str:
+                    with _cred_lock:
+                        _consecutive_402[cred_idx] = _consecutive_402.get(cred_idx, 0) + 1
+                        n402 = _consecutive_402[cred_idx]
+
+                    if n402 < _402_THRESHOLD and attempt < max_retries:
+                        # Likely transient rate-limit from parallel requests.
+                        # Back off longer than for 429 (30s base).
+                        wait_secs = 30 * n402  # 30s, 60s
+                        logger.warning(
+                            "NDVI %s got 402 (cred %d, hit #%d/%d), "
+                            "treating as transient rate-limit — backoff %ds...",
+                            label, cred_idx + 1, n402, _402_THRESHOLD, wait_secs,
+                        )
+                        # Invalidate cached connection so next attempt re-auths
+                        with _cred_lock:
+                            _connections.pop(cred_idx, None)
+                        _time.sleep(wait_secs)
+                        continue
+                    else:
+                        # Threshold reached — let _check_credits_error decide
+                        # (it will probe before marking permanently exhausted)
+                        logger.warning(
+                            "NDVI %s: %d consecutive 402s on cred %d — "
+                            "checking if truly exhausted...",
+                            label, n402, cred_idx + 1,
+                        )
+                        try:
+                            _check_credits_error(exc, cred_index=cred_idx)
+                            # If _check_credits_error returned (probe passed),
+                            # the 402 was transient.  Retry.
+                            with _cred_lock:
+                                _consecutive_402[cred_idx] = 0
+                                _connections.pop(cred_idx, None)
+                            if attempt < max_retries:
+                                logger.info(
+                                    "NDVI %s: probe passed for cred %d, retrying...",
+                                    label, cred_idx + 1,
+                                )
+                                _time.sleep(15)
+                                continue
+                        except CredentialRotatedError:
+                            with _cred_lock:
+                                cred_idx = _credential_index
+                            logger.info(
+                                "NDVI %s: cred exhausted, rotated to cred %d",
+                                label, cred_idx + 1,
+                            )
+                            if attempt < max_retries:
+                                continue
+                        except CreditsExhaustedError as ce:
+                            return label, ce
+                        # Fall through to skip
+
+                # --- Handle 429 / 503 with backoff ---
                 if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt < max_retries:
                     # Parse Retry-After from exception string if available
                     retry_match = _re.search(r'Retry-After[":\s]+(\d+)', exc_str, _re.IGNORECASE)
@@ -705,17 +867,36 @@ def get_ndvi_timeseries(
                     else:
                         wait_secs = 10 * (attempt + 1)  # 10s, 20s, 30s
                     logger.warning(
-                        "NDVI %s rate limited/overloaded, retry %d/%d in %ds (rotating credentials)...",
+                        "NDVI %s rate limited/overloaded, retry %d/%d in %ds...",
                         label, attempt + 1, max_retries, wait_secs,
                     )
-                    rotate_credentials()
+                    # Don't rotate credentials on 429 from parallel workers —
+                    # just wait and retry with the same cred.
                     _time.sleep(wait_secs)
                     continue
-                _check_credits_error(exc)  # raises on 402 (rotated or exhausted)
+
+                # --- Other errors — skip month ---
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
         # Should not be reached, but guard anyway
         return label, Exception(f"NDVI {label}: retries exhausted")
+
+    def _download_sequential(download_list):
+        """Fallback: download months one-at-a-time with a single credential.
+        Used when parallel downloads cause too many 402s."""
+        import time as _time
+        results = []
+        for label, ms, me, mc in download_list:
+            if credits_exhausted:
+                results.append((label, CreditsExhaustedError("all exhausted")))
+                continue
+            func_creds = FUNCTIONING_CREDENTIALS()
+            cred = func_creds[0] if func_creds else _credential_index
+            result = _download_month((label, ms, me, mc, cred))
+            results.append(result)
+            if result[1] is None:
+                _time.sleep(2)  # gentle pacing between sequential downloads
+        return results
 
     if to_download:
         _func_creds = FUNCTIONING_CREDENTIALS()
@@ -731,14 +912,48 @@ def get_ndvi_timeseries(
             for i, (label, ms, me, mc) in enumerate(to_download)
         ]
         logger.info("Downloading %d NDVI months (%d parallel)...", len(to_download), _n_par)
+
+        # Phase 1: parallel download
+        failed_tasks = []  # tasks that got CreditsExhaustedError
         with concurrent.futures.ThreadPoolExecutor(max_workers=_n_par) as pool:
-            futures = {pool.submit(_download_month, t): t[0] for t in to_download_with_cred}
+            futures = {pool.submit(_download_month, t): t for t in to_download_with_cred}
             for fut in concurrent.futures.as_completed(futures):
+                task = futures[fut]
                 label, exc = fut.result()
-                if exc:
-                    logger.debug("Month %s failed", label)
-                else:
+                if exc is None:
                     logger.info("Month %s done", label)
+                elif isinstance(exc, CreditsExhaustedError):
+                    # Collect for sequential fallback (credits may recover)
+                    failed_tasks.append((task[0], task[1], task[2], task[3]))
+                    logger.warning("Month %s got CreditsExhaustedError in parallel phase", label)
+                else:
+                    logger.debug("Month %s failed: %s", label, exc)
+
+        # Phase 2: if any tasks failed with exhaustion errors during parallel
+        # download, reset exhaustion tracking and try sequentially.
+        # Parallel 402s are often transient rate-limits, not real exhaustion.
+        if failed_tasks and not all(
+            mc.exists() and _validate_cache(mc) for _, _, _, mc in failed_tasks
+        ):
+            still_needed = [
+                (l, ms, me, mc) for l, ms, me, mc in failed_tasks
+                if not (mc.exists() and _validate_cache(mc))
+            ]
+            if still_needed:
+                logger.info(
+                    "Retrying %d months sequentially after parallel 402 failures...",
+                    len(still_needed),
+                )
+                # Reset exhaustion — parallel 402s were likely transient
+                reset_exhausted_credentials()
+                import time as _time
+                _time.sleep(15)  # let rate-limits cool down
+                seq_results = _download_sequential(still_needed)
+                for label, exc in seq_results:
+                    if exc is None:
+                        logger.info("Sequential month %s done", label)
+                    else:
+                        logger.debug("Sequential month %s failed: %s", label, exc)
 
     # Read all cached months
     for label, m_start, m_end, month_cache in tasks:
@@ -851,6 +1066,11 @@ def get_land_cover(
         ``{"map": np.ndarray (H,W), "transform": Affine, "crs": CRS,
         "classes": dict}``
     """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping land cover — all Copernicus credentials exhausted")
+        return None
+
     bbox = _validate_bbox(bbox_wgs84)
 
     cache_file = _cache_path("landcover", bbox)
@@ -922,6 +1142,11 @@ def get_sar_backscatter(
         "transform": Affine, "crs": CRS,
         "date_range": str}``
     """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping SAR backscatter — all Copernicus credentials exhausted")
+        return None
+
     bbox = _validate_bbox(bbox_wgs84)
 
     cache_file = _cache_path("sar", bbox, start=start_date, end=end_date)

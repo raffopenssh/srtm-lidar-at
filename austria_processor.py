@@ -2598,20 +2598,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
                         cop_cache = _get_cop_cache()
                         cop = {}
-                        # Fetch NDVI, landcover, SAR in parallel (each uses
-                        # a separate Copernicus credential for true concurrency)
-                        import concurrent.futures as _cop_cf
-                        from copernicus import FUNCTIONING_CREDENTIALS as _func_creds
-                        _fc = _func_creds()
-                        # Round-robin assign credentials to the 3 fetches
-                        _ci = lambda i: _fc[i % len(_fc)] if _fc else None
-                        with _cop_cf.ThreadPoolExecutor(max_workers=max(len(_fc), 1)) as _cex:
-                            _f_ndvi = _cex.submit(cop_cache.get_ndvi, bbox_dict, obs_year, _ci(0))
-                            _f_lc   = _cex.submit(cop_cache.get_landcover, bbox_dict, _ci(1))
-                            _f_sar  = _cex.submit(cop_cache.get_sar, bbox_dict, obs_year, _ci(2))
-                        nd = _f_ndvi.result()
-                        lc = _f_lc.result()
-                        sar = _f_sar.result()
+                        nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+                        lc = cop_cache.get_landcover(bbox_dict)
+                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
                         if nd and nd.get("ndvi") is not None:
                             cop["ndvi"] = nd["ndvi"]
                             cop["transform"] = nd.get("transform")

@@ -362,7 +362,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div id="area-hint" style="display:none;width:100%;font-size:11px;color:#b87700;background:#fff8e1;padding:5px 8px;border-radius:4px"></div>
     </div>
   </div>
-  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="train-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span class="doc-links"><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span id="train-status" style="font-size:10px;opacity:0.8;margin-left:8px"></span><span class="doc-links"><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
   <div class="sidebar-collapse-bar" id="sidebar-collapse-bar"><span class="collapse-arrow">▲</span></div>
 </div>
 
@@ -1312,6 +1312,35 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
         el.style.color='#888';
       }
     }catch(e){/* keep previous display on transient fetch error */}
+  }
+  update();
+  setInterval(update,10000);
+})();
+
+// ============ PROCESSOR STATUS ============
+(function pollProcessorStatus(){
+  const el=document.getElementById('proc-status');
+  async function update(){
+    try{
+      const r=await fetch('/api/v1/processing/status');
+      const d=await r.json();
+      const s=d.state||'idle';
+      if(s==='running'){
+        const kg=d.current_kg?` KG ${d.current_kg.code}`:''; 
+        const step=d.current_kg?` · ${d.current_kg.step}`:'';
+        const pct=d.total_kgs?((d.completed/d.total_kgs)*100).toFixed(1)+'%':'0%';
+        el.innerHTML=`🗺️ Proc: ${d.completed}/${d.total_kgs} (${pct})${kg}${step}`;
+        el.style.color='#3fb950';
+      } else if(s==='paused'){
+        el.innerHTML=`⏸ Proc paused: ${d.completed}/${d.total_kgs}`;
+        el.style.color='#d29922';
+      } else if(d.completed>0){
+        el.innerHTML=`■ Proc done: ${d.success}✓ ${d.failed}✗`;
+        el.style.color='#8b949e';
+      } else {
+        el.textContent='';
+      }
+    }catch(e){}
   }
   update();
   setInterval(update,10000);

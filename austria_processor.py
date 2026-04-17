@@ -66,6 +66,24 @@ KG_TIMEOUT_SECONDS = 30 * 60
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 3.0  # crop KG bbox if wider
 
+# Tile caches — initialised lazily in subprocess
+_cop_cache = None
+_hansen_cache = None
+
+def _get_cop_cache():
+    global _cop_cache
+    if _cop_cache is None:
+        from tile_cache import CopernicusTileCache
+        _cop_cache = CopernicusTileCache()
+    return _cop_cache
+
+def _get_hansen_cache():
+    global _hansen_cache
+    if _hansen_cache is None:
+        from tile_cache import HansenTileCache
+        _hansen_cache = HansenTileCache()
+    return _hansen_cache
+
 # CRS transformers
 _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -194,6 +212,94 @@ class ProgressTracker:
                 self._state["rate_kgs_per_hour"] = round(3600 / avg, 2)
                 remaining = self._state["total_kgs"] - n
                 self._state["eta_seconds"] = int(remaining * avg)
+
+    def update_system_metrics(self):
+        """Collect system metrics: RAM, CPU, disk, caches."""
+        system = {}
+        try:
+            # System RAM
+            with open("/proc/meminfo") as f:
+                mi = f.read()
+            for line in mi.splitlines():
+                if line.startswith("MemTotal:"):
+                    system["ram_total_mb"] = int(line.split()[1]) // 1024
+                elif line.startswith("MemAvailable:"):
+                    system["ram_avail_mb"] = int(line.split()[1]) // 1024
+            if "ram_total_mb" in system and "ram_avail_mb" in system:
+                used = system["ram_total_mb"] - system["ram_avail_mb"]
+                system["ram_used_mb"] = used
+                system["ram_pct"] = round(100 * used / max(system["ram_total_mb"], 1), 1)
+        except Exception:
+            pass
+
+        try:
+            # CPU load
+            load1 = os.getloadavg()[0]
+            n_cpu = os.cpu_count() or 1
+            system["load_1m"] = round(load1, 2)
+            system["cpu_pct"] = round(100 * load1 / n_cpu, 1)
+        except Exception:
+            pass
+
+        try:
+            # Disk free
+            st = os.statvfs("/")
+            free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+            total_gb = (st.f_blocks * st.f_frsize) / (1024 ** 3)
+            system["disk_free_gb"] = round(free_gb, 1)
+            system["disk_used_pct"] = round(100 * (1 - free_gb / total_gb), 1)
+        except Exception:
+            pass
+
+        try:
+            # Process RSS
+            status = open("/proc/self/status").read()
+            for line in status.splitlines():
+                if line.startswith("VmRSS:"):
+                    system["proc_ram_mb"] = int(line.split()[1]) // 1024
+                    break
+            system["proc_pid"] = os.getpid()
+        except Exception:
+            pass
+
+        try:
+            # JSON cache stats
+            json_files = list(JSON_DIR.glob("*.json"))
+            system["json_cache_files"] = len(json_files)
+            system["json_cache_mb"] = round(
+                sum(f.stat().st_size for f in json_files) / 1024 / 1024, 1)
+        except Exception:
+            pass
+
+        try:
+            # GPKG temp dir
+            gpkg_files = list(GPKG_DIR.glob("*.gpkg"))
+            system["gpkg_temp_files"] = len(gpkg_files)
+            system["gpkg_temp_mb"] = round(
+                sum(f.stat().st_size for f in gpkg_files) / 1024 / 1024, 1)
+        except Exception:
+            pass
+
+        try:
+            # Tile cache stats
+            from tile_cache import cache_summary
+            system["tile_caches"] = cache_summary()
+        except Exception:
+            pass
+
+        try:
+            # Circuit breaker state
+            cb = _read_circuit_breaker()
+            system["copernicus_circuit"] = (
+                "open" if cb["consecutive_failures"] >= 3
+                and (time.time() - cb["last_failure"]) < cb["cooldown"]
+                else "closed"
+            )
+        except Exception:
+            pass
+
+        with self._lock:
+            self._state["system"] = system
 
 
 # ---------------------------------------------------------------------------
@@ -1305,7 +1411,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
         except Exception as e:
             log.warning("KG %s: ortho failed: %s", kg_code, e)
 
-        # --- 4. Copernicus ---
+        # --- 4. Copernicus (tile-cached) ---
         copernicus_data = None
         if include_copernicus:
             result["step"] = "copernicus"
@@ -1315,21 +1421,27 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                 log.info("KG %s: Copernicus circuit breaker OPEN, skipping", kg_code)
             else:
                 try:
-                    import copernicus
                     bbox_dict = {"west": west, "south": south,
                                  "east": east, "north": north}
+                    cop_cache = _get_cop_cache()
                     cop = {}
-                    # NDVI
-                    try:
-                        nd = copernicus.get_ndvi_composite(bbox_dict, year=obs_year)
+                    # NDVI (grid-snapped tile cache)
+                    nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+                    if nd and nd.get("ndvi") is not None:
                         cop["ndvi"] = nd["ndvi"]
-                    except Exception:
-                        pass
-                    # WorldCover
-                    try:
-                        cop["landcover"] = copernicus.get_land_cover(bbox_dict)
-                    except Exception:
-                        pass
+                        cop["transform"] = nd.get("transform")
+                        cop["crs"] = nd.get("crs")
+                    # WorldCover (grid-snapped tile cache)
+                    lc = cop_cache.get_landcover(bbox_dict)
+                    if lc:
+                        cop["landcover"] = lc
+                    # SAR (grid-snapped tile cache)
+                    sar = cop_cache.get_sar(bbox_dict, year=obs_year)
+                    if sar:
+                        cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
+                        if "transform" in sar:
+                            cop["sar_transform"] = sar["transform"]
+
                     copernicus_data = cop if cop else None
 
                     # Update circuit breaker
@@ -1346,12 +1458,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True) -> dict:
                     cb["last_failure"] = time.time()
                     _write_circuit_breaker(cb)
 
-        # --- 5. Hansen ---
+        # --- 5. Hansen (tile-cached) ---
         result["step"] = "hansen"
         hansen_data = None
         try:
-            import hansen
-            hansen_data = hansen.get_forest_prior(
+            hc = _get_hansen_cache()
+            hansen_data = hc.get_forest_prior(
                 (west, south, east, north), transform, (h, w))
         except Exception as e:
             log.warning("KG %s: Hansen failed: %s", kg_code, e)
@@ -1590,6 +1702,11 @@ def main():
             completed_codes.add(key.replace("_json", ""))
     pending = [kg for kg in kgs if kg["kg_code"] not in completed_codes]
 
+    # Sort geographically for tile-cache locality
+    from tile_cache import sort_kgs_geographically
+    pending = sort_kgs_geographically(pending)
+    log.info("KGs sorted geographically for cache locality")
+
     log.info("Total KGs: %d, already completed: %d, pending: %d",
              len(kgs), len(completed_codes), len(pending))
 
@@ -1724,6 +1841,7 @@ def main():
             IN_PROGRESS_FILE.unlink()
 
         progress.update_rates(t_start)
+        progress.update_system_metrics()
         progress.save()
         cleanup_json_dir()
 

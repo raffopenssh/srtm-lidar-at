@@ -11,552 +11,678 @@
           --blue: #58a6ff; --purple: #bc8cff; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg);
-         color: var(--text); padding: 20px; line-height: 1.5; }
-  h1 { font-size: 18px; color: var(--blue); margin-bottom: 4px; }
-  .subtitle { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+         color: var(--text); padding: 16px 20px; line-height: 1.5; }
+
+  /* Header */
+  .hdr { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .hdr h1 { font-size: 18px; color: var(--blue); }
+  .hdr-links { font-size: 11px; display: flex; gap: 10px; }
+  .hdr-links a { color: var(--dim); text-decoration: none; }
+  .hdr-links a:hover { color: var(--text); }
+  .subtitle { color: var(--dim); font-size: 12px; margin: 2px 0 14px; }
   .subtitle b { color: var(--text); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
-  .card .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
-  .card .value { font-size: 22px; font-weight: bold; margin-top: 2px; }
-  .card .detail { font-size: 11px; color: var(--dim); margin-top: 2px; }
-  .section { margin-bottom: 20px; }
-  .section-title { font-size: 14px; color: var(--blue); margin-bottom: 8px;
-                   border-bottom: 1px solid var(--border); padding-bottom: 4px; }
-  .bar { height: 8px; border-radius: 4px; background: var(--border); margin-top: 6px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
-  .bar-fill.green { background: var(--green); }
-  .bar-fill.yellow { background: var(--yellow); }
-  .bar-fill.red { background: var(--red); }
-  .state-idle { color: var(--dim); }
-  .state-running { color: var(--green); }
-  .state-paused { color: var(--yellow); }
-  .state-complete { color: var(--purple); }
-  .state-error { color: var(--red); }
 
-  /* Step indicator */
-  .steps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
-  .step { font-size: 10px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border);
-          background: var(--card); color: var(--dim); white-space: nowrap; transition: all 0.3s; }
-  .step.done { border-color: #23492e; color: var(--green); background: #0d2818; }
-  .step.active { border-color: var(--blue); color: var(--blue); background: #0d1f3c; animation: pulse 1.5s infinite; }
-  .step.pending { opacity: 0.4; }
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+  /* Cards grid */
+  .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .card .lb { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .val { font-size: 20px; font-weight: bold; margin: 1px 0; }
+  .card .det { font-size: 11px; color: var(--dim); margin-top: 1px; line-height: 1.4; }
+  .card .det b { color: var(--text); font-weight: 600; }
 
-  /* Log area */
-  .log-area { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-              padding: 10px 12px; max-height: 260px; overflow-y: auto; font-size: 12px; }
-  .log-entry { padding: 2px 0; border-bottom: 1px solid #21262d; display: flex; gap: 8px; }
-  .log-entry:last-child { border-bottom: none; }
-  .log-ts { color: var(--dim); white-space: nowrap; flex-shrink: 0; font-size: 11px; }
-  .log-msg { flex: 1; }
+  /* Progress bar */
+  .bar { height: 6px; border-radius: 3px; background: var(--border); margin-top: 4px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+  .bar-fill.g { background: var(--green); }
+  .bar-fill.y { background: var(--yellow); }
+  .bar-fill.r { background: var(--red); }
+  .bar-fill.b { background: var(--blue); }
+
+  /* State colors */
+  .st-running { color: var(--green); }
+  .st-idle { color: var(--dim); }
+  .st-paused { color: var(--yellow); }
+  .st-stopped { color: var(--red); }
+  .st-complete { color: var(--purple); }
+
+  /* Current KG card */
+  .kg-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+             padding: 10px 14px; margin-bottom: 14px; }
+  .kg-title { font-size: 15px; font-weight: bold; }
+  .kg-sub { font-size: 11px; color: var(--dim); }
+  .steps { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 6px; }
+  .stp { font-size: 10px; padding: 2px 7px; border-radius: 3px; border: 1px solid var(--border);
+         color: var(--dim); background: transparent; white-space: nowrap; transition: all 0.3s; }
+  .stp.done { border-color: #23492e; color: var(--green); }
+  .stp.done::before { content: '✓ '; }
+  .stp.act { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.08);
+             animation: pulse 1.5s ease-in-out infinite; }
+  .stp.pend { opacity: 0.35; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.55; } }
+  .spin { display: inline-block; width: 8px; height: 8px; border: 1.5px solid var(--border);
+          border-top-color: var(--blue); border-radius: 50%; animation: sp .7s linear infinite;
+          vertical-align: middle; margin-right: 3px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* Section */
+  .sec { margin-bottom: 14px; }
+  .sec-t { font-size: 13px; color: var(--blue); margin-bottom: 6px;
+           border-bottom: 1px solid var(--border); padding-bottom: 3px;
+           display: flex; justify-content: space-between; align-items: center; }
+  .sec-t .tag { font-size: 10px; color: var(--dim); font-weight: normal; }
+
+  /* Map */
+  #kgMap { height: 200px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px; }
+  .leaflet-container { background: var(--bg) !important; }
+
+  /* Log */
+  .log-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+              max-height: 300px; overflow-y: auto; font-size: 12px; }
+  .log-row { padding: 3px 10px; border-bottom: 1px solid #21262d; display: flex; gap: 8px; align-items: baseline; }
+  .log-row:last-child { border-bottom: none; }
+  .log-ts { color: var(--dim); white-space: nowrap; flex-shrink: 0; font-size: 10px; }
+  .log-kg { color: var(--purple); font-size: 10px; white-space: nowrap; flex-shrink: 0; min-width: 42px; }
+  .log-msg { flex: 1; word-break: break-word; }
   .log-info .log-msg { color: var(--dim); }
   .log-success .log-msg { color: var(--green); }
   .log-error .log-msg { color: var(--red); }
-  .log-warn .log-msg { color: var(--yellow); }
+  .log-warning .log-msg { color: var(--yellow); }
 
-  /* Table */
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; color: var(--dim); font-size: 11px; text-transform: uppercase;
-       letter-spacing: 0.5px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
-  td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--dim); font-size: 10px; text-transform: uppercase;
+       letter-spacing: 0.5px; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
   tr:hover td { background: #1c2128; }
 
   /* Controls */
-  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .btn { font-family: inherit; font-size: 12px; padding: 6px 16px; border-radius: 6px;
+  .ctrl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  .btn { font-family: inherit; font-size: 11px; padding: 5px 14px; border-radius: 5px;
          border: 1px solid var(--border); background: var(--card); color: var(--text);
-         cursor: pointer; transition: all 0.2s; }
+         cursor: pointer; transition: all 0.15s; }
   .btn:hover { background: #1c2128; border-color: var(--dim); }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-green { border-color: #23492e; color: var(--green); }
-  .btn-green:hover { background: #0d2818; }
-  .btn-yellow { border-color: #3d3019; color: var(--yellow); }
-  .btn-yellow:hover { background: #1a1a0d; }
-  .btn-red { border-color: #3d1f1f; color: var(--red); }
-  .btn-red:hover { background: #1f0d0d; }
-  .input-field { font-family: inherit; font-size: 12px; padding: 6px 10px; border-radius: 6px;
-                 border: 1px solid var(--border); background: var(--card); color: var(--text);
-                 width: 100px; outline: none; }
-  .input-field:focus { border-color: var(--blue); }
+  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .btn-g { border-color: #23492e; color: var(--green); }
+  .btn-g:hover { background: #0d2818; }
+  .btn-y { border-color: #3d3019; color: var(--yellow); }
+  .btn-y:hover { background: #1a1a0d; }
+  .btn-r { border-color: #3d1f1f; color: var(--red); }
+  .btn-r:hover { background: #1f0d0d; }
+  .inp { font-family: inherit; font-size: 11px; padding: 5px 8px; border-radius: 5px;
+         border: 1px solid var(--border); background: var(--card); color: var(--text);
+         width: 90px; outline: none; }
+  .inp:focus { border-color: var(--blue); }
+  select.inp { width: auto; min-width: 120px; }
+  .sep { color: var(--border); }
 
   /* Collapsible */
-  .collapsible-header { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
-  .collapsible-header .arrow { transition: transform 0.2s; font-size: 10px; }
-  .collapsible-header.open .arrow { transform: rotate(90deg); }
-  .collapsible-body { display: none; margin-top: 8px; }
-  .collapsible-body.open { display: block; }
+  .coll-h { cursor: pointer; user-select: none; }
+  .coll-h .arr { transition: transform 0.2s; display: inline-block; font-size: 9px; margin-right: 4px; }
+  .coll-h.open .arr { transform: rotate(90deg); }
+  .coll-b { display: none; margin-top: 6px; }
+  .coll-b.open { display: block; }
 
-  /* Map */
-  #kgMap { height: 280px; border-radius: 8px; border: 1px solid var(--border); }
-  .leaflet-container { background: var(--bg) !important; }
-
-  .poll-info { position: fixed; bottom: 12px; right: 16px; font-size: 11px; color: var(--dim);
-               background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; }
-  .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--border);
-             border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Bottom row */
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } body { padding: 10px; } .grid { grid-template-columns: 1fr 1fr; } }
-  .auto-scroll-toggle { font-size: 11px; color: var(--dim); cursor: pointer; user-select: none; }
-  .auto-scroll-toggle input { margin-right: 4px; }
+
+  /* Poll indicator */
+  .poll { position: fixed; bottom: 10px; right: 14px; font-size: 10px; color: var(--dim);
+          background: var(--card); border: 1px solid var(--border); border-radius: 5px;
+          padding: 3px 8px; display: flex; align-items: center; gap: 6px; z-index: 50; }
+  .poll-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+              animation: blink 5s linear infinite; }
+  @keyframes blink { 0%,90% { opacity:1; } 95% { opacity:0.3; } 100% { opacity:1; } }
+
+  /* Circuit badge */
+  .badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; text-transform: uppercase;
+           letter-spacing: 0.3px; }
+  .badge-closed { background: #0d2818; color: var(--green); border: 1px solid #23492e; }
+  .badge-open { background: #1f0d0d; color: var(--red); border: 1px solid #3d1f1f; }
+
+  /* Disk bar */
+  .disk-bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 3px; }
+  .disk-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .cards { grid-template-columns: repeat(3, 1fr); }
+    .two-col { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 600px) {
+    body { padding: 10px; }
+    .cards { grid-template-columns: 1fr 1fr; }
+  }
 </style>
 </head>
 <body>
 
-<div style="display:flex;align-items:baseline;gap:16px;flex-wrap:wrap">
+<!-- Header -->
+<div class="hdr">
   <h1>🇦🇹 Austria Landscape Processor</h1>
-  <span style="font-size:11px;display:flex;gap:10px">
-    <a href="/" style="color:var(--dim);text-decoration:none">← app</a>
-    <a href="/training" style="color:var(--dim);text-decoration:none">training</a>
-    <a href="/api/v1/processing/status" style="color:var(--dim);text-decoration:none">api</a>
+  <span class="hdr-links">
+    <a href="/">app</a>
+    <a href="/training.html">training</a>
+    <a href="/api/v1/docs/llm.txt">api docs</a>
   </span>
 </div>
-<div class="subtitle" id="subtitle">Processing <b>—</b>/<b>—</b> KGs • <b>—</b> uploaded • <b>—</b> failed</div>
+<div class="subtitle" id="subtitle">Connecting…</div>
 
-<!-- Progress Section -->
-<div class="section">
-  <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-      <div>
-        <span class="label">Overall Progress</span>
-        <span id="progressPct" style="margin-left:8px;font-size:14px;font-weight:bold;color:var(--green)">0%</span>
-      </div>
-      <div style="display:flex;gap:16px;font-size:12px">
-        <span>State: <span id="stateLabel" class="state-idle">idle</span></span>
-        <span>Elapsed: <span id="elapsed" style="color:var(--text)">—</span></span>
-        <span>ETA: <span id="eta" style="color:var(--text)">—</span></span>
-        <span>Rate: <span id="rate" style="color:var(--text)">—</span> KG/h</span>
-        <span>Avg: <span id="avgTime" style="color:var(--text)">—</span>/KG</span>
-      </div>
-    </div>
-    <div class="bar"><div class="bar-fill green" id="progressBar" style="width:0%"></div></div>
+<!-- Stats Cards Row -->
+<div class="cards" id="cardsRow">
+  <div class="card" id="cService">
+    <div class="lb">Service</div>
+    <div class="val st-idle" id="cServiceVal">○ Idle</div>
+    <div class="det" id="cServiceDet">—</div>
+  </div>
+  <div class="card" id="cProgress">
+    <div class="lb">Progress</div>
+    <div class="val" id="cProgVal">—</div>
+    <div class="bar"><div class="bar-fill g" id="cProgBar" style="width:0"></div></div>
+    <div class="det" id="cProgDet">—</div>
+  </div>
+  <div class="card" id="cRate">
+    <div class="lb">Rate</div>
+    <div class="val" id="cRateVal">—</div>
+    <div class="det" id="cRateDet">—</div>
+  </div>
+  <div class="card" id="cSystem">
+    <div class="lb">System</div>
+    <div class="val" id="cSysVal">—</div>
+    <div class="det" id="cSysDet">—</div>
+    <div class="disk-bar"><div class="disk-fill" id="cDiskFill" style="width:0;background:var(--green)"></div></div>
+  </div>
+  <div class="card" id="cZenodo">
+    <div class="lb">Zenodo</div>
+    <div class="val" id="cZenVal">—</div>
+    <div class="det" id="cZenDet">—</div>
   </div>
 </div>
 
-<!-- Current KG Card + Stats Cards -->
-<div class="two-col">
-  <div class="section">
-    <div class="section-title">Current KG</div>
-    <div class="card" id="currentKgCard">
-      <div style="color:var(--dim);font-size:12px">No KG currently processing</div>
+<!-- Current KG -->
+<div class="kg-card" id="kgCard" style="display:none">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">
+    <div>
+      <span class="kg-title" id="kgTitle">—</span>
+      <span class="kg-sub" id="kgSub"></span>
     </div>
+    <div class="kg-sub" id="kgTimer">—</div>
   </div>
-  <div class="section">
-    <div class="section-title">Statistics</div>
-    <div class="grid" id="statsCards" style="margin-bottom:0">
-      <div class="card"><div class="label">Processed</div><div class="value" id="statProcessed">—</div><div class="detail" id="statProcessedDetail">—</div></div>
-      <div class="card"><div class="label">Uploaded</div><div class="value" id="statUploaded">—</div><div class="detail" id="statUploadedDetail">—</div></div>
-      <div class="card"><div class="label">Parcels</div><div class="value" id="statParcels">—</div><div class="detail">total parcels processed</div></div>
-      <div class="card"><div class="label">Buildings</div><div class="value" id="statBuildings">—</div><div class="detail">total buildings detected</div></div>
-    </div>
-  </div>
+  <div class="steps" id="kgSteps"></div>
 </div>
+
+<!-- Map (compact) -->
+<div id="kgMap"></div>
 
 <!-- Controls -->
-<div class="section">
-  <div class="section-title">Controls</div>
-  <div class="card">
-    <div class="controls">
-      <button class="btn btn-green" id="btnStart" onclick="sendCmd('start')">▶ Start</button>
-      <button class="btn btn-yellow" id="btnPause" onclick="sendCmd('pause')" disabled>⏸ Pause</button>
-      <button class="btn btn-green" id="btnResume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
-      <span style="color:var(--border)">│</span>
-      <span style="font-size:12px;color:var(--dim)">Single KG:</span>
-      <input type="text" class="input-field" id="singleKgInput" placeholder="e.g. 63349">
-      <button class="btn" onclick="processSingleKg()">Process</button>
-    </div>
+<div class="ctrl" id="controls">
+  <button class="btn btn-g" id="btnStart" onclick="sendCmd('start')">▶ Start</button>
+  <button class="btn btn-y" id="btnPause" onclick="sendCmd('pause')" disabled>‖ Pause</button>
+  <button class="btn btn-g" id="btnResume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
+  <button class="btn btn-r" id="btnStop" onclick="sendCmd('stop')" disabled>■ Stop</button>
+  <span class="sep">│</span>
+  <span style="font-size:11px;color:var(--dim)">Single KG:</span>
+  <input type="text" class="inp" id="singleKg" placeholder="63349">
+  <button class="btn" onclick="processSingle()">Process</button>
+  <span class="sep">│</span>
+  <select class="inp" id="stateSelect">
+    <option value="">All states</option>
+    <option>Burgenland</option><option>Kärnten</option><option>Niederösterreich</option>
+    <option>Oberösterreich</option><option>Salzburg</option><option>Steiermark</option>
+    <option>Tirol</option><option>Vorarlberg</option><option>Wien</option>
+  </select>
+</div>
+
+<!-- Live Log -->
+<div class="sec">
+  <div class="sec-t">
+    <span>Live Log</span>
+    <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
+      <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
+    </label>
+  </div>
+  <div class="log-wrap" id="logArea">
+    <div class="log-row log-info"><span class="log-msg">Waiting for data…</span></div>
   </div>
 </div>
 
-<!-- Log + Map -->
+<!-- Bottom Row: Failed + Zenodo Manifest -->
 <div class="two-col">
-  <div class="section">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <div class="section-title" style="border:none;margin:0;padding:0">Recent Activity</div>
-      <label class="auto-scroll-toggle"><input type="checkbox" id="autoScroll" checked> auto-scroll</label>
+  <!-- Failed KGs -->
+  <div class="sec">
+    <div class="sec-t coll-h" id="failHead" onclick="toggle('fail')">
+      <span><span class="arr">▶</span> Failed KGs <span style="color:var(--red)" id="failN">0</span></span>
     </div>
-    <div class="log-area" id="logArea"></div>
-  </div>
-  <div class="section">
-    <div class="section-title">KG Map</div>
-    <div id="kgMap"></div>
-  </div>
-</div>
-
-<!-- Failed KGs -->
-<div class="section">
-  <div class="collapsible-header" id="failedHeader" onclick="toggleFailed()">
-    <span class="arrow">▶</span>
-    <span class="section-title" style="border:none;margin:0;padding:0">Failed KGs (<span id="failedCount">0</span>)</span>
-  </div>
-  <div class="collapsible-body" id="failedBody">
-    <div class="card" style="overflow-x:auto;padding:0">
-      <table id="failedTable">
-        <thead><tr><th>KG Code</th><th>Name</th><th>Step</th><th>Error</th><th>Time</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
+    <div class="coll-b" id="failBody">
+      <div class="card" style="overflow-x:auto;padding:0;max-height:260px;overflow-y:auto">
+        <table id="failTbl">
+          <thead><tr><th>Code</th><th>Name</th><th>Step</th><th>Error</th><th>Time</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </div>
-</div>
-
-<!-- Zenodo Manifest -->
-<div class="section">
-  <div class="collapsible-header" id="zenodoHeader" onclick="toggleZenodo()">
-    <span class="arrow">▶</span>
-    <span class="section-title" style="border:none;margin:0;padding:0">Zenodo Manifest (<span id="zenodoCount">0</span> entries, <span id="zenodoSize">0 B</span>)</span>
-  </div>
-  <div class="collapsible-body" id="zenodoBody">
-    <div class="card" style="overflow-x:auto;padding:0">
-      <table id="zenodoTable" style="font-size:12px">
-        <thead><tr><th>Key</th><th>Depo ID</th><th>Filename</th><th>Size</th><th>MD5</th><th>Uploaded</th><th>Version</th><th>URL</th></tr></thead>
-        <tbody></tbody>
-      </table>
+  <!-- Zenodo Manifest -->
+  <div class="sec">
+    <div class="sec-t coll-h" id="zenHead" onclick="toggle('zen')">
+      <span><span class="arr">▶</span> Zenodo Manifest <span style="color:var(--dim)" id="zenSummary">0 entries · 0 B</span></span>
+    </div>
+    <div class="coll-b" id="zenBody">
+      <div class="card" style="overflow-x:auto;padding:0;max-height:300px;overflow-y:auto">
+        <table id="zenTbl">
+          <thead><tr><th>Key</th><th>Depo</th><th>Filename</th><th>Size</th><th>MD5</th><th>Uploaded</th><th>URL</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
 
-<div class="poll-info">Polling <span id="pollCountdown">5</span>s</div>
+<!-- Poll indicator -->
+<div class="poll">
+  <span class="poll-dot" id="pollDot"></span>
+  <span>Polling <span id="pollCd">5</span>s</span>
+  <span style="margin-left:4px" id="lastPoll">—</span>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const API = '/api/v1/processing/status';
-const POLL_INTERVAL = 5;
-let countdown = POLL_INTERVAL;
-let map = null;
-let mapMarkers = L.layerGroup();
-let lastLogCount = 0;
+const POLL = 5;
+let cd = POLL;
+let map, mapMarkers;
+let prevLogHash = '';
+let kgTimerStart = null;
+let kgTimerInterval = null;
 
-const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','gpkg_full','gpkg_light','json','upload','done'];
-const STEP_LABELS = { cadastre:'Cadastre', lidar:'LiDAR', ortho:'Ortho', copernicus:'Copernicus',
-  hansen:'Hansen', segment:'Segment', gpkg_full:'GPKG Full', gpkg_light:'GPKG Light',
-  json:'JSON', upload:'Upload', done:'Done' };
-
+// ── Helpers ──────────────────────────────────────────────────────
 function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
-
-function fmtDuration(secs) {
-  if (secs == null || secs <= 0) return '—';
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  const s = Math.floor(secs % 60);
+function fmtD(s) {
+  if (s == null || s <= 0) return '—';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+  if (d > 0) return d + 'd ' + h + 'h';
   if (h > 0) return h + 'h ' + m + 'm';
-  if (m > 0) return m + 'm ' + s + 's';
-  return s + 's';
+  if (m > 0) return m + 'm ' + Math.floor(s%60) + 's';
+  return Math.floor(s) + 's';
 }
-
-function fmtBytes(bytes) {
-  if (bytes == null || bytes === 0) return '0 B';
-  const units = ['B','KB','MB','GB','TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+function fmtB(b) {
+  if (b == null || b === 0) return '0 B';
+  const u = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + u[i];
 }
-
-function fmtTime(iso) {
+function fmtT(iso) {
   if (!iso) return '—';
   try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
 }
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+// Step pipeline
+const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','gpkg_full','gpkg_light','json','upload','done'];
+const STEP_LBL = {cadastre:'Cadastre',lidar:'LiDAR',ortho:'Ortho',copernicus:'Copernicus',
+  hansen:'Hansen',segment:'Segment',gpkg_full:'GPKG Full',gpkg_light:'GPKG Light',
+  json:'JSON',upload:'Upload',done:'Done'};
+
+// ── Map ─────────────────────────────────────────────────────────
 function initMap() {
-  map = L.map('kgMap', { zoomControl: true, attributionControl: false }).setView([47.5, 13.5], 7);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 18, subdomains: 'abcd'
-  }).addTo(map);
-  mapMarkers.addTo(map);
-}
-
-function updateSubtitle(d) {
-  const el = document.getElementById('subtitle');
-  el.innerHTML = `Processing <b>${fmt(d.completed || 0)}</b>/<b>${fmt(d.total_kgs || 0)}</b> KGs • <b>${fmt(d.uploaded || 0)}</b> uploaded • <b>${fmt(d.failed || 0)}</b> failed`;
-}
-
-function updateProgress(d) {
-  const pct = d.total_kgs > 0 ? ((d.completed || 0) / d.total_kgs * 100) : 0;
-  document.getElementById('progressPct').textContent = pct.toFixed(1) + '%';
-  const bar = document.getElementById('progressBar');
-  bar.style.width = pct + '%';
-  bar.className = 'bar-fill ' + (d.failed > d.completed * 0.1 ? 'yellow' : 'green');
-
-  const stateEl = document.getElementById('stateLabel');
-  const state = d.state || 'idle';
-  stateEl.textContent = state;
-  stateEl.className = 'state-' + state;
-
-  document.getElementById('elapsed').textContent = fmtDuration(d.elapsed_seconds);
-  document.getElementById('eta').textContent = fmtDuration(d.eta_seconds);
-  document.getElementById('rate').textContent = d.rate_kgs_per_hour != null ? d.rate_kgs_per_hour.toFixed(1) : '—';
-  document.getElementById('avgTime').textContent = fmtDuration(d.avg_seconds_per_kg);
-
-  // Control button states
-  const btnStart = document.getElementById('btnStart');
-  const btnPause = document.getElementById('btnPause');
-  const btnResume = document.getElementById('btnResume');
-  if (state === 'running') {
-    btnStart.disabled = true; btnPause.disabled = false;
-    btnResume.style.display = 'none'; btnPause.style.display = '';
-  } else if (state === 'paused') {
-    btnStart.disabled = true; btnPause.style.display = 'none';
-    btnResume.style.display = ''; btnResume.disabled = false;
-  } else if (state === 'complete') {
-    btnStart.disabled = true; btnPause.disabled = true;
-    btnResume.style.display = 'none';
-  } else {
-    btnStart.disabled = false; btnPause.disabled = true;
-    btnResume.style.display = 'none';
-  }
-}
-
-function updateCurrentKg(d) {
-  const card = document.getElementById('currentKgCard');
-  const kg = d.current_kg;
-  if (!kg) {
-    const msg = d.state === 'complete' ? 'Processing complete ✓' :
-                d.state === 'paused' ? 'Processing paused' : 'No KG currently processing';
-    card.innerHTML = `<div style="color:var(--dim);font-size:12px">${msg}</div>`;
-    return;
-  }
-
-  const elapsed = kg.started_at ? Math.floor((Date.now() - new Date(kg.started_at).getTime()) / 1000) : 0;
-  const currentStepIdx = STEPS.indexOf(kg.step);
-
-  let stepsHtml = '<div class="steps">';
-  STEPS.forEach((s, i) => {
-    let cls = 'step';
-    if (i < currentStepIdx) cls += ' done';
-    else if (i === currentStepIdx) cls += ' active';
-    else cls += ' pending';
-    stepsHtml += `<span class="${cls}">${i === currentStepIdx ? '<span class="spinner"></span> ' : ''}${STEP_LABELS[s] || s}</span>`;
-  });
-  stepsHtml += '</div>';
-
-  card.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap">
-      <div>
-        <span style="font-size:16px;font-weight:bold;color:var(--text)">${kg.code}</span>
-        <span style="color:var(--dim);margin-left:6px">${kg.name || ''}</span>
-        <span style="color:var(--dim);font-size:11px;margin-left:6px">${kg.state || ''}</span>
-      </div>
-      <div style="font-size:12px;color:var(--dim)">⏱ ${fmtDuration(elapsed)}</div>
-    </div>
-    ${stepsHtml}
-  `;
-}
-
-function updateStats(d) {
-  document.getElementById('statProcessed').textContent = fmt(d.completed || 0);
-  document.getElementById('statProcessedDetail').textContent =
-    `${fmt(d.success || 0)} success / ${fmt(d.failed || 0)} failed`;
-
-  document.getElementById('statUploaded').textContent = fmt(d.uploaded || 0);
-  document.getElementById('statUploadedDetail').textContent = fmtBytes(d.upload_size_bytes || 0);
-
-  document.getElementById('statParcels').textContent = fmt(d.parcels_total || 0);
-  document.getElementById('statBuildings').textContent = fmt(d.buildings_total || 0);
-}
-
-function updateLog(d) {
-  const log = d.recent_log || [];
-  if (log.length === lastLogCount) return;
-  lastLogCount = log.length;
-
-  const area = document.getElementById('logArea');
-  let html = '';
-  // Show newest first (sort by timestamp descending)
-  const sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
-  sorted.forEach(entry => {
-    const lvl = entry.level || 'info';
-    const cls = lvl === 'error' ? 'log-error' : lvl === 'success' ? 'log-success' :
-                lvl === 'warn' || lvl === 'warning' ? 'log-warn' : 'log-info';
-    const ts = fmtTime(entry.ts);
-    const kgTag = entry.kg ? `[${entry.kg}] ` : '';
-    html += `<div class="log-entry ${cls}"><span class="log-ts">${ts}</span><span class="log-msg">${kgTag}${escHtml(entry.msg)}</span></div>`;
-  });
-  area.innerHTML = html;
-
-  if (document.getElementById('autoScroll').checked) {
-    area.scrollTop = 0;
-  }
-}
-
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-function updateFailed(d) {
-  const failed = d.failed_kgs || [];
-  document.getElementById('failedCount').textContent = failed.length;
-  const tbody = document.querySelector('#failedTable tbody');
-  if (failed.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:12px">No failed KGs</td></tr>';
-    return;
-  }
-  let html = '';
-  failed.forEach(f => {
-    html += `<tr>
-      <td style="color:var(--text);font-weight:bold">${f.code}</td>
-      <td>${f.name || '—'}</td>
-      <td><span class="step" style="display:inline-block">${STEP_LABELS[f.step] || f.step || '—'}</span></td>
-      <td style="color:var(--red);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(f.error)}">${escHtml(f.error) || '—'}</td>
-      <td style="white-space:nowrap">${fmtTime(f.ts)}</td>
-      <td><button class="btn btn-yellow" style="padding:2px 10px;font-size:11px" onclick="retryKg('${f.code}')">↻ Retry</button></td>
-    </tr>`;
-  });
-  tbody.innerHTML = html;
+  map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    {maxZoom:18, subdomains:'abcd'}).addTo(map);
+  mapMarkers = L.layerGroup().addTo(map);
 }
 
 function updateMap(d) {
   if (!map) return;
-  // We only update map if we have KG centroid data in the response
-  // For now, show failed KGs and current KG if coordinates are available
-  // The map will be populated if the API provides kg_centroids array
-  const centroids = d.kg_centroids;
-  if (!centroids || centroids.length === 0) return;
-
+  const c = d.kg_centroids;
+  if (!c || !c.length) return;
   mapMarkers.clearLayers();
-  centroids.forEach(c => {
-    const color = c.status === 'success' ? '#3fb950' :
-                  c.status === 'failed' ? '#f85149' :
-                  c.status === 'current' ? '#58a6ff' : '#30363d';
-    const marker = L.circleMarker([c.lat, c.lng], {
-      radius: 3, fillColor: color, fillOpacity: 0.7,
-      stroke: false
-    });
-    if (c.code) marker.bindTooltip(`${c.code} ${c.name || ''}`, { className: 'dark-tooltip' });
-    mapMarkers.addLayer(marker);
+  c.forEach(p => {
+    const col = p.status === 'success' ? '#3fb950' :
+                p.status === 'failed' ? '#f85149' :
+                p.status === 'current' ? '#58a6ff' : '#30363d';
+    const r = p.status === 'current' ? 5 : 3;
+    const m = L.circleMarker([p.lat, p.lng], {radius:r, fillColor:col, fillOpacity:0.7, stroke:false});
+    if (p.code) m.bindTooltip(p.code + ' ' + (p.name||''), {className:'dark-tooltip'});
+    mapMarkers.addLayer(m);
   });
 }
 
-function toggleFailed() {
-  const header = document.getElementById('failedHeader');
-  const body = document.getElementById('failedBody');
-  header.classList.toggle('open');
-  body.classList.toggle('open');
+// ── Collapsible ─────────────────────────────────────────────────
+function toggle(id) {
+  const h = document.getElementById(id + 'Head');
+  const b = document.getElementById(id + 'Body');
+  h.classList.toggle('open');
+  b.classList.toggle('open');
+  if (id === 'zen' && h.classList.contains('open')) fetchManifest();
 }
 
-function toggleZenodo() {
-  const header = document.getElementById('zenodoHeader');
-  const body = document.getElementById('zenodoBody');
-  const wasOpen = header.classList.contains('open');
-  header.classList.toggle('open');
-  body.classList.toggle('open');
-  if (!wasOpen) fetchManifest();
+// ── Cards ───────────────────────────────────────────────────────
+function updateCards(d) {
+  const s = d.state || 'idle';
+  const sys = d.system || {};
+  const mf = d.manifest || {};
+
+  // Service
+  const dots = {running:'●',idle:'○',paused:'◉',stopped:'○',complete:'✓'};
+  const sEl = document.getElementById('cServiceVal');
+  sEl.textContent = (dots[s]||'○') + ' ' + s.charAt(0).toUpperCase() + s.slice(1);
+  sEl.className = 'val st-' + s;
+  let sdet = '';
+  if (sys.proc_pid) sdet += 'PID ' + sys.proc_pid;
+  if (sys.proc_ram_mb) sdet += ' · ' + sys.proc_ram_mb + 'MB';
+  if (sys.copernicus_circuit) {
+    const cc = sys.copernicus_circuit;
+    sdet += ' <span class="badge badge-' + cc + '">cop ' + cc + '</span>';
+  }
+  document.getElementById('cServiceDet').innerHTML = sdet || '—';
+
+  // Progress
+  const done = d.completed || 0;
+  const total = d.total_kgs || 0;
+  const pct = total > 0 ? (done / total * 100) : 0;
+  document.getElementById('cProgVal').textContent = done + '/' + total;
+  const bar = document.getElementById('cProgBar');
+  bar.style.width = pct.toFixed(1) + '%';
+  bar.className = 'bar-fill ' + ((d.failed || 0) > done * 0.1 ? 'y' : 'g');
+  let pdet = '';
+  if (d.failed > 0) pdet += '<span style="color:var(--red)">' + d.failed + ' failed</span> · ';
+  if (d.current_kg) pdet += esc(d.current_kg.code) + ' ' + esc(d.current_kg.name || '');
+  else if (d.last_kg_code) pdet += 'last: ' + d.last_kg_code;
+  document.getElementById('cProgDet').innerHTML = pdet || '—';
+
+  // Rate
+  const rate = d.rate_kgs_per_hour;
+  document.getElementById('cRateVal').textContent = rate != null ? rate.toFixed(1) + ' KG/h' : '—';
+  let rdet = '';
+  if (d.avg_seconds_per_kg) rdet += 'avg ' + fmtD(d.avg_seconds_per_kg) + '/KG';
+  if (d.eta_seconds) rdet += ' · ETA ' + fmtD(d.eta_seconds);
+  if (d.last_kg_seconds) rdet += ' · last ' + fmtD(d.last_kg_seconds);
+  document.getElementById('cRateDet').innerHTML = rdet || '—';
+
+  // System
+  const hasRam = sys.ram_used_mb || sys.ram_total_mb || sys.cpu_pct != null;
+  if (hasRam) {
+    const procRam = sys.proc_ram_mb ? sys.proc_ram_mb + 'MB' : '—';
+    const totalRam = sys.ram_total_mb ? (sys.ram_total_mb/1024).toFixed(1) + 'GB' : '—';
+    const usedRam = sys.ram_used_mb ? (sys.ram_used_mb/1024).toFixed(1) + 'GB' : '—';
+    document.getElementById('cSysVal').innerHTML =
+      '<span style="font-size:14px">RAM</span> ' + usedRam + '/' + totalRam;
+    let sd = '';
+    if (sys.cpu_pct != null) sd += 'CPU ' + sys.cpu_pct.toFixed(0) + '%';
+    if (sys.proc_ram_mb) sd += ' · Proc ' + procRam;
+    if (sys.disk_free_gb != null) sd += ' · Disk ' + sys.disk_free_gb.toFixed(1) + 'GB free';
+    // Tile caches
+    const tc = sys.tile_caches || {};
+    const copTc = tc.copernicus || {};
+    const hanTc = tc.hansen || {};
+    const tcParts = [];
+    if (copTc.files) tcParts.push('Cop ' + copTc.files + ' tiles/' + (copTc.size_mb||0) + 'MB');
+    if (hanTc.files) tcParts.push('Han ' + hanTc.files + ' tiles/' + (hanTc.size_mb||0) + 'MB');
+    if (sys.json_cache_files) tcParts.push('JSON ' + sys.json_cache_files + '/' + (sys.json_cache_mb||0) + 'MB');
+    if (sys.gpkg_temp_files) tcParts.push('Temp ' + sys.gpkg_temp_files + '/' + (sys.gpkg_temp_mb||0) + 'MB');
+    if (tcParts.length) sd += '\n' + tcParts.join(' · ');
+    // Circuit breaker
+    if (sys.copernicus_circuit === 'open') sd += '\n⚡ Copernicus circuit OPEN';
+    if (sys.proc_pid) sd += '\nPID ' + sys.proc_pid;
+    document.getElementById('cSysDet').innerHTML = esc(sd).replace(/\n/g, '<br>') || '—';
+    // disk bar
+    const diskPct = sys.disk_used_pct || 0;
+    const df = document.getElementById('cDiskFill');
+    df.style.width = diskPct + '%';
+    df.style.background = diskPct > 90 ? 'var(--red)' : diskPct > 75 ? 'var(--yellow)' : 'var(--green)';
+  } else {
+    document.getElementById('cSysVal').textContent = '—';
+    document.getElementById('cSysDet').textContent = s === 'idle' ? 'waiting for data' : '—';
+  }
+
+  // Zenodo
+  const mc = mf.count || d.uploaded || 0;
+  const ms = mf.total_size_bytes || d.upload_size_bytes || 0;
+  document.getElementById('cZenVal').textContent = mc + ' uploaded';
+  document.getElementById('cZenDet').innerHTML = fmtB(ms) + ' total';
 }
 
-let lastManifestFetch = 0;
+// ── Subtitle ────────────────────────────────────────────────────
+function updateSubtitle(d) {
+  const el = document.getElementById('subtitle');
+  const elapsed = d.elapsed_seconds ? ' · elapsed <b>' + fmtD(d.elapsed_seconds) + '</b>' : '';
+  const started = d.started_at ? ' · since ' + fmtT(d.started_at) : '';
+  const extra = d.n_new_buildings_total ? ' · <b>' + fmt(d.n_new_buildings_total) + '</b> new buildings' : '';
+  const infra = d.n_infrastructure_total ? ' · <b>' + fmt(d.n_infrastructure_total) + '</b> infrastructure' : '';
+  el.innerHTML = '<b>' + fmt(d.completed||0) + '</b>/<b>' + fmt(d.total_kgs||0) + '</b> KGs · <b>' +
+    fmt(d.success||0) + '</b> success · <b>' + fmt(d.uploaded||0) + '</b> uploaded' +
+    extra + infra + elapsed + started;
+}
+
+// ── Current KG ──────────────────────────────────────────────────
+function updateKgCard(d) {
+  const card = document.getElementById('kgCard');
+  const kg = d.current_kg;
+  if (!kg) {
+    // Show idle state info
+    if (d.state === 'idle' || d.state === 'stopped') {
+      card.style.display = 'block';
+      card.style.borderColor = 'var(--border)';
+      const last = d.last_kg_code ? 'Last completed: ' + d.last_kg_code : '';
+      const t = d.last_kg_seconds ? ' in ' + fmtD(d.last_kg_seconds) : '';
+      card.innerHTML = '<div style="color:var(--dim);font-size:12px">' +
+        (d.state === 'idle' ? '○ Idle' : '■ Stopped') + (last ? ' · ' + last + t : '') +
+        '</div>';
+    } else if (d.state === 'complete') {
+      card.style.display = 'block';
+      card.style.borderColor = '#23492e';
+      card.innerHTML = '<div style="color:var(--green);font-size:13px">✓ Processing complete</div>';
+    } else if (d.state === 'paused') {
+      card.style.display = 'block';
+      card.style.borderColor = '#3d3019';
+      card.innerHTML = '<div style="color:var(--yellow);font-size:12px">◉ Paused</div>';
+    } else {
+      card.style.display = 'none';
+    }
+    clearKgTimer();
+    return;
+  }
+
+  card.style.display = 'block';
+  card.style.borderColor = 'rgba(88,166,255,0.3)';
+
+  // Timer
+  if (kg.started_at && kgTimerStart !== kg.started_at) {
+    kgTimerStart = kg.started_at;
+    clearKgTimer();
+    kgTimerInterval = setInterval(updateKgTimerDisplay, 1000);
+    updateKgTimerDisplay();
+  }
+
+  document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
+  document.getElementById('kgSub').textContent =
+    (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + (kg.step || '?');
+
+  // Steps pipeline
+  const curIdx = STEPS.indexOf(kg.step);
+  let sh = '';
+  STEPS.forEach((st, i) => {
+    let cls = 'stp';
+    if (i < curIdx) cls += ' done';
+    else if (i === curIdx) cls += ' act';
+    else cls += ' pend';
+    const pre = (i === curIdx) ? '<span class="spin"></span>' : '';
+    sh += '<span class="' + cls + '">' + pre + (STEP_LBL[st]||st) + '</span>';
+  });
+  document.getElementById('kgSteps').innerHTML = sh;
+}
+
+function updateKgTimerDisplay() {
+  if (!kgTimerStart) return;
+  const elapsed = Math.floor((Date.now() - new Date(kgTimerStart).getTime()) / 1000);
+  const el = document.getElementById('kgTimer');
+  if (el) el.textContent = '⏱ ' + fmtD(elapsed);
+}
+function clearKgTimer() {
+  if (kgTimerInterval) { clearInterval(kgTimerInterval); kgTimerInterval = null; }
+  kgTimerStart = null;
+}
+
+// ── Log ─────────────────────────────────────────────────────────
+function updateLog(d) {
+  const log = d.recent_log || [];
+  // Simple hash to avoid re-rendering identical log
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '');
+  if (hash === prevLogHash) return;
+  prevLogHash = hash;
+
+  const area = document.getElementById('logArea');
+  if (log.length === 0) {
+    area.innerHTML = '<div class="log-row log-info"><span class="log-msg">No recent activity</span></div>';
+    return;
+  }
+
+  // Newest first
+  const sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  let h = '';
+  sorted.forEach(e => {
+    const lvl = e.level || 'info';
+    const cls = 'log-row log-' + lvl;
+    h += '<div class="' + cls + '">' +
+      '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
+      (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +
+      '<span class="log-msg">' + esc(e.msg) + '</span></div>';
+  });
+  area.innerHTML = h;
+  if (document.getElementById('autoScroll').checked) area.scrollTop = 0;
+}
+
+// ── Failed KGs ──────────────────────────────────────────────────
+function updateFailed(d) {
+  const list = d.failed_kgs || [];
+  document.getElementById('failN').textContent = list.length;
+  const tb = document.querySelector('#failTbl tbody');
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:10px">No failures ✓</td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(f =>
+    '<tr>' +
+    '<td style="color:var(--text);font-weight:bold">' + esc(f.code) + '</td>' +
+    '<td>' + esc(f.name||'—') + '</td>' +
+    '<td><span class="stp" style="display:inline-block">' + (STEP_LBL[f.step]||f.step||'—') + '</span></td>' +
+    '<td style="color:var(--red);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(f.error) + '">' + esc(f.error||'—') + '</td>' +
+    '<td style="white-space:nowrap">' + fmtT(f.ts) + '</td>' +
+    '<td><button class="btn btn-y" style="padding:2px 8px;font-size:10px" onclick="retryKg(\'' + esc(f.code) + '\')">↻</button></td>' +
+    '</tr>'
+  ).join('');
+}
+
+// ── Controls ────────────────────────────────────────────────────
+function updateControls(d) {
+  const s = d.state || 'idle';
+  const start = document.getElementById('btnStart');
+  const pause = document.getElementById('btnPause');
+  const resume = document.getElementById('btnResume');
+  const stop = document.getElementById('btnStop');
+  if (s === 'running') {
+    start.disabled = true; pause.disabled = false; pause.style.display = '';
+    resume.style.display = 'none'; stop.disabled = false;
+  } else if (s === 'paused') {
+    start.disabled = true; pause.style.display = 'none';
+    resume.style.display = ''; resume.disabled = false; stop.disabled = false;
+  } else if (s === 'complete') {
+    start.disabled = true; pause.disabled = true; resume.style.display = 'none'; stop.disabled = true;
+  } else {
+    start.disabled = false; pause.disabled = true; resume.style.display = 'none'; stop.disabled = true;
+  }
+}
+
+// ── API Commands ────────────────────────────────────────────────
+async function sendCmd(action) {
+  try {
+    const r = await fetch('/api/v1/processing/' + action, {method:'POST'});
+    if (!r.ok) console.error(action + ':', await r.text());
+    setTimeout(poll, 400);
+  } catch(e) { console.error(action, e); }
+}
+async function processSingle() {
+  const v = document.getElementById('singleKg').value.trim();
+  if (!v) return;
+  try {
+    const r = await fetch('/api/v1/processing/single?kg=' + encodeURIComponent(v), {method:'POST'});
+    if (!r.ok) alert('Failed: ' + await r.text());
+    else document.getElementById('singleKg').value = '';
+    setTimeout(poll, 400);
+  } catch(e) { console.error(e); }
+}
+async function retryKg(code) {
+  try {
+    const r = await fetch('/api/v1/processing/retry?kg=' + encodeURIComponent(code), {method:'POST'});
+    if (!r.ok) alert('Retry failed: ' + await r.text());
+    setTimeout(poll, 400);
+  } catch(e) { console.error(e); }
+}
+
+// ── Zenodo Manifest ─────────────────────────────────────────────
+let lastManFetch = 0;
 async function fetchManifest() {
-  // Rate-limit: max once per 10s
-  if (Date.now() - lastManifestFetch < 10000) return;
-  lastManifestFetch = Date.now();
+  if (Date.now() - lastManFetch < 10000) return;
+  lastManFetch = Date.now();
   try {
     const r = await fetch('/api/v1/processing/manifest');
     if (!r.ok) return;
     const d = await r.json();
-    document.getElementById('zenodoCount').textContent = fmt(d.count || 0);
-    document.getElementById('zenodoSize').textContent = fmtBytes(d.total_size_bytes || 0);
-    const tbody = document.querySelector('#zenodoTable tbody');
+    document.getElementById('zenSummary').textContent =
+      fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
     const entries = d.entries || {};
     const keys = Object.keys(entries).sort();
-    // Show most recent first (by uploaded_at), limit to 200 rows
-    const sorted = keys.map(k => ({key: k, ...entries[k]}))
-      .sort((a, b) => (b.uploaded_at || '').localeCompare(a.uploaded_at || ''))
+    const sorted = keys.map(k => ({key:k, ...entries[k]}))
+      .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''))
       .slice(0, 200);
-    tbody.innerHTML = sorted.map(e => {
-      const bucketUrl = e.bucket_url || '';
-      const fileUrl = bucketUrl ? `${bucketUrl}/${e.filename || ''}` : '';
-      const md5Short = (e.checksum || '').substring(0, 12);
-      const ts = e.uploaded_at ? new Date(e.uploaded_at).toLocaleString() : '—';
-      const isError = e.key && e.key.endsWith('_error');
-      const rowStyle = isError ? ' style="color:var(--red)"' : '';
-      return `<tr${rowStyle}>
-        <td>${esc(e.key || '')}</td>
-        <td>${e.depo_id || '—'}</td>
-        <td>${esc(e.filename || '—')}</td>
-        <td>${fmtBytes(e.size || 0)}</td>
-        <td title="${esc(e.checksum || '')}">${md5Short || '—'}</td>
-        <td>${ts}</td>
-        <td>${esc(e.version || '—')}</td>
-        <td>${fileUrl ? `<a href="${esc(fileUrl)}" target="_blank" style="color:var(--blue)">link</a>` : '—'}</td>
-      </tr>`;
+    document.querySelector('#zenTbl tbody').innerHTML = sorted.map(e => {
+      const url = e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '';
+      const md5 = (e.checksum||'').substring(0,12);
+      return '<tr>' +
+        '<td>' + esc(e.key||'') + '</td>' +
+        '<td>' + (e.depo_id||'—') + '</td>' +
+        '<td>' + esc(e.filename||'—') + '</td>' +
+        '<td>' + fmtB(e.size||0) + '</td>' +
+        '<td title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
+        '<td>' + (e.uploaded_at ? new Date(e.uploaded_at).toLocaleString() : '—') + '</td>' +
+        '<td>' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)">↗</a>' : '—') + '</td>' +
+        '</tr>';
     }).join('');
-  } catch (e) { console.error('Manifest fetch error:', e); }
+  } catch(e) { console.error('manifest:', e); }
 }
 
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-async function sendCmd(action) {
-  try {
-    const r = await fetch(`/api/v1/processing/${action}`, { method: 'POST' });
-    if (!r.ok) {
-      const t = await r.text();
-      console.error(`${action} failed:`, t);
-    }
-    setTimeout(poll, 500);
-  } catch (e) { console.error(`${action} error:`, e); }
-}
-
-async function processSingleKg() {
-  const input = document.getElementById('singleKgInput');
-  const kg = input.value.trim();
-  if (!kg) return;
-  try {
-    const r = await fetch(`/api/v1/processing/single?kg=${encodeURIComponent(kg)}`, { method: 'POST' });
-    if (!r.ok) {
-      const t = await r.text();
-      alert(`Failed: ${t}`);
-    } else {
-      input.value = '';
-    }
-    setTimeout(poll, 500);
-  } catch (e) { console.error('Single KG error:', e); }
-}
-
-async function retryKg(code) {
-  try {
-    const r = await fetch(`/api/v1/processing/retry?kg=${encodeURIComponent(code)}`, { method: 'POST' });
-    if (!r.ok) {
-      const t = await r.text();
-      alert(`Retry failed: ${t}`);
-    }
-    setTimeout(poll, 500);
-  } catch (e) { console.error('Retry error:', e); }
-}
-
+// ── Main Poll ───────────────────────────────────────────────────
 async function poll() {
+  const dot = document.getElementById('pollDot');
+  dot.style.background = 'var(--blue)';
   try {
     const r = await fetch(API);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-
     updateSubtitle(d);
-    updateProgress(d);
-    updateCurrentKg(d);
-    updateStats(d);
+    updateCards(d);
+    updateKgCard(d);
     updateLog(d);
     updateFailed(d);
+    updateControls(d);
     updateMap(d);
-    // Auto-refresh manifest if section is open
-    if (document.getElementById('zenodoHeader').classList.contains('open')) fetchManifest();
-  } catch (e) {
-    console.error('Poll error:', e);
+    if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
+    document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString();
+    dot.style.background = 'var(--green)';
+  } catch(e) {
+    console.error('poll:', e);
+    dot.style.background = 'var(--red)';
   }
 }
 
-function initPage() {
-  initMap();
-  poll();
-  setInterval(poll, POLL_INTERVAL * 1000);
-  setInterval(() => {
-    countdown--;
-    if (countdown <= 0) countdown = POLL_INTERVAL;
-    document.getElementById('pollCountdown').textContent = countdown;
-  }, 1000);
-}
-
-initPage();
+// ── Init ────────────────────────────────────────────────────────
+initMap();
+poll();
+setInterval(poll, POLL * 1000);
+setInterval(() => {
+  cd--;
+  if (cd <= 0) cd = POLL;
+  document.getElementById('pollCd').textContent = cd;
+}, 1000);
 </script>
 </body>
 </html>

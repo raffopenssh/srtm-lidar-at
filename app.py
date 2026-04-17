@@ -742,6 +742,56 @@ def processing_status():
         if _processor_process is not None and _processor_process.poll() is not None:
             data['state'] = 'stopped'
             _processor_process = None
+        # Always add fresh system metrics (even if processor writes them too)
+        if 'system' not in data:
+            data['system'] = {}
+        try:
+            import pathlib as _pl
+            # Live RAM
+            mi = open('/proc/meminfo').read()
+            mt = ma = 0
+            for line in mi.splitlines():
+                if line.startswith('MemTotal:'):
+                    mt = int(line.split()[1]) // 1024
+                elif line.startswith('MemAvailable:'):
+                    ma = int(line.split()[1]) // 1024
+            if mt:
+                data['system']['ram_total_mb'] = mt
+                data['system']['ram_used_mb'] = mt - ma
+                data['system']['ram_pct'] = round(100 * (mt - ma) / mt, 1)
+            # Disk
+            st = os.statvfs('/')
+            fg = (st.f_bavail * st.f_frsize) / (1024**3)
+            tg = (st.f_blocks * st.f_frsize) / (1024**3)
+            data['system']['disk_free_gb'] = round(fg, 1)
+            data['system']['disk_used_pct'] = round(100*(1 - fg/tg), 1)
+            # CPU
+            data['system']['cpu_pct'] = round(100 * os.getloadavg()[0] / max(os.cpu_count() or 1, 1), 1)
+            # Processor PID check
+            if _processor_process and _processor_process.poll() is None:
+                data['system']['proc_pid'] = _processor_process.pid
+                try:
+                    rss_kb = int(open(f'/proc/{_processor_process.pid}/status').read().split('VmRSS:')[1].split()[0])
+                    data['system']['proc_ram_mb'] = rss_kb // 1024
+                except Exception:
+                    pass
+            # Tile caches
+            try:
+                from tile_cache import cache_summary
+                data['system']['tile_caches'] = cache_summary()
+            except Exception:
+                pass
+            # Manifest summary
+            mf = _pl.Path('data/austria_processor/zenodo_manifest.json')
+            if mf.exists():
+                md = json.loads(mf.read_text())
+                ents = md.get('entries', {})
+                data['manifest'] = {
+                    'count': len(ents),
+                    'total_size_bytes': sum(e.get('size', 0) for e in ents.values()),
+                }
+        except Exception:
+            pass
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

@@ -209,7 +209,7 @@ class CopernicusTileCache:
             bbox["west"], bbox["south"], bbox["east"], bbox["north"],
             self.GRID_STEP)
 
-    def get_ndvi(self, bbox_wgs: dict, year: int = 2024) -> Optional[dict]:
+    def get_ndvi(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
         """Get NDVI composite, using grid-snapped cache."""
         tw, ts, te, tn = self._snap(bbox_wgs)
         tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
@@ -232,7 +232,8 @@ class CopernicusTileCache:
         self._stats["misses"] += 1
         try:
             import copernicus
-            result = copernicus.get_ndvi_composite(tile_bbox, year=year)
+            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
+            result = copernicus.get_ndvi_composite(tile_bbox, year=year, _conn=_conn)
             # Save to cache
             tf = result["transform"]
             _atomic_savez(
@@ -253,7 +254,7 @@ class CopernicusTileCache:
             log.warning("Copernicus NDVI tile fetch failed: %s", e)
             return None
 
-    def get_landcover(self, bbox_wgs: dict) -> Optional[dict]:
+    def get_landcover(self, bbox_wgs: dict, cred_index: int = None) -> Optional[dict]:
         """Get ESA WorldCover, grid-snapped."""
         tw, ts, te, tn = self._snap(bbox_wgs)
         tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
@@ -270,7 +271,8 @@ class CopernicusTileCache:
         self._stats["misses"] += 1
         try:
             import copernicus
-            result = copernicus.get_land_cover(tile_bbox)
+            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
+            result = copernicus.get_land_cover(tile_bbox, _conn=_conn)
             _atomic_savez(path, data=np.array(result, dtype=object))
             log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
                      tw, ts, te, tn)
@@ -284,7 +286,7 @@ class CopernicusTileCache:
             log.warning("Copernicus WorldCover tile fetch failed: %s", e)
             return None
 
-    def get_sar(self, bbox_wgs: dict, year: int = 2024) -> Optional[dict]:
+    def get_sar(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
         """Get SAR backscatter, grid-snapped."""
         tw, ts, te, tn = self._snap(bbox_wgs)
         tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
@@ -305,8 +307,9 @@ class CopernicusTileCache:
         self._stats["misses"] += 1
         try:
             import copernicus
+            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
             result = copernicus.get_sar_backscatter(
-                tile_bbox, f"{year}-06-01", f"{year}-09-30")
+                tile_bbox, f"{year}-06-01", f"{year}-09-30", _conn=_conn)
             tf = result["transform"]
             _atomic_savez(
                 path,

@@ -734,9 +734,7 @@ def get_ndvi_timeseries(
             current = current.replace(month=current.month + 1)
     logger.info("NDVI months to fetch: %s", [m.strftime('%Y-%m') for m in months])
 
-    # Fetch each month as a separate NDVI composite — parallel downloads
-    import concurrent.futures
-
+    # Fetch each month as a separate NDVI composite — sequential downloads
     monthly_ndvi: Dict[str, np.ndarray] = {}
     transform = None
     crs = None
@@ -768,17 +766,17 @@ def get_ndvi_timeseries(
     _consecutive_402: Dict[int, int] = {}  # cred_idx -> consecutive 402 count
     _402_THRESHOLD = 3  # mark exhausted only after this many consecutive 402s
 
-    def _download_month(args):
-        import re as _re
+    def _download_month_sequential(label, m_start, m_end, month_cache):
+        """Download a single month's NDVI using the current credential.
+        Returns (label, error_or_None)."""
         import time as _time
-        label, m_start, m_end, month_cache, cred_idx = args
-        logger.info("Fetching NDVI for %s (%s → %s) [cred %d]", label, m_start, m_end, cred_idx + 1)
-        max_retries = 4  # increased to give room for 402 retries
+        max_retries = 3
         for attempt in range(max_retries + 1):
+            if credits_exhausted:
+                return label, CreditsExhaustedError("all exhausted")
             try:
-                # Invalidate stale connection for this cred (may have been
-                # cleared by a probe or rotation on another thread)
-                c = _get_connection_for_cred(cred_idx)
+                cred_idx = _credential_index
+                c = _get_connection()
                 s2 = c.load_collection(
                     "SENTINEL2_L2A",
                     spatial_extent=bbox,
@@ -792,8 +790,6 @@ def get_ndvi_timeseries(
                 ndvi_median = ndvi_cube.reduce_dimension(
                     dimension="t", reducer="median",
                 )
-                # Use sync-only download for monthly NDVI — don't fall back to
-                # batch on EmptyBounds (no data = skip month, batch won't help)
                 month_cache.parent.mkdir(parents=True, exist_ok=True)
                 tmp_month = month_cache.with_suffix(month_cache.suffix + ".tmp")
                 try:
@@ -806,176 +802,98 @@ def get_ndvi_timeseries(
                 except Exception:
                     tmp_month.unlink(missing_ok=True)
                     raise
-                # Success — reset consecutive 402 counter for this cred
-                with _cred_lock:
-                    _consecutive_402.pop(cred_idx, None)
                 logger.info("NDVI %s downloaded OK", label)
                 return label, None
             except CredentialRotatedError:
-                # _check_credits_error rotated us — pick up the new cred
-                with _cred_lock:
-                    cred_idx = _credential_index
-                logger.info("NDVI %s: credential rotated, retrying with cred %d",
-                            label, cred_idx + 1)
+                logger.info("NDVI %s: credential rotated, retrying", label)
                 continue
             except CreditsExhaustedError as exc:
-                # All credentials gone; signal to orchestrator
                 logger.error("NDVI %s: all credentials exhausted", label)
                 return label, exc
             except Exception as exc:
                 exc_str = str(exc)
 
-                # --- Handle 402 with backoff (treat like 429 initially) ---
-                if '402' in exc_str and 'PaymentRequired' in exc_str:
-                    with _cred_lock:
-                        _consecutive_402[cred_idx] = _consecutive_402.get(cred_idx, 0) + 1
-                        n402 = _consecutive_402[cred_idx]
+                # --- No data / overcast month detection ---
+                # openEO returns various errors when a month has no valid
+                # pixels after cloud masking (fully overcast).
+                is_nodata = False
+                nodata_patterns = [
+                    'EmptyBounds', 'empty collection', 'no data available',
+                    'NoDataAvailable', 'ResultTooLarge',
+                ]
+                for pat in nodata_patterns:
+                    if pat.lower() in exc_str.lower():
+                        is_nodata = True
+                        break
+                # Also treat empty-file errors as no-data
+                if 'download produced empty file' in exc_str:
+                    is_nodata = True
 
-                    if n402 < _402_THRESHOLD and attempt < max_retries:
-                        # Likely transient rate-limit from parallel requests.
-                        # Back off longer than for 429 (30s base).
-                        wait_secs = 30 * n402  # 30s, 60s
-                        logger.warning(
-                            "NDVI %s got 402 (cred %d, hit #%d/%d), "
-                            "treating as transient rate-limit — backoff %ds...",
-                            label, cred_idx + 1, n402, _402_THRESHOLD, wait_secs,
-                        )
-                        # Invalidate cached connection so next attempt re-auths
-                        with _cred_lock:
-                            _connections.pop(cred_idx, None)
-                        _time.sleep(wait_secs)
-                        continue
-                    else:
-                        # Threshold reached — let _check_credits_error decide
-                        # (it will probe before marking permanently exhausted)
-                        logger.warning(
-                            "NDVI %s: %d consecutive 402s on cred %d — "
-                            "checking if truly exhausted...",
-                            label, n402, cred_idx + 1,
-                        )
-                        try:
-                            _check_credits_error(exc, cred_index=cred_idx)
-                            # If _check_credits_error returned (probe passed),
-                            # the 402 was transient.  Retry.
-                            with _cred_lock:
-                                _consecutive_402[cred_idx] = 0
-                                _connections.pop(cred_idx, None)
-                            if attempt < max_retries:
-                                logger.info(
-                                    "NDVI %s: probe passed for cred %d, retrying...",
-                                    label, cred_idx + 1,
-                                )
-                                _time.sleep(15)
-                                continue
-                        except CredentialRotatedError:
-                            with _cred_lock:
-                                cred_idx = _credential_index
-                            logger.info(
-                                "NDVI %s: cred exhausted, rotated to cred %d",
-                                label, cred_idx + 1,
+                if is_nodata:
+                    logger.info(
+                        "NDVI %s: no cloud-free data available (likely overcast) — skipping",
+                        label,
+                    )
+                    return label, None  # not an error, just no data
+
+                # --- Handle 402 PaymentRequired ---
+                if '402' in exc_str and 'PaymentRequired' in exc_str:
+                    # Let _check_credits_error probe + rotate if needed
+                    try:
+                        _check_credits_error(exc)
+                        # Probe passed — transient 402.  Retry with backoff.
+                        if attempt < max_retries:
+                            wait_secs = 10 * (attempt + 1)
+                            logger.warning(
+                                "NDVI %s: transient 402 (attempt %d/%d), "
+                                "backoff %ds...",
+                                label, attempt + 1, max_retries, wait_secs,
                             )
-                            if attempt < max_retries:
-                                continue
-                        except CreditsExhaustedError as ce:
-                            return label, ce
-                        # Fall through to skip
+                            _time.sleep(wait_secs)
+                            continue
+                    except CredentialRotatedError:
+                        # Rotated to fresh credential — retry immediately
+                        logger.info("NDVI %s: credential exhausted, rotated to next", label)
+                        if attempt < max_retries:
+                            continue
+                    except CreditsExhaustedError as ce:
+                        return label, ce
+                    logger.warning(
+                        "NDVI %s: persistent 402 after %d retries — skipping month",
+                        label, max_retries,
+                    )
+                    return label, exc
 
                 # --- Handle 429 / 503 with backoff ---
                 if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt < max_retries:
-                    # Parse Retry-After from exception string if available
-                    retry_match = _re.search(r'Retry-After[":\s]+(\d+)', exc_str, _re.IGNORECASE)
-                    if retry_match:
-                        wait_secs = int(retry_match.group(1))
-                    else:
-                        wait_secs = 10 * (attempt + 1)  # 10s, 20s, 30s
+                    wait_secs = 10 * (attempt + 1)
                     logger.warning(
-                        "NDVI %s rate limited/overloaded, retry %d/%d in %ds...",
-                        label, attempt + 1, max_retries, wait_secs,
+                        "NDVI %s: rate limited (%s), retry %d/%d in %ds...",
+                        label,
+                        '429' if '429' in exc_str else '503',
+                        attempt + 1, max_retries, wait_secs,
                     )
-                    # Don't rotate credentials on 429 from parallel workers —
-                    # just wait and retry with the same cred.
                     _time.sleep(wait_secs)
                     continue
 
                 # --- Other errors — skip month ---
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
-        # Should not be reached, but guard anyway
         return label, Exception(f"NDVI {label}: retries exhausted")
 
-    def _download_sequential(download_list):
-        """Fallback: download months one-at-a-time with a single credential.
-        Used when parallel downloads cause too many 402s."""
-        import time as _time
-        results = []
-        for label, ms, me, mc in download_list:
-            if credits_exhausted:
-                results.append((label, CreditsExhaustedError("all exhausted")))
-                continue
-            func_creds = FUNCTIONING_CREDENTIALS()
-            cred = func_creds[0] if func_creds else _credential_index
-            result = _download_month((label, ms, me, mc, cred))
-            results.append(result)
-            if result[1] is None:
-                _time.sleep(2)  # gentle pacing between sequential downloads
-        return results
-
     if to_download:
-        _func_creds = FUNCTIONING_CREDENTIALS()
-        if not _func_creds:
-            # All credentials exhausted — fall back to current credential index
-            # (it may have recovered, or will raise CreditsExhaustedError)
-            _func_creds = [_credential_index]
-            logger.warning("All credentials marked exhausted, falling back to cred %d", _credential_index + 1)
-        _n_par = max(len(_func_creds), 1)
-        # Assign each download task a credential index (round-robin)
-        to_download_with_cred = [
-            (label, ms, me, mc, _func_creds[i % _n_par])
-            for i, (label, ms, me, mc) in enumerate(to_download)
-        ]
-        logger.info("Downloading %d NDVI months (%d parallel)...", len(to_download), _n_par)
-
-        # Phase 1: parallel download
-        failed_tasks = []  # tasks that got CreditsExhaustedError
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_n_par) as pool:
-            futures = {pool.submit(_download_month, t): t for t in to_download_with_cred}
-            for fut in concurrent.futures.as_completed(futures):
-                task = futures[fut]
-                label, exc = fut.result()
-                if exc is None:
-                    logger.info("Month %s done", label)
-                elif isinstance(exc, CreditsExhaustedError):
-                    # Collect for sequential fallback (credits may recover)
-                    failed_tasks.append((task[0], task[1], task[2], task[3]))
-                    logger.warning("Month %s got CreditsExhaustedError in parallel phase", label)
-                else:
-                    logger.debug("Month %s failed: %s", label, exc)
-
-        # Phase 2: if any tasks failed with exhaustion errors during parallel
-        # download, reset exhaustion tracking and try sequentially.
-        # Parallel 402s are often transient rate-limits, not real exhaustion.
-        if failed_tasks and not all(
-            mc.exists() and _validate_cache(mc) for _, _, _, mc in failed_tasks
-        ):
-            still_needed = [
-                (l, ms, me, mc) for l, ms, me, mc in failed_tasks
-                if not (mc.exists() and _validate_cache(mc))
-            ]
-            if still_needed:
-                logger.info(
-                    "Retrying %d months sequentially after parallel 402 failures...",
-                    len(still_needed),
-                )
-                # Reset exhaustion — parallel 402s were likely transient
-                reset_exhausted_credentials()
-                import time as _time
-                _time.sleep(15)  # let rate-limits cool down
-                seq_results = _download_sequential(still_needed)
-                for label, exc in seq_results:
-                    if exc is None:
-                        logger.info("Sequential month %s done", label)
-                    else:
-                        logger.debug("Sequential month %s failed: %s", label, exc)
+        import time as _time
+        logger.info("Downloading %d NDVI months (sequential, single credential)...", len(to_download))
+        for label, m_start, m_end, month_cache in to_download:
+            lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
+            if exc is None:
+                logger.info("Month %s done", lbl)
+            elif isinstance(exc, CreditsExhaustedError):
+                logger.warning("Stopping NDVI downloads — credits exhausted")
+                break
+            else:
+                logger.debug("Month %s failed: %s", lbl, exc)
+            _time.sleep(2)  # gentle pacing between sequential downloads
 
     # Read all cached months
     for label, m_start, m_end, month_cache in tasks:

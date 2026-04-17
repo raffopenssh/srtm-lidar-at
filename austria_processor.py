@@ -4062,10 +4062,24 @@ def main():
                                 if ts_list is not None:
                                     ckg["tile_statuses"] = ts_list
                         if s and s != last_step:
+                            prev_step = last_step
                             last_step = s
                             progress.set_step(s)
+                            # Log the NEW step starting
                             if detail:
                                 progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)
+                            # If the PREVIOUS step had issues, log its completion
+                            # at that level so the log matches the tag badge
+                            if prev_step and prev_step in _step_issues:
+                                issue_lvl = _step_issues[prev_step]
+                                step_label = prev_step
+                                step_time = sd.get("step_times", {}).get(prev_step)
+                                time_str = f" ({step_time}s)" if step_time else ""
+                                progress.add_log(
+                                    issue_lvl,
+                                    f"KG {_code}: {step_label}{time_str} completed with {issue_lvl}s",
+                                    _code,
+                                )
                             progress.save()
                 except Exception:
                     pass

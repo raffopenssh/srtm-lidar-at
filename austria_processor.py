@@ -2571,20 +2571,28 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         def __init__(self, path):
             super().__init__(level=logging.WARNING)
             self._path = path
-        # Known-harmless messages to suppress (not relay to dashboard)
+        # Known-harmless messages to suppress entirely
         _SUPPRESS = (
             "DeprecationWarning: 'Memory' driver is deprecated",
+            "Failed to parse API error response",
+        )
+        # Messages to downgrade from error → warning (non-fatal)
+        _DOWNGRADE = (
+            "Preflight process graph validation failed",
         )
         def emit(self, record):
             try:
                 msg = self.format(record)
-                # Skip known-harmless GDAL deprecation noise
                 if any(s in msg for s in self._SUPPRESS):
                     return
+                lvl = "error" if record.levelno >= logging.ERROR else "warning"
+                # Downgrade non-fatal errors to warnings
+                if lvl == "error" and any(s in msg for s in self._DOWNGRADE):
+                    lvl = "warning"
                 import json as _j
                 entry = _j.dumps({
                     "ts": datetime.now(timezone.utc).isoformat(),
-                    "level": "error" if record.levelno >= logging.ERROR else "warning",
+                    "level": lvl,
                     "msg": msg,
                     "step": _prev_step[0] or "",
                 }) + "\n"

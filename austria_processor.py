@@ -2589,6 +2589,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     logging.getLogger().addHandler(_relay_handler)
 
     _subtile_progress = [None]  # [dict | None] — set when processing a sub-tile
+    _tile_statuses = []  # [{lat, lng, status, issues, subtile_info}] — per-tile dots for map
 
     def _report_step(step, detail=""):
         try:
@@ -2609,6 +2610,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                        "n_tiles": _tile_progress[1]}
             if _subtile_progress[0] is not None:
                 payload["subtile"] = _subtile_progress[0]
+            if _tile_statuses:
+                payload["tile_statuses"] = _tile_statuses
             _json.dump(payload, open(str(step_file) + ".tmp", "w"))
             os.rename(str(step_file) + ".tmp", str(step_file))
         except Exception:
@@ -2781,6 +2784,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 tile_label = f"tile {tile_idx+1}/{n_tiles}"
                 _subtile_progress[0] = None
             result["step"] = f"tile_{tile_idx+1}"
+            # Track tile centroid + status for dashboard map
+            _tile_lat = (ts + tn) / 2
+            _tile_lng = (tw + te) / 2
+            _tile_entry = {"lat": round(_tile_lat, 5), "lng": round(_tile_lng, 5),
+                          "status": "current", "issues": {},
+                          "idx": tile_idx + 1}
+            if _sti:
+                _tile_entry["subtile"] = {"orig": _orig_idx + 1, "sub": _si + 1,
+                                          "n_sub": _nsub, "km": _skm}
+            _tile_statuses.append(_tile_entry)
             _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
 
             # --- Check for cached tile checkpoint ---
@@ -2817,6 +2830,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 # Remap labels in seg_result to match new obj_ids
                 # (not needed — labels are per-tile and used by
                 # build_*_tiled with their own obj_map)
+                # Mark tile as done-from-cache on dashboard map
+                _tile_avail = cached_tile.get("tile_avail", {})
+                _tile_entry["status"] = "done"
+                _tile_entry["issues"] = {
+                    k: ("ok" if _tile_avail.get(k) else "miss")
+                    for k in ["lidar", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+                }
+                _tile_entry["n_objects"] = len(cached_tile.get("core_objects", []))
                 _report_step(f"tile_{tile_idx+1}", f"restored from cache")
                 continue
 
@@ -2848,6 +2869,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except Exception as e:
                 log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
                 tile_data_availability.append(tile_avail)
+                _tile_entry["status"] = "error"
+                _tile_entry["issues"]["lidar"] = "fail"
                 continue
             th, tw_ = tdata["shape"]
             tvalid = int(tdata["mask"].sum())
@@ -2856,6 +2879,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 tile_data_availability.append(tile_avail)
                 # Cache empty tiles — deterministic, no point retrying
                 _save_tile_checkpoint(tile_idx, None, [], [], [], tile_avail, None, {}, {}, {}, 0)
+                _tile_entry["status"] = "skip"
                 continue
 
             t_transform = tdata["transform"]
@@ -3218,6 +3242,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
             log.info("KG %s %s: done (%d objects, %d core)",
                      kg_code, tile_label, len(id_remap), len(core_objects))
+            # Update tile status for dashboard map
+            _tile_entry["status"] = "done"
+            _tile_entry["issues"] = {
+                k: ("ok" if tile_avail.get(k) else "miss")
+                for k in ["lidar", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+            }
+            _tile_entry["n_objects"] = len(core_objects)
             _report_step(f"tile_{tile_idx+1}",
                          f"done: {len(core_objects)} objects")
 
@@ -4025,6 +4056,10 @@ def main():
                                     ckg.pop("step_detail", None)
                                 # Expose step issues to frontend
                                 ckg["step_issues"] = dict(_step_issues)
+                                # Relay per-tile statuses for map dots
+                                ts_list = sd.get("tile_statuses")
+                                if ts_list is not None:
+                                    ckg["tile_statuses"] = ts_list
                         if s and s != last_step:
                             last_step = s
                             progress.set_step(s)

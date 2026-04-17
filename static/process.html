@@ -82,6 +82,14 @@
   /* Map */
   #kgMap { height: 200px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px; }
   .leaflet-container { background: var(--bg) !important; }
+  .tile-dot-current {
+    animation: tilePulse 2s ease-in-out infinite;
+    filter: drop-shadow(0 0 6px #58a6ff) drop-shadow(0 0 12px #58a6ff);
+  }
+  @keyframes tilePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.6); }
+  }
 
   /* Log */
   .log-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
@@ -331,6 +339,7 @@ const POLL = 5;
 let cd = POLL;
 let map, mapMarkers;
 let copLayer, hanLayer;
+let tileDotsLayer;
 let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
@@ -370,11 +379,11 @@ function initMap() {
   map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
-  mapMarkers = L.layerGroup().addTo(map);
   copLayer = L.layerGroup().addTo(map);
   hanLayer = L.layerGroup().addTo(map);
+  tileDotsLayer = L.layerGroup().addTo(map);
   L.control.layers(null, {
-    'KG centroids': mapMarkers,
+    'Tile dots': tileDotsLayer,
     'Copernicus tiles (0.1°)': copLayer,
     'Hansen tiles (0.5°)': hanLayer,
   }, {collapsed: true, position: 'topright'}).addTo(map);
@@ -382,19 +391,64 @@ function initMap() {
 }
 
 function updateMap(d) {
-  if (!map) return;
-  const c = d.kg_centroids;
-  if (!c || !c.length) return;
-  mapMarkers.clearLayers();
-  c.forEach(p => {
-    const col = p.status === 'success' ? '#3fb950' :
-                p.status === 'failed' ? '#f85149' :
-                p.status === 'current' ? '#58a6ff' : '#30363d';
-    const r = p.status === 'current' ? 5 : 3;
-    const m = L.circleMarker([p.lat, p.lng], {radius:r, fillColor:col, fillOpacity:0.7, stroke:false});
-    if (p.code) m.bindTooltip(p.code + ' ' + (p.name||''), {className:'dark-tooltip'});
-    mapMarkers.addLayer(m);
+  // KG-level centroids removed — tile dots handle current KG.
+  // Completed/failed KGs still get a marker via tile_statuses.
+}
+
+function updateTileDots(d) {
+  if (!map || !tileDotsLayer) return;
+  const kg = d.current_kg;
+  const tiles = kg && kg.tile_statuses;
+  if (!tiles || !tiles.length) { tileDotsLayer.clearLayers(); return; }
+  tileDotsLayer.clearLayers();
+
+  // Detect if all tiles of the KG are done (none "current")
+  const allDone = tiles.every(t => t.status === 'done' || t.status === 'skip');
+
+  tiles.forEach(t => {
+    let col, radius = 4, opacity = 0.85, cls = '';
+    if (t.status === 'current') {
+      col = '#58a6ff'; radius = 6; cls = 'tile-dot-current';
+    } else if (t.status === 'skip') {
+      col = '#30363d'; radius = 2; opacity = 0.4;
+    } else if (t.status === 'error') {
+      col = '#f85149'; radius = 5;
+    } else if (t.status === 'done') {
+      if (allDone) {
+        // KG complete — all dots turn bright green
+        col = '#3fb950'; radius = 4; opacity = 0.9;
+      } else {
+        // Grade by layer availability
+        const iss = t.issues || {};
+        const layers = ['lidar','ortho','copernicus_ndvi','worldcover','sar','hansen'];
+        const ok = layers.filter(l => iss[l] === 'ok').length;
+        const pct = ok / layers.length;
+        if (pct >= 0.8) col = '#3fb950';
+        else if (pct >= 0.5) col = '#d29922';
+        else col = '#f0883e';
+      }
+    } else {
+      col = '#484f58'; radius = 3; opacity = 0.5; // queued / unknown
+    }
+    if (t.subtile) radius = Math.max(2, radius - 1);
+    const opts = { radius, fillColor: col, fillOpacity: opacity,
+                   stroke: t.status === 'current', color: col,
+                   weight: 1, opacity: 0.6 };
+    if (cls) opts.className = cls;
+    const m = L.circleMarker([t.lat, t.lng], opts);
+    // Tooltip
+    let tip = 'Tile ' + t.idx;
+    if (t.subtile) tip += ' (sub ' + t.subtile.sub + '/' + t.subtile.n_sub + ' @ ' + t.subtile.km + 'km)';
+    tip += ' — ' + t.status;
+    if (t.n_objects != null) tip += ' · ' + t.n_objects + ' obj';
+    if (t.issues && t.status === 'done') {
+      const miss = Object.entries(t.issues).filter(([,v]) => v !== 'ok').map(([k]) => k);
+      if (miss.length) tip += ' · missing: ' + miss.join(', ');
+    }
+    m.bindTooltip(tip, {className: 'dark-tooltip'});
+    tileDotsLayer.addLayer(m);
   });
+
 }
 
 // ── Collapsible ─────────────────────────────────────────────────
@@ -793,6 +847,7 @@ async function poll() {
     updateFailed(d);
     updateControls(d);
     updateMap(d);
+    updateTileDots(d);
     updateLastKg(d);
     // Refresh tile overlays every 10s
     if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();

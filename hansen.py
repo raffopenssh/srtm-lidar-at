@@ -108,7 +108,8 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
 
     # Cache — atomic write to avoid corrupt files on interruption
     tf_flat = np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    # np.savez_compressed appends .npz if missing, so use .tmp.npz
+    tmp_path = cache_path.with_suffix(".tmp.npz")
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(str(tmp_path), data=data, transform=tf_flat)

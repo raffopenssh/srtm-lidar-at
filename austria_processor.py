@@ -669,7 +669,7 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
     obj_map = {o.obj_id: o for o in objects}
 
     # Segments classified as roof/building
-    building_objs = [o for o in objects if o.obj_type in ('roof', 'greenhouse', 'solar_panel')]
+    building_objs = [o for o in objects if o.obj_type == 'roof']
     if not building_objs:
         return results
 

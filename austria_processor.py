@@ -1657,16 +1657,20 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
         return out_path
 
     table_count = 0
+    _GPKG_NODATA = -9999.0  # NaN not supported in GPKG ancillary table
     def _write_table(name, arrays, h, w, tf, dtype='float32', descs=None):
         nonlocal table_count
         opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
                     dtype=dtype, crs='EPSG:3035', transform=tf,
                     RASTER_TABLE=name, RASTER_IDENTIFIER=name)
-        if dtype == 'float32': opts['nodata'] = float('nan')
+        if dtype == 'float32': opts['nodata'] = _GPKG_NODATA
         if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
             for i, arr in enumerate(arrays, 1):
-                dst.write(arr[:h, :w], i)
+                band = arr[:h, :w]
+                if dtype == 'float32':
+                    band = np.where(np.isnan(band), _GPKG_NODATA, band)
+                dst.write(band, i)
                 if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
         table_count += 1
 
@@ -1732,16 +1736,20 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     if os.path.exists(out_path): os.unlink(out_path)
 
     table_count = 0
+    _GPKG_NODATA_L = -9999.0
     def _write_raster(name, arrays, h, w, tf, dtype='uint8', descs=None):
         nonlocal table_count
         opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
                     dtype=dtype, crs='EPSG:3035', transform=tf,
                     RASTER_TABLE=name, RASTER_IDENTIFIER=name)
-        if dtype == 'float32': opts['nodata'] = float('nan')
+        if dtype == 'float32': opts['nodata'] = _GPKG_NODATA_L
         if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
             for i, arr in enumerate(arrays, 1):
-                dst.write(arr[:h, :w], i)
+                band = arr[:h, :w]
+                if dtype == 'float32':
+                    band = np.where(np.isnan(band), _GPKG_NODATA_L, band)
+                dst.write(band, i)
                 if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
         table_count += 1
 
@@ -2575,6 +2583,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _SUPPRESS = (
             "DeprecationWarning: 'Memory' driver is deprecated",
             "Failed to parse API error response",
+            "NaN nodata value cannot be recorded",
         )
         # Messages to downgrade from error → warning (non-fatal)
         _DOWNGRADE = (

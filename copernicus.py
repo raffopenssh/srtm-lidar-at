@@ -62,8 +62,9 @@ CACHE_DIR = pathlib.Path("/home/exedev/srtm-lidar/rf_training_data/copernicus_ca
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
-# Maximum bbox extent in degrees (~10 km at mid-latitudes ≈ 0.09°)
-MAX_BBOX_SPAN_DEG = 0.12
+# Maximum bbox extent in degrees.  The tile_cache grid snaps outward
+# to 0.1° steps, so tiles can reach 0.2° span.  0.25° gives headroom.
+MAX_BBOX_SPAN_DEG = 0.25
 
 # Synchronous download size threshold (area in sq-degrees).
 # Below this we use direct download(); above we use batch jobs.
@@ -273,6 +274,22 @@ def _touch_cache(path: pathlib.Path):
         pass
 
 
+def _validate_cache(path: pathlib.Path) -> bool:
+    """Return True if *path* looks like a valid (non-empty) cache file.
+
+    Deletes the file and returns False when it is 0-byte or unreadable,
+    which can happen when a previous download was interrupted mid-write.
+    """
+    try:
+        if path.stat().st_size == 0:
+            logger.warning("Removing corrupt (0-byte) cache file: %s", path)
+            path.unlink(missing_ok=True)
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _enforce_cache_limit():
     """Evict oldest cache files if total size exceeds CACHE_MAX_BYTES."""
     try:
@@ -299,8 +316,16 @@ def _enforce_cache_limit():
         pass
 
 
-def _validate_bbox(bbox: Dict[str, float]) -> Dict[str, float]:
-    """Validate and normalise a WGS-84 bounding box dict."""
+def _validate_bbox(bbox: Dict[str, float], *, warn_large: bool = True) -> Dict[str, float]:
+    """Validate and normalise a WGS-84 bounding box dict.
+
+    Parameters
+    ----------
+    warn_large : bool
+        Log a warning when the bbox exceeds ``MAX_BBOX_SPAN_DEG``.
+        Set to False for pre-tiled requests (e.g. from tile_cache)
+        where the caller already controls the extent.
+    """
     required = {"west", "south", "east", "north"}
     if not required.issubset(bbox.keys()):
         raise ValueError(f"bbox must contain keys {required}, got {set(bbox.keys())}")
@@ -311,7 +336,7 @@ def _validate_bbox(bbox: Dict[str, float]) -> Dict[str, float]:
 
     span_lon = e - w
     span_lat = n - s
-    if span_lon > MAX_BBOX_SPAN_DEG or span_lat > MAX_BBOX_SPAN_DEG:
+    if warn_large and (span_lon > MAX_BBOX_SPAN_DEG or span_lat > MAX_BBOX_SPAN_DEG):
         logger.warning(
             "Bbox span (%.4f° × %.4f°) exceeds recommended max %.4f°. "
             "Large requests may be slow or fail.",
@@ -363,8 +388,21 @@ def _run_datacube(
 
     Uses synchronous ``download()`` for small cubes and batch-job
     ``execute_batch()`` for larger ones.
+
+    Downloads go to a temp file first and are atomically renamed on
+    success.  This prevents 0-byte / partial files from poisoning
+    the cache when a download times out or fails mid-write.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write: download to a temp sibling, rename on success
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+
+    def _cleanup_tmp():
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Try synchronous download first (faster for small areas)
     # Retry once on 429 Too Many Requests
@@ -377,16 +415,26 @@ def _run_datacube(
         logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
                     output_path, SYNC_DOWNLOAD_TIMEOUT)
         try:
+            _cleanup_tmp()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(datacube.download, str(output_path), format)
+                future = pool.submit(datacube.download, str(tmp_path), format)
                 future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
-            logger.info("Synchronous download complete: %s", output_path)
-            return output_path
+            # Verify non-empty before committing
+            if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                tmp_path.rename(output_path)
+                logger.info("Synchronous download complete: %s", output_path)
+                return output_path
+            else:
+                _cleanup_tmp()
+                logger.warning("Synchronous download produced empty file, falling back to batch job")
+                break
         except concurrent.futures.TimeoutError:
+            _cleanup_tmp()
             logger.warning("Synchronous download timed out after %ds, falling back to batch job",
                           SYNC_DOWNLOAD_TIMEOUT)
             break
         except Exception as exc:
+            _cleanup_tmp()
             _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
             exc_str = str(exc)
             if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
@@ -416,7 +464,6 @@ def _run_datacube(
     # Find the result file
     tifs = sorted(output_dir.glob("*.tif")) + sorted(output_dir.glob("*.tiff"))
     if tifs:
-        # Copy/rename to expected path
         import shutil
         shutil.copy2(str(tifs[0]), str(output_path))
     elif output_dir.is_file():
@@ -463,7 +510,7 @@ def get_ndvi_composite(
     date_range = f"{start_date}/{end_date}"
 
     cache_file = _cache_path("ndvi_composite", bbox, year=year)
-    if cache_file.exists():
+    if cache_file.exists() and _validate_cache(cache_file):
         logger.info("Cache hit for NDVI composite: %s", cache_file)
         _touch_cache(cache_file)
         data, transform, crs = _read_geotiff(cache_file)
@@ -549,7 +596,7 @@ def get_ndvi_timeseries(
 
     # Check for stacked cache (new format)
     cache_file = _cache_path("ndvi_ts_v2", bbox, start=start_date, end=end_date)
-    if cache_file.exists():
+    if cache_file.exists() and _validate_cache(cache_file):
         logger.info("Cache hit for NDVI time series v2: %s", cache_file)
         _touch_cache(cache_file)
         return _parse_timeseries_tiff(cache_file, start_date, end_date)
@@ -597,7 +644,7 @@ def get_ndvi_timeseries(
     # Check which months need downloading
     to_download = []
     for label, m_start, m_end, month_cache in tasks:
-        if month_cache.exists():
+        if month_cache.exists() and _validate_cache(month_cache):
             logger.debug("Cache hit for %s: %s", label, month_cache)
             _touch_cache(month_cache)
         else:
@@ -629,7 +676,17 @@ def get_ndvi_timeseries(
                 # Use sync-only download for monthly NDVI — don't fall back to
                 # batch on EmptyBounds (no data = skip month, batch won't help)
                 month_cache.parent.mkdir(parents=True, exist_ok=True)
-                ndvi_median.download(str(month_cache), format="GTiff")
+                tmp_month = month_cache.with_suffix(month_cache.suffix + ".tmp")
+                try:
+                    ndvi_median.download(str(tmp_month), format="GTiff")
+                    if tmp_month.exists() and tmp_month.stat().st_size > 0:
+                        tmp_month.rename(month_cache)
+                    else:
+                        tmp_month.unlink(missing_ok=True)
+                        raise RuntimeError("download produced empty file")
+                except Exception:
+                    tmp_month.unlink(missing_ok=True)
+                    raise
                 logger.info("NDVI %s downloaded OK", label)
                 return label, None
             except Exception as exc:
@@ -667,7 +724,7 @@ def get_ndvi_timeseries(
 
     # Read all cached months
     for label, m_start, m_end, month_cache in tasks:
-        if not month_cache.exists():
+        if not month_cache.exists() or not _validate_cache(month_cache):
             continue
         try:
             with rasterio.open(str(month_cache)) as ds:
@@ -779,7 +836,7 @@ def get_land_cover(
     bbox = _validate_bbox(bbox_wgs84)
 
     cache_file = _cache_path("landcover", bbox)
-    if cache_file.exists():
+    if cache_file.exists() and _validate_cache(cache_file):
         logger.info("Cache hit for land cover: %s", cache_file)
         _touch_cache(cache_file)
         data, transform, crs = _read_geotiff(cache_file)
@@ -850,10 +907,15 @@ def get_sar_backscatter(
     bbox = _validate_bbox(bbox_wgs84)
 
     cache_file = _cache_path("sar", bbox, start=start_date, end=end_date)
-    if cache_file.exists():
-        logger.info("Cache hit for SAR backscatter: %s", cache_file)
-        _touch_cache(cache_file)
-        return _parse_sar_tiff(cache_file, start_date, end_date)
+    if cache_file.exists() and _validate_cache(cache_file):
+        try:
+            logger.info("Cache hit for SAR backscatter: %s", cache_file)
+            _touch_cache(cache_file)
+            return _parse_sar_tiff(cache_file, start_date, end_date)
+        except Exception as exc:
+            logger.warning("Corrupt SAR cache %s (%s), deleting and re-fetching",
+                          cache_file, exc)
+            cache_file.unlink(missing_ok=True)
 
     logger.info(
         "Fetching SAR backscatter for bbox=%s, %s → %s",

@@ -3369,6 +3369,8 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
 
     # --- GDAL config for large raster I/O ---
+    # Suppress GDAL 3.11 deprecation warning for 'Memory' driver (used internally by rasterio)
+    os.environ.setdefault('GDAL_DEPRECATION_WARNING_THRESHOLD', '99999')
     os.environ.setdefault('GDAL_CACHEMAX', '256')
     os.environ.setdefault('VSI_CACHE', 'TRUE')
     os.environ.setdefault('VSI_CACHE_SIZE', '33554432')  # 32 MB

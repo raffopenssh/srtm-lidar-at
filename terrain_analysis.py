@@ -84,6 +84,11 @@ def characterise_terrain(dtm: np.ndarray, mask: np.ndarray, res: float = 1.0) ->
     slope_valid = slope[valid]
     tri_valid = tri[valid]
 
+    # Strip NaN values that propagate from DTM edge pixels through gradient ops
+    tri_valid = tri_valid[np.isfinite(tri_valid)]
+    slope_valid = slope_valid[np.isfinite(slope_valid)]
+    elev_valid = elev_valid[np.isfinite(elev_valid)]
+
     def pct(arr, p):
         return float(np.nanpercentile(arr, p)) if len(arr) > 0 else None
 

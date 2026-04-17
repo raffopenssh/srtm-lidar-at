@@ -33,16 +33,22 @@ CACHE_DIR = Path("/tmp/hansen_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_URL = "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12"
-TILE = "50N_010E"
 
-LAYER_URLS = {
-    "treecover2000": f"{BASE_URL}/Hansen_GFC-2024-v1.12_treecover2000_{TILE}.tif",
-    "gain":          f"{BASE_URL}/Hansen_GFC-2024-v1.12_gain_{TILE}.tif",
-    "lossyear":      f"{BASE_URL}/Hansen_GFC-2024-v1.12_lossyear_{TILE}.tif",
-    "datamask":      f"{BASE_URL}/Hansen_GFC-2024-v1.12_datamask_{TILE}.tif",
-    "first":         f"{BASE_URL}/Hansen_GFC-2024-v1.12_first_{TILE}.tif",
-    "last":          f"{BASE_URL}/Hansen_GFC-2024-v1.12_last_{TILE}.tif",
-}
+# Hansen GFC tiles are 10°×10°.  Austria spans ~9.5°E–17.2°E so we need two tiles.
+AUSTRIA_TILES = ["50N_000E", "50N_010E"]
+
+LAYERS = ["treecover2000", "gain", "lossyear", "datamask", "first", "last"]
+
+
+def _tile_for_lon(lon: float) -> str:
+    """Return the Hansen tile name that covers a given longitude."""
+    tile_west = int(lon // 10) * 10
+    ew = "E" if tile_west >= 0 else "W"
+    return f"50N_{abs(tile_west):03d}{ew}"
+
+
+def _layer_url(layer: str, tile: str) -> str:
+    return f"{BASE_URL}/Hansen_GFC-2024-v1.12_{layer}_{tile}.tif"
 
 GDAL_ENV = {
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
@@ -79,7 +85,8 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
         tf = rasterio.Affine(*tf_flat[:6])
         return cached["data"], tf
 
-    url = LAYER_URLS[layer]
+    tile = _tile_for_lon(west)
+    url = _layer_url(layer, tile)
     vsicurl = f"/vsicurl/{url}"
     log.info("Hansen: reading %s for bbox %s", layer, bbox_wgs84)
 
@@ -99,9 +106,15 @@ def _read_layer_window(layer: str, bbox_wgs84: tuple) -> tuple[np.ndarray, raste
         direct_retries=3,       # first 3 attempts use direct, then rotate proxies
     )
 
-    # Cache
+    # Cache — atomic write to avoid corrupt files on interruption
     tf_flat = np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
-    np.savez_compressed(str(cache_path), data=data, transform=tf_flat)
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    try:
+        np.savez_compressed(str(tmp_path), data=data, transform=tf_flat)
+        tmp_path.rename(cache_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     log.info("Hansen: cached %s (%dx%d)", layer, data.shape[1], data.shape[0])
 
     return data, tf
@@ -123,7 +136,31 @@ def read_hansen_window(
     dict with keys per layer (array), plus 'transform' and 'shape'
     """
     if layers is None:
-        layers = list(LAYER_URLS.keys())
+        layers = list(LAYERS)
+
+    west, south, east, north = bbox_wgs84
+
+    # If bbox straddles a 10° tile boundary, split and merge
+    west_tile = _tile_for_lon(west)
+    east_tile = _tile_for_lon(east)
+    if west_tile != east_tile:
+        boundary = int(east // 10) * 10  # e.g. 10.0
+        left = read_hansen_window((west, south, boundary - 1e-6, north), layers)
+        right = read_hansen_window((boundary, south, east, north), layers)
+        # Horizontal concat — left | right
+        result = {}
+        for layer in layers:
+            if layer in left and layer in right:
+                result[layer] = np.concatenate([left[layer], right[layer]], axis=1)
+            elif layer in left:
+                result[layer] = left[layer]
+            elif layer in right:
+                result[layer] = right[layer]
+        result["transform"] = left["transform"]
+        first_arr = result[layers[0]]
+        result["shape"] = first_arr.shape
+        result["crs"] = CRS.from_epsg(4326)
+        return result
 
     result = {}
     tf = None

@@ -34,6 +34,21 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+
+def _atomic_savez(path: Path, **arrays) -> None:
+    """Write an .npz file atomically via a temp file + rename.
+
+    Prevents corrupt 0-byte cache files if the process is interrupted.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        np.savez_compressed(str(tmp), **arrays)
+        tmp.rename(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Grid-snapping utilities
 # ---------------------------------------------------------------------------
@@ -220,8 +235,8 @@ class CopernicusTileCache:
             result = copernicus.get_ndvi_composite(tile_bbox, year=year)
             # Save to cache
             tf = result["transform"]
-            np.savez_compressed(
-                str(path),
+            _atomic_savez(
+                path,
                 ndvi=result["ndvi"],
                 transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                 crs=str(result.get("crs", "EPSG:4326")),
@@ -256,7 +271,7 @@ class CopernicusTileCache:
         try:
             import copernicus
             result = copernicus.get_land_cover(tile_bbox)
-            np.savez_compressed(str(path), data=np.array(result, dtype=object))
+            _atomic_savez(path, data=np.array(result, dtype=object))
             log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
                      tw, ts, te, tn)
             return result
@@ -293,8 +308,8 @@ class CopernicusTileCache:
             result = copernicus.get_sar_backscatter(
                 tile_bbox, f"{year}-06-01", f"{year}-09-30")
             tf = result["transform"]
-            np.savez_compressed(
-                str(path),
+            _atomic_savez(
+                path,
                 vv=result["vv"], vh=result["vh"],
                 transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                 crs=str(result.get("crs", "EPSG:4326")),
@@ -384,7 +399,7 @@ class HansenTileCache:
             for layer in ["treecover2000", "lossyear", "gain", "datamask"]:
                 if layer in raw:
                     save_dict[layer] = raw[layer]
-            np.savez_compressed(str(path), **save_dict)
+            _atomic_savez(path, **save_dict)
             log.info("Hansen tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
                      tw, ts, te, tn, raw["shape"][1], raw["shape"][0])
             return raw

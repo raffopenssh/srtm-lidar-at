@@ -103,6 +103,11 @@ _credits_exhausted_at: Optional[str] = None  # ISO timestamp
 _exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 
 
+def FUNCTIONING_CREDENTIALS() -> list:
+    """Return the list of credential indices that haven't been exhausted (402)."""
+    return [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
+
+
 class CreditsExhaustedError(Exception):
     """Raised when ALL Copernicus credentials return 402 PaymentRequired."""
     pass
@@ -650,16 +655,16 @@ def get_ndvi_timeseries(
         else:
             to_download.append((label, m_start, m_end, month_cache))
 
-    # Download missing months in parallel (2 concurrent — openEO rate limit)
+    # Download missing months in parallel (one credential per worker)
     def _download_month(args):
         import re as _re
         import time as _time
-        label, m_start, m_end, month_cache = args
-        logger.info("Fetching NDVI for %s (%s → %s)", label, m_start, m_end)
+        label, m_start, m_end, month_cache, cred_idx = args
+        logger.info("Fetching NDVI for %s (%s → %s) [cred %d]", label, m_start, m_end, cred_idx + 1)
         max_retries = 3
         for attempt in range(max_retries + 1):
             try:
-                c = _get_connection()
+                c = _get_connection_for_cred(cred_idx)
                 s2 = c.load_collection(
                     "SENTINEL2_L2A",
                     spatial_extent=bbox,
@@ -712,9 +717,16 @@ def get_ndvi_timeseries(
         return label, Exception(f"NDVI {label}: retries exhausted")
 
     if to_download:
-        logger.info("Downloading %d NDVI months (2 parallel)...", len(to_download))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = {pool.submit(_download_month, t): t[0] for t in to_download}
+        _func_creds = FUNCTIONING_CREDENTIALS()
+        _n_par = max(len(_func_creds), 1)
+        # Assign each download task a credential index (round-robin)
+        to_download_with_cred = [
+            (label, ms, me, mc, _func_creds[i % _n_par])
+            for i, (label, ms, me, mc) in enumerate(to_download)
+        ]
+        logger.info("Downloading %d NDVI months (%d parallel)...", len(to_download), _n_par)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_n_par) as pool:
+            futures = {pool.submit(_download_month, t): t[0] for t in to_download_with_cred}
             for fut in concurrent.futures.as_completed(futures):
                 label, exc = fut.result()
                 if exc:

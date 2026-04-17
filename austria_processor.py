@@ -2598,15 +2598,29 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
                         cop_cache = _get_cop_cache()
                         cop = {}
-                        nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+                        # Fetch NDVI, landcover, SAR in parallel (each can
+                        # use a separate Copernicus credential)
+                        import concurrent.futures as _cop_cf
+                        def _fetch_ndvi():
+                            return cop_cache.get_ndvi(bbox_dict, year=obs_year)
+                        def _fetch_lc():
+                            return cop_cache.get_landcover(bbox_dict)
+                        def _fetch_sar():
+                            return cop_cache.get_sar(bbox_dict, year=obs_year)
+                        from copernicus import FUNCTIONING_CREDENTIALS as _func_creds
+                        with _cop_cf.ThreadPoolExecutor(max_workers=max(len(_func_creds()), 1)) as _cex:
+                            _f_ndvi = _cex.submit(_fetch_ndvi)
+                            _f_lc   = _cex.submit(_fetch_lc)
+                            _f_sar  = _cex.submit(_fetch_sar)
+                        nd = _f_ndvi.result()
+                        lc = _f_lc.result()
+                        sar = _f_sar.result()
                         if nd and nd.get("ndvi") is not None:
                             cop["ndvi"] = nd["ndvi"]
                             cop["transform"] = nd.get("transform")
                             cop["crs"] = nd.get("crs")
-                        lc = cop_cache.get_landcover(bbox_dict)
                         if lc:
                             cop["landcover"] = lc
-                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
                         if sar:
                             cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
                             if "transform" in sar:

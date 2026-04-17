@@ -2811,7 +2811,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 _tile_entry["subtile"] = {"orig": _orig_idx + 1, "sub": _si + 1,
                                           "n_sub": _nsub, "km": _skm}
             _tile_statuses.append(_tile_entry)
-            _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
 
             # --- Check for cached tile checkpoint ---
             cached_tile = _load_tile_checkpoint(tile_idx)
@@ -2855,8 +2854,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     for k in ["lidar", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
                 }
                 _tile_entry["n_objects"] = len(cached_tile.get("core_objects", []))
-                _report_step(f"tile_{tile_idx+1}", f"restored from cache")
                 continue
+
+            _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
 
             # Per-tile data availability tracker
             tile_avail = {

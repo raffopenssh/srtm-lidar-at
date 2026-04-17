@@ -643,6 +643,21 @@ def enrich_buildings_with_heights(buildings: list, dtm: np.ndarray,
 # Vectorise segments not matched to cadastre (new buildings, infrastructure)
 # ---------------------------------------------------------------------------
 
+def _segment_touches_edge(seg_mask: np.ndarray) -> bool:
+    """Return True if any pixel in *seg_mask* lies on the raster boundary.
+
+    Edge-touching segments are likely truncated by the segmentation window
+    and their area/shape metrics are unreliable.
+    """
+    h, w = seg_mask.shape
+    if h < 2 or w < 2:
+        return True
+    return bool(
+        seg_mask[0, :].any() or seg_mask[-1, :].any() or
+        seg_mask[:, 0].any() or seg_mask[:, -1].any()
+    )
+
+
 def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
                                   mask: np.ndarray, transform,
                                   cadastre_fp_mask: np.ndarray,
@@ -684,6 +699,7 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
             poly_3035 = s_shape(geom_dict)
             poly_wgs = transform_to_wgs(poly_3035)
             c_wgs = poly_wgs.centroid
+            at_edge = _segment_touches_edge(seg_mask)
 
             # Height stats from nDSM
             seg_h = ndsm[seg_mask]
@@ -701,6 +717,7 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
                 "centroid_lat": round(c_wgs.y, 7),
                 "geometry_wgs": mapping(poly_wgs),
                 "confidence": round(obj.confidence, 2),
+                "edge_clipped": at_edge,
             })
         except Exception:
             continue
@@ -734,14 +751,27 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
         if obj.obj_type not in INFRA_TYPES:
             continue
         spec = INFRA_TYPES[obj.obj_type]
-        if obj.area_sqm < spec['min_area']:
-            continue
-        if obj.obj_type == 'tree_loss' and obj.area_sqm < 5000:
-            continue  # clear cuts > 0.5ha only
 
         seg_mask = labels == obj.obj_id
         if not seg_mask.any():
             continue
+        at_edge = _segment_touches_edge(seg_mask)
+
+        # Area filter — relax for edge-clipped segments since their
+        # measured area is a lower bound (the real feature continues
+        # beyond the segmentation window).
+        effective_area = obj.area_sqm
+        if at_edge and obj.obj_type == 'tree_loss':
+            # Edge-clipped tree_loss: only require 500m² (the full
+            # clearing might be huge, we just see the edge of it)
+            if effective_area < 500:
+                continue
+        elif obj.obj_type == 'tree_loss':
+            if effective_area < 5000:
+                continue  # interior clear cuts > 0.5ha only
+        else:
+            if effective_area < spec['min_area']:
+                continue
 
         try:
             label_single = np.where(seg_mask, 1, 0).astype(np.int32)
@@ -765,6 +795,7 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
                     "centroid_lat": round(c_wgs.y, 7),
                     "geometry_wgs": mapping(poly_wgs),
                     "confidence": round(obj.confidence, 2),
+                    "edge_clipped": at_edge,
                 }
 
                 if obj.obj_type == 'parking':
@@ -776,8 +807,8 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
                     mean_h = abs(float(np.nanmean(seg_h))) if len(seg_h) > 0 else 0
                     volume = mean_h * poly_3035.area
                     feature["volume_m3"] = round(volume, 1)
-                    if volume < 10:
-                        continue  # skip tiny earthworks
+                    if volume < 10 and not at_edge:
+                        continue  # skip tiny earthworks (unless edge-clipped)
 
                 if obj.obj_type in ('bridge', 'mast'):
                     feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
@@ -793,6 +824,143 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
             continue
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Resolve edge-clipped features against full-KG rasters
+# ---------------------------------------------------------------------------
+
+def resolve_edge_clipped_features(
+    new_buildings: list,
+    infrastructure: list,
+    full_ndsm: np.ndarray,
+    full_dsm: np.ndarray,
+    full_mask: np.ndarray,
+    full_transform,
+) -> tuple[list, list]:
+    """Re-measure edge-clipped buildings & infra using the full-KG nDSM.
+
+    For each feature with ``edge_clipped=True`` whose type has height above
+    ground (roofs, solar, mast, excavation, fill, bridge), we rasterize the
+    clipped polygon into the *full-KG* nDSM, then flood-fill outwards from
+    that seed into contiguous pixels that match the height profile.  The
+    resulting polygon replaces the clipped one and the flag is cleared to
+    ``edge_resolved``.
+
+    Tree-loss keeps its flag because it depends on temporal differencing which
+    only exists inside the segmentation window.
+
+    Returns (new_buildings, infrastructure) — mutated copies.
+    """
+    from rasterio.features import rasterize as rio_rasterize
+    from rasterio.features import shapes as rio_shapes
+    from shapely.geometry import shape as s_shape
+    from scipy.ndimage import binary_dilation
+
+    fh, fw = full_ndsm.shape
+    RESOLVABLE_TYPES = {'roof', 'greenhouse', 'solar_panel', 'parking',
+                        'excavation', 'fill', 'bridge', 'mast'}
+
+    def _try_resolve(feat: dict) -> dict:
+        """Attempt to grow a clipped feature into full-KG nDSM."""
+        if not feat.get('edge_clipped'):
+            return feat
+        if feat.get('type') not in RESOLVABLE_TYPES:
+            return feat
+
+        try:
+            geom_wgs = feat['geometry_wgs']
+            if isinstance(geom_wgs, dict):
+                poly_wgs = s_shape(geom_wgs)
+            else:
+                poly_wgs = geom_wgs
+            poly_3035 = transform_to_3035(poly_wgs)
+
+            # Rasterize seed into full-KG grid
+            seed = rio_rasterize(
+                [(poly_3035, 1)], out_shape=(fh, fw), transform=full_transform,
+                fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+            if seed.sum() < 2:
+                return feat
+
+            # Height profile of the seed region
+            seed_h = full_ndsm[seed & full_mask]
+            seed_h = seed_h[np.isfinite(seed_h)]
+            if len(seed_h) < 2:
+                return feat
+            h_lo = float(np.percentile(seed_h, 10)) - 2.0
+            h_hi = float(np.percentile(seed_h, 90)) + 2.0
+
+            # Height-compatible mask in full-KG
+            compatible = full_mask & np.isfinite(full_ndsm) & \
+                         (full_ndsm >= h_lo) & (full_ndsm <= h_hi)
+
+            # Iterative binary dilation from seed, bounded by compatible
+            grown = seed.copy()
+            for _ in range(200):  # max ~200m growth
+                expanded = binary_dilation(grown, iterations=1) & compatible
+                if expanded.sum() == grown.sum():
+                    break
+                grown = expanded
+
+            if grown.sum() <= seed.sum():
+                return feat  # no growth
+
+            # Vectorize the grown mask
+            grown_int = grown.astype(np.int32)
+            polys = []
+            for geom_dict, val in rio_shapes(grown_int, mask=grown,
+                                             transform=full_transform):
+                if val == 1:
+                    polys.append(s_shape(geom_dict))
+            if not polys:
+                return feat
+
+            from shapely.ops import unary_union as _uu
+            merged_3035 = _uu(polys)
+            merged_wgs = transform_to_wgs(merged_3035)
+
+            # Recompute stats on grown region
+            grown_h = full_ndsm[grown]
+            grown_h = grown_h[np.isfinite(grown_h)]
+            max_h = float(np.nanmax(grown_h)) if len(grown_h) > 0 else feat.get('max_height_m', 0)
+            mean_h = float(np.nanmean(grown_h)) if len(grown_h) > 0 else feat.get('mean_height_m', 0)
+
+            grown_dsm = full_dsm[grown]
+            grown_dsm = grown_dsm[np.isfinite(grown_dsm)]
+            dsm_std = float(np.std(grown_dsm)) if len(grown_dsm) > 0 else 0.0
+
+            resolved = dict(feat)
+            resolved['geometry_wgs'] = mapping(merged_wgs)
+            resolved['area_sqm'] = round(float(merged_3035.area), 1)
+            resolved['max_height_m'] = round(max_h, 2)
+            if 'mean_height_m' in resolved:
+                resolved['mean_height_m'] = round(mean_h, 2)
+            c_wgs = merged_wgs.centroid
+            resolved['centroid_lon'] = round(c_wgs.x, 7)
+            resolved['centroid_lat'] = round(c_wgs.y, 7)
+            resolved['edge_clipped'] = False
+            resolved['edge_resolved'] = True
+
+            # Type-specific updates
+            if feat.get('type') in ('roof', 'greenhouse', 'solar_panel'):
+                resolved['stories_est'] = max(1, round(max_h / 3.0))
+                resolved['roof_type_hint'] = 'flat' if dsm_std < 1.5 else 'pitched'
+            if feat.get('type') == 'parking':
+                resolved['est_parking_spots'] = max(1, round(merged_3035.area / 12.5))
+            if feat.get('type') in ('excavation', 'fill'):
+                resolved['volume_m3'] = round(abs(mean_h) * merged_3035.area, 1)
+
+            log.info("  edge_resolved %s: %s m² → %s m²",
+                     feat.get('type'), feat.get('area_sqm'), resolved['area_sqm'])
+            return resolved
+        except Exception as e:
+            log.debug("  edge_resolve failed for %s: %s", feat.get('type'), e)
+            return feat
+
+    resolved_nb = [_try_resolve(nb) for nb in new_buildings]
+    resolved_infra = [_try_resolve(inf) for inf in infrastructure]
+    return resolved_nb, resolved_infra
 
 
 # ---------------------------------------------------------------------------
@@ -1173,8 +1341,14 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                      objects: list, mask: np.ndarray, transform,
                      cadastre_data: dict, ndsm: np.ndarray,
                      new_buildings: list, infrastructure: list,
-                     obs_year: int = 0) -> str:
-    """Build lightweight GeoPackage with segmentation + enriched cadastre."""
+                     obs_year: int = 0,
+                     full_data: dict = None) -> str:
+    """Build lightweight GeoPackage with segmentation + enriched cadastre.
+
+    When *full_data* is provided (full-KG DTM/DSM/nDSM), parcels and buildings
+    are enriched against the full-KG raster so every feature gets heights,
+    even those outside the segmentation window.
+    """
     import rasterio
     import fiona
     from fiona.crs import from_epsg
@@ -1221,10 +1395,11 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
         except Exception as e:
             log.warning("Light GPKG vector segments failed: %s", e)
 
-    # Parcels with heights
-    dtm = data["dtm"]
+    # Parcels with heights — use full-KG DTM if available
+    enrich_dtm = full_data["dtm"] if full_data else data["dtm"]
+    enrich_tf = full_data["transform"] if full_data else transform
     enriched_parcels = enrich_parcels_with_heights(
-        cadastre_data["parcels"], dtm, transform)
+        cadastre_data["parcels"], enrich_dtm, enrich_tf)
     if enriched_parcels:
         schema_p = {
             'geometry': 'MultiPolygon',
@@ -1250,10 +1425,11 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                     },
                 })
 
-    # Building footprints with heights
-    dsm = data["dsm"]
+    # Building footprints with heights — use full-KG rasters if available
+    enrich_dsm = full_data["dsm"] if full_data else data["dsm"]
+    enrich_ndsm = full_data["ndsm"] if full_data else ndsm
     enriched_bldgs = enrich_buildings_with_heights(
-        cadastre_data["building_footprints"], dtm, dsm, ndsm, transform)
+        cadastre_data["building_footprints"], enrich_dtm, enrich_dsm, enrich_ndsm, enrich_tf)
     if enriched_bldgs:
         schema_b = {
             'geometry': 'MultiPolygon',
@@ -1291,6 +1467,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                 ('max_height_m', 'float'), ('stories_est', 'int'),
                 ('roof_type_hint', 'str'), ('confidence', 'float'),
                 ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+                ('edge_clipped', 'bool'),
             ],
         }
         with fiona.open(out_path, 'w', driver='GPKG', layer='new_buildings',
@@ -1307,6 +1484,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                         'confidence': nb.get('confidence', 0),
                         'centroid_lon': nb.get('centroid_lon'),
                         'centroid_lat': nb.get('centroid_lat'),
+                        'edge_clipped': nb.get('edge_clipped', False),
                     },
                 })
 
@@ -1319,6 +1497,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                 ('volume_m3', 'float'), ('max_height_m', 'float'),
                 ('est_parking_spots', 'int'), ('confidence', 'float'),
                 ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+                ('edge_clipped', 'bool'),
             ],
         }
         with fiona.open(out_path, 'w', driver='GPKG', layer='infrastructure',
@@ -1335,6 +1514,7 @@ def build_light_gpkg(kg_code: str, data: dict, labels: np.ndarray,
                         'confidence': inf.get('confidence', 0),
                         'centroid_lon': inf.get('centroid_lon'),
                         'centroid_lat': inf.get('centroid_lat'),
+                        'edge_clipped': inf.get('edge_clipped', False),
                     },
                 })
 
@@ -1351,13 +1531,29 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
                        spectral: dict, hansen_data: dict,
                        copernicus_data: dict, new_buildings: list,
                        infrastructure: list, ndsm: np.ndarray,
-                       obs_year: int) -> dict:
-    """Build comprehensive JSON summary for a KG."""
+                       obs_year: int,
+                       full_data: dict = None,
+                       seg_window_km: float = None) -> dict:
+    """Build comprehensive JSON summary for a KG.
+
+    When *full_data* is provided, parcel/building enrichment uses the full-KG
+    DTM/DSM so every feature gets elevation, even those outside the
+    segmentation window.  *seg_window_km* records the window size used.
+    """
     import tile_index as ti
+    import rasterio
 
     mask = data["mask"]
     dtm = data["dtm"]
     h, w = data["shape"]
+
+    # Full-KG rasters for enrichment (fall back to windowed data)
+    full_dtm = full_data["dtm"] if full_data else dtm
+    full_dsm = full_data["dsm"] if full_data else data["dsm"]
+    full_ndsm = full_data["ndsm"] if full_data else ndsm
+    full_mask = full_data["mask"] if full_data else mask
+    full_tf = full_data["transform"] if full_data else data["transform"]
+    full_h, full_w = full_data["shape"] if full_data else (h, w)
 
     # --- KG info ---
     summary = {
@@ -1368,7 +1564,7 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "gemeinde": kg_info.get("gemeinde_name", ""),
         "district": kg_info.get("district_name", ""),
         "bbox": kg_info.get("bbox", {}),
-        "total_area_sqm": int(mask.sum()),  # valid pixels = m2 at 1m res
+        "total_area_sqm": int(full_mask.sum()),  # full-KG valid pixels = m2 at 1m res
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "observation_period": {
             "primary_year": obs_year,
@@ -1651,6 +1847,7 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             "centroid_lon": nb.get("centroid_lon"),
             "centroid_lat": nb.get("centroid_lat"),
             "confidence": nb.get("confidence"),
+            "edge_clipped": nb.get("edge_clipped", False),
         } for nb in new_buildings],
     }
 
@@ -1674,10 +1871,17 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
     }
 
     # --- Per-parcel detail ---
-    transform = data["transform"]
-    dtm = data["dtm"]
+    # Use full-KG DTM for elevation so ALL parcels get heights.
+    # Segmentation labels only cover the windowed area.
+    seg_transform = data["transform"]
     parcel_details = []
     obj_map = {o.obj_id: o for o in objects} if objects else {}
+    seg_geom_3035 = None
+    if seg_window_km is not None:
+        # Build segmentation window polygon for inside/outside test
+        seg_bounds = rasterio.transform.array_bounds(h, w, seg_transform)
+        seg_geom_3035 = box(*seg_bounds)
+    n_inside_window = 0
     for p in cadastre_data["parcels"]:
         pd = {
             "parcel_id": p["parcel_id"],
@@ -1690,31 +1894,54 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             pd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
         except Exception:
             pass
-        # DTM elevation at centroid (with neighborhood fallback)
+        # DTM elevation at centroid — use full-KG DTM (with neighborhood fallback)
         try:
             c3 = geom_3035.centroid
-            col = int((c3.x - transform.c) / transform.a)
-            row = int((transform.f - c3.y) / abs(transform.e))
-            if 0 <= row < h and 0 <= col < w:
-                val = float(dtm[row, col])
+            col = int((c3.x - full_tf.c) / full_tf.a)
+            row = int((full_tf.f - c3.y) / abs(full_tf.e))
+            if 0 <= row < full_h and 0 <= col < full_w:
+                val = float(full_dtm[row, col])
                 if np.isfinite(val):
                     pd["elevation_m"] = round(val, 2)
                 else:
                     # Try 5x5 neighborhood
-                    r0, r1 = max(0, row-2), min(h, row+3)
-                    c0, c1 = max(0, col-2), min(w, col+3)
-                    patch = dtm[r0:r1, c0:c1]
+                    r0, r1 = max(0, row-2), min(full_h, row+3)
+                    c0, c1 = max(0, col-2), min(full_w, col+3)
+                    patch = full_dtm[r0:r1, c0:c1]
                     valid = patch[np.isfinite(patch)]
                     if len(valid) > 0:
                         pd["elevation_m"] = round(float(np.nanmean(valid)), 2)
         except Exception:
             pass
-        # Segment type breakdown within parcel
-        if labels is not None and objects:
+        # Check if parcel is inside the segmentation window.
+        # Use overlap fraction, not bare intersects, so parcels with
+        # only a sliver inside the window don't get misleading area_summary.
+        parcel_in_window = True
+        seg_coverage_frac = 1.0
+        if seg_geom_3035 is not None:
+            try:
+                if not seg_geom_3035.intersects(geom_3035):
+                    parcel_in_window = False
+                    seg_coverage_frac = 0.0
+                else:
+                    isect = seg_geom_3035.intersection(geom_3035)
+                    parcel_area = max(geom_3035.area, 1e-6)
+                    seg_coverage_frac = isect.area / parcel_area
+                    # Require ≥50% of parcel inside window for segmentation data
+                    parcel_in_window = seg_coverage_frac >= 0.5
+            except Exception:
+                parcel_in_window = False
+                seg_coverage_frac = 0.0
+        pd["segmented"] = parcel_in_window
+        pd["seg_coverage_frac"] = round(seg_coverage_frac, 3)
+        if parcel_in_window:
+            n_inside_window += 1
+        # Segment type breakdown within parcel (only if ≥50% inside window)
+        if parcel_in_window and labels is not None and objects:
             try:
                 from rasterio.features import rasterize as rio_rasterize
                 p_mask = rio_rasterize(
-                    [(geom_3035, 1)], out_shape=(h, w), transform=transform,
+                    [(geom_3035, 1)], out_shape=(h, w), transform=seg_transform,
                     fill=0, dtype=np.uint8, all_touched=True).astype(bool)
                 p_labels = labels[p_mask]
                 p_ndsm = ndsm[p_mask]
@@ -1755,10 +1982,12 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
     summary["parcels"] = {
         "count": len(cadastre_data["parcels"]),
         "total_area_sqm": round(sum(p.get("area_sqm", 0) for p in cadastre_data["parcels"]), 1),
+        "parcels_in_seg_window": n_inside_window,
         "details": parcel_details,
     }
 
     # --- Per-building-footprint detail ---
+    # Use full-KG rasters for height so ALL buildings get data.
     building_details = []
     for b in cadastre_data["building_footprints"]:
         bd = {}
@@ -1772,15 +2001,15 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             bd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
         except Exception:
             pass
-        # Height stats from nDSM
+        # Height stats from full-KG nDSM
         try:
             from rasterio.features import rasterize as rio_rasterize
-            b_mask = rio_rasterize(
-                [(geom_3035, 1)], out_shape=(h, w), transform=transform,
+            b_mask_full = rio_rasterize(
+                [(geom_3035, 1)], out_shape=(full_h, full_w), transform=full_tf,
                 fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-            oh = ndsm[b_mask]
+            oh = full_ndsm[b_mask_full]
             oh = oh[np.isfinite(oh)]
-            dsm_vals = data["dsm"][b_mask]
+            dsm_vals = full_dsm[b_mask_full]
             dsm_vals = dsm_vals[np.isfinite(dsm_vals)]
             if len(oh) > 0:
                 max_h = float(np.max(oh))
@@ -1791,10 +2020,25 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
                 bd["stories_est"] = max(1, round(max_h / 3.0))
         except Exception:
             pass
-        # Segment types within footprint
-        if labels is not None and objects:
+        # Check if building is inside segmentation window (same 50% rule)
+        bld_in_window = True
+        if seg_geom_3035 is not None:
             try:
-                b_labels = labels[b_mask]
+                if not seg_geom_3035.intersects(geom_3035):
+                    bld_in_window = False
+                else:
+                    isect = seg_geom_3035.intersection(geom_3035)
+                    bld_in_window = isect.area / max(geom_3035.area, 1e-6) >= 0.5
+            except Exception:
+                bld_in_window = False
+        bd["segmented"] = bld_in_window
+        # Segment types within footprint (only if inside window)
+        if bld_in_window and labels is not None and objects:
+            try:
+                b_mask_seg = rio_rasterize(
+                    [(geom_3035, 1)], out_shape=(h, w), transform=seg_transform,
+                    fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                b_labels = labels[b_mask_seg]
                 tc = Counter()
                 for lbl in np.unique(b_labels):
                     obj = obj_map.get(int(lbl))
@@ -1811,6 +2055,28 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "details": building_details,
     }
 
+    # --- Coverage ---
+    # Segmentation window vs full KG extent
+    seg_area_sqm = int(mask.sum())
+    full_area_sqm = int(full_mask.sum())
+    seg_coverage_pct = round(100 * seg_area_sqm / max(full_area_sqm, 1), 1)
+    n_parcels_total = len(cadastre_data["parcels"])
+    n_parcels_with_elev = sum(1 for pd in parcel_details if pd.get("elevation_m") is not None)
+    n_buildings_total = len(cadastre_data["building_footprints"])
+    n_buildings_with_h = sum(1 for bd in building_details if bd.get("max_height_m") is not None)
+    summary["coverage"] = {
+        "segmentation_window_km": seg_window_km,
+        "segmentation_area_sqm": seg_area_sqm,
+        "full_kg_area_sqm": full_area_sqm,
+        "segmentation_coverage_pct": seg_coverage_pct,
+        "parcel_coverage_pct": round(100 * n_parcels_with_elev / max(n_parcels_total, 1), 1),
+        "building_coverage_pct": round(100 * n_buildings_with_h / max(n_buildings_total, 1), 1),
+        "parcels_in_seg_window": n_inside_window,
+        "parcels_total": n_parcels_total,
+        "buildings_total": n_buildings_total,
+        "note": "Segmentation+classification covers the central window; DTM elevation covers all parcels/buildings in the full KG.",
+    }
+
     # --- Methods ---
     summary["methods"] = {
         "segmentation": "Felzenszwalb over-segmentation + RAG merge on fused gradient (DTM+DSM+RGBI+NDVI), 1m resolution",
@@ -1823,7 +2089,7 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "ndvi_copernicus": "Sentinel-2 L2A B08/B04, openEO, 10m resampled to 1m",
         "ndvi_harmonics": "1st-order harmonic fit (mean + amplitude·cos(2πt/12 - phase)) to monthly Sentinel-2 NDVI",
         "sar": "Sentinel-1 IW GRD, VV+VH polarisation, summer composite via openEO",
-        "terrain": "Slope (Sobel), aspect, TRI, TPI, curvature from DTM",
+        "terrain": "Slope (Sobel), aspect, TRI, TPI, curvature from full-KG DTM",
         "texture": "GLCM contrast/homogeneity/entropy from BEV ortho greyscale",
         "hansen": "Hansen GFC-2024-v1.12, 30m, treecover2000 + lossyear + gain",
         "infrastructure": "austria-power API (wind turbines, solar, substations, masts)",
@@ -1835,6 +2101,8 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
         "fragmentation": "Shannon diversity index on segment type fractions",
         "edge_density": "Total segment perimeter / total area",
         "phenology": "Harmonic amplitude+phase → crop/deciduous/evergreen/bare classes",
+        "top_10_objects": "Tallest objects within the segmentation window (not full KG)",
+        "coverage": "Full-KG DTM read for parcel/building elevation; segmentation limited to central window to prevent timeouts",
         "cadastre_source": "BEV INSPIRE cadastre via cadastre-process-api.exe.xyz",
         "data_sources": [
             "BEV ALS DTM/DSM 1m (2022, 2023, 2024)",
@@ -1898,18 +2166,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             west, south = bb["min_lon"], bb["min_lat"]
             east, north = bb["max_lon"], bb["max_lat"]
 
-        # Limit size — use max_km override if provided (retry ladder)
-        crop_km = max_km if max_km is not None else MAX_KG_AREA_KM
-        dx_km = (east - west) * 111 * np.cos(np.radians((south + north) / 2))
-        dy_km = (north - south) * 111
-        if dx_km > crop_km or dy_km > crop_km:
-            cx, cy = (west + east) / 2, (south + north) / 2
-            half = (crop_km / 2) / 111
-            west, south, east, north = cx - half, cy - half, cx + half, cy + half
-            log.info("KG %s: cropped to %.1fkm window", kg_code, crop_km)
-
-        geom_wgs = box(west, south, east, north)
-        geom_3035 = transform_to_3035(geom_wgs)
+        # Store the API bbox as the "full KG" bbox (may be refined below)
+        full_west, full_south, full_east, full_north = west, south, east, north
         obs_year = ti.dataset_to_year(ti.DEFAULT_DATASET)
 
         # --- 1. Cadastre ---
@@ -1920,10 +2178,82 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["n_buildings"] = len(cadastre_data["building_footprints"])
         _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, {len(cadastre_data['building_footprints'])} buildings")
 
-        # --- 2. LiDAR ---
+        # --- 1b. Compute full KG bbox from cadastre geometry union ---
+        # The API bbox can be inaccurate; use the actual geometry extent.
+        all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
+                         + [b["geometry"] for b in cadastre_data["building_footprints"]])
+        if all_cad_geoms:
+            try:
+                from shapely.ops import unary_union as _unary_union
+                cad_union_3035 = _unary_union(all_cad_geoms)
+                cad_union_wgs = transform_to_wgs(cad_union_3035)
+                cb = cad_union_wgs.bounds  # (minx, miny, maxx, maxy)
+                # Use the wider of API bbox and cadastre bbox
+                full_west = min(full_west, cb[0])
+                full_south = min(full_south, cb[1])
+                full_east = max(full_east, cb[2])
+                full_north = max(full_north, cb[3])
+                log.info("KG %s: full KG bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
+                         kg_code, full_west, full_south, full_east, full_north)
+            except Exception as e:
+                log.warning("KG %s: cadastre union failed, using API bbox: %s", kg_code, e)
+
+        full_geom_wgs = box(full_west, full_south, full_east, full_north)
+        full_geom_3035 = transform_to_3035(full_geom_wgs)
+
+        # --- 2. Full-KG LiDAR (default date only, for height enrichment) ---
+        result["step"] = "lidar_full"
+        _report_step("lidar_full", "reading full-KG DTM/DSM")
+        full_data = raster_io.read_dtm_dsm(full_geom_3035, ti.DEFAULT_DATASET)
+        full_h, full_w = full_data["shape"]
+        full_valid_px = int(full_data["mask"].sum())
+        if full_valid_px < 100:
+            result["error"] = f"too few valid pixels in full KG: {full_valid_px}"
+            return result
+        full_dtm = full_data["dtm"]
+        full_dsm = full_data["dsm"]
+        full_ndsm = full_data["ndsm"]
+        full_mask = full_data["mask"]
+        full_transform = full_data["transform"]
+        log.info("KG %s: full-KG DTM/DSM %dx%d, %d valid px",
+                 kg_code, full_h, full_w, full_valid_px)
+        _report_step("lidar_full", f"full KG {full_h}x{full_w}, {full_valid_px} px")
+
+        # --- 2b. Terrain analysis on full-KG DTM ---
+        result["step"] = "terrain_full"
+        _report_step("terrain_full", "full-KG terrain analysis")
+        terrain_stats = {}
+        try:
+            terrain_stats = ta.characterise_terrain(full_dtm, full_mask)
+        except Exception as e:
+            log.warning("KG %s: full-KG terrain failed: %s", kg_code, e)
+        _report_step("terrain_full", "done")
+
+        # --- 3. Crop to segmentation window for expensive operations ---
+        crop_km = max_km if max_km is not None else MAX_KG_AREA_KM
+        dx_km = (full_east - full_west) * 111 * np.cos(np.radians((full_south + full_north) / 2))
+        dy_km = (full_north - full_south) * 111
+        seg_cropped = False
+        if dx_km > crop_km or dy_km > crop_km:
+            cx, cy = (full_west + full_east) / 2, (full_south + full_north) / 2
+            half = (crop_km / 2) / 111
+            west, south, east, north = cx - half, cy - half, cx + half, cy + half
+            log.info("KG %s: segmentation window cropped to %.1fkm", kg_code, crop_km)
+            seg_cropped = True
+        else:
+            west, south, east, north = full_west, full_south, full_east, full_north
+
+        geom_wgs = box(west, south, east, north)
+        geom_3035 = transform_to_3035(geom_wgs)
+
+        # --- 3b. Windowed LiDAR for segmentation ---
         result["step"] = "lidar"
-        _report_step("lidar")
-        data = raster_io.read_dtm_dsm(geom_3035, ti.DEFAULT_DATASET)
+        _report_step("lidar", "reading windowed DTM/DSM for segmentation")
+        if seg_cropped:
+            data = raster_io.read_dtm_dsm(geom_3035, ti.DEFAULT_DATASET)
+        else:
+            # No crop needed — reuse full-KG data
+            data = full_data
         h, w = data["shape"]
         valid_px = int(data["mask"].sum())
         # Scale pixel limit with crop window (smaller window = fewer pixels needed)
@@ -2165,15 +2495,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["n_segments"] = len(objects)
         _report_step("segment", f"{len(objects)} objects, {result.get('n_segments',0)} segments")
 
-        # --- 7. Terrain ---
-        result["step"] = "terrain"
-        _report_step("terrain")
-        terrain_stats = {}
-        try:
-            terrain_stats = ta.characterise_terrain(data["dtm"], mask)
-        except Exception as e:
-            log.warning("KG %s: terrain failed: %s", kg_code, e)
-        _report_step("terrain", "done")
+        # --- 7. Terrain (already done on full-KG DTM in step 2b) ---
 
         # --- 8. Vectorise unmatched buildings & infrastructure ---
         result["step"] = "vectorise"
@@ -2195,6 +2517,20 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["n_infrastructure"] = len(infrastructure_vec)
         _report_step("vectorise", f"{len(new_buildings)} new buildings, {len(infrastructure_vec)} infrastructure")
 
+        # --- 8b. Resolve edge-clipped features against full-KG nDSM ---
+        if seg_cropped and (new_buildings or infrastructure_vec):
+            result["step"] = "resolve_edges"
+            _report_step("resolve_edges")
+            try:
+                new_buildings, infrastructure_vec = resolve_edge_clipped_features(
+                    new_buildings, infrastructure_vec,
+                    full_ndsm, full_dsm, full_mask, full_transform)
+                n_resolved = (sum(1 for x in new_buildings if x.get('edge_resolved'))
+                              + sum(1 for x in infrastructure_vec if x.get('edge_resolved')))
+                _report_step("resolve_edges", f"{n_resolved} features resolved")
+            except Exception as e:
+                log.warning("KG %s: edge resolution failed: %s", kg_code, e)
+
         # --- 9. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full")
@@ -2209,7 +2545,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         light_gpkg = build_light_gpkg(
             kg_code, data, labels, objects, mask, transform,
             cadastre_data, ndsm, new_buildings, infrastructure_vec,
-            obs_year=obs_year)
+            obs_year=obs_year, full_data=full_data)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 11. Build JSON summary ---
@@ -2218,7 +2554,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         json_summary = build_json_summary(
             kg_code, kg, data, labels, objects, cadastre_data,
             terrain_stats, spectral, hansen_data, copernicus_data,
-            new_buildings, infrastructure_vec, ndsm, obs_year)
+            new_buildings, infrastructure_vec, ndsm, obs_year,
+            full_data=full_data,
+            seg_window_km=crop_km if seg_cropped else None)
 
         json_path = str(JSON_DIR / f"{kg_code}.json")
         with open(json_path, 'w') as f:
@@ -2234,7 +2572,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         log.error("KG %s failed at step %s: %s", kg_code, result["step"], e)
 
     # Explicitly free large arrays before returning to parent
-    for _var in ('data', 'labels', 'objects', 'ndsm', 'spectral',
+    for _var in ('data', 'full_data', 'full_dtm', 'full_dsm', 'full_ndsm',
+                 'labels', 'objects', 'ndsm', 'spectral',
                  'copernicus_data', 'hansen_data', 'cadastre_data',
                  'new_buildings', 'infrastructure_vec', 'dtm_dates', 'dsm_dates',
                  'building_fp_mask', 'seg_result', 'terrain_stats'):
@@ -2346,7 +2685,7 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                 "terrain", "ndvi", "sar", "ndvi_harmonics",
                 "temporal_change", "phenology",
                 "hansen", "new_buildings", "infrastructure",
-                "parcels", "building_footprints", "methods",
+                "parcels", "building_footprints", "methods", "coverage",
             ]
             for k in required_keys:
                 if k not in js:
@@ -2375,10 +2714,11 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                              n_with_elev, len(p_details), n_with_area, len(p_details))
                     if n_with_elev == 0:
                         issues.append("JSON: no parcels have elevation_m")
-                    elif n_with_elev < len(p_details) * 0.3:
-                        issues.append(f"JSON: only {n_with_elev}/{len(p_details)} parcels have elevation_m")
+                    elif n_with_elev < len(p_details) * 0.8:
+                        issues.append(f"JSON: only {n_with_elev}/{len(p_details)} parcels have elevation_m (expect >80% with full-KG DTM)")
                     if n_with_area == 0 and len(p_details) > 5:
-                        issues.append("JSON: no parcels have area_summary")
+                        # area_summary only available for parcels inside segmentation window
+                        log.info("  JSON: no parcels have area_summary (may be outside seg window)")
                     # Check largest parcel has full data
                     biggest = max(p_details, key=lambda p: p.get("area_sqm", 0))
                     if not biggest.get("parcel_id"):

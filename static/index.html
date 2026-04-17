@@ -308,8 +308,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
           <option value="elevation">Elevation</option>
           <option value="terrain">Terrain</option>
           <option value="segment" selected>Segment</option>
-          <option value="changes">Changes</option>
-          <option value="changes/trees">Tree Growth</option>
+
         </select>
       </div>
       <div class="ot-wrap"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
@@ -608,7 +607,7 @@ const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'
 const STATUS_COLORS={grown:{l:'▲',c:'#228B22'},felled:{l:'▼',c:'#DC143C'},new:{l:'★',c:'#00BFFF'},stable:{l:'●',c:'#888'},declined:{l:'▼',c:'#FF8C00'},dead:{l:'✖',c:'#8B0000'}};
 const EVENT_COLORS={tree_growth:{l:'▲',c:'#228B22'},tree_felling:{l:'▼',c:'#DC143C'},new_tree:{l:'★',c:'#00BFFF'},forest_clearcut:{l:'◆',c:'#FF00FF'},vegetation_growth:{l:'▲',c:'#7CFC00'},vegetation_loss:{l:'▼',c:'#FF8C00'},new_building:{l:'■',c:'#DC143C'},demolition:{l:'□',c:'#FF4500'},construction:{l:'■',c:'#FF6347'},earthwork_fill:{l:'◆',c:'#DAA520'},earthwork_cut:{l:'◇',c:'#8B4513'},earthwork_grading:{l:'◆',c:'#A0522D'},earthwork_dam:{l:'█',c:'#696969'},earthwork_trench:{l:'—',c:'#404040'},earthwork_pond:{l:'●',c:'#1E90FF'},road_new:{l:'—',c:'#808080'},road_resurfaced:{l:'—',c:'#A9A9A9'},road_widened:{l:'—',c:'#696969'},surface_change:{l:'×',c:'#D2B48C'},unknown_change:{l:'?',c:'#888'}};
 const DEF={l:'○',c:'#666'};
-function typeInfo(t,ep){if(ep==='changes/trees')return STATUS_COLORS[t]||DEF;if(ep==='changes')return EVENT_COLORS[t]||DEF;return TYPE_SHAPES[t]||DEF;}
+function typeInfo(t,ep){return TYPE_SHAPES[t]||DEF;}
 
 // ============ OBJECT TYPE MULTI-SELECT ============
 const OT_GROUPS={
@@ -1090,7 +1089,7 @@ function updateModalContent(){
 
   // Cards
   html+='<div class="summary-grid">';
-  html+=`<div class="summary-card"><div class="val">${features.length}</div><div class="lbl">${lastEndpoint==='changes'?'Change events':lastEndpoint==='changes/trees'?'Trees analysed':'Objects detected'}</div></div>`;
+  html+=`<div class="summary-card"><div class="val">${features.length}</div><div class="lbl">Objects detected</div></div>`;
 
   if(lastEndpoint==='segment'){
     let totalA=0,mmA=0;
@@ -1125,7 +1124,7 @@ function updateModalContent(){
     }
     const sorted=Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]);
     const total=sorted.reduce((s,[,n])=>s+n,0);
-    const tiMap=lastEndpoint==='changes/trees'?STATUS_COLORS:lastEndpoint==='changes'?EVENT_COLORS:TYPE_SHAPES;
+    const tiMap=TYPE_SHAPES;
 
     const typeAreas={};
     for(const f of features){
@@ -1374,8 +1373,6 @@ function updateLegendScale(){
   if(colorMode==='height'){
     d.innerHTML=`<div class="legend-scale-wrap"><div class="legend-bar" style="background:${viridisGrad()}"><div class="legend-hf-overlay"><div class="legend-hf-dim left" id="lhf-dim-l"></div><div class="legend-hf-dim right" id="lhf-dim-r"></div><div class="legend-hf-thumb" id="lhf-lo" style="left:0%"></div><div class="legend-hf-thumb" id="lhf-hi" style="left:100%"></div></div></div></div><div class="legend-labels" style="position:relative;height:14px"><span style="position:absolute;left:0" id="lhf-lo-lbl">0 m</span><span style="position:absolute;left:47%;transform:translateX(-50%)">10</span><span style="position:absolute;left:67%;transform:translateX(-50%)">20</span><span style="position:absolute;right:0" id="lhf-hi-lbl">45+ m</span></div>`;
     _initLegendHeightFilter();
-  } else if(lastEndpoint==='changes'||lastEndpoint==='changes/trees'){
-    d.innerHTML=`<div class="legend-bar" style="background:${divGrad()}"></div><div class="legend-labels"><span>−5 m</span><span>0</span><span>+5 m</span></div>`;
   } else d.innerHTML='';
 }
 // ============ LEGEND HEIGHT FILTER ============
@@ -1497,8 +1494,6 @@ function _filterRasterByHeight(hLo,hHi){
 function markerColor(f){
   const p=f.properties;
   if(colorMode==='height'){const h=p.height_max_m||p.height_after_m||p.height_max||0;return viridisCSS(Math.min(Math.sqrt(Math.max(h,0)/45),1));}
-  if(lastEndpoint==='changes/trees'){const dh=p.height_change_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
-  if(lastEndpoint==='changes'){const dh=p.height_change_mean_m||0;return divCSS(Math.max(-1,Math.min(1,dh/5)));}
   return null;
 }
 function reRenderMarkers(){resultLayer.clearLayers();markersByType={};if(allFeatureData.length)showFeaturesOnMap({features:allFeatureData});}
@@ -2858,16 +2853,16 @@ function showResultOnMap(data){
   mi.innerHTML=mh;mi.style.display=mh?'':'none';
 
   const cmBar=document.getElementById('color-mode-bar');
-  cmBar.style.display=['segment','changes','changes/trees'].includes(lastEndpoint)?'':'none';
+  cmBar.style.display=lastEndpoint==='segment'?'':'none';
   updateLegendScale();
 
   const typeCounts={};
-  let tiMap=lastEndpoint==='changes/trees'?STATUS_COLORS:lastEndpoint==='changes'?EVENT_COLORS:TYPE_SHAPES;
+  let tiMap=TYPE_SHAPES;
   for(const f of data.features){
     const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
     typeCounts[t]=(typeCounts[t]||0)+1;
   }
-  document.getElementById('legend-types-title').textContent=lastEndpoint==='changes/trees'?'Tree Status':lastEndpoint==='changes'?'Event Types':'Object Types';
+  document.getElementById('legend-types-title').textContent='Object Types';
   buildLegend(typeCounts,tiMap);
   buildSummary(data);
   showFeaturesOnMap(data);
@@ -2907,15 +2902,7 @@ function buildSummary(data){
   const panel=document.getElementById('summary-panel'),content=document.getElementById('summary-content');
   if(!data.features||!data.features.length){panel.style.display='none';return;}
   panel.style.display='';const n=data.features.length;let html='';
-  if(lastEndpoint==='changes/trees'){
-    const bs={};
-    for(const f of data.features){const s=f.properties.status||'?';bs[s]=(bs[s]||0)+1;}
-    html=`<b>${n}</b> trees — `+Object.entries(bs).map(([s,c])=>`<span style="color:${(STATUS_COLORS[s]||DEF).c}">${s}: ${c}</span>`).join(', ');
-    if(data.meta)html+=`<br><b>Period:</b> ${fmtDate(data.meta.date_a)} → ${fmtDate(data.meta.date_b)}`;
-  } else if(lastEndpoint==='changes'){
-    html=`<b>${n}</b> change events`;
-    if(data.meta)html+=` &nbsp; ${fmtDate(data.meta.date_a)} → ${fmtDate(data.meta.date_b)}`;
-  } else {
+  {
     let totalA=0,mmA=0;
     for(const f of data.features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
     html=`<b>${n}</b> objects &nbsp; <b>${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</b> manmade`;

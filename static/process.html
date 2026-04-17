@@ -342,7 +342,7 @@ function fmtT(iso) {
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Step pipeline
-const STEPS = ['cadastre','lidar','ortho','copernicus','hansen','segment','terrain','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
+const STEPS = ['cadastre','lidar','terrain','ortho','copernicus','hansen','segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
 const STEP_LBL = {cadastre:'Cadastre',lidar:'LiDAR',ortho:'Ortho',copernicus:'Copernicus',
   hansen:'Hansen',segment:'Segment',terrain:'Terrain',vectorise:'Vectorise',
   gpkg_full:'GPKG Full',gpkg_light:'GPKG Light',json:'JSON',validate:'Validate',
@@ -706,8 +706,8 @@ async function poll() {
     updateControls(d);
     updateMap(d);
     updateLastKg(d);
-    // Refresh tile overlays every 60s
-    if (Date.now() - lastTileFetch > 60000) fetchTileOverlays();
+    // Refresh tile overlays every 10s
+    if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString();
     dot.style.background = 'var(--green)';
@@ -829,13 +829,8 @@ function renderTileOverlays(d) {
       fillOpacity: evicted ? 0.03 : 0.06,
       fillColor: evicted ? '#f85149' : '#58a6ff',
       dashArray: evicted ? '4 3' : null,
-      interactive: true,
+      interactive: false,
     });
-    rect.bindTooltip(
-      'Copernicus 0.1°' + (evicted ? ' (evicted)' : '') +
-      '<br>' + t.w.toFixed(2) + ',' + t.s.toFixed(2) + ' → ' + t.e.toFixed(2) + ',' + t.n.toFixed(2),
-      {className: 'dark-tooltip', sticky: true}
-    );
     copLayer.addLayer(rect);
   });
   // Hansen 0.5° tiles — green outlines
@@ -849,13 +844,8 @@ function renderTileOverlays(d) {
       fillOpacity: evicted ? 0.02 : 0.04,
       fillColor: evicted ? '#d29922' : '#3fb950',
       dashArray: evicted ? '6 4' : null,
-      interactive: true,
+      interactive: false,
     });
-    rect.bindTooltip(
-      'Hansen 0.5°' + (evicted ? ' (evicted)' : '') +
-      '<br>' + t.w.toFixed(2) + ',' + t.s.toFixed(2) + ' → ' + t.e.toFixed(2) + ',' + t.n.toFixed(2),
-      {className: 'dark-tooltip', sticky: true}
-    );
     hanLayer.addLayer(rect);
   });
 }

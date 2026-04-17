@@ -2388,12 +2388,24 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     kg_code = kg["kg_code"]
     result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
 
+    _prev_step = [None, None]  # [step_name, start_time]
+    _step_times = {}           # step_name → seconds
+
     def _report_step(step, detail=""):
         try:
+            now = time.time()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            # Record elapsed time for previous step
+            if _prev_step[0] is not None and _prev_step[1] is not None:
+                elapsed = round(now - _prev_step[1], 1)
+                _step_times[_prev_step[0]] = round(
+                    _step_times.get(_prev_step[0], 0) + elapsed, 1)
+            _prev_step[0] = step
+            _prev_step[1] = now
             step_file = DATA_DIR / "current_step.json"
             import json as _json
             _json.dump({"step": step, "detail": detail,
-                        "ts": datetime.now(timezone.utc).isoformat()},
+                        "ts": now_iso, "step_times": _step_times},
                        open(str(step_file) + ".tmp", "w"))
             os.rename(str(step_file) + ".tmp", str(step_file))
         except Exception:
@@ -2489,6 +2501,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tile_geom_3035 = transform_to_3035(tile_geom_wgs)
 
             # --- 3a. LiDAR (default date) ---
+            _report_step("lidar", f"{tile_label} — reading DTM/DSM")
             try:
                 tdata = raster_io.read_dtm_dsm(tile_geom_3035, ti.DEFAULT_DATASET)
             except Exception as e:
@@ -2505,6 +2518,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             t_ndsm = tdata["ndsm"]
 
             # --- 3b. Terrain stats for this tile ---
+            _report_step("terrain", tile_label)
             try:
                 t_terrain = ta.characterise_terrain(tdata["dtm"], t_mask)
                 terrain_stats_list.append((t_terrain, tvalid))
@@ -2542,6 +2556,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 dtm_dates = dsm_dates = None
 
             # --- 3d. Orthophoto ---
+            _report_step("ortho", tile_label)
             spectral = None
             try:
                 import ortho_io
@@ -2573,6 +2588,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         v[::max(1, len(v)//5000)].tolist())  # subsample
 
             # --- 3e. Copernicus ---
+            _report_step("copernicus", tile_label)
             copernicus_data = None
             if include_copernicus:
                 c_breaker = _read_circuit_breaker()
@@ -2661,6 +2677,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                     v[::max(1, len(v)//2000)].tolist())
 
             # --- 3f. Hansen ---
+            _report_step("hansen", tile_label)
             hansen_data = None
             try:
                 hc = _get_hansen_cache()
@@ -2683,7 +2700,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     all_hansen_info["cf_sum"][0] += int(cf.sum())
 
             # --- 3g. Segmentation ---
-            _report_step(f"tile_{tile_idx+1}", f"segmenting {tile_label}")
+            _report_step("segment", tile_label)
 
             building_fp_mask = None
             if cadastre_data["building_footprints"]:
@@ -2780,6 +2797,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             all_objects.extend(core_objects)
 
             # --- 3h. Vectorise new buildings & infrastructure (this tile) ---
+            _report_step("vectorise", tile_label)
             try:
                 nb = vectorise_unmatched_buildings(
                     t_objects, t_labels, t_mask, t_transform,
@@ -3538,6 +3556,12 @@ def main():
                         sd = json.loads(step_file.read_text())
                         s = sd.get("step", "")
                         detail = sd.get("detail", "")
+                        # Always merge step_times from subprocess
+                        sub_times = sd.get("step_times", {})
+                        if sub_times:
+                            with progress._lock:
+                                if progress._state["current_kg"]:
+                                    progress._state["current_kg"]["step_times"] = sub_times
                         if s and s != last_step:
                             last_step = s
                             progress.set_step(s)

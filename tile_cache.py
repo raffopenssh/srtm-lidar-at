@@ -100,45 +100,43 @@ def crop_raster_to_bbox(data: np.ndarray, transform, target_bbox_wgs: tuple,
 # ---------------------------------------------------------------------------
 
 _TILE_INDEX_PATH = Path("data/austria_processor/tile_bbox_index.json")
-_tile_index_lock = threading.Lock() if 'threading' in dir() else None
-
-try:
-    import threading as _threading
-    _tile_index_lock = _threading.Lock()
-except Exception:
-    pass
+_TILE_INDEX_LOCK = Path("data/austria_processor/tile_bbox_index.lock")
 
 
 def _record_tile_bbox(source: str, w: float, s: float, e: float, n: float,
                       status: str = "cached"):
     """Record a tile bbox in the index file for map visualisation.
 
-    source: 'copernicus', 'hansen', 'bev'
-    status: 'cached' or 'evicted'
+    Uses a lockfile for cross-process safety (subprocess writes,
+    gunicorn reads).  Fast path: skip if key already present.
     """
+    import fcntl
     key = f"{source}_{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}"
     entry = {"source": source, "w": round(w, 5), "s": round(s, 5),
              "e": round(e, 5), "n": round(n, 5), "status": status,
              "ts": time.time()}
     try:
-        if _tile_index_lock:
-            _tile_index_lock.acquire()
-        idx = {}
-        if _TILE_INDEX_PATH.exists():
+        _TILE_INDEX_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with open(_TILE_INDEX_LOCK, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
-                idx = json.loads(_TILE_INDEX_PATH.read_text())
-            except Exception:
                 idx = {}
-        idx[key] = entry
-        _TILE_INDEX_PATH.write_text(json.dumps(idx))
-    except Exception:
-        pass
-    finally:
-        if _tile_index_lock:
-            try:
-                _tile_index_lock.release()
-            except Exception:
-                pass
+                if _TILE_INDEX_PATH.exists():
+                    try:
+                        idx = json.loads(_TILE_INDEX_PATH.read_text())
+                    except Exception:
+                        idx = {}
+                if key in idx and idx[key].get("status") == status:
+                    return  # already recorded
+                idx[key] = entry
+                tmp = str(_TILE_INDEX_PATH) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(idx, f)
+                os.replace(tmp, _TILE_INDEX_PATH)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except (BlockingIOError, OSError):
+        pass  # another process holds the lock — skip this update
 
 
 def get_tile_bbox_index() -> dict:
@@ -163,77 +161,11 @@ def get_tile_bbox_index() -> dict:
 
 
 def rebuild_tile_bbox_index():
-    """Scan cache directories and rebuild the tile bbox index.
-
-    Copernicus tiles are in EPSG:32633 — we reconstruct WGS84 bbox
-    from transform + shape.  Hansen tiles are already in WGS84.
+    """No-op fallback.  The index is maintained incrementally by
+    ``_record_tile_bbox`` which is called from ``_tile_path`` on every
+    cache access (hit or miss).
     """
-    from pyproj import Transformer
-    tx_to_wgs = Transformer.from_crs("EPSG:32633", "EPSG:4326", always_xy=True)
-
-    idx = {}
-
-    # --- Copernicus tiles ---
-    cop_dir = CopernicusTileCache.CACHE_DIR
-    if cop_dir.exists():
-        for f in cop_dir.glob("*.npz"):
-            try:
-                cached = np.load(str(f), allow_pickle=True)
-                t = cached["transform"]
-                # Find a data array to get shape
-                for arr_key in ["ndvi", "vv", "data"]:
-                    if arr_key in cached:
-                        shape = cached[arr_key].shape
-                        break
-                else:
-                    continue
-                crs = str(cached.get("crs", "EPSG:32633"))
-                west_m = float(t[2])
-                north_m = float(t[5])
-                east_m = west_m + shape[1] * float(t[0])
-                south_m = north_m + shape[0] * float(t[4])
-                if "4326" in crs:
-                    w, s, e, n = west_m, south_m, east_m, north_m
-                else:
-                    w, s = tx_to_wgs.transform(west_m, south_m)
-                    e, n = tx_to_wgs.transform(east_m, north_m)
-                key = f"copernicus_{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}"
-                idx[key] = {"source": "copernicus", "w": round(w, 5),
-                            "s": round(s, 5), "e": round(e, 5),
-                            "n": round(n, 5), "status": "cached",
-                            "ts": f.stat().st_mtime,
-                            "file": f.name}
-            except Exception as exc:
-                log.debug("Skip copernicus cache %s: %s", f.name, exc)
-
-    # --- Hansen tiles ---
-    han_dir = HansenTileCache.CACHE_DIR
-    if han_dir.exists():
-        for f in han_dir.glob("*.npz"):
-            try:
-                cached = np.load(str(f), allow_pickle=True)
-                t = cached["transform"]
-                shape = tuple(cached["shape"])
-                w = float(t[2])
-                n = float(t[5])
-                e = w + shape[1] * float(t[0])
-                s = n + shape[0] * float(t[4])
-                key = f"hansen_{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}"
-                idx[key] = {"source": "hansen", "w": round(w, 5),
-                            "s": round(s, 5), "e": round(e, 5),
-                            "n": round(n, 5), "status": "cached",
-                            "ts": f.stat().st_mtime,
-                            "file": f.name}
-            except Exception as exc:
-                log.debug("Skip hansen cache %s: %s", f.name, exc)
-
-    try:
-        _TILE_INDEX_PATH.write_text(json.dumps(idx))
-        log.info("Tile bbox index rebuilt: %d entries", len(idx))
-    except Exception as exc:
-        log.warning("Failed to write tile bbox index: %s", exc)
-
-    return idx
+    pass
 
 
 class CopernicusTileCache:
@@ -253,6 +185,8 @@ class CopernicusTileCache:
     def _tile_path(self, prefix: str, w: float, s: float, e: float, n: float,
                    **extra) -> Path:
         key = tile_key(prefix, w, s, e, n, **extra)
+        # Record bbox for map overlay
+        _record_tile_bbox("copernicus", w, s, e, n, "cached")
         return self.CACHE_DIR / f"{prefix}_{key}.npz"
 
     def _snap(self, bbox: dict) -> Tuple[float, float, float, float]:
@@ -294,7 +228,6 @@ class CopernicusTileCache:
             )
             log.info("Copernicus NDVI tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
                      tw, ts, te, tn, result["ndvi"].shape[1], result["ndvi"].shape[0])
-            _record_tile_bbox("copernicus", tw, ts, te, tn, "cached")
             return result
         except Exception as e:
             self._stats["errors"] += 1
@@ -326,7 +259,6 @@ class CopernicusTileCache:
             np.savez_compressed(str(path), data=np.array(result, dtype=object))
             log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
                      tw, ts, te, tn)
-            _record_tile_bbox("copernicus", tw, ts, te, tn, "cached")
             return result
         except Exception as e:
             self._stats["errors"] += 1
@@ -369,7 +301,6 @@ class CopernicusTileCache:
             )
             log.info("Copernicus SAR tile cached: %.2f,%.2f → %.2f,%.2f",
                      tw, ts, te, tn)
-            _record_tile_bbox("copernicus", tw, ts, te, tn, "cached")
             return result
         except Exception as e:
             self._stats["errors"] += 1
@@ -409,6 +340,7 @@ class HansenTileCache:
 
     def _tile_path(self, w: float, s: float, e: float, n: float) -> Path:
         key = tile_key("hansen", w, s, e, n)
+        _record_tile_bbox("hansen", w, s, e, n, "cached")
         return self.CACHE_DIR / f"hansen_{key}.npz"
 
     def _snap(self, bbox_wgs: tuple) -> Tuple[float, float, float, float]:
@@ -455,7 +387,6 @@ class HansenTileCache:
             np.savez_compressed(str(path), **save_dict)
             log.info("Hansen tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
                      tw, ts, te, tn, raw["shape"][1], raw["shape"][0])
-            _record_tile_bbox("hansen", tw, ts, te, tn, "cached")
             return raw
         except Exception as e:
             self._stats["errors"] += 1

@@ -3891,6 +3891,8 @@ def main():
             warnings_file = DATA_DIR / "subprocess_warnings.jsonl"
             last_step = ""
             _warn_offset = 0  # track read position in warnings file
+            # Track per-step worst issue level: {step: "warning"|"error"}
+            _step_issues = {}
             while not _stop.is_set():
                 try:
                     if step_file.exists():
@@ -3914,6 +3916,8 @@ def main():
                                     ckg["step_detail"] = detail
                                 else:
                                     ckg.pop("step_detail", None)
+                                # Expose step issues to frontend
+                                ckg["step_issues"] = dict(_step_issues)
                         if s and s != last_step:
                             last_step = s
                             progress.set_step(s)
@@ -3935,11 +3939,17 @@ def main():
                                 continue
                             try:
                                 entry = json.loads(line)
+                                lvl = entry.get("level", "warning")
                                 progress.add_log(
-                                    entry.get("level", "warning"),
+                                    lvl,
                                     f"KG {_code}: {entry.get('msg', '')}",
                                     _code,
                                 )
+                                # Attribute warning/error to current step
+                                if last_step:
+                                    cur = _step_issues.get(last_step, "")
+                                    if lvl == "error" or cur != "error":
+                                        _step_issues[last_step] = lvl
                             except json.JSONDecodeError:
                                 pass
                         if new_lines:

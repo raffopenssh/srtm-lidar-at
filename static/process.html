@@ -55,6 +55,10 @@
          color: var(--dim); background: transparent; white-space: nowrap; transition: all 0.3s; }
   .stp.done { border-color: #23492e; color: var(--green); }
   .stp.done::before { content: '✓ '; }
+  .stp.done-warn { border-color: #6e4e15; color: var(--yellow); }
+  .stp.done-warn::before { content: '⚠ '; }
+  .stp.done-err { border-color: #6e2015; color: var(--red); }
+  .stp.done-err::before { content: '✗ '; }
   .stp.act { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.08);
              animation: pulse 1.5s ease-in-out infinite; }
   .stp.pend { opacity: 0.35; }
@@ -91,7 +95,10 @@
   .log-success .log-msg { color: var(--green); }
   .log-error .log-msg { color: var(--red); }
   .log-warning .log-msg { color: var(--yellow); }
-  .log-ok { display: inline-block; background: #3fb95022; color: #3fb950; font-size: 9px; padding: 0 5px; border-radius: 3px; margin-left: 6px; font-weight: 600; }
+  .log-badge { display: inline-block; font-size: 9px; padding: 0 5px; border-radius: 3px; margin-left: 6px; font-weight: 600; }
+  .log-badge-ok { background: #3fb95022; color: #3fb950; }
+  .log-badge-warn { background: #d2992222; color: var(--yellow); }
+  .log-badge-err { background: #f8514922; color: var(--red); }
 
   /* Tables */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -576,12 +583,20 @@ function updateKgCard(d) {
 
   // Steps pipeline with elapsed time per step
   const curIdx = STEPS.indexOf(pipelineStep);
+  const stepIssues = kg.step_issues || {};
   let sh = '';
   STEPS.forEach((st, i) => {
     let cls = 'stp';
-    if (i < curIdx) cls += ' done';
-    else if (i === curIdx) cls += ' act';
-    else cls += ' pend';
+    if (i < curIdx) {
+      const issue = stepIssues[st];
+      if (issue === 'error') cls += ' done-err';
+      else if (issue === 'warning') cls += ' done-warn';
+      else cls += ' done';
+    } else if (i === curIdx) {
+      cls += ' act';
+    } else {
+      cls += ' pend';
+    }
     const pre = (i === curIdx) ? '<span class="spin"></span>' : '';
     const tip = (i === curIdx && kg.step_detail) ? ' title="' + esc(kg.step_detail) + '"' : '';
     // Show elapsed seconds for completed steps
@@ -638,9 +653,17 @@ function updateLog(d) {
       const c = colors[grade] || '#8b949e';
       return '<span style="background:' + c + '22;color:' + c + ';padding:1px 5px;border-radius:3px;font-weight:600">Q:' + pct + '% ' + grade + '</span>';
     });
-    // ✔ badge: info-level step entries that aren't the latest for their KG
-    const isCompletedStep = lvl === 'info' && e.kg && latestInfoPerKg[e.kg] !== i;
-    const badge = isCompletedStep ? '<span class="log-ok">✔</span>' : '';
+    // Badge: ✓ for completed info steps, ⚠ for warnings, ✗ for errors
+    let badge = '';
+    if (lvl === 'warning') {
+      badge = '<span class="log-badge log-badge-warn">⚠</span>';
+    } else if (lvl === 'error') {
+      badge = '<span class="log-badge log-badge-err">✗</span>';
+    } else if (lvl === 'success') {
+      badge = '<span class="log-badge log-badge-ok">✔</span>';
+    } else if (lvl === 'info' && e.kg && latestInfoPerKg[e.kg] !== i) {
+      badge = '<span class="log-badge log-badge-ok">✔</span>';
+    }
     h += '<div class="' + cls + '">' +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
       (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +

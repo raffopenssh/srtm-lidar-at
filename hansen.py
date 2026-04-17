@@ -29,7 +29,7 @@ from rasterio.crs import CRS
 
 log = logging.getLogger(__name__)
 
-CACHE_DIR = Path("/tmp/hansen_cache")
+CACHE_DIR = Path("data/austria_processor/hansen_layer_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_URL = "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12"

@@ -719,6 +719,11 @@ def get_ndvi_timeseries(
 
     if to_download:
         _func_creds = FUNCTIONING_CREDENTIALS()
+        if not _func_creds:
+            # All credentials exhausted — fall back to current credential index
+            # (it may have recovered, or will raise CreditsExhaustedError)
+            _func_creds = [_credential_index]
+            logger.warning("All credentials marked exhausted, falling back to cred %d", _credential_index + 1)
         _n_par = max(len(_func_creds), 1)
         # Assign each download task a credential index (round-robin)
         to_download_with_cred = [

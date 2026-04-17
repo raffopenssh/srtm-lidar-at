@@ -145,6 +145,16 @@ def read_hansen_window(
     east_tile = _tile_for_lon(east)
     if west_tile != east_tile:
         boundary = int(east // 10) * 10  # e.g. 10.0
+
+        # Skip degenerate splits where one side has zero/near-zero width
+        left_degenerate = boundary - west < 1e-7
+        right_degenerate = east - boundary < 1e-7
+
+        if left_degenerate and not right_degenerate:
+            return read_hansen_window((boundary, south, east, north), layers)
+        if right_degenerate and not left_degenerate:
+            return read_hansen_window((west, south, boundary - 1e-6, north), layers)
+
         left = read_hansen_window((west, south, boundary - 1e-6, north), layers)
         right = read_hansen_window((boundary, south, east, north), layers)
         # Horizontal concat — left | right
@@ -194,6 +204,8 @@ def resample_to_target(
         src = hansen_data.get(key)
         if src is None:
             continue
+        if 0 in src.shape:
+            continue  # skip degenerate arrays
         dst = np.zeros(target_shape, dtype=src.dtype)
         reproject(
             source=src,

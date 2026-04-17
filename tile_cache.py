@@ -378,13 +378,21 @@ class HansenTileCache:
             self._stats["hits"] += 1
             try:
                 cached = np.load(str(path), allow_pickle=True)
-                result = {}
-                for layer in ["treecover2000", "lossyear", "gain", "datamask"]:
-                    if layer in cached:
-                        result[layer] = cached[layer]
-                result["transform"] = _arr_to_affine(cached["transform"])
-                result["shape"] = tuple(cached["shape"])
-                return result
+                cached_shape = tuple(cached["shape"])
+                # Check for degenerate cached data
+                if any(d == 0 for d in cached_shape):
+                    log.warning("Degenerate Hansen cache %s (shape %s), removing",
+                                path.name, cached_shape)
+                    path.unlink(missing_ok=True)
+                    # Fall through to re-fetch below
+                else:
+                    result = {}
+                    for layer in ["treecover2000", "lossyear", "gain", "datamask"]:
+                        if layer in cached:
+                            result[layer] = cached[layer]
+                    result["transform"] = _arr_to_affine(cached["transform"])
+                    result["shape"] = cached_shape
+                    return result
             except Exception as e:
                 log.warning("Corrupt Hansen cache %s: %s", path.name, e)
                 path.unlink(missing_ok=True)

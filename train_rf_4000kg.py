@@ -657,6 +657,28 @@ def match_segments_via_raster(
     if n_relabelled:
         source_counts["hansen_tree_loss"] = n_relabelled
 
+    # --- Post-pass: remap excavation/fill → earthwork ---
+    n_merged = 0
+    for i, lbl in enumerate(train_labels):
+        if lbl in ("excavation", "fill"):
+            train_labels[i] = "earthwork"
+            n_merged += 1
+    if n_merged:
+        source_counts["earthwork_merged"] = n_merged
+        log.info("Merged %d excavation/fill labels → earthwork", n_merged)
+
+    # --- Post-pass: drop RF-excluded classes (unlearnable) ---
+    from learned_classifier import RF_EXCLUDED_CLASSES
+    keep = [(f, l) for f, l in zip(train_features, train_labels)
+            if l not in RF_EXCLUDED_CLASSES]
+    n_dropped = len(train_features) - len(keep)
+    if n_dropped:
+        train_features = [f for f, _ in keep]
+        train_labels = [l for _, l in keep]
+        source_counts["rf_excluded_dropped"] = n_dropped
+        log.info("Dropped %d samples of RF-excluded classes: %s",
+                 n_dropped, RF_EXCLUDED_CLASSES)
+
     return train_features, train_labels, source_counts
 
 

@@ -1242,6 +1242,292 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
         log.warning('GPKG style table failed: %s', e)
 
 
+def _write_segment_points(gpkg_path: str, objects: list,
+                          layer_name: str = 'segment_points',
+                          obs_year: int = 0):
+    """Write segment centroid points with full attributes to a GPKG.
+
+    This mirrors the GeoJSON Point features that the API returns,
+    enabling the same map visualisation from the GPKG/Zenodo store.
+    """
+    import fiona
+    from fiona.crs import from_epsg
+
+    schema = {
+        'geometry': 'Point',
+        'properties': [
+            # Identity
+            ('id', 'int'),
+            ('type', 'str'),
+            ('type_code', 'int'),
+            ('group_type', 'str'),
+            ('height_class', 'str'),
+            # Geometry
+            ('area_sqm', 'float'),
+            ('perimeter_m', 'float'),
+            ('compactness', 'float'),
+            ('elongation', 'float'),
+            ('solidity', 'float'),
+            ('extent', 'float'),
+            # Height
+            ('height_max_m', 'float'),
+            ('height_mean_m', 'float'),
+            ('height_p90_m', 'float'),
+            ('height_std_m', 'float'),
+            # Surface
+            ('slope_mean_deg', 'float'),
+            ('roughness', 'float'),
+            ('dsm_edge_strength', 'float'),
+            # Spectral
+            ('ndvi_mean', 'float'),
+            ('ndvi_fused', 'float'),
+            ('brightness_mean', 'float'),
+            ('nir_mean', 'float'),
+            # Temporal
+            ('height_change_m', 'float'),
+            ('dtm_change_m', 'float'),
+            ('temporal_stability', 'float'),
+            ('volume_change_m3', 'float'),
+            ('volume_change_abs_m3', 'float'),
+            ('dtm_change_max_m', 'float'),
+            # Texture
+            ('glcm_entropy', 'float'),
+            ('glcm_homogeneity', 'float'),
+            ('texture_complexity', 'float'),
+            # SAR
+            ('sar_vv', 'float'),
+            ('sar_vh', 'float'),
+            # Phenology
+            ('harm_amplitude', 'float'),
+            ('harm_phase', 'float'),
+            ('phenology_class', 'str'),
+            # Classification
+            ('confidence', 'float'),
+            ('is_manmade', 'int'),
+            # Rendering
+            ('color', 'str'),
+            ('color_height', 'str'),
+            # Observation
+            ('obs_year', 'int'),
+        ],
+    }
+
+    with fiona.open(gpkg_path, 'w', driver='GPKG', layer=layer_name,
+                    schema=schema, crs=from_epsg(4326)) as dst:
+        written = 0
+        for obj in objects:
+            # Convert centroid from EPSG:3035 to WGS84
+            try:
+                lon, lat = _tx_to_wgs.transform(obj.centroid_e, obj.centroid_n)
+            except Exception:
+                continue
+            tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+            hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+            hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+            hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+            dst.write({
+                'geometry': {'type': 'Point', 'coordinates': [round(lon, 7), round(lat, 7)]},
+                'properties': {
+                    'id': obj.obj_id,
+                    'type': obj.obj_type,
+                    'type_code': obj.type_code,
+                    'group_type': obj.group_type or '',
+                    'height_class': _height_class(obj.height_max),
+                    'area_sqm': round(obj.area_sqm, 1),
+                    'perimeter_m': round(obj.perimeter_m, 1),
+                    'compactness': round(obj.compactness, 3),
+                    'elongation': round(obj.elongation, 2),
+                    'solidity': round(obj.solidity, 3),
+                    'extent': round(obj.extent, 3),
+                    'height_max_m': round(obj.height_max, 2),
+                    'height_mean_m': round(obj.height_mean, 2),
+                    'height_p90_m': round(obj.height_p90, 2),
+                    'height_std_m': round(obj.height_std, 2),
+                    'slope_mean_deg': round(obj.slope_mean, 1),
+                    'roughness': round(obj.roughness, 3),
+                    'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'ndvi_mean': round(obj.ndvi_mean, 4),
+                    'ndvi_fused': round(obj.ndvi_fused, 4),
+                    'brightness_mean': round(obj.brightness_mean, 1),
+                    'nir_mean': round(obj.nir_mean, 1),
+                    'height_change_m': round(obj.height_change, 3),
+                    'dtm_change_m': round(obj.dtm_change, 3),
+                    'temporal_stability': round(obj.temporal_stability, 3),
+                    'volume_change_m3': round(obj.volume_change_m3, 1),
+                    'volume_change_abs_m3': round(obj.volume_change_abs_m3, 1),
+                    'dtm_change_max_m': round(obj.dtm_change_max, 3),
+                    'glcm_entropy': round(obj.glcm_entropy, 4),
+                    'glcm_homogeneity': round(obj.glcm_homogeneity, 4),
+                    'texture_complexity': round(obj.texture_complexity, 4),
+                    'sar_vv': round(obj.sar_vv, 4),
+                    'sar_vh': round(obj.sar_vh, 4),
+                    'harm_amplitude': round(obj.harm_amplitude, 4),
+                    'harm_phase': round(obj.harm_phase, 1),
+                    'phenology_class': obj.phenology_class or '',
+                    'confidence': round(obj.confidence, 3),
+                    'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'color': hex_type,
+                    'color_height': hex_height,
+                    'obs_year': obs_year or 0,
+                },
+            })
+            written += 1
+    log.info("GPKG point layer '%s': %d points", layer_name, written)
+
+    # Add point style
+    try:
+        _write_gpkg_point_style(gpkg_path, layer_name)
+    except Exception as e:
+        log.warning('GPKG point style failed: %s', e)
+
+
+def _write_gpkg_point_style(gpkg_path: str, layer_name: str):
+    """Write QGIS-compatible point style using data-defined colour."""
+    import sqlite3
+    qml = (
+        '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+        '<qgis version="3.34">'
+        '<renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0">'
+        '<symbols>'
+        '<symbol type="marker" name="0" clip_to_extent="1" alpha="0.8">'
+        '<layer class="SimpleMarker" enabled="1" locked="0" pass="0">'
+        '<Option type="Map">'
+        '<Option type="QString" value="circle" name="name"/>'
+        '<Option type="QString" value="3" name="size"/>'
+        '<Option type="QString" value="0.35,0.35,0.35,255" name="outline_color"/>'
+        '<Option type="QString" value="0.2" name="outline_width"/>'
+        '</Option>'
+        '<data_defined_properties><Property><Option type="Map">'
+        '<Option type="Map" name="properties"><Option type="Map" name="fillColor">'
+        '<Option type="bool" value="true" name="active"/>'
+        '<Option type="QString" value="&quot;color&quot;" name="expression"/>'
+        '<Option type="int" value="3" name="type"/>'
+        '</Option></Option></Option></Property></data_defined_properties>'
+        '</layer></symbol></symbols></renderer-v2></qgis>'
+    )
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+        conn.execute(
+            'INSERT INTO layer_styles '
+            '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+            'VALUES (?, ?, ?, ?, 1, ?)',
+            (layer_name, 'geom', 'Segment points by type', qml,
+             'Auto-generated colour-by-type point style'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
+                           has_points: bool = True, has_parcels: bool = False,
+                           has_buildings: bool = False, has_new_buildings: bool = False,
+                           has_infrastructure: bool = False):
+    """Write QGIS styles for all vector layers in a GPKG."""
+    import sqlite3
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+
+        def _add_style(table, geom_col, name, qml, desc):
+            conn.execute(
+                'INSERT INTO layer_styles '
+                '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+                'VALUES (?, ?, ?, ?, 1, ?)',
+                (table, geom_col, name, qml, desc),
+            )
+
+        # Parcels: yellow outline, transparent fill
+        if has_parcels:
+            _add_style('parcels', 'geom', 'Parcel boundaries',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.3">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,255,200,50" name="color"/>'
+                '<Option type="QString" value="200,180,0,255" name="outline_color"/>'
+                '<Option type="QString" value="0.4" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Yellow outline parcel boundaries')
+
+        # Buildings: red fill, dark outline
+        if has_buildings:
+            _add_style('buildings', 'geom', 'Buildings',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.6">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="220,20,60,160" name="color"/>'
+                '<Option type="QString" value="100,10,30,255" name="outline_color"/>'
+                '<Option type="QString" value="0.3" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Red building footprints')
+
+        # New buildings: magenta, dashed
+        if has_new_buildings:
+            _add_style('new_buildings', 'geom', 'New buildings',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.7">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,0,255,180" name="color"/>'
+                '<Option type="QString" value="180,0,180,255" name="outline_color"/>'
+                '<Option type="QString" value="0.5" name="outline_width"/>'
+                '<Option type="QString" value="dash" name="outline_style"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Magenta dashed new building detections')
+
+        # Infrastructure: orange
+        if has_infrastructure:
+            _add_style('infrastructure', 'geom', 'Infrastructure',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.6">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,140,0,160" name="color"/>'
+                '<Option type="QString" value="180,100,0,255" name="outline_color"/>'
+                '<Option type="QString" value="0.3" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Orange infrastructure features')
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
 
 def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
     """Compute overlapping tiles covering the full KG bbox. Returns [(w,s,e,n)]."""
@@ -1421,6 +1707,14 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
             except Exception as e:
                 log.warning("Full GPKG vectors tile %d failed: %s", ti_idx+1, e)
 
+    # Segment centroid points — one layer with all objects
+    if all_objects:
+        try:
+            _write_segment_points(out_path, all_objects,
+                                  layer_name='segment_points', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Full GPKG segment points failed: %s", e)
+
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
              fsize/1e6, table_count, len(tile_seg_results))
@@ -1587,6 +1881,28 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     'confidence': inf.get('confidence',0),
                     'centroid_lon': inf.get('centroid_lon'), 'centroid_lat': inf.get('centroid_lat'),
                     'edge_clipped': inf.get('edge_clipped', False)}})
+
+    # Segment centroid points — one layer with all objects
+    if all_objects:
+        try:
+            _write_segment_points(out_path, all_objects,
+                                  layer_name='segment_points', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Light GPKG segment points failed: %s", e)
+
+    # Write QGIS styles for all layers
+    try:
+        _write_gpkg_all_styles(
+            out_path,
+            has_segments=bool(all_objects),
+            has_points=bool(all_objects),
+            has_parcels=bool(cadastre_data.get("parcels")),
+            has_buildings=bool(cadastre_data.get("building_footprints")),
+            has_new_buildings=bool(new_buildings),
+            has_infrastructure=bool(infrastructure),
+        )
+    except Exception as e:
+        log.warning("Light GPKG styles failed: %s", e)
 
     return out_path
 
@@ -1872,6 +2188,12 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "parcel_segmentation_coverage_pct": round(100*nwa/max(len(parcel_details),1), 1),
         "building_height_coverage_pct": round(100*nbh/max(len(bld_details),1), 1),
         "note": "Full KG tiled segmentation; every parcel/building has elevation + segmentation data."}
+    # --- Segment summary (counts only; full points are in GPKG) ---
+    seg_type_counts = Counter(obj.obj_type for obj in objects)
+    summary["segments"] = {
+        "total": len(objects),
+        "by_type": dict(seg_type_counts.most_common()),
+    }
     # --- Methods ---
     summary["methods"] = {
         "segmentation": f"Felzenszwalb+RAG on {n_tiles} overlapping {tile_km}km tiles, centroid-dedup",
@@ -3140,10 +3462,18 @@ def main():
                if kg["kg_code"] not in completed_codes
                and kg["kg_code"] not in failed_kgs]
 
-    # Sort geographically for tile-cache locality
-    from tile_cache import sort_kgs_geographically
-    pending = sort_kgs_geographically(pending)
-    log.info("KGs sorted geographically for cache locality")
+    # Sort by nearest-neighbor traversal for maximum cache reuse
+    from tile_cache import order_kgs_nearest_neighbor
+    # Resume from last completed KG if available
+    resume_from = None
+    if completed_codes:
+        # Find the last completed KG that has a local JSON
+        json_files = sorted(JSON_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+        if json_files:
+            resume_from = json_files[-1].stem
+            log.info("Resuming nearest-neighbor traversal from last KG: %s", resume_from)
+    pending = order_kgs_nearest_neighbor(pending, start_code=resume_from)
+    log.info("KGs ordered by nearest-neighbor traversal for cache locality")
 
     log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
              len(kgs), len(completed_codes), len(failed_kgs), len(pending))

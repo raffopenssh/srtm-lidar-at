@@ -313,6 +313,8 @@ const API = '/api/v1/processing/status';
 const POLL = 5;
 let cd = POLL;
 let map, mapMarkers;
+let copLayer, hanLayer;
+let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
 let kgTimerInterval = null;
@@ -352,6 +354,14 @@ function initMap() {
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
   mapMarkers = L.layerGroup().addTo(map);
+  copLayer = L.layerGroup().addTo(map);
+  hanLayer = L.layerGroup().addTo(map);
+  L.control.layers(null, {
+    'KG centroids': mapMarkers,
+    'Copernicus tiles (0.1°)': copLayer,
+    'Hansen tiles (0.5°)': hanLayer,
+  }, {collapsed: true, position: 'topright'}).addTo(map);
+  fetchTileOverlays();
 }
 
 function updateMap(d) {
@@ -696,6 +706,8 @@ async function poll() {
     updateControls(d);
     updateMap(d);
     updateLastKg(d);
+    // Refresh tile overlays every 60s
+    if (Date.now() - lastTileFetch > 60000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString();
     dot.style.background = 'var(--green)';
@@ -792,6 +804,60 @@ function renderLastKg(js) {
     '<span class="ds-tag ' + (s.ok ? 'ds-ok' : 'ds-miss') + '">' +
     (s.ok ? '\u2713 ' : '\u2717 ') + s.name + '</span>'
   ).join('');
+}
+
+// ── Tile Cache Overlays ─────────────────────────────────────────
+async function fetchTileOverlays() {
+  lastTileFetch = Date.now();
+  try {
+    const r = await fetch('/api/v1/processing/tiles');
+    if (!r.ok) return;
+    const d = await r.json();
+    renderTileOverlays(d);
+  } catch(e) { console.error('tiles:', e); }
+}
+function renderTileOverlays(d) {
+  if (!map) return;
+  // Copernicus 0.1° tiles — blue outlines
+  copLayer.clearLayers();
+  (d.copernicus || []).forEach(t => {
+    const bounds = [[t.s, t.w], [t.n, t.e]];
+    const evicted = t.status === 'evicted';
+    const rect = L.rectangle(bounds, {
+      color: evicted ? '#f85149' : '#58a6ff',
+      weight: evicted ? 1 : 1.5,
+      fillOpacity: evicted ? 0.03 : 0.06,
+      fillColor: evicted ? '#f85149' : '#58a6ff',
+      dashArray: evicted ? '4 3' : null,
+      interactive: true,
+    });
+    rect.bindTooltip(
+      'Copernicus 0.1°' + (evicted ? ' (evicted)' : '') +
+      '<br>' + t.w.toFixed(2) + ',' + t.s.toFixed(2) + ' → ' + t.e.toFixed(2) + ',' + t.n.toFixed(2),
+      {className: 'dark-tooltip', sticky: true}
+    );
+    copLayer.addLayer(rect);
+  });
+  // Hansen 0.5° tiles — green outlines
+  hanLayer.clearLayers();
+  (d.hansen || []).forEach(t => {
+    const bounds = [[t.s, t.w], [t.n, t.e]];
+    const evicted = t.status === 'evicted';
+    const rect = L.rectangle(bounds, {
+      color: evicted ? '#d29922' : '#3fb950',
+      weight: evicted ? 1 : 2,
+      fillOpacity: evicted ? 0.02 : 0.04,
+      fillColor: evicted ? '#d29922' : '#3fb950',
+      dashArray: evicted ? '6 4' : null,
+      interactive: true,
+    });
+    rect.bindTooltip(
+      'Hansen 0.5°' + (evicted ? ' (evicted)' : '') +
+      '<br>' + t.w.toFixed(2) + ',' + t.s.toFixed(2) + ' → ' + t.e.toFixed(2) + ',' + t.n.toFixed(2),
+      {className: 'dark-tooltip', sticky: true}
+    );
+    hanLayer.addLayer(rect);
+  });
 }
 
 // ── Init ────────────────────────────────────────────────────────

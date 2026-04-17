@@ -263,17 +263,21 @@ def landscape_metadata(
     """
     return {
         "metadata": {
-            "title": f"Austria Landscape — KG {kg_code} {kg_name} ({file_type})",
+            "title": f"Austria Landscape \u2014 KG {kg_code} {kg_name} ({file_type})",
             "upload_type": "dataset",
             "description": (
-                f"Landscape classification raster for Austrian cadastral unit "
+                f"Landscape classification for Austrian cadastral unit "
                 f"<b>{kg_code} {kg_name}</b>.\n"
+                f"Contains: segmentation raster/vectors, DTM/DSM/nDSM, cadastre parcels "
+                f"with elevation, buildings with heights, new building detections, "
+                f"infrastructure analysis, terrain stats, NDVI, SAR, phenology.\n"
                 f"Format: {file_type}, version {version}.\n"
-                f"Derived from BEV ALS LIDAR (DTM/DSM) and Basemap.at orthophoto data."
+                f"Derived from BEV ALS LIDAR (DTM/DSM), Basemap.at orthophoto, "
+                f"Sentinel-2 NDVI, Sentinel-1 SAR, ESA WorldCover, Hansen GFC."
             ),
             "creators": [{"name": "SRTM-LIDAR Pipeline"}],
-            "access_right": "open",
-            "license": "cc-by-4.0",
+            "access_right": "restricted",
+            "access_conditions": "Contact the dataset creator for access.",
             "version": version,
             "keywords": [
                 "austria",
@@ -281,6 +285,8 @@ def landscape_metadata(
                 "lidar",
                 "dtm",
                 "dsm",
+                "segmentation",
+                "cadastre",
                 kg_code,
                 kg_name,
             ],

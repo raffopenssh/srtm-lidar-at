@@ -125,6 +125,11 @@ for v in ("cemetery", "allotments"):
 for v in ("scrub", "heath"):
     _LANDCOVER_MAP[("natural", v)] = "shrub"
 
+# power infrastructure
+_LANDCOVER_MAP[("power", "generator")] = "solar_panel"  # needs solar check
+_LANDCOVER_MAP[("power", "substation")] = "substation"
+_LANDCOVER_MAP[("power", "plant")] = "substation"
+
 
 # ---------------------------------------------------------------------------
 # Landcover rasterization codes
@@ -233,6 +238,7 @@ def _query_all(bbox: tuple[float, float, float, float]) -> Optional[dict]:
         "waterway": f'[out:json][timeout:60]{bb};way["waterway"];out geom;',
         "landuse":  f'[out:json][timeout:60]{bb};(way["landuse"];relation["landuse"];);out geom;',
         "natural":  f'[out:json][timeout:60]{bb};(way["natural"];relation["natural"];);out geom;',
+        "power":    f'[out:json][timeout:60]{bb};(way["power"];node["power"="generator"];node["power"="tower"];);out geom;',
     }
 
     results = {}

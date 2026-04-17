@@ -921,6 +921,20 @@ def processing_log():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/processing/tiles')
+def processing_tiles():
+    """Return cache tile bboxes for map overlay in process.html."""
+    try:
+        from tile_cache import get_tile_bbox_index, rebuild_tile_bbox_index, _TILE_INDEX_PATH
+        # Rebuild if missing or stale (>5 min)
+        if not _TILE_INDEX_PATH.exists() or \
+           (time.time() - _TILE_INDEX_PATH.stat().st_mtime > 300):
+            rebuild_tile_bbox_index()
+        return jsonify(get_tile_bbox_index())
+    except Exception as e:
+        return jsonify({'error': str(e), 'copernicus': [], 'hansen': []})
+
+
 @app.route('/api/v1/processing/manifest')
 def processing_manifest():
     """Return the Zenodo manifest for the processor."""

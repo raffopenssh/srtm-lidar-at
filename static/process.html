@@ -91,6 +91,7 @@
   .log-success .log-msg { color: var(--green); }
   .log-error .log-msg { color: var(--red); }
   .log-warning .log-msg { color: var(--yellow); }
+  .log-ok { display: inline-block; background: #3fb95022; color: #3fb950; font-size: 9px; padding: 0 5px; border-radius: 3px; margin-left: 6px; font-weight: 600; }
 
   /* Tables */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -618,8 +619,16 @@ function updateLog(d) {
 
   // Newest first
   const sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  // Build set of KGs that have step transitions — all info entries except
+  // the latest per-KG are "completed" steps and get a ✔ badge.
+  const latestInfoPerKg = {};  // kg -> index of newest info entry
+  sorted.forEach((e, i) => {
+    if ((e.level || 'info') === 'info' && e.kg && !(e.kg in latestInfoPerKg)) {
+      latestInfoPerKg[e.kg] = i;
+    }
+  });
   let h = '';
-  sorted.forEach(e => {
+  sorted.forEach((e, i) => {
     const lvl = e.level || 'info';
     const cls = 'log-row log-' + lvl;
     let msg = esc(e.msg);
@@ -629,10 +638,13 @@ function updateLog(d) {
       const c = colors[grade] || '#8b949e';
       return '<span style="background:' + c + '22;color:' + c + ';padding:1px 5px;border-radius:3px;font-weight:600">Q:' + pct + '% ' + grade + '</span>';
     });
+    // ✔ badge: info-level step entries that aren't the latest for their KG
+    const isCompletedStep = lvl === 'info' && e.kg && latestInfoPerKg[e.kg] !== i;
+    const badge = isCompletedStep ? '<span class="log-ok">✔</span>' : '';
     h += '<div class="' + cls + '">' +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
       (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +
-      '<span class="log-msg">' + msg + '</span></div>';
+      '<span class="log-msg">' + msg + badge + '</span></div>';
   });
   area.innerHTML = h;
   if (document.getElementById('autoScroll').checked) area.scrollTop = 0;

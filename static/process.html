@@ -522,8 +522,9 @@ function updateKgCard(d) {
   document.getElementById('kgSub').textContent =
     (kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + (kg.step || '?') + stepDetail;
 
-  // Steps pipeline with detail tooltip on active step
+  // Steps pipeline with elapsed time per step
   const curIdx = STEPS.indexOf(kg.step);
+  const stepTimes = kg.step_times || {};
   let sh = '';
   STEPS.forEach((st, i) => {
     let cls = 'stp';
@@ -532,7 +533,10 @@ function updateKgCard(d) {
     else cls += ' pend';
     const pre = (i === curIdx) ? '<span class="spin"></span>' : '';
     const tip = (i === curIdx && kg.step_detail) ? ' title="' + esc(kg.step_detail) + '"' : '';
-    sh += '<span class="' + cls + '"' + tip + '>' + pre + (STEP_LBL[st]||st) + '</span>';
+    // Show elapsed seconds for completed steps
+    const t = stepTimes[st];
+    const tStr = (t != null && i < curIdx) ? ' <span style="opacity:0.6;font-size:9px">' + fmtD(t) + '</span>' : '';
+    sh += '<span class="' + cls + '"' + tip + '>' + pre + (STEP_LBL[st]||st) + tStr + '</span>';
   });
   document.getElementById('kgSteps').innerHTML = sh;
 }
@@ -748,7 +752,7 @@ function renderLastKg(js) {
   items.push({l: 'New Buildings', v: fmt(newb.count || 0)});
   items.push({l: 'Infrastructure', v: fmt(infra.total || 0)});
   items.push({l: 'Trees', v: fmt(trees.count) + ' / ' + ((trees.canopy_area_sqm||0)/10000).toFixed(2) + 'ha'});
-  items.push({l: 'Tallest', v: (top10[0]?.height_m||0).toFixed(1) + 'm ' + (top10[0]?.type||'')});
+  items.push({l: 'Tallest', v: (top10[0]?.height_max_m||top10[0]?.height_m||0).toFixed(1) + 'm ' + (top10[0]?.type||'')});
   items.push({l: 'Tallest Tree', v: (top10t[0]?.height_m||0).toFixed(1) + 'm'});
   items.push({l: 'Stem Vol', v: (trees.est_stem_volume_m3||0).toFixed(0) + ' m\u00b3'});
   items.push({l: 'Elev', v: (terrain.elevation_min_m||0).toFixed(0) + '\u2013' + (terrain.elevation_max_m||0).toFixed(0) + 'm'});

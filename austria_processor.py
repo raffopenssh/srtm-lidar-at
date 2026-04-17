@@ -180,9 +180,26 @@ class ProgressTracker:
     def set_step(self, step: str, detail: str = ""):
         with self._lock:
             if self._state["current_kg"]:
+                now = datetime.now(timezone.utc).isoformat()
+                prev_step = self._state["current_kg"].get("step", "")
+                prev_start = self._state["current_kg"].get("step_started_at")
+                # Record elapsed time for previous step
+                if prev_step and prev_start:
+                    try:
+                        from datetime import datetime as _dt
+                        t0 = _dt.fromisoformat(prev_start)
+                        t1 = _dt.fromisoformat(now)
+                        elapsed = (t1 - t0).total_seconds()
+                        steps_done = self._state["current_kg"].setdefault("step_times", {})
+                        steps_done[prev_step] = round(elapsed, 1)
+                    except Exception:
+                        pass
                 self._state["current_kg"]["step"] = step
+                self._state["current_kg"]["step_started_at"] = now
                 if detail:
                     self._state["current_kg"]["step_detail"] = detail
+                else:
+                    self._state["current_kg"].pop("step_detail", None)
 
     def add_log(self, level: str, msg: str, kg: str = ""):
         with self._lock:
@@ -1501,15 +1518,25 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
     summary["terrain"] = {}
     if terrain_stats:
         ts = terrain_stats
+        elev = ts.get("elevation", {})
+        slope = ts.get("slope_deg", {})
+        tri = ts.get("ruggedness_tri", {})
+        curv = ts.get("curvature", {})
+        aspect_dist = ts.get("aspect_distribution_pct", {})
+        # Find dominant aspect
+        dominant_aspect = max(aspect_dist, key=aspect_dist.get) if aspect_dist else ""
         summary["terrain"] = {
-            "steepness_mean_deg": ts.get("slope_mean_deg"),
-            "steepness_max_deg": ts.get("slope_max_deg"),
-            "aspect_dominant": ts.get("dominant_aspect", ""),
-            "roughness_mean": ts.get("roughness_mean"),
-            "curvature_mean": ts.get("curvature_mean"),
-            "elevation_min_m": ts.get("elevation_min_m"),
-            "elevation_max_m": ts.get("elevation_max_m"),
-            "elevation_range_m": ts.get("elevation_range_m"),
+            "steepness_mean_deg": slope.get("mean"),
+            "steepness_max_deg": slope.get("max"),
+            "aspect_dominant": dominant_aspect,
+            "aspect_distribution_pct": aspect_dist,
+            "slope_classes_pct": ts.get("slope_classes_pct", {}),
+            "roughness_mean": tri.get("mean"),
+            "curvature_mean": curv.get("mean") if isinstance(curv, dict) else None,
+            "elevation_min_m": elev.get("min"),
+            "elevation_max_m": elev.get("max"),
+            "elevation_range_m": elev.get("range"),
+            "elevation_mean_m": elev.get("mean"),
             "method": "DTM Sobel slope + aspect, BEV ALS 1m",
         }
 
@@ -1663,13 +1690,23 @@ def build_json_summary(kg_code: str, kg_info: dict, data: dict,
             pd["centroid"] = {"lon": round(c_wgs.x, 7), "lat": round(c_wgs.y, 7)}
         except Exception:
             pass
-        # DTM elevation at centroid
+        # DTM elevation at centroid (with neighborhood fallback)
         try:
             c3 = geom_3035.centroid
             col = int((c3.x - transform.c) / transform.a)
             row = int((transform.f - c3.y) / abs(transform.e))
             if 0 <= row < h and 0 <= col < w:
-                pd["elevation_m"] = round(float(dtm[row, col]), 2)
+                val = float(dtm[row, col])
+                if np.isfinite(val):
+                    pd["elevation_m"] = round(val, 2)
+                else:
+                    # Try 5x5 neighborhood
+                    r0, r1 = max(0, row-2), min(h, row+3)
+                    c0, c1 = max(0, col-2), min(w, col+3)
+                    patch = dtm[r0:r1, c0:c1]
+                    valid = patch[np.isfinite(patch)]
+                    if len(valid) > 0:
+                        pd["elevation_m"] = round(float(np.nanmean(valid)), 2)
         except Exception:
             pass
         # Segment type breakdown within parcel
@@ -2226,13 +2263,13 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             import rasterio
             expected_layers = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
             found_layers = set()
-            ds_list = rasterio.open(full_path).subdatasets if hasattr(rasterio.open(full_path), 'subdatasets') else []
-            # Try listing GPKG raster tables
+            # List all GPKG raster tables (tiles + 2d-gridded-coverage)
             try:
                 import sqlite3
                 conn = sqlite3.connect(full_path)
                 tables = [r[0] for r in conn.execute(
-                    "SELECT table_name FROM gpkg_contents WHERE data_type='tiles'").fetchall()]
+                    "SELECT table_name FROM gpkg_contents "
+                    "WHERE data_type IN ('tiles', '2d-gridded-coverage')").fetchall()]
                 conn.close()
                 found_layers = set(tables)
             except Exception:
@@ -2259,7 +2296,8 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             conn = sqlite3.connect(light_path)
             # Raster tables
             raster_tables = [r[0] for r in conn.execute(
-                "SELECT table_name FROM gpkg_contents WHERE data_type='tiles'").fetchall()]
+                "SELECT table_name FROM gpkg_contents "
+                    "WHERE data_type IN ('tiles', '2d-gridded-coverage')").fetchall()]
             # Vector tables
             vector_tables = [r[0] for r in conn.execute(
                 "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
@@ -2329,15 +2367,24 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             if parcels.get("count", 0) > 0 and not p_details:
                 issues.append("JSON: parcels.details is empty despite count>0")
             else:
-                # Spot-check first parcel
+                # Spot-check parcels
                 if p_details:
-                    p0 = p_details[0]
-                    if not p0.get("parcel_id"):
-                        issues.append("JSON: first parcel missing parcel_id")
-                    if not p0.get("centroid"):
-                        issues.append("JSON: first parcel missing centroid")
-                    if not p0.get("area_summary") and p0.get("area_sqm", 0) > 100:
-                        issues.append("JSON: first parcel missing area_summary")
+                    n_with_elev = sum(1 for p in p_details if p.get("elevation_m") is not None)
+                    n_with_area = sum(1 for p in p_details if p.get("area_summary"))
+                    log.info("  JSON: %d/%d parcels with elevation, %d/%d with area_summary",
+                             n_with_elev, len(p_details), n_with_area, len(p_details))
+                    if n_with_elev == 0:
+                        issues.append("JSON: no parcels have elevation_m")
+                    elif n_with_elev < len(p_details) * 0.3:
+                        issues.append(f"JSON: only {n_with_elev}/{len(p_details)} parcels have elevation_m")
+                    if n_with_area == 0 and len(p_details) > 5:
+                        issues.append("JSON: no parcels have area_summary")
+                    # Check largest parcel has full data
+                    biggest = max(p_details, key=lambda p: p.get("area_sqm", 0))
+                    if not biggest.get("parcel_id"):
+                        issues.append("JSON: largest parcel missing parcel_id")
+                    if not biggest.get("centroid"):
+                        issues.append("JSON: largest parcel missing centroid")
 
             # Check building_footprints have details
             bfp = js.get("building_footprints", {})
@@ -2482,7 +2529,7 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
         log.info("  top types: %s",
                  ", ".join(f"{t}={v.get('area_sqm',0)}m\u00b2" for t, v in top5))
     log.info("  tallest=%.1fm | tallest_tree=%.1fm | trees=%d | stem_vol=%.0f m\u00b3",
-             top_obj[0].get("height_m", 0) if top_obj else 0,
+             top_obj[0].get("height_max_m", 0) if top_obj else 0,
              top_tree[0].get("height_m", 0) if top_tree else 0,
              tree_stats.get("count", 0),
              tree_stats.get("est_stem_volume_m3", 0) or 0)
@@ -2708,8 +2755,25 @@ def main():
     manifest = Manifest(str(MANIFEST_PATH))
     log.info("Zenodo manifest: %d entries", len(manifest))
 
-    # --- Load progress tracker ---
+    # --- Load progress tracker (reset stale state from previous run) ---
     progress = ProgressTracker(PROGRESS_FILE)
+    progress.update(
+        failed_kgs=[],
+        failed=0,
+        completed=0,
+        success=0,
+        uploaded=0,
+        upload_size_bytes=0,
+        last_kg_code=None,
+        last_kg_seconds=0,
+        n_new_buildings_total=0,
+        n_infrastructure_total=0,
+        parcels_total=0,
+        buildings_total=0,
+        recent_log=[],
+        current_kg=None,
+    )
+    progress.save()
 
     # --- Get KG list ---
     if args.kg:

@@ -521,9 +521,9 @@ def classify_with_rf_batch(
     Returns dict mapping label -> (type_name, type_code, confidence, is_manmade).
     Uses predict_batch for a single RF call instead of per-segment calls.
 
-    If *mark_uncertain* is True, segments with RF confidence below 0.10 are
+    If *mark_uncertain* is True, segments with RF confidence below 0.15 are
     labelled 'unclassified' (the RF has no real signal).  Segments between
-    0.10 and *min_confidence* still fall back to rule-based classification.
+    0.15 and *min_confidence* still fall back to rule-based classification.
     This makes deep uncertainty visible without losing rule-based coverage.
     """
     from object_segmentation import OBJECT_TYPES, classify_object
@@ -569,7 +569,7 @@ def classify_with_rf_batch(
                     results[feat["label"]] = ("unclassified", uc_code, conf, False)
                 else:
                     results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
-        elif mark_uncertain and (conf or 0) < 0.10:
+        elif mark_uncertain and (conf or 0) < 0.15:
             # Very low confidence → unclassified (RF has no real signal)
             results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
         else:

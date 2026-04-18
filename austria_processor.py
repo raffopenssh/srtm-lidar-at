@@ -1750,6 +1750,117 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
                 _add_style(tbl, '', 'Surface model', dtm_qml,
                            f'Digital surface model {tbl}')
 
+        # --- Sentinel-2 NDVI: green-yellow-brown diverging ramp ---
+        if 'NDVI' in raster_tables:
+            ndvi_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+                '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+                'classificationMode="2" minimumValue="-0.2" maximumValue="1.0">'
+                '<item value="-0.2" color="#d73027" label="-0.2 (bare/water)"/>'
+                '<item value="0.0" color="#f46d43" label="0.0"/>'
+                '<item value="0.1" color="#fdae61" label="0.1"/>'
+                '<item value="0.2" color="#fee08b" label="0.2"/>'
+                '<item value="0.3" color="#ffffbf" label="0.3"/>'
+                '<item value="0.4" color="#d9ef8b" label="0.4"/>'
+                '<item value="0.5" color="#a6d96a" label="0.5"/>'
+                '<item value="0.6" color="#66bd63" label="0.6"/>'
+                '<item value="0.7" color="#1a9850" label="0.7"/>'
+                '<item value="0.8" color="#006837" label="0.8 (dense veg)"/>'
+                '<item value="1.0" color="#004529" label="1.0"/>'
+                '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+            )
+            _add_style('NDVI', '', 'Sentinel-2 NDVI', ndvi_qml,
+                       'NDVI composite: red = bare/water, green = vegetation')
+
+        # --- ESA WorldCover: official class colour scheme ---
+        if 'WorldCover' in raster_tables:
+            wc_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="paletted" band="1" opacity="0.85">'
+                '<colorPalette>'
+                '<item value="10" color="#006400" label="Tree cover" alpha="255"/>'
+                '<item value="20" color="#ffbb22" label="Shrubland" alpha="255"/>'
+                '<item value="30" color="#ffff4c" label="Grassland" alpha="255"/>'
+                '<item value="40" color="#f096ff" label="Cropland" alpha="255"/>'
+                '<item value="50" color="#fa0000" label="Built-up" alpha="255"/>'
+                '<item value="60" color="#b4b4b4" label="Bare / sparse veg" alpha="255"/>'
+                '<item value="70" color="#f0f0f0" label="Snow and ice" alpha="255"/>'
+                '<item value="80" color="#0064c8" label="Permanent water" alpha="255"/>'
+                '<item value="90" color="#0096a0" label="Herbaceous wetland" alpha="255"/>'
+                '<item value="95" color="#00cf75" label="Mangroves" alpha="255"/>'
+                '<item value="100" color="#fae6a0" label="Moss and lichen" alpha="255"/>'
+                '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('WorldCover', '', 'ESA WorldCover 2021', wc_qml,
+                       'Land cover classes with official ESA colour scheme')
+
+        # --- Sentinel-1 SAR (VV+VH): grey ramp for radar backscatter (dB) ---
+        if 'SAR' in raster_tables:
+            sar_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="multibandcolor" opacity="1" '
+                'redBand="1" greenBand="2" blueBand="1">'
+                '<redContrastEnhancement><minValue>-25</minValue>'
+                '<maxValue>0</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</redContrastEnhancement>'
+                '<greenContrastEnhancement><minValue>-30</minValue>'
+                '<maxValue>-5</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</greenContrastEnhancement>'
+                '<blueContrastEnhancement><minValue>-25</minValue>'
+                '<maxValue>0</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</blueContrastEnhancement>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('SAR', '', 'SAR VV-VH composite', sar_qml,
+                       'Sentinel-1 SAR: Red/Blue=VV, Green=VH (stretched dB)')
+
+        # --- Hansen tree cover 2000: green ramp 0-100% ---
+        if 'Hansen_treecover' in raster_tables:
+            tc_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="0.9">'
+                '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+                'classificationMode="2" minimumValue="0" maximumValue="100">'
+                '<item value="0" color="#f7f7f7" label="0% (no trees)"/>'
+                '<item value="10" color="#d9f0a3" label="10%"/>'
+                '<item value="25" color="#addd8e" label="25%"/>'
+                '<item value="50" color="#78c679" label="50%"/>'
+                '<item value="75" color="#31a354" label="75%"/>'
+                '<item value="100" color="#006837" label="100% (full canopy)"/>'
+                '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+            )
+            _add_style('Hansen_treecover', '', 'Tree cover 2000', tc_qml,
+                       'Hansen Global Forest: tree canopy density in year 2000')
+
+        # --- Hansen loss year: diverging yellow→red timeline ---
+        if 'Hansen_lossyear' in raster_tables:
+            ly_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="paletted" band="1" opacity="0.9">'
+                '<colorPalette>'
+                '<item value="0" color="#ffffff" label="No loss" alpha="0"/>'
+                '<item value="1" color="#ffffcc" label="2001" alpha="255"/>'
+                '<item value="5" color="#fed976" label="2005" alpha="255"/>'
+                '<item value="10" color="#fd8d3c" label="2010" alpha="255"/>'
+                '<item value="15" color="#e31a1c" label="2015" alpha="255"/>'
+                '<item value="20" color="#b10026" label="2020" alpha="255"/>'
+                '<item value="23" color="#800026" label="2023" alpha="255"/>'
+                '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('Hansen_lossyear', '', 'Forest loss year', ly_qml,
+                       'Hansen Global Forest: year of forest loss (1=2001 … 23=2023)')
+
         conn.commit()
     finally:
         conn.close()

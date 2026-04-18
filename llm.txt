@@ -191,6 +191,67 @@ RF model status: trained, n_samples, oob_score, feature_importances.
 #### GET /api/v1/training/status
 Background RF training job progress (4000-KG run).
 
+### Search Index (fast pre-built SQLite FTS5 + R-tree over all 8440 Austrian KGs)
+
+#### GET /api/v1/index/status
+Index statistics: kg_count, processed_count, total_area_km2, zenodo_kgs, etc.
+
+#### POST /api/v1/index/rebuild
+Rebuild search index from scratch (~0.3s).
+
+#### GET /api/v1/query ← UNIFIED QUERY ENDPOINT
+Supports multiple query modes via query params. All return JSON.
+
+Query modes (pick one):
+  q=<text>                Full-text search (KG/gemeinde/district/state names)
+  kg=<code>               Exact KG lookup (returns full index record + landcover + hansen + links)
+  parcel=<KGCODE-GNR>     Parcel lookup (returns KG summary + parcel detail if processed)
+  bbox=<w,s,e,n>          Spatial R-tree query (KGs intersecting bbox)
+  point=<lon,lat>         Point proximity query (sorted by distance)
+  state=<code|name>       KGs in a Bundesland (or aggregate if aggregate=true)
+  district=<code>         KGs in a Bezirk (or aggregate if aggregate=true)
+  gemeinde=<code>         KGs in a Gemeinde (or aggregate if aggregate=true)
+  type=<object_type>      Rank KGs by object type (metric=area|fraction|count|height)
+  hansen=true             Hansen forest loss query (year_from, year_to, min_loss)
+  new_buildings=true      KGs with new uncadastred buildings (min_count=N)
+
+Modifiers:
+  aggregate=true          Return aggregate stats instead of KG list
+  processed_only=true     Only processed KGs
+  limit=N                 Max results (default 100, max 1000)
+  offset=N                Pagination offset
+  radius=N                Radius in km for point query (default 5)
+  metric=<area|fraction|count|height>  For type= ranking
+  year_from=YYYY          Start year for hansen filter
+  year_to=YYYY            End year for hansen filter
+
+Response for single KG (kg= or query_kg):
+  {kg_code, kg_name, gemeinde_name, district_name, state_name,
+   bbox, centroid, parcel_count, building_count, total_area_sqm,
+   processed, generated_at, primary_year,
+   dominant_type, vegetated_fraction, shannon_diversity, n_segments,
+   elevation_{min,max,mean}_m, slope_mean_deg, aspect_dominant, ndvi_mean,
+   tree_{count,canopy_sqm,mean_height_m,stem_volume_m3},
+   net_volume_change_m3, temporal_stability,
+   new_building_count, infrastructure_count,
+   quality_score, quality_grade,
+   landcover: [{object_type, area_sqm, fraction, n_objects, height_{min,max,mean,p90}}, ...],
+   hansen_loss: [{loss_year, loss_pixels}, ...],
+   _links: {json, zenodo_json, zenodo_light_gpkg, zenodo_full_gpkg}}
+
+Response for aggregate (state/district/gemeinde/country):
+  {name, level, total_kgs, processed_kgs, total_area_km2, total_parcels,
+   total_buildings, total_trees, tree_canopy_km2, total_new_buildings,
+   avg_elevation_m, avg_slope_deg, avg_ndvi, avg_quality_score,
+   top_landcover: [...], hansen_loss_by_year: {...}}
+
+#### GET /api/v1/kg/<kg_code>
+Full KG JSON summary if processed locally, else index data with Zenodo links.
+Add ?index_only=true to always use index (faster, no file I/O).
+
+#### GET /api/v1/parcel/<KGCODE-GNR>
+Parcel lookup via search index + local JSON detail.
+
 ---
 
 ## 25 Object Types
@@ -385,4 +446,44 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80'
 
 # Direct GPKG download from share
 curl -o analysis.gpkg 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg'
+
+# --- Search Index queries ---
+# Index status
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/index/status'
+
+# Text search (fuzzy, supports KG/gemeinde/district/state names)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Gaissau'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien'
+
+# Spatial queries
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=15.0,47.0,16.0,48.0'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48&radius=5'
+
+# Admin hierarchy
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg'        # list KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&aggregate=true'  # stats
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=802'            # Bregenz district KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=802&aggregate=true'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?aggregate=true'           # all Austria
+
+# Specific KG detail (landcover + hansen + zenodo links)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/kg/91109?index_only=true'
+
+# Parcel lookup
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcel=91109-535/6'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcel/91109-535/6'
+
+# Object type rankings across KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=tree&metric=area&limit=10'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=roof&metric=fraction'
+
+# Hansen forest loss
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?hansen=true&year_from=2020&year_to=2024'
+
+# New buildings
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&min_count=50'
+
+# List processed KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?processed_only=true'
 ```

@@ -62,7 +62,7 @@ TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 
 MAX_KG_PIXELS = 4_000_000
-KG_TIMEOUT_SECONDS = 30 * 60
+KG_TIMEOUT_SECONDS = 90 * 60   # 90 min — Copernicus harmonics alone can take 45 min per grid tile
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
@@ -4129,8 +4129,25 @@ def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
 
 # === SECTION: Encapsulated sub-tile Copernicus fetcher ===
 
-_COP_SUBTILE_SIZES = [0.5, 0.2]   # km — ladder for per-step sub-tiling
+# Copernicus sub-tile fallback: split into 4 quadrants (2×2), then 16 (4×4)
 _COP_STEP_TIMEOUT = 300            # 5 min per sub-step (NDVI/WorldCover/SAR/harmonics)
+
+
+def _quadrant_split(bbox_dict: dict, n: int = 2) -> list[dict]:
+    """Split a bbox into n×n equal quadrants. Returns list of bbox dicts."""
+    w, s, e, n_ = bbox_dict["west"], bbox_dict["south"], bbox_dict["east"], bbox_dict["north"]
+    dx = (e - w) / n
+    dy = (n_ - s) / n
+    quads = []
+    for row in range(n):
+        for col in range(n):
+            quads.append({
+                "west":  w + col * dx,
+                "south": s + row * dy,
+                "east":  w + (col + 1) * dx,
+                "north": s + (row + 1) * dy,
+            })
+    return quads
 
 
 def _fetch_copernicus_for_tile(
@@ -4206,26 +4223,20 @@ def _fetch_copernicus_for_tile(
         log.warning("Copernicus full-tile fetch failed for %s: %s — trying sub-tiles",
                     tile_label, e)
 
-    # --- Sub-tile fallback: subdivide and stitch ---
-    tw = bbox_dict["west"]
-    ts = bbox_dict["south"]
-    te = bbox_dict["east"]
-    tn = bbox_dict["north"]
-
-    for sub_km in _COP_SUBTILE_SIZES:
-        sub_bboxes = _compute_tile_grid(tw, ts, te, tn,
-                                        tile_km=sub_km, overlap_km=0.01)
-        _report(f"sub-tiling @ {sub_km}km ({len(sub_bboxes)} pieces)")
-        log.info("Copernicus sub-tile fallback for %s: %d sub-tiles @ %.1fkm",
-                 tile_label, len(sub_bboxes), sub_km)
+    # --- Sub-tile fallback: quadrant split and stitch ---
+    # Ladder: first try 4 quadrants (2×2), then 16 (4×4)
+    for n_split in [2, 4]:
+        sub_bboxes = _quadrant_split(bbox_dict, n=n_split)
+        n_pieces = n_split * n_split
+        _report(f"quadrant split {n_split}×{n_split} ({n_pieces} pieces)")
+        log.info("Copernicus quadrant fallback for %s: %d quadrants (%d×%d)",
+                 tile_label, n_pieces, n_split, n_split)
 
         sub_results = []
-        all_ok = True
-        for si, (sw, ss, se, sn) in enumerate(sub_bboxes):
-            sub_label = f"sub-tile {si+1}/{len(sub_bboxes)} @ {sub_km}km — "
+        for si, sb in enumerate(sub_bboxes):
+            sub_label = f"quadrant {si+1}/{n_pieces} — "
             _report(sub_label.rstrip(" — "))
             try:
-                sb = {"west": sw, "south": ss, "east": se, "north": sn}
                 sr = _try_fetch_single(sb, label=sub_label)
                 sub_results.append((sb, sr))
             except Exception as e:
@@ -4233,19 +4244,18 @@ def _fetch_copernicus_for_tile(
                 if isinstance(e, CreditsExhaustedError) or \
                    isinstance(e.__cause__, CreditsExhaustedError):
                     raise
-                log.warning("Copernicus sub-tile %d/%d failed: %s",
-                            si+1, len(sub_bboxes), e)
+                log.warning("Copernicus quadrant %d/%d failed: %s",
+                            si+1, n_pieces, e)
                 sub_results.append((sb, None))
-                all_ok = False
 
-        # Stitch sub-tile results back together
+        # Stitch quadrant results back together
         stitched = _stitch_copernicus_subtiles(
             sub_results, bbox_dict, tile_label)
         if stitched is not None:
             return stitched
 
-        log.warning("Copernicus stitch failed at %.1fkm for %s, trying smaller",
-                    sub_km, tile_label)
+        log.warning("Copernicus stitch failed at %d×%d for %s, trying finer split",
+                    n_split, n_split, tile_label)
 
     return None
 
@@ -4423,7 +4433,7 @@ def _stitch_copernicus_subtiles(
 
 
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
-                   failed_tiles: dict = None, mark_uncertain: bool = False) -> dict:
+                   mark_uncertain: bool = False) -> dict:
     """Process a single KG with tiled segmentation for full coverage.
 
     The full KG is divided into overlapping 1.5km tiles.  Each tile
@@ -4431,15 +4441,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     Hansen, segmentation, classification).  Results are merged into
     one set of vectors/stats covering the entire KG.
 
-    Parameters
-    ----------
-    failed_tiles : dict[int, float] | None
-        Mapping of original tile index → sub-tile km.  On a retry
-        after timeout, only the tile that was in-progress is
-        sub-divided at the given resolution.  Already-completed
-        tiles are restored from checkpoint and keep their original
-        quality.  Example: ``{3: 0.5}`` means "sub-divide original
-        tile 3 into 0.5 km sub-tiles".
+    On retry after timeout, tile checkpoints mean completed tiles are
+    instantly restored — no bbox changes or sub-division needed.
 
     This function runs in a subprocess for memory isolation.
     """
@@ -4643,74 +4646,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             full_west, full_south, full_east, full_north,
             tile_km=tile_km, overlap_km=0.1)
 
-        # --- 2b. Expand failed tiles into sub-tiles ---
-        # failed_tiles maps original tile_idx → sub_tile_km.
-        # Replace that tile's bbox with a finer grid; keep others.
-        _ft = failed_tiles or {}
-        tiles_wgs = []      # final flat list of bboxes
-        _subtile_info = {}  # maps new flat idx → (orig_tile_idx, sub_idx, n_sub, sub_km)
-        _orig_to_flat = {}  # maps orig_idx → new flat_idx (non-expanded tiles only)
-        for orig_idx, bbox in enumerate(base_tiles_wgs):
-            if orig_idx in _ft:
-                sub_km = _ft[orig_idx]
-                ow, os_, oe, on = bbox
-                subs = _compute_tile_grid(ow, os_, oe, on,
-                                          tile_km=sub_km, overlap_km=0.05)
-                log.info("KG %s: tile %d sub-divided into %d sub-tiles @ %.1fkm",
-                         kg_code, orig_idx, len(subs), sub_km)
-                for si, sb in enumerate(subs):
-                    flat_idx = len(tiles_wgs)
-                    _subtile_info[flat_idx] = (orig_idx, si, len(subs), sub_km)
-                    tiles_wgs.append(sb)
-            else:
-                _orig_to_flat[orig_idx] = len(tiles_wgs)
-                tiles_wgs.append(bbox)
-
+        tiles_wgs = base_tiles_wgs
         n_tiles = len(tiles_wgs)
-
-        # --- 2c. Remap checkpoint files when indices shifted ---
-        # Previous run saved checkpoints keyed by the *old* flat
-        # index (= orig_idx when there was no expansion).  With
-        # failed-tile expansion the flat indices shift.  We rename
-        # files so _load_tile_checkpoint finds the right data, and
-        # delete stale files that belong to a previous (now
-        # superseded) expansion of a failed tile.
-        if _ft and _orig_to_flat:
-            existing = sorted(_tile_ckpt_dir.glob("tile_*.pkl"))
-            # Parse old flat indices from filenames
-            old_idxs = {}
-            for p in existing:
-                try:
-                    old_idxs[int(p.stem.split("_")[1])] = p
-                except (IndexError, ValueError):
-                    continue
-            # 1) Delete any checkpoint whose old flat idx is NOT a
-            #    valid orig tile (i.e. it was a sub-tile from the
-            #    previous expansion and is now stale).
-            for old_idx, path in list(old_idxs.items()):
-                if old_idx not in _orig_to_flat:
-                    # Not a surviving original tile — stale sub-tile
-                    # or the failed tile itself.
-                    path.unlink(missing_ok=True)
-                    log.debug("KG %s: removed stale checkpoint %s",
-                              kg_code, path.name)
-                    del old_idxs[old_idx]
-            # 2) Rename surviving checkpoints to new flat indices.
-            #    Rename in descending order to avoid collisions.
-            renames = []
-            for old_idx, path in old_idxs.items():
-                new_idx = _orig_to_flat[old_idx]
-                if new_idx != old_idx:
-                    renames.append((path, _tile_ckpt_dir / f"tile_{new_idx}.pkl"))
-            for src, dst in sorted(renames, key=lambda p: -int(p[0].stem.split("_")[1])):
-                if src.exists() and not dst.exists():
-                    src.rename(dst)
-                    log.debug("KG %s: renamed checkpoint %s → %s",
-                              kg_code, src.name, dst.name)
-        _n_subtiled = len(_ft)
-        if _n_subtiled:
-            log.info("KG %s: %d tiles total (%d original tiles sub-divided)",
-                     kg_code, n_tiles, _n_subtiled)
         log.info("KG %s: %d tiles (%.1fkm base) covering %.4f,%.4f → %.4f,%.4f",
                  kg_code, n_tiles, tile_km,
                  full_west, full_south, full_east, full_north)
@@ -4733,19 +4670,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # --- 3. Process each tile ---
         for tile_idx, (tw, ts, te, tn) in enumerate(tiles_wgs):
             _tile_progress[0] = tile_idx + 1
-            # Build label that includes sub-tile info when applicable
-            _sti = _subtile_info.get(tile_idx)
-            if _sti:
-                _orig_idx, _si, _nsub, _skm = _sti
-                tile_label = (f"tile {tile_idx+1}/{n_tiles} "
-                              f"(sub-tile {_si+1}/{_nsub} of orig {_orig_idx+1} @ {_skm}km)")
-                _subtile_progress[0] = {"orig_tile": _orig_idx + 1,
-                                        "sub_idx": _si + 1,
-                                        "n_sub": _nsub,
-                                        "sub_km": _skm}
-            else:
-                tile_label = f"tile {tile_idx+1}/{n_tiles}"
-                _subtile_progress[0] = None
+            tile_label = f"tile {tile_idx+1}/{n_tiles}"
+            _subtile_progress[0] = None
             result["step"] = f"tile_{tile_idx+1}"
             # Track tile centroid + status for dashboard map
             _tile_lat = (ts + tn) / 2
@@ -4753,9 +4679,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _tile_entry = {"lat": round(_tile_lat, 5), "lng": round(_tile_lng, 5),
                           "status": "current", "issues": {},
                           "idx": tile_idx + 1}
-            if _sti:
-                _tile_entry["subtile"] = {"orig": _orig_idx + 1, "sub": _si + 1,
-                                          "n_sub": _nsub, "km": _skm}
             _tile_statuses.append(_tile_entry)
 
             # --- Check for cached tile checkpoint ---
@@ -5700,16 +5623,7 @@ def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "complet
         log.warning("Failed to save tile history for %s: %s", kg_code, e)
 
 
-# === SECTION: main() — KG iteration, retry ladder, subprocess management ===
-
-# Per-tile retry ladder: on timeout, sub-divide ONLY the timed-out
-# tile into smaller sub-tiles.  Each step is a tile_km for the sub-tiles.
-# The first entry (0.5km) is the first sub-division of a 1.5km tile;
-# 0.2km is used if a 0.5km sub-tile itself times out.
-SUB_TILE_LADDER = [0.5, 0.2]   # km — per-tile subdivision sizes
-
-# Increased timeout: allow extra time for sub-tiled retries.
-KG_TIMEOUT_SECONDS_RETRY = 90 * 60   # 90 min for retry runs
+# === SECTION: main() — KG iteration, retry loop, subprocess management ===
 
 RETRIED_KGS_FILE = DATA_DIR / "retried_kgs.json"
 
@@ -6133,136 +6047,60 @@ def main():
         kg_succeeded = False
 
         try:
-            # ---- Per-tile retry: on timeout, sub-divide ONLY the
-            #      timed-out tile, not the entire KG. ----
-            failed_tiles = {}         # orig tile_idx → sub_km
-            _tile_ladder_pos = {}     # orig tile_idx → next index in SUB_TILE_LADDER
-            # Allow enough attempts: each tile can independently
-            # step through the full ladder, plus the initial run.
-            max_attempts = len(SUB_TILE_LADDER) * 4 + 1
+            # ---- Simple retry: on timeout, retry once with same
+            #      tile grid (checkpoints restore completed tiles). ----
+            max_attempts = 2  # initial + one retry
 
             for attempt_idx in range(max_attempts):
                 if attempt_idx > 0:
                     gc.collect()
-                    log.info("  → Retrying KG %s: sub-tiling %d tile(s)",
-                             kg_code, len(failed_tiles))
+                    log.info("  → Retrying KG %s (attempt %d/%d, tile checkpoints will restore completed tiles)",
+                             kg_code, attempt_idx + 1, max_attempts)
                     progress.add_log("info",
-                                     f"Retry KG {kg_code}: sub-tiling {len(failed_tiles)} tile(s)",
+                                     f"Retry KG {kg_code} (attempt {attempt_idx + 1}/{max_attempts})",
                                      kg_code)
                     progress.save()
-
-                # On retries, disable Copernicus for sub-tiles ≤ 0.2km
-                # (10m resolution not useful at 200m tiles).
-                min_sub_km = min(failed_tiles.values()) if failed_tiles else MAX_KG_AREA_KM
-                use_cop = include_cop and min_sub_km >= 0.5
-
-                timeout = KG_TIMEOUT_SECONDS if attempt_idx == 0 else KG_TIMEOUT_SECONDS_RETRY
 
                 pool = multiprocessing.Pool(processes=1)
                 try:
                     async_result = pool.apply_async(
                         process_one_kg, args=(kg,),
-                        kwds={"include_copernicus": use_cop,
-                              "failed_tiles": failed_tiles if failed_tiles else None,
+                        kwds={"include_copernicus": include_cop,
                               "mark_uncertain": mark_uncertain})
                     try:
-                        result = async_result.get(timeout=timeout)
+                        result = async_result.get(timeout=KG_TIMEOUT_SECONDS)
                         break  # success — exit retry loop
                     except multiprocessing.TimeoutError:
                         _step_monitor_stop.set()
                         step_thread.join(timeout=3)
-                        # Read which tile was in progress from current_step.json
+                        # Read which step was in progress
                         last_step = "unknown"
-                        timed_out_tile = None  # always an original tile index
                         try:
                             sd = json.loads((DATA_DIR / "current_step.json").read_text())
                             last_step = sd.get("step", "unknown")
-                            # If we're already processing sub-tiles, the
-                            # subtile field gives us the *original* tile idx.
-                            st_info = sd.get("subtile")
-                            if st_info and "orig_tile" in st_info:
-                                timed_out_tile = st_info["orig_tile"] - 1  # 0-based
-                            else:
-                                ct = sd.get("current_tile", 0)
-                                if ct > 0:
-                                    timed_out_tile = ct - 1  # 0-based
                         except Exception:
                             pass
                         pool.terminate()
                         pool.join()
 
-                        # Only sub-tile if the timeout occurred during
-                        # actual tile processing.  Post-tile steps
-                        # (GPKG build, JSON, validate, upload) should
-                        # NOT trigger sub-tiling — just retry the
-                        # whole KG with the same tiles.
-                        _TILE_STEPS = {"lidar", "terrain", "ortho",
-                                       "copernicus", "hansen", "segment",
-                                       "vectorise"}
-                        _is_tile_step = (last_step in _TILE_STEPS or
-                                         last_step.startswith("tile_"))
-
-                        if timed_out_tile is not None and _is_tile_step:
-                            # Per-tile ladder: each tile can step
-                            # through SUB_TILE_LADDER independently.
-                            t_lp = _tile_ladder_pos.get(timed_out_tile, 0)
-                            if t_lp >= len(SUB_TILE_LADDER):
-                                # This tile has exhausted all sizes
-                                log.error("KG %s: TIMEOUT at step %s — tile %d exhausted all retries",
-                                          kg_code, last_step, timed_out_tile)
-                                failed_kgs.add(kg_code)
-                                _save_failed_kgs(failed_kgs)
-                                progress.add_failure(kg_code, kg_name,
-                                                     f"timeout at {last_step} tile {timed_out_tile} (all retries)",
-                                                     last_step)
-                                progress.add_log("error",
-                                                 f"KG {kg_code} tile {timed_out_tile} timed out after all retries",
-                                                 kg_code)
-                                progress.save()
-                                # Persist tile dots for timed-out KG
-                                with progress._lock:
-                                    _ckg = progress._state.get("current_kg") or {}
-                                    _ts = _ckg.get("tile_statuses", [])
-                                _save_tile_history(kg_code, _ts, "failed")
-                                result = None
-                                break
-
-                            sub_km = SUB_TILE_LADDER[t_lp]
-                            _tile_ladder_pos[timed_out_tile] = t_lp + 1
-
-                            # Mark tile for sub-division.  Stale
-                            # checkpoint cleanup is handled inside
-                            # process_one_kg (section 2c) which has
-                            # full knowledge of the old-→new index
-                            # mapping.
-                            failed_tiles[timed_out_tile] = sub_km
+                        if attempt_idx == 0:
+                            # First timeout — retry once
                             log.warning("  → TIMEOUT after %d min at step %s — "
-                                        "sub-dividing tile %d at %.1fkm",
-                                        timeout // 60, last_step,
-                                        timed_out_tile, sub_km)
-                        elif not _is_tile_step:
-                            # Timeout during post-tile step (GPKG build,
-                            # JSON, validate, etc.) — retry the whole KG
-                            # with the same tiles, don't sub-tile.
-                            log.warning("  → TIMEOUT after %d min during post-tile step '%s' — "
-                                        "retrying without sub-tiling",
-                                        timeout // 60, last_step)
-                            # Don't modify failed_tiles — keep whatever
-                            # was there (usually empty on first attempt).
+                                        "will retry (tile checkpoints preserved)",
+                                        KG_TIMEOUT_SECONDS // 60, last_step)
                         else:
-                            # Can't identify the tile — treat as permanent
-                            log.error("KG %s: TIMEOUT at step %s — can't identify tile",
+                            # Second timeout — mark as permanently failed
+                            log.error("KG %s: TIMEOUT at step %s on retry — marking as failed",
                                       kg_code, last_step)
                             failed_kgs.add(kg_code)
                             _save_failed_kgs(failed_kgs)
                             progress.add_failure(kg_code, kg_name,
-                                                 f"timeout at {last_step} (unknown tile)",
+                                                 f"timeout at {last_step} (after retry)",
                                                  last_step)
                             progress.add_log("error",
-                                             f"KG {kg_code} timed out at {last_step}, can't identify tile",
+                                             f"KG {kg_code} timed out at {last_step} after retry",
                                              kg_code)
                             progress.save()
-                            # Persist tile dots for timed-out KG
                             with progress._lock:
                                 _ckg = progress._state.get("current_kg") or {}
                                 _ts = _ckg.get("tile_statuses", [])
@@ -6278,6 +6116,7 @@ def main():
                 finally:
                     pool.close()
                     pool.join()
+
 
             # Stop step monitor
             _step_monitor_stop.set()

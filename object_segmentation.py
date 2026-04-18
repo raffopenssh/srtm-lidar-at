@@ -1801,8 +1801,8 @@ def segment_and_classify(
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
 
-    If mark_uncertain=True, segments with RF confidence below 0.15 are
-    labelled 'unclassified' (deep uncertainty).  Segments between 0.15
+    If mark_uncertain=True, segments with RF confidence below 0.10 are
+    labelled 'unclassified' (deep uncertainty).  Segments between 0.10
     and the confidence threshold still fall back to rule-based.
     Infrastructure detection still runs regardless.
 

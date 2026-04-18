@@ -468,7 +468,7 @@ def classify_with_rf(
     *,
     fallback_fn=None,
     has_spectral: bool = False,
-    min_confidence: float = 0.4,
+    min_confidence: float = 0.2,
 ) -> tuple[str, int, float, bool]:
     """Classify segment: try RF first, fall back to rules.
 
@@ -513,7 +513,7 @@ def classify_with_rf_batch(
     features: list[dict],
     *,
     has_spectral: bool = False,
-    min_confidence: float = 0.4,
+    min_confidence: float = 0.2,
     rf_only: bool = False,
 ) -> dict[int, tuple[str, int, float, bool]]:
     """Batch-classify segments with RF, falling back to rules per-segment.
@@ -521,8 +521,9 @@ def classify_with_rf_batch(
     Returns dict mapping label -> (type_name, type_code, confidence, is_manmade).
     Uses predict_batch for a single RF call instead of per-segment calls.
 
-    If *rf_only* is True, low-confidence segments are labelled 'unclassified'
-    instead of falling back to rule-based heuristics.
+    If *rf_only* is True, the RF's best prediction is always accepted
+    regardless of confidence (only 'unclassified' if RF returns no prediction).
+    When rf_only is False, segments below *min_confidence* fall back to rules.
     """
     from object_segmentation import OBJECT_TYPES, classify_object
 
@@ -566,8 +567,18 @@ def classify_with_rf_batch(
             else:
                 results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
         elif rf_only:
-            # rf_only: don't fall back to rules, mark as unclassified
-            results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
+            # rf_only: accept RF's best prediction even at low confidence —
+            # the model's top class is still more informative than 'unclassified'.
+            # Only fall back to unclassified if RF returned no prediction at all.
+            if pred and pred in OBJECT_TYPES:
+                if pred == "earthwork":
+                    dtm_ch = feat.get("dtm_change", 0.0)
+                    pred = "excavation" if dtm_ch < 0 else "fill"
+                code = OBJECT_TYPES[pred]
+                is_mm = pred in MANMADE_TYPES
+                results[feat["label"]] = (pred, code, conf, is_mm)
+            else:
+                results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
         else:
             # Fall back to rule-based for low-confidence predictions
             results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)

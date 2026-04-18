@@ -1801,9 +1801,9 @@ def segment_and_classify(
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
 
-    If rf_only=True, only the 16 RF classes are emitted.  Segments where
-    the RF confidence is below *min_confidence* are labelled 'unclassified'
-    instead of falling back to rule-based heuristics.  Infrastructure
+    If rf_only=True, the RF's best prediction is always accepted regardless
+    of confidence — only segments with no RF prediction at all become
+    'unclassified'.  Rule-based fallback is skipped.  Infrastructure
     detection (wind_turbine, solar_panel, substation, mast) still runs
     because those classes are excluded from RF training.
 

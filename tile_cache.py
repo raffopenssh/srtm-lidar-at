@@ -53,9 +53,7 @@ def _atomic_savez(path: Path, **arrays) -> None:
         raise
 
 
-# ---------------------------------------------------------------------------
-# Grid-snapping utilities
-# ---------------------------------------------------------------------------
+# === SECTION: Grid-snapping utilities ===
 
 def snap_bbox_to_grid(west: float, south: float, east: float, north: float,
                       step: float) -> Tuple[float, float, float, float]:
@@ -110,13 +108,9 @@ def crop_raster_to_bbox(data: np.ndarray, transform, target_bbox_wgs: tuple,
     return cropped, new_tf
 
 
-# ---------------------------------------------------------------------------
-# Copernicus Tile Cache
-# ---------------------------------------------------------------------------
+# === SECTION: CopernicusTileCache ===
 
-# ---------------------------------------------------------------------------
-# Tile bbox index — records WGS84 bboxes of all cached tiles for map overlay
-# ---------------------------------------------------------------------------
+# === SECTION: Tile bbox index (for dashboard map overlay) ===
 
 _TILE_INDEX_PATH = Path("data/austria_processor/tile_bbox_index.json")
 _TILE_INDEX_LOCK = Path("data/austria_processor/tile_bbox_index.lock")
@@ -187,9 +181,7 @@ def rebuild_tile_bbox_index():
     pass
 
 
-# ---------------------------------------------------------------------------
-# Retry configuration for transient Copernicus server errors (HTTP 500, 502, 503)
-# ---------------------------------------------------------------------------
+# === SECTION: Copernicus retry config ===
 _SERVER_ERROR_MAX_RETRIES = 4        # up to 4 retries (5 total attempts)
 _SERVER_ERROR_BACKOFF_SECS = [30, 60, 120, 240]  # exponential backoff delays
 
@@ -412,9 +404,7 @@ class CopernicusTileCache:
                 "size_mb": round(total_bytes / 1024 / 1024, 1)}
 
 
-# ---------------------------------------------------------------------------
-# Hansen Tile Cache
-# ---------------------------------------------------------------------------
+# === SECTION: HansenTileCache ===
 
 class HansenTileCache:
     """Grid-snapped cache for Hansen Global Forest Change data.
@@ -533,9 +523,7 @@ class HansenTileCache:
                 "size_mb": round(total_bytes / 1024 / 1024, 1)}
 
 
-# ---------------------------------------------------------------------------
-# Geographic sorting for cache locality
-# ---------------------------------------------------------------------------
+# === SECTION: Geographic sorting (nearest-neighbor KG ordering) ===
 
 def sort_kgs_geographically(kgs: list[dict], step: float = 0.1) -> list[dict]:
     """Sort KGs in serpentine (boustrophedon) scan for maximum cache reuse.
@@ -745,9 +733,7 @@ def order_kgs_nearest_neighbor(kgs: list[dict],
 
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Helpers ===
 
 def _arr_to_affine(arr):
     """Convert a 6-element array back to rasterio Affine."""

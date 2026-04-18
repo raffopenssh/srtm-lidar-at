@@ -35,20 +35,9 @@ from skimage.filters import sobel
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Object types — hierarchical: individual + group level
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Individual object types — only what our sensors can actually detect
-#
-# Detection basis per type:
-#   DTM/DSM 1m : height, slope, roughness, shape, temporal change
-#   RGBI 0.2m  : NDVI, brightness, NIR
-#   Sentinel-2 : growing-season NDVI, ESA WorldCover prior
-#
+# === SECTION: Object types (25 types + 11 groups) ===
+# Detection basis: DTM/DSM 1m, RGBI 0.2m, Sentinel-2 NDVI, ESA WorldCover.
 # Cadastre code references in comments for cross-validation.
-# ---------------------------------------------------------------------------
 OBJECT_TYPES = {
     # ---- Vegetation (NDVI + height + roughness) ----
     "tree": 1,           # nDSM>4m, rough DSM, high NDVI           [W 56]
@@ -153,9 +142,7 @@ CADASTRE_TO_TYPE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# SegmentedObject — the output unit
-# ---------------------------------------------------------------------------
+# === SECTION: SegmentedObject dataclass ===
 
 @dataclass
 class SegmentedObject:
@@ -218,9 +205,7 @@ class SegmentedObject:
     features: dict = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Helpers (local stats, slope) ===
 
 def _local_std(arr: np.ndarray, size: int = 3) -> np.ndarray:
     """Fast local standard deviation via uniform filter."""

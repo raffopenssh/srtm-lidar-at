@@ -39,9 +39,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Credentials & configuration
-# ---------------------------------------------------------------------------
+# === SECTION: Credentials & configuration (multi-account rotation) ===
 # Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
 # OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
 # OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
@@ -87,9 +85,7 @@ WORLDCOVER_CLASSES: Dict[int, str] = {
     100: "moss_lichen",
 }
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Internal helpers (connection, cache, retry) ===
 
 _connection: Optional[Any] = None
 
@@ -576,9 +572,7 @@ def _run_datacube(
     return output_path
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+# === SECTION: Public API (NDVI, WorldCover, SAR, harmonics) ===
 
 
 @_retry_on_rotation
@@ -1172,9 +1166,7 @@ def _parse_sar_tiff(
     }
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Utility helpers ===
 
 
 def clear_cache() -> int:
@@ -1221,9 +1213,7 @@ def ndvi_quality_mask(
     return (ndvi >= min_val) & (ndvi <= max_val) & np.isfinite(ndvi)
 
 
-# ---------------------------------------------------------------------------
-# CLI smoke test
-# ---------------------------------------------------------------------------
+# === SECTION: CLI smoke test ===
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

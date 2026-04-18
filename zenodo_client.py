@@ -48,9 +48,7 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# === SECTION: Constants ===
 
 DEFAULT_BASE_URL = "https://zenodo.org"
 DEFAULT_TOKEN = "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
@@ -58,9 +56,7 @@ DEFAULT_TOKEN = "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
-# ---------------------------------------------------------------------------
-# Entry dataclass
-# ---------------------------------------------------------------------------
+# === SECTION: Entry dataclass ===
 
 
 @dataclass
@@ -95,9 +91,7 @@ class Entry:
         )
 
 
-# ---------------------------------------------------------------------------
-# Manifest — thread-safe, file-backed JSON registry
-# ---------------------------------------------------------------------------
+# === SECTION: Manifest (thread-safe, file-backed JSON registry) ===
 
 
 class Manifest:
@@ -209,9 +203,7 @@ class Manifest:
         return f"Manifest(path={self._path!r}, entries={len(self)})"
 
 
-# ---------------------------------------------------------------------------
-# Metadata helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Metadata helpers (Zenodo deposit metadata) ===
 
 #: Type alias for the callable that produces Zenodo metadata JSON.
 MetadataFunc = Callable[[str, str, str], Dict[str, Any]]
@@ -320,9 +312,7 @@ def landscape_metadata(
     }
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+# === SECTION: Client (Zenodo REST API) ===
 
 
 class ZenodoError(Exception):

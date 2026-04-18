@@ -26,11 +26,9 @@ import tile_index as ti
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Disk cache for windowed reads — avoids repeated HTTP range requests to BEV
-# for the same (layer, tile, window).  Especially useful for the processor
-# where retries / restarts would otherwise re-fetch everything.
-# ---------------------------------------------------------------------------
+# === SECTION: Disk cache + BEV windowed reads ===
+# Avoids repeated HTTP range requests to BEV for the same (layer, tile, window).
+# Especially useful for the processor where retries/restarts would re-fetch everything.
 
 BEV_CACHE_DIR = Path("data/austria_processor/bev_tile_cache")
 BEV_CACHE_DIR.mkdir(parents=True, exist_ok=True)

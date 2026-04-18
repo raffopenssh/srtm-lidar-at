@@ -33,17 +33,13 @@ from pathlib import Path
 
 import tile_index as ti
 
-# ---------------------------------------------------------------------------
-# Disk cache for ortho windowed reads
-# ---------------------------------------------------------------------------
+# === SECTION: Disk cache for ortho windowed reads ===
 ORTHO_CACHE_DIR = Path("data/austria_processor/ortho_tile_cache")
 ORTHO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# GDAL environment (shared with raster_io)
-# ---------------------------------------------------------------------------
+# === SECTION: GDAL environment ===
 
 GDAL_ENV = {
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
@@ -56,9 +52,7 @@ GDAL_ENV = {
     "GDAL_CACHEMAX": "512",
 }
 
-# ---------------------------------------------------------------------------
-# Graceful retry + proxy rotation for BEV reads
-# ---------------------------------------------------------------------------
+# === SECTION: BEV retry import ===
 from bev_retry import open_with_retry
 
 
@@ -69,9 +63,7 @@ def _apply_gdal_env() -> None:
 
 _apply_gdal_env()
 
-# ---------------------------------------------------------------------------
-# Orthophoto dataset registry
-# ---------------------------------------------------------------------------
+# === SECTION: Orthophoto dataset registry (URLs, tile grids) ===
 
 #: Native ground sampling distance of the DOP tiles (metres).
 DOP_NATIVE_RES = 0.2
@@ -109,12 +101,10 @@ RGBI_SERIES: dict[str, dict] = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# RGBI operate index — bbox in WGS84 [lat_min, lon_min, lat_max, lon_max]
+# === SECTION: RGBI operate index ===
+# bbox in WGS84 [lat_min, lon_min, lat_max, lon_max].
 # Discovered from BEV CSW catalogue + verified HTTP availability.
-# Each operate has separate RGB + NIR files.  Newest operates listed first
-# per area so ``find_rgbi_operates`` returns the most recent match first.
-# ---------------------------------------------------------------------------
+# Each operate has separate RGB + NIR files. Newest first per area.
 
 RGBI_OPERATES: dict[str, dict] = {
     # --- series 20250415 (2024 flights, newest) ---
@@ -208,9 +198,7 @@ def find_rgbi_operates(
     return hits
 
 
-# ---------------------------------------------------------------------------
-# URL helpers
-# ---------------------------------------------------------------------------
+# === SECTION: URL helpers (tile URL construction) ===
 
 
 def get_dop_tile_url(
@@ -277,9 +265,7 @@ def get_rgbi_url(
     return f"/vsicurl/{base}{filename}"
 
 
-# ---------------------------------------------------------------------------
-# Internal: pick the best overview level for a target resolution
-# ---------------------------------------------------------------------------
+# === SECTION: Overview level selection ===
 
 
 def _best_overview_level(
@@ -308,9 +294,7 @@ def _best_overview_level(
     return best_factor if best is not None else None
 
 
-# ---------------------------------------------------------------------------
-# Single-tile reader (internal)
-# ---------------------------------------------------------------------------
+# === SECTION: Single-tile reader ===
 
 
 def _read_ortho_single_tile(
@@ -419,9 +403,7 @@ def _read_ortho_single_tile(
         return data, out_transform, ds.crs
 
 
-# ---------------------------------------------------------------------------
-# Multi-tile mosaicking (internal)
-# ---------------------------------------------------------------------------
+# === SECTION: Multi-tile mosaicking ===
 
 
 def _read_ortho_multi_tile(
@@ -483,9 +465,7 @@ def _read_ortho_multi_tile(
     return out, out_transform, crs or rasterio.crs.CRS.from_epsg(3035)
 
 
-# ---------------------------------------------------------------------------
-# Public API – DOP 50 km grid reads
-# ---------------------------------------------------------------------------
+# === SECTION: Public API — DOP 50km grid reads ===
 
 
 def read_ortho_window(
@@ -576,9 +556,7 @@ def read_ortho_rgb(
     )
 
 
-# ---------------------------------------------------------------------------
-# Public API – RGBI operate reads
-# ---------------------------------------------------------------------------
+# === SECTION: Public API — RGBI operate reads ===
 
 
 def read_rgbi_operate(
@@ -691,9 +669,7 @@ def _read_generic_window(
         return data, out_transform, ds.crs
 
 
-# ---------------------------------------------------------------------------
-# Spectral indices
-# ---------------------------------------------------------------------------
+# === SECTION: Spectral indices (NDVI, CIR) ===
 
 
 def compute_ndvi(
@@ -776,9 +752,7 @@ def compute_spectral_indices(
     return indices
 
 
-# ---------------------------------------------------------------------------
-# Convenience: read ortho aligned to an ALS result dict
-# ---------------------------------------------------------------------------
+# === SECTION: Convenience — read ortho aligned to ALS result ===
 
 
 def _ensure_shape(arr: np.ndarray, h: int, w: int) -> np.ndarray:

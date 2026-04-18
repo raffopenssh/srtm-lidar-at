@@ -49,9 +49,7 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
-# ---------------------------------------------------------------------------
-# Processing queue: limit concurrent heavy tasks (segment, one-stop, etc.)
-# ---------------------------------------------------------------------------
+# === SECTION: Processing queue (semaphore for concurrent heavy tasks) ===
 _TASK_SEMAPHORE = threading.Semaphore(2)   # max 2 concurrent heavy tasks
 _TASK_QUEUE_LOCK = threading.Lock()
 _TASK_QUEUE_SIZE = 0  # current waiting count
@@ -147,9 +145,7 @@ def _apply_height_filter_objects(objects: list, params: dict) -> list:
     return [o for o in objects if hf(o.height_max)]
 
 
-# ---------------------------------------------------------------------------
-# Async job + progress tracking (file-backed so all gunicorn workers can read)
-# ---------------------------------------------------------------------------
+# === SECTION: Async task system (file-backed progress + result storage) ===
 _PROGRESS_DIR = Path('/tmp/segment_progress')
 _PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 _RESULTS_DIR = Path('/tmp/segment_results')
@@ -715,9 +711,7 @@ def stop_curve_eval():
         return jsonify(running=_is_curve_eval_running(), msg=str(e)), 500
 
 
-# ---------------------------------------------------------------------------
-# Austria Processor endpoints
-# ---------------------------------------------------------------------------
+# === SECTION: Austria Processor endpoints (proxy to processor state) ===
 
 _processor_process = None  # subprocess.Popen for the processor
 
@@ -1024,9 +1018,7 @@ def api_parcel(parcel_id):
     return jsonify({'error': f'KG {kg_code} not processed yet'}), 404
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Geometry + parameter helpers ===
 
 def _get_geometry():
     """Extract geometry from request. Supports JSON body, form data, file upload.
@@ -1335,9 +1327,7 @@ def _clear_raster_caches():
         log.info("Cleared %d cached raster entries after training", cleared)
 
 
-# ---------------------------------------------------------------------------
-# 1. ELEVATION
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/elevation endpoint ===
 
 @app.route('/api/v1/elevation', methods=['POST'])
 def elevation():
@@ -1428,9 +1418,7 @@ def elevation():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# 2. TERRAIN
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/terrain endpoint ===
 
 @app.route('/api/v1/terrain', methods=['POST'])
 def terrain():
@@ -1463,9 +1451,7 @@ def terrain():
 
 
 
-# ---------------------------------------------------------------------------
-# 3b. WATERSHED SEGMENTATION (new — Felzenszwalb + RAG)
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/segment endpoint (async segmentation pipeline) ===
 
 @app.route('/api/v1/segment', methods=['POST'])
 def segment_objects():
@@ -1933,9 +1919,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     return resp
 
 
-# ---------------------------------------------------------------------------
-# 3c. SEGMENT RASTER OVERLAY
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/segment/overlay + raster rendering ===
 
 # Cache for last segmentation result so legend filter re-renders are instant
 _seg_cache = {"labels": None, "objects": None, "mask": None,
@@ -2423,9 +2407,7 @@ def segment_overlay():
         return _error(str(e))
 
 
-# ---------------------------------------------------------------------------
-# 3d. GEOPACKAGE EXPORT
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/export/geopackage endpoint ===
 
 @app.route('/api/v1/export/geopackage', methods=['POST'])
 def export_geopackage():
@@ -2533,9 +2515,7 @@ def download_gpkg(task_id):
         return _error(f"Download error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# 3c. KML EXPORT
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/export/kml endpoint ===
 
 @app.route('/api/v1/export/kml', methods=['POST'])
 def export_kml():
@@ -3347,9 +3327,7 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
     return None
 
 
-# ---------------------------------------------------------------------------
-# 3e. MBTILES EXPORT
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/export/mbtiles endpoint ===
 
 @app.route('/api/v1/export/mbtiles', methods=['POST'])
 def export_mbtiles():
@@ -3622,9 +3600,7 @@ def _render_overlay_for_mbtiles(layer, data, geom_3035, geom_wgs, dataset, param
         return None, None
 
 
-# ---------------------------------------------------------------------------
-# 5. TEMPORAL CHANGE DETECTION
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/changes endpoint (temporal analysis) ===
 
 @app.route('/api/v1/changes', methods=['POST'])
 def changes():
@@ -3691,9 +3667,7 @@ def changes():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# 6. PER-TREE GROWTH ANALYSIS
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/changes/trees endpoint ===
 
 @app.route('/api/v1/changes/trees', methods=['POST'])
 def changes_trees():
@@ -3747,9 +3721,7 @@ def changes_trees():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# 7. MULTI-EPOCH SUMMARY
-# ---------------------------------------------------------------------------
+# === SECTION: Multi-epoch summary ===
 
 @app.route('/api/v1/changes/summary', methods=['POST'])
 def changes_summary():
@@ -3779,13 +3751,9 @@ def changes_summary():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# INFO
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/info endpoint ===
 
-# ---------------------------------------------------------------------------
-# LIDAR / ORTHO OVERLAY & DOWNLOAD
-# ---------------------------------------------------------------------------
+# === SECTION: LiDAR/ortho/DTM/CIR/Hansen overlay + GeoTIFF download ===
 
 def _extract_single_geom(features_or_geom):
     """Extract a single shapely geometry from _get_geometry() output."""
@@ -4329,9 +4297,7 @@ def ortho_geotiff():
         return _error(str(e))
 
 
-# ---------------------------------------------------------------------------
-# RF CLASSIFIER TRAINING
-# ---------------------------------------------------------------------------
+# === SECTION: RF classifier training endpoints ===
 
 @app.route('/api/v1/classifier/train', methods=['POST'])
 def train_classifier():
@@ -4537,9 +4503,7 @@ def _dominant_cadastre_code(feat, parcels):
     return best
 
 
-# ---------------------------------------------------------------------------
-# INFO & DOCS
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/docs + share endpoints ===
 
 @app.route('/api/v1/info', methods=['GET'])
 def info():
@@ -4580,9 +4544,7 @@ def info():
     })
 
 
-# ---------------------------------------------------------------------------
-# LAYER AVAILABILITY
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/layers endpoint (layer availability check) ===
 
 @app.route('/api/v1/layers', methods=['GET'])
 def layers_availability():
@@ -4667,9 +4629,7 @@ def layers_availability():
         return _error(f"Internal error: {e}", 500)
 
 
-# ---------------------------------------------------------------------------
-# ONE-STOP URL: GET /api/v1/onestop — segment + autosave via a single URL
-# ---------------------------------------------------------------------------
+# === SECTION: /api/v1/onestop endpoint (single-URL segment + download) ===
 
 @app.route('/api/v1/onestop', methods=['GET'])
 def onestop():
@@ -5106,7 +5066,7 @@ def llm_docs():
     return Response("Documentation not yet generated.", mimetype='text/plain')
 
 
-# ============ PARSE GEOMETRY FILE ============
+# === SECTION: /api/v1/parse-geometry endpoint ===
 
 @app.route('/api/v1/parse-geometry', methods=['POST'])
 def parse_geometry_file():
@@ -5261,7 +5221,7 @@ def parse_geometry_file():
         return _error(f'Failed to parse file: {e}')
 
 
-# ============ SHARE ============
+# === SECTION: /api/v1/share endpoints (save/load/rename/list) ===
 
 SHARE_DIR = Path('data/shares')
 SHARE_DIR.mkdir(parents=True, exist_ok=True)

@@ -235,9 +235,24 @@ Response for single KG (kg= or query_kg):
    net_volume_change_m3, temporal_stability,
    new_building_count, infrastructure_count,
    quality_score, quality_grade,
+   zenodo_json_url, zenodo_json_size,
+   zenodo_light_gpkg_url, zenodo_light_gpkg_size,
+   zenodo_full_gpkg_url, zenodo_full_gpkg_size,
+   zenodo_depo_id,
    landcover: [{object_type, area_sqm, fraction, n_objects, height_{min,max,mean,p90}}, ...],
    hansen_loss: [{loss_year, loss_pixels}, ...],
-   _links: {json, zenodo_json, zenodo_light_gpkg, zenodo_full_gpkg}}
+   _links: {
+     json: "https://srtm-lidar-at.exe.xyz:8000/api/v1/kg/<code>",
+     zenodo_json: "https://zenodo.org/api/files/<bucket>/<code>.json",
+     zenodo_light_gpkg: "https://zenodo.org/api/files/<bucket>/<code>_light.gpkg",
+     zenodo_full_gpkg: "https://zenodo.org/api/files/<bucket>/<code>_full.gpkg"
+   }}
+
+  Zenodo links are direct download URLs for the three per-KG products:
+  - JSON summary (~1MB): landscape analysis, landcover, parcels, buildings, terrain, NDVI, etc.
+  - Light GPKG (~100MB): segment raster+vector, enriched parcels + buildings
+  - Full GPKG (~400MB): all raster layers (DTM/DSM/nDSM/ortho) + segment vectors
+  Links appear once the KG has been uploaded to Zenodo. Null otherwise.
 
 Response for aggregate (state/district/gemeinde/country):
   {name, level, total_kgs, processed_kgs, total_area_km2, total_parcels,
@@ -466,9 +481,15 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=802'            #
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=802&aggregate=true'
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?aggregate=true'           # all Austria
 
-# Specific KG detail (landcover + hansen + zenodo links)
+# Specific KG detail (landcover + hansen + zenodo download links)
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109'
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/kg/91109?index_only=true'
+# → includes zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
+#   and _links.zenodo_json, _links.zenodo_light_gpkg, _links.zenodo_full_gpkg
+#   (direct Zenodo download URLs when available)
+
+# Rebuild index (picks up new processor results + Zenodo manifest)
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/index/rebuild'
 
 # Parcel lookup
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcel=91109-535/6'

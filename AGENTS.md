@@ -152,7 +152,14 @@ Contain: UI state + analysis result + cached overlay images.
 `aggregate=true`, `processed_only=true`, `limit=`, `offset=`
 
 Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
-Auto-rebuilt on startup and when new KG JSONs appear.
+Auto-rebuilt on startup and when new KG JSONs appear (60s poll).
+Manual rebuild: `POST /api/v1/index/rebuild`.
+
+Every KG record includes Zenodo download URLs when available:
+- `zenodo_json_url` — JSON summary (~1MB)
+- `zenodo_light_gpkg_url` — segments + enriched parcels/buildings (~100MB)
+- `zenodo_full_gpkg_url` — all raster layers + vectors (~400MB)
+- Also in `_links` object for convenience.
 
 ## Frontend (static/index.html)
 

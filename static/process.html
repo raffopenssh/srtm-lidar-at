@@ -247,6 +247,7 @@
     <div class="val" id="cProgVal">—</div>
     <div class="bar"><div class="bar-fill g" id="cProgBar" style="width:0"></div></div>
     <div class="det" id="cProgDet">—</div>
+    <div id="cProgFailed" style="margin-top:4px"></div>
   </div>
   <div class="card" id="cRate">
     <div class="lb">Rate</div>
@@ -602,6 +603,23 @@ function updateCards(d) {
   else if (d.last_kg_code) pdet += 'last: ' + d.last_kg_code;
   document.getElementById('cProgDet').innerHTML = pdet || '—';
 
+  // Failed KG tags in progress card
+  const fContainer = document.getElementById('cProgFailed');
+  const fList = d.failed_kgs || [];
+  if (fList.length) {
+    fContainer.innerHTML = fList.map(f =>
+      '<span style="display:inline-flex;align-items:center;gap:3px;background:rgba(248,81,73,0.12);' +
+      'border:1px solid rgba(248,81,73,0.3);border-radius:4px;padding:1px 6px;margin:2px 3px 0 0;' +
+      'font-size:10px;color:var(--red);white-space:nowrap" title="' + esc(f.error||'') + '">' +
+      '<b>' + esc(f.code) + '</b> ' + esc(f.name||'') +
+      ' <span style="cursor:pointer;color:var(--yellow);font-weight:bold;margin-left:2px" ' +
+      'onclick="event.stopPropagation();retryKg(\'' + esc(f.code) + '\')" title="Retry this KG">↻</span>' +
+      '</span>'
+    ).join('');
+  } else {
+    fContainer.innerHTML = '';
+  }
+
   // Rate
   const rate = d.rate_kgs_per_hour;
   document.getElementById('cRateVal').textContent = rate != null ? rate.toFixed(1) + ' KG/h' : '—';
@@ -913,7 +931,15 @@ async function processSingle() {
 async function retryKg(code) {
   try {
     const r = await fetch('/api/v1/processing/retry?kg=' + encodeURIComponent(code), {method:'POST'});
-    if (!r.ok) alert('Retry failed: ' + await r.text());
+    if (!r.ok) { alert('Retry failed: ' + await r.text()); return; }
+    const d = await r.json();
+    if (d.status === 'queued_for_retry') {
+      if (confirm(code + ' queued for retry.\nRestart processor now to pick it up?')) {
+        await fetch('/api/v1/processing/stop', {method:'POST'});
+        await new Promise(r => setTimeout(r, 1500));
+        await fetch('/api/v1/processing/start', {method:'POST'});
+      }
+    }
     setTimeout(poll, 400);
   } catch(e) { console.error(e); }
 }

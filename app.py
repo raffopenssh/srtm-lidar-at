@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import pickle
+import sys
 import re
 import tempfile
 import threading
@@ -954,21 +955,85 @@ def processing_single():
 
 @app.route('/api/v1/processing/retry', methods=['POST'])
 def processing_retry():
-    """Retry a specific failed KG."""
+    """Retry a specific failed KG.
+
+    Removes the KG from failed_kgs.json and retried_kgs.json so it will
+    be reprocessed.  If the processor is already running, a restart is
+    needed for the change to take effect (the running process caches the
+    failed set in memory).  If the processor is NOT running, it is
+    started automatically.
+    """
     kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
     if not kg:
         return jsonify({'error': 'kg parameter required'}), 400
-    # Remove error entry from manifest so it will be reprocessed
-    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+
+    data_dir = Path('data/austria_processor')
+    actions = []
+
+    # Remove from failed_kgs.json
+    failed_path = data_dir / 'failed_kgs.json'
+    if failed_path.exists():
+        try:
+            codes = set(json.loads(failed_path.read_text()))
+            if kg in codes:
+                codes.discard(kg)
+                failed_path.write_text(json.dumps(sorted(codes), indent=2))
+                actions.append('removed from failed_kgs')
+        except Exception as e:
+            log.warning('retry: failed_kgs.json: %s', e)
+
+    # Remove from retried_kgs.json so it gets a fresh retry pass
+    retried_path = data_dir / 'retried_kgs.json'
+    if retried_path.exists():
+        try:
+            codes = set(json.loads(retried_path.read_text()))
+            if kg in codes:
+                codes.discard(kg)
+                retried_path.write_text(json.dumps(sorted(codes), indent=2))
+                actions.append('removed from retried_kgs')
+        except Exception as e:
+            log.warning('retry: retried_kgs.json: %s', e)
+
+    # Remove from progress tracker failed_kgs list
+    progress_path = data_dir / 'progress.json'
+    if progress_path.exists():
+        try:
+            d = json.loads(progress_path.read_text())
+            flist = d.get('failed_kgs', [])
+            d['failed_kgs'] = [f for f in flist if f.get('code') != kg]
+            if len(d['failed_kgs']) != len(flist):
+                d['failed'] = max(0, d.get('failed', 0) - 1)
+                progress_path.write_text(json.dumps(d, indent=2, default=str))
+                actions.append('removed from progress')
+        except Exception as e:
+            log.warning('retry: progress.json: %s', e)
+
+    # Remove error entry from manifest
+    manifest_path = data_dir / 'zenodo_manifest.json'
     if manifest_path.exists():
         try:
             from zenodo_client import Manifest
             m = Manifest(str(manifest_path))
             m.delete(f'{kg}_error')
             m.save()
+            actions.append('removed from manifest')
         except Exception:
             pass
-    return processing_start()  # start with that KG
+
+    # If processor is not running (neither systemd nor subprocess), start it
+    processor_running = ((_processor_process is not None
+                          and _processor_process.poll() is None)
+                         or _is_processor_running())
+    if not processor_running:
+        return processing_start()
+
+    # Processor is running — KG will be picked up after restart
+    return jsonify({
+        'status': 'queued_for_retry',
+        'kg': kg,
+        'actions': actions,
+        'note': 'Processor is running. Restart it to pick up the retried KG.',
+    })
 
 
 @app.route('/api/v1/processing/log')

@@ -396,6 +396,78 @@ class CopernicusTileCache:
         log.warning("Copernicus SAR tile fetch failed: %s", last_exc)
         return None
 
+    def get_harmonics(self, bbox_wgs: dict, year: int = 2024,
+                      cred_index: int = None) -> Optional[dict]:
+        """Get NDVI harmonic features, grid-snapped.
+
+        Fetches monthly NDVI time series and computes harmonic fit
+        (mean, amplitude, phase, rmse) for the grid tile.  Subsequent
+        requests within the same 0.1° cell are instant cache hits.
+        """
+        tw, ts, te, tn = self._snap(bbox_wgs)
+        tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
+        path = self._tile_path("harmonics", tw, ts, te, tn, year=year)
+
+        if path.exists():
+            self._stats["hits"] += 1
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                result = {}
+                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
+                    if k in cached:
+                        result[k] = cached[k]
+                if "transform" in cached:
+                    result["transform"] = _arr_to_affine(cached["transform"])
+                if "crs" in cached:
+                    result["crs"] = str(cached["crs"])
+                return result
+            except Exception as e:
+                log.warning("Corrupt harmonics cache %s: %s", path.name, e)
+                path.unlink(missing_ok=True)
+
+        self._stats["misses"] += 1
+        from copernicus import CreditsExhaustedError
+        last_exc = None
+        for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
+            try:
+                import ndvi_harmonics
+                result = ndvi_harmonics.get_harmonic_features(tile_bbox, year)
+                if result is None:
+                    self._stats["errors"] += 1
+                    return None
+                # Save to cache
+                save_kw = {}
+                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
+                    if k in result:
+                        save_kw[k] = result[k]
+                tf = result.get("transform")
+                if tf:
+                    save_kw["transform"] = np.array(
+                        [tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
+                save_kw["crs"] = str(result.get("crs", "EPSG:4326"))
+                _atomic_savez(path, **save_kw)
+                log.info("Copernicus harmonics tile cached: %.2f,%.2f → %.2f,%.2f",
+                         tw, ts, te, tn)
+                return result
+            except Exception as e:
+                if isinstance(e, CreditsExhaustedError) or \
+                   isinstance(e.__cause__, CreditsExhaustedError):
+                    self._stats["errors"] += 1
+                    raise
+                last_exc = e
+                if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
+                    delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
+                    log.warning(
+                        "Copernicus harmonics fetch failed (attempt %d/%d), "
+                        "retrying in %ds: %s",
+                        attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e)
+                    time.sleep(delay)
+                    continue
+                break
+        self._stats["errors"] += 1
+        log.warning("Copernicus harmonics tile fetch failed: %s", last_exc)
+        return None
+
     @property
     def stats(self) -> dict:
         n_files = sum(1 for _ in self.CACHE_DIR.glob("*.npz"))

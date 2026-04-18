@@ -4112,6 +4112,304 @@ def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
     return merged
 
 
+# === SECTION: Encapsulated sub-tile Copernicus fetcher ===
+
+_COP_SUBTILE_SIZES = [0.5, 0.2]   # km — ladder for per-step sub-tiling
+_COP_STEP_TIMEOUT = 300            # 5 min per sub-step (NDVI/WorldCover/SAR/harmonics)
+
+
+def _fetch_copernicus_for_tile(
+    bbox_dict: dict,
+    obs_year: int,
+    cop_cache,
+    report_fn=None,
+    tile_label: str = "",
+) -> dict | None:
+    """Fetch all Copernicus data for a tile bbox, with sub-tile fallback.
+
+    If the initial fetch for the full bbox times out, the bbox is
+    subdivided into smaller sub-tiles.  Each sub-tile is fetched
+    independently and the results are stitched (mosaicked) back into
+    a single set of arrays covering the original bbox.
+
+    Returns a ``copernicus_data`` dict (ndvi, landcover, vv, vh,
+    harmonics, transform, crs, sar_transform) or ``None``.
+    """
+    import concurrent.futures as _cf
+
+    def _report(detail):
+        if report_fn:
+            report_fn("copernicus", f"{tile_label} — {detail}")
+
+    def _try_fetch_single(bbox, label=""):
+        """Attempt to fetch all Copernicus layers for one bbox."""
+        cop = {}
+
+        # NDVI composite (grid-snapped, usually fast)
+        _report(f"{label}NDVI" if label else "NDVI")
+        nd = cop_cache.get_ndvi(bbox, year=obs_year)
+        if nd and nd.get("ndvi") is not None:
+            cop["ndvi"] = nd["ndvi"]
+            cop["transform"] = nd.get("transform")
+            cop["crs"] = nd.get("crs")
+
+        # WorldCover
+        _report(f"{label}WorldCover" if label else "WorldCover")
+        lc = cop_cache.get_landcover(bbox)
+        if lc:
+            cop["landcover"] = lc
+
+        # SAR
+        _report(f"{label}SAR" if label else "SAR")
+        sar = cop_cache.get_sar(bbox, year=obs_year)
+        if sar:
+            cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
+            if "transform" in sar:
+                cop["sar_transform"] = sar["transform"]
+
+        # Harmonics (slowest — uses grid-snapped cache)
+        if cop:
+            _report(f"{label}harmonics" if label else "harmonics")
+            harm = cop_cache.get_harmonics(bbox, year=obs_year)
+            if harm is not None:
+                cop["harmonics"] = harm
+
+        return cop if cop else None
+
+    # --- First attempt: full bbox ---
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_try_fetch_single, bbox_dict)
+            result = fut.result(timeout=_COP_STEP_TIMEOUT * 4)  # 20 min total
+            if result is not None:
+                return result
+    except _cf.TimeoutError:
+        log.warning("Copernicus full-tile fetch timed out for %s — trying sub-tiles",
+                    tile_label)
+    except Exception as e:
+        from copernicus import CreditsExhaustedError
+        if isinstance(e, CreditsExhaustedError) or \
+           isinstance(e.__cause__, CreditsExhaustedError):
+            raise
+        log.warning("Copernicus full-tile fetch failed for %s: %s — trying sub-tiles",
+                    tile_label, e)
+
+    # --- Sub-tile fallback: subdivide and stitch ---
+    tw = bbox_dict["west"]
+    ts = bbox_dict["south"]
+    te = bbox_dict["east"]
+    tn = bbox_dict["north"]
+
+    for sub_km in _COP_SUBTILE_SIZES:
+        sub_bboxes = _compute_tile_grid(tw, ts, te, tn,
+                                        tile_km=sub_km, overlap_km=0.01)
+        _report(f"sub-tiling @ {sub_km}km ({len(sub_bboxes)} pieces)")
+        log.info("Copernicus sub-tile fallback for %s: %d sub-tiles @ %.1fkm",
+                 tile_label, len(sub_bboxes), sub_km)
+
+        sub_results = []
+        all_ok = True
+        for si, (sw, ss, se, sn) in enumerate(sub_bboxes):
+            sub_label = f"sub-tile {si+1}/{len(sub_bboxes)} @ {sub_km}km — "
+            _report(sub_label.rstrip(" — "))
+            try:
+                sb = {"west": sw, "south": ss, "east": se, "north": sn}
+                sr = _try_fetch_single(sb, label=sub_label)
+                sub_results.append((sb, sr))
+            except Exception as e:
+                from copernicus import CreditsExhaustedError
+                if isinstance(e, CreditsExhaustedError) or \
+                   isinstance(e.__cause__, CreditsExhaustedError):
+                    raise
+                log.warning("Copernicus sub-tile %d/%d failed: %s",
+                            si+1, len(sub_bboxes), e)
+                sub_results.append((sb, None))
+                all_ok = False
+
+        # Stitch sub-tile results back together
+        stitched = _stitch_copernicus_subtiles(
+            sub_results, bbox_dict, tile_label)
+        if stitched is not None:
+            return stitched
+
+        log.warning("Copernicus stitch failed at %.1fkm for %s, trying smaller",
+                    sub_km, tile_label)
+
+    return None
+
+
+def _stitch_copernicus_subtiles(
+    sub_results: list,
+    target_bbox: dict,
+    tile_label: str,
+) -> dict | None:
+    """Mosaic sub-tile Copernicus results into one dict covering target_bbox.
+
+    Each sub_result is (bbox_dict, cop_dict|None).  Arrays are placed
+    into an output grid at the correct geo-position using the transform.
+    """
+    # Collect non-None results
+    valid = [(bbox, cop) for bbox, cop in sub_results if cop is not None]
+    if not valid:
+        return None
+
+    # Determine which layers are available across sub-tiles
+    has_ndvi = any(c.get("ndvi") is not None for _, c in valid)
+    has_lc = any(c.get("landcover") is not None for _, c in valid)
+    has_vv = any(c.get("vv") is not None for _, c in valid)
+    has_vh = any(c.get("vh") is not None for _, c in valid)
+    has_harm = any(c.get("harmonics") is not None for _, c in valid)
+
+    if not (has_ndvi or has_lc or has_vv or has_vh or has_harm):
+        return None
+
+    result = {}
+
+    # For each raster layer, mosaic into a common grid
+    # Use the first available sub-tile to determine resolution
+    import rasterio
+    from rasterio.transform import from_bounds as _tfb
+
+    def _mosaic_layer(sub_results_with_data, layer_key, tf_key="transform"):
+        """Mosaic a single 2D layer from sub-tiles."""
+        pieces = []
+        for bbox, cop in sub_results_with_data:
+            arr = cop.get(layer_key)
+            tf = cop.get(tf_key)
+            if arr is not None and tf is not None:
+                pieces.append((arr, tf, bbox))
+        if not pieces:
+            return None, None
+
+        # Determine output resolution from first piece
+        ref_tf = pieces[0][1]
+        res_x = abs(ref_tf.a)
+        res_y = abs(ref_tf.e)
+
+        # Output grid covering target_bbox
+        tw = target_bbox["west"]
+        ts = target_bbox["south"]
+        te = target_bbox["east"]
+        tn = target_bbox["north"]
+        out_w = max(1, int(np.ceil((te - tw) / res_x)))
+        out_h = max(1, int(np.ceil((tn - ts) / res_y)))
+        out_tf = rasterio.Affine(res_x, 0, tw, 0, -res_y, tn)
+
+        out = np.full((out_h, out_w), np.nan, dtype=np.float32)
+
+        for arr, tf, bbox in pieces:
+            # Compute where this piece lands in the output grid
+            col_off = int(round((tf.c - out_tf.c) / res_x))
+            row_off = int(round((out_tf.f - tf.f) / res_y))
+            h, w = arr.shape[:2] if arr.ndim >= 2 else (1, arr.shape[0])
+            # Clamp to output bounds
+            src_r0 = max(0, -row_off)
+            src_c0 = max(0, -col_off)
+            dst_r0 = max(0, row_off)
+            dst_c0 = max(0, col_off)
+            dst_r1 = min(out_h, row_off + h)
+            dst_c1 = min(out_w, col_off + w)
+            src_r1 = src_r0 + (dst_r1 - dst_r0)
+            src_c1 = src_c0 + (dst_c1 - dst_c0)
+            if dst_r1 > dst_r0 and dst_c1 > dst_c0:
+                out[dst_r0:dst_r1, dst_c0:dst_c1] = arr[src_r0:src_r1, src_c0:src_c1]
+
+        return out, out_tf
+
+    # Mosaic NDVI
+    if has_ndvi:
+        arr, tf = _mosaic_layer(valid, "ndvi")
+        if arr is not None:
+            result["ndvi"] = arr
+            result["transform"] = tf
+            result["crs"] = valid[0][1].get("crs", "EPSG:4326")
+
+    # Mosaic WorldCover (dict with 'data' array)
+    if has_lc:
+        # WorldCover comes as a dict — extract the raster array
+        lc_pieces = []
+        for bbox, cop in valid:
+            lc = cop.get("landcover")
+            if lc is not None:
+                if isinstance(lc, dict) and "data" in lc:
+                    lc_pieces.append((bbox, {"landcover": lc["data"],
+                                             "transform": lc.get("transform",
+                                                                  cop.get("transform"))}))
+                elif isinstance(lc, np.ndarray):
+                    lc_pieces.append((bbox, {"landcover": lc,
+                                             "transform": cop.get("transform")}))
+        if lc_pieces:
+            arr, tf = _mosaic_layer(lc_pieces, "landcover")
+            if arr is not None:
+                # Re-wrap in the same format
+                result["landcover"] = valid[0][1].get("landcover")
+                if isinstance(result["landcover"], dict):
+                    result["landcover"]["data"] = arr
+                else:
+                    result["landcover"] = arr
+
+    # Mosaic SAR (VV/VH)
+    if has_vv or has_vh:
+        sar_tf_key = "sar_transform"
+        # Some sub-tiles may not have sar_transform — fall back to transform
+        for bbox, cop in valid:
+            if cop.get(sar_tf_key) is None and cop.get("transform") is not None:
+                cop[sar_tf_key] = cop["transform"]
+        if has_vv:
+            arr, tf = _mosaic_layer(valid, "vv", tf_key=sar_tf_key)
+            if arr is not None:
+                result["vv"] = arr
+                result["sar_transform"] = tf
+        if has_vh:
+            arr, tf = _mosaic_layer(valid, "vh", tf_key=sar_tf_key)
+            if arr is not None:
+                result["vh"] = arr
+                if "sar_transform" not in result:
+                    result["sar_transform"] = tf
+
+    # Mosaic harmonics (h_mean, h_amplitude, h_phase, h_rmse)
+    if has_harm:
+        harm_result = {}
+        harm_keys = ["h_mean", "h_amplitude", "h_phase", "h_rmse"]
+        # Build pseudo-results with harmonics arrays at top level
+        harm_pieces = []
+        for bbox, cop in valid:
+            h = cop.get("harmonics")
+            if h is not None:
+                flat = {}
+                for hk in harm_keys:
+                    if hk in h:
+                        flat[hk] = h[hk]
+                flat["transform"] = h.get("transform", cop.get("transform"))
+                harm_pieces.append((bbox, flat))
+        for hk in harm_keys:
+            arr, tf = _mosaic_layer(harm_pieces, hk)
+            if arr is not None:
+                harm_result[hk] = arr
+                harm_result["transform"] = tf
+        if harm_result:
+            harm_result["crs"] = valid[0][1].get("harmonics", {}).get("crs",
+                                   valid[0][1].get("crs", "EPSG:4326"))
+            result["harmonics"] = harm_result
+
+    if not result:
+        return None
+
+    # Ensure transform + crs are set
+    if "transform" not in result:
+        for _, cop in valid:
+            if cop.get("transform") is not None:
+                result["transform"] = cop["transform"]
+                break
+    if "crs" not in result:
+        result["crs"] = "EPSG:4326"
+
+    log.info("Copernicus stitched %d sub-tiles for %s: %s",
+             len(valid), tile_label,
+             [k for k in result if k not in ("transform", "crs", "sar_transform")])
+    return result
+
+
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
                    failed_tiles: dict = None, rf_only: bool = False) -> dict:
     """Process a single KG with tiled segmentation for full coverage.
@@ -4631,40 +4929,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     try:
                         bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
                         cop_cache = _get_cop_cache()
-                        cop = {}
-                        nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
-                        if nd and nd.get("ndvi") is not None:
-                            cop["ndvi"] = nd["ndvi"]
-                            cop["transform"] = nd.get("transform")
-                            cop["crs"] = nd.get("crs")
-                        _report_step("copernicus", f"{tile_label} — WorldCover")
-                        lc = cop_cache.get_landcover(bbox_dict)
-                        if lc:
-                            cop["landcover"] = lc
-                        _report_step("copernicus", f"{tile_label} — SAR")
-                        sar = cop_cache.get_sar(bbox_dict, year=obs_year)
-                        if sar:
-                            cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
-                            if "transform" in sar:
-                                cop["sar_transform"] = sar["transform"]
-                        if cop:
-                            try:
-                                _report_step("copernicus", f"{tile_label} — harmonics")
-                                import ndvi_harmonics
-                                import concurrent.futures as _cf
-                                with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                                    _hfut = _ex.submit(
-                                        ndvi_harmonics.get_harmonic_features,
-                                        bbox_dict, obs_year)
-                                    try:
-                                        harm = _hfut.result(timeout=300)
-                                        if harm is not None:
-                                            cop["harmonics"] = harm
-                                    except (_cf.TimeoutError, Exception):
-                                        pass
-                            except Exception:
-                                pass
-                        copernicus_data = cop if cop else None
+                        copernicus_data = _fetch_copernicus_for_tile(
+                            bbox_dict, obs_year, cop_cache,
+                            report_fn=_report_step,
+                            tile_label=tile_label,
+                        )
                         # Update circuit breaker
                         if copernicus_data:
                             c_breaker["consecutive_failures"] = 0
@@ -5543,15 +5812,30 @@ def main():
     manifest = Manifest(str(MANIFEST_PATH))
     log.info("Zenodo manifest: %d entries", len(manifest))
 
+    # --- Initialize counters from manifest + local JSON files ---
+    # Count already-uploaded KGs from manifest (entries ending with _json)
+    _uploaded_kgs = sum(1 for k in manifest.keys() if k.endswith('_json'))
+    _upload_bytes = sum(
+        e.size for k in manifest.keys()
+        if (e := manifest.get(k)) is not None
+    )
+    # Count completed KGs from local JSON files on disk
+    _local_jsons = list(JSON_DIR.glob("*.json")) if JSON_DIR.is_dir() else []
+    _completed = len(_local_jsons)
+    log.info(
+        "Resuming state: %d uploaded KGs, %d bytes, %d local JSONs",
+        _uploaded_kgs, _upload_bytes, _completed,
+    )
+
     # --- Load progress tracker (reset stale state from previous run) ---
     progress = ProgressTracker(PROGRESS_FILE)
     progress.update(
         failed_kgs=[],
         failed=0,
-        completed=0,
-        success=0,
-        uploaded=0,
-        upload_size_bytes=0,
+        completed=_completed,
+        success=_completed,
+        uploaded=_uploaded_kgs,
+        upload_size_bytes=_upload_bytes,
         last_kg_code=None,
         last_kg_seconds=0,
         n_new_buildings_total=0,

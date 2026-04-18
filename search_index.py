@@ -6,6 +6,7 @@ Zenodo download links from the manifest.
 
 Tables: kg, kg_landcover, kg_hansen, kg_rtree (R-tree), fts_kg (FTS5), index_meta
 """
+import fcntl
 import json
 import os
 import sqlite3
@@ -69,6 +70,7 @@ class SearchIndex:
         os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
         self.db_path = db_path
         self._write_lock = threading.Lock()
+        self._file_lock_path = db_path + '.lock'
         self._local = threading.local()
         self._migrate()
 
@@ -76,18 +78,19 @@ class SearchIndex:
         """Thread-local connection."""
         c = getattr(self._local, 'conn', None)
         if c is None:
-            c = sqlite3.connect(self.db_path, check_same_thread=False)
+            c = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
             c.row_factory = sqlite3.Row
             c.execute('PRAGMA journal_mode=WAL')
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('PRAGMA cache_size=-64000')
             c.execute('PRAGMA foreign_keys=ON')
+            c.execute('PRAGMA busy_timeout=30000')
             self._local.conn = c
         return c
 
-    def _migrate(self):
-        c = self._conn()
-        stmts = [
+    def _schema_stmts(self):
+        """Return list of CREATE statements for current schema."""
+        return [
             # === Core KG table ===
             '''CREATE TABLE IF NOT EXISTS kg (
                 kg_code TEXT PRIMARY KEY,
@@ -124,6 +127,33 @@ class SearchIndex:
                 temporal_stability REAL,
                 new_building_count INTEGER DEFAULT 0,
                 infrastructure_count INTEGER DEFAULT 0,
+                -- building aggregates (from building_footprints + new_buildings)
+                building_footprint_sqm REAL DEFAULT 0,
+                building_mean_height_m REAL,
+                building_max_height_m REAL,
+                building_stories_mean REAL,
+                building_stories_max INTEGER,
+                building_pitched_pct REAL,
+                new_building_footprint_sqm REAL DEFAULT 0,
+                new_building_mean_height_m REAL,
+                new_building_stories_mean REAL,
+                -- SAR
+                sar_vv_mean_db REAL,
+                sar_vh_mean_db REAL,
+                -- NDVI harmonics
+                ndvi_harm_mean REAL,
+                ndvi_harm_amplitude REAL,
+                ndvi_harm_phase REAL,
+                -- temporal change
+                dtm_change_mean_m REAL,
+                n_changed_segments INTEGER,
+                total_disturbed_volume_m3 REAL,
+                -- phenology
+                phenology_dominant TEXT,
+                -- coverage
+                n_tiles INTEGER,
+                building_height_coverage_pct REAL,
+                --
                 quality_score REAL,
                 quality_grade TEXT,
                 zenodo_json_url TEXT,
@@ -178,7 +208,10 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_lc_type ON kg_landcover(object_type)',
             'CREATE INDEX IF NOT EXISTS idx_hansen_year ON kg_hansen(loss_year)',
         ]
-        for s in stmts:
+
+    def _migrate(self):
+        c = self._conn()
+        for s in self._schema_stmts():
             try:
                 c.execute(s)
             except Exception as e:
@@ -194,11 +227,31 @@ class SearchIndex:
               manifest_path='data/austria_processor/zenodo_manifest.json'):
         """Full rebuild from scratch. Completes in <2s for 8440 KGs."""
         t0 = time.time()
+        # File lock prevents concurrent rebuilds across gunicorn workers
+        lock_fd = open(self._file_lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            return self._build_inner(kg_list_path, json_dir, manifest_path, t0)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _build_inner(self, kg_list_path, json_dir, manifest_path, t0):
         with self._write_lock:
             c = self._conn()
-            # Clear all
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_rtree', 'fts_kg', 'index_meta'):
-                c.execute(f'DELETE FROM {t}')
+            # Drop and recreate — ensures schema changes are picked up
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'index_meta'):
+                c.execute(f'DROP TABLE IF EXISTS {t}')
+            for t in ('kg_rtree', 'fts_kg'):
+                c.execute(f'DROP TABLE IF EXISTS {t}')
+            c.commit()
+            # Recreate tables with current schema (inline, same connection)
+            for s in self._schema_stmts():
+                try:
+                    c.execute(s)
+                except Exception as e:
+                    log.warning('build schema: %s: %s', s[:60], e)
+            c.commit()
 
             # Load sources
             kg_list = json.loads(Path(kg_list_path).read_text()) if Path(kg_list_path).exists() else []
@@ -245,6 +298,13 @@ class SearchIndex:
                     0, 0, None, 0,  # tree_stats
                     None, None,  # temporal
                     0, 0,  # new_building, infrastructure
+                    0, None, None, None, None, None,  # building aggregates
+                    0, None, None,  # new_building aggregates
+                    None, None,  # sar
+                    None, None, None,  # ndvi harmonics
+                    None, None, None,  # temporal change
+                    None,  # phenology
+                    None, None,  # coverage
                     None, None,  # quality
                     _zenodo_url(zj), zj.get('size'),
                     _zenodo_url(zl), zl.get('size'),
@@ -258,7 +318,7 @@ class SearchIndex:
 
             c.executemany(
                 '''INSERT OR REPLACE INTO kg VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ''', kg_rows)
             c.executemany('INSERT INTO fts_kg VALUES (?,?,?,?,?)', fts_rows)
             c.executemany('INSERT INTO kg_rtree VALUES (?,?,?,?,?)', rtree_rows)
@@ -302,22 +362,56 @@ class SearchIndex:
         op = data.get('observation_period', {})
         nb = data.get('new_buildings', {})
         inf = data.get('infrastructure', {})
+        bf = data.get('building_footprints', {})
+        sar = data.get('sar', {})
+        harm = data.get('ndvi_harmonics', {})
+        phen = data.get('phenology', {})
+        cov = data.get('coverage', {})
+
+        # --- Building aggregate stats ---
+        bf_details = bf.get('details', [])
+        bf_heights = [b['max_height_m'] for b in bf_details if b.get('max_height_m')]
+        bf_stories = [b['stories_est'] for b in bf_details if b.get('stories_est')]
+        bf_roofs = [b.get('roof_type_hint') for b in bf_details if b.get('roof_type_hint')]
+        bf_areas = [b.get('footprint_area_sqm', 0) for b in bf_details]
+
+        nb_features = nb.get('features', [])
+        nb_heights = [b['max_height_m'] for b in nb_features if b.get('max_height_m')]
+        nb_stories = [b['stories_est'] for b in nb_features if b.get('stories_est')]
+        nb_areas = [b.get('area_sqm', 0) for b in nb_features]
+
+        # Phenology dominant class
+        phen_dist = phen.get('distribution', {})
+        phen_dominant = max(phen_dist, key=phen_dist.get) if phen_dist else None
 
         c.execute('''UPDATE kg SET
             processed=1, generated_at=?, primary_year=?,
+            total_area_sqm=?, parcel_count=?,
             dominant_type=?, vegetated_fraction=?, shannon_diversity=?, n_segments=?,
+            building_count=?,
             elevation_min_m=?, elevation_max_m=?, elevation_mean_m=?,
             slope_mean_deg=?, aspect_dominant=?,
             ndvi_mean=?,
             tree_count=?, tree_canopy_sqm=?, tree_mean_height_m=?, tree_stem_volume_m3=?,
             net_volume_change_m3=?, temporal_stability=?,
             new_building_count=?, infrastructure_count=?,
+            building_footprint_sqm=?, building_mean_height_m=?, building_max_height_m=?,
+            building_stories_mean=?, building_stories_max=?, building_pitched_pct=?,
+            new_building_footprint_sqm=?, new_building_mean_height_m=?, new_building_stories_mean=?,
+            sar_vv_mean_db=?, sar_vh_mean_db=?,
+            ndvi_harm_mean=?, ndvi_harm_amplitude=?, ndvi_harm_phase=?,
+            dtm_change_mean_m=?, n_changed_segments=?, total_disturbed_volume_m3=?,
+            phenology_dominant=?,
+            n_tiles=?, building_height_coverage_pct=?,
             quality_score=?, quality_grade=?
             WHERE kg_code=?''',
             (
                 data.get('generated_at'), op.get('primary_year'),
+                data.get('total_area_sqm', 0),
+                data.get('parcels', {}).get('count', 0),
                 ls.get('dominant_type'), ls.get('vegetated_fraction'),
                 ls.get('shannon_diversity'), ls.get('n_segments'),
+                bf.get('count', 0),
                 tr.get('elevation_min_m'), tr.get('elevation_max_m'), tr.get('elevation_mean_m'),
                 tr.get('steepness_mean_deg'), tr.get('aspect_dominant'),
                 nd.get('copernicus_mean') or nd.get('bev_nir_mean'),
@@ -325,6 +419,28 @@ class SearchIndex:
                 ts.get('mean_height_m'), ts.get('est_stem_volume_m3', 0),
                 tc.get('net_volume_change_m3'), tc.get('mean_stability'),
                 nb.get('count', 0), inf.get('total', 0),
+                # building aggregates
+                sum(bf_areas) if bf_areas else 0,
+                (sum(bf_heights) / len(bf_heights)) if bf_heights else None,
+                max(bf_heights) if bf_heights else None,
+                (sum(bf_stories) / len(bf_stories)) if bf_stories else None,
+                max(bf_stories) if bf_stories else None,
+                (sum(1 for r in bf_roofs if r == 'pitched') / len(bf_roofs) * 100) if bf_roofs else None,
+                # new building aggregates
+                sum(nb_areas) if nb_areas else 0,
+                (sum(nb_heights) / len(nb_heights)) if nb_heights else None,
+                (sum(nb_stories) / len(nb_stories)) if nb_stories else None,
+                # sar
+                sar.get('vv_mean_db'), sar.get('vh_mean_db'),
+                # ndvi harmonics
+                harm.get('mean_mean'), harm.get('amplitude_mean'), harm.get('phase_mean'),
+                # temporal change
+                tc.get('dtm_change_mean_m'), tc.get('n_changed_segments'), tc.get('total_disturbed_volume_m3'),
+                # phenology
+                phen_dominant,
+                # coverage
+                cov.get('n_tiles'), cov.get('building_height_coverage_pct'),
+                # quality
                 dq.get('quality_score'), dq.get('quality_grade'),
                 code,
             ))
@@ -858,6 +974,15 @@ class SearchIndex:
     def _kg_summary(self, row):
         """Convert a kg Row to a summary dict (no landcover/hansen detail)."""
         d = dict(row)
+        # Round float columns for cleaner output
+        for k, v in d.items():
+            if isinstance(v, float):
+                if 'pct' in k or 'fraction' in k:
+                    d[k] = round(v, 1)
+                elif 'stories' in k:
+                    d[k] = round(v, 1)
+                else:
+                    d[k] = round(v, 2)
         d['_links'] = self._build_links(d)
         return d
 

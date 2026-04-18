@@ -638,9 +638,9 @@ def fetch_cadastre_data(kg_code: str) -> dict:
         except Exception as e:
             log.warning("KG %s: building filter failed: %s", kg_code, e)
 
-    log.info("KG %s: %d parcels, %d footprints (was %d), %d landuse",
+    log.info("KG %s: %d parcels, %d footprints (was %d), %d addresses, %d landuse",
              kg_code, len(result["parcels"]), len(result["building_footprints"]),
-             n_before, len(result["landuse"]))
+             n_before, len(result["building_addresses"]), len(result["landuse"]))
     return result
 
 

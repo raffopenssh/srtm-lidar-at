@@ -5987,6 +5987,14 @@ def main():
 
         IN_PROGRESS_FILE.write_text(kg_code)
 
+        # Truncate stale subprocess warnings so the monitor thread
+        # doesn't replay errors from a previous KG / run.
+        _warn_file = DATA_DIR / "subprocess_warnings.jsonl"
+        try:
+            _warn_file.write_text("")
+        except OSError:
+            pass
+
         # Start background thread to monitor subprocess step reporting
         import threading
         _step_monitor_stop = threading.Event()

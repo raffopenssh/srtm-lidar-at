@@ -5681,8 +5681,13 @@ def _share_eviction_tier(path: Path) -> int:
         return 0
 
 
+MAX_AUTO_SAVES = 15  # keep at most this many tier-0 auto-saves
+
 def _share_evict():
     """Remove shares until total size < SHARE_MAX_BYTES.
+
+    Also caps the number of tier-0 (auto-save / hex-hash) shares to
+    MAX_AUTO_SAVES so they don't crowd out named shares in the UI.
 
     Eviction tiers (lower evicted first):
       0: unnamed auto-saves and hex-hash shares
@@ -5693,6 +5698,19 @@ def _share_evict():
     """
     all_files = list(SHARE_DIR.glob('*.json.gz'))
     total = sum(f.stat().st_size for f in all_files)
+
+    # --- Phase 1: cap tier-0 auto-saves to MAX_AUTO_SAVES ---
+    tier0 = sorted(
+        [f for f in all_files if _share_eviction_tier(f) == 0],
+        key=lambda f: f.stat().st_mtime, reverse=True  # newest first
+    )
+    for victim in tier0[MAX_AUTO_SAVES:]:
+        total -= victim.stat().st_size
+        victim.unlink(missing_ok=True)
+        all_files.remove(victim)
+        log.info("share: evicted excess auto-save %s (total now %d MB)", victim.name, total // 1_000_000)
+
+    # --- Phase 2: size-based eviction ---
     if total <= SHARE_MAX_BYTES:
         return
     # Sort by (tier, mtime) — lowest tier and oldest files evicted first
@@ -5707,10 +5725,18 @@ def _share_evict():
 
 @app.route('/api/v1/shares', methods=['GET'])
 def share_list():
-    """List saved shares with metadata, most recent first."""
+    """List saved shares with metadata.
+
+    Ordering: user-renamed shares first (tier 3), then named (tier 2),
+    then auto-saves/hex (tier 0).  Within each group, most recent first.
+    This ensures manually-named shares are always visible regardless of
+    how many auto-saves accumulate.
+    """
     try:
-        files = sorted(SHARE_DIR.glob('*.json.gz'), key=lambda f: f.stat().st_mtime, reverse=True)
-        limit = int(request.args.get('limit', 20))
+        all_files = list(SHARE_DIR.glob('*.json.gz'))
+        # Sort by (-tier, -mtime) so high-tier (named) shares come first
+        files = sorted(all_files, key=lambda f: (-_share_eviction_tier(f), -f.stat().st_mtime))
+        limit = int(request.args.get('limit', 30))
         items = []
         for f in files[:limit]:
             share_id = f.stem.replace('.json', '')

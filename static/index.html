@@ -2394,20 +2394,37 @@ _loadBtn.onclick=async()=>{
   const ac=new AbortController();
   const tid=setTimeout(()=>ac.abort(),5000);
   try{
-    const resp=await fetch('/api/v1/shares?limit=15',{signal:ac.signal});
+    const resp=await fetch('/api/v1/shares?limit=30',{signal:ac.signal});
     clearTimeout(tid);
     const shares=await resp.json();
     const area=document.getElementById('ld-shares-area');
     if(!area)return;
     if(shares.length){
-      let sh='<div class="ld-section">Recent Shares</div>';
-      for(const s of shares){
-        const name=s.name||s.id;
-        const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
-        const desc=s.description||'saved share';
-        const ago=_timeAgo(s.updated);
-        const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
-        sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
+      // Split into named (user-renamed) vs auto-saves
+      const named=shares.filter(s=>!s.id.startsWith('auto-')&&!/^[0-9a-f]{12}$/.test(s.id)&&s.size_kb>1);
+      const auto=shares.filter(s=>!named.includes(s));
+      let sh='';
+      if(named.length){
+        sh+='<div class="ld-section">Saved</div>';
+        for(const s of named){
+          const name=s.name||s.id;
+          const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
+          const desc=s.description||'saved share';
+          const ago=_timeAgo(s.updated);
+          const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
+          sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
+        }
+      }
+      if(auto.length){
+        sh+='<div class="ld-section">Recent</div>';
+        for(const s of auto.slice(0,10)){
+          const name=s.name||s.id;
+          const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
+          const desc=s.description||'saved share';
+          const ago=_timeAgo(s.updated);
+          const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
+          sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
+        }
       }
       area.innerHTML=sh;
     } else { area.innerHTML=''; }

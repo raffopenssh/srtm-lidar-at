@@ -1858,7 +1858,7 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
             'copernicus': str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'),
             'cadastre': str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'),
             'hansen': str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'),
-            'rf_only': str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes'),
+            'rf_only': str(params.get('rf_only', 'false')).lower() in ('true', '1', 'yes'),
             'geometry': geometry_text,
         }
         # Compute center from result bbox if available
@@ -1935,7 +1935,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
-    rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
+    rf_only = str(params.get('rf_only', 'false')).lower() in ('true', '1', 'yes')
     type_filter = params.get('types', None)
     if isinstance(type_filter, str):
         type_filter = [t.strip() for t in type_filter.split(',')]
@@ -2497,7 +2497,7 @@ def segment_overlay():
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
-        rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
+        rf_only = str(params.get('rf_only', 'false')).lower() in ('true', '1', 'yes')
         type_filter_str = params.get('types', None)
         type_filter = None
         if type_filter_str:
@@ -3356,7 +3356,7 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                         _il = InfrastructureLookup.for_bbox(_w4, _s4, _e4, _n4)
                     except Exception:
                         pass
-                _rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
+                _rf_only = str(params.get('rf_only', 'false')).lower() in ('true', '1', 'yes')
                 result = seg.segment_and_classify(
                     dtm, dsm, mask, tf, spectral=spectral,
                     observation_year=ti.dataset_to_year(dataset),
@@ -3685,7 +3685,7 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
                     _il2 = InfrastructureLookup.for_bbox(_w42, _s42, _e42, _n42)
                 except Exception:
                     pass
-            _rf_only2 = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
+            _rf_only2 = str(params.get('rf_only', 'false')).lower() in ('true', '1', 'yes')
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], mask, tf, spectral=spectral,
                 observation_year=ti.dataset_to_year(dataset),

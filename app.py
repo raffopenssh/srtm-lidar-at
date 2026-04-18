@@ -957,11 +957,12 @@ def processing_single():
 def processing_retry():
     """Retry a specific failed KG.
 
-    Removes the KG from failed_kgs.json and retried_kgs.json so it will
-    be reprocessed.  If the processor is already running, a restart is
-    needed for the change to take effect (the running process caches the
-    failed set in memory).  If the processor is NOT running, it is
-    started automatically.
+    Writes the KG code to ``retry_queue.json``.  The running processor
+    picks this up each iteration and inserts the KG as the very next
+    item in its processing queue.  Also cleans up the failed/progress
+    state so the KG is no longer shown as failed.
+
+    If the processor is NOT running, it is started automatically.
     """
     kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
     if not kg:
@@ -969,6 +970,19 @@ def processing_retry():
 
     data_dir = Path('data/austria_processor')
     actions = []
+
+    # Write to retry queue (processor reads + clears each iteration)
+    retry_path = data_dir / 'retry_queue.json'
+    try:
+        existing = []
+        if retry_path.exists():
+            existing = json.loads(retry_path.read_text())
+        if kg not in existing:
+            existing.append(kg)
+        retry_path.write_text(json.dumps(existing))
+        actions.append('added to retry_queue')
+    except Exception as e:
+        log.warning('retry: retry_queue.json: %s', e)
 
     # Remove from failed_kgs.json
     failed_path = data_dir / 'failed_kgs.json'
@@ -1027,12 +1041,12 @@ def processing_retry():
     if not processor_running:
         return processing_start()
 
-    # Processor is running — KG will be picked up after restart
+    # Processor is running — it will pick up the retry queue entry
     return jsonify({
         'status': 'queued_for_retry',
         'kg': kg,
         'actions': actions,
-        'note': 'Processor is running. Restart it to pick up the retried KG.',
+        'note': 'KG will be processed next by the running processor.',
     })
 
 

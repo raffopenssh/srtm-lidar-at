@@ -932,14 +932,6 @@ async function retryKg(code) {
   try {
     const r = await fetch('/api/v1/processing/retry?kg=' + encodeURIComponent(code), {method:'POST'});
     if (!r.ok) { alert('Retry failed: ' + await r.text()); return; }
-    const d = await r.json();
-    if (d.status === 'queued_for_retry') {
-      if (confirm(code + ' queued for retry.\nRestart processor now to pick it up?')) {
-        await fetch('/api/v1/processing/stop', {method:'POST'});
-        await new Promise(r => setTimeout(r, 1500));
-        await fetch('/api/v1/processing/start', {method:'POST'});
-      }
-    }
     setTimeout(poll, 400);
   } catch(e) { console.error(e); }
 }

@@ -5626,9 +5626,96 @@ def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "complet
 # === SECTION: main() — KG iteration, retry loop, subprocess management ===
 
 RETRIED_KGS_FILE = DATA_DIR / "retried_kgs.json"
+DEFER_GAP = 5  # re-insert transient failures this many KGs later
 
 # Graceful shutdown flag
 _shutdown_requested = False
+
+
+def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool:
+    """Classify whether a KG failure is transient (worth auto-retrying).
+
+    Transient errors are server-side / network issues that are likely to
+    resolve on their own after a few minutes.  The KG is re-inserted into
+    the pending queue ``DEFER_GAP`` positions later so the caches are
+    still warm.
+
+    Returns True for transient, False for permanent.
+    """
+    err_lower = error.lower() if error else ""
+    step_lower = step.lower() if step else ""
+
+    # --- Timeouts at network-heavy steps are almost always transient ---
+    _transient_steps = {"copernicus", "harmonics", "hansen", "ortho", "lidar"}
+    if is_timeout and step_lower in _transient_steps:
+        return True
+
+    # --- Server errors in the error message ---
+    _server_patterns = [
+        "500", "502", "503", "429",
+        "server error", "internal server error", "bad gateway",
+        "service unavailable", "too many requests",
+        "connection reset", "connectionreset",
+        "connection refused", "connectionrefused",
+        "connection aborted", "connectionaborted",
+        "broken pipe", "brokenpipe",
+        "remote end closed", "remotedisconnected",
+        "read timed out", "readtimeout",
+        "connect timeout", "connecttimeout",
+        "connection timed out",
+        "timeout",  # generic network timeouts
+        "ssl", "certificate",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
+    ]
+    for pat in _server_patterns:
+        if pat in err_lower:
+            return True
+
+    # --- openEO / Copernicus transient issues ---
+    _openeo_patterns = [
+        "openeo", "batch job failed", "job timed out",
+        "synchronous download timed out",
+    ]
+    for pat in _openeo_patterns:
+        if pat in err_lower:
+            return True
+
+    # --- BEV data server hiccups ---
+    if "rasterio" in err_lower and ("http" in err_lower or "curl" in err_lower):
+        return True
+
+    return False
+
+
+RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.json"
+
+
+def _read_retry_queue() -> list[str]:
+    """Read and clear the retry queue file.  Returns list of KG codes."""
+    try:
+        if RETRY_QUEUE_FILE.exists():
+            codes = json.loads(RETRY_QUEUE_FILE.read_text())
+            RETRY_QUEUE_FILE.write_text("[]")
+            return [c for c in codes if isinstance(c, str)]
+    except Exception:
+        pass
+    return []
+
+
+def _append_retry_queue(kg_code: str):
+    """Append a KG code to the retry queue file (atomic)."""
+    try:
+        existing = []
+        if RETRY_QUEUE_FILE.exists():
+            existing = json.loads(RETRY_QUEUE_FILE.read_text())
+        if kg_code not in existing:
+            existing.append(kg_code)
+        RETRY_QUEUE_FILE.write_text(json.dumps(existing))
+    except Exception:
+        pass
 
 
 def _load_failed_kgs() -> set:
@@ -5884,7 +5971,25 @@ def main():
     include_cop = not args.no_copernicus
     mark_uncertain = args.mark_uncertain
 
-    for i, kg in enumerate(pending):
+    # Deferred retry queue: list of (inject_after_index, kg_dict, attempt_num)
+    _deferred_retries: list[tuple[int, dict, int]] = []
+
+    i = 0
+    while i < len(pending):
+        # --- Check for deferred retries ready to be injected ---
+        ready = [d for d in _deferred_retries if d[0] <= i]
+        for defer_idx, defer_kg, defer_attempt in ready:
+            _deferred_retries.remove((defer_idx, defer_kg, defer_attempt))
+            # Insert right after current position so it's picked up next
+            pending.insert(i + 1, defer_kg)
+            # Tag with defer metadata for logging / attempt tracking
+            defer_kg["_defer_attempt"] = defer_attempt
+            log.info("↻ Deferred retry: KG %s re-inserted at position %d "
+                     "(attempt %d)",
+                     defer_kg["kg_code"], i + 1, defer_attempt)
+
+        kg = pending[i]
+
         # --- Check graceful shutdown ---
         if _shutdown_requested:
             log.info("Shutdown requested — stopping after %d KGs", i)
@@ -6089,18 +6194,41 @@ def main():
                                         "will retry (tile checkpoints preserved)",
                                         KG_TIMEOUT_SECONDS // 60, last_step)
                         else:
-                            # Second timeout — mark as permanently failed
-                            log.error("KG %s: TIMEOUT at step %s on retry — marking as failed",
-                                      kg_code, last_step)
-                            failed_kgs.add(kg_code)
-                            _save_failed_kgs(failed_kgs)
-                            progress.add_failure(kg_code, kg_name,
-                                                 f"timeout at {last_step} (after retry)",
-                                                 last_step)
-                            progress.add_log("error",
-                                             f"KG {kg_code} timed out at {last_step} after retry",
-                                             kg_code)
-                            progress.save()
+                            # Second timeout — check if transient
+                            _err_msg = f"timeout at {last_step} (after retry)"
+                            _defer_n = kg.get("_defer_attempt", 0)
+                            if _defer_n < 2 and _is_transient_error(
+                                    _err_msg, last_step, is_timeout=True):
+                                log.warning(
+                                    "KG %s: TIMEOUT at step %s — transient, "
+                                    "deferring %d KGs (attempt %d)",
+                                    kg_code, last_step, DEFER_GAP, _defer_n + 1)
+                                _append_retry_queue(kg_code)
+                                _deferred: dict = dict(kg)
+                                _deferred["_defer_attempt"] = _defer_n + 1
+                                _deferred_retries.append(
+                                    (i + DEFER_GAP, _deferred, _defer_n + 1))
+                                progress.add_log(
+                                    "warning",
+                                    f"KG {kg_code} timeout at {last_step} — "
+                                    f"deferred retry in {DEFER_GAP} KGs",
+                                    kg_code)
+                                progress.save()
+                            else:
+                                log.error(
+                                    "KG %s: TIMEOUT at step %s on retry "
+                                    "— marking as failed",
+                                    kg_code, last_step)
+                                failed_kgs.add(kg_code)
+                                _save_failed_kgs(failed_kgs)
+                                progress.add_failure(
+                                    kg_code, kg_name, _err_msg, last_step)
+                                progress.add_log(
+                                    "error",
+                                    f"KG {kg_code} timed out at {last_step} "
+                                    f"after retry",
+                                    kg_code)
+                                progress.save()
                             with progress._lock:
                                 _ckg = progress._state.get("current_kg") or {}
                                 _ts = _ckg.get("tile_statuses", [])
@@ -6198,33 +6326,49 @@ def main():
                                      f"KG {kg_code}: credits exhausted — not marking failed",
                                      kg_code)
                 else:
-                    progress.add_failure(
-                        kg_code, kg_name,
-                        result.get("error", "unknown"),
-                        result.get("step", "unknown"),
-                    )
-                    progress.add_log(
-                        "error",
-                        f"KG {kg_code} failed at {result.get('step')}: {result.get('error')}",
-                        kg_code,
-                    )
-                    # Record failure in manifest for retry tracking
-                    from zenodo_client import Entry
-                    manifest.set(f"{kg_code}_error", Entry(
-                        key=f"{kg_code}_error",
-                        depo_id=0, bucket_url="", filename="",
-                        size=0, checksum="",
-                        uploaded_at=datetime.now(timezone.utc).isoformat(),
-                        version=json.dumps({
-                            "error": result.get("error", ""),
-                            "step": result.get("step", ""),
-                            "traceback": result.get("traceback", "")[:500],
-                        }),
-                    ))
-                    manifest.save()
+                    _err = result.get("error", "unknown")
+                    _stp = result.get("step", "unknown")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    if _defer_n < 2 and _is_transient_error(_err, _stp):
+                        log.warning(
+                            "KG %s: transient error at %s — deferring "
+                            "%d KGs (attempt %d): %s",
+                            kg_code, _stp, DEFER_GAP, _defer_n + 1, _err)
+                        _append_retry_queue(kg_code)
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _deferred_retries.append(
+                            (i + DEFER_GAP, _deferred, _defer_n + 1))
+                        progress.add_log(
+                            "warning",
+                            f"KG {kg_code} error at {_stp} — "
+                            f"deferred retry in {DEFER_GAP} KGs: {_err}",
+                            kg_code)
+                    else:
+                        progress.add_failure(
+                            kg_code, kg_name, _err, _stp)
+                        progress.add_log(
+                            "error",
+                            f"KG {kg_code} failed at {_stp}: {_err}",
+                            kg_code,
+                        )
+                        # Record failure in manifest for retry tracking
+                        from zenodo_client import Entry
+                        manifest.set(f"{kg_code}_error", Entry(
+                            key=f"{kg_code}_error",
+                            depo_id=0, bucket_url="", filename="",
+                            size=0, checksum="",
+                            uploaded_at=datetime.now(timezone.utc).isoformat(),
+                            version=json.dumps({
+                                "error": _err,
+                                "step": _stp,
+                                "traceback": result.get("traceback", "")[:500],
+                            }),
+                        ))
+                        manifest.save()
 
-                    log.warning("KG %s: FAILED at %s: %s",
-                                kg_code, result.get("step"), result.get("error"))
+                        log.warning("KG %s: FAILED at %s: %s",
+                                    kg_code, _stp, _err)
                     # Persist tile dots for failed KG
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
@@ -6232,8 +6376,26 @@ def main():
                     _save_tile_history(kg_code, _ts, "failed")
 
         except Exception as e:
-            progress.add_failure(kg_code, kg_name, str(e), "exception")
-            progress.add_log("error", f"KG {kg_code} exception: {e}", kg_code)
+            _err_str = str(e)
+            _defer_n = kg.get("_defer_attempt", 0)
+            if _defer_n < 2 and _is_transient_error(_err_str, "exception"):
+                log.warning(
+                    "KG %s: transient exception — deferring %d KGs "
+                    "(attempt %d): %s",
+                    kg_code, DEFER_GAP, _defer_n + 1, _err_str)
+                _append_retry_queue(kg_code)
+                _deferred = dict(kg)
+                _deferred["_defer_attempt"] = _defer_n + 1
+                _deferred_retries.append(
+                    (i + DEFER_GAP, _deferred, _defer_n + 1))
+                progress.add_log(
+                    "warning",
+                    f"KG {kg_code} exception — deferred retry in "
+                    f"{DEFER_GAP} KGs: {_err_str}",
+                    kg_code)
+            else:
+                progress.add_failure(kg_code, kg_name, _err_str, "exception")
+                progress.add_log("error", f"KG {kg_code} exception: {e}", kg_code)
             log.error("KG %s: EXCEPTION: %s", kg_code, traceback.format_exc())
             # Persist tile dots for exceptioned KG
             with progress._lock:
@@ -6319,6 +6481,33 @@ def main():
                      s["success"], s["failed"],
                      s["rate_kgs_per_hour"],
                      s["eta_seconds"] / 3600 if s["eta_seconds"] else 0)
+
+        # --- Check file-based retry queue (written by API or transient handler) ---
+        for rq_code in _read_retry_queue():
+            if rq_code == kg_code:
+                continue  # just processed this one
+            # Only inject if not already in deferred list or pending
+            _already = (rq_code in failed_kgs
+                        or rq_code in completed_codes
+                        or any(d[1]["kg_code"] == rq_code
+                               for d in _deferred_retries)
+                        or any(p["kg_code"] == rq_code
+                               for p in pending[i+1:i+DEFER_GAP+2]))
+            if _already:
+                continue
+            # Find the KG dict from full list
+            rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
+            if rq_kg:
+                rq_kg = dict(rq_kg)
+                rq_kg["_defer_attempt"] = 0
+                pending.insert(i + 1, rq_kg)
+                # Also remove from failed sets so it actually runs
+                failed_kgs.discard(rq_code)
+                _save_failed_kgs(failed_kgs)
+                log.info("↻ Manual retry: KG %s inserted next in queue",
+                         rq_code)
+
+        i += 1
 
     # Done
     if _shutdown_requested:

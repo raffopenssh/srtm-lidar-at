@@ -487,6 +487,7 @@ cadastre API ──→ cadastre ──→ ground truth  features  labels
 | `tile_checkpoints/<kg>/tile_N.pkl` | Child | Child (on retry) | Resume from last completed tile |
 | `zenodo_manifest.json` | Parent (`Manifest`) | Parent + Dashboard | Upload tracking (success/error per KG) |
 | `failed_kgs.json` | Parent | Parent (on restart) | Permanently-failed KGs to skip |
+| `retry_queue.json` | API / transient handler | Parent (each iteration) | KG codes to insert next in queue (read + cleared) |
 | `kg_list.json` | Parent | Parent | Cached list of ~8440 KGs (avoid repeated API calls) |
 
 ### Operations
@@ -562,13 +563,14 @@ nearest-neighbor ordering relative to the last completed KG.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `copernicus: credits exhausted` | All openEO credentials used up | Update `_CREDENTIALS` in `copernicus.py`, delete `data/austria_processor/copernicus_paused` |
-| Timeout on large KG | Copernicus slow (NDVI downloads) | Automatic: retry once with checkpoints, Copernicus uses quadrant split internally |
+| Timeout on large KG | Copernicus slow (NDVI downloads) | Automatic: retry once with checkpoints, then deferred retry 5 KGs later if transient |
 | OOM kill | KG exceeds 3GB MemoryMax | Automatic: systemd restarts, tile checkpoints preserved |
 | `Synchronous download timed out` | Normal Copernicus behavior | No action — falls back to batch job automatically |
 | `Hansen resample failed` | No Hansen data (western Vorarlberg) | Non-fatal, skipped. Hansen data sparse at AT borders |
 | 0-byte cache files | Interrupted before atomic-write fix | Delete the 0-byte `.tif`/`.npz` files manually |
 | Disk critically low | Caches filling disk | Automatic: `check_disk_space()` does LRU cleanup, pauses if <3GB |
 | Stale `progress.json` | Service died without cleanup | Restart clears stale state in `main()` init block |
+| Transient server error (500/503/timeout) | Remote service hiccup | Automatic: deferred retry 5 KGs later (up to 2×), then permanent fail |
 
 ### Per-KG Outputs
 

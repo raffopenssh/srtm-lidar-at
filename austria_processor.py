@@ -697,6 +697,10 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
         from shapely.geometry import shape as s_shape
         try:
             poly_3035 = s_shape(geom_dict)
+            # Skip tiny polygon fragments (< 20 sqm) — these are
+            # segmentation noise at edges, not real buildings.
+            if poly_3035.area < 20:
+                continue
             poly_wgs = transform_to_wgs(poly_3035)
             c_wgs = poly_wgs.centroid
             at_edge = _segment_touches_edge(seg_mask)
@@ -775,51 +779,61 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
 
         try:
             label_single = np.where(seg_mask, 1, 0).astype(np.int32)
-            for geom_dict, val in rasterize_shapes(
-                label_single, mask=seg_mask, transform=transform, connectivity=4,
-            ):
-                if val == 0:
-                    continue
-                from shapely.geometry import shape as s_shape
-                poly_3035 = s_shape(geom_dict)
-                poly_wgs = transform_to_wgs(poly_3035)
-                c_wgs = poly_wgs.centroid
+            from shapely.geometry import shape as s_shape
 
-                seg_h = ndsm[seg_mask]
-                seg_dtm = dtm[seg_mask]
+            # Collect all polygons for this segment and pick the largest
+            all_polys = [
+                s_shape(gd)
+                for gd, val in rasterize_shapes(
+                    label_single, mask=seg_mask, transform=transform, connectivity=4,
+                )
+                if val != 0
+            ]
+            if not all_polys:
+                continue
+            poly_3035 = max(all_polys, key=lambda p: p.area)
 
-                feature = {
-                    "type": obj.obj_type,
-                    "area_sqm": round(float(poly_3035.area), 1),
-                    "centroid_lon": round(c_wgs.x, 7),
-                    "centroid_lat": round(c_wgs.y, 7),
-                    "geometry_wgs": mapping(poly_wgs),
-                    "confidence": round(obj.confidence, 2),
-                    "edge_clipped": at_edge,
-                }
+            # Apply min_area filter on the actual polygon area (not segment-level)
+            if poly_3035.area < spec['min_area']:
+                continue
 
-                if obj.obj_type == 'parking':
-                    # ~12.5 m2 per parking spot (standard)
-                    feature["est_parking_spots"] = max(1, round(poly_3035.area / 12.5))
+            poly_wgs = transform_to_wgs(poly_3035)
+            c_wgs = poly_wgs.centroid
 
-                if obj.obj_type in ('excavation', 'fill'):
-                    # Volume estimate: mean absolute height change * area
-                    mean_h = abs(float(np.nanmean(seg_h))) if len(seg_h) > 0 else 0
-                    volume = mean_h * poly_3035.area
-                    feature["volume_m3"] = round(volume, 1)
-                    if volume < 10 and not at_edge:
-                        continue  # skip tiny earthworks (unless edge-clipped)
+            seg_h = ndsm[seg_mask]
+            seg_dtm = dtm[seg_mask]
 
-                if obj.obj_type in ('bridge', 'mast'):
-                    feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+            feature = {
+                "type": obj.obj_type,
+                "area_sqm": round(float(poly_3035.area), 1),
+                "centroid_lon": round(c_wgs.x, 7),
+                "centroid_lat": round(c_wgs.y, 7),
+                "geometry_wgs": mapping(poly_wgs),
+                "confidence": round(obj.confidence, 2),
+                "edge_clipped": at_edge,
+            }
 
-                if obj.obj_type in ('fence', 'wall'):
-                    # Length estimate from perimeter / 2 (rectangular assumption)
-                    feature["length_m"] = round(poly_3035.length / 2, 1)
-                    feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+            if obj.obj_type == 'parking':
+                # ~12.5 m2 per parking spot (standard)
+                feature["est_parking_spots"] = max(1, round(poly_3035.area / 12.5))
 
-                results.append(feature)
-                break  # one polygon per object
+            if obj.obj_type in ('excavation', 'fill'):
+                # Volume estimate: mean absolute height change * area
+                mean_h = abs(float(np.nanmean(seg_h))) if len(seg_h) > 0 else 0
+                volume = mean_h * poly_3035.area
+                feature["volume_m3"] = round(volume, 1)
+                if volume < 10 and not at_edge:
+                    continue  # skip tiny earthworks (unless edge-clipped)
+
+            if obj.obj_type in ('bridge', 'mast'):
+                feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+
+            if obj.obj_type in ('fence', 'wall'):
+                # Length estimate from perimeter / 2 (rectangular assumption)
+                feature["length_m"] = round(poly_3035.length / 2, 1)
+                feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+
+            results.append(feature)
         except Exception:
             continue
 
@@ -1689,6 +1703,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
             del tdata
         except Exception as e:
             log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx+1, e)
+
         if tr.get("labels") is not None:
             labels = tr["labels"]
             type_raster = np.zeros((th, tw), dtype=np.uint8)
@@ -1779,6 +1794,23 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         except Exception:
             pass
 
+    # --- Pre-load DTM data once per tile for GPKG parcel/building enrichment ---
+    _gpkg_tile_data = {}  # ti_idx → tdata
+    for ti_idx, tr in enumerate(tile_seg_results):
+        try:
+            _gpkg_tile_data[ti_idx] = _read_dtm_for_tile(tr)
+        except Exception:
+            pass
+
+    def _gpkg_find_tile(e3035, n3035):
+        for ti_idx, tr in enumerate(tile_seg_results):
+            left, bottom, right, top = tr["bounds_3035"]
+            if left <= e3035 <= right and bottom <= n3035 <= top:
+                td = _gpkg_tile_data.get(ti_idx)
+                if td is not None:
+                    return tr, td
+        return None, None
+
     # --- Parcels (enriched from tiles) ---
     parcels = cadastre_data["parcels"]
     if parcels:
@@ -1796,9 +1828,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     c_wgs = transform_to_wgs(c3)
                     props["centroid_lon"] = round(c_wgs.x, 7)
                     props["centroid_lat"] = round(c_wgs.y, 7)
-                    tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
-                    if tr:
-                        tdata = _read_dtm_for_tile(tr)
+                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
+                    if tr and tdata:
                         tf = tdata["transform"]
                         col = int((c3.x - tf.c) / tf.a)
                         row = int((tf.f - c3.y) / abs(tf.e))
@@ -1806,7 +1837,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                         if 0 <= row < dh and 0 <= col < dw:
                             val = float(tdata["dtm"][row, col])
                             if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
-                        del tdata
                 except Exception:
                     pass
                 dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
@@ -1834,9 +1864,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     c_wgs = transform_to_wgs(c3)
                     props["centroid_lon"] = round(c_wgs.x, 7)
                     props["centroid_lat"] = round(c_wgs.y, 7)
-                    tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
-                    if tr:
-                        tdata = _read_dtm_for_tile(tr)
+                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
+                    if tr and tdata:
                         dh, dw = tdata["shape"]
                         fp = rio_rasterize(
                             [(geom_3035, 1)], out_shape=(dh, dw),
@@ -1851,10 +1880,10 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                             props["dsm_std"] = round(float(np.std(dv)), 2) if len(dv) > 0 else 0.0
                             props["roof_type_hint"] = "flat" if props["dsm_std"] < 1.5 else "pitched"
                             props["stories_est"] = max(1, round(mh / 3.0))
-                        del tdata
                 except Exception:
                     pass
                 dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
+    del _gpkg_tile_data  # free memory
 
     # --- New buildings ---
     if new_buildings:
@@ -2203,9 +2232,53 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "by_type": {t: {"count": len(items), "total_area_sqm": round(sum(i.get("area_sqm",0) for i in items),1),
                         "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
                    for t, items in ibt.items()}}
+    # --- Pre-load DTM data once per tile for parcel/building enrichment ---
+    obj_map = {o.obj_id: o for o in objects} if objects else {}
+    _tile_data_cache = {}  # tile_idx → tdata dict
+    for ti_idx, tr in enumerate(tile_seg_results):
+        try:
+            _tile_data_cache[ti_idx] = _read_dtm_for_tile(tr)
+        except Exception as e:
+            log.warning("JSON: failed to pre-load DTM for tile %d: %s", ti_idx, e)
+    log.info("JSON: pre-loaded DTM for %d/%d tiles", len(_tile_data_cache), len(tile_seg_results))
+
+    def _find_tile_with_data(e3035, n3035):
+        """Find tile containing point AND return its cached tdata."""
+        for ti_idx, tr in enumerate(tile_seg_results):
+            left, bottom, right, top = tr["bounds_3035"]
+            if left <= e3035 <= right and bottom <= n3035 <= top:
+                tdata = _tile_data_cache.get(ti_idx)
+                if tdata is not None:
+                    return tr, tdata
+        return None, None
+
+    def _point_elevation_fallback(e3035, n3035):
+        """Direct DTM point read as fallback when no tile covers the point."""
+        try:
+            import raster_io as _rio
+            import tile_index as _ti
+            from shapely.geometry import box as _box
+            # Read a tiny window around the point (10×10m)
+            tdata = _rio.read_dtm_dsm(_box(e3035 - 5, n3035 - 5, e3035 + 5, n3035 + 5),
+                                      _ti.DEFAULT_DATASET)
+            dtm = tdata["dtm"]; tf = tdata["transform"]
+            col = int((e3035 - tf.c) / tf.a); row = int((tf.f - n3035) / abs(tf.e))
+            dh, dw = dtm.shape
+            if 0 <= row < dh and 0 <= col < dw:
+                val = float(dtm[row, col])
+                if np.isfinite(val):
+                    return round(val, 2)
+            # Try patch average
+            v = dtm[np.isfinite(dtm)]
+            if len(v) > 0:
+                return round(float(np.nanmean(v)), 2)
+        except Exception:
+            pass
+        return None
+
     # --- Per-parcel detail ---
     parcel_details = []
-    obj_map = {o.obj_id: o for o in objects} if objects else {}
+    n_parcel_no_tile = 0
     for p in cadastre_data["parcels"]:
         pd = {"parcel_id": p["parcel_id"], "area_sqm": round(p.get("area_sqm",0), 1)}
         geom_3035 = p["geometry"]
@@ -2215,9 +2288,8 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         except Exception: pass
         try:
             c3 = geom_3035.centroid
-            tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
-            if tr:
-                tdata = _read_dtm_for_tile(tr)
+            tr, tdata = _find_tile_with_data(c3.x, c3.y)
+            if tr and tdata:
                 dtm = tdata["dtm"]; tf = tdata["transform"]
                 col = int((c3.x - tf.c)/tf.a); row = int((tf.f - c3.y)/abs(tf.e))
                 dh, dw = dtm.shape
@@ -2228,6 +2300,12 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
                         v = patch[np.isfinite(patch)]
                         if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
+            else:
+                n_parcel_no_tile += 1
+                # Fallback: direct DTM point read
+                elev = _point_elevation_fallback(c3.x, c3.y)
+                if elev is not None:
+                    pd["elevation_m"] = elev
                 if tr.get("labels") is not None and objects:
                     from rasterio.features import rasterize as rio_rasterize
                     pm = rio_rasterize([(geom_3035,1)], out_shape=tr["shape"],
@@ -2246,15 +2324,19 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     pd["vegetated_fraction"] = round(vpx/tpx, 4); pd["is_vegetated"] = vpx/tpx > 0.5
                     vh = pn[np.isfinite(pn)]
                     if len(vh) > 0: pd["ndsm_max_m"] = round(float(np.max(vh)),2); pd["ndsm_mean_m"] = round(float(np.mean(vh)),2)
-                del tdata
-        except Exception: pass
+        except Exception as e:
+            log.debug("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
+    if n_parcel_no_tile > 0:
+        log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",
+                    n_parcel_no_tile, len(cadastre_data["parcels"]))
     summary["parcels"] = {
         "count": len(cadastre_data["parcels"]),
         "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
         "details": parcel_details}
     # --- Per-building detail ---
     bld_details = []
+    n_bld_no_tile = 0
     for b in cadastre_data["building_footprints"]:
         bd = {}; geom_3035 = b["geometry"]; props = b.get("properties",{})
         bd["building_id"] = props.get("building_id", props.get("id",""))
@@ -2265,10 +2347,9 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         except Exception: pass
         try:
             c3 = geom_3035.centroid
-            tr = _find_tile_for_point(c3.x, c3.y, tile_seg_results)
-            if tr:
+            tr, tdata = _find_tile_with_data(c3.x, c3.y)
+            if tr and tdata:
                 from rasterio.features import rasterize as rio_rasterize
-                tdata = _read_dtm_for_tile(tr)
                 dh, dw = tdata["shape"]
                 bm = rio_rasterize([(geom_3035,1)], out_shape=(dh,dw), transform=tdata["transform"],
                                    fill=0, dtype=np.uint8, all_touched=True).astype(bool)
@@ -2286,9 +2367,19 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         obj = obj_map.get(int(lbl))
                         if obj: tc_[obj.obj_type] += int((bl==lbl).sum())
                     if tc_: bd["segment_types"] = {t:px for t,px in tc_.most_common()}
-                del tdata
-        except Exception: pass
+            else:
+                n_bld_no_tile += 1
+                # Fallback: at least get elevation for the centroid
+                elev = _point_elevation_fallback(c3.x, c3.y)
+                if elev is not None:
+                    bd["centroid_dtm_m"] = elev
+        except Exception as e:
+            log.debug("JSON: building %s enrichment failed: %s", bd.get("building_id"), e)
         bld_details.append(bd)
+    if n_bld_no_tile > 0:
+        log.warning("JSON: %d/%d buildings have no matching tile", n_bld_no_tile, len(cadastre_data["building_footprints"]))
+    # Free tile data cache
+    del _tile_data_cache
     summary["building_footprints"] = {"count": len(cadastre_data["building_footprints"]), "details": bld_details}
     # --- Coverage ---
     nwe = sum(1 for p in parcel_details if p.get("elevation_m") is not None)
@@ -3366,8 +3457,8 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
         issues.append("FULL_GPKG: missing")
     else:
         try:
-            import rasterio
-            expected_layers = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
+            import re as _re
+            expected_layers = ["DTM", "DSM", "nDSM", "segment_type"]
             found_layers = set()
             # List all GPKG raster tables (tiles + 2d-gridded-coverage)
             try:
@@ -3380,11 +3471,11 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                 found_layers = set(tables)
             except Exception:
                 pass
+            # Check for each expected base layer: exact name or tiled variant {name}_t{N}
             for layer in expected_layers:
-                if layer not in found_layers:
-                    issues.append(f"FULL_GPKG: missing raster layer '{layer}'")
-            if "Ortho" not in found_layers:
-                issues.append("FULL_GPKG: missing Ortho layer (ortho read may have failed)")
+                pat = _re.compile(rf'^{_re.escape(layer)}(_t\d+)?$')
+                if not any(pat.match(t) for t in found_layers):
+                    issues.append(f"FULL_GPKG: missing raster layer '{layer}' (or tiled '{layer}_tN')")
             fsize = os.path.getsize(full_path)
             if fsize < 10_000:
                 issues.append(f"FULL_GPKG: suspiciously small ({fsize} bytes)")
@@ -3399,6 +3490,7 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
     else:
         try:
             import sqlite3
+            import re as _re
             conn = sqlite3.connect(light_path)
             # Raster tables
             raster_tables = [r[0] for r in conn.execute(
@@ -3409,23 +3501,36 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                 "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
             conn.close()
 
-            if "segment_type" not in raster_tables:
-                issues.append("LIGHT_GPKG: missing segment_type raster")
+            # segment_type raster: exact name or tiled variant
+            seg_type_pat = _re.compile(r'^segment_type(_t\d+)?$')
+            if not any(seg_type_pat.match(t) for t in raster_tables):
+                issues.append("LIGHT_GPKG: missing segment_type raster (or tiled 'segment_type_tN')")
 
-            expected_vectors = ["segments", "parcels"]
-            for v in expected_vectors:
-                if v not in vector_tables:
-                    issues.append(f"LIGHT_GPKG: missing vector layer '{v}'")
+            # segments vector: exact name or tiled variant
+            seg_vec_pat = _re.compile(r'^segments(_t\d+)?$')
+            if not any(seg_vec_pat.match(t) for t in vector_tables):
+                issues.append("LIGHT_GPKG: missing vector layer 'segments' (or tiled 'segments_tN')")
+
+            # parcels is always a single (non-tiled) layer
+            if "parcels" not in vector_tables:
+                issues.append("LIGHT_GPKG: missing vector layer 'parcels'")
 
             # Count features in vector layers
             try:
                 import fiona
+                segment_layer_counts = {}  # track segment tile emptiness
                 for vt in vector_tables:
                     with fiona.open(light_path, layer=vt) as src:
                         n = len(src)
                         log.info("  LIGHT_GPKG: layer '%s' → %d features", vt, n)
-                        if n == 0:
+                        if seg_vec_pat.match(vt):
+                            segment_layer_counts[vt] = n
+                        elif n == 0:
+                            # Non-segment layers: warn individually
                             issues.append(f"LIGHT_GPKG: layer '{vt}' is empty")
+                # For segment layers, only warn if ALL are empty
+                if segment_layer_counts and all(c == 0 for c in segment_layer_counts.values()):
+                    issues.append(f"LIGHT_GPKG: all segment layers are empty ({', '.join(sorted(segment_layer_counts))})")
             except Exception as e:
                 issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
 

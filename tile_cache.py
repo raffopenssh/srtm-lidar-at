@@ -187,6 +187,34 @@ def rebuild_tile_bbox_index():
     pass
 
 
+# ---------------------------------------------------------------------------
+# Retry configuration for transient Copernicus server errors (HTTP 500, 502, 503)
+# ---------------------------------------------------------------------------
+_SERVER_ERROR_MAX_RETRIES = 4        # up to 4 retries (5 total attempts)
+_SERVER_ERROR_BACKOFF_SECS = [30, 60, 120, 240]  # exponential backoff delays
+
+
+def _is_server_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a transient HTTP 5xx server error.
+
+    Matches error messages containing '[500]', '[502]', '[503]',
+    'Internal Server Error', 'Bad Gateway', 'Service Unavailable',
+    'EjrApiError', or the generic 'Server error' pattern that the
+    Copernicus openEO backend emits during maintenance windows.
+    """
+    msg = str(exc)
+    # Also check chained cause
+    cause_msg = str(exc.__cause__) if exc.__cause__ else ""
+    combined = f"{msg} {cause_msg}"
+    server_patterns = (
+        "[500]", "[502]", "[503]",
+        "Internal Server Error", "Bad Gateway", "Service Unavailable",
+        "Server error", "EjrApiError",
+        "server error", "502 Bad Gateway", "503 Service",
+    )
+    return any(pat in combined for pat in server_patterns)
+
+
 class CopernicusTileCache:
     """Grid-snapped cache for Copernicus openEO data.
 
@@ -232,31 +260,46 @@ class CopernicusTileCache:
                 log.warning("Corrupt Copernicus cache %s: %s", path.name, e)
                 path.unlink(missing_ok=True)
 
-        # Fetch from openEO for the full tile
+        # Fetch from openEO for the full tile (with retry on server errors)
         self._stats["misses"] += 1
-        try:
-            import copernicus
-            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
-            result = copernicus.get_ndvi_composite(tile_bbox, year=year, _conn=_conn)
-            # Save to cache
-            tf = result["transform"]
-            _atomic_savez(
-                path,
-                ndvi=result["ndvi"],
-                transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
-                crs=str(result.get("crs", "EPSG:4326")),
-            )
-            log.info("Copernicus NDVI tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
-                     tw, ts, te, tn, result["ndvi"].shape[1], result["ndvi"].shape[0])
-            return result
-        except Exception as e:
-            self._stats["errors"] += 1
-            from copernicus import CreditsExhaustedError
-            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
-                log.error("Copernicus NDVI: credits exhausted — pausing")
-                raise
-            log.warning("Copernicus NDVI tile fetch failed: %s", e)
-            return None
+        from copernicus import CreditsExhaustedError
+        last_exc = None
+        for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
+            try:
+                import copernicus
+                _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
+                result = copernicus.get_ndvi_composite(tile_bbox, year=year, _conn=_conn)
+                # Save to cache
+                tf = result["transform"]
+                _atomic_savez(
+                    path,
+                    ndvi=result["ndvi"],
+                    transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
+                    crs=str(result.get("crs", "EPSG:4326")),
+                )
+                log.info("Copernicus NDVI tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
+                         tw, ts, te, tn, result["ndvi"].shape[1], result["ndvi"].shape[0])
+                return result
+            except Exception as e:
+                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                    self._stats["errors"] += 1
+                    log.error("Copernicus NDVI: credits exhausted — pausing")
+                    raise
+                last_exc = e
+                if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
+                    delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
+                    log.warning(
+                        "Copernicus NDVI tile fetch failed (server error, attempt %d/%d), "
+                        "retrying in %ds: %s",
+                        attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                # Non-retryable error or retries exhausted
+                break
+        self._stats["errors"] += 1
+        log.warning("Copernicus NDVI tile fetch failed: %s", last_exc)
+        return None
 
     def get_landcover(self, bbox_wgs: dict, cred_index: int = None) -> Optional[dict]:
         """Get ESA WorldCover, grid-snapped."""
@@ -273,22 +316,36 @@ class CopernicusTileCache:
                 path.unlink(missing_ok=True)
 
         self._stats["misses"] += 1
-        try:
-            import copernicus
-            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
-            result = copernicus.get_land_cover(tile_bbox, _conn=_conn)
-            _atomic_savez(path, data=np.array(result, dtype=object))
-            log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
-                     tw, ts, te, tn)
-            return result
-        except Exception as e:
-            self._stats["errors"] += 1
-            from copernicus import CreditsExhaustedError
-            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
-                log.error("Copernicus WorldCover: credits exhausted — pausing")
-                raise
-            log.warning("Copernicus WorldCover tile fetch failed: %s", e)
-            return None
+        from copernicus import CreditsExhaustedError
+        last_exc = None
+        for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
+            try:
+                import copernicus
+                _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
+                result = copernicus.get_land_cover(tile_bbox, _conn=_conn)
+                _atomic_savez(path, data=np.array(result, dtype=object))
+                log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
+                         tw, ts, te, tn)
+                return result
+            except Exception as e:
+                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                    self._stats["errors"] += 1
+                    log.error("Copernicus WorldCover: credits exhausted — pausing")
+                    raise
+                last_exc = e
+                if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
+                    delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
+                    log.warning(
+                        "Copernicus WorldCover tile fetch failed (server error, attempt %d/%d), "
+                        "retrying in %ds: %s",
+                        attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+        self._stats["errors"] += 1
+        log.warning("Copernicus WorldCover tile fetch failed: %s", last_exc)
+        return None
 
     def get_sar(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
         """Get SAR backscatter, grid-snapped."""
@@ -309,29 +366,43 @@ class CopernicusTileCache:
                 path.unlink(missing_ok=True)
 
         self._stats["misses"] += 1
-        try:
-            import copernicus
-            _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
-            result = copernicus.get_sar_backscatter(
-                tile_bbox, f"{year}-06-01", f"{year}-09-30", _conn=_conn)
-            tf = result["transform"]
-            _atomic_savez(
-                path,
-                vv=result["vv"], vh=result["vh"],
-                transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
-                crs=str(result.get("crs", "EPSG:4326")),
-            )
-            log.info("Copernicus SAR tile cached: %.2f,%.2f → %.2f,%.2f",
-                     tw, ts, te, tn)
-            return result
-        except Exception as e:
-            self._stats["errors"] += 1
-            from copernicus import CreditsExhaustedError
-            if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
-                log.error("Copernicus SAR: credits exhausted — pausing")
-                raise
-            log.warning("Copernicus SAR tile fetch failed: %s", e)
-            return None
+        from copernicus import CreditsExhaustedError
+        last_exc = None
+        for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
+            try:
+                import copernicus
+                _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
+                result = copernicus.get_sar_backscatter(
+                    tile_bbox, f"{year}-06-01", f"{year}-09-30", _conn=_conn)
+                tf = result["transform"]
+                _atomic_savez(
+                    path,
+                    vv=result["vv"], vh=result["vh"],
+                    transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
+                    crs=str(result.get("crs", "EPSG:4326")),
+                )
+                log.info("Copernicus SAR tile cached: %.2f,%.2f → %.2f,%.2f",
+                         tw, ts, te, tn)
+                return result
+            except Exception as e:
+                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                    self._stats["errors"] += 1
+                    log.error("Copernicus SAR: credits exhausted — pausing")
+                    raise
+                last_exc = e
+                if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
+                    delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
+                    log.warning(
+                        "Copernicus SAR tile fetch failed (server error, attempt %d/%d), "
+                        "retrying in %ds: %s",
+                        attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+        self._stats["errors"] += 1
+        log.warning("Copernicus SAR tile fetch failed: %s", last_exc)
+        return None
 
     @property
     def stats(self) -> dict:

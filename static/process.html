@@ -90,6 +90,12 @@
     transform-origin: center;
     filter: drop-shadow(0 0 4px rgba(255,255,255,0.9)) drop-shadow(0 0 8px #58a6ff);
   }
+  .tile-dot-completed {
+    filter: drop-shadow(0 0 4px rgba(255,255,255,0.65)) drop-shadow(0 0 8px rgba(255,255,255,0.35));
+  }
+  .tile-dot-failed {
+    filter: drop-shadow(0 0 3px rgba(248,81,73,0.5));
+  }
   .pulse-ring {
     position: absolute;
     left: 50%; top: 50%;
@@ -364,12 +370,15 @@ const API = '/api/v1/processing/status';
 const POLL = 5;
 let cd = POLL;
 let map, mapMarkers;
-let tileDotsLayer;
+let tileDotsLayer;       // current KG tile dots (redrawn each poll)
+let historyDotsLayer;    // accumulated past-KG tile dots (persistent)
 let copLayer, hanLayer;
 let pulseMarker = null;
 let _lastPulseKey = null;
 let _tilesFitted = false;
 let _fittedKgCode = null;
+let _lastCurrentKgCode = null;  // track KG transitions
+let _kgHistory = {};            // kgCode -> {tiles: [...], status: 'completed'|'failed'}
 let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
@@ -411,9 +420,11 @@ function initMap() {
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
   copLayer = L.layerGroup().addTo(map);
   hanLayer = L.layerGroup().addTo(map);
+  historyDotsLayer = L.layerGroup().addTo(map);
   tileDotsLayer = L.layerGroup().addTo(map);
   L.control.layers(null, {
     'Tile dots': tileDotsLayer,
+    'History dots': historyDotsLayer,
     'Copernicus tiles (0.1°)': copLayer,
     'Hansen tiles (0.5°)': hanLayer,
   }, {collapsed: true, position: 'topright'}).addTo(map);
@@ -425,16 +436,71 @@ function updateMap(d) {
   // Completed/failed KGs still get a marker via tile_statuses.
 }
 
+// Render accumulated history dots (completed & failed KGs)
+function renderHistoryDots() {
+  if (!map || !historyDotsLayer) return;
+  historyDotsLayer.clearLayers();
+  Object.entries(_kgHistory).forEach(([kgCode, entry]) => {
+    const isCompleted = entry.status === 'completed';
+    const isFailed = entry.status === 'failed';
+    entry.tiles.forEach(t => {
+      let col, opacity, cls;
+      if (isFailed) {
+        col = '#f85149'; opacity = 0.7; cls = 'tile-dot tile-dot-failed';
+      } else {
+        // completed — green with white glow
+        col = '#3fb950'; opacity = 0.85; cls = 'tile-dot tile-dot-completed';
+      }
+      const m = L.circleMarker([t.lat, t.lng], {
+        radius: 1.5, fillColor: col, fillOpacity: opacity,
+        stroke: false, className: cls
+      });
+      m.bindTooltip(kgCode + ' — ' + entry.status, {className: 'dark-tooltip'});
+      historyDotsLayer.addLayer(m);
+    });
+  });
+}
+
 function updateTileDots(d) {
   if (!map || !tileDotsLayer) return;
   const kg = d.current_kg;
+  const currentKgCode = kg && kg.code;
   const tiles = kg && kg.tile_statuses;
+
+  // Detect KG transition: if the current KG changed, archive the previous one
+  if (_lastCurrentKgCode && _lastCurrentKgCode !== currentKgCode) {
+    // Previous KG is no longer current — check if it was completed or failed
+    // Look in failed_kgs list to determine status
+    const failedCodes = (d.failed_kgs || []).map(f => f.code);
+    const prevStatus = failedCodes.includes(_lastCurrentKgCode) ? 'failed' : 'completed';
+    // Only archive if we have tile data for it (from our snapshot)
+    if (_kgHistory[_lastCurrentKgCode] && _kgHistory[_lastCurrentKgCode]._snapshot) {
+      _kgHistory[_lastCurrentKgCode] = {
+        tiles: _kgHistory[_lastCurrentKgCode]._snapshot,
+        status: prevStatus
+      };
+    }
+    renderHistoryDots();
+  }
+
+  // Track current KG code
+  _lastCurrentKgCode = currentKgCode;
+
+  // If no current KG or no tiles, clear the active layer
   if (!tiles || !tiles.length) {
     tileDotsLayer.clearLayers();
     if (pulseMarker) { map.removeLayer(pulseMarker); pulseMarker = null; _lastPulseKey = null; }
     _tilesFitted = false;
     return;
   }
+
+  // Snapshot tile positions for the current KG (so we can archive them later)
+  if (currentKgCode) {
+    if (!_kgHistory[currentKgCode]) _kgHistory[currentKgCode] = {};
+    _kgHistory[currentKgCode]._snapshot = tiles.map(t => ({lat: t.lat, lng: t.lng}));
+  }
+
+  // Clear and redraw the current KG's active tile dots
   tileDotsLayer.clearLayers();
 
   // Detect if all tiles of the KG are done (none "current")
@@ -482,8 +548,7 @@ function updateTileDots(d) {
   });
 
   // Auto-fit map to tile bounds on first load or KG change
-  const kgCode = kg && kg.code;
-  if (kgCode !== _fittedKgCode) { _tilesFitted = false; _fittedKgCode = kgCode; }
+  if (currentKgCode !== _fittedKgCode) { _tilesFitted = false; _fittedKgCode = currentKgCode; }
   if (!_tilesFitted) {
     const lats = tiles.map(t => t.lat);
     const lngs = tiles.map(t => t.lng);
@@ -1022,7 +1087,7 @@ function renderLastKg(js) {
   items.push({l: 'SAR VH', v: sar.vh_mean_db != null ? sar.vh_mean_db.toFixed(1) + 'dB' : '\u2014'});
   items.push({l: 'Harm Mean', v: harm.mean_mean != null ? harm.mean_mean.toFixed(4) : '\u2014'});
   items.push({l: 'Harm Amp', v: harm.amplitude_mean != null ? harm.amplitude_mean.toFixed(4) : '\u2014'});
-  items.push({l: 'Temporal', v: temporal.events ? temporal.events.length + ' events' : '\u2014'});
+  items.push({l: 'Temporal', v: temporal.datasets_compared ? temporal.datasets_compared.length + ' dates, \u0394' + (temporal.dtm_change_mean_m||0).toFixed(3) + 'm' : '\u2014'});
   items.push({l: 'Hansen Loss', v: fmt(hansen.total_loss_pixels || 0) + ' px'});
   items.push({l: 'Dominant', v: landscape.dominant_type || '?'});
   items.push({l: 'Shannon', v: (landscape.shannon_diversity||0).toFixed(2)});
@@ -1042,7 +1107,7 @@ function renderLastKg(js) {
     {name:'Sentinel-2 NDVI', ok: !!(ndvi.copernicus_mean)},
     {name:'SAR', ok: !!(sar.vv_mean_db != null)},
     {name:'Harmonics', ok: !!(harm.mean_mean != null)},
-    {name:'Temporal', ok: !!(temporal.events && temporal.events.length > 0)},
+    {name:'Temporal', ok: !!(temporal.datasets_compared && temporal.datasets_compared.length > 1)},
     {name:'Hansen', ok: !!(hansen.total_loss_pixels != null || hansen.treecover2000 != null)},
     {name:'Cadastre', ok: !!(parcels.count > 0)},
     {name:'Phenology', ok: !!js.phenology && Object.keys(js.phenology).length > 0},

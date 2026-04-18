@@ -24,10 +24,10 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 ### Core
 | File | Lines | Purpose |
 |------|------:|----------|
-| `app.py` | 3223 | Flask API — all endpoints, async task system, progress tracking |
-| `static/index.html` | ~2100 | Single-file Leaflet UI (all JS/CSS inline) |
-| `object_segmentation.py` | 1939 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
-| `learned_classifier.py` | — | Random Forest classifier (44 features, cadastre-trained) |
+| `app.py` | ~5700 | Flask API — all endpoints, async task system, progress tracking |
+| `static/index.html` | ~3100 | Single-file Leaflet UI (all JS/CSS inline) |
+| `object_segmentation.py` | ~2200 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
+| `learned_classifier.py` | ~560 | Random Forest classifier (44 features, cadastre-trained) |
 
 ### Data I/O
 | File | Purpose |
@@ -230,6 +230,34 @@ sudo systemctl restart rf_train        # restart RF training
 tail -f /tmp/rf_train_4000kg.log       # training logs
 systemctl status rf_train srv          # check both services
 ```
+
+---
+
+## app.py Code Map (~5700 lines)
+
+All sections marked with `# === SECTION:` — use `grep -n '# ===' app.py`.
+
+| Marker | Key contents |
+|--------|---------------|
+| `Processing queue` | `_TASK_SEMAPHORE` (max 2 concurrent heavy tasks) |
+| `Async task system` | File-backed progress in `/tmp/segment_progress/`, result storage in `/tmp/segment_results/` |
+| `Austria Processor endpoints` | Proxy to processor state: start/stop/pause/resume/status/log/manifest |
+| `Geometry + parameter helpers` | `_get_geometry()`, `_get_params()`, `_validate_area()`, `_clean_polygon()` |
+| `/api/v1/elevation` | DTM elevation enrichment |
+| `/api/v1/terrain` | Terrain characterisation (slope, aspect, roughness) |
+| `/api/v1/segment` | **Main analysis endpoint** — async segmentation pipeline, `_segment_core()`, `_segment_worker()` |
+| `segment/overlay + raster rendering` | `_segment_rgba()`, `_render_seg_overlay()`, overlay cache |
+| `export/geopackage` | GPKG export with raster layers + vectors, async via `_gpkg_worker()` |
+| `export/kml` | KML export with grouping + styling |
+| `export/mbtiles` | MBTiles export (async) |
+| `/api/v1/changes` | Temporal change detection (multi-date DTM comparison) |
+| `LiDAR/ortho overlay + download` | DTM/DSM/ortho/CIR/Hansen tile overlays + GeoTIFF download |
+| `RF classifier training` | `/api/v1/classifier/train`, `/api/v1/classifier/status` |
+| `/api/v1/docs + share` | Docs endpoint, share save/load/rename/list |
+| `/api/v1/layers` | Layer availability check for a bbox |
+| `/api/v1/onestop` | Single-URL segment + download (queued) |
+| `/api/v1/parse-geometry` | Upload KML/GeoJSON/Shapefile/GPX/WKT |
+| `/api/v1/share` | Save/load/rename/list shares (`data/shares/`, 1GB cap, LRU) |
 
 ---
 

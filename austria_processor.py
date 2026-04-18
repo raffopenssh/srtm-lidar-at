@@ -1899,29 +1899,36 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
             _add_style('WorldCover', '', 'ESA WorldCover 2021', wc_qml,
                        'Land cover classes with official ESA colour scheme')
 
-        # --- Sentinel-1 SAR (VV+VH): grey ramp for radar backscatter (dB) ---
-        if 'SAR' in raster_tables:
-            sar_qml = (
+        # --- Sentinel-1 SAR VV: grey ramp for radar backscatter (dB) ---
+        if 'SAR_VV' in raster_tables:
+            vv_qml = (
                 '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
                 '<qgis version="3.34"><pipe>'
-                '<rasterrenderer type="multibandcolor" opacity="1" '
-                'redBand="1" greenBand="2" blueBand="1">'
-                '<redContrastEnhancement><minValue>-25</minValue>'
+                '<rasterrenderer type="singlebandgray" opacity="1" '
+                'grayBand="1">'
+                '<contrastEnhancement><minValue>-25</minValue>'
                 '<maxValue>0</maxValue>'
                 '<algorithm>StretchToMinimumMaximum</algorithm>'
-                '</redContrastEnhancement>'
-                '<greenContrastEnhancement><minValue>-30</minValue>'
-                '<maxValue>-5</maxValue>'
-                '<algorithm>StretchToMinimumMaximum</algorithm>'
-                '</greenContrastEnhancement>'
-                '<blueContrastEnhancement><minValue>-25</minValue>'
-                '<maxValue>0</maxValue>'
-                '<algorithm>StretchToMinimumMaximum</algorithm>'
-                '</blueContrastEnhancement>'
+                '</contrastEnhancement>'
                 '</rasterrenderer></pipe></qgis>'
             )
-            _add_style('SAR', '', 'SAR VV-VH composite', sar_qml,
-                       'Sentinel-1 SAR: Red/Blue=VV, Green=VH (stretched dB)')
+            _add_style('SAR_VV', '', 'SAR VV backscatter', vv_qml,
+                       'Sentinel-1 SAR VV polarisation (dB, -25 to 0)')
+        # --- Sentinel-1 SAR VH: grey ramp for radar backscatter (dB) ---
+        if 'SAR_VH' in raster_tables:
+            vh_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandgray" opacity="1" '
+                'grayBand="1">'
+                '<contrastEnhancement><minValue>-30</minValue>'
+                '<maxValue>-5</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</contrastEnhancement>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('SAR_VH', '', 'SAR VH backscatter', vh_qml,
+                       'Sentinel-1 SAR VH polarisation (dB, -30 to -5)')
 
         # --- Hansen tree cover 2000: green ramp 0-100% ---
         if 'Hansen_treecover' in raster_tables:
@@ -2995,9 +3002,11 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, rf_o
                         full_arr[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
                         any_sar = True
         if any_sar:
-            _write_table('SAR', [vv_full, vh_full], full_h, full_w, full_tf,
-                         descs=['Sentinel-1 VV (dB)', 'Sentinel-1 VH (dB)'])
-            log.info("  FULL_GPKG: SAR (VV+VH) written")
+            _write_table('SAR_VV', [vv_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-1 VV (dB)'])
+            _write_table('SAR_VH', [vh_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-1 VH (dB)'])
+            log.info("  FULL_GPKG: SAR_VV + SAR_VH written")
         del vv_full, vh_full
     except Exception as e:
         log.warning("FULL_GPKG: SAR layer failed: %s", e)

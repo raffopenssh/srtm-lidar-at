@@ -2122,7 +2122,7 @@ def _merge_boundary_segments(
     full_top: float,
     res: float,
     ndsm_full: np.ndarray | None = None,
-    rf_only: bool = False,
+    mark_uncertain: bool = False,
 ):
     """Merge compatible segments that touch across tile boundaries.
 
@@ -2552,7 +2552,7 @@ def _merge_boundary_segments(
 
 # === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
 
-def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, rf_only=False):
+def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=False):
     """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
     segment_height) covering the full KG bbox, plus unified segment vectors."""
     import rasterio
@@ -2720,7 +2720,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, rf_o
         _merge_boundary_segments(
             labels_full, seg_type_full, all_objects,
             tile_seg_results, full_left, full_top, res,
-            ndsm_full=ndsm_full, rf_only=rf_only)
+            ndsm_full=ndsm_full, mark_uncertain=mark_uncertain)
     except Exception as e:
         log.warning("Full GPKG boundary merge failed: %s", e)
 
@@ -3120,7 +3120,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, rf_o
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
-                           obs_year=0, rf_only=False):
+                           obs_year=0, mark_uncertain=False):
     """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
     import rasterio, fiona
     import rasterio.transform
@@ -3233,7 +3233,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             _merge_boundary_segments(
                 labels_full, seg_type_full, all_objects,
                 tile_seg_results, full_left, full_top, res,
-                rf_only=rf_only)
+                mark_uncertain=mark_uncertain)
         except Exception as e:
             log.warning("Light GPKG boundary merge failed: %s", e)
 
@@ -4404,7 +4404,7 @@ def _stitch_copernicus_subtiles(
 
 
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
-                   failed_tiles: dict = None, rf_only: bool = False) -> dict:
+                   failed_tiles: dict = None, mark_uncertain: bool = False) -> dict:
     """Process a single KG with tiled segmentation for full coverage.
 
     The full KG is divided into overlapping 1.5km tiles.  Each tile
@@ -5051,7 +5051,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     hansen=hansen_data,
                     observation_year=obs_year,
                     infra_lookup=infra,
-                    rf_only=rf_only,
+                    mark_uncertain=mark_uncertain,
                 )
             except Exception as e:
                 log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
@@ -5187,7 +5187,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
         full_gpkg = build_full_gpkg_tiled(
-            kg_code, tile_seg_results, all_objects, obs_year, rf_only=rf_only)
+            kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         result["files"]["full_gpkg"] = full_gpkg
 
         # --- 6. Build light GPKG ---
@@ -5196,7 +5196,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
-            obs_year=obs_year, rf_only=rf_only)
+            obs_year=obs_year, mark_uncertain=mark_uncertain)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 7. Build JSON summary ---
@@ -5767,8 +5767,8 @@ def main():
                         help="Skip Copernicus data (faster)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List KGs without processing")
-    parser.add_argument("--rf-only", action="store_true",
-                        help="Only emit RF classes; low-confidence segments become 'unclassified'")
+    parser.add_argument("--mark-uncertain", action="store_true",
+                        help="Label low-confidence RF segments as 'unclassified' instead of rule-based fallback")
     args = parser.parse_args()
 
     try:
@@ -5949,7 +5949,7 @@ def main():
 
     t_start = time.time()
     include_cop = not args.no_copernicus
-    rf_only = args.rf_only
+    mark_uncertain = args.mark_uncertain
 
     for i, kg in enumerate(pending):
         # --- Check graceful shutdown ---
@@ -6137,7 +6137,7 @@ def main():
                         process_one_kg, args=(kg,),
                         kwds={"include_copernicus": use_cop,
                               "failed_tiles": failed_tiles if failed_tiles else None,
-                              "rf_only": rf_only})
+                              "mark_uncertain": mark_uncertain})
                     try:
                         result = async_result.get(timeout=timeout)
                         break  # success — exit retry loop

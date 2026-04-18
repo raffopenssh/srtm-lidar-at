@@ -75,7 +75,7 @@ OBJECT_TYPES = {
     "tree_loss": 52,     # logging/timber harvest: was tall, now ground, terrain intact
     "construction": 53,  # new structure, or site clearing (tree_loss + earthworks)
     "earthwork": 54,      # merged excavation+fill (RF training only; split back at inference)
-    "unclassified": 99,   # RF confidence too low (rf_only mode)
+    "unclassified": 99,   # RF confidence too low (mark_uncertain mode)
 }
 
 # Group types (merge adjacent compatible individuals)
@@ -1794,18 +1794,17 @@ def segment_and_classify(
     observation_year: int | None = None,
     features_only: bool = False,
     infra_lookup=None,
-    rf_only: bool = False,
+    mark_uncertain: bool = False,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
 
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
 
-    If rf_only=True, the RF's best prediction is always accepted regardless
-    of confidence — only segments with no RF prediction at all become
-    'unclassified'.  Rule-based fallback is skipped.  Infrastructure
-    detection (wind_turbine, solar_panel, substation, mast) still runs
-    because those classes are excluded from RF training.
+    If mark_uncertain=True, segments with RF confidence below 0.15 are
+    labelled 'unclassified' (deep uncertainty).  Segments between 0.15
+    and the confidence threshold still fall back to rule-based.
+    Infrastructure detection still runs regardless.
 
     Parameters
     ----------
@@ -1936,7 +1935,7 @@ def segment_and_classify(
             _w.simplefilter("ignore", UserWarning)
             rf_results = classify_with_rf_batch(
                 features, has_spectral=has_spectral,
-                rf_only=rf_only,
+                mark_uncertain=mark_uncertain,
             )
         log.info("Step 4: RF batch classified %d segments", len(rf_results))
 
@@ -1968,8 +1967,8 @@ def segment_and_classify(
                 )
                 if _infra_result is not None:
                     type_name, type_code, conf, is_mm = _infra_result
-        elif rf_only:
-            # rf_only mode: no rule-based fallback, but still check infrastructure
+        elif mark_uncertain:
+            # mark_uncertain mode: no rule-based fallback, but still check infrastructure
             type_name, type_code, conf, is_mm = "unclassified", OBJECT_TYPES["unclassified"], 0.0, False
             if _nearby:
                 _infra_result = _classify_infrastructure(

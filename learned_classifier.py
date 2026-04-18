@@ -514,23 +514,24 @@ def classify_with_rf_batch(
     *,
     has_spectral: bool = False,
     min_confidence: float = 0.4,
-    rf_only: bool = False,
+    mark_uncertain: bool = False,
 ) -> dict[int, tuple[str, int, float, bool]]:
     """Batch-classify segments with RF, falling back to rules per-segment.
 
     Returns dict mapping label -> (type_name, type_code, confidence, is_manmade).
     Uses predict_batch for a single RF call instead of per-segment calls.
 
-    If *rf_only* is True, the RF's best prediction is always accepted
-    regardless of confidence (only 'unclassified' if RF returns no prediction).
-    When rf_only is False, segments below *min_confidence* fall back to rules.
+    If *mark_uncertain* is True, segments with RF confidence below 0.15 are
+    labelled 'unclassified' (the RF has no real signal).  Segments between
+    0.15 and *min_confidence* still fall back to rule-based classification.
+    This makes deep uncertainty visible without losing rule-based coverage.
     """
     from object_segmentation import OBJECT_TYPES, classify_object
 
     results = {}
     clf = get_classifier()
     if not clf.is_trained or not features:
-        if rf_only:
+        if mark_uncertain:
             # No trained model — everything is unclassified
             uc_code = OBJECT_TYPES.get("unclassified", 99)
             for feat in features:
@@ -562,23 +563,15 @@ def classify_with_rf_batch(
                 code = OBJECT_TYPES[pred]
                 is_mm = pred in MANMADE_TYPES
                 results[feat["label"]] = (pred, code, conf, is_mm)
-            elif rf_only:
-                results[feat["label"]] = ("unclassified", uc_code, conf, False)
             else:
-                results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
-        elif rf_only:
-            # rf_only: accept RF's best prediction even at low confidence —
-            # the model's top class is still more informative than 'unclassified'.
-            # Only fall back to unclassified if RF returned no prediction at all.
-            if pred and pred in OBJECT_TYPES:
-                if pred == "earthwork":
-                    dtm_ch = feat.get("dtm_change", 0.0)
-                    pred = "excavation" if dtm_ch < 0 else "fill"
-                code = OBJECT_TYPES[pred]
-                is_mm = pred in MANMADE_TYPES
-                results[feat["label"]] = (pred, code, conf, is_mm)
-            else:
-                results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
+                # Unknown type from RF — mark unclassified or fall back
+                if mark_uncertain:
+                    results[feat["label"]] = ("unclassified", uc_code, conf, False)
+                else:
+                    results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
+        elif mark_uncertain and (conf or 0) < 0.15:
+            # Very low confidence → unclassified (RF has no real signal)
+            results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
         else:
             # Fall back to rule-based for low-confidence predictions
             results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)

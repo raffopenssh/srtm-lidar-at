@@ -569,8 +569,10 @@ def classify_with_rf_batch(
                     results[feat["label"]] = ("unclassified", uc_code, conf, False)
                 else:
                     results[feat["label"]] = classify_object(feat, has_spectral=has_spectral)
-        elif mark_uncertain and (conf or 0) < 0.15:
-            # Very low confidence → unclassified (RF has no real signal)
+        elif mark_uncertain and (conf or 0) < 0.15 and feat.get("area", 0) < 1000:
+            # Very low confidence on a small segment → unclassified.
+            # Large segments (>=1000m²) always get rule-based fallback because
+            # a huge unclassified blob is uninformative.
             results[feat["label"]] = ("unclassified", uc_code, conf if conf else 0.0, False)
         else:
             # Fall back to rule-based for low-confidence predictions

@@ -2110,6 +2110,199 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
             log.warning("FULL_GPKG: ortho year %d failed: %s", o_year, e)
 
     # ------------------------------------------------------------------
+    # Copernicus NDVI (10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        ndvi_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        any_ndvi = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+            if nd and nd.get("ndvi") is not None:
+                from rasterio.warp import reproject, Resampling
+                src_arr = nd["ndvi"].astype(np.float32)
+                src_tf = nd["transform"]
+                src_crs = nd.get("crs", "EPSG:4326")
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                dst_arr = np.full((th_t, tw_t2), np.nan, dtype=np.float32)
+                reproject(
+                    src_arr, dst_arr,
+                    src_transform=src_tf, src_crs=src_crs,
+                    dst_transform=dst_tf, dst_crs='EPSG:3035',
+                    resampling=Resampling.bilinear,
+                )
+                ndvi_full[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                any_ndvi = True
+        if any_ndvi:
+            _write_table('NDVI', [ndvi_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-2 NDVI composite'])
+            log.info("  FULL_GPKG: NDVI written")
+        del ndvi_full
+    except Exception as e:
+        log.warning("FULL_GPKG: NDVI layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # ESA WorldCover (10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        wc_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        any_wc = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            lc = cop_cache.get_landcover(bbox_dict)
+            if lc and lc.get("map") is not None:
+                from rasterio.warp import reproject, Resampling
+                src_arr = lc["map"].astype(np.uint8)
+                src_tf = lc["transform"]
+                src_crs = lc.get("crs", "EPSG:4326")
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                dst_arr = np.zeros((th_t, tw_t2), dtype=np.uint8)
+                reproject(
+                    src_arr, dst_arr,
+                    src_transform=src_tf, src_crs=src_crs,
+                    dst_transform=dst_tf, dst_crs='EPSG:3035',
+                    resampling=Resampling.nearest,
+                )
+                wc_full[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                any_wc = True
+        if any_wc:
+            _write_table('WorldCover', [wc_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['ESA WorldCover 2021 class'])
+            log.info("  FULL_GPKG: WorldCover written")
+        del wc_full
+    except Exception as e:
+        log.warning("FULL_GPKG: WorldCover layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Sentinel-1 SAR (VV + VH, 10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        vv_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        vh_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        any_sar = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            sar = cop_cache.get_sar(bbox_dict, year=obs_year)
+            if sar:
+                from rasterio.warp import reproject, Resampling
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                src_tf = sar["transform"]
+                src_crs = sar.get("crs", "EPSG:4326")
+                for band_name, full_arr in [("vv", vv_full), ("vh", vh_full)]:
+                    src_arr = sar.get(band_name)
+                    if src_arr is not None:
+                        src_arr = src_arr.astype(np.float32)
+                        dst_arr = np.full((th_t, tw_t2), np.nan, dtype=np.float32)
+                        reproject(
+                            src_arr, dst_arr,
+                            src_transform=src_tf, src_crs=src_crs,
+                            dst_transform=dst_tf, dst_crs='EPSG:3035',
+                            resampling=Resampling.bilinear,
+                        )
+                        full_arr[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                        any_sar = True
+        if any_sar:
+            _write_table('SAR', [vv_full, vh_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-1 VV (dB)', 'Sentinel-1 VH (dB)'])
+            log.info("  FULL_GPKG: SAR (VV+VH) written")
+        del vv_full, vh_full
+    except Exception as e:
+        log.warning("FULL_GPKG: SAR layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Hansen Global Forest Change (30m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        hc = _get_hansen_cache()
+        tc_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        ly_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        any_hansen = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            th_t, tw_t2 = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th_t, full_h)
+            c_end = min(col_off + tw_t2, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+            dst_tf = rasterio.transform.from_bounds(
+                tile_left, tr["bounds_3035"][1],
+                tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+            hd = hc.get_forest_prior(
+                (tw_t, ts_t, te_t, tn_t), dst_tf, (th_t, tw_t2))
+            if hd:
+                tc = hd.get("treecover2000")
+                ly = hd.get("loss_year")
+                if tc is not None:
+                    tc_full[row_off:r_end, col_off:c_end] = tc[:th_eff, :tw_eff]
+                    any_hansen = True
+                if ly is not None:
+                    ly_full[row_off:r_end, col_off:c_end] = ly[:th_eff, :tw_eff]
+        if any_hansen:
+            _write_table('Hansen_treecover', [tc_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['Tree cover 2000 (%)'])
+            _write_table('Hansen_lossyear', [ly_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['Forest loss year (0=none, 1=2001, ..., 23=2023)'])
+            log.info("  FULL_GPKG: Hansen (treecover + lossyear) written")
+        del tc_full, ly_full
+    except Exception as e:
+        log.warning("FULL_GPKG: Hansen layer failed: %s", e)
+
+    # ------------------------------------------------------------------
     # Segment vectors — one unified layer from stitched labels
     # ------------------------------------------------------------------
     if all_objects and tile_seg_results:
@@ -3405,7 +3598,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 _tile_entry["status"] = "done"
                 _tile_entry["issues"] = {
                     k: ("ok" if _tile_avail.get(k) else "miss")
-                    for k in ["lidar", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+                    for k in ["dtm", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
                 }
                 _tile_entry["n_objects"] = len(cached_tile.get("core_objects", []))
                 continue
@@ -3823,7 +4016,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _tile_entry["status"] = "done"
             _tile_entry["issues"] = {
                 k: ("ok" if tile_avail.get(k) else "miss")
-                for k in ["lidar", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+                for k in ["dtm", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
             }
             _tile_entry["n_objects"] = len(core_objects)
             _report_step(f"tile_{tile_idx+1}",

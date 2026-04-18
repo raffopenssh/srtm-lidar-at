@@ -503,7 +503,7 @@ function updateTileDots(d) {
         col = '#3fb950'; opacity = 0.9;
       } else {
         const iss = t.issues || {};
-        const layers = ['lidar','ortho','copernicus_ndvi','worldcover','sar','hansen'];
+        const layers = ['dtm','ortho','copernicus_ndvi','worldcover','sar','hansen'];
         const ok = layers.filter(l => iss[l] === 'ok').length;
         const pct = ok / layers.length;
         if (pct >= 0.8) col = '#3fb950';

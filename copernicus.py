@@ -858,13 +858,25 @@ def get_ndvi_timeseries(
                     )
                     return label, exc
 
-                # --- Handle 429 / 503 with backoff ---
-                if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt < max_retries:
-                    wait_secs = 10 * (attempt + 1)
+                # --- Handle 429 / 500 / 503 with backoff ---
+                _retryable = (
+                    "429" in exc_str
+                    or "500" in exc_str
+                    or "503" in exc_str
+                    or "Internal" in exc_str
+                    or "Server error" in exc_str
+                    or "max connections" in exc_str
+                )
+                if _retryable and attempt < max_retries:
+                    wait_secs = 15 * (attempt + 1)
+                    _reason = (
+                        '429' if '429' in exc_str
+                        else '500' if ('500' in exc_str or 'Internal' in exc_str or 'Server error' in exc_str)
+                        else '503'
+                    )
                     logger.warning(
-                        "NDVI %s: rate limited (%s), retry %d/%d in %ds...",
-                        label,
-                        '429' if '429' in exc_str else '503',
+                        "NDVI %s: server error (%s), retry %d/%d in %ds...",
+                        label, _reason,
                         attempt + 1, max_retries, wait_secs,
                     )
                     _time.sleep(wait_secs)

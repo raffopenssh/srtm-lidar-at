@@ -29,6 +29,11 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 | `object_segmentation.py` | ~2200 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
 | `learned_classifier.py` | ~560 | Random Forest classifier (44 features, cadastre-trained) |
 
+### Search Index
+| File | Purpose |
+|------|----------|
+| `search_index.py` | SQLite FTS5 + R-tree index over all 8440 KGs. Spatial/text/admin/aggregate queries <25ms. Auto-rebuilds on new JSONs. |
+
 ### Data I/O
 | File | Purpose |
 |------|----------|
@@ -132,6 +137,22 @@ Contain: UI state + analysis result + cached overlay images.
 | POST | `/api/v1/classifier/train` | Train RF on a bbox |
 | GET | `/api/v1/classifier/status` | RF model status |
 | GET | `/api/v1/training/status` | Background RF training progress |
+
+### Search Index
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/index/status` | Index statistics (kg_count, processed, area, zenodo) |
+| POST | `/api/v1/index/rebuild` | Rebuild index (~0.3s) |
+| GET | `/api/v1/query` | Unified query — text/spatial/admin/type/hansen/buildings |
+| GET | `/api/v1/kg/<code>` | KG JSON or index data with Zenodo links |
+| GET | `/api/v1/parcel/<id>` | Parcel lookup via index + local JSON |
+
+`/api/v1/query` params: `q=`, `kg=`, `parcel=`, `bbox=w,s,e,n`, `point=lon,lat`,
+`state=`, `district=`, `gemeinde=`, `type=`, `hansen=true`, `new_buildings=true`,
+`aggregate=true`, `processed_only=true`, `limit=`, `offset=`
+
+Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
+Auto-rebuilt on startup and when new KG JSONs appear.
 
 ## Frontend (static/index.html)
 

@@ -231,6 +231,59 @@ tail -f /tmp/rf_train_4000kg.log       # training logs
 systemctl status rf_train srv          # check both services
 ```
 
+### Cross-Cutting Concerns (things that span multiple files)
+
+These are the dangerous changes — they touch many files and are easy to break.
+
+**Adding/changing an object type:**
+1. `object_segmentation.py` → `OBJECT_TYPES` dict (canonical type→code mapping)
+2. `object_segmentation.py` → `GROUP_TYPES` dict (if it belongs to a group)
+3. `object_segmentation.py` → `classify_object()` (rule-based classification logic)
+4. `app.py` → `SEGMENT_COLORS` dict (RGBA for overlays/exports)
+5. `austria_processor.py` → `SEGMENT_COLORS` dict (**duplicate** of app.py's — must match)
+6. `static/index.html` → JS `TYPE_COLORS` object (RGB for frontend legend — must match)
+7. `learned_classifier.py` → `CADASTRE_TO_TYPE` (if cadastre has a matching land-use code)
+
+**Adding/changing an RF feature:**
+1. `learned_classifier.py` → `FEATURE_KEYS` list (canonical feature order, currently 57 keys)
+2. `object_segmentation.py` → `extract_object_features()` (must populate the new key in feat dict)
+3. Retrain the model: existing `.joblib` files become incompatible if feature count changes
+
+**Changing the Copernicus credential set:**
+1. `copernicus.py` → `_CREDENTIALS` list
+2. Delete `data/austria_processor/copernicus_paused` if it exists
+3. Optionally reset circuit breaker: delete `data/austria_processor/openeo_circuit.json`
+
+**Changing tile grid / overlap:**
+1. `austria_processor.py` → `_compute_tile_grid()` (tile_km, overlap_km params)
+2. `tile_cache.py` → grid sizes per source (0.1° Copernicus, 0.5° Hansen)
+3. Invalidate tile checkpoints: `rm -rf data/austria_processor/tile_checkpoints/`
+
+### Navigation Cheatsheet
+
+```bash
+# Find any section in any file
+grep -rn '# === SECTION' *.py
+
+# Find a section in a specific file
+grep -n '# ===' austria_processor.py
+
+# Find all files that reference a type/feature/color
+grep -rl 'SEGMENT_COLORS' *.py static/*.html
+
+# Find where a function is defined
+grep -n 'def process_one_kg' *.py
+
+# Find the RF feature list
+grep -A60 'FEATURE_KEYS = \[' learned_classifier.py
+
+# Check which processor step is running
+cat data/austria_processor/current_step.json | python3 -m json.tool
+
+# Full project section index
+grep -rn '# ===' *.py | sed 's/# === SECTION: //' | sed 's/ ===//' | column -t -s:
+```
+
 ---
 
 ## app.py Code Map (~5700 lines)

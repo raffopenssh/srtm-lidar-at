@@ -76,8 +76,13 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
 .geo-drop-overlay{display:none;position:absolute;inset:0;background:rgba(13,115,119,.12);border:2px dashed #0d7377;border-radius:6px;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#0d7377;pointer-events:none;z-index:2}
 .geo-input-wrap.dragover .geo-drop-overlay{display:flex}
 /* Load dropdown */
-.load-dropdown{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:340px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:9999;max-height:320px;overflow-y:auto;-webkit-overflow-scrolling:touch}
-.load-dropdown.open{display:block}
+.load-dropdown{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:340px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:9999;max-height:380px;overflow:hidden;display:none;flex-direction:column}
+.load-dropdown.open{display:flex}
+.ld-search-wrap{padding:8px 10px 6px;border-bottom:1px solid #eee;flex-shrink:0;position:sticky;top:0;background:#fff;z-index:1;border-radius:8px 8px 0 0}
+.ld-search{width:100%;padding:6px 10px 6px 28px;border:1px solid #ddd;border-radius:6px;font-size:12px;outline:none;background:#fafafa url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E") 8px center no-repeat;transition:border-color .15s}
+.ld-search:focus{border-color:#0d7377;background-color:#fff}
+.ld-search::placeholder{color:#bbb}
+.ld-scroll{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1}
 .load-dropdown .ld-empty{padding:16px;text-align:center;color:#999;font-size:12px}
 .load-dropdown .ld-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;transition:background .1s;border-bottom:1px solid #f0f0f0}
 .load-dropdown .ld-item:last-child{border-bottom:none}
@@ -2377,61 +2382,81 @@ document.getElementById('geo-input').addEventListener('click',(e)=>{
 
 // ============ LOAD DROPDOWN ============
 let _loadDropOpen=false;
+let _ldAllShares=[];  // cached share list for filtering
 const _loadBtn=document.getElementById('btn-load');
 const _loadDrop=document.getElementById('load-dropdown');
 
+function _ldItemHtml(s){
+  const name=s.name||s.id;
+  const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
+  const desc=s.description||'saved share';
+  const ago=_timeAgo(s.updated);
+  const dlIcon=s.onestop?`<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>`:'';
+  return `<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
+}
+function _isNamedShare(s){return !s.id.startsWith('auto-')&&!/^[0-9a-f]{12}$/.test(s.id)&&s.size_kb>1;}
+function _renderShareItems(shares,query){
+  const q=(query||'').toLowerCase().trim();
+  const words=q?q.split(/\s+/):[];
+  const match=s=>{
+    if(!words.length)return true;
+    const hay=((s.name||'')+' '+(s.id||'')+' '+(s.description||'')).toLowerCase();
+    return words.every(w=>hay.includes(w));
+  };
+  const named=shares.filter(s=>_isNamedShare(s));
+  const auto=shares.filter(s=>!_isNamedShare(s));
+  const fNamed=named.filter(match),fAuto=auto.filter(match);
+  let sh='';
+  if(!q||'sample kohlschwarz forest'.includes(q)){
+    sh+='<div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>';
+    sh+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
+  }
+  if(fNamed.length){
+    sh+='<div class="ld-section">Saved</div>';
+    for(const s of fNamed) sh+=_ldItemHtml(s);
+  }
+  const showAuto=q?fAuto:fAuto.slice(0,10);
+  if(showAuto.length){
+    sh+='<div class="ld-section">Recent</div>';
+    for(const s of showAuto) sh+=_ldItemHtml(s);
+  }
+  if(!sh) sh='<div class="ld-empty">No matches</div>';
+  return sh;
+}
 _loadBtn.onclick=async()=>{
   if(_loadDropOpen){_closeLoadDrop();return;}
-  // Show sample + upload button immediately, load shares in background
-  let html='<div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>';
-  html+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
-  html+='<div id="ld-shares-area"><div class="ld-empty">Loading shares\u2026</div></div>';
-  _loadDrop.innerHTML=html;
+  _loadDrop.innerHTML=
+    '<div class="ld-search-wrap"><input class="ld-search" id="ld-search" type="text" placeholder="Search shares\u2026" autocomplete="off"></div>'+
+    '<div class="ld-scroll" id="ld-scroll"><div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>'+
+    '<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>'+
+    '<div id="ld-shares-area"><div class="ld-empty">Loading shares\u2026</div></div></div>';
   _attachLoadHandlers();
   _loadDrop.classList.add('open');
   _loadDropOpen=true;
-  // Fetch shares with timeout
+  const searchInput=document.getElementById('ld-search');
+  searchInput.addEventListener('input',()=>{
+    const scroll=document.getElementById('ld-scroll');
+    if(!scroll||!_ldAllShares.length)return;
+    scroll.innerHTML=_renderShareItems(_ldAllShares,searchInput.value);
+    _attachLoadHandlers();
+  });
+  searchInput.addEventListener('click',e=>e.stopPropagation());
+  searchInput.addEventListener('keydown',e=>{if(e.key==='Escape'){_closeLoadDrop();e.preventDefault();}});
+  setTimeout(()=>searchInput.focus(),50);
   const ac=new AbortController();
   const tid=setTimeout(()=>ac.abort(),5000);
   try{
-    const resp=await fetch('/api/v1/shares?limit=30',{signal:ac.signal});
+    const resp=await fetch('/api/v1/shares?limit=50',{signal:ac.signal});
     clearTimeout(tid);
-    const shares=await resp.json();
-    const area=document.getElementById('ld-shares-area');
-    if(!area)return;
-    if(shares.length){
-      // Split into named (user-renamed) vs auto-saves
-      const named=shares.filter(s=>!s.id.startsWith('auto-')&&!/^[0-9a-f]{12}$/.test(s.id)&&s.size_kb>1);
-      const auto=shares.filter(s=>!named.includes(s));
-      let sh='';
-      if(named.length){
-        sh+='<div class="ld-section">Saved</div>';
-        for(const s of named){
-          const name=s.name||s.id;
-          const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
-          const desc=s.description||'saved share';
-          const ago=_timeAgo(s.updated);
-          const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
-          sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
-        }
-      }
-      if(auto.length){
-        sh+='<div class="ld-section">Recent</div>';
-        for(const s of auto.slice(0,10)){
-          const name=s.name||s.id;
-          const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
-          const desc=s.description||'saved share';
-          const ago=_timeAgo(s.updated);
-          const dlIcon = s.onestop ? `<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>` : '';
-          sh+=`<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
-        }
-      }
-      area.innerHTML=sh;
-    } else { area.innerHTML=''; }
+    _ldAllShares=await resp.json();
+    const scroll=document.getElementById('ld-scroll');
+    if(!scroll)return;
+    const q=document.getElementById('ld-search')?.value||'';
+    scroll.innerHTML=_renderShareItems(_ldAllShares,q);
     _attachLoadHandlers();
   }catch(e){
     clearTimeout(tid);
-    const area=document.getElementById('ld-shares-area');
+    const area=document.getElementById('ld-shares-area')||document.getElementById('ld-scroll');
     if(area) area.innerHTML=e.name==='AbortError'?'':'<div class="ld-empty">Failed to load shares</div>';
   }
 };

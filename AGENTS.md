@@ -395,10 +395,10 @@ main()                           ← parent process, iterates KGs
    thread (`_monitor_step_file`) polls this every 2s and feeds it into
    `ProgressTracker` → `progress.json` → dashboard API → `process.html`.
 
-5. **Retry ladder**: On timeout (30min initial, 90min retry), the parent
-   identifies which tile timed out and re-runs with smaller sub-tiles:
-   `SUB_TILE_LADDER = [0.5, 0.2]` km. Each tile steps through the ladder
-   independently. Exhausted tiles → permanent failure.
+5. **Retry**: On timeout (90min), the parent retries once with the same
+   tile grid — checkpoints restore completed tiles, only the interrupted
+   tile is re-processed. Copernicus handles its own failures internally
+   via `_quadrant_split()` (2×2 then 4×4). Tile grid is **never** subdivided.
 
 6. **Grid-snapped caches**: Remote data (Copernicus, Hansen) is cached in a
    regular grid so adjacent KGs share cached tiles. See `tile_cache.py`.
@@ -499,19 +499,70 @@ grep -i "warning\|error\|failed" data/austria_processor/logs/processor.log | tai
 # --- Status ---
 curl -s http://localhost:8000/api/v1/processing/status | python3 -m json.tool
 
-# --- Restart (SIGKILL needed — graceful stop waits for current tile) ---
-sudo systemctl kill -s SIGKILL austria_processor && sleep 2 && sudo systemctl start austria_processor
+# --- Restart ---
+sudo systemctl stop austria_processor && sudo systemctl start austria_processor
 
 # --- Dashboard ---
 # https://srtm-lidar-at.exe.xyz:8000/process.html
 ```
+
+### Re-processing a KG (after bad output or code fix)
+
+```bash
+# 1. Stop processor
+sudo systemctl stop austria_processor
+
+# 2. Delete Zenodo draft depositions (get depo_ids from manifest)
+python3 -c "
+import json, requests
+TOKEN = '...'  # from austria_processor.py line 48
+m = json.load(open('data/austria_processor/zenodo_manifest.json'))
+entries = m.get('entries', m)
+for k in list(entries.keys()):
+    if 'KGCODE' in k:
+        requests.delete(f'https://zenodo.org/api/deposit/depositions/{entries[k][\"depo_id\"]}',
+                       params={'access_token': TOKEN})
+        del entries[k]
+json.dump(m, open('data/austria_processor/zenodo_manifest.json', 'w'), indent=2)
+"
+
+# 3. Remove local JSON + tile history
+rm -f data/austria_processor/json/KGCODE.json
+python3 -c "
+import json
+f = 'data/austria_processor/tile_history.json'
+d = json.load(open(f))
+d.pop('KGCODE', None)
+json.dump(d, open(f, 'w'))
+"
+
+# 4. Clear search index entry
+python3 -c "
+import sqlite3
+db = sqlite3.connect('data/search_index.db')
+db.execute('UPDATE kg SET processed=0, zenodo_json_url=NULL, zenodo_json_size=NULL, zenodo_light_gpkg_url=NULL, zenodo_light_gpkg_size=NULL, zenodo_full_gpkg_url=NULL, zenodo_full_gpkg_size=NULL, zenodo_depo_id=NULL WHERE kg_code=?', ('KGCODE',))
+db.execute('DELETE FROM kg_landcover WHERE kg_code=?', ('KGCODE',))
+db.execute('DELETE FROM kg_hansen WHERE kg_code=?', ('KGCODE',))
+db.commit()
+"
+
+# 5. Remove tile checkpoints if they exist
+rm -rf data/austria_processor/tile_checkpoints/KGCODE/
+
+# 6. Restart — KG will appear in pending queue
+sudo systemctl start austria_processor
+```
+
+Replace `KGCODE` with the KG code (e.g. `91109`). Depositions must be
+unpublished (draft) to delete via API. The KG will be re-queued via
+nearest-neighbor ordering relative to the last completed KG.
 
 ### Common Failure Modes & Fixes
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `copernicus: credits exhausted` | All openEO credentials used up | Update `_CREDENTIALS` in `copernicus.py`, delete `data/austria_processor/copernicus_paused` |
-| Timeout on large KG | Tile too complex (dense forest) | Automatic: retry ladder shrinks tile to 0.5→0.2km |
+| Timeout on large KG | Copernicus slow (NDVI downloads) | Automatic: retry once with checkpoints, Copernicus uses quadrant split internally |
 | OOM kill | KG exceeds 3GB MemoryMax | Automatic: systemd restarts, tile checkpoints preserved |
 | `Synchronous download timed out` | Normal Copernicus behavior | No action — falls back to batch job automatically |
 | `Hansen resample failed` | No Hansen data (western Vorarlberg) | Non-fatal, skipped. Hansen data sparse at AT borders |
@@ -567,7 +618,7 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | BEV data read failure | `raster_io.py` → `bev_retry.py` (exponential backoff + proxy rotation) |
 | Zenodo upload failure | `main()` ~line 4900, calls `zenodo_client.py` |
 | Dashboard not updating | `app.py` `/api/v1/processing/status` reads `progress.json`; check parent thread alive |
-| Retry ladder not working | `main()` ~line 4785, `SUB_TILE_LADDER`, `_tile_ladder_pos` dict |
+| Copernicus quadrant fallback | `_quadrant_split()` ~line 4132, called from `_fetch_copernicus_for_tile()` |
 
 
 ### Planned Refactor (next maintenance window)
@@ -579,7 +630,7 @@ Detailed prompt in `data/next-prompt.md`. Requires stopping the processor.
 - Fixes: `_height_class()` has already diverged between the two copies.
 
 **Step 2 — Split `austria_processor.py`** (stop processor first):
-- `austria_processor.py` (~2000L) — orchestration: `main()`, `process_one_kg()`, retry ladder, Zenodo upload
+- `austria_processor.py` (~2000L) — orchestration: `main()`, `process_one_kg()`, retry logic, Zenodo upload
 - `kg_builders.py` (~1800L) — `build_full_gpkg_tiled()`, `build_light_gpkg_tiled()`, `build_json_summary_tiled()`, GPKG style/vector writers
 - `kg_enrichment.py` (~800L) — `fetch_cadastre_data()`, height enrichment, vectorisation, edge-clip resolution
 

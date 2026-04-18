@@ -2488,21 +2488,36 @@ def _merge_boundary_segments(
 
         new_type = None
         new_conf = survivor.confidence
+        _has_spec = bool(survivor.ndvi_mean)
         if rf and rf.model is not None:
             try:
-                new_type, new_conf = rf.predict(feat)
+                _pred, _conf = rf.predict(feat)
+                if _pred and _conf >= 0.4:
+                    # Post-split: earthwork → excavation or fill
+                    if _pred == "earthwork":
+                        dtm_ch = feat.get("dtm_change", 0.0)
+                        _pred = "excavation" if dtm_ch < 0 else "fill"
+                    new_type = _pred
+                    new_conf = _conf
+                elif mark_uncertain and (_conf or 0) < 0.15 \
+                        and survivor.area_sqm < 1000:
+                    new_type = 'unclassified'
+                    new_conf = _conf if _conf else 0.0
+                else:
+                    # Low-confidence RF → rule-based fallback
+                    new_type = None
             except Exception:
                 pass
         if new_type is None:
             try:
                 new_type, _, new_conf, _ = classify_object(
-                    feat, has_spectral=bool(survivor.ndvi_mean))
+                    feat, has_spectral=_has_spec)
             except Exception:
                 new_type = None
 
         # Anchor-weak: if the re-classified type is also implausible
         # for the anchor count, mark as unclassified.
-        if anchor_weak and new_type:
+        if anchor_weak and new_type and new_type != 'unclassified':
             new_max = _ANCHOR_MAX_AREA.get(new_type, 10000)
             new_area_per = survivor.area_sqm / n_anchors
             if new_area_per > new_max:

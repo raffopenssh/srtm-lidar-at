@@ -468,7 +468,7 @@ def classify_with_rf(
     *,
     fallback_fn=None,
     has_spectral: bool = False,
-    min_confidence: float = 0.2,
+    min_confidence: float = 0.4,
 ) -> tuple[str, int, float, bool]:
     """Classify segment: try RF first, fall back to rules.
 
@@ -513,7 +513,7 @@ def classify_with_rf_batch(
     features: list[dict],
     *,
     has_spectral: bool = False,
-    min_confidence: float = 0.2,
+    min_confidence: float = 0.4,
     rf_only: bool = False,
 ) -> dict[int, tuple[str, int, float, bool]]:
     """Batch-classify segments with RF, falling back to rules per-segment.

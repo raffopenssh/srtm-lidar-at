@@ -207,6 +207,7 @@ def fit_harmonics_image(
 def get_harmonic_features(
     bbox_wgs84: dict,
     year: int = 2023,
+    progress_fn=None,
 ) -> Optional[dict[str, np.ndarray]]:
     """Fetch NDVI time series and compute harmonic parameters.
 
@@ -229,7 +230,8 @@ def get_harmonic_features(
     try:
         start = f"{year}-01-01"
         end = f"{year}-12-31"
-        ts = copernicus.get_ndvi_timeseries(bbox_wgs84, start, end)
+        ts = copernicus.get_ndvi_timeseries(bbox_wgs84, start, end,
+                                              progress_fn=progress_fn)
         monthly = ts.get("monthly_ndvi", {})
         if len(monthly) < 4:
             log.warning("Only %d months of NDVI, need >= 4", len(monthly))

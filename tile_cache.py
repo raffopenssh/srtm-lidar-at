@@ -397,7 +397,8 @@ class CopernicusTileCache:
         return None
 
     def get_harmonics(self, bbox_wgs: dict, year: int = 2024,
-                      cred_index: int = None) -> Optional[dict]:
+                      cred_index: int = None,
+                      progress_fn=None) -> Optional[dict]:
         """Get NDVI harmonic features, grid-snapped.
 
         Fetches monthly NDVI time series and computes harmonic fit
@@ -431,7 +432,8 @@ class CopernicusTileCache:
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
                 import ndvi_harmonics
-                result = ndvi_harmonics.get_harmonic_features(tile_bbox, year)
+                result = ndvi_harmonics.get_harmonic_features(
+                    tile_bbox, year, progress_fn=progress_fn)
                 if result is None:
                     self._stats["errors"] += 1
                     return None

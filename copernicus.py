@@ -670,6 +670,7 @@ def get_ndvi_timeseries(
     bbox_wgs84: Dict[str, float],
     start_date: str,
     end_date: str,
+    progress_fn: Any = None,
 ) -> Dict[str, Any]:
     """Fetch monthly NDVI aggregates over a period.
 
@@ -889,16 +890,30 @@ def get_ndvi_timeseries(
 
     if to_download:
         import time as _time
+        n_total = len(tasks)
+        n_done = n_total - len(to_download)  # already cached
         logger.info("Downloading %d NDVI months (sequential, single credential)...", len(to_download))
         for label, m_start, m_end, month_cache in to_download:
             lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
             if exc is None:
-                logger.info("Month %s done", lbl)
+                n_done += 1
+                logger.info("Month %s done (%d/%d)", lbl, n_done, n_total)
+                if progress_fn:
+                    try:
+                        progress_fn(n_done, n_total)
+                    except Exception:
+                        pass
             elif isinstance(exc, CreditsExhaustedError):
                 logger.warning("Stopping NDVI downloads — credits exhausted")
                 break
             else:
+                n_done += 1  # count failed months too for progress
                 logger.debug("Month %s failed: %s", lbl, exc)
+                if progress_fn:
+                    try:
+                        progress_fn(n_done, n_total)
+                    except Exception:
+                        pass
             _time.sleep(2)  # gentle pacing between sequential downloads
 
     # Read all cached months

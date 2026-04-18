@@ -4168,7 +4168,11 @@ def _fetch_copernicus_for_tile(
         # Harmonics (slowest — uses grid-snapped cache)
         if cop:
             _report(f"{label}harmonics" if label else "harmonics")
-            harm = cop_cache.get_harmonics(bbox, year=obs_year)
+            def _harm_progress(done, total):
+                _report(f"{label}harmonics ({done}/{total} months)" if label
+                        else f"harmonics ({done}/{total} months)")
+            harm = cop_cache.get_harmonics(bbox, year=obs_year,
+                                           progress_fn=_harm_progress)
             if harm is not None:
                 cop["harmonics"] = harm
 

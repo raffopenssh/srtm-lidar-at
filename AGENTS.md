@@ -568,3 +568,19 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | Zenodo upload failure | `main()` ~line 4900, calls `zenodo_client.py` |
 | Dashboard not updating | `app.py` `/api/v1/processing/status` reads `progress.json`; check parent thread alive |
 | Retry ladder not working | `main()` ~line 4785, `SUB_TILE_LADDER`, `_tile_ladder_pos` dict |
+
+
+### Planned Refactor (next maintenance window)
+
+Detailed prompt in `data/next-prompt.md`. Requires stopping the processor.
+
+**Step 1 — Extract `segment_types.py`** (safe, processor can stay running):
+- Move `SEGMENT_COLORS`, `_height_class()`, `_viridis_rgb()` out of `app.py` + `austria_processor.py` into a shared module.
+- Fixes: `_height_class()` has already diverged between the two copies.
+
+**Step 2 — Split `austria_processor.py`** (stop processor first):
+- `austria_processor.py` (~2000L) — orchestration: `main()`, `process_one_kg()`, retry ladder, Zenodo upload
+- `kg_builders.py` (~1800L) — `build_full_gpkg_tiled()`, `build_light_gpkg_tiled()`, `build_json_summary_tiled()`, GPKG style/vector writers
+- `kg_enrichment.py` (~800L) — `fetch_cadastre_data()`, height enrichment, vectorisation, edge-clip resolution
+
+Gotchas: lazy imports inside `process_one_kg()` (subprocess boundary), pass `DATA_DIR`/`GPKG_DIR` as args to builders.

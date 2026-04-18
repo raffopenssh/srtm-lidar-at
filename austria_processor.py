@@ -1091,7 +1091,107 @@ def resolve_edge_clipped_features(
     return resolved_nb, resolved_infra
 
 
-# === SECTION: GPKG style + vector writers (shared by full + light builders) ===
+# === SECTION: GPKG CRS fix + style + vector writers (shared by full + light builders) ===
+
+def _fix_gpkg_raster_crs(gpkg_path: str):
+    """Ensure all raster layers in a GPKG have valid CRS registration.
+
+    GDAL's GPKG driver registers uint8 rasters as data_type='tiles' instead of
+    '2d-gridded-coverage'. QGIS may not read CRS from 'tiles'-type layers,
+    showing a "Layer has no CRS" warning. This function:
+      1. Converts any 'tiles' entries in gpkg_contents to '2d-gridded-coverage'
+      2. Ensures the gpkg_2d_gridded_coverage_ancillary table + rows exist
+      3. Ensures the gpkg_2d_gridded_tile_ancillary table exists
+      4. Registers the gridded coverage extension in gpkg_extensions
+    """
+    import sqlite3
+    if not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0:
+        return
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        # Find raster layers registered as 'tiles' that should be '2d-gridded-coverage'
+        tile_rows = conn.execute(
+            "SELECT table_name FROM gpkg_contents WHERE data_type = 'tiles'"
+        ).fetchall()
+        if not tile_rows:
+            return  # nothing to fix
+
+        tile_names = [r[0] for r in tile_rows]
+        log.info("Fixing GPKG raster CRS for %d 'tiles' layers: %s",
+                 len(tile_names), tile_names)
+
+        # 1. Update data_type
+        conn.execute(
+            "UPDATE gpkg_contents SET data_type = '2d-gridded-coverage' "
+            "WHERE data_type = 'tiles'"
+        )
+
+        # 2. Ensure ancillary tables exist
+        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_coverage_ancillary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tile_matrix_set_name TEXT NOT NULL,
+            datatype TEXT NOT NULL DEFAULT 'integer',
+            scale REAL NOT NULL DEFAULT 1.0,
+            "offset" REAL NOT NULL DEFAULT 0.0,
+            precision REAL DEFAULT 1.0,
+            data_null REAL,
+            grid_cell_encoding TEXT DEFAULT 'grid-value-is-center',
+            uom TEXT,
+            field_name TEXT DEFAULT 'Height',
+            quantity_definition TEXT DEFAULT 'Height'
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_tile_ancillary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tpudt_name TEXT NOT NULL,
+            tpudt_id INTEGER NOT NULL,
+            scale REAL NOT NULL DEFAULT 1.0,
+            "offset" REAL NOT NULL DEFAULT 0.0,
+            min REAL DEFAULT NULL,
+            max REAL DEFAULT NULL,
+            mean REAL DEFAULT NULL,
+            std_dev REAL DEFAULT NULL
+        )''')
+
+        # 3. Add ancillary rows for newly-converted layers
+        for tname in tile_names:
+            existing = conn.execute(
+                "SELECT 1 FROM gpkg_2d_gridded_coverage_ancillary "
+                "WHERE tile_matrix_set_name = ?", (tname,)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    'INSERT INTO gpkg_2d_gridded_coverage_ancillary '
+                    '(tile_matrix_set_name, datatype, scale, "offset") '
+                    'VALUES (?, ?, ?, ?)',
+                    (tname, 'integer', 1.0, 0.0)
+                )
+
+        # 4. Register the gridded coverage extension
+        try:
+            conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_extensions (
+                table_name TEXT,
+                column_name TEXT,
+                extension_name TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)
+            )''')
+            for tname in tile_names:
+                conn.execute(
+                    'INSERT OR IGNORE INTO gpkg_extensions '
+                    '(table_name, column_name, extension_name, definition, scope) '
+                    'VALUES (?, NULL, ?, ?, ?)',
+                    (tname, 'gpkg_2d_gridded_coverage',
+                     'http://www.geopackage.org/18-000.html', 'read-write')
+                )
+        except Exception:
+            pass  # extension table may already have constraints
+
+        conn.commit()
+    except Exception as e:
+        log.warning("GPKG CRS fix failed for %s: %s", gpkg_path, e)
+    finally:
+        conn.close()
 
 SEGMENT_COLORS = {
     "tree":         (0, 100, 0, 180),
@@ -2444,6 +2544,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
     except Exception as e:
         log.warning("Full GPKG styles failed: %s", e)
 
+    # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
+    _fix_gpkg_raster_crs(out_path)
+
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
              fsize / 1e6, table_count, len(tile_seg_results))
@@ -2702,6 +2805,9 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         )
     except Exception as e:
         log.warning("Light GPKG styles failed: %s", e)
+
+    # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
+    _fix_gpkg_raster_crs(out_path)
 
     return out_path
 

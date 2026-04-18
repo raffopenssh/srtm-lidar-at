@@ -4993,7 +4993,18 @@ def main():
                         pool.terminate()
                         pool.join()
 
-                        if timed_out_tile is not None:
+                        # Only sub-tile if the timeout occurred during
+                        # actual tile processing.  Post-tile steps
+                        # (GPKG build, JSON, validate, upload) should
+                        # NOT trigger sub-tiling — just retry the
+                        # whole KG with the same tiles.
+                        _TILE_STEPS = {"lidar", "terrain", "ortho",
+                                       "copernicus", "hansen", "segment",
+                                       "vectorise"}
+                        _is_tile_step = (last_step in _TILE_STEPS or
+                                         last_step.startswith("tile_"))
+
+                        if timed_out_tile is not None and _is_tile_step:
                             # Per-tile ladder: each tile can step
                             # through SUB_TILE_LADDER independently.
                             t_lp = _tile_ladder_pos.get(timed_out_tile, 0)
@@ -5031,6 +5042,15 @@ def main():
                                         "sub-dividing tile %d at %.1fkm",
                                         timeout // 60, last_step,
                                         timed_out_tile, sub_km)
+                        elif not _is_tile_step:
+                            # Timeout during post-tile step (GPKG build,
+                            # JSON, validate, etc.) — retry the whole KG
+                            # with the same tiles, don't sub-tile.
+                            log.warning("  → TIMEOUT after %d min during post-tile step '%s' — "
+                                        "retrying without sub-tiling",
+                                        timeout // 60, last_step)
+                            # Don't modify failed_tiles — keep whatever
+                            # was there (usually empty on first attempt).
                         else:
                             # Can't identify the tile — treat as permanent
                             log.error("KG %s: TIMEOUT at step %s — can't identify tile",

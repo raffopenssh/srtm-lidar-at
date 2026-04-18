@@ -305,29 +305,31 @@ main()                           ← parent process, iterates KGs
 | **Memory** | ~100MB | Up to 3GB (MemoryMax enforced by systemd) |
 | **Timeout** | Enforces 30/90min via `async_result.get(timeout=)` | No awareness of timeout |
 
-### Code Map of austria_processor.py (~5100 lines)
+### Code Map of austria_processor.py
 
-| Lines | Section | Key functions |
-|-------|---------|---------------|
-| 1–95 | Config + constants | `DATA_DIR`, `ZENODO_TOKEN`, `KG_TIMEOUT_SECONDS` |
-| 96–200 | Disk management | `check_disk_space()`, `_lru_delete()` |
-| 200–225 | Logging setup | File + stderr handlers |
-| 226–445 | **`ProgressTracker`** class | JSON-backed state: `set_step()`, `add_log()`, `record_success()`, `update_rates()` |
-| 445–475 | Circuit breaker | `_read_circuit_breaker()` — openEO rate-limit protection |
-| 475–530 | Geometry helpers | `transform_to_3035/wgs()`, `get_all_kgs()` |
-| 530–645 | Cadastre fetching | `fetch_cadastre_data()` — REST calls to cadastre API |
-| 645–780 | Height enrichment | `enrich_parcels_with_heights()`, `enrich_buildings_with_heights()` |
-| 780–1120 | Vectorisation | `vectorise_unmatched_buildings()`, `vectorise_infrastructure()`, `resolve_edge_clipped_features()` |
-| 1120–1200 | Helpers | `_height_class()`, `_viridis_rgb()`, `_to_multi()` |
-| 1200–1900 | GPKG writing | `_write_segment_vectors()`, `_write_segment_points()`, `_write_gpkg_all_styles()` |
-| 1900–2180 | **`build_full_gpkg_tiled()`** | Stitches raster layers across tiles into one GPKG |
-| 2180–2540 | **`build_light_gpkg_tiled()`** | Segment rasters + enriched parcels/buildings |
-| 2540–2920 | **`build_json_summary_tiled()`** | Per-parcel elevation, area summary, height distributions |
-| 2920–3065 | Data quality + validation | `compute_data_quality()`, `validate_kg_outputs()` |
-| 3065–3930 | **`process_one_kg()`** | The main per-KG pipeline (see flow above) |
-| 3930–4385 | Output validation + tile history | `validate_kg_outputs()`, `_save_tile_history()` |
-| 4385–4450 | Constants | `SUB_TILE_LADDER`, `KG_TIMEOUT_SECONDS_RETRY` |
-| 4450–end | **`main()`** | KG iteration, retry logic, subprocess management, Zenodo upload |
+All sections are marked with `# === SECTION: ... ===` comments. Use `grep -n '# ===' austria_processor.py` to orient yourself.
+
+| Marker | Key contents |
+|--------|---------------|
+| `Config` | `DATA_DIR`, `ZENODO_TOKEN`, `KG_TIMEOUT_SECONDS`, tile cache init |
+| `Disk cache management` | `check_disk_space()`, `_lru_delete()` |
+| `Logging` | File + stderr handlers |
+| `ProgressTracker` | JSON-backed state class: `set_step()`, `add_log()`, `record_success()`, `update_rates()` |
+| `Circuit breaker` | `_read_circuit_breaker()` — openEO rate-limit protection |
+| `Geometry helpers` | `transform_to_3035/wgs()` |
+| `KG list` | `get_all_kgs()` — fetch + cache all ~8440 KGs |
+| `Cadastre data fetching` | `fetch_cadastre_data()` — REST calls to cadastre API |
+| `Height enrichment` | `enrich_parcels_with_heights()`, `enrich_buildings_with_heights()` |
+| `Vectorise unmatched segments` | `vectorise_unmatched_buildings()`, `vectorise_infrastructure()` |
+| `Resolve edge-clipped features` | `resolve_edge_clipped_features()` — tile boundary fixup |
+| `GPKG style + vector writers` | `_write_segment_vectors()`, `_write_segment_points()`, `_write_gpkg_all_styles()` |
+| `Tiled GPKG + JSON builders` | **`build_full_gpkg_tiled()`**, **`build_light_gpkg_tiled()`**, **`build_json_summary_tiled()`** |
+| `Data quality scoring` | `compute_data_quality()` |
+| `process_one_kg()` | **The main per-KG pipeline** (runs in subprocess, see flow above) |
+| `Output validation` | `validate_kg_outputs()` |
+| `Zenodo upload helpers` | `upload_kg_to_zenodo()` |
+| `JSON dir cleanup` | 4GB cap, LRU eviction |
+| `main()` | **KG iteration, retry ladder, subprocess management** |
 
 ### Key Modules Called by the Processor
 

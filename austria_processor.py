@@ -42,9 +42,7 @@ from pyproj import Transformer
 from shapely.geometry import box, shape as shapely_shape, Point, Polygon, MultiPolygon, mapping
 from shapely.ops import transform as shapely_transform
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# === SECTION: Config ===
 
 CADASTRE_BASE = "https://cadastre-process-api.exe.xyz/api/v1"
 ZENODO_TOKEN = "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
@@ -93,9 +91,7 @@ _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 
 
-# ---------------------------------------------------------------------------
-# Disk cache management
-# ---------------------------------------------------------------------------
+# === SECTION: Disk cache management (LRU cleanup, free-space checks) ===
 
 def check_disk_space(current_kg_code: str = "") -> bool:
     """Check free disk space and clean caches if below threshold.
@@ -197,9 +193,7 @@ def check_disk_space(current_kg_code: str = "") -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# === SECTION: Logging ===
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,16 +204,12 @@ log = logging.getLogger('austria_processor')
 for name in ['rasterio', 'urllib3', 'botocore', 'PIL', 'fiona']:
     logging.getLogger(name).setLevel(logging.WARNING)
 
-# ---------------------------------------------------------------------------
-# Ensure directories
-# ---------------------------------------------------------------------------
+# === SECTION: Ensure directories ===
 
 for d in [DATA_DIR, JSON_DIR, GPKG_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Progress tracking (written to disk, read by /api/v1/processing/status)
-# ---------------------------------------------------------------------------
+# === SECTION: ProgressTracker (JSON-backed state, read by dashboard API) ===
 
 _progress_lock = None  # set in main()
 
@@ -442,9 +432,7 @@ class ProgressTracker:
             self._state["system"] = system
 
 
-# ---------------------------------------------------------------------------
-# Circuit breaker (same pattern as rf_train)
-# ---------------------------------------------------------------------------
+# === SECTION: Circuit breaker (openEO rate-limit protection) ===
 
 def _read_circuit_breaker() -> dict:
     try:
@@ -461,9 +449,7 @@ def _write_circuit_breaker(state: dict):
         pass
 
 
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
+# === SECTION: Geometry helpers (CRS transforms) ===
 
 def transform_to_3035(geom):
     return shapely_transform(_tx_to_3035.transform, geom)
@@ -472,9 +458,7 @@ def transform_to_wgs(geom):
     return shapely_transform(_tx_to_wgs.transform, geom)
 
 
-# ---------------------------------------------------------------------------
-# KG list
-# ---------------------------------------------------------------------------
+# === SECTION: KG list (fetch + cache all ~8440 KGs) ===
 
 def get_all_kgs(state_filter: str = None) -> list[dict]:
     """Fetch all KGs from cadastre API. Caches to kg_list.json."""
@@ -528,9 +512,7 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
     return all_kgs
 
 
-# ---------------------------------------------------------------------------
-# Cadastre data fetching
-# ---------------------------------------------------------------------------
+# === SECTION: Cadastre data fetching (REST API calls) ===
 
 def fetch_cadastre_data(kg_code: str) -> dict:
     """Fetch parcels, building footprints, landuse from cadastre API."""
@@ -640,9 +622,7 @@ def fetch_cadastre_data(kg_code: str) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Height enrichment for parcels and buildings
-# ---------------------------------------------------------------------------
+# === SECTION: Height enrichment (DTM/DSM → parcel + building heights) ===
 
 def enrich_parcels_with_heights(parcels: list, dtm: np.ndarray,
                                 transform) -> list[dict]:
@@ -777,9 +757,7 @@ def enrich_buildings_with_heights(buildings: list, dtm: np.ndarray,
     return enriched
 
 
-# ---------------------------------------------------------------------------
-# Vectorise segments not matched to cadastre (new buildings, infrastructure)
-# ---------------------------------------------------------------------------
+# === SECTION: Vectorise unmatched segments (new buildings, infrastructure) ===
 
 def _segment_touches_edge(seg_mask: np.ndarray) -> bool:
     """Return True if any pixel in *seg_mask* lies on the raster boundary.
@@ -978,9 +956,7 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
     return results
 
 
-# ---------------------------------------------------------------------------
-# Resolve edge-clipped features against full-KG rasters
-# ---------------------------------------------------------------------------
+# === SECTION: Resolve edge-clipped features (tile boundary fixup) ===
 
 def resolve_edge_clipped_features(
     new_buildings: list,
@@ -1115,9 +1091,7 @@ def resolve_edge_clipped_features(
     return resolved_nb, resolved_infra
 
 
-# ---------------------------------------------------------------------------
-# GPKG builders
-# ---------------------------------------------------------------------------
+# === SECTION: GPKG style + vector writers (shared by full + light builders) ===
 
 SEGMENT_COLORS = {
     "tree":         (0, 100, 0, 180),
@@ -1896,9 +1870,7 @@ def _read_dtm_for_tile(tr):
     return _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
 
 
-# ---------------------------------------------------------------------------
-# Tiled GPKG + JSON builders
-# ---------------------------------------------------------------------------
+# === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
 
 def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
     """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
@@ -2430,9 +2402,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     return out_path
 
 
-# ---------------------------------------------------------------------------
-# Data quality score computation
-# ---------------------------------------------------------------------------
+# === SECTION: Data quality scoring ===
 
 # Weight each data source by its contribution to segmentation quality.
 # DTM+DSM are essential (segmentation fails without them).
@@ -2915,9 +2885,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     return summary
 
 
-# ---------------------------------------------------------------------------
-# Core per-KG processing — tiled for full-KG coverage
-# ---------------------------------------------------------------------------
+# === SECTION: process_one_kg() — core per-KG pipeline (runs in subprocess) ===
 
 def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
     """Compute a grid of overlapping tiles covering the full KG bbox.
@@ -3929,9 +3897,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     gc.collect()
     return result
 
-# ---------------------------------------------------------------------------
-# Output validation
-# ---------------------------------------------------------------------------
+# === SECTION: Output validation ===
 
 def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
     """Validate all KG output products. Returns list of issues (empty = all OK)."""
@@ -4278,9 +4244,7 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
                  ",".join(dq.get("missing_layers", [])) or "none")
 
 
-# ---------------------------------------------------------------------------
-# Zenodo upload
-# ---------------------------------------------------------------------------
+# === SECTION: Zenodo upload helpers ===
 
 def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                         manifest, quality_score: float = 0.0,
@@ -4337,9 +4301,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
     return upload_stats
 
 
-# ---------------------------------------------------------------------------
-# JSON dir cleanup
-# ---------------------------------------------------------------------------
+# === SECTION: JSON dir cleanup (4GB cap, LRU eviction) ===
 
 def cleanup_json_dir():
     """Delete oldest JSON files if dir exceeds 4GB."""
@@ -4374,9 +4336,7 @@ def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "complet
         log.warning("Failed to save tile history for %s: %s", kg_code, e)
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+# === SECTION: main() — KG iteration, retry ladder, subprocess management ===
 
 # Per-tile retry ladder: on timeout, sub-divide ONLY the timed-out
 # tile into smaller sub-tiles.  Each step is a tile_km for the sub-tiles.

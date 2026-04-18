@@ -231,102 +231,193 @@ tail -f /tmp/rf_train_4000kg.log       # training logs
 systemctl status rf_train srv          # check both services
 ```
 
-### Austria Processor Operations
+---
 
-The processor runs as `austria_processor.service`. It processes KGs sequentially,
-each tiled into 1.5km windows. It resumes from where it left off on restart
-(no KG data is lost — incomplete KGs are retried).
+## Austria Processor — Mental Model
+
+**Read this section first when working on the processor. It will save you hours.**
+
+The Austria Processor (`austria_processor.py`, 5131 lines, 80 functions) processes
+all ~8440 Austrian Katastralgemeinden (KGs) into landscape analysis products and
+uploads them to Zenodo. It runs for weeks as a background systemd service.
+
+### The Big Picture (5-second version)
+
+```
+main()                           ← parent process, iterates KGs
+  └─ for each KG:
+       └─ multiprocessing.Pool(1)  ← child process (memory isolation)
+            └─ process_one_kg()
+                 ├── fetch cadastre → compute bbox
+                 ├── tile grid (1.5km, 100m overlap)
+                 ├── for each tile:
+                 │     ├── read LiDAR (DTM/DSM, 3 dates)
+                 │     ├── read ortho (RGBI)
+                 │     ├── fetch Copernicus (NDVI/SAR/WorldCover)
+                 │     ├── fetch Hansen (forest change)
+                 │     ├── segment (Felzenszwalb + RF classify)
+                 │     ├── vectorise new buildings + infrastructure
+                 │     └── checkpoint tile to disk
+                 ├── merge tile results (dedup at boundaries)
+                 ├── build full GPKG (all raster layers + vectors)
+                 ├── build light GPKG (segments + enriched parcels/buildings)
+                 ├── build JSON summary (per-parcel stats)
+                 ├── validate outputs
+                 └── upload to Zenodo
+```
+
+### Architecture Decisions (why it's built this way)
+
+1. **Subprocess per KG**: Each KG runs in `multiprocessing.Pool(1)` so memory
+   is fully reclaimed between KGs. The parent only does orchestration + Zenodo upload.
+
+2. **Tiling**: KGs vary from <1km to 27km across. Everything is processed as
+   overlapping 1.5km tiles to cap memory at ~90MB/tile. Tiles overlap by 100m
+   so edge objects aren't truncated. Dedup uses centroid-ownership (core zone =
+   tile shrunk by 50m on overlap sides).
+
+3. **Tile checkpoints**: Each completed tile is pickled to
+   `data/austria_processor/tile_checkpoints/<kg>/tile_N.pkl`.
+   On crash/restart, completed tiles are restored — only the interrupted tile
+   is re-processed. Checkpoints are deleted after successful KG completion.
+
+4. **Parent-child communication**: The subprocess writes step progress to
+   `data/austria_processor/current_step.json` (atomic temp+rename). A parent
+   thread (`_monitor_step_file`) polls this every 2s and feeds it into
+   `ProgressTracker` → `progress.json` → dashboard API → `process.html`.
+
+5. **Retry ladder**: On timeout (30min initial, 90min retry), the parent
+   identifies which tile timed out and re-runs with smaller sub-tiles:
+   `SUB_TILE_LADDER = [0.5, 0.2]` km. Each tile steps through the ladder
+   independently. Exhausted tiles → permanent failure.
+
+6. **Grid-snapped caches**: Remote data (Copernicus, Hansen) is cached in a
+   regular grid so adjacent KGs share cached tiles. See `tile_cache.py`.
+
+### The Two Processes
+
+| | Parent (`main()`) | Child (`process_one_kg()`) |
+|---|---|---|
+| **Runs in** | `austria_processor.service` | `multiprocessing.Pool(1)` |
+| **PID** | Long-lived | New per KG |
+| **Responsible for** | KG iteration, retry logic, Zenodo upload, progress tracking, signal handling | All data I/O, segmentation, GPKG/JSON building |
+| **Communicates via** | `current_step.json`, `subprocess_warnings.jsonl`, return dict | Same files (writes them) |
+| **Memory** | ~100MB | Up to 3GB (MemoryMax enforced by systemd) |
+| **Timeout** | Enforces 30/90min via `async_result.get(timeout=)` | No awareness of timeout |
+
+### Code Map of austria_processor.py (~5100 lines)
+
+| Lines | Section | Key functions |
+|-------|---------|---------------|
+| 1–95 | Config + constants | `DATA_DIR`, `ZENODO_TOKEN`, `KG_TIMEOUT_SECONDS` |
+| 96–200 | Disk management | `check_disk_space()`, `_lru_delete()` |
+| 200–225 | Logging setup | File + stderr handlers |
+| 226–445 | **`ProgressTracker`** class | JSON-backed state: `set_step()`, `add_log()`, `record_success()`, `update_rates()` |
+| 445–475 | Circuit breaker | `_read_circuit_breaker()` — openEO rate-limit protection |
+| 475–530 | Geometry helpers | `transform_to_3035/wgs()`, `get_all_kgs()` |
+| 530–645 | Cadastre fetching | `fetch_cadastre_data()` — REST calls to cadastre API |
+| 645–780 | Height enrichment | `enrich_parcels_with_heights()`, `enrich_buildings_with_heights()` |
+| 780–1120 | Vectorisation | `vectorise_unmatched_buildings()`, `vectorise_infrastructure()`, `resolve_edge_clipped_features()` |
+| 1120–1200 | Helpers | `_height_class()`, `_viridis_rgb()`, `_to_multi()` |
+| 1200–1900 | GPKG writing | `_write_segment_vectors()`, `_write_segment_points()`, `_write_gpkg_all_styles()` |
+| 1900–2180 | **`build_full_gpkg_tiled()`** | Stitches raster layers across tiles into one GPKG |
+| 2180–2540 | **`build_light_gpkg_tiled()`** | Segment rasters + enriched parcels/buildings |
+| 2540–2920 | **`build_json_summary_tiled()`** | Per-parcel elevation, area summary, height distributions |
+| 2920–3065 | Data quality + validation | `compute_data_quality()`, `validate_kg_outputs()` |
+| 3065–3930 | **`process_one_kg()`** | The main per-KG pipeline (see flow above) |
+| 3930–4385 | Output validation + tile history | `validate_kg_outputs()`, `_save_tile_history()` |
+| 4385–4450 | Constants | `SUB_TILE_LADDER`, `KG_TIMEOUT_SECONDS_RETRY` |
+| 4450–end | **`main()`** | KG iteration, retry logic, subprocess management, Zenodo upload |
+
+### Key Modules Called by the Processor
+
+| Module | Size | What it does for the processor |
+|--------|------|-------------------------------|
+| `tile_cache.py` | 772L | Grid-snapped caches for Copernicus + Hansen. `CopernicusTileCache`, `HansenTileCache`, `order_kgs_nearest_neighbor()` |
+| `object_segmentation.py` | 2218L | `segment_objects_in_area()` — Felzenszwalb + RAG + RF classify. Called once per tile. |
+| `copernicus.py` | 1262L | openEO client: NDVI, WorldCover, SAR, harmonics. Has credential rotation + sync/batch fallback. |
+| `ortho_io.py` | 992L | BEV orthophoto reader (RGBI, 47 Operates, DOP fallback). |
+| `raster_io.py` | 359L | Windowed reads from BEV GeoTIFFs via `/vsicurl/`. |
+| `hansen.py` | 453L | Hansen Global Forest Change data reader. |
+| `cadastre.py` | 459L | Building footprints + parcel boundaries from cadastre API. |
+| `terrain_analysis.py` | 157L | Slope, aspect, TRI, curvature from DTM. |
+| `learned_classifier.py` | 559L | RF model loading + 44-feature classification. |
+| `zenodo_client.py` | 841L | Zenodo deposit creation, file upload, publish. `Manifest` class for tracking. |
+| `bev_retry.py` | 252L | Exponential backoff + proxy rotation for `rasterio.open()`. |
+
+### Data Flow Through a Single Tile
+
+```
+BEV servers ──→ raster_io / bev_retry ──→ DTM, DSM (1m)
+                                           ↓
+BEV servers ──→ ortho_io ──→ RGBI (0.2m)  │
+                               ↓           ↓
+openEO ──→ tile_cache ──→ NDVI/SAR/LC    terrain_analysis
+                            ↓                ↓
+UMD ──→ tile_cache ──→ Hansen           object_segmentation
+                            ↓           ↙ ↓ ↘
+cadastre API ──→ cadastre ──→ ground truth  features  labels
+                                              ↓
+                                    learned_classifier (RF)
+                                              ↓
+                                    classified objects
+                                    ↙          ↓          ↘
+                        vectorise_*     tile_seg_result    terrain_stats
+```
+
+### Persistence & Recovery
+
+| File | Written by | Read by | Purpose |
+|------|-----------|---------|--------|
+| `progress.json` | Parent (ProgressTracker) | Dashboard API | Live state: current KG, step, rates, log |
+| `current_step.json` | Child (`_report_step()`) | Parent (`_monitor_step_file` thread) | IPC: step name + detail + tile index |
+| `subprocess_warnings.jsonl` | Child (`_WarningRelayHandler`) | Parent (`_monitor_step_file`) | WARNING/ERROR log relay |
+| `in_progress_kg.txt` | Parent | Parent (on restart) | Crash recovery: re-process interrupted KG |
+| `tile_checkpoints/<kg>/tile_N.pkl` | Child | Child (on retry) | Resume from last completed tile |
+| `zenodo_manifest.json` | Parent (`Manifest`) | Parent + Dashboard | Upload tracking (success/error per KG) |
+| `failed_kgs.json` | Parent | Parent (on restart) | Permanently-failed KGs to skip |
+| `kg_list.json` | Parent | Parent | Cached list of ~8440 KGs (avoid repeated API calls) |
+
+### Operations
 
 ```bash
-# --- Logs (primary source of truth) ---
-tail -f data/austria_processor/logs/processor.log     # live log
-tail -100 data/austria_processor/logs/processor.log   # recent history
-grep -i "warning\|error\|failed" data/austria_processor/logs/processor.log | tail -20  # problems
+# --- Logs ---
+tail -f data/austria_processor/logs/processor.log
+grep -i "warning\|error\|failed" data/austria_processor/logs/processor.log | tail -20
 
 # --- Status ---
 curl -s http://localhost:8000/api/v1/processing/status | python3 -m json.tool
-# Key fields: state, completed, failed, current_kg.{code,step}, system.{ram_pct,disk_free_gb,proc_pid}
 
-# --- Restart (SIGKILL needed — graceful stop waits for current tile to finish) ---
-sudo systemctl kill -s SIGKILL austria_processor
-sleep 2
-sudo systemctl start austria_processor
-# Note: RestartSec=60 in the unit file, so systemd waits 60s between stop and start.
-# The `start` command may block ~60s while systemd enforces this.
+# --- Restart (SIGKILL needed — graceful stop waits for current tile) ---
+sudo systemctl kill -s SIGKILL austria_processor && sleep 2 && sudo systemctl start austria_processor
 
 # --- Dashboard ---
 # https://srtm-lidar-at.exe.xyz:8000/process.html
-# Shows: service card (PID/RAM), progress, rate, system resources, current KG
-# pipeline steps, map of processed KGs, live log, Zenodo manifest.
 ```
 
-**Common issues to check in logs:**
-- `WARNING copernicus: Synchronous download timed out` → normal, falls back to batch job
-- `WARNING tile_cache: Copernicus SAR tile fetch failed` → SAR download failed, skipped (non-fatal)
-- `WARNING tile_cache: Hansen resample failed` → Hansen tile missing for bbox (western Vorarlberg)
-- `ERROR copernicus: credits exhausted` → all Copernicus credentials used up, processor pauses
-- `RuntimeWarning: Mean of empty slice` → should be fixed; if seen, check terrain_analysis.py
+### Common Failure Modes & Fixes
 
-**Key files:**
-- `data/austria_processor/logs/processor.log` — full log (stdout+stderr)
-- `data/austria_processor/progress.json` — live state (read by dashboard API)
-- `data/austria_processor/in_progress_kg.txt` — current KG code (for crash recovery)
-- `data/austria_processor/zenodo_manifest.json` — upload tracking
-- `data/austria_processor/copernicus_tiles/` — grid-snapped Copernicus cache (.npz)
-- `data/austria_processor/hansen_tiles/` — grid-snapped Hansen cache (.npz)
-- `data/austria_processor/bev_tile_cache/` — BEV DTM/DSM windowed read cache
-- `rf_training_data/copernicus_cache/` — per-bbox Copernicus cache (.tif, from RF training)
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `copernicus: credits exhausted` | All openEO credentials used up | Update `_CREDENTIALS` in `copernicus.py`, delete `data/austria_processor/copernicus_paused` |
+| Timeout on large KG | Tile too complex (dense forest) | Automatic: retry ladder shrinks tile to 0.5→0.2km |
+| OOM kill | KG exceeds 3GB MemoryMax | Automatic: systemd restarts, tile checkpoints preserved |
+| `Synchronous download timed out` | Normal Copernicus behavior | No action — falls back to batch job automatically |
+| `Hansen resample failed` | No Hansen data (western Vorarlberg) | Non-fatal, skipped. Hansen data sparse at AT borders |
+| 0-byte cache files | Interrupted before atomic-write fix | Delete the 0-byte `.tif`/`.npz` files manually |
+| Disk critically low | Caches filling disk | Automatic: `check_disk_space()` does LRU cleanup, pauses if <3GB |
+| Stale `progress.json` | Service died without cleanup | Restart clears stale state in `main()` init block |
 
-**Cache corruption:** Downloads use atomic writes (temp file + rename). If you see
-0-byte `.tif` or `.npz` files in cache dirs, delete them — they're leftovers from
-interrupted downloads before the atomic write fix.
+### Per-KG Outputs
 
-Deps: rasterio, pyproj, shapely, numpy, scipy, scikit-image, scikit-learn, flask, gunicorn, openeo, requests
+1. **Full GPKG** (`{kg}_full.gpkg`): DTM/DSM/nDSM + ortho + segment_type rasters, segment vector polygons
+2. **Light GPKG** (`{kg}_light.gpkg`): segment raster+vector, all parcels w/ DTM heights, all buildings w/ object heights, new buildings, infrastructure
+3. **JSON summary** (`{kg}.json`): area summary, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, coverage stats, methods
 
-### Austria Processor
-| File | Purpose |
-|------|----------|
-| `austria_processor.py` | Main processor: iterates KGs, tiles, segments, builds GPKGs + JSON, uploads to Zenodo |
-| `zenodo_client.py` | Python Zenodo API client (port of Go zenodo-mirror-go-pkg) |
-| `austria_processor.service` | systemd unit for background processing |
-| `static/process.html` | Processing dashboard (status, map, controls, Zenodo manifest) |
+JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, `parcel_segmentation_coverage_pct`, `building_height_coverage_pct`.
 
-### Tiled Full-KG Processing
+### API Endpoints (served by app.py, read processor state)
 
-`process_one_kg()` tiles the **entire KG** into overlapping 1.5km windows, processes each
-tile through the full pipeline, and merges results for complete KG coverage.
-
-**Flow:**
-1. Fetch cadastre → compute full KG bbox from geometry union (make_valid)
-2. `_compute_tile_grid()`: 1.5km tiles, 100m overlap
-3. **Per tile**: LiDAR (3 dates) + ortho + Copernicus + Hansen + Felzenszwalb segmentation + RF classify
-4. Remap obj_ids to global unique range; dedup at tile boundaries via centroid-ownership (core zone = tile shrunk by 50m on overlap sides)
-5. `_merge_terrain_stats()`: pixel-weighted merge across tiles
-6. `build_full_gpkg_tiled()`: per-tile DTM/DSM/nDSM + segment_type rasters, segment vectors
-7. `build_light_gpkg_tiled()`: segment rasters + all parcels/buildings enriched from their covering tile
-8. `build_json_summary_tiled()`: every parcel gets elevation + area_summary + height_distribution
-
-**Memory**: one 1.5km tile (~90MB) in memory at a time. Works for KGs up to 27km (Matrei: ~324 tiles).
-
-**Retry ladder**: `RETRY_LADDER = [1.5, 0.5, 0.2]` km — on timeout, shrink tile size and retry.
-
-**Key helpers:**
-- `_find_tile_for_point(e, n, tiles)` — find which tile covers a point (for parcel enrichment)
-- `_read_dtm_for_tile(tr)` — re-read DTM from BEV cache (instant, no HTTP)
-- `_segment_touches_edge(seg_mask)` — detect truncated segments at tile boundary
-- `edge_clipped` flag on new_buildings/infrastructure vectors
-
-### Austria Processor Data
-| Path | Purpose |
-|------|----------|
-| `data/austria_processor/zenodo_manifest.json` | Tracks all Zenodo uploads + failures |
-| `data/austria_processor/json/` | Per-KG JSON summaries (kept under 4GB) |
-| `data/austria_processor/progress.json` | Live progress state for dashboard |
-| `data/austria_processor/kg_list.json` | Cached list of all ~8440 Austrian KGs |
-| `data/austria_processor/bev_tile_cache/` | Cached BEV DTM/DSM windowed reads (fast re-read) |
-| `data/austria_processor/gpkg/` | Temp GPKG files (deleted after Zenodo upload) |
-
-### Austria Processor API Endpoints
 | Method | Path | Purpose |
 |--------|------|----------|
 | GET | `/api/v1/processing/status` | Processor progress (polled by process.html) |
@@ -341,9 +432,28 @@ tile through the full pipeline, and merges results for complete KG coverage.
 | GET | `/api/v1/kg/<kg_code>` | KG JSON summary (local or Zenodo link) |
 | GET | `/api/v1/parcel/<parcel_id>` | Parcel lookup via KG JSON |
 
-### Per-KG Outputs
-1. **Full GPKG** (`{kg}_full.gpkg`): per-tile DTM/DSM/nDSM + segment_type rasters, segment vector polygons
-2. **Light GPKG** (`{kg}_light.gpkg`): segment raster+vector, **all** parcels w/ DTM heights, **all** buildings w/ object heights, new buildings, infrastructure
-3. **JSON summary** (`{kg}.json`): area summary, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, coverage stats, methods
+### Files
 
-JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, `parcel_segmentation_coverage_pct`, `building_height_coverage_pct`.
+| File | Size | Purpose |
+|------|------|----------|
+| `austria_processor.py` | 5131L | Main processor (this section documents it) |
+| `zenodo_client.py` | 841L | Zenodo API client + `Manifest` class |
+| `tile_cache.py` | 772L | Grid-snapped Copernicus + Hansen caching |
+| `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure) |
+| `static/process.html` | 1117L | Dashboard UI (status, map, log, Zenodo manifest) |
+| `data/austria_processor/MONITOR.md` | — | Monitoring checklist + expected timelines |
+
+### Where to Look When Debugging
+
+| Problem area | Look at |
+|---|---|
+| KG fails during segmentation | `process_one_kg()` line ~3700, calls `object_segmentation.segment_objects_in_area()` |
+| GPKG output wrong | `build_full_gpkg_tiled()` (line 1903) or `build_light_gpkg_tiled()` (line 2177) |
+| JSON summary wrong | `build_json_summary_tiled()` (line 2537) |
+| Parcel heights wrong | `enrich_parcels_with_heights()` (line 647) |
+| Tile boundary artifacts | Centroid-ownership dedup in `process_one_kg()` ~line 3830, `_segment_touches_edge()` |
+| Copernicus data missing | `tile_cache.py` → `copernicus.py` → credential rotation + circuit breaker |
+| BEV data read failure | `raster_io.py` → `bev_retry.py` (exponential backoff + proxy rotation) |
+| Zenodo upload failure | `main()` ~line 4900, calls `zenodo_client.py` |
+| Dashboard not updating | `app.py` `/api/v1/processing/status` reads `progress.json`; check parent thread alive |
+| Retry ladder not working | `main()` ~line 4785, `SUB_TILE_LADDER`, `_tile_ladder_pos` dict |

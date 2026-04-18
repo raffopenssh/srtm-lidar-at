@@ -2023,6 +2023,27 @@ def segment_and_classify(
         )
         objects.append(obj)
 
+    # --- Step 4b: Post-classification NDVI override for path/road ---
+    # Flat ground with high NDVI should not be path/road — reclassify to grass/crop.
+    n_ndvi_override = 0
+    for obj in objects:
+        if obj.obj_type in ('path', 'road') and obj.ndvi_fused > 0.35:
+            # High fused NDVI → surface is vegetated, not paved
+            obj.obj_type = 'grass'
+            obj.type_code = OBJECT_TYPES['grass']
+            obj.is_manmade = False
+            obj.confidence = max(0.3, obj.confidence - 0.15)
+            n_ndvi_override += 1
+        elif obj.obj_type in ('path', 'road') and obj.ndvi_fused == 0 and obj.ndvi_mean > 0.15:
+            # No Copernicus data but BEV NIR shows vegetation
+            obj.obj_type = 'grass'
+            obj.type_code = OBJECT_TYPES['grass']
+            obj.is_manmade = False
+            obj.confidence = max(0.25, obj.confidence - 0.2)
+            n_ndvi_override += 1
+    if n_ndvi_override > 0:
+        log.info("Step 4b: NDVI override reclassified %d path/road → grass", n_ndvi_override)
+
     # --- Step 5: Cadastre calibration ---
     if building_footprints is not None:
         log.info("Step 5: Cadastre calibration")

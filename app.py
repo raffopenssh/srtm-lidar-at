@@ -818,6 +818,13 @@ def processing_status():
         except Exception:
             pass
         data['git_commit'] = _GIT_COMMIT
+        # Include persisted tile history for all completed/failed KGs
+        try:
+            th_path = Path('data/austria_processor/tile_history.json')
+            if th_path.exists():
+                data['tile_history'] = json.loads(th_path.read_text())
+        except Exception:
+            pass
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

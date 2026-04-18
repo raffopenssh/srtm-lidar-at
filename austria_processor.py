@@ -60,12 +60,15 @@ KG_LIST_FILE = DATA_DIR / "kg_list.json"
 FAILED_KGS_FILE = DATA_DIR / "failed_kgs.json"
 IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
+TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 
 MAX_KG_PIXELS = 4_000_000
 KG_TIMEOUT_SECONDS = 30 * 60
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
+DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
+DISK_CRITICAL_FREE_GB = 3.0  # pause processor if still low after cleanup
 
 # Tile caches — initialised lazily in subprocess
 _cop_cache = None
@@ -88,6 +91,111 @@ def _get_hansen_cache():
 # CRS transformers
 _tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
+
+
+# ---------------------------------------------------------------------------
+# Disk cache management
+# ---------------------------------------------------------------------------
+
+def check_disk_space(current_kg_code: str = "") -> bool:
+    """Check free disk space and clean caches if below threshold.
+
+    Returns True if processing can continue, False if disk is critically low.
+    """
+    import shutil
+    usage = shutil.disk_usage("/")
+    free_gb = usage.free / (1024 ** 3)
+
+    if free_gb >= DISK_MIN_FREE_GB:
+        return True
+
+    _log = logging.getLogger("disk_cleanup")
+    _log.warning("Disk free: %.1f GB (threshold: %.1f GB) — starting cache cleanup",
+                 free_gb, DISK_MIN_FREE_GB)
+    freed_bytes = 0
+
+    def _lru_delete(directory: Path, target_bytes: int, label: str,
+                    exclude_prefix: str = "") -> int:
+        """Delete oldest files in directory by mtime until target_bytes freed."""
+        nonlocal freed_bytes
+        if not directory.exists():
+            return 0
+        files = []
+        for f in directory.iterdir():
+            if f.is_file() and not f.name.startswith("."):
+                if exclude_prefix and f.name.startswith(exclude_prefix):
+                    continue
+                try:
+                    files.append((f, f.stat().st_mtime, f.stat().st_size))
+                except OSError:
+                    continue
+        files.sort(key=lambda x: x[1])  # oldest first
+        deleted = 0
+        n_deleted = 0
+        for fpath, _, fsize in files:
+            if deleted >= target_bytes:
+                break
+            try:
+                fpath.unlink()
+                deleted += fsize
+                freed_bytes += fsize
+                n_deleted += 1
+            except OSError:
+                continue
+        if deleted > 0:
+            _log.info("  %s: freed %.1f MB (%d files)",
+                      label, deleted / 1e6, n_deleted)
+        return deleted
+
+    target_2gb = 2 * 1024 ** 3
+
+    # 1. Delete old temp GPKG files (>1 hour old)
+    if GPKG_DIR.exists():
+        import time as _t
+        now = _t.time()
+        for f in GPKG_DIR.iterdir():
+            if f.is_file() and (now - f.stat().st_mtime) > 3600:
+                try:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    freed_bytes += sz
+                    _log.info("  Deleted old GPKG: %s (%.1f MB)", f.name, sz / 1e6)
+                except OSError:
+                    pass
+
+    # 2. BEV tile cache (LRU)
+    bev_cache = DATA_DIR / "bev_tile_cache"
+    _lru_delete(bev_cache, target_2gb, "bev_tile_cache")
+
+    # 3. Ortho tile cache (LRU)
+    ortho_cache = DATA_DIR / "ortho_tile_cache"
+    _lru_delete(ortho_cache, target_2gb, "ortho_tile_cache")
+
+    # 4. Copernicus tiles (LRU)
+    cop_cache = DATA_DIR / "copernicus_tiles"
+    _lru_delete(cop_cache, target_2gb, "copernicus_tiles")
+
+    # 5. Hansen tiles (LRU)
+    hansen_cache = DATA_DIR / "hansen_tiles"
+    _lru_delete(hansen_cache, target_2gb, "hansen_tiles")
+
+    # 6. RF training Copernicus cache (LRU)
+    rf_cop_cache = Path("rf_training_data/copernicus_cache")
+    _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
+
+    _log.info("Disk cleanup freed %.1f MB total", freed_bytes / 1e6)
+
+    # Re-check
+    usage = shutil.disk_usage("/")
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < DISK_CRITICAL_FREE_GB:
+        _log.error("Disk still critically low: %.1f GB free after cleanup. "
+                   "Pausing processor.", free_gb)
+        return False
+
+    _log.info("Disk free after cleanup: %.1f GB — OK to continue", free_gb)
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -496,9 +604,39 @@ def fetch_cadastre_data(kg_code: str) -> dict:
         except Exception:
             continue
 
-    log.info("KG %s: %d parcels, %d footprints, %d landuse",
+    # --- Filter buildings to KG boundary (parcels define the KG extent) ---
+    n_before = len(result["building_footprints"])
+    if result["parcels"] and result["building_footprints"]:
+        try:
+            from shapely.ops import unary_union as _uu
+            from shapely.validation import make_valid as _mv
+            parcel_geoms = []
+            for p in result["parcels"]:
+                g = p["geometry"]
+                try:
+                    parcel_geoms.append(_mv(g) if not g.is_valid else g)
+                except Exception:
+                    parcel_geoms.append(g.buffer(0))
+            kg_boundary = _uu(parcel_geoms).buffer(50)  # 50m buffer
+            filtered_bfp = []
+            filtered_bfp_geo = []
+            for i, b in enumerate(result["building_footprints"]):
+                if kg_boundary.contains(b["geometry"].centroid):
+                    filtered_bfp.append(b)
+                    if i < len(result["buildings_geojson"]):
+                        filtered_bfp_geo.append(result["buildings_geojson"][i])
+            n_removed = n_before - len(filtered_bfp)
+            if n_removed > 0:
+                log.info("KG %s: filtered %d/%d buildings outside KG boundary",
+                         kg_code, n_removed, n_before)
+            result["building_footprints"] = filtered_bfp
+            result["buildings_geojson"] = filtered_bfp_geo
+        except Exception as e:
+            log.warning("KG %s: building filter failed: %s", kg_code, e)
+
+    log.info("KG %s: %d parcels, %d footprints (was %d), %d landuse",
              kg_code, len(result["parcels"]), len(result["building_footprints"]),
-             len(result["landuse"]))
+             n_before, len(result["landuse"]))
     return result
 
 
@@ -1454,7 +1592,7 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
                            has_points: bool = True, has_parcels: bool = False,
                            has_buildings: bool = False, has_new_buildings: bool = False,
                            has_infrastructure: bool = False):
-    """Write QGIS styles for all vector layers in a GPKG."""
+    """Write QGIS styles for all vector and raster layers in a GPKG."""
     import sqlite3
     conn = sqlite3.connect(gpkg_path)
     try:
@@ -1483,6 +1621,8 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
                 'VALUES (?, ?, ?, ?, 1, ?)',
                 (table, geom_col, name, qml, desc),
             )
+
+        # --- Vector layer styles ---
 
         # Parcels: yellow outline, transparent fill
         if has_parcels:
@@ -1536,6 +1676,105 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
                 '<Option type="QString" value="0.3" name="outline_width"/>'
                 '</Option></layer></symbol></symbols></renderer-v2></qgis>',
                 'Orange infrastructure features')
+
+        # --- Raster layer styles ---
+        # Detect which raster tables exist in this GPKG
+        raster_tables = set()
+        try:
+            rows = conn.execute(
+                "SELECT table_name FROM gpkg_contents "
+                "WHERE data_type IN ('tiles', '2d-gridded-coverage')"
+            ).fetchall()
+            raster_tables = {r[0] for r in rows}
+        except Exception:
+            pass
+
+        # Build segment_type categorized colour map from SEGMENT_COLORS
+        if 'segment_type' in raster_tables:
+            _cat_items = []
+            for type_name, type_code in sorted(SEGMENT_COLORS.items(), key=lambda x: x[1]):
+                from object_segmentation import OBJECT_TYPES as _OT
+                code = _OT.get(type_name)
+                if code is None:
+                    continue
+                r, g, b, a = SEGMENT_COLORS[type_name]
+                _cat_items.append(
+                    f'<item value="{code}" label="{type_name}" '
+                    f'color="{r},{g},{b}" alpha="{a}"/>'
+                )
+            seg_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34">'
+                '<pipe><rasterrenderer type="paletted" band="1" opacity="0.8">'
+                '<colorPalette>' + ''.join(_cat_items) + '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('segment_type', '', 'Object types', seg_qml,
+                       'Categorized colour map by object type code')
+
+        # DTM/DSM: terrain colour ramp (green-brown-white)
+        dtm_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+            '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+            'classificationMode="2" minimumValue="0" maximumValue="3000">'
+            '<item value="0" color="#1a9641" label="0m"/>'
+            '<item value="500" color="#a6d96a" label="500m"/>'
+            '<item value="1000" color="#ffffbf" label="1000m"/>'
+            '<item value="2000" color="#a0522d" label="2000m"/>'
+            '<item value="3000" color="#ffffff" label="3000m"/>'
+            '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+        )
+        if 'DTM' in raster_tables:
+            _add_style('DTM', '', 'Elevation', dtm_qml,
+                       'Terrain elevation colour ramp')
+        if 'DSM' in raster_tables:
+            _add_style('DSM', '', 'Surface model', dtm_qml,
+                       'Digital surface model colour ramp')
+
+        # nDSM / segment_height: height colour ramp (viridis-style)
+        height_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+            '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+            'classificationMode="2" minimumValue="0" maximumValue="30">'
+            '<item value="0" color="#440154" label="0m"/>'
+            '<item value="5" color="#31688e" label="5m"/>'
+            '<item value="10" color="#35b779" label="10m"/>'
+            '<item value="20" color="#90d743" label="20m"/>'
+            '<item value="30" color="#fde725" label="30m"/>'
+            '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+        )
+        if 'nDSM' in raster_tables:
+            _add_style('nDSM', '', 'Object heights', height_qml,
+                       'Normalised DSM height colour ramp')
+        if 'segment_height' in raster_tables:
+            _add_style('segment_height', '', 'Segment heights', height_qml,
+                       'Segment height colour ramp')
+
+        # Multi-band RGB rendering (Ortho + CIR)
+        _rgb_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="multibandcolor" opacity="1" '
+            'redBand="1" greenBand="2" blueBand="3">'
+            '</rasterrenderer></pipe></qgis>'
+        )
+        for tbl in raster_tables:
+            if tbl.startswith('Ortho_'):
+                _add_style(tbl, '', 'True colour', _rgb_qml,
+                           'RGB orthophoto rendering')
+            elif tbl.startswith('CIR_'):
+                _add_style(tbl, '', 'CIR false colour', _rgb_qml,
+                           'Colour Infrared: NIR→R, Red→G, Green→B')
+            elif tbl.startswith('DTM_'):
+                _add_style(tbl, '', 'Elevation', dtm_qml,
+                           f'Terrain elevation {tbl}')
+            elif tbl.startswith('DSM_'):
+                _add_style(tbl, '', 'Surface model', dtm_qml,
+                           f'Digital surface model {tbl}')
 
         conn.commit()
     finally:
@@ -1662,8 +1901,10 @@ def _read_dtm_for_tile(tr):
 # ---------------------------------------------------------------------------
 
 def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
-    """Full GPKG: per-tile raster layers + segment vectors."""
+    """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
+    segment_height) covering the full KG bbox, plus unified segment vectors."""
     import rasterio
+    import rasterio.transform
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
     if os.path.exists(out_path): os.unlink(out_path)
     if not tile_seg_results:
@@ -1672,6 +1913,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
 
     table_count = 0
     _GPKG_NODATA = -9999.0  # NaN not supported in GPKG ancillary table
+
     def _write_table(name, arrays, h, w, tf, dtype='float32', descs=None):
         nonlocal table_count
         opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
@@ -1688,43 +1930,225 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
                 if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
         table_count += 1
 
-    obj_map = {o.obj_id: o for o in all_objects}
-    multi = len(tile_seg_results) > 1
+    # ------------------------------------------------------------------
+    # Compute union bounding box of all tiles
+    # ------------------------------------------------------------------
+    all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
+    all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
+    all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
+    all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
+    full_left = min(all_lefts)
+    full_bottom = min(all_bottoms)
+    full_right = max(all_rights)
+    full_top = max(all_tops)
 
+    res = 1.0  # 1m resolution
+    full_w = int(round((full_right - full_left) / res))
+    full_h = int(round((full_top - full_bottom) / res))
+    full_tf = rasterio.transform.from_bounds(
+        full_left, full_bottom, full_right, full_top, full_w, full_h)
+
+    log.info("  Full-KG raster: %d x %d px (%.0f x %.0f m), %d tiles",
+             full_w, full_h, full_right - full_left, full_top - full_bottom,
+             len(tile_seg_results))
+
+    # ------------------------------------------------------------------
+    # Allocate full-KG rasters
+    # ------------------------------------------------------------------
+    dtm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    dsm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    ndsm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
+    seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+
+    obj_map = {o.obj_id: o for o in all_objects}
+
+    # ------------------------------------------------------------------
+    # Paint each tile into the full-KG rasters
+    # ------------------------------------------------------------------
     for ti_idx, tr in enumerate(tile_seg_results):
         th, tw = tr["shape"]
-        tf = tr["transform"]
-        sfx = f"_t{ti_idx+1}" if multi else ""
+        tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+
+        # Compute pixel offset of this tile within the full-KG raster
+        col_off = int(round((tile_left - full_left) / res))
+        row_off = int(round((full_top - tile_top) / res))
+
+        # Clamp to full raster bounds (safety)
+        r_end = min(row_off + th, full_h)
+        c_end = min(col_off + tw, full_w)
+        th_eff = r_end - row_off
+        tw_eff = c_end - col_off
+        if th_eff <= 0 or tw_eff <= 0:
+            continue
+
+        # DTM / DSM / nDSM
         try:
             tdata = _read_dtm_for_tile(tr)
-            _write_table(f'DTM{sfx}', [tdata["dtm"].astype(np.float32)], th, tw, tf)
-            _write_table(f'DSM{sfx}', [tdata["dsm"].astype(np.float32)], th, tw, tf)
-            _write_table(f'nDSM{sfx}', [tdata["ndsm"].astype(np.float32)], th, tw, tf)
+            dtm_full[row_off:r_end, col_off:c_end] = tdata["dtm"][:th_eff, :tw_eff].astype(np.float32)
+            dsm_full[row_off:r_end, col_off:c_end] = tdata["dsm"][:th_eff, :tw_eff].astype(np.float32)
+            ndsm_full[row_off:r_end, col_off:c_end] = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
             del tdata
         except Exception as e:
-            log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx+1, e)
+            log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx + 1, e)
 
+        # Segment type + segment height + labels
         if tr.get("labels") is not None:
-            labels = tr["labels"]
-            type_raster = np.zeros((th, tw), dtype=np.uint8)
-            for uid in np.unique(labels):
+            labels_tile = tr["labels"][:th_eff, :tw_eff]
+            labels_full[row_off:r_end, col_off:c_end] = labels_tile.astype(np.int32)
+
+            type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
+            for uid in np.unique(labels_tile):
                 if uid == 0: continue
                 obj = obj_map.get(int(uid))
-                if obj: type_raster[labels == uid] = obj.type_code
-            _write_table(f'segment_type{sfx}', [type_raster], th, tw, tf,
-                         dtype='uint8', descs=['Object type code'])
+                if obj: type_tile[labels_tile == uid] = obj.type_code
+            seg_type_full[row_off:r_end, col_off:c_end] = type_tile
 
-    # Segment vectors — one layer combining all tiles
-    if all_objects and tile_seg_results:
+            # Segment height from per-tile ndsm
+            if tr.get("ndsm") is not None:
+                seg_height_full[row_off:r_end, col_off:c_end] = \
+                    tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Write stitched raster layers
+    # ------------------------------------------------------------------
+    _write_table('DTM', [dtm_full], full_h, full_w, full_tf,
+                 descs=['Digital Terrain Model (m)'])
+    del dtm_full
+
+    _write_table('DSM', [dsm_full], full_h, full_w, full_tf,
+                 descs=['Digital Surface Model (m)'])
+    del dsm_full
+
+    _write_table('nDSM', [ndsm_full], full_h, full_w, full_tf,
+                 descs=['Normalised DSM (m)'])
+    del ndsm_full
+
+    _write_table('segment_type', [seg_type_full], full_h, full_w, full_tf,
+                 dtype='uint8', descs=['Object type code'])
+    del seg_type_full
+
+    _write_table('segment_height', [seg_height_full], full_h, full_w, full_tf,
+                 descs=['Segment height (m)'])
+    del seg_height_full
+
+    # ------------------------------------------------------------------
+    # Multi-date DTM/DSM: one layer per additional date
+    # ------------------------------------------------------------------
+    import tile_index as _ti
+    import raster_io as _rio
+    other_dates = sorted(d for d in _ti.DATASETS if d != _ti.DEFAULT_DATASET)
+    for date_key in other_dates:
+        year = _ti.dataset_to_year(date_key)
+        dtm_extra = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        dsm_extra = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        any_data = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            th, tw = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
             try:
-                lname = f"segments_t{ti_idx+1}" if multi else "segments"
-                _write_segment_vectors(
-                    out_path, tr["labels"], all_objects,
-                    tr.get("mask", np.ones(tr["shape"], dtype=bool)),
-                    tr["transform"], layer_name=lname, obs_year=obs_year)
+                d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
+                dtm_extra[row_off:r_end, col_off:c_end] = d2["dtm"][:th_eff, :tw_eff].astype(np.float32)
+                dsm_extra[row_off:r_end, col_off:c_end] = d2["dsm"][:th_eff, :tw_eff].astype(np.float32)
+                any_data = True
+                del d2
+            except Exception:
+                pass
+        if any_data:
+            _write_table(f'DTM_{year}', [dtm_extra], full_h, full_w, full_tf,
+                         descs=[f'DTM {year} (m)'])
+            _write_table(f'DSM_{year}', [dsm_extra], full_h, full_w, full_tf,
+                         descs=[f'DSM {year} (m)'])
+            log.info("  FULL_GPKG: DTM/DSM %d written", year)
+        del dtm_extra, dsm_extra
+
+    # ------------------------------------------------------------------
+    # Ortho + CIR: one layer per available ortho year
+    # ------------------------------------------------------------------
+    import ortho_io as _oio
+    import concurrent.futures as _cf
+    # Ortho year slots: map ortho_year → read_ortho_for_als year param
+    _ORTHO_YEARS = {2024: 2024, 2023: 2023, 2020: 2020}
+
+    def _stitch_ortho_for_year(o_year):
+        """Read ortho per tile for a given year, stitch into full-KG."""
+        ortho_arr = np.zeros((4, full_h, full_w), dtype=np.uint8)
+        got_rgb = False
+        got_nir = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            th, tw = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+            try:
+                tdata = _read_dtm_for_tile(tr)
+                with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                    fut = _ex.submit(_oio.read_ortho_for_als, tdata, year=o_year)
+                    rgb_t, nir_t = fut.result(timeout=180)
+                del tdata
+                if rgb_t is not None:
+                    got_rgb = True
+                    for b in range(3):
+                        ortho_arr[b, row_off:r_end, col_off:c_end] = rgb_t[b][:th_eff, :tw_eff]
+                    if nir_t is not None:
+                        got_nir = True
+                        ortho_arr[3, row_off:r_end, col_off:c_end] = nir_t[:th_eff, :tw_eff]
             except Exception as e:
-                log.warning("Full GPKG vectors tile %d failed: %s", ti_idx+1, e)
+                log.warning("GPKG tile %d ortho yr=%d failed: %s", ti_idx + 1, o_year, e)
+        return ortho_arr, got_rgb, got_nir
+
+    for o_year in sorted(_ORTHO_YEARS.keys(), reverse=True):  # newest first
+        try:
+            ortho_full, got_rgb, got_nir = _stitch_ortho_for_year(_ORTHO_YEARS[o_year])
+            if got_rgb:
+                bands = [ortho_full[0], ortho_full[1], ortho_full[2]]
+                descs = ['Red', 'Green', 'Blue']
+                if got_nir:
+                    bands.append(ortho_full[3])
+                    descs.append('NIR')
+                _write_table(f'Ortho_{o_year}', bands, full_h, full_w, full_tf,
+                             dtype='uint8', descs=descs)
+                if got_nir:
+                    _write_table(f'CIR_{o_year}',
+                                 [ortho_full[3], ortho_full[0], ortho_full[1]],
+                                 full_h, full_w, full_tf, dtype='uint8',
+                                 descs=['NIR\u2192Red', 'Red\u2192Green', 'Green\u2192Blue'])
+                log.info("  FULL_GPKG: Ortho+CIR %d written (NIR=%s)", o_year, got_nir)
+            else:
+                log.info("  FULL_GPKG: no ortho data for year %d", o_year)
+            del ortho_full
+        except Exception as e:
+            log.warning("FULL_GPKG: ortho year %d failed: %s", o_year, e)
+
+    # ------------------------------------------------------------------
+    # Segment vectors — one unified layer from stitched labels
+    # ------------------------------------------------------------------
+    if all_objects and tile_seg_results:
+        try:
+            mask_full = labels_full > 0
+            _write_segment_vectors(
+                out_path, labels_full, all_objects,
+                mask_full, full_tf, layer_name='segments', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Full GPKG segment vectors failed: %s", e)
+    del labels_full
 
     # Segment centroid points — one layer with all objects
     if all_objects:
@@ -1734,17 +2158,28 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
         except Exception as e:
             log.warning("Full GPKG segment points failed: %s", e)
 
+    # Write QGIS styles for all layers (raster + vector)
+    try:
+        _write_gpkg_all_styles(
+            out_path,
+            has_segments=bool(all_objects),
+            has_points=bool(all_objects),
+        )
+    except Exception as e:
+        log.warning("Full GPKG styles failed: %s", e)
+
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
-             fsize/1e6, table_count, len(tile_seg_results))
+             fsize / 1e6, table_count, len(tile_seg_results))
     return out_path
 
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
                            obs_year=0):
-    """Light GPKG: segment raster per tile + enriched cadastre vectors."""
+    """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
     import rasterio, fiona
+    import rasterio.transform
     from fiona.crs import from_epsg
 
     out_path = str(GPKG_DIR / f"{kg_code}_light.gpkg")
@@ -1752,6 +2187,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
 
     table_count = 0
     _GPKG_NODATA_L = -9999.0
+
     def _write_raster(name, arrays, h, w, tf, dtype='uint8', descs=None):
         nonlocal table_count
         opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
@@ -1769,30 +2205,80 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         table_count += 1
 
     obj_map = {o.obj_id: o for o in all_objects}
-    multi = len(tile_seg_results) > 1
 
-    for ti_idx, tr in enumerate(tile_seg_results):
-        th, tw = tr["shape"]
-        tf = tr["transform"]
-        sfx = f"_t{ti_idx+1}" if multi else ""
-        if tr.get("labels") is not None:
-            labels = tr["labels"]
-            type_raster = np.zeros((th, tw), dtype=np.uint8)
-            for uid in np.unique(labels):
-                if uid == 0: continue
-                obj = obj_map.get(int(uid))
-                if obj: type_raster[labels == uid] = obj.type_code
-            _write_raster(f'segment_type{sfx}', [type_raster], th, tw, tf,
-                          descs=['Object type code'])
-        # Segment vectors
-        try:
-            lname = f"segments_t{ti_idx+1}" if multi else "segments"
-            _write_segment_vectors(
-                out_path, tr["labels"], all_objects,
-                tr.get("mask", np.ones(tr["shape"], dtype=bool)),
-                tr["transform"], layer_name=lname, obs_year=obs_year)
-        except Exception:
-            pass
+    # ------------------------------------------------------------------
+    # Stitch segment rasters across all tiles into full-KG extent
+    # ------------------------------------------------------------------
+    if tile_seg_results:
+        all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
+        all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
+        all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
+        all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
+        full_left = min(all_lefts)
+        full_bottom = min(all_bottoms)
+        full_right = max(all_rights)
+        full_top = max(all_tops)
+
+        res = 1.0  # 1m resolution
+        full_w = int(round((full_right - full_left) / res))
+        full_h = int(round((full_top - full_bottom) / res))
+        full_tf = rasterio.transform.from_bounds(
+            full_left, full_bottom, full_right, full_top, full_w, full_h)
+
+        # Allocate full-KG rasters for segments
+        seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+
+        # Paint each tile
+        for ti_idx, tr in enumerate(tile_seg_results):
+            th, tw = tr["shape"]
+            tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+
+            if tr.get("labels") is not None:
+                labels_tile = tr["labels"][:th_eff, :tw_eff]
+                labels_full[row_off:r_end, col_off:c_end] = labels_tile.astype(np.int32)
+
+                type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
+                for uid in np.unique(labels_tile):
+                    if uid == 0: continue
+                    obj = obj_map.get(int(uid))
+                    if obj: type_tile[labels_tile == uid] = obj.type_code
+                seg_type_full[row_off:r_end, col_off:c_end] = type_tile
+
+            if tr.get("ndsm") is not None:
+                seg_height_full[row_off:r_end, col_off:c_end] = \
+                    tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+
+        # Write stitched segment rasters
+        _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
+                      descs=['Object type code'])
+        del seg_type_full
+
+        _write_raster('segment_height', [seg_height_full], full_h, full_w, full_tf,
+                      dtype='float32', descs=['Segment height (m)'])
+        del seg_height_full
+
+        # Segment vectors — one unified layer from stitched labels
+        if all_objects:
+            try:
+                mask_full = labels_full > 0
+                _write_segment_vectors(
+                    out_path, labels_full, all_objects,
+                    mask_full, full_tf, layer_name='segments', obs_year=obs_year)
+            except Exception as e:
+                log.warning("Light GPKG segment vectors failed: %s", e)
+        del labels_full
 
     # --- Pre-load DTM data once per tile for GPKG parcel/building enrichment ---
     _gpkg_tile_data = {}  # ti_idx → tdata
@@ -3458,24 +3944,31 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
     else:
         try:
             import re as _re
-            expected_layers = ["DTM", "DSM", "nDSM", "segment_type"]
+            expected_raster = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
             found_layers = set()
-            # List all GPKG raster tables (tiles + 2d-gridded-coverage)
             try:
                 import sqlite3
                 conn = sqlite3.connect(full_path)
                 tables = [r[0] for r in conn.execute(
                     "SELECT table_name FROM gpkg_contents "
                     "WHERE data_type IN ('tiles', '2d-gridded-coverage')").fetchall()]
+                vector_tabs = [r[0] for r in conn.execute(
+                    "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
                 conn.close()
                 found_layers = set(tables)
             except Exception:
-                pass
-            # Check for each expected base layer: exact name or tiled variant {name}_t{N}
-            for layer in expected_layers:
-                pat = _re.compile(rf'^{_re.escape(layer)}(_t\d+)?$')
-                if not any(pat.match(t) for t in found_layers):
-                    issues.append(f"FULL_GPKG: missing raster layer '{layer}' (or tiled '{layer}_tN')")
+                vector_tabs = []
+            # Check required raster layers (stitched single layers)
+            for layer in expected_raster:
+                if layer not in found_layers:
+                    issues.append(f"FULL_GPKG: missing raster layer '{layer}'")
+            # Ortho is optional but note if missing
+            has_ortho = any(t.startswith('Ortho_') for t in found_layers)
+            if not has_ortho:
+                log.info("  FULL_GPKG: no ortho layer (may not be available for this KG)")
+            # Check segments vector layer
+            if 'segments' not in vector_tabs:
+                issues.append("FULL_GPKG: missing vector layer 'segments'")
             fsize = os.path.getsize(full_path)
             if fsize < 10_000:
                 issues.append(f"FULL_GPKG: suspiciously small ({fsize} bytes)")
@@ -3501,15 +3994,15 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                 "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
             conn.close()
 
-            # segment_type raster: exact name or tiled variant
-            seg_type_pat = _re.compile(r'^segment_type(_t\d+)?$')
-            if not any(seg_type_pat.match(t) for t in raster_tables):
-                issues.append("LIGHT_GPKG: missing segment_type raster (or tiled 'segment_type_tN')")
+            # segment_type and segment_height rasters (stitched single layers)
+            if 'segment_type' not in raster_tables:
+                issues.append("LIGHT_GPKG: missing segment_type raster")
+            if 'segment_height' not in raster_tables:
+                issues.append("LIGHT_GPKG: missing segment_height raster")
 
-            # segments vector: exact name or tiled variant
-            seg_vec_pat = _re.compile(r'^segments(_t\d+)?$')
-            if not any(seg_vec_pat.match(t) for t in vector_tables):
-                issues.append("LIGHT_GPKG: missing vector layer 'segments' (or tiled 'segments_tN')")
+            # segments vector (single stitched layer)
+            if 'segments' not in vector_tables:
+                issues.append("LIGHT_GPKG: missing vector layer 'segments'")
 
             # parcels is always a single (non-tiled) layer
             if "parcels" not in vector_tables:
@@ -3518,19 +4011,12 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             # Count features in vector layers
             try:
                 import fiona
-                segment_layer_counts = {}  # track segment tile emptiness
                 for vt in vector_tables:
                     with fiona.open(light_path, layer=vt) as src:
                         n = len(src)
                         log.info("  LIGHT_GPKG: layer '%s' → %d features", vt, n)
-                        if seg_vec_pat.match(vt):
-                            segment_layer_counts[vt] = n
-                        elif n == 0:
-                            # Non-segment layers: warn individually
+                        if n == 0:
                             issues.append(f"LIGHT_GPKG: layer '{vt}' is empty")
-                # For segment layers, only warn if ALL are empty
-                if segment_layer_counts and all(c == 0 for c in segment_layer_counts.values()):
-                    issues.append(f"LIGHT_GPKG: all segment layers are empty ({', '.join(sorted(segment_layer_counts))})")
             except Exception as e:
                 issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
 
@@ -3869,6 +4355,25 @@ def cleanup_json_dir():
         log.info("JSON cleanup: deleted %s", f.name)
 
 
+def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "completed"):
+    """Append completed/failed KG tile positions to tile_history.json."""
+    try:
+        history = {}
+        if TILE_HISTORY_FILE.exists():
+            history = json.loads(TILE_HISTORY_FILE.read_text())
+        if status == "completed" and tile_statuses:
+            history[kg_code] = [[round(t["lat"], 5), round(t["lng"], 5)]
+                                for t in tile_statuses if "lat" in t and "lng" in t]
+        else:
+            history[kg_code] = status  # "failed"
+        tmp = str(TILE_HISTORY_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(history, f)
+        os.rename(tmp, str(TILE_HISTORY_FILE))
+    except Exception as e:
+        log.warning("Failed to save tile history for %s: %s", kg_code, e)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -4145,6 +4650,14 @@ def main():
         except Exception:
             pass
 
+        # --- Disk space check before starting KG ---
+        if not check_disk_space(kg_code):
+            progress.add_log("error", f"Disk critically low — pausing processor", kg_code)
+            progress.update(state="paused_disk")
+            progress.save()
+            log.error("Disk critically low after cleanup — pausing")
+            break
+
         progress.set_current_kg(kg_code, kg_name, kg_state, "starting")
         progress.add_log("info", f"Starting KG {kg_code} ({kg_name})", kg_code)
         progress.save()
@@ -4344,6 +4857,11 @@ def main():
                                                  f"KG {kg_code} tile {timed_out_tile} timed out after all retries",
                                                  kg_code)
                                 progress.save()
+                                # Persist tile dots for timed-out KG
+                                with progress._lock:
+                                    _ckg = progress._state.get("current_kg") or {}
+                                    _ts = _ckg.get("tile_statuses", [])
+                                _save_tile_history(kg_code, _ts, "failed")
                                 result = None
                                 break
 
@@ -4373,6 +4891,11 @@ def main():
                                              f"KG {kg_code} timed out at {last_step}, can't identify tile",
                                              kg_code)
                             progress.save()
+                            # Persist tile dots for timed-out KG
+                            with progress._lock:
+                                _ckg = progress._state.get("current_kg") or {}
+                                _ts = _ckg.get("tile_statuses", [])
+                            _save_tile_history(kg_code, _ts, "failed")
                             result = None
                             break
 
@@ -4449,6 +4972,11 @@ def main():
                     f"quality={_qs:.0%} {_qg})",
                     kg_code,
                 )
+                # Persist tile dots for completed KG
+                with progress._lock:
+                    _ckg = progress._state.get("current_kg") or {}
+                    _ts = _ckg.get("tile_statuses", [])
+                _save_tile_history(kg_code, _ts, "completed")
             else:
                 # --- Copernicus credits exhausted? Don't mark as permanently failed ---
                 is_credits_issue = (result.get("copernicus_exhausted")
@@ -4487,11 +5015,21 @@ def main():
 
                     log.warning("KG %s: FAILED at %s: %s",
                                 kg_code, result.get("step"), result.get("error"))
+                    # Persist tile dots for failed KG
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "failed")
 
         except Exception as e:
             progress.add_failure(kg_code, kg_name, str(e), "exception")
             progress.add_log("error", f"KG {kg_code} exception: {e}", kg_code)
             log.error("KG %s: EXCEPTION: %s", kg_code, traceback.format_exc())
+            # Persist tile dots for exceptioned KG
+            with progress._lock:
+                _ckg = progress._state.get("current_kg") or {}
+                _ts = _ckg.get("tile_statuses", [])
+            _save_tile_history(kg_code, _ts, "failed")
 
         # Cleanup
         if IN_PROGRESS_FILE.exists():

@@ -378,7 +378,7 @@ let _lastPulseKey = null;
 let _tilesFitted = false;
 let _fittedKgCode = null;
 let _lastCurrentKgCode = null;  // track KG transitions
-let _kgHistory = {};            // kgCode -> {tiles: [...], status: 'completed'|'failed'}
+let _lastTileHistoryCount = 0;  // cache to avoid redrawing every poll
 let lastTileFetch = 0;
 let prevLogHash = '';
 let kgTimerStart = null;
@@ -437,25 +437,29 @@ function updateMap(d) {
 }
 
 // Render accumulated history dots (completed & failed KGs)
-function renderHistoryDots() {
-  if (!map || !historyDotsLayer) return;
+// Render persisted tile history from server (tile_history.json)
+// Only redraws when the number of KGs in history changes.
+function renderServerHistoryDots(tileHistory) {
+  if (!map || !historyDotsLayer || !tileHistory) return;
+  const keys = Object.keys(tileHistory);
+  // Skip redraw if count hasn't changed (same set of KGs)
+  if (keys.length === _lastTileHistoryCount) return;
+  _lastTileHistoryCount = keys.length;
   historyDotsLayer.clearLayers();
-  Object.entries(_kgHistory).forEach(([kgCode, entry]) => {
-    const isCompleted = entry.status === 'completed';
-    const isFailed = entry.status === 'failed';
-    entry.tiles.forEach(t => {
-      let col, opacity, cls;
-      if (isFailed) {
-        col = '#f85149'; opacity = 0.7; cls = 'tile-dot tile-dot-failed';
-      } else {
-        // completed — green with white glow
-        col = '#3fb950'; opacity = 0.85; cls = 'tile-dot tile-dot-completed';
-      }
-      const m = L.circleMarker([t.lat, t.lng], {
-        radius: 1.5, fillColor: col, fillOpacity: opacity,
-        stroke: false, className: cls
+  keys.forEach(kgCode => {
+    const val = tileHistory[kgCode];
+    const isFailed = (typeof val === 'string');  // "failed" string vs array of coords
+    const tiles = isFailed ? [] : val;
+    if (isFailed) {
+      // No tile positions for failed KGs — nothing to draw
+      return;
+    }
+    tiles.forEach(pos => {
+      const m = L.circleMarker([pos[0], pos[1]], {
+        radius: 1.5, fillColor: '#3fb950', fillOpacity: 0.85,
+        stroke: false, className: 'tile-dot tile-dot-completed'
       });
-      m.bindTooltip(kgCode + ' — ' + entry.status, {className: 'dark-tooltip'});
+      m.bindTooltip(kgCode + ' — completed', {className: 'dark-tooltip'});
       historyDotsLayer.addLayer(m);
     });
   });
@@ -467,22 +471,6 @@ function updateTileDots(d) {
   const currentKgCode = kg && kg.code;
   const tiles = kg && kg.tile_statuses;
 
-  // Detect KG transition: if the current KG changed, archive the previous one
-  if (_lastCurrentKgCode && _lastCurrentKgCode !== currentKgCode) {
-    // Previous KG is no longer current — check if it was completed or failed
-    // Look in failed_kgs list to determine status
-    const failedCodes = (d.failed_kgs || []).map(f => f.code);
-    const prevStatus = failedCodes.includes(_lastCurrentKgCode) ? 'failed' : 'completed';
-    // Only archive if we have tile data for it (from our snapshot)
-    if (_kgHistory[_lastCurrentKgCode] && _kgHistory[_lastCurrentKgCode]._snapshot) {
-      _kgHistory[_lastCurrentKgCode] = {
-        tiles: _kgHistory[_lastCurrentKgCode]._snapshot,
-        status: prevStatus
-      };
-    }
-    renderHistoryDots();
-  }
-
   // Track current KG code
   _lastCurrentKgCode = currentKgCode;
 
@@ -492,12 +480,6 @@ function updateTileDots(d) {
     if (pulseMarker) { map.removeLayer(pulseMarker); pulseMarker = null; _lastPulseKey = null; }
     _tilesFitted = false;
     return;
-  }
-
-  // Snapshot tile positions for the current KG (so we can archive them later)
-  if (currentKgCode) {
-    if (!_kgHistory[currentKgCode]) _kgHistory[currentKgCode] = {};
-    _kgHistory[currentKgCode]._snapshot = tiles.map(t => ({lat: t.lat, lng: t.lng}));
   }
 
   // Clear and redraw the current KG's active tile dots
@@ -1015,6 +997,7 @@ async function poll() {
     updateControls(d);
     updateMap(d);
     updateTileDots(d);
+    renderServerHistoryDots(d.tile_history || {});
     updateLastKg(d);
     // Refresh tile overlays every 10s
     if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();

@@ -515,14 +515,15 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
 # === SECTION: Cadastre data fetching (REST API calls) ===
 
 def fetch_cadastre_data(kg_code: str) -> dict:
-    """Fetch parcels, building footprints, landuse from cadastre API."""
+    """Fetch parcels, building footprints, buildings (addresses), landuse from cadastre API."""
     result = {"parcels": [], "building_footprints": [], "landuse": [],
-              "parcels_geojson": [], "buildings_geojson": []}
+              "parcels_geojson": [], "buildings_geojson": [],
+              "building_addresses": []}
     try:
         resp = requests.get(
             f"{CADASTRE_BASE}/export/geojson",
             params={"kg": kg_code,
-                    "layers": "parcels,building_footprints,landuse_polygons",
+                    "layers": "parcels,building_footprints,buildings,landuse_polygons",
                     "include_geometry": "true"},
             timeout=120,
         )
@@ -566,6 +567,27 @@ def fetch_cadastre_data(kg_code: str) -> dict:
                 "properties": f.get("properties", {}),
             })
             result["buildings_geojson"].append(f)
+        except Exception:
+            continue
+
+    # Parse building address points (for joining to footprints)
+    bld_fc = data.get("buildings", {}).get("features", [])
+    for f in bld_fc:
+        try:
+            geom = shapely_shape(f["geometry"])
+            if geom.is_empty:
+                continue
+            geom_3035 = transform_to_3035(geom)
+            props = f.get("properties", {})
+            result["building_addresses"].append({
+                "geometry_3035": geom_3035,
+                "building_id": props.get("building_id", ""),
+                "full_address": props.get("full_address", ""),
+                "house_number": props.get("house_number", ""),
+                "street": props.get("street", ""),
+                "postal_code": props.get("postal_code", ""),
+                "location": props.get("location", ""),
+            })
         except Exception:
             continue
 
@@ -3286,7 +3308,31 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     bldgs = cadastre_data["building_footprints"]
     if bldgs:
         from rasterio.features import rasterize as rio_rasterize
+        # Build address lookup for GPKG building enrichment
+        _addr_list_gpkg = cadastre_data.get("building_addresses", [])
+        _addr_lk = {}
+        for a in _addr_list_gpkg:
+            ag = a.get("geometry_3035")
+            if ag:
+                key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)
+                _addr_lk.setdefault(key, []).append(a)
+
+        def _find_addr_gpkg(c3, max_dist=30):
+            cx, cy = c3.x, c3.y
+            best, best_d = None, max_dist
+            for dx in (-10, 0, 10):
+                for dy in (-10, 0, 10):
+                    key = (round((cx+dx)/10)*10, round((cy+dy)/10)*10)
+                    for a in _addr_lk.get(key, []):
+                        d = c3.distance(a["geometry_3035"])
+                        if d < best_d:
+                            best, best_d = a, d
+            return best
+
         schema_b = {'geometry': 'MultiPolygon', 'properties': [
+            ('building_id', 'str'), ('ns', 'int'),
+            ('full_address', 'str'), ('house_number', 'str'),
+            ('street', 'str'), ('postal_code', 'str'), ('location', 'str'),
             ('max_height_m', 'float'), ('mean_height_m', 'float'),
             ('dsm_std', 'float'), ('roof_type_hint', 'str'),
             ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
@@ -3296,10 +3342,25 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             for b in bldgs:
                 geom_3035 = b["geometry"]
                 geom_wgs = b["geometry_wgs"]
-                props = {"max_height_m": None, "mean_height_m": None, "dsm_std": None,
+                bp = b.get("properties", {})
+                props = {"building_id": "", "ns": None,
+                         "full_address": "", "house_number": "",
+                         "street": "", "postal_code": "", "location": "",
+                         "max_height_m": None, "mean_height_m": None, "dsm_std": None,
                          "roof_type_hint": "", "stories_est": None,
                          "footprint_area_sqm": round(float(geom_3035.area), 1),
                          "centroid_lon": None, "centroid_lat": None}
+                if bp.get("ns"): props["ns"] = bp["ns"]
+                try:
+                    c3 = geom_3035.centroid
+                    addr = _find_addr_gpkg(c3)
+                    if addr:
+                        props["building_id"] = addr.get("building_id", "")
+                        for ak in ("full_address", "house_number", "street", "postal_code", "location"):
+                            v = addr.get(ak, "")
+                            if v: props[ak] = v
+                except Exception:
+                    pass
                 try:
                     c3 = geom_3035.centroid
                     c_wgs = transform_to_wgs(c3)
@@ -3777,16 +3838,51 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
         "details": parcel_details}
     # --- Per-building detail ---
+    # Build spatial lookup for address points → join to footprints
+    _addr_list = cadastre_data.get("building_addresses", [])
+    _addr_lookup = {}  # keyed by (rounded_x, rounded_y) → list of addr dicts
+    for a in _addr_list:
+        ag = a.get("geometry_3035")
+        if ag:
+            key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)  # 10m grid
+            _addr_lookup.setdefault(key, []).append(a)
+
+    def _find_address(centroid_3035, max_dist=30):
+        """Find nearest address point within max_dist metres of a footprint centroid."""
+        cx, cy = centroid_3035.x, centroid_3035.y
+        best, best_d = None, max_dist
+        # Search 3x3 grid cells around centroid
+        for dx in (-10, 0, 10):
+            for dy in (-10, 0, 10):
+                key = (round((cx + dx) / 10) * 10, round((cy + dy) / 10) * 10)
+                for a in _addr_lookup.get(key, []):
+                    d = centroid_3035.distance(a["geometry_3035"])
+                    if d < best_d:
+                        best, best_d = a, d
+        return best
+
     bld_details = []
     n_bld_no_tile = 0
     for b in cadastre_data["building_footprints"]:
         bd = {}; geom_3035 = b["geometry"]; props = b.get("properties",{})
         bd["building_id"] = props.get("building_id", props.get("id",""))
         bd["footprint_area_sqm"] = round(float(geom_3035.area), 1)
+        # Nutzungssymbol from footprint layer
+        if props.get("ns"): bd["ns"] = props["ns"]
         try:
             cw = transform_to_wgs(geom_3035.centroid)
             bd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
         except Exception: pass
+        # Join nearest address point
+        try:
+            addr = _find_address(geom_3035.centroid)
+            if addr:
+                if addr.get("building_id"): bd["building_id"] = addr["building_id"]
+                for ak in ("full_address", "house_number", "street", "postal_code", "location"):
+                    v = addr.get(ak, "")
+                    if v: bd[ak] = v
+        except Exception:
+            pass
         try:
             c3 = geom_3035.centroid
             tr, tdata = _find_tile_with_data(c3.x, c3.y)

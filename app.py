@@ -1059,6 +1059,125 @@ def api_parcel(parcel_id):
     return jsonify({'error': f'Parcel {parcel_id} not found'}), 404
 
 
+# === SECTION: GPKG detail lazy-load endpoints ===
+
+def _parse_bbox_param(s):
+    """Parse 'w,s,e,n' bbox string to tuple, or None."""
+    if not s:
+        return None
+    try:
+        parts = [float(x) for x in s.split(',')]
+        if len(parts) == 4:
+            return tuple(parts)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+@app.route('/api/v1/kg/<kg_code>/buildings')
+def api_kg_buildings(kg_code):
+    """Height-enriched building footprints from the light GPKG.
+    Lazy-loads from Zenodo if not cached locally.
+
+    Params: bbox=w,s,e,n  limit=N  offset=N
+    """
+    try:
+        idx = si.get_index()
+        bbox = _parse_bbox_param(request.args.get('bbox'))
+        limit = min(int(request.args.get('limit', 500)), 5000)
+        offset = int(request.args.get('offset', 0))
+        result = idx.query_buildings(kg_code, bbox=bbox, limit=limit, offset=offset)
+        if result is None:
+            return jsonify({'error': f'No building data available for KG {kg_code}'}), 404
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_kg_buildings %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>/new_buildings')
+def api_kg_new_buildings(kg_code):
+    """Detected new buildings from the light GPKG.
+
+    Params: bbox=w,s,e,n  limit=N  offset=N
+    """
+    try:
+        idx = si.get_index()
+        bbox = _parse_bbox_param(request.args.get('bbox'))
+        limit = min(int(request.args.get('limit', 500)), 5000)
+        offset = int(request.args.get('offset', 0))
+        result = idx.query_new_buildings_detail(kg_code, bbox=bbox, limit=limit, offset=offset)
+        if result is None:
+            return jsonify({'error': f'No new building data available for KG {kg_code}'}), 404
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_kg_new_buildings %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>/infrastructure')
+def api_kg_infrastructure(kg_code):
+    """Detected infrastructure from the light GPKG.
+
+    Params: bbox=w,s,e,n  limit=N  offset=N
+    """
+    try:
+        idx = si.get_index()
+        bbox = _parse_bbox_param(request.args.get('bbox'))
+        limit = min(int(request.args.get('limit', 500)), 5000)
+        offset = int(request.args.get('offset', 0))
+        result = idx.query_infrastructure_detail(kg_code, bbox=bbox, limit=limit, offset=offset)
+        if result is None:
+            return jsonify({'error': f'No infrastructure data available for KG {kg_code}'}), 404
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_kg_infrastructure %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>/segments')
+def api_kg_segments(kg_code):
+    """Segment polygons from the light GPKG.
+
+    Params: bbox=w,s,e,n  type=t1,t2,...  limit=N  offset=N
+    """
+    try:
+        idx = si.get_index()
+        bbox = _parse_bbox_param(request.args.get('bbox'))
+        type_str = request.args.get('type', '')
+        type_filter = [t.strip() for t in type_str.split(',') if t.strip()] or None
+        limit = min(int(request.args.get('limit', 500)), 5000)
+        offset = int(request.args.get('offset', 0))
+        result = idx.query_segments_detail(kg_code, bbox=bbox, type_filter=type_filter,
+                                           limit=limit, offset=offset)
+        if result is None:
+            return jsonify({'error': f'No segment data available for KG {kg_code}'}), 404
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_kg_segments %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>/layers')
+def api_kg_layers(kg_code):
+    """List available vector layers in a KG's GPKG.
+
+    Params: variant=light|full (default: light)
+    """
+    try:
+        idx = si.get_index()
+        variant = request.args.get('variant', 'light')
+        if variant not in ('light', 'full'):
+            return jsonify({'error': 'variant must be light or full'}), 400
+        result = idx.gpkg_layers(kg_code, variant=variant)
+        if result is None:
+            return jsonify({'error': f'No GPKG available for KG {kg_code}'}), 404
+        return jsonify({'kg_code': kg_code, 'variant': variant, 'layers': result})
+    except Exception as e:
+        log.warning('api_kg_layers %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/query')
 def api_query():
     """Unified query endpoint. Supports multiple query modes via params.

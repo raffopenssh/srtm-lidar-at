@@ -749,6 +749,109 @@ class SearchIndex:
         return [self._kg_summary(r) for r in rows]
 
     # ════════════════════════════════════════════════════════════════
+    # Lazy-load detail from light GPKG (Zenodo or local)
+    # ════════════════════════════════════════════════════════════════
+
+    def query_buildings(self, kg_code, bbox=None, limit=500, offset=0):
+        """Return height-enriched building footprints for a KG.
+        Lazy-loads the light GPKG from Zenodo if needed."""
+        gpkg = self._resolve_gpkg(kg_code, 'light')
+        if not gpkg:
+            return None
+        return _query_gpkg_layer(gpkg, 'buildings', bbox=bbox, limit=limit, offset=offset)
+
+    def query_new_buildings_detail(self, kg_code, bbox=None, limit=500, offset=0):
+        """Return detected new building footprints for a KG."""
+        gpkg = self._resolve_gpkg(kg_code, 'light')
+        if not gpkg:
+            return None
+        return _query_gpkg_layer(gpkg, 'new_buildings', bbox=bbox, limit=limit, offset=offset)
+
+    def query_infrastructure_detail(self, kg_code, bbox=None, limit=500, offset=0):
+        """Return detected infrastructure for a KG."""
+        gpkg = self._resolve_gpkg(kg_code, 'light')
+        if not gpkg:
+            return None
+        return _query_gpkg_layer(gpkg, 'infrastructure', bbox=bbox, limit=limit, offset=offset)
+
+    def query_segments_detail(self, kg_code, bbox=None, type_filter=None,
+                              limit=500, offset=0):
+        """Return segment polygons for a KG, optionally filtered by type."""
+        gpkg = self._resolve_gpkg(kg_code, 'light')
+        if not gpkg:
+            return None
+        return _query_gpkg_layer(gpkg, 'segments', bbox=bbox,
+                                 type_filter=type_filter, limit=limit, offset=offset)
+
+    def query_segment_points(self, kg_code, bbox=None, type_filter=None,
+                             limit=500, offset=0):
+        """Return segment centroid points for a KG."""
+        gpkg = self._resolve_gpkg(kg_code, 'light')
+        if not gpkg:
+            # Try full GPKG which has segment_points
+            gpkg = self._resolve_gpkg(kg_code, 'full')
+            if not gpkg:
+                return None
+        return _query_gpkg_layer(gpkg, 'segment_points', bbox=bbox,
+                                 type_filter=type_filter, limit=limit, offset=offset)
+
+    def gpkg_layers(self, kg_code, variant='light'):
+        """List available vector layers in a KG's GPKG."""
+        gpkg = self._resolve_gpkg(kg_code, variant)
+        if not gpkg:
+            return None
+        try:
+            import fiona
+            layers = fiona.listlayers(gpkg)
+            result = []
+            for l in layers:
+                try:
+                    with fiona.open(gpkg, layer=l) as src:
+                        result.append({
+                            'name': l,
+                            'count': len(src),
+                            'geometry_type': src.schema.get('geometry'),
+                            'properties': list(src.schema.get('properties', {}).keys()),
+                        })
+                except Exception:
+                    result.append({'name': l, 'count': 0, 'geometry_type': None, 'properties': []})
+            return result
+        except Exception as e:
+            log.warning('gpkg_layers %s %s: %s', kg_code, variant, e)
+            return None
+
+    def _resolve_gpkg(self, kg_code, variant='light'):
+        """Find or download a GPKG for a KG. Returns local path or None.
+
+        Search order:
+        1. Local processor output  (data/austria_processor/gpkg/)
+        2. GPKG cache              (data/gpkg_cache/)
+        3. Download from Zenodo    (cached for future use)
+        """
+        # 1. Local processor output
+        local = Path(f'data/austria_processor/gpkg/{kg_code}_{variant}.gpkg')
+        if local.exists() and local.stat().st_size > 0:
+            return str(local)
+
+        # 2. GPKG cache
+        cache = get_gpkg_cache()
+        cached = cache.get(kg_code, variant)
+        if cached:
+            return cached
+
+        # 3. Zenodo URL from index
+        c = self._conn()
+        col = f'zenodo_{variant}_gpkg_url'
+        row = c.execute(f'SELECT {col} FROM kg WHERE kg_code=?', (kg_code,)).fetchone()
+        if not row or not row[0]:
+            return None
+        url = row[0]
+
+        # Download in background? No — caller needs it now. Download synchronously.
+        path = cache.download(kg_code, variant, url)
+        return path
+
+    # ════════════════════════════════════════════════════════════════
     # Helpers
     # ════════════════════════════════════════════════════════════════
 
@@ -764,6 +867,157 @@ def _zenodo_url(entry):
     if not entry or not entry.get('bucket_url'):
         return None
     return f"{entry['bucket_url']}/{entry['filename']}"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# GPKG lazy-load cache
+# ════════════════════════════════════════════════════════════════════════
+
+GPKG_CACHE_DIR = 'data/gpkg_cache'
+GPKG_CACHE_MAX_BYTES = 1_000_000_000  # 1 GB
+
+
+class GpkgCache:
+    """LRU disk cache for light/full GPKGs downloaded from Zenodo."""
+
+    def __init__(self, cache_dir=GPKG_CACHE_DIR, max_bytes=GPKG_CACHE_MAX_BYTES):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+
+    def _path(self, kg_code, variant):
+        return self.cache_dir / f'{kg_code}_{variant}.gpkg'
+
+    def get(self, kg_code, variant='light'):
+        """Return cached path if it exists, else None. Touch for LRU."""
+        p = self._path(kg_code, variant)
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                p.touch()  # update mtime for LRU
+            except OSError:
+                pass
+            return str(p)
+        return None
+
+    def download(self, kg_code, variant, url):
+        """Download a GPKG from Zenodo. Returns local path or None."""
+        import urllib.request
+        with self._lock:
+            # Double-check after lock
+            existing = self.get(kg_code, variant)
+            if existing:
+                return existing
+            self._evict_if_needed()
+            dest = self._path(kg_code, variant)
+            tmp = dest.with_suffix('.gpkg.tmp')
+            try:
+                log.info('gpkg_cache: downloading %s %s from %s', kg_code, variant, url[:80])
+                req = urllib.request.Request(url, headers={'User-Agent': 'srtm-lidar/1.0'})
+                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                tmp.rename(dest)
+                log.info('gpkg_cache: cached %s (%d MB)', dest.name, dest.stat().st_size // (1024*1024))
+                return str(dest)
+            except Exception as e:
+                log.warning('gpkg_cache: download failed %s %s: %s', kg_code, variant, e)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+
+    def _evict_if_needed(self):
+        """Remove oldest files until under max_bytes."""
+        files = sorted(self.cache_dir.glob('*.gpkg'), key=lambda p: p.stat().st_mtime)
+        total = sum(f.stat().st_size for f in files)
+        while total > self.max_bytes and files:
+            victim = files.pop(0)
+            sz = victim.stat().st_size
+            try:
+                victim.unlink()
+                total -= sz
+                log.info('gpkg_cache: evicted %s (%d MB)', victim.name, sz // (1024*1024))
+            except OSError:
+                pass
+
+    def size_bytes(self):
+        """Total cache size."""
+        return sum(f.stat().st_size for f in self.cache_dir.glob('*.gpkg'))
+
+    def count(self):
+        """Number of cached files."""
+        return len(list(self.cache_dir.glob('*.gpkg')))
+
+
+_gpkg_cache = None
+_gpkg_cache_lock = threading.Lock()
+
+
+def get_gpkg_cache() -> GpkgCache:
+    global _gpkg_cache
+    if _gpkg_cache is None:
+        with _gpkg_cache_lock:
+            if _gpkg_cache is None:
+                _gpkg_cache = GpkgCache()
+    return _gpkg_cache
+
+
+def _query_gpkg_layer(gpkg_path, layer_name, bbox=None, type_filter=None,
+                      limit=500, offset=0):
+    """Read features from a GPKG layer. Returns {layer, count, features} or None.
+
+    bbox: (min_lon, min_lat, max_lon, max_lat) in WGS84
+    type_filter: list of object type strings to include
+    """
+    import fiona
+    try:
+        layers = fiona.listlayers(gpkg_path)
+        if layer_name not in layers:
+            return None
+    except Exception:
+        return None
+
+    features = []
+    total = 0
+    try:
+        with fiona.open(gpkg_path, layer=layer_name) as src:
+            if bbox:
+                it = src.filter(bbox=(bbox[0], bbox[1], bbox[2], bbox[3]))
+            else:
+                it = iter(src)
+
+            for f in it:
+                if type_filter:
+                    ft = f.get('properties', {}).get('type')
+                    if ft not in type_filter:
+                        continue
+                total += 1
+                if total <= offset:
+                    continue
+                if len(features) >= limit:
+                    continue  # keep counting total
+                feat = {
+                    'type': 'Feature',
+                    'geometry': dict(f.get('geometry', {})) if f.get('geometry') else None,
+                    'properties': dict(f.get('properties', {})),
+                }
+                features.append(feat)
+    except Exception as e:
+        log.warning('_query_gpkg_layer %s/%s: %s', gpkg_path, layer_name, e)
+        return None
+
+    return {
+        'layer': layer_name,
+        'total': total,
+        'offset': offset,
+        'limit': limit,
+        'features': features,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════

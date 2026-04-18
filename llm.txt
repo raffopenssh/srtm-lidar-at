@@ -267,6 +267,31 @@ Add ?index_only=true to always use index (faster, no file I/O).
 #### GET /api/v1/parcel/<KGCODE-GNR>
 Parcel lookup via search index + local JSON detail.
 
+#### GET /api/v1/kg/<kg_code>/buildings
+Height-enriched building footprints (GeoJSON features from light GPKG).
+Lazy-loads from Zenodo on first access, cached locally (1GB LRU).
+Properties: max_height_m, mean_height_m, dsm_std, roof_type_hint, stories_est, footprint_area_sqm.
+Params: bbox=w,s,e,n  limit=N(default 500, max 5000)  offset=N
+
+#### GET /api/v1/kg/<kg_code>/new_buildings
+Detected new buildings not in cadastre (from light GPKG).
+Properties: type, area_sqm, max_height_m, stories_est, roof_type_hint, confidence.
+Params: bbox=w,s,e,n  limit=N  offset=N
+
+#### GET /api/v1/kg/<kg_code>/infrastructure
+Detected infrastructure features (from light GPKG).
+Properties: type, area_sqm, volume_m3, max_height_m, est_parking_spots, confidence.
+Params: bbox=w,s,e,n  limit=N  offset=N
+
+#### GET /api/v1/kg/<kg_code>/segments
+Segment polygons with classification (from light GPKG).
+Properties: id, type, type_code, group_type, height_class, area_sqm, etc.
+Params: bbox=w,s,e,n  type=tree,roof,...  limit=N  offset=N
+
+#### GET /api/v1/kg/<kg_code>/layers
+List available vector layers in the KG's GPKG.
+Params: variant=light|full (default: light)
+
 ---
 
 ## 25 Object Types

@@ -4135,8 +4135,6 @@ def _fetch_copernicus_for_tile(
     Returns a ``copernicus_data`` dict (ndvi, landcover, vv, vh,
     harmonics, transform, crs, sar_transform) or ``None``.
     """
-    import concurrent.futures as _cf
-
     def _report(detail):
         if report_fn:
             report_fn("copernicus", f"{tile_label} — {detail}")
@@ -4176,16 +4174,11 @@ def _fetch_copernicus_for_tile(
 
         return cop if cop else None
 
-    # --- First attempt: full bbox ---
+    # --- First attempt: full bbox (inline, no thread wrapper) ---
     try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_try_fetch_single, bbox_dict)
-            result = fut.result(timeout=_COP_STEP_TIMEOUT * 4)  # 20 min total
-            if result is not None:
-                return result
-    except _cf.TimeoutError:
-        log.warning("Copernicus full-tile fetch timed out for %s — trying sub-tiles",
-                    tile_label)
+        result = _try_fetch_single(bbox_dict)
+        if result is not None:
+            return result
     except Exception as e:
         from copernicus import CreditsExhaustedError
         if isinstance(e, CreditsExhaustedError) or \

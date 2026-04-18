@@ -1221,6 +1221,7 @@ SEGMENT_COLORS = {
     "fill":         (255, 140, 0, 200),
     "tree_loss":    (255, 0, 255, 200),
     "construction": (255, 69, 0, 200),
+    "unclassified": (190, 190, 190, 120),
 }
 
 
@@ -2081,6 +2082,370 @@ def _read_dtm_for_tile(tr):
     return _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
 
 
+# === SECTION: Boundary segment merging (cross-tile stitching) ===
+
+def _merge_boundary_segments(
+    labels_full: np.ndarray,
+    seg_type_full: np.ndarray,
+    all_objects: list,
+    tile_seg_results: list,
+    full_left: float,
+    full_top: float,
+    res: float,
+    ndsm_full: np.ndarray | None = None,
+):
+    """Merge compatible segments that touch across tile boundaries.
+
+    Segments split by tile boundaries often have too few pixels for reliable
+    classification.  This function:
+      1. Computes the overlap zones from tile_seg_results bounds.
+      2. Scans overlap zones for adjacent segment-pairs from different tiles.
+      3. Merges compatible pairs (union-find) using the same _MERGE_RULES.
+      4. Remaps labels_full / seg_type_full so the merged segment has one ID.
+      5. Recomputes area-weighted stats for the surviving SegmentedObject.
+      6. Re-classifies merged segments.
+
+    Modifies labels_full, seg_type_full, and all_objects **in place**.
+    Returns the number of merges performed.
+    """
+    from object_segmentation import _MERGE_RULES, OBJECT_TYPES, classify_object
+
+    full_h, full_w = labels_full.shape
+    obj_map = {o.obj_id: o for o in all_objects}
+    if len(obj_map) < 2:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 1. Build a tile-ownership raster to identify cross-tile adjacency.
+    #    Each pixel gets the index of the tile that "owns" it (highest
+    #    feather weight).  Adjacent pixels with different tile owners
+    #    AND different labels are cross-tile boundary candidates.
+    # ------------------------------------------------------------------
+    tile_owner = np.full((full_h, full_w), -1, dtype=np.int16)
+    tile_best_w = np.zeros((full_h, full_w), dtype=np.float32)
+
+    def _fw(rows, cols, margin=100):
+        wy = np.ones(rows, dtype=np.float32)
+        wx = np.ones(cols, dtype=np.float32)
+        m = min(margin, rows // 2, cols // 2)
+        if m > 0:
+            ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+            wy[:m] = np.minimum(wy[:m], ramp)
+            wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+            wx[:m] = np.minimum(wx[:m], ramp)
+            wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+        return wy[:, None] * wx[None, :]
+
+    for ti_idx, tr in enumerate(tile_seg_results):
+        th, tw = tr["shape"]
+        tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+        col_off = int(round((tile_left - full_left) / res))
+        row_off = int(round((full_top - tile_top) / res))
+        r_end = min(row_off + th, full_h)
+        c_end = min(col_off + tw, full_w)
+        th_eff = r_end - row_off
+        tw_eff = c_end - col_off
+        if th_eff <= 0 or tw_eff <= 0:
+            continue
+        fw = _fw(th_eff, tw_eff, margin=100)
+        wins = fw > tile_best_w[row_off:r_end, col_off:c_end]
+        tile_owner[row_off:r_end, col_off:c_end] = np.where(
+            wins, ti_idx, tile_owner[row_off:r_end, col_off:c_end])
+        tile_best_w[row_off:r_end, col_off:c_end] = np.maximum(
+            tile_best_w[row_off:r_end, col_off:c_end], fw)
+    del tile_best_w
+
+    # ------------------------------------------------------------------
+    # 2. Find adjacent segment pairs across tile boundaries.
+    #    Scan horizontal and vertical neighbours; keep pairs where
+    #    tile_owner differs AND labels differ AND both labels are valid.
+    # ------------------------------------------------------------------
+    adj_pairs: set[tuple[int, int]] = set()
+
+    def _collect_cross_pairs(owner_a, owner_b, label_a, label_b):
+        """Find unique (min,max) label pairs across tile boundaries."""
+        cross = ((owner_a != owner_b) & (owner_a >= 0) & (owner_b >= 0)
+                 & (label_a != label_b) & (label_a > 0) & (label_b > 0))
+        if not cross.any():
+            return
+        rc = np.nonzero(cross)
+        la = label_a[rc].astype(np.int64)
+        lb = label_b[rc].astype(np.int64)
+        # Vectorised unique-pair extraction
+        mn = np.minimum(la, lb)
+        mx = np.maximum(la, lb)
+        # Pack into single int64 for fast unique
+        packed = mn * (np.int64(labels_full.max()) + 1) + mx
+        for p in np.unique(packed):
+            divisor = int(labels_full.max()) + 1
+            a_id = int(p // divisor)
+            b_id = int(p % divisor)
+            adj_pairs.add((a_id, b_id))
+
+    # Vertical adjacency: (r, c) vs (r, c+1)
+    _collect_cross_pairs(
+        tile_owner[:, :-1], tile_owner[:, 1:],
+        labels_full[:, :-1], labels_full[:, 1:])
+    # Horizontal adjacency: (r, c) vs (r+1, c)
+    _collect_cross_pairs(
+        tile_owner[:-1, :], tile_owner[1:, :],
+        labels_full[:-1, :], labels_full[1:, :])
+    del tile_owner
+
+    if not adj_pairs:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 3. Filter to compatible pairs and build union-find
+    # ------------------------------------------------------------------
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # Larger area survives as root
+        oa = obj_map.get(ra)
+        ob = obj_map.get(rb)
+        area_a = oa.area_sqm if oa else 0
+        area_b = ob.area_sqm if ob else 0
+        if area_a >= area_b:
+            parent[rb] = ra
+        else:
+            parent[ra] = rb
+
+    n_compat = 0
+    for id_a, id_b in adj_pairs:
+        oa = obj_map.get(id_a)
+        ob = obj_map.get(id_b)
+        if oa is None or ob is None:
+            continue
+        # Check compatibility: same type or merge-rule compatible
+        if oa.obj_type == ob.obj_type:
+            union(id_a, id_b)
+            n_compat += 1
+        else:
+            compat_a = _MERGE_RULES.get(oa.obj_type, set())
+            if ob.obj_type in compat_a:
+                union(id_a, id_b)
+                n_compat += 1
+
+    if n_compat == 0:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 4. Build merge groups
+    # ------------------------------------------------------------------
+    groups: dict[int, list[int]] = {}  # root_id → [member_ids]
+    all_ids = set()
+    for id_a, id_b in adj_pairs:
+        all_ids.add(id_a)
+        all_ids.add(id_b)
+    for oid in all_ids:
+        root = find(oid)
+        groups.setdefault(root, set()).add(oid)
+    # Only keep groups with actual merges
+    merge_groups = {root: members for root, members in groups.items()
+                    if len(members) > 1}
+    if not merge_groups:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 5. Remap labels and recompute stats
+    # ------------------------------------------------------------------
+    n_merges = 0
+    remap = {}  # old_id → new_id (survivor)
+    remove_ids = set()
+
+    for root_id, member_ids in merge_groups.items():
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+        absorbed = [obj_map[mid] for mid in member_ids
+                    if mid != root_id and mid in obj_map]
+        if not absorbed:
+            continue
+
+        # Area-weighted merge of stats
+        total_area = survivor.area_sqm + sum(o.area_sqm for o in absorbed)
+        if total_area <= 0:
+            continue
+
+        def _wmean(attr):
+            """Area-weighted mean of an attribute."""
+            val = getattr(survivor, attr) * survivor.area_sqm
+            for o in absorbed:
+                val += getattr(o, attr) * o.area_sqm
+            return val / total_area
+
+        # Recompute survivor stats
+        survivor.area_sqm = total_area
+        survivor.perimeter_m = survivor.perimeter_m + sum(o.perimeter_m for o in absorbed)  # approximate
+        survivor.height_max = max(survivor.height_max, *(o.height_max for o in absorbed))
+        survivor.height_mean = _wmean('height_mean')
+        survivor.height_p90 = max(survivor.height_p90, *(o.height_p90 for o in absorbed))
+        survivor.height_std = _wmean('height_std')
+        survivor.slope_mean = _wmean('slope_mean')
+        survivor.roughness = _wmean('roughness')
+        survivor.ndvi_mean = _wmean('ndvi_mean')
+        survivor.ndvi_std = _wmean('ndvi_std')
+        survivor.ndvi_fused = _wmean('ndvi_fused')
+        survivor.brightness_mean = _wmean('brightness_mean')
+        survivor.nir_mean = _wmean('nir_mean')
+        survivor.height_change = _wmean('height_change')
+        survivor.dtm_change = _wmean('dtm_change')
+        survivor.temporal_stability = _wmean('temporal_stability')
+        survivor.volume_change_m3 = survivor.volume_change_m3 + sum(o.volume_change_m3 for o in absorbed)
+        survivor.volume_change_abs_m3 = survivor.volume_change_abs_m3 + sum(o.volume_change_abs_m3 for o in absorbed)
+        survivor.dtm_change_max = max(survivor.dtm_change_max, *(o.dtm_change_max for o in absorbed))
+        survivor.glcm_entropy = _wmean('glcm_entropy')
+        survivor.glcm_homogeneity = _wmean('glcm_homogeneity')
+        survivor.texture_complexity = _wmean('texture_complexity')
+        survivor.sar_vv = _wmean('sar_vv')
+        survivor.sar_vh = _wmean('sar_vh')
+        survivor.harm_amplitude = _wmean('harm_amplitude')
+        survivor.harm_phase = _wmean('harm_phase')
+        # Recompute compactness (approximate)
+        if survivor.perimeter_m > 0:
+            survivor.compactness = round(
+                4 * 3.14159 * survivor.area_sqm / (survivor.perimeter_m ** 2), 4)
+
+        # Recompute centroid from pixel coordinates
+        # (done after label remap below)
+
+        # Build remap
+        for o in absorbed:
+            remap[o.obj_id] = root_id
+            remove_ids.add(o.obj_id)
+        n_merges += len(absorbed)
+
+    if not remap:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 6. Apply label remap to the full rasters (vectorised)
+    # ------------------------------------------------------------------
+    # Build a lookup array for fast remapping
+    max_label = int(labels_full.max())
+    lut = np.arange(max_label + 1, dtype=np.int32)
+    for old_id, new_id in remap.items():
+        if old_id <= max_label:
+            lut[old_id] = new_id
+    labels_full[:] = lut[labels_full]
+
+    # Update seg_type_full for remapped labels
+    for root_id in merge_groups:
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+        seg_type_full[labels_full == root_id] = survivor.type_code
+
+    # ------------------------------------------------------------------
+    # 7. Re-classify merged segments whose area grew significantly
+    # ------------------------------------------------------------------
+    try:
+        from learned_classifier import get_classifier
+        rf = get_classifier()
+    except Exception:
+        rf = None
+
+    for root_id in merge_groups:
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+        # Build a features dict from the surviving object's attributes
+        feat = {
+            'area_sqm': survivor.area_sqm,
+            'height_max': survivor.height_max,
+            'height_mean': survivor.height_mean,
+            'height_p90': survivor.height_p90,
+            'height_std': survivor.height_std,
+            'slope_mean': survivor.slope_mean,
+            'roughness': survivor.roughness,
+            'ndvi_mean': survivor.ndvi_mean,
+            'ndvi_std': survivor.ndvi_std,
+            'ndvi_fused': survivor.ndvi_fused,
+            'brightness_mean': survivor.brightness_mean,
+            'nir_mean': survivor.nir_mean,
+            'height_change': survivor.height_change,
+            'dtm_change': survivor.dtm_change,
+            'temporal_stability': survivor.temporal_stability,
+            'compactness': survivor.compactness,
+            'elongation': survivor.elongation,
+            'solidity': survivor.solidity,
+            'extent': survivor.extent,
+            'dsm_edge_strength': survivor.dsm_edge_strength,
+            'volume_change_m3': survivor.volume_change_m3,
+            'volume_change_abs_m3': survivor.volume_change_abs_m3,
+            'dtm_change_max': survivor.dtm_change_max,
+            'glcm_entropy': survivor.glcm_entropy,
+            'glcm_homogeneity': survivor.glcm_homogeneity,
+            'texture_complexity': survivor.texture_complexity,
+            'sar_vv': survivor.sar_vv,
+            'sar_vh': survivor.sar_vh,
+            'harm_amplitude': survivor.harm_amplitude,
+            'harm_phase': survivor.harm_phase,
+            'perimeter_m': survivor.perimeter_m,
+        }
+        # Merge any stored raw features from the survivor
+        if survivor.features:
+            for k, v in survivor.features.items():
+                if k not in feat:
+                    feat[k] = v
+
+        new_type = None
+        new_conf = survivor.confidence
+        if rf and rf.model is not None:
+            try:
+                new_type, new_conf = rf.predict(feat)
+            except Exception:
+                pass
+        if new_type is None:
+            try:
+                new_type, _, new_conf, _ = classify_object(feat, has_spectral=bool(survivor.ndvi_mean))
+            except Exception:
+                new_type = None
+
+        if new_type and new_type in OBJECT_TYPES:
+            survivor.obj_type = new_type
+            survivor.type_code = OBJECT_TYPES[new_type]
+            survivor.confidence = new_conf
+            survivor.is_manmade = new_type in (
+                'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
+                'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation')
+            # Update raster
+            seg_type_full[labels_full == root_id] = survivor.type_code
+
+    # ------------------------------------------------------------------
+    # 8. Recompute centroids for merged segments
+    # ------------------------------------------------------------------
+    for root_id in merge_groups:
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+        pix = np.argwhere(labels_full == root_id)
+        if len(pix) > 0:
+            mean_row = pix[:, 0].mean()
+            mean_col = pix[:, 1].mean()
+            survivor.centroid_e = full_left + (mean_col + 0.5) * res
+            survivor.centroid_n = full_top - (mean_row + 0.5) * res
+
+    # ------------------------------------------------------------------
+    # 9. Remove absorbed objects from all_objects
+    # ------------------------------------------------------------------
+    all_objects[:] = [o for o in all_objects if o.obj_id not in remove_ids]
+
+    log.info("  Boundary merge: %d pairs found, %d segments merged into %d groups",
+             len(adj_pairs), n_merges, len(merge_groups))
+    return n_merges
+
+
 # === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
 
 def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
@@ -2136,16 +2501,39 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
              len(tile_seg_results))
 
     # ------------------------------------------------------------------
-    # Allocate full-KG rasters
+    # Allocate full-KG rasters (weighted accumulation for seamless blending)
     # ------------------------------------------------------------------
-    dtm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
-    dsm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
-    ndsm_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    # For continuous rasters (DTM/DSM/nDSM), use weighted accumulation
+    # to feather-blend overlapping tiles and eliminate stitching lines.
+    dtm_sum = np.zeros((full_h, full_w), dtype=np.float64)
+    dsm_sum = np.zeros((full_h, full_w), dtype=np.float64)
+    ndsm_sum = np.zeros((full_h, full_w), dtype=np.float64)
+    weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
     seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
     seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
     labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+    # For categorical rasters (labels/type), track best tile per pixel
+    # so overlap zones use the tile whose centre is closest (= highest feather weight).
+    best_cat_weight = np.zeros((full_h, full_w), dtype=np.float32)
 
     obj_map = {o.obj_id: o for o in all_objects}
+
+    def _feather_weight(rows, cols, margin=100):
+        """Build a 2D weight array that tapers from 1.0 at centre to 0.0 at edges.
+
+        margin is the feather width in pixels (= overlap_km * 1000 = 100m @ 1m res).
+        Pixels beyond margin from any edge get weight 1.0.
+        """
+        wy = np.ones(rows, dtype=np.float32)
+        wx = np.ones(cols, dtype=np.float32)
+        m = min(margin, rows // 2, cols // 2)
+        if m > 0:
+            ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+            wy[:m] = np.minimum(wy[:m], ramp)
+            wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+            wx[:m] = np.minimum(wx[:m], ramp)
+            wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+        return wy[:, None] * wx[None, :]  # outer product → 2D
 
     # ------------------------------------------------------------------
     # Paint each tile into the full-KG rasters
@@ -2166,32 +2554,71 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
         if th_eff <= 0 or tw_eff <= 0:
             continue
 
-        # DTM / DSM / nDSM
+        # DTM / DSM / nDSM — feather-blended
         try:
             tdata = _read_dtm_for_tile(tr)
-            dtm_full[row_off:r_end, col_off:c_end] = tdata["dtm"][:th_eff, :tw_eff].astype(np.float32)
-            dsm_full[row_off:r_end, col_off:c_end] = tdata["dsm"][:th_eff, :tw_eff].astype(np.float32)
-            ndsm_full[row_off:r_end, col_off:c_end] = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+            tile_dtm = tdata["dtm"][:th_eff, :tw_eff].astype(np.float32)
+            tile_dsm = tdata["dsm"][:th_eff, :tw_eff].astype(np.float32)
+            tile_ndsm = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
             del tdata
+
+            fw = _feather_weight(th_eff, tw_eff, margin=100)
+            valid = ~np.isnan(tile_dtm)
+            w = np.where(valid, fw, 0.0).astype(np.float64)
+
+            dtm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_dtm, 0.0).astype(np.float64) * w
+            dsm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_dsm, 0.0).astype(np.float64) * w
+            ndsm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_ndsm, 0.0).astype(np.float64) * w
+            weight_sum[row_off:r_end, col_off:c_end] += w
         except Exception as e:
             log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx + 1, e)
 
-        # Segment type + segment height + labels
+        # Segment type + segment height + labels (categorical — highest-weight-wins)
+        # Only overwrite a pixel if this tile has a higher feather weight
+        # (i.e. the pixel is closer to this tile's centre than any previous tile).
         if tr.get("labels") is not None:
-            labels_tile = tr["labels"][:th_eff, :tw_eff]
-            labels_full[row_off:r_end, col_off:c_end] = labels_tile.astype(np.int32)
+            labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
 
             type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
             for uid in np.unique(labels_tile):
                 if uid == 0: continue
                 obj = obj_map.get(int(uid))
                 if obj: type_tile[labels_tile == uid] = obj.type_code
-            seg_type_full[row_off:r_end, col_off:c_end] = type_tile
 
-            # Segment height from per-tile ndsm
+            cat_fw = _feather_weight(th_eff, tw_eff, margin=100)
+            wins = cat_fw > best_cat_weight[row_off:r_end, col_off:c_end]
+            labels_full[row_off:r_end, col_off:c_end] = np.where(
+                wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
+            seg_type_full[row_off:r_end, col_off:c_end] = np.where(
+                wins, type_tile, seg_type_full[row_off:r_end, col_off:c_end])
+
             if tr.get("ndsm") is not None:
-                seg_height_full[row_off:r_end, col_off:c_end] = \
-                    tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                tile_sh = tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                seg_height_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
+
+            best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
+                best_cat_weight[row_off:r_end, col_off:c_end], cat_fw)
+
+    # ------------------------------------------------------------------
+    # Normalise weighted sums → final blended rasters
+    # ------------------------------------------------------------------
+    has_data = weight_sum > 0
+    dtm_full = np.where(has_data, dtm_sum / weight_sum, np.nan).astype(np.float32)
+    dsm_full = np.where(has_data, dsm_sum / weight_sum, np.nan).astype(np.float32)
+    ndsm_full = np.where(has_data, ndsm_sum / weight_sum, np.nan).astype(np.float32)
+    del dtm_sum, dsm_sum, ndsm_sum, weight_sum, best_cat_weight
+
+    # ------------------------------------------------------------------
+    # Merge boundary segments across tiles (before writing rasters)
+    # ------------------------------------------------------------------
+    try:
+        _merge_boundary_segments(
+            labels_full, seg_type_full, all_objects,
+            tile_seg_results, full_left, full_top, res,
+            ndsm_full=ndsm_full)
+    except Exception as e:
+        log.warning("Full GPKG boundary merge failed: %s", e)
 
     # ------------------------------------------------------------------
     # Write stitched raster layers
@@ -2224,8 +2651,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
     other_dates = sorted(d for d in _ti.DATASETS if d != _ti.DEFAULT_DATASET)
     for date_key in other_dates:
         year = _ti.dataset_to_year(date_key)
-        dtm_extra = np.full((full_h, full_w), np.nan, dtype=np.float32)
-        dsm_extra = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        dtm_sum2 = np.zeros((full_h, full_w), dtype=np.float64)
+        dsm_sum2 = np.zeros((full_h, full_w), dtype=np.float64)
+        wsum2 = np.zeros((full_h, full_w), dtype=np.float64)
         any_data = False
         for ti_idx, tr in enumerate(tile_seg_results):
             th, tw = tr["shape"]
@@ -2241,19 +2669,29 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
                 continue
             try:
                 d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
-                dtm_extra[row_off:r_end, col_off:c_end] = d2["dtm"][:th_eff, :tw_eff].astype(np.float32)
-                dsm_extra[row_off:r_end, col_off:c_end] = d2["dsm"][:th_eff, :tw_eff].astype(np.float32)
-                any_data = True
+                td = d2["dtm"][:th_eff, :tw_eff].astype(np.float32)
+                ts2 = d2["dsm"][:th_eff, :tw_eff].astype(np.float32)
                 del d2
+                fw = _feather_weight(th_eff, tw_eff, margin=100)
+                v = ~np.isnan(td)
+                w = np.where(v, fw, 0.0).astype(np.float64)
+                dtm_sum2[row_off:r_end, col_off:c_end] += np.where(v, td, 0.0).astype(np.float64) * w
+                dsm_sum2[row_off:r_end, col_off:c_end] += np.where(v, ts2, 0.0).astype(np.float64) * w
+                wsum2[row_off:r_end, col_off:c_end] += w
+                any_data = True
             except Exception:
                 pass
         if any_data:
+            hd2 = wsum2 > 0
+            dtm_extra = np.where(hd2, dtm_sum2 / wsum2, np.nan).astype(np.float32)
+            dsm_extra = np.where(hd2, dsm_sum2 / wsum2, np.nan).astype(np.float32)
             _write_table(f'DTM_{year}', [dtm_extra], full_h, full_w, full_tf,
                          descs=[f'DTM {year} (m)'])
             _write_table(f'DSM_{year}', [dsm_extra], full_h, full_w, full_tf,
                          descs=[f'DSM {year} (m)'])
             log.info("  FULL_GPKG: DTM/DSM %d written", year)
-        del dtm_extra, dsm_extra
+            del dtm_extra, dsm_extra
+        del dtm_sum2, dsm_sum2, wsum2
 
     # ------------------------------------------------------------------
     # Ortho + CIR: one layer per available ortho year
@@ -2264,8 +2702,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
     _ORTHO_YEARS = {2024: 2024, 2023: 2023, 2020: 2020}
 
     def _stitch_ortho_for_year(o_year):
-        """Read ortho per tile for a given year, stitch into full-KG."""
-        ortho_arr = np.zeros((4, full_h, full_w), dtype=np.uint8)
+        """Read ortho per tile for a given year, feather-blend into full-KG."""
+        ortho_sum = np.zeros((4, full_h, full_w), dtype=np.float64)
+        ortho_w = np.zeros((full_h, full_w), dtype=np.float64)
         got_rgb = False
         got_nir = False
         for ti_idx, tr in enumerate(tile_seg_results):
@@ -2288,13 +2727,24 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
                 del tdata
                 if rgb_t is not None:
                     got_rgb = True
+                    fw = _feather_weight(th_eff, tw_eff, margin=100).astype(np.float64)
                     for b in range(3):
-                        ortho_arr[b, row_off:r_end, col_off:c_end] = rgb_t[b][:th_eff, :tw_eff]
+                        ortho_sum[b, row_off:r_end, col_off:c_end] += \
+                            rgb_t[b][:th_eff, :tw_eff].astype(np.float64) * fw
                     if nir_t is not None:
                         got_nir = True
-                        ortho_arr[3, row_off:r_end, col_off:c_end] = nir_t[:th_eff, :tw_eff]
+                        ortho_sum[3, row_off:r_end, col_off:c_end] += \
+                            nir_t[:th_eff, :tw_eff].astype(np.float64) * fw
+                    ortho_w[row_off:r_end, col_off:c_end] += fw
             except Exception as e:
                 log.warning("GPKG tile %d ortho yr=%d failed: %s", ti_idx + 1, o_year, e)
+        # Normalise
+        has = ortho_w > 0
+        ortho_arr = np.zeros((4, full_h, full_w), dtype=np.uint8)
+        for b in range(4):
+            ortho_arr[b] = np.where(has,
+                np.clip(ortho_sum[b] / np.where(has, ortho_w, 1.0), 0, 255),
+                0).astype(np.uint8)
         return ortho_arr, got_rgb, got_nir
 
     for o_year in sorted(_ORTHO_YEARS.keys(), reverse=True):  # newest first
@@ -2325,7 +2775,8 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
     # ------------------------------------------------------------------
     try:
         cop_cache = _get_cop_cache()
-        ndvi_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        ndvi_sum = np.zeros((full_h, full_w), dtype=np.float64)
+        ndvi_wsum = np.zeros((full_h, full_w), dtype=np.float64)
         any_ndvi = False
         for ti_idx, tr in enumerate(tile_seg_results):
             bbox_wgs = tr["bbox_wgs"]
@@ -2358,13 +2809,21 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
                     dst_transform=dst_tf, dst_crs='EPSG:3035',
                     resampling=Resampling.bilinear,
                 )
-                ndvi_full[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                tile_data = dst_arr[:th_eff, :tw_eff]
+                fw = _feather_weight(th_eff, tw_eff, margin=100)
+                v = ~np.isnan(tile_data)
+                w = np.where(v, fw, 0.0).astype(np.float64)
+                ndvi_sum[row_off:r_end, col_off:c_end] += np.where(v, tile_data, 0.0).astype(np.float64) * w
+                ndvi_wsum[row_off:r_end, col_off:c_end] += w
                 any_ndvi = True
         if any_ndvi:
+            hd = ndvi_wsum > 0
+            ndvi_full = np.where(hd, ndvi_sum / ndvi_wsum, np.nan).astype(np.float32)
             _write_table('NDVI', [ndvi_full], full_h, full_w, full_tf,
                          descs=['Sentinel-2 NDVI composite'])
             log.info("  FULL_GPKG: NDVI written")
-        del ndvi_full
+            del ndvi_full
+        del ndvi_sum, ndvi_wsum
     except Exception as e:
         log.warning("FULL_GPKG: NDVI layer failed: %s", e)
 
@@ -2608,8 +3067,21 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
         seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
         labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+        best_cat_weight = np.zeros((full_h, full_w), dtype=np.float32)
 
-        # Paint each tile
+        def _feather_weight_light(rows, cols, margin=100):
+            wy = np.ones(rows, dtype=np.float32)
+            wx = np.ones(cols, dtype=np.float32)
+            m = min(margin, rows // 2, cols // 2)
+            if m > 0:
+                ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+                wy[:m] = np.minimum(wy[:m], ramp)
+                wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+                wx[:m] = np.minimum(wx[:m], ramp)
+                wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+            return wy[:, None] * wx[None, :]
+
+        # Paint each tile (highest-weight-wins for categorical data)
         for ti_idx, tr in enumerate(tile_seg_results):
             th, tw = tr["shape"]
             tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
@@ -2625,19 +3097,38 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 continue
 
             if tr.get("labels") is not None:
-                labels_tile = tr["labels"][:th_eff, :tw_eff]
-                labels_full[row_off:r_end, col_off:c_end] = labels_tile.astype(np.int32)
+                labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
 
                 type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
                 for uid in np.unique(labels_tile):
                     if uid == 0: continue
                     obj = obj_map.get(int(uid))
                     if obj: type_tile[labels_tile == uid] = obj.type_code
-                seg_type_full[row_off:r_end, col_off:c_end] = type_tile
 
-            if tr.get("ndsm") is not None:
-                seg_height_full[row_off:r_end, col_off:c_end] = \
-                    tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                cat_fw = _feather_weight_light(th_eff, tw_eff, margin=100)
+                wins = cat_fw > best_cat_weight[row_off:r_end, col_off:c_end]
+                labels_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
+                seg_type_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, type_tile, seg_type_full[row_off:r_end, col_off:c_end])
+
+                if tr.get("ndsm") is not None:
+                    tile_sh = tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                    seg_height_full[row_off:r_end, col_off:c_end] = np.where(
+                        wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
+
+                best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
+                    best_cat_weight[row_off:r_end, col_off:c_end], cat_fw)
+
+        del best_cat_weight
+
+        # Merge boundary segments across tiles
+        try:
+            _merge_boundary_segments(
+                labels_full, seg_type_full, all_objects,
+                tile_seg_results, full_left, full_top, res)
+        except Exception as e:
+            log.warning("Light GPKG boundary merge failed: %s", e)
 
         # Write stitched segment rasters
         _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
@@ -3441,7 +3932,7 @@ def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
 
 
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
-                   failed_tiles: dict = None) -> dict:
+                   failed_tiles: dict = None, rf_only: bool = False) -> dict:
     """Process a single KG with tiled segmentation for full coverage.
 
     The full KG is divided into overlapping 1.5km tiles.  Each tile
@@ -4832,6 +5323,8 @@ def main():
                         help="Skip Copernicus data (faster)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List KGs without processing")
+    parser.add_argument("--rf-only", action="store_true",
+                        help="Only emit RF classes; low-confidence segments become 'unclassified'")
     args = parser.parse_args()
 
     try:
@@ -4997,6 +5490,7 @@ def main():
 
     t_start = time.time()
     include_cop = not args.no_copernicus
+    rf_only = args.rf_only
 
     for i, kg in enumerate(pending):
         # --- Check graceful shutdown ---
@@ -5183,7 +5677,8 @@ def main():
                     async_result = pool.apply_async(
                         process_one_kg, args=(kg,),
                         kwds={"include_copernicus": use_cop,
-                              "failed_tiles": failed_tiles if failed_tiles else None})
+                              "failed_tiles": failed_tiles if failed_tiles else None,
+                              "rf_only": rf_only})
                     try:
                         result = async_result.get(timeout=timeout)
                         break  # success — exit retry loop

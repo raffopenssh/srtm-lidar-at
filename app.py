@@ -41,11 +41,36 @@ import object_segmentation as seg  # watershed-based segmentation
 import hansen  # Hansen Global Forest Change calibration
 import temporal_analysis as tca
 import geo_parse
+import search_index as si
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+
+# Initialize search index + watch for new KG JSON files
+def _init_search_index():
+    try:
+        idx = si.init_index()
+        # Watch for new JSON files every 60s
+        json_dir = Path('data/austria_processor/json')
+        known = set(f.stem for f in json_dir.glob('*.json')) if json_dir.exists() else set()
+        while True:
+            time.sleep(60)
+            try:
+                if not json_dir.exists():
+                    continue
+                current = set(f.stem for f in json_dir.glob('*.json'))
+                new_kgs = current - known
+                if new_kgs:
+                    log.info('🔍 New KGs detected: %s, rebuilding index', new_kgs)
+                    idx.build()
+                    known = current
+            except Exception as e:
+                log.warning('Search index watch: %s', e)
+    except Exception as e:
+        log.warning('Search index init failed: %s', e)
+threading.Thread(target=_init_search_index, daemon=True).start()
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
@@ -977,45 +1002,178 @@ def processing_manifest():
         return jsonify({'error': str(e)}), 500
 
 
+# === SECTION: Search index API endpoints ===
+
+@app.route('/api/v1/index/status')
+def index_status():
+    """Search index status and statistics."""
+    try:
+        idx = si.get_index()
+        return jsonify(idx.stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/index/rebuild', methods=['POST'])
+def index_rebuild():
+    """Rebuild the search index from scratch."""
+    try:
+        idx = si.get_index()
+        idx.build()
+        return jsonify(idx.stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/kg/<kg_code>')
 def api_kg(kg_code):
-    """Return the JSON summary for a KG."""
+    """Return KG info from index. If JSON exists locally, serves the full JSON.
+    Otherwise returns index data with Zenodo download links."""
+    # If full JSON exists locally, serve it directly (backwards-compatible)
     json_path = Path(f'data/austria_processor/json/{kg_code}.json')
-    if json_path.exists():
+    if json_path.exists() and not request.args.get('index_only'):
         return send_file(str(json_path), mimetype='application/json')
-    # Check Zenodo manifest for download link
-    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
-    if manifest_path.exists():
-        try:
-            data = json.loads(manifest_path.read_text())
-            entry = data.get('entries', {}).get(f'{kg_code}_json')
-            if entry:
-                return jsonify({
-                    'available': True, 'source': 'zenodo',
-                    'download_url': f"{entry.get('bucket_url', '')}/{entry.get('filename', '')}",
-                    'depo_id': entry.get('depo_id'),
-                })
-        except Exception:
-            pass
+    # Fall back to search index
+    try:
+        idx = si.get_index()
+        result = idx.query_kg(kg_code)
+        if result:
+            return jsonify(result)
+    except Exception as e:
+        log.warning('index query_kg %s: %s', kg_code, e)
     return jsonify({'error': f'KG {kg_code} not found'}), 404
 
 
-@app.route('/api/v1/parcel/<parcel_id>')
+@app.route('/api/v1/parcel/<path:parcel_id>')
 def api_parcel(parcel_id):
-    """Return JSON summary for the KG containing a parcel."""
-    # parcel_id format: "KGCODE-GNR" e.g. "75414-1314/1"
+    """Look up a parcel. Returns KG summary + parcel detail if available."""
     if '-' not in parcel_id:
         return jsonify({'error': 'Invalid parcel_id format, expected KGCODE-GNR'}), 400
-    kg_code = parcel_id.split('-')[0]
-    json_path = Path(f'data/austria_processor/json/{kg_code}.json')
-    if json_path.exists():
-        try:
-            data = json.loads(json_path.read_text())
-            data['_query_parcel_id'] = parcel_id
-            return jsonify(data)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'error': f'KG {kg_code} not processed yet'}), 404
+    try:
+        idx = si.get_index()
+        result = idx.query_parcel(parcel_id)
+        if result:
+            return jsonify(result)
+    except Exception as e:
+        log.warning('index query_parcel %s: %s', parcel_id, e)
+    return jsonify({'error': f'Parcel {parcel_id} not found'}), 404
+
+
+@app.route('/api/v1/query')
+def api_query():
+    """Unified query endpoint. Supports multiple query modes via params.
+
+    Params:
+      q=<text>          Full-text search (KG/gemeinde/district/state names)
+      kg=<code>         Exact KG code lookup
+      parcel=<id>       Parcel lookup (KGCODE-GNR)
+      bbox=<w,s,e,n>    Spatial bbox query
+      point=<lon,lat>   Point proximity query
+      radius=<km>       Radius for point query (default 5)
+      state=<code|name>         Filter/aggregate by Bundesland
+      district=<code>           Filter/aggregate by Bezirk
+      gemeinde=<code>           Filter/aggregate by Gemeinde
+      type=<object_type>        Rank KGs by object type
+      metric=<area|fraction|count|height>  Ranking metric (with type=)
+      hansen=true               Hansen forest loss query
+      year_from=<YYYY>          Start year for hansen/temporal filter
+      year_to=<YYYY>            End year for hansen/temporal filter
+      new_buildings=true         Query KGs with new buildings
+      min_count=<N>             Min count for new_buildings
+      processed_only=true       Only return processed KGs
+      aggregate=true            Return aggregate stats instead of KG list
+      limit=<N>                 Max results (default 100)
+      offset=<N>                Offset for pagination
+    """
+    try:
+        idx = si.get_index()
+        args = request.args
+        limit = min(int(args.get('limit', 100)), 1000)
+        offset = int(args.get('offset', 0))
+        processed_only = args.get('processed_only', '').lower() in ('true', '1', 'yes')
+        do_aggregate = args.get('aggregate', '').lower() in ('true', '1', 'yes')
+
+        # Single KG lookup
+        if args.get('kg'):
+            result = idx.query_kg(args['kg'])
+            return jsonify(result) if result else (jsonify({'error': 'KG not found'}), 404)
+
+        # Parcel lookup
+        if args.get('parcel'):
+            result = idx.query_parcel(args['parcel'])
+            return jsonify(result) if result else (jsonify({'error': 'Parcel not found'}), 404)
+
+        # Aggregate queries
+        if do_aggregate or args.get('state') and not args.get('q'):
+            if args.get('state'):
+                return jsonify(idx.aggregate_state(args['state']))
+            if args.get('district'):
+                return jsonify(idx.aggregate_district(args['district']))
+            if args.get('gemeinde'):
+                return jsonify(idx.aggregate_gemeinde(args['gemeinde']))
+            if do_aggregate:
+                return jsonify(idx.aggregate_country())
+
+        # Admin hierarchy — list KGs in a state/district/gemeinde
+        if args.get('state') and not do_aggregate:
+            sc = args['state']
+            # Accept name or code
+            if not sc.isdigit():
+                for code, name in si.STATE_CODES.items():
+                    if name.lower() == sc.lower():
+                        sc = code
+                        break
+            return jsonify(idx.query_admin('state', sc, processed_only=processed_only, limit=limit))
+        if args.get('district'):
+            return jsonify(idx.query_admin('district', args['district'],
+                                           processed_only=processed_only, limit=limit))
+        if args.get('gemeinde'):
+            return jsonify(idx.query_admin('gemeinde', args['gemeinde'],
+                                           processed_only=processed_only, limit=limit))
+
+        # Object type ranking
+        if args.get('type'):
+            metric = args.get('metric', 'area')
+            return jsonify(idx.query_type_ranking(args['type'], metric=metric, limit=limit))
+
+        # Hansen forest loss
+        if args.get('hansen', '').lower() in ('true', '1', 'yes'):
+            yf = int(args['year_from']) if args.get('year_from') else None
+            yt = int(args['year_to']) if args.get('year_to') else None
+            ml = int(args.get('min_loss', 0))
+            return jsonify(idx.query_hansen_loss(year_from=yf, year_to=yt,
+                                                 min_loss=ml, limit=limit))
+
+        # New buildings
+        if args.get('new_buildings', '').lower() in ('true', '1', 'yes'):
+            mc = int(args.get('min_count', 1))
+            return jsonify(idx.query_new_buildings(min_count=mc, limit=limit))
+
+        # Spatial bbox
+        if args.get('bbox'):
+            parts = [float(x) for x in args['bbox'].split(',')]
+            if len(parts) == 4:
+                return jsonify(idx.query_bbox(*parts, processed_only=processed_only, limit=limit))
+            return jsonify({'error': 'bbox must be w,s,e,n'}), 400
+
+        # Point proximity
+        if args.get('point'):
+            parts = [float(x) for x in args['point'].split(',')]
+            if len(parts) == 2:
+                radius = float(args.get('radius', 5))
+                return jsonify(idx.query_point(parts[0], parts[1], radius_km=radius))
+            return jsonify({'error': 'point must be lon,lat'}), 400
+
+        # Full-text search
+        if args.get('q'):
+            return jsonify(idx.query_text(args['q'], limit=limit))
+
+        # Default: list processed KGs
+        return jsonify(idx.query_processed(limit=limit, offset=offset))
+
+    except Exception as e:
+        log.exception('query error')
+        return jsonify({'error': str(e)}), 500
 
 
 # === SECTION: Geometry + parameter helpers ===
@@ -1581,6 +1739,7 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
             'copernicus': str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'),
             'cadastre': str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'),
             'hansen': str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'),
+            'rf_only': str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes'),
             'geometry': geometry_text,
         }
         # Compute center from result bbox if available
@@ -1657,6 +1816,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
+    rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
     type_filter = params.get('types', None)
     if isinstance(type_filter, str):
         type_filter = [t.strip() for t in type_filter.split(',')]
@@ -1763,6 +1923,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             rag_threshold=rag_threshold,
             observation_year=obs_year,
             infra_lookup=_infra_lookup,
+            rf_only=rf_only,
         )
 
         objects = result['objects']
@@ -1907,6 +2068,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "include_cadastre": include_cadastre,
             "include_hansen": include_hansen,
             "include_infra": include_infra,
+            "rf_only": rf_only,
             "processing_time_s": round(time.time() - t0, 2),
             **_rf_model_meta(),
         },
@@ -2053,6 +2215,7 @@ SEGMENT_COLORS = {
     "fill":         (255, 140, 0, 200),
     "tree_loss":    (255, 0, 255, 200),
     "construction": (255, 69, 0, 200),
+    "unclassified": (190, 190, 190, 120),
 }
 
 

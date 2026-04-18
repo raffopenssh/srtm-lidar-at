@@ -1668,6 +1668,17 @@ async function checkLayerAvailability(){
         cb.checked=false;
       }
     });
+    // Disable Copernicus checkbox when processor is running
+    const copCb=document.getElementById('include_copernicus');
+    const copLbl=copCb?.parentElement;
+    if(avail.copernicus_disabled){
+      copCb.checked=false;copCb.disabled=true;
+      if(copLbl)copLbl.title='Disabled — Austria processor is using openEO credentials';
+      if(copLbl)copLbl.style.opacity='0.5';
+    }else{
+      copCb.disabled=false;
+      if(copLbl){copLbl.title='';copLbl.style.opacity='';}
+    }
   }catch(e){console.warn('Layer availability check failed:',e);}
 }
 
@@ -2899,6 +2910,9 @@ function showResultOnMap(data){
     if(meta.rf_trained_at)mh+=meta.rf_trained_at;
     if(meta.rf_n_kgs)mh+=` &nbsp; ${meta.rf_n_kgs} KGs`;
     if(meta.rf_oob)mh+=` &nbsp; OOB ${meta.rf_oob}`;
+  }
+  if(data.warnings&&data.warnings.length){
+    mh+='<br><span style="color:#fa0">⚠ '+data.warnings.join('; ')+'</span>';
   }
   mi.innerHTML=mh;mi.style.display=mh?'':'none';
 

@@ -740,6 +740,18 @@ def stop_curve_eval():
 
 _processor_process = None  # subprocess.Popen for the processor
 
+def _is_processor_running() -> bool:
+    """Check if Austria processor is actively running (systemd or subprocess)."""
+    try:
+        p = Path('data/austria_processor/progress.json')
+        if p.exists():
+            d = json.loads(p.read_text())
+            if d.get('state') == 'running':
+                return True
+    except Exception:
+        pass
+    return False
+
 # Git commit hash (read once at startup)
 try:
     import subprocess as _sp
@@ -1932,6 +1944,11 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
     include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
     include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+    _cop_disabled_by_processor = False
+    if include_copernicus and _is_processor_running():
+        include_copernicus = False
+        _cop_disabled_by_processor = True
+        log.info('Copernicus disabled for request — Austria processor is running')
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
@@ -2196,6 +2213,9 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         resp["cadastre_evaluation"] = all_evaluation
     if hansen_evaluation:
         resp["hansen_evaluation"] = hansen_evaluation
+    if _cop_disabled_by_processor:
+        resp.setdefault('warnings', []).append(
+            'Copernicus (Sentinel-2/SAR) disabled — Austria processor is using openEO credentials')
 
     return resp
 
@@ -2494,6 +2514,8 @@ def segment_overlay():
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
         include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
         include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
+        if include_copernicus and _is_processor_running():
+            include_copernicus = False
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
@@ -4728,7 +4750,9 @@ def train_classifier():
         rgb, spectral = _try_read_ortho(data)
 
         # Copernicus (NDVI, land cover, SAR, harmonics)
-        copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
+        copernicus_data = None
+        if not _is_processor_running():
+            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
         # Hansen forest prior
         hansen_data = None
@@ -4996,13 +5020,16 @@ def layers_availability():
         dsm_result = {y: has_tiles for y in ('2024', '2023', '2022')}
         hansen_available = has_tiles
 
-        return jsonify({
+        resp = {
             "ortho": ortho_result,
             "cir": cir_result,
             "dtm": dtm_result,
             "dsm": dsm_result,
             "hansen": hansen_available,
-        })
+        }
+        if _is_processor_running():
+            resp["copernicus_disabled"] = True
+        return jsonify(resp)
     except ValueError as e:
         return _error(str(e))
     except Exception as e:

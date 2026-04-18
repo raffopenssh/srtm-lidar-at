@@ -2505,7 +2505,7 @@ document.getElementById('ld-file-input').addEventListener('change',function(){
   this.value='';
 });
 function _closeLoadDrop(){_loadDrop.classList.remove('open');_loadDropOpen=false;}
-document.addEventListener('click',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.target)&&!_loadDrop.contains(e.target))_closeLoadDrop();});
+document.addEventListener('pointerdown',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.target)&&!_loadDrop.contains(e.target))_closeLoadDrop();});
 
 async function _loadShareById(id, name){
   showLoading('Loading '+name+'\u2026');

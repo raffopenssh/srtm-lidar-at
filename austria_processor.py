@@ -2093,6 +2093,7 @@ def _merge_boundary_segments(
     full_top: float,
     res: float,
     ndsm_full: np.ndarray | None = None,
+    rf_only: bool = False,
 ):
     """Merge compatible segments that touch across tile boundaries.
 
@@ -2328,6 +2329,13 @@ def _merge_boundary_segments(
     if not remap:
         return 0
 
+    # Save pre-merge types for anchor-density check in step 7
+    _pre_merge_types = {o.obj_id: o.obj_type for o in all_objects}
+    for oid in remove_ids:
+        o = obj_map.get(oid)
+        if o:
+            _pre_merge_types[oid] = o.obj_type
+
     # ------------------------------------------------------------------
     # 6. Apply label remap to the full rasters (vectorised)
     # ------------------------------------------------------------------
@@ -2347,19 +2355,70 @@ def _merge_boundary_segments(
         seg_type_full[labels_full == root_id] = survivor.type_code
 
     # ------------------------------------------------------------------
-    # 7. Re-classify merged segments whose area grew significantly
+    # 7. Re-classify merged segments with anchor-density validation
+    #
+    # "Anchor density" = how many original same-type segments support
+    # the merged polygon.  A 10 ha polygon classified as "roof" from
+    # one tiny segment is very weak; 10 ha of "tree" from 50 segments
+    # is solid.  When area-per-anchor exceeds the threshold, we force
+    # re-classification and penalise confidence.
     # ------------------------------------------------------------------
+    _ANCHOR_MAX_AREA = {
+        # Manmade: individual structures rarely > these sizes
+        'roof': 2000, 'wall': 500, 'fence': 500, 'mast': 200,
+        'greenhouse': 2000, 'solar_panel': 1000, 'substation': 3000,
+        'wind_turbine': 5000,
+        # Transport: roads are elongated but segments stay bounded
+        'road': 5000, 'path': 3000, 'parking': 3000, 'bridge': 1000,
+        # Vegetation: canopy segments are naturally larger
+        'tree': 20000, 'shrub': 15000, 'hedge': 5000,
+        'grass': 30000, 'crop': 50000, 'garden': 10000,
+        'orchard': 20000, 'vineyard': 15000,
+        # Natural / disturbance
+        'water': 50000, 'bare_soil': 30000, 'rock': 30000,
+        'excavation': 10000, 'fill': 10000, 'construction': 5000,
+        'tree_loss': 20000, 'earthwork': 10000,
+    }
+    _MANMADE_TYPES = {
+        'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
+        'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation'}
+
     try:
         from learned_classifier import get_classifier
         rf = get_classifier()
     except Exception:
         rf = None
 
-    for root_id in merge_groups:
+    n_reclassified = 0
+    n_anchor_weak = 0
+    for root_id, member_ids in merge_groups.items():
         survivor = obj_map.get(root_id)
         if survivor is None:
             continue
-        # Build a features dict from the surviving object's attributes
+
+        # --- Anchor-density check ---
+        current_type = survivor.obj_type
+        # Count how many original (pre-merge) segments had a compatible type
+        n_anchors = 0
+        compat_set = _MERGE_RULES.get(current_type, set()) | {current_type}
+        for mid in member_ids:
+            orig_type = _pre_merge_types.get(mid, '')
+            if orig_type in compat_set:
+                n_anchors += 1
+        n_anchors = max(n_anchors, 1)
+
+        area_per_anchor = survivor.area_sqm / n_anchors
+        max_area = _ANCHOR_MAX_AREA.get(current_type, 10000)
+        anchor_weak = area_per_anchor > max_area
+
+        if anchor_weak:
+            n_anchor_weak += 1
+            log.info("  Anchor-weak: id=%d type=%s area=%.0fm² anchors=%d "
+                     "(%.0fm²/anchor, limit=%d)",
+                     root_id, current_type, survivor.area_sqm,
+                     n_anchors, area_per_anchor, max_area)
+
+        # --- Build features for re-classification ---
         feat = {
             'area_sqm': survivor.area_sqm,
             'height_max': survivor.height_max,
@@ -2393,7 +2452,6 @@ def _merge_boundary_segments(
             'harm_phase': survivor.harm_phase,
             'perimeter_m': survivor.perimeter_m,
         }
-        # Merge any stored raw features from the survivor
         if survivor.features:
             for k, v in survivor.features.items():
                 if k not in feat:
@@ -2408,18 +2466,33 @@ def _merge_boundary_segments(
                 pass
         if new_type is None:
             try:
-                new_type, _, new_conf, _ = classify_object(feat, has_spectral=bool(survivor.ndvi_mean))
+                new_type, _, new_conf, _ = classify_object(
+                    feat, has_spectral=bool(survivor.ndvi_mean))
             except Exception:
                 new_type = None
 
+        # Anchor-weak: if the re-classified type is also implausible
+        # for the anchor count, mark as unclassified.
+        if anchor_weak and new_type:
+            new_max = _ANCHOR_MAX_AREA.get(new_type, 10000)
+            new_area_per = survivor.area_sqm / n_anchors
+            if new_area_per > new_max:
+                # Re-classified type is also too large per anchor → unclassified
+                log.info("    → unclassified (re-class %s also exceeds %.0f/anchor)",
+                         new_type, new_max)
+                new_type = 'unclassified'
+                new_conf = min(new_conf * 0.3, 0.2)
+            else:
+                # Re-classified type fits the anchor density → accept but penalise
+                new_conf = min(new_conf * 0.7, 0.5)
+
         if new_type and new_type in OBJECT_TYPES:
+            if new_type != current_type:
+                n_reclassified += 1
             survivor.obj_type = new_type
             survivor.type_code = OBJECT_TYPES[new_type]
             survivor.confidence = new_conf
-            survivor.is_manmade = new_type in (
-                'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
-                'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation')
-            # Update raster
+            survivor.is_manmade = new_type in _MANMADE_TYPES
             seg_type_full[labels_full == root_id] = survivor.type_code
 
     # ------------------------------------------------------------------
@@ -2441,14 +2514,16 @@ def _merge_boundary_segments(
     # ------------------------------------------------------------------
     all_objects[:] = [o for o in all_objects if o.obj_id not in remove_ids]
 
-    log.info("  Boundary merge: %d pairs found, %d segments merged into %d groups",
-             len(adj_pairs), n_merges, len(merge_groups))
+    log.info("  Boundary merge: %d pairs found, %d segments merged into %d groups, "
+             "%d reclassified, %d anchor-weak",
+             len(adj_pairs), n_merges, len(merge_groups),
+             n_reclassified, n_anchor_weak)
     return n_merges
 
 
 # === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
 
-def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
+def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, rf_only=False):
     """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
     segment_height) covering the full KG bbox, plus unified segment vectors."""
     import rasterio
@@ -2616,7 +2691,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
         _merge_boundary_segments(
             labels_full, seg_type_full, all_objects,
             tile_seg_results, full_left, full_top, res,
-            ndsm_full=ndsm_full)
+            ndsm_full=ndsm_full, rf_only=rf_only)
     except Exception as e:
         log.warning("Full GPKG boundary merge failed: %s", e)
 
@@ -3014,7 +3089,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year):
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
-                           obs_year=0):
+                           obs_year=0, rf_only=False):
     """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
     import rasterio, fiona
     import rasterio.transform
@@ -3126,7 +3201,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         try:
             _merge_boundary_segments(
                 labels_full, seg_type_full, all_objects,
-                tile_seg_results, full_left, full_top, res)
+                tile_seg_results, full_left, full_top, res,
+                rf_only=rf_only)
         except Exception as e:
             log.warning("Light GPKG boundary merge failed: %s", e)
 
@@ -4608,6 +4684,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     hansen=hansen_data,
                     observation_year=obs_year,
                     infra_lookup=infra,
+                    rf_only=rf_only,
                 )
             except Exception as e:
                 log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
@@ -4743,7 +4820,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
         full_gpkg = build_full_gpkg_tiled(
-            kg_code, tile_seg_results, all_objects, obs_year)
+            kg_code, tile_seg_results, all_objects, obs_year, rf_only=rf_only)
         result["files"]["full_gpkg"] = full_gpkg
 
         # --- 6. Build light GPKG ---
@@ -4752,7 +4829,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
-            obs_year=obs_year)
+            obs_year=obs_year, rf_only=rf_only)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 7. Build JSON summary ---

@@ -75,6 +75,7 @@ OBJECT_TYPES = {
     "tree_loss": 52,     # logging/timber harvest: was tall, now ground, terrain intact
     "construction": 53,  # new structure, or site clearing (tree_loss + earthworks)
     "earthwork": 54,      # merged excavation+fill (RF training only; split back at inference)
+    "unclassified": 99,   # RF confidence too low (rf_only mode)
 }
 
 # Group types (merge adjacent compatible individuals)
@@ -1793,11 +1794,18 @@ def segment_and_classify(
     observation_year: int | None = None,
     features_only: bool = False,
     infra_lookup=None,
+    rf_only: bool = False,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
 
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
+
+    If rf_only=True, only the 16 RF classes are emitted.  Segments where
+    the RF confidence is below *min_confidence* are labelled 'unclassified'
+    instead of falling back to rule-based heuristics.  Infrastructure
+    detection (wind_turbine, solar_panel, substation, mast) still runs
+    because those classes are excluded from RF training.
 
     Parameters
     ----------
@@ -1928,6 +1936,7 @@ def segment_and_classify(
             _w.simplefilter("ignore", UserWarning)
             rf_results = classify_with_rf_batch(
                 features, has_spectral=has_spectral,
+                rf_only=rf_only,
             )
         log.info("Step 4: RF batch classified %d segments", len(rf_results))
 
@@ -1945,6 +1954,23 @@ def segment_and_classify(
             type_name, type_code, conf, is_mm = rf_results[feat["label"]]
             # Even with RF result, check infrastructure for dropped classes
             # (wind_turbine, solar_panel, substation are not RF-predicted)
+            if _nearby:
+                _infra_result = _classify_infrastructure(
+                    feat, _nearby,
+                    feat.get("h_mean", 0), feat.get("h_max", 0),
+                    feat.get("h_std", 0), feat.get("area", 0),
+                    feat.get("compactness", 0),
+                    feat.get("fused_ndvi_mean", 0) or feat.get("ndvi_mean", 0),
+                    bool(feat.get("fused_ndvi_mean") or feat.get("ndvi_mean")),
+                    feat.get("dsm_roughness", 0),
+                    feat.get("brightness_mean", 0), has_spectral,
+                    feat.get("ndvi_mean", 0), feat.get("nir_mean", 0),
+                )
+                if _infra_result is not None:
+                    type_name, type_code, conf, is_mm = _infra_result
+        elif rf_only:
+            # rf_only mode: no rule-based fallback, but still check infrastructure
+            type_name, type_code, conf, is_mm = "unclassified", OBJECT_TYPES["unclassified"], 0.0, False
             if _nearby:
                 _infra_result = _classify_infrastructure(
                     feat, _nearby,

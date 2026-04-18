@@ -1311,7 +1311,7 @@ def _get_params():
                 'object_types', 'resolution', 'format',
                 'include_ortho', 'include_temporal',
                 'include_copernicus', 'include_cadastre',
-                'include_hansen', 'include_infra', 'color_mode', 'types',
+                'include_hansen', 'include_infra', 'rf_only', 'color_mode', 'types',
                 'ortho_year', 'min_object_size',
                 'felz_scale', 'rag_threshold', 'groups',
                 'include_dtm', 'include_dsm', 'include_segments', 'include_segments_vector',
@@ -1943,7 +1943,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
                 log.warning("Hansen calibration failed: %s", e)
 
         # Populate seg_cache so overlay/gpkg endpoints can reuse results
-        seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_temporal"
+        seg_cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_{rf_only}_temporal"
         _seg_cache.update({
             "labels": labels, "objects": objects,
             "mask": data['mask'], "transform": data['transform'],
@@ -2378,6 +2378,7 @@ def segment_overlay():
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
+        rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
         type_filter_str = params.get('types', None)
         type_filter = None
         if type_filter_str:
@@ -2402,7 +2403,7 @@ def segment_overlay():
         _validate_area(geom_3035)
 
         # Build a cache key from geometry bounds + dataset + analysis options
-        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_temporal"
+        cache_key = f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}_{include_hansen}_{include_infra}_{rf_only}_temporal"
 
         # When share_id is provided, try to find ANY cached labels for this geometry
         # (regardless of analysis options) — we only need the pixel labels, not the types
@@ -2533,6 +2534,7 @@ def segment_overlay():
             hansen=hansen_data,
             observation_year=obs_year,
             infra_lookup=_infra_lookup,
+            rf_only=rf_only,
         )
 
         objects = result['objects']
@@ -3235,10 +3237,12 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                         _il = InfrastructureLookup.for_bbox(_w4, _s4, _e4, _n4)
                     except Exception:
                         pass
+                _rf_only = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
                 result = seg.segment_and_classify(
                     dtm, dsm, mask, tf, spectral=spectral,
                     observation_year=ti.dataset_to_year(dataset),
                     infra_lookup=_il,
+                    rf_only=_rf_only,
                 )
                 objects = result['objects']
                 labels = result['labels']
@@ -3562,10 +3566,12 @@ def _render_overlay_for_gpkg(layer_id, data, geom_3035, geom_wgs, dataset,
                     _il2 = InfrastructureLookup.for_bbox(_w42, _s42, _e42, _n42)
                 except Exception:
                     pass
+            _rf_only2 = str(params.get('rf_only', 'true')).lower() in ('true', '1', 'yes')
             result = seg.segment_and_classify(
                 data['dtm'], data['dsm'], mask, tf, spectral=spectral,
                 observation_year=ti.dataset_to_year(dataset),
                 infra_lookup=_il2,
+                rf_only=_rf_only2,
             )
             labels = result['labels']
             objects = result['objects']

@@ -333,6 +333,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         <label><input id="include_cadastre" type="checkbox"> Cadastre</label>
         <label><input id="include_hansen" type="checkbox"> Hansen</label>
         <label><input id="include_infra" type="checkbox" checked> Infra</label>
+        <label><input id="rf_only" type="checkbox" checked> RF only</label>
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin:4px 0 2px">
@@ -603,7 +604,7 @@ function divCSS(t){const n=(t+1)/2;let r,g,b;if(n<.5){const f=n*2;r=33+f*222;g=1
 function divGrad(){const s=[];for(let i=0;i<=10;i++)s.push(divCSS(-1+i*.2)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
 
 // ============ TYPE CONFIG ============
-const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},wind_turbine:{s:'x',l:'⚡',c:'#1565C0'},substation:{s:'sq',l:'⬡',c:'#FF6F00'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},tree_loss:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'}};
+const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},wind_turbine:{s:'x',l:'⚡',c:'#1565C0'},substation:{s:'sq',l:'⬡',c:'#FF6F00'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},tree_loss:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'},unclassified:{s:'cir',l:'○',c:'#BEBEBE'}};
 const STATUS_COLORS={grown:{l:'▲',c:'#228B22'},felled:{l:'▼',c:'#DC143C'},new:{l:'★',c:'#00BFFF'},stable:{l:'●',c:'#888'},declined:{l:'▼',c:'#FF8C00'},dead:{l:'✖',c:'#8B0000'}};
 const EVENT_COLORS={tree_growth:{l:'▲',c:'#228B22'},tree_felling:{l:'▼',c:'#DC143C'},new_tree:{l:'★',c:'#00BFFF'},forest_clearcut:{l:'◆',c:'#FF00FF'},vegetation_growth:{l:'▲',c:'#7CFC00'},vegetation_loss:{l:'▼',c:'#FF8C00'},new_building:{l:'■',c:'#DC143C'},demolition:{l:'□',c:'#FF4500'},construction:{l:'■',c:'#FF6347'},earthwork_fill:{l:'◆',c:'#DAA520'},earthwork_cut:{l:'◇',c:'#8B4513'},earthwork_grading:{l:'◆',c:'#A0522D'},earthwork_dam:{l:'█',c:'#696969'},earthwork_trench:{l:'—',c:'#404040'},earthwork_pond:{l:'●',c:'#1E90FF'},road_new:{l:'—',c:'#808080'},road_resurfaced:{l:'—',c:'#A9A9A9'},road_widened:{l:'—',c:'#696969'},surface_change:{l:'×',c:'#D2B48C'},unknown_change:{l:'?',c:'#888'}};
 const DEF={l:'○',c:'#666'};
@@ -618,7 +619,8 @@ const OT_GROUPS={
   'Transportation':['road','path','parking','bridge'],
   'Agricultural':['crop','orchard','vineyard','garden'],
   'Terrain':['bare_soil','rock'],
-  'Disturbance':['excavation','fill','tree_loss','construction']
+  'Disturbance':['excavation','fill','tree_loss','construction'],
+  'Other':['unclassified']
 };
 const ALL_OBJ_TYPES=Object.values(OT_GROUPS).flat();
 const selectedTypes=new Set(ALL_OBJ_TYPES);
@@ -819,7 +821,8 @@ const SEGMENT_RGB={
   wall:[139,69,19],mast:[64,64,64],wind_turbine:[21,101,192],substation:[255,111,0],road:[128,128,128],path:[169,169,169],parking:[105,105,105],
   bridge:[112,128,144],crop:[218,165,32],orchard:[107,142,35],vineyard:[147,112,219],
   garden:[60,179,113],bare_soil:[210,180,140],rock:[139,134,130],excavation:[139,0,0],
-  fill:[255,140,0],tree_loss:[255,0,255],construction:[255,69,0]
+  fill:[255,140,0],tree_loss:[255,0,255],construction:[255,69,0],
+  unclassified:[190,190,190]
 };
 // Build reverse lookup: "R,G,B" -> type name
 const _rgbToType={};
@@ -1680,6 +1683,7 @@ async function loadRasterOverlay(typeFilter, shareId){
   if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
   if(document.getElementById('include_infra').checked)url+='&include_infra=true';
+  if(document.getElementById('rf_only').checked)url+='&rf_only=true';
   const topNC=document.getElementById('top_n_classes').value;
   if(topNC)url+='&top_n_classes='+topNC;
   if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
@@ -1769,6 +1773,7 @@ function getShareState(){
     cadastre:document.getElementById('include_cadastre').checked,
     hansen:document.getElementById('include_hansen').checked,
     infra:document.getElementById('include_infra').checked,
+    rf_only:document.getElementById('rf_only').checked,
     top_n_classes:document.getElementById('top_n_classes').value,
     top_n_objects:document.getElementById('top_n_objects').value,
     min_height_m:document.getElementById('min_height_m').value,
@@ -1817,6 +1822,7 @@ function restoreShareState(s){
   if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
   if(s.infra!==undefined) document.getElementById('include_infra').checked=s.infra;
+  if(s.rf_only!==undefined) document.getElementById('rf_only').checked=s.rf_only;
   if(s.top_n_classes) document.getElementById('top_n_classes').value=s.top_n_classes;
   if(s.top_n_objects) document.getElementById('top_n_objects').value=s.top_n_objects;
   if(s.min_height_m) document.getElementById('min_height_m').value=s.min_height_m;
@@ -2743,6 +2749,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
   if(document.getElementById('include_infra').checked)params.set('include_infra','true');
+  if(document.getElementById('rf_only').checked)params.set('rf_only','true');
 
   const taskId=isSeg?crypto.randomUUID():'';
   if(taskId)params.set('task_id',taskId);

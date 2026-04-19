@@ -301,8 +301,10 @@ class ZipIndex:
     entry offsets locally.  Subsequent lookups are instant.
     """
 
-    def __init__(self, url: str, cache_dir: Path = _ZIP_INDEX_CACHE_DIR):
+    def __init__(self, url: str, cache_dir: Path = _ZIP_INDEX_CACHE_DIR,
+                 session: Optional[requests.Session] = None):
         self.url = url
+        self._session = session
         self._cache_dir = cache_dir
         self._entries: Optional[Dict[str, zipfile.ZipInfo]] = None
         self._cache_key = hashlib.md5(url.encode()).hexdigest()[:12]
@@ -333,7 +335,7 @@ class ZipIndex:
 
         # Fetch central directory from remote ZIP
         log.info("Fetching ZIP index from %s", self.url)
-        hrf = HTTPRangeFile(self.url)
+        hrf = HTTPRangeFile(self.url, session=self._session)
         with zipfile.ZipFile(hrf) as zf:
             entries = {zi.filename: zi for zi in zf.infolist()}
 
@@ -378,7 +380,7 @@ class ZipIndex:
         # Read the local file header + compressed data
         # Local header is 30 bytes + filename_len + extra_len,
         # followed by compressed data of compress_size bytes.
-        hrf = HTTPRangeFile(self.url)
+        hrf = HTTPRangeFile(self.url, session=self._session)
         hrf.seek(zi.header_offset)
 
         # Read local file header (30 bytes minimum)
@@ -408,7 +410,7 @@ class ZipIndex:
             return zlib.decompress(compressed, -15)
         else:
             # Fallback: download via zipfile (slower, full central dir parse)
-            hrf2 = HTTPRangeFile(self.url)
+            hrf2 = HTTPRangeFile(self.url, session=self._session)
             with zipfile.ZipFile(hrf2) as zf:
                 return zf.read(name)
 
@@ -657,16 +659,32 @@ class ZenodoCache:
         return result
 
     def _file_download_url(self, zip_name: str) -> Optional[str]:
-        """Get the download URL for a ZIP in the cache deposit."""
-        finfo = self.manifest.get_file(zip_name)
-        if finfo and finfo.get("url"):
-            return finfo["url"]
+        """Get the download URL for a ZIP in the cache deposit.
 
-        # Try record_id-based URL
-        rid = self.manifest.record_id or self.manifest.depo_id
+        For published records uses /records/{id}/files/{name}.
+        For draft deposits uses /api/records/{id}/draft/files/{name}/content
+        (requires access_token, which is appended by _authed_session()).
+        """
+        rid = self.manifest.record_id
+        did = self.manifest.depo_id
+
         if rid:
+            # Published record — public URL
             return f"{self.base_url}/records/{rid}/files/{zip_name}"
+
+        if did:
+            # Draft deposit — authenticated API URL
+            return (f"{self.base_url}/api/records/{did}/draft/files/"
+                    f"{zip_name}/content")
+
         return None
+
+    def _authed_session(self) -> requests.Session:
+        """Return a session with the access_token as a default query param."""
+        s = requests.Session()
+        s.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+        s.params = {"access_token": self.token}  # type: ignore[assignment]
+        return s
 
     # --- Upload ---
 
@@ -786,7 +804,7 @@ class ZenodoCache:
                     from datetime import datetime, timezone
                     self.manifest.set_file(
                         zip_name,
-                        url=f"{self.base_url}/records/{depo_id}/files/{zip_name}",
+                        url=self._file_download_url(zip_name),
                         size=zip_path.stat().st_size,
                         checksum=checksum,
                         tile_count=merged_count,
@@ -825,7 +843,8 @@ class ZenodoCache:
             return None
 
         try:
-            idx = ZipIndex(url)
+            session = self._authed_session() if not self.manifest.record_id else None
+            idx = ZipIndex(url, session=session)
             self._zip_indices[zip_name] = idx
             return idx
         except Exception as e:

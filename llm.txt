@@ -203,6 +203,18 @@ Rebuild search index from scratch (~0.3s).
 #### GET /api/v1/query ← UNIFIED QUERY ENDPOINT
 Supports multiple query modes via query params. All return JSON.
 
+Speed tiers:
+  FAST (<25ms)   Index queries: bbox, admin, type ranking, confidence, divergence, compound
+  MEDIUM (~1s)   JSON scan (pre-filtered): parcels_by_type, top_features, parcel lookup
+  SLOW (~10s)    GPKG download+query: /api/v1/kg/<code>/buildings, segments, etc.
+
+Common questions → endpoints:
+  "Parcels where tree RF conf > 0.8, area > 1500m²"      → parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500
+  "Tallest trees with RF conf > 0.9"                     → top_features=trees&min_confidence=0.9
+  "New buildings in area X with RF roof conf > 0.75"     → top_features=new_buildings&min_confidence=0.75&bbox=...
+  "Infrastructure masts with RF conf > 0.8"              → top_features=infrastructure&type=mast&min_confidence=0.8
+  "Multiple types + terrain + no buildings"              → POST /api/v1/query/compound (see below)
+
 Query modes (pick one):
   q=<text>                Full-text search (KG/gemeinde/district/state names)
   kg=<code>               Exact KG lookup (returns full index record + landcover + hansen + links)
@@ -222,7 +234,7 @@ Query modes (pick one):
   type_confidence=<type>  Rank KGs by RF confidence for a specific object type
   high_confidence_type=<type>  KGs where type has RF confidence >= min_confidence AND area >= min_area_sqm
   parcels_by_type=<type>  Per-parcel filter: parcels where type has RF confidence >= min_confidence AND area >= min_area_sqm (scans KG JSONs)
-  top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG features filtered by min_confidence, optionally type=<object_type>
+  top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG features filtered by min_confidence, optionally type=<object_type>, bbox=<w,s,e,n>
   min_confidence=<float>  Min RF confidence threshold (used with high_confidence_type, parcels_by_type, top_features)
   min_area_sqm=<float>    Min area m² for type (used with high_confidence_type, parcels_by_type)
 
@@ -610,6 +622,8 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?confidence_rank=asc&limit=
 # RF confidence for a specific type
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type_confidence=tree&limit=20'
 
+# --- RF Classification Queries ---
+
 # KGs where tree RF confidence > 0.8 and tree area > 1500 m²
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?high_confidence_type=tree&min_confidence=0.8&min_area_sqm=1500'
 
@@ -622,6 +636,37 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_con
 # New building footprints with RF roof confidence > 0.75
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75'
 
+# New building footprints in a specific area (bbox) with RF conf > 0.75
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75&bbox=15.4,47.0,15.5,47.1'
+
 # Infrastructure (e.g. masts) with RF confidence > 0.8
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8'
+
+# --- Compound Query (POST) ---
+# All filters combined in one request. Pure SQL, fast.
+
+# Tree conf>0.8 area>800 + grass conf>0.8 area>1300 + no buildings + SW aspect + rugged terrain
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},{"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],"max_buildings":0,"aspect":["S","SW","W"],"min_roughness":2.0}'
+
+# High-elevation steep terrain with lots of trees, sorted by tree area
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_elevation":1500,"min_slope":15,"min_tree_count":100,"sort":"tree_canopy_sqm","sort_dir":"desc"}'
+
+# KGs with high NDVI, low SAR, evergreen phenology in Tirol
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Tirol","min_ndvi":0.6,"max_sar_vv":-10,"phenology":"evergreen"}'
+
+# Landcover filter: KGs with >20% crop area and mean crop height < 1m
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"landcover_filters":[{"type":"crop","min_fraction":0.2,"max_height_mean":1.0}]}'
+
+# Temporal change hotspots: high DTM change + low stability
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_dtm_change":0.5,"max_diverged_pct":5,"sort":"temporal_stability","sort_dir":"asc"}'
 ```

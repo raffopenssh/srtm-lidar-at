@@ -1168,18 +1168,30 @@ class SearchIndex:
         return results[offset:offset + limit]
 
     def query_top_features(self, feature_type, object_type=None,
-                           min_confidence=0.0, limit=100, offset=0):
+                           min_confidence=0.0, bbox=None,
+                           limit=100, offset=0):
         """Cross-KG query for top trees / objects / new buildings / infrastructure.
 
         feature_type: 'trees', 'objects', 'new_buildings', 'infrastructure'
         Filters by rf_confidence >= min_confidence and optionally by object_type.
+        bbox: (w,s,e,n) to restrict which KGs are scanned.
         Returns features sorted by height (descending).
         """
         c = self._conn()
-        # Only scan processed KGs
-        kg_rows = c.execute(
-            'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code'
-        ).fetchall()
+        # Pre-filter KGs spatially if bbox given
+        if bbox and len(bbox) == 4:
+            kg_rows = c.execute('''
+                SELECT k.kg_code FROM kg k
+                JOIN kg_rtree r ON r.id = k.rowid
+                WHERE k.processed=1
+                  AND r.max_lon >= ? AND r.min_lon <= ?
+                  AND r.max_lat >= ? AND r.min_lat <= ?
+                ORDER BY k.kg_code
+            ''', (bbox[0], bbox[2], bbox[1], bbox[3])).fetchall()
+        else:
+            kg_rows = c.execute(
+                'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code'
+            ).fetchall()
         results = []
         for kg_row in kg_rows:
             kg_code = kg_row['kg_code']

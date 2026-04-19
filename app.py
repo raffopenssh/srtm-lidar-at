@@ -1711,9 +1711,15 @@ def api_query():
         if args.get('top_features'):
             mc = float(args.get('min_confidence', 0))
             otype = args.get('type')
+            tf_bbox = None
+            if args.get('bbox'):
+                bp = [float(x) for x in args['bbox'].split(',')]
+                if len(bp) == 4:
+                    tf_bbox = tuple(bp)
             return jsonify(idx.query_top_features(
                 args['top_features'], object_type=otype,
-                min_confidence=mc, limit=limit, offset=offset))
+                min_confidence=mc, bbox=tf_bbox,
+                limit=limit, offset=offset))
 
         # Spatial bbox
         if args.get('bbox'):

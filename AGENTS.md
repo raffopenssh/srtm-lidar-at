@@ -182,8 +182,18 @@ Contain: UI state + analysis result + cached overlay images.
   Starts from our landscape index → finds KGs → expands to parcels from KG JSONs → enriches with cadastre.
   This is the power query. Answers: "100 parcels with tree conf>0.8 area>800 + no buildings + SW aspect + rugged."
 
-Compound filters: all `query_compound()` params (type_filters, landcover_filters, bbox, state,
-min_roughness, aspect, min_elevation, min_ndvi, etc.)
+Compound filters: all `query_compound()` params — type_filters, landcover_filters, bbox, state,
+district, gemeinde, aspect, dominant_type, phenology, terrain_class, quality_grade,
++ 70+ numeric min/max filters covering: terrain (slope, roughness, elevation, elevation_min/max,
+elevation_range, steepness_max, tri), area (total_area, parcels, segments), buildings
+(building_count, building_height, building_max_height, building_stories, building_stories_max,
+building_pitched_pct, building_footprint, new_building_footprint/height/stories,
+infrastructure, building_height_coverage), trees (tree_count, tree_height, tree_canopy_sqm,
+tree_volume), vegetation (ndvi, vegetated_fraction, shannon_diversity), NDVI harmonics
+(ndvi_amplitude, ndvi_harm_mean, ndvi_phase), SAR (sar_vv, sar_vh), temporal change
+(dtm_change, volume_change, changed_segments, disturbed_volume, temporal_stability),
+classification quality (confidence, rf_confidence, diverged_pct, rf_diverged_count,
+rf_classified_pct, quality_score)
 
 Parcel filters: `min_vegetated_fraction`, `types`, `min_type_fraction`, `min_ndsm_max`,
 `min_elevation`, `min_parcel_area`, `is_vegetated`, `min_rf_confidence`,

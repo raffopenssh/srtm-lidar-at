@@ -1546,27 +1546,43 @@ def api_query_compound():
       bbox: [w, s, e, n]
       state, district, gemeinde: str
       aspect: ["S","SW","W"]           dominant aspect direction
-      dominant_type: str                 e.g. "tree", "grass"
-      phenology: str                     phenology_dominant =
-      quality_grade: str                 e.g. "A", "B"
+      dominant_type, phenology, terrain_class, quality_grade: str (exact match)
 
       Numeric ranges (min_X / max_X):
-        slope, roughness, elevation, elevation_range, steepness_max,
-        buildings, new_buildings, tree_count, tree_height, tree_canopy_sqm,
-        ndvi, vegetated_fraction, shannon_diversity, confidence, rf_confidence,
-        diverged_pct (max), quality_score, temporal_stability, infrastructure,
-        building_height, sar_vv, sar_vh, ndvi_amplitude, dtm_change
+        --- Terrain ---
+        slope, roughness, elevation, elevation_min, elevation_max,
+        elevation_range, steepness_max, tri
+        --- Area / parcels / segments ---
+        total_area, parcels, segments
+        --- Buildings ---
+        buildings, new_buildings, infrastructure,
+        building_height, building_max_height,
+        building_stories, building_stories_max,
+        building_pitched_pct, building_footprint,
+        new_building_footprint, new_building_height, new_building_stories,
+        building_height_coverage
+        --- Trees ---
+        tree_count, tree_height, tree_canopy_sqm, tree_volume
+        --- Vegetation ---
+        ndvi, vegetated_fraction, shannon_diversity
+        --- NDVI harmonics ---
+        ndvi_amplitude, ndvi_harm_mean, ndvi_phase
+        --- SAR ---
+        sar_vv, sar_vh
+        --- Temporal change ---
+        dtm_change, volume_change, changed_segments, disturbed_volume,
+        temporal_stability
+        --- Classification quality ---
+        confidence, rf_confidence, diverged_pct (max),
+        rf_diverged_count (max), rf_classified_pct, quality_score
 
       type_filters: [{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}, ...]
         Filter by RF classification confidence + area per object type.
-
       landcover_filters: [{"type": "grass", "min_area_sqm": 1300, "min_fraction": 0.1}, ...]
         Filter by landcover area/fraction/height per object type.
-
       sort: str (any kg column or type-derived column)
       sort_dir: "asc" | "desc"
-      limit: int (default 50, max 1000)
-      offset: int
+      limit: int (default 50, max 1000), offset: int
 
     Example:
       POST /api/v1/query/compound

@@ -288,6 +288,31 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_kg_elev_range ON kg(elevation_range_m)',
             'CREATE INDEX IF NOT EXISTS idx_kg_tri ON kg(tri_mean)',
             'CREATE INDEX IF NOT EXISTS idx_kg_terrain_class ON kg(terrain_class)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_footprint ON kg(building_footprint_sqm)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_max_height ON kg(building_max_height_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_stories ON kg(building_stories_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_pitched ON kg(building_pitched_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_new_bldg_fp ON kg(new_building_footprint_sqm)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_infrastructure ON kg(infrastructure_count)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_tree_volume ON kg(tree_stem_volume_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_vol_change ON kg(net_volume_change_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_changed_segs ON kg(n_changed_segments)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_disturbed_vol ON kg(total_disturbed_volume_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_temporal_stab ON kg(temporal_stability)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_ndvi ON kg(ndvi_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_ndvi_harm ON kg(ndvi_harm_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_sar_vv ON kg(sar_vv_mean_db)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_sar_vh ON kg(sar_vh_mean_db)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_phenology ON kg(phenology_dominant)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_total_area ON kg(total_area_sqm)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_parcel_count ON kg(parcel_count)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_n_segments ON kg(n_segments)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_min ON kg(elevation_min_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_max ON kg(elevation_max_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_rf_classified ON kg(rf_classified_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_ht_cov ON kg(building_height_coverage_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_shannon ON kg(shannon_diversity)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_veg_frac ON kg(vegetated_fraction)',
         ]
 
     def _migrate(self):
@@ -1721,21 +1746,75 @@ class SearchIndex:
           state, district, gemeinde: str
           aspect: [str, ...]            e.g. ["S","SW","W"]
           dominant_type: str
-          min_slope / max_slope: float
-          min_roughness: float          roughness_mean >=
-          min_elevation / max_elevation: float
-          min_elevation_range: float
-          min_steepness_max: float
-          max_buildings / min_buildings: int
-          min_new_buildings: int
-          min_tree_count / min_tree_height / min_tree_canopy_sqm: float
-          min_ndvi / max_ndvi: float
+          phenology: str
+          terrain_class: str            level|nearly_level|slightly_rugged|...
+          quality_grade: str            A|B|C|D
+
+          --- Terrain ---
+          min_slope / max_slope: float              slope_mean_deg
+          min_roughness: float                      roughness_mean
+          min_elevation / max_elevation: float      elevation_mean_m
+          min_elevation_min / max_elevation_min: float  elevation_min_m (valley floor)
+          min_elevation_max / max_elevation_max: float  elevation_max_m (ridge top)
+          min_elevation_range: float                elevation_range_m
+          min_steepness_max: float                  steepness_max_deg
+          min_tri / max_tri: float                  Terrain Ruggedness Index
+
+          --- Area / parcels / segments ---
+          min_total_area / max_total_area: float    total_area_sqm
+          min_parcels / max_parcels: int            parcel_count
+          min_segments / max_segments: int           n_segments
+
+          --- Buildings ---
+          min_buildings / max_buildings: int          building_count
+          min_new_buildings: int                      new_building_count
+          min_infrastructure: int                     infrastructure_count
+          min_building_height / max_building_height: float   building_mean_height_m
+          min_building_max_height / max_building_max_height: float  building_max_height_m
+          min_building_stories / max_building_stories: float  building_stories_mean
+          min_building_stories_max / max_building_stories_max: int  building_stories_max
+          min_building_pitched_pct / max_building_pitched_pct: float  % pitched roofs
+          min_building_footprint / max_building_footprint: float  total building_footprint_sqm
+          min_new_building_footprint: float           new_building_footprint_sqm
+          min_new_building_height: float              new_building_mean_height_m
+          min_new_building_stories: float             new_building_stories_mean
+          min_building_height_coverage: float         building_height_coverage_pct
+
+          --- Trees ---
+          min_tree_count: int                         tree_count
+          min_tree_height: float                      tree_mean_height_m
+          min_tree_canopy_sqm: float                  tree_canopy_sqm
+          min_tree_volume: float                      tree_stem_volume_m3
+
+          --- Vegetation ---
+          min_ndvi / max_ndvi: float                  ndvi_mean
           min_vegetated_fraction / max_vegetated_fraction: float
           min_shannon_diversity: float
-          min_confidence / min_rf_confidence: float
-          max_diverged_pct: float
-          min_quality_score / min_temporal_stability: float
-          phenology: str
+
+          --- NDVI harmonics ---
+          min_ndvi_amplitude: float                   ndvi_harm_amplitude
+          min_ndvi_harm_mean / max_ndvi_harm_mean: float  ndvi_harm_mean
+          min_ndvi_phase / max_ndvi_phase: float      ndvi_harm_phase (peak month)
+
+          --- SAR ---
+          min_sar_vv / max_sar_vv: float              sar_vv_mean_db
+          min_sar_vh / max_sar_vh: float              sar_vh_mean_db
+
+          --- Temporal change ---
+          min_dtm_change / max_dtm_change: float      dtm_change_mean_m
+          min_volume_change / max_volume_change: float  net_volume_change_m3
+          min_changed_segments: int                    n_changed_segments
+          min_disturbed_volume: float                  total_disturbed_volume_m3
+          min_temporal_stability: float                temporal_stability
+
+          --- Classification quality ---
+          min_confidence: float                       mean_confidence
+          min_rf_confidence: float                    rf_mean_confidence
+          max_diverged_pct: float                     rf_diverged_pct
+          max_rf_diverged_count: int                  rf_diverged_count
+          min_rf_classified_pct: float                rf_classified_pct
+          min_quality_score: float                    quality_score
+
           --- Per-type classification (fast, joins kg_classification) ---
           type_filters: [{"type": str, "min_confidence": float, "min_area_sqm": float}, ...]
           --- Per-type landcover (fast, joins kg_landcover) ---
@@ -1845,6 +1924,50 @@ class SearchIndex:
             ('max_dtm_change', 'dtm_change_mean_m', '<='),
             ('min_tri', 'tri_mean', '>='),
             ('max_tri', 'tri_mean', '<='),
+            # --- Area / parcels / segments ---
+            ('min_total_area', 'total_area_sqm', '>='),
+            ('max_total_area', 'total_area_sqm', '<='),
+            ('min_parcels', 'parcel_count', '>='),
+            ('max_parcels', 'parcel_count', '<='),
+            ('min_segments', 'n_segments', '>='),
+            ('max_segments', 'n_segments', '<='),
+            # --- Elevation extremes ---
+            ('min_elevation_min', 'elevation_min_m', '>='),
+            ('max_elevation_min', 'elevation_min_m', '<='),
+            ('min_elevation_max', 'elevation_max_m', '>='),
+            ('max_elevation_max', 'elevation_max_m', '<='),
+            # --- Trees ---
+            ('min_tree_volume', 'tree_stem_volume_m3', '>='),
+            # --- Temporal ---
+            ('min_volume_change', 'net_volume_change_m3', '>='),
+            ('max_volume_change', 'net_volume_change_m3', '<='),
+            ('min_changed_segments', 'n_changed_segments', '>='),
+            ('min_disturbed_volume', 'total_disturbed_volume_m3', '>='),
+            # --- Building detail ---
+            ('min_building_max_height', 'building_max_height_m', '>='),
+            ('max_building_max_height', 'building_max_height_m', '<='),
+            ('min_building_stories', 'building_stories_mean', '>='),
+            ('max_building_stories', 'building_stories_mean', '<='),
+            ('min_building_stories_max', 'building_stories_max', '>='),
+            ('max_building_stories_max', 'building_stories_max', '<='),
+            ('min_building_pitched_pct', 'building_pitched_pct', '>='),
+            ('max_building_pitched_pct', 'building_pitched_pct', '<='),
+            ('min_building_footprint', 'building_footprint_sqm', '>='),
+            ('max_building_footprint', 'building_footprint_sqm', '<='),
+            # --- New building detail ---
+            ('min_new_building_footprint', 'new_building_footprint_sqm', '>='),
+            ('min_new_building_height', 'new_building_mean_height_m', '>='),
+            ('min_new_building_stories', 'new_building_stories_mean', '>='),
+            # --- NDVI harmonics ---
+            ('min_ndvi_harm_mean', 'ndvi_harm_mean', '>='),
+            ('max_ndvi_harm_mean', 'ndvi_harm_mean', '<='),
+            ('min_ndvi_phase', 'ndvi_harm_phase', '>='),
+            ('max_ndvi_phase', 'ndvi_harm_phase', '<='),
+            # --- Coverage ---
+            ('min_building_height_coverage', 'building_height_coverage_pct', '>='),
+            # --- Classification ---
+            ('min_rf_classified_pct', 'rf_classified_pct', '>='),
+            ('max_rf_diverged_count', 'rf_diverged_count', '<='),
         ]
         for fkey, col, op in _range_map:
             val = filters.get(fkey)

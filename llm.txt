@@ -1,4 +1,4 @@
-# Austrian Landscape Analysis API — v5.3
+# Austrian Landscape Analysis API — v5.4
 # Base: https://srtm-lidar-at.exe.xyz:8000
 # Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
 
@@ -708,15 +708,76 @@ Filter keys (all optional):
   bbox: [w,s,e,n]                       spatial filter
   state, district, gemeinde: str         admin filter
   aspect: ["S","SW","W"]                dominant aspect direction
-  dominant_type, phenology, quality_grade: str  exact match
-  terrain_class: str                     exact match, e.g. "level", "moderately_rugged"
+  dominant_type, phenology, quality_grade, terrain_class: str  exact match
+    terrain_class values: level, nearly_level, slightly_rugged,
+      intermediately_rugged, moderately_rugged, highly_rugged, extremely_rugged
+
   Numeric ranges (prefix min_ or max_):
-    slope, roughness, elevation, elevation_range, steepness_max,
-    tri (Terrain Ruggedness Index),
-    buildings, new_buildings, tree_count, tree_height, tree_canopy_sqm,
-    ndvi, vegetated_fraction, shannon_diversity, confidence, rf_confidence,
-    quality_score, temporal_stability, infrastructure, building_height,
-    sar_vv, sar_vh, ndvi_amplitude, dtm_change, diverged_pct (max only)
+    --- Terrain ---
+    slope              slope_mean_deg
+    roughness          roughness_mean
+    elevation          elevation_mean_m
+    elevation_min      elevation_min_m (valley floor)
+    elevation_max      elevation_max_m (ridge top)
+    elevation_range    elevation_range_m
+    steepness_max      steepness_max_deg
+    tri                Terrain Ruggedness Index
+
+    --- Area / parcels / segments ---
+    total_area         total_area_sqm (KG area)
+    parcels            parcel_count
+    segments           n_segments
+
+    --- Buildings ---
+    buildings               building_count
+    new_buildings            new_building_count (min only)
+    infrastructure           infrastructure_count (min only)
+    building_height          building_mean_height_m
+    building_max_height      building_max_height_m
+    building_stories         building_stories_mean
+    building_stories_max     building_stories_max (tallest building)
+    building_pitched_pct     % pitched roofs (0-100)
+    building_footprint       total building_footprint_sqm
+    new_building_footprint   new_building_footprint_sqm (min only)
+    new_building_height      new_building_mean_height_m (min only)
+    new_building_stories     new_building_stories_mean (min only)
+    building_height_coverage building_height_coverage_pct (min only)
+
+    --- Trees ---
+    tree_count         tree_count (min only)
+    tree_height        tree_mean_height_m (min only)
+    tree_canopy_sqm    tree_canopy_sqm (min only)
+    tree_volume        tree_stem_volume_m3 (min only)
+
+    --- Vegetation ---
+    ndvi               ndvi_mean
+    vegetated_fraction vegetated_fraction (0-1)
+    shannon_diversity  shannon_diversity (min only)
+
+    --- NDVI harmonics ---
+    ndvi_amplitude     ndvi_harm_amplitude (min only)
+    ndvi_harm_mean     ndvi_harm_mean (annual mean)
+    ndvi_phase         ndvi_harm_phase (peak month)
+
+    --- SAR ---
+    sar_vv             sar_vv_mean_db
+    sar_vh             sar_vh_mean_db
+
+    --- Temporal change ---
+    dtm_change         dtm_change_mean_m
+    volume_change      net_volume_change_m3
+    changed_segments   n_changed_segments (min only)
+    disturbed_volume   total_disturbed_volume_m3 (min only)
+    temporal_stability temporal_stability
+
+    --- Classification quality ---
+    confidence         mean_confidence
+    rf_confidence      rf_mean_confidence
+    diverged_pct       rf_diverged_pct (max only)
+    rf_diverged_count  rf_diverged_count (max only)
+    rf_classified_pct  rf_classified_pct (min only)
+    quality_score      quality_score
+
   type_filters: [{type, min_confidence, min_area_sqm}, ...]
     RF classification confidence + area per object type (joins kg_classification)
   landcover_filters: [{type, min_area_sqm, min_fraction, min_height_mean, max_height_mean}, ...]
@@ -728,16 +789,32 @@ Filter keys (all optional):
 
 All filters are fast (pure SQL on indexed columns). Returns {total, offset, limit, results}.
 
-### Search Index Schema Additions
+### Search Index Schema
 
-New columns on the kg table (indexed):
-  tri_mean        REAL    — mean Terrain Ruggedness Index for the KG
-  terrain_class   TEXT    — Riley classification (level … extremely_rugged)
+kg table columns (all indexed): kg_code, kg_name, gemeinde_code, gemeinde_name,
+  district_code, district_name, state_code, state_name, bbox, centroid,
+  parcel_count, building_count, total_area_sqm, processed, primary_year,
+  dominant_type, vegetated_fraction, shannon_diversity, n_segments,
+  elevation_min_m, elevation_max_m, elevation_mean_m, slope_mean_deg,
+  aspect_dominant, roughness_mean, steepness_max_deg, elevation_range_m,
+  tri_mean, terrain_class, ndvi_mean,
+  tree_count, tree_canopy_sqm, tree_mean_height_m, tree_stem_volume_m3,
+  net_volume_change_m3, temporal_stability,
+  new_building_count, infrastructure_count,
+  building_footprint_sqm, building_mean_height_m, building_max_height_m,
+  building_stories_mean, building_stories_max, building_pitched_pct,
+  new_building_footprint_sqm, new_building_mean_height_m, new_building_stories_mean,
+  sar_vv_mean_db, sar_vh_mean_db,
+  ndvi_harm_mean, ndvi_harm_amplitude, ndvi_harm_phase,
+  dtm_change_mean_m, n_changed_segments, total_disturbed_volume_m3,
+  phenology_dominant, n_tiles, building_height_coverage_pct,
+  mean_confidence, rf_classified_pct, rf_mean_confidence,
+  rf_diverged_count, rf_diverged_pct, quality_score, quality_grade,
+  zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
 
-New table: kg_buildings (per-building records, joined to kg via kg_code):
-  building_id, kg_code, roof_type_hint (flat/pitched), max_height_m (REAL),
-  stories_est (INT), footprint_area_sqm (REAL), centroid_lon (REAL), centroid_lat (REAL)
-  Enables compound queries that filter on building-level attributes.
+kg_buildings table (per-building records, joined via kg_code):
+  building_id, roof_type_hint (flat/pitched), max_height_m, mean_height_m,
+  stories_est, footprint_area_sqm, centroid_lon, centroid_lat, centroid_dtm_m
 
 Async flow:
   1. POST {"min_elevation": 1500, "async": true} → 202 {task_id, status, poll}
@@ -1115,6 +1192,71 @@ curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_dtm_change":0.5,"max_diverged_pct":5,"sort":"temporal_stability","sort_dir":"asc"}'
 
+# --- NEW: Building detail filters ---
+
+# KGs with tall buildings (mean > 12m, max > 20m) and > 60% pitched roofs
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_building_height":12,"min_building_max_height":20,"min_building_pitched_pct":60}'
+
+# KGs with multi-story buildings (avg > 3 stories, tallest > 5) and large footprint
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_building_stories":3,"min_building_stories_max":5,"min_building_footprint":50000,"sort":"building_max_height_m","sort_dir":"desc"}'
+
+# KGs with new construction: new buildings with footprint > 500m² and height > 5m
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_new_buildings":3,"min_new_building_footprint":500,"min_new_building_height":5}'
+
+# Rural KGs: no multi-story, small footprint, mostly pitched roofs
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_building_stories_max":2,"max_building_footprint":10000,"min_building_pitched_pct":80,"state":"Burgenland"}'
+
+# --- NEW: Terrain detail filters ---
+
+# High alpine: valley floor > 1500m, ridge > 2500m, very rugged
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_elevation_min":1500,"min_elevation_max":2500,"min_elevation_range":800,"terrain_class":"highly_rugged"}'
+
+# Flat lowlands with large area and many parcels
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"terrain_class":"level","max_elevation":300,"min_total_area":5000000,"min_parcels":200}'
+
+# --- NEW: Temporal & disturbance filters ---
+
+# Active construction/earthworks: high volume change + many changed segments
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_changed_segments":20,"min_disturbed_volume":5000,"sort":"total_disturbed_volume_m3","sort_dir":"desc"}'
+
+# Erosion/subsidence: negative volume change + low stability
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_volume_change":-1000,"min_temporal_stability":0,"sort":"net_volume_change_m3","sort_dir":"asc"}'
+
+# --- NEW: Tree & vegetation detail ---
+
+# KGs with high stem volume (forestry interest) and good NDVI amplitude (seasonal)
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_tree_volume":10000,"min_ndvi_amplitude":0.15,"sort":"tree_stem_volume_m3","sort_dir":"desc"}'
+
+# NDVI seasonal peak timing: late-season peak (phase > 7 = July+)
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_ndvi_phase":7,"max_ndvi_phase":9,"min_ndvi_harm_mean":0.5}'
+
+# --- NEW: Classification quality ---
+
+# High-quality RF coverage: > 90% RF classified, low divergence
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_rf_classified_pct":90,"max_rf_diverged_count":5,"min_quality_score":80}'
+
 # --- Pagination examples ---
 # Page through all KGs in Vorarlberg (25 per page)
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=0'
@@ -1252,10 +1394,26 @@ SW aspect, rugged terrain."
 ```
 
 compound supports all SearchIndex.query_compound() filters:
-  bbox, state, district, gemeinde, aspect, dominant_type, phenology, terrain_class,
-  min_slope, min_roughness, min_elevation, max_elevation, min_ndvi,
-  min_vegetated_fraction, max_buildings, min_tree_count, min_tree_canopy_sqm,
-  min_confidence, min_rf_confidence, min_tri, max_tri,
+  bbox, state, district, gemeinde, aspect, dominant_type, phenology,
+  terrain_class, quality_grade,
+  Terrain: min/max_slope, min_roughness, min/max_elevation,
+    min/max_elevation_min (valley floor), min/max_elevation_max (ridge top),
+    min_elevation_range, min_steepness_max, min/max_tri
+  Area: min/max_total_area, min/max_parcels, min/max_segments
+  Buildings: min/max_buildings, min_new_buildings, min_infrastructure,
+    min/max_building_height, min/max_building_max_height,
+    min/max_building_stories, min/max_building_stories_max,
+    min/max_building_pitched_pct, min/max_building_footprint,
+    min_new_building_footprint, min_new_building_height, min_new_building_stories,
+    min_building_height_coverage
+  Trees: min_tree_count, min_tree_height, min_tree_canopy_sqm, min_tree_volume
+  Vegetation: min/max_ndvi, min/max_vegetated_fraction, min_shannon_diversity
+  NDVI harmonics: min_ndvi_amplitude, min/max_ndvi_harm_mean, min/max_ndvi_phase
+  SAR: min/max_sar_vv, min/max_sar_vh
+  Temporal: min/max_dtm_change, min/max_volume_change, min_changed_segments,
+    min_disturbed_volume, min_temporal_stability
+  Quality: min_confidence, min_rf_confidence, max_diverged_pct,
+    max_rf_diverged_count, min_rf_classified_pct, min_quality_score
   type_filters, landcover_filters, sort, sort_dir
 
 parcel_filters (per-parcel from our KG JSONs):

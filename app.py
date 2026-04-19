@@ -1496,6 +1496,62 @@ def api_kg_layers(kg_code):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/query/compound', methods=['POST'])
+def api_query_compound():
+    """Compound query: filter KGs by any combination of attributes.
+
+    POST JSON body with filter keys (all optional):
+      bbox: [w, s, e, n]
+      state, district, gemeinde: str
+      aspect: ["S","SW","W"]           dominant aspect direction
+      dominant_type: str                 e.g. "tree", "grass"
+      phenology: str                     phenology_dominant =
+      quality_grade: str                 e.g. "A", "B"
+
+      Numeric ranges (min_X / max_X):
+        slope, roughness, elevation, elevation_range, steepness_max,
+        buildings, new_buildings, tree_count, tree_height, tree_canopy_sqm,
+        ndvi, vegetated_fraction, shannon_diversity, confidence, rf_confidence,
+        diverged_pct (max), quality_score, temporal_stability, infrastructure,
+        building_height, sar_vv, sar_vh, ndvi_amplitude, dtm_change
+
+      type_filters: [{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}, ...]
+        Filter by RF classification confidence + area per object type.
+
+      landcover_filters: [{"type": "grass", "min_area_sqm": 1300, "min_fraction": 0.1}, ...]
+        Filter by landcover area/fraction/height per object type.
+
+      sort: str (any kg column or type-derived column)
+      sort_dir: "asc" | "desc"
+      limit: int (default 50, max 1000)
+      offset: int
+
+    Example:
+      POST /api/v1/query/compound
+      {
+        "type_filters": [
+          {"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800},
+          {"type": "grass", "min_confidence": 0.8, "min_area_sqm": 1300}
+        ],
+        "max_buildings": 0,
+        "aspect": ["S", "SW", "W"],
+        "min_roughness": 2.0,
+        "sort": "tree_area_sqm",
+        "sort_dir": "desc"
+      }
+    """
+    try:
+        idx = si.get_index()
+        body = request.get_json(force=True) or {}
+        limit = min(int(body.pop('limit', 50)), 1000)
+        offset = int(body.pop('offset', 0))
+        result = idx.query_compound(body, limit=limit, offset=offset)
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_query_compound: %s', e)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/query')
 def api_query():
     """Unified query endpoint. Supports multiple query modes via params.

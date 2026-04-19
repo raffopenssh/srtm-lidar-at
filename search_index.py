@@ -118,6 +118,9 @@ class SearchIndex:
                 elevation_mean_m REAL,
                 slope_mean_deg REAL,
                 aspect_dominant TEXT,
+                roughness_mean REAL,
+                steepness_max_deg REAL,
+                elevation_range_m REAL,
                 ndvi_mean REAL,
                 tree_count INTEGER DEFAULT 0,
                 tree_canopy_sqm REAL DEFAULT 0,
@@ -238,6 +241,9 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_kg_diverged ON kg(rf_diverged_pct)',
             'CREATE INDEX IF NOT EXISTS idx_kg_confidence ON kg(mean_confidence)',
             'CREATE INDEX IF NOT EXISTS idx_kg_rf_confidence ON kg(rf_mean_confidence)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_roughness ON kg(roughness_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_steepness_max ON kg(steepness_max_deg)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_range ON kg(elevation_range_m)',
         ]
 
     def _migrate(self):
@@ -254,6 +260,17 @@ class SearchIndex:
             ('rf_mean_confidence', 'REAL', None),
             ('rf_diverged_count', 'INTEGER', 0),
             ('rf_diverged_pct', 'REAL', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
+        # Add terrain detail columns (idempotent)
+        for col, ctype, default in [
+            ('roughness_mean', 'REAL', None),
+            ('steepness_max_deg', 'REAL', None),
+            ('elevation_range_m', 'REAL', None),
         ]:
             try:
                 dflt = f' DEFAULT {default}' if default is not None else ''
@@ -453,6 +470,7 @@ class SearchIndex:
             building_count=?,
             elevation_min_m=?, elevation_max_m=?, elevation_mean_m=?,
             slope_mean_deg=?, aspect_dominant=?,
+            roughness_mean=?, steepness_max_deg=?, elevation_range_m=?,
             ndvi_mean=?,
             tree_count=?, tree_canopy_sqm=?, tree_mean_height_m=?, tree_stem_volume_m3=?,
             net_volume_change_m3=?, temporal_stability=?,
@@ -478,6 +496,7 @@ class SearchIndex:
                 bf.get('count', 0),
                 tr.get('elevation_min_m'), tr.get('elevation_max_m'), tr.get('elevation_mean_m'),
                 tr.get('steepness_mean_deg'), tr.get('aspect_dominant'),
+                tr.get('roughness_mean'), tr.get('steepness_max_deg'), tr.get('elevation_range_m'),
                 nd.get('copernicus_mean') or nd.get('bev_nir_mean'),
                 ts.get('count', 0), ts.get('total_canopy_sqm', 0),
                 ts.get('mean_height_m'), ts.get('est_stem_volume_m3', 0),
@@ -1200,6 +1219,226 @@ class SearchIndex:
         # Sort by height/area descending
         results.sort(key=lambda x: x.get(sort_key, 0) or 0, reverse=True)
         return results[offset:offset + limit]
+
+    def query_compound(self, filters, limit=50, offset=0):
+        """Compound query: filter KGs by any combination of index columns,
+        per-type classification, and per-type landcover.
+
+        filters dict keys (all optional):
+          --- KG-level (fast, index) ---
+          bbox: [w, s, e, n]
+          state, district, gemeinde: str
+          aspect: [str, ...]            e.g. ["S","SW","W"]
+          dominant_type: str
+          min_slope / max_slope: float
+          min_roughness: float          roughness_mean >=
+          min_elevation / max_elevation: float
+          min_elevation_range: float
+          min_steepness_max: float
+          max_buildings / min_buildings: int
+          min_new_buildings: int
+          min_tree_count / min_tree_height / min_tree_canopy_sqm: float
+          min_ndvi / max_ndvi: float
+          min_vegetated_fraction / max_vegetated_fraction: float
+          min_shannon_diversity: float
+          min_confidence / min_rf_confidence: float
+          max_diverged_pct: float
+          min_quality_score / min_temporal_stability: float
+          phenology: str
+          --- Per-type classification (fast, joins kg_classification) ---
+          type_filters: [{"type": str, "min_confidence": float, "min_area_sqm": float}, ...]
+          --- Per-type landcover (fast, joins kg_landcover) ---
+          landcover_filters: [{"type": str, "min_area_sqm": float, "min_fraction": float,
+                               "min_height_mean": float, "max_height_mean": float}, ...]
+          --- Sort ---
+          sort: str (column name, default: kg_code)
+          sort_dir: "asc" | "desc"
+
+        """
+        c = self._conn()
+        joins = []
+        where = ['k.processed = 1']
+        params = []
+
+        # --- Per-type classification joins ---
+        for i, tf in enumerate(filters.get('type_filters') or []):
+            alias = f'cl{i}'
+            joins.append(f'JOIN kg_classification {alias} ON {alias}.kg_code = k.kg_code')
+            where.append(f'{alias}.object_type = ?')
+            params.append(tf['type'])
+            if tf.get('min_confidence', 0) > 0:
+                where.append(f'{alias}.rf_mean_confidence >= ?')
+                params.append(tf['min_confidence'])
+            if tf.get('min_area_sqm', 0) > 0:
+                where.append(f'{alias}.area_sqm >= ?')
+                params.append(tf['min_area_sqm'])
+
+        # --- Per-type landcover joins ---
+        for i, lf in enumerate(filters.get('landcover_filters') or []):
+            alias = f'lc{i}'
+            joins.append(f'JOIN kg_landcover {alias} ON {alias}.kg_code = k.kg_code')
+            where.append(f'{alias}.object_type = ?')
+            params.append(lf['type'])
+            if lf.get('min_area_sqm', 0) > 0:
+                where.append(f'{alias}.area_sqm >= ?')
+                params.append(lf['min_area_sqm'])
+            if lf.get('min_fraction', 0) > 0:
+                where.append(f'{alias}.fraction >= ?')
+                params.append(lf['min_fraction'])
+            if lf.get('min_height_mean') is not None:
+                where.append(f'{alias}.height_mean >= ?')
+                params.append(lf['min_height_mean'])
+            if lf.get('max_height_mean') is not None:
+                where.append(f'{alias}.height_mean <= ?')
+                params.append(lf['max_height_mean'])
+
+        # --- Spatial (R-tree) ---
+        bbox = filters.get('bbox')
+        if bbox and len(bbox) == 4:
+            joins.append('JOIN kg_rtree r ON r.id = k.rowid')
+            where.append('r.max_lon >= ? AND r.min_lon <= ? AND r.max_lat >= ? AND r.min_lat <= ?')
+            params.extend([bbox[0], bbox[2], bbox[1], bbox[3]])
+
+        # --- Admin filters ---
+        if filters.get('state'):
+            where.append('(k.state_code = ? OR k.state_name = ?)')
+            params.extend([filters['state'], filters['state']])
+        if filters.get('district'):
+            where.append('k.district_code = ?')
+            params.append(filters['district'])
+        if filters.get('gemeinde'):
+            where.append('k.gemeinde_code = ?')
+            params.append(filters['gemeinde'])
+
+        # --- Aspect ---
+        aspect = filters.get('aspect')
+        if aspect:
+            placeholders = ','.join('?' * len(aspect))
+            where.append(f'k.aspect_dominant IN ({placeholders})')
+            params.extend(aspect)
+
+        # --- Numeric range filters (all on indexed kg columns) ---
+        _range_map = [
+            ('min_slope', 'slope_mean_deg', '>='),
+            ('max_slope', 'slope_mean_deg', '<='),
+            ('min_roughness', 'roughness_mean', '>='),
+            ('min_elevation', 'elevation_mean_m', '>='),
+            ('max_elevation', 'elevation_mean_m', '<='),
+            ('min_elevation_range', 'elevation_range_m', '>='),
+            ('min_steepness_max', 'steepness_max_deg', '>='),
+            ('max_buildings', 'building_count', '<='),
+            ('min_buildings', 'building_count', '>='),
+            ('min_new_buildings', 'new_building_count', '>='),
+            ('min_tree_count', 'tree_count', '>='),
+            ('min_tree_height', 'tree_mean_height_m', '>='),
+            ('min_tree_canopy_sqm', 'tree_canopy_sqm', '>='),
+            ('min_ndvi', 'ndvi_mean', '>='),
+            ('max_ndvi', 'ndvi_mean', '<='),
+            ('min_vegetated_fraction', 'vegetated_fraction', '>='),
+            ('max_vegetated_fraction', 'vegetated_fraction', '<='),
+            ('min_shannon_diversity', 'shannon_diversity', '>='),
+            ('min_confidence', 'mean_confidence', '>='),
+            ('min_rf_confidence', 'rf_mean_confidence', '>='),
+            ('max_diverged_pct', 'rf_diverged_pct', '<='),
+            ('min_quality_score', 'quality_score', '>='),
+            ('min_temporal_stability', 'temporal_stability', '>='),
+            ('min_infrastructure', 'infrastructure_count', '>='),
+            ('min_building_height', 'building_mean_height_m', '>='),
+            ('max_building_height', 'building_mean_height_m', '<='),
+            ('min_sar_vv', 'sar_vv_mean_db', '>='),
+            ('max_sar_vv', 'sar_vv_mean_db', '<='),
+            ('min_sar_vh', 'sar_vh_mean_db', '>='),
+            ('max_sar_vh', 'sar_vh_mean_db', '<='),
+            ('min_ndvi_amplitude', 'ndvi_harm_amplitude', '>='),
+            ('min_dtm_change', 'dtm_change_mean_m', '>='),
+            ('max_dtm_change', 'dtm_change_mean_m', '<='),
+        ]
+        for fkey, col, op in _range_map:
+            val = filters.get(fkey)
+            if val is not None:
+                where.append(f'k.{col} {op} ?')
+                params.append(val)
+
+        # --- Exact match filters ---
+        if filters.get('dominant_type'):
+            where.append('k.dominant_type = ?')
+            params.append(filters['dominant_type'])
+        if filters.get('phenology'):
+            where.append('k.phenology_dominant = ?')
+            params.append(filters['phenology'])
+        if filters.get('quality_grade'):
+            where.append('k.quality_grade = ?')
+            params.append(filters['quality_grade'])
+
+        # --- Extra SELECT columns for matched types ---
+        extra_cols = []
+        for i, tf in enumerate(filters.get('type_filters') or []):
+            alias = f'cl{i}'
+            t = tf['type']
+            extra_cols.append(f'{alias}.rf_mean_confidence AS "{t}_rf_confidence"')
+            extra_cols.append(f'{alias}.area_sqm AS "{t}_area_sqm"')
+            extra_cols.append(f'{alias}.rf_count AS "{t}_rf_count"')
+            extra_cols.append(f'{alias}.diverged_count AS "{t}_diverged_count"')
+        for i, lf in enumerate(filters.get('landcover_filters') or []):
+            alias = f'lc{i}'
+            t = lf['type']
+            extra_cols.append(f'{alias}.area_sqm AS "{t}_lc_area_sqm"')
+            extra_cols.append(f'{alias}.fraction AS "{t}_lc_fraction"')
+            extra_cols.append(f'{alias}.height_mean AS "{t}_lc_height_mean"')
+
+        extra_sel = (', ' + ', '.join(extra_cols)) if extra_cols else ''
+
+        # --- Sort ---
+        sort_col = filters.get('sort', 'kg_code')
+        sort_dir = filters.get('sort_dir', 'asc').upper()
+        if sort_dir not in ('ASC', 'DESC'):
+            sort_dir = 'ASC'
+        _sortable = {c[1] for c in c.execute('PRAGMA table_info(kg)').fetchall()}
+        for tf in (filters.get('type_filters') or []):
+            t = tf['type']
+            _sortable.update([f'{t}_rf_confidence', f'{t}_area_sqm'])
+        for lf in (filters.get('landcover_filters') or []):
+            t = lf['type']
+            _sortable.update([f'{t}_lc_area_sqm', f'{t}_lc_fraction'])
+        if sort_col not in _sortable:
+            sort_col = 'kg_code'
+
+        join_sql = '\n            '.join(joins)
+        where_sql = ' AND '.join(where)
+
+        sql = f'''
+            SELECT k.*{extra_sel}
+            FROM kg k
+            {join_sql}
+            WHERE {where_sql}
+            ORDER BY "{sort_col}" {sort_dir}
+            LIMIT ? OFFSET ?
+        '''
+        params.extend([limit, offset])
+
+        rows = c.execute(sql, params).fetchall()
+        results = []
+        for r in rows:
+            d = self._kg_summary(r)
+            for key in r.keys():
+                if key not in d and r[key] is not None:
+                    d[key] = r[key]
+            results.append(d)
+
+        # Total count for pagination
+        count_sql = f'''
+            SELECT COUNT(*) FROM kg k
+            {join_sql}
+            WHERE {where_sql}
+        '''
+        total = c.execute(count_sql, params[:-2]).fetchone()[0]
+
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_divergence_pairs(self, limit=50):
         """Get the most common RF→final type divergence pairs across all KGs."""

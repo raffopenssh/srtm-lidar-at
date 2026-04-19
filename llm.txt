@@ -294,6 +294,34 @@ Response for aggregate (state/district/gemeinde/country):
    avg_elevation_m, avg_slope_deg, avg_ndvi, avg_quality_score,
    top_landcover: [...], hansen_loss_by_year: {...}}
 
+#### POST /api/v1/query/compound ← COMPOUND FILTER
+Filter KGs by any combination of attributes. POST JSON body.
+
+Filter keys (all optional):
+  bbox: [w,s,e,n]                       spatial filter
+  state, district, gemeinde: str         admin filter
+  aspect: ["S","SW","W"]                dominant aspect direction
+  dominant_type, phenology, quality_grade: str  exact match
+  Numeric ranges (prefix min_ or max_):
+    slope, roughness, elevation, elevation_range, steepness_max,
+    buildings, new_buildings, tree_count, tree_height, tree_canopy_sqm,
+    ndvi, vegetated_fraction, shannon_diversity, confidence, rf_confidence,
+    quality_score, temporal_stability, infrastructure, building_height,
+    sar_vv, sar_vh, ndvi_amplitude, dtm_change, diverged_pct (max only)
+  type_filters: [{type, min_confidence, min_area_sqm}, ...]
+    RF classification confidence + area per object type (joins kg_classification)
+  landcover_filters: [{type, min_area_sqm, min_fraction, min_height_mean, max_height_mean}, ...]
+    Landcover area/fraction/height per type (joins kg_landcover)
+  sort: str (column name), sort_dir: "asc"|"desc"
+  limit: int (default 50, max 1000), offset: int
+
+All filters are fast (pure SQL on indexed columns). Returns {total, offset, limit, results}.
+
+Example: tree conf>0.8 area>800 + grass conf>0.8 area>1300 + no buildings + SW aspect + rugged:
+  POST {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},
+    {"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],
+    "max_buildings":0, "aspect":["S","SW","W"], "min_roughness":2.0}
+
 #### GET /api/v1/kg/<kg_code>
 Full KG JSON summary if processed locally, else index data with Zenodo links.
 Add ?index_only=true to always use index (faster, no file I/O).

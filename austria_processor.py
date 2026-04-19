@@ -96,6 +96,15 @@ _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 def check_disk_space(current_kg_code: str = "") -> bool:
     """Check free disk space and clean caches if below threshold.
 
+    Cleanup is **prioritised**: cheap-to-refetch caches (BEV COG tiles, ortho
+    tiles) are evicted first.  Expensive caches (Copernicus openEO tiles,
+    Hansen) are only touched as a last resort, because re-fetching them costs
+    ~15-45 min per tile via openEO batch jobs.
+
+    The function stops evicting as soon as enough space is freed (target:
+    DISK_MIN_FREE_GB + 2 GB headroom), rather than blindly deleting a fixed
+    amount from every category.
+
     Returns True if processing can continue, False if disk is critically low.
     """
     import shutil
@@ -109,6 +118,12 @@ def check_disk_space(current_kg_code: str = "") -> bool:
     _log.warning("Disk free: %.1f GB (threshold: %.1f GB) — starting cache cleanup",
                  free_gb, DISK_MIN_FREE_GB)
     freed_bytes = 0
+
+    # How much we need to free to get back to threshold + 2 GB headroom
+    need_bytes = int((DISK_MIN_FREE_GB + 2.0 - free_gb) * 1024 ** 3)
+
+    def _enough_freed() -> bool:
+        return freed_bytes >= need_bytes
 
     def _lru_delete(directory: Path, target_bytes: int, label: str,
                     exclude_prefix: str = "") -> int:
@@ -149,7 +164,7 @@ def check_disk_space(current_kg_code: str = "") -> bool:
 
     target_2gb = 2 * 1024 ** 3
 
-    # 1. Delete old temp GPKG files (>1 hour old)
+    # 1. Delete old temp GPKG files (>1 hour old) — always
     if GPKG_DIR.exists():
         import time as _t
         now = _t.time()
@@ -163,25 +178,40 @@ def check_disk_space(current_kg_code: str = "") -> bool:
                 except OSError:
                     pass
 
-    # 2. BEV tile cache (LRU)
-    bev_cache = DATA_DIR / "bev_tile_cache"
-    _lru_delete(bev_cache, target_2gb, "bev_tile_cache")
+    # --- Tier 1: cheap to re-fetch (COG range reads, ~seconds) ---
 
-    # 3. Ortho tile cache (LRU)
-    ortho_cache = DATA_DIR / "ortho_tile_cache"
-    _lru_delete(ortho_cache, target_2gb, "ortho_tile_cache")
+    # 2. BEV tile cache (LRU) — cheap, fast COG reads
+    if not _enough_freed():
+        bev_cache = DATA_DIR / "bev_tile_cache"
+        _lru_delete(bev_cache, target_2gb, "bev_tile_cache")
 
-    # 4. Copernicus tiles (LRU)
-    cop_cache = DATA_DIR / "copernicus_tiles"
-    _lru_delete(cop_cache, target_2gb, "copernicus_tiles")
+    # 3. Ortho tile cache (LRU) — cheap, fast COG reads
+    if not _enough_freed():
+        ortho_cache = DATA_DIR / "ortho_tile_cache"
+        _lru_delete(ortho_cache, target_2gb, "ortho_tile_cache")
 
-    # 5. Hansen tiles (LRU)
-    hansen_cache = DATA_DIR / "hansen_tiles"
-    _lru_delete(hansen_cache, target_2gb, "hansen_tiles")
+    # 4. RF training Copernicus cache (LRU) — batch download intermediates,
+    #    the tile_cache .npz files are the canonical copies
+    if not _enough_freed():
+        rf_cop_cache = Path("rf_training_data/copernicus_cache")
+        _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
 
-    # 6. RF training Copernicus cache (LRU)
-    rf_cop_cache = Path("rf_training_data/copernicus_cache")
-    _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
+    # --- Tier 2: expensive to re-fetch (openEO batch jobs, ~15-45 min) ---
+    # Only evict these if tier 1 wasn't enough.
+
+    if not _enough_freed():
+        _log.warning("  Tier-1 caches insufficient (freed %.1f MB, need %.1f MB) "
+                     "— evicting expensive Copernicus/Hansen tiles",
+                     freed_bytes / 1e6, need_bytes / 1e6)
+
+        # 5. Hansen tiles (LRU) — moderately expensive
+        hansen_cache = DATA_DIR / "hansen_tiles"
+        _lru_delete(hansen_cache, target_2gb, "hansen_tiles")
+
+    if not _enough_freed():
+        # 6. Copernicus tiles (LRU) — MOST expensive to re-fetch
+        cop_cache = DATA_DIR / "copernicus_tiles"
+        _lru_delete(cop_cache, target_2gb, "copernicus_tiles")
 
     _log.info("Disk cleanup freed %.1f MB total", freed_bytes / 1e6)
 

@@ -62,6 +62,11 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 | `train_rf_100kg.py` | Earlier 100-KG training script (superseded) |
 | `calibrate.py` | Cadastre calibration utilities |
 
+### Streamed GPKG Builder
+| File | Purpose |
+|------|----------|
+| `gpkg_streamed.py` | Strip-streamed full-GPKG writer for large KGs (>100 Mpx). Keeps peak memory ~500 MB regardless of KG size. Called automatically by `build_full_gpkg_tiled()` when pixel count exceeds threshold. |
+
 ### Deprecated (kept for reference)
 `landscape_classifier.py`, `object_classifier.py`, `scene_adaptive_classifier_patches.py`
 
@@ -631,6 +636,7 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure) |
 | `static/process.html` | 1117L | Dashboard UI (status, map, log, Zenodo manifest) |
 | `data/austria_processor/MONITOR.md` | — | Monitoring checklist + expected timelines |
+| `gpkg_streamed.py` | ~500L | Strip-streamed full-GPKG builder for large KGs (auto-used >100 Mpx) |
 
 ### Where to Look When Debugging
 

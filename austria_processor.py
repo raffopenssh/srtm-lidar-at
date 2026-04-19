@@ -2624,6 +2624,25 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
              len(tile_seg_results))
 
     # ------------------------------------------------------------------
+    # For large KGs, use strip-streamed writing to stay within memory
+    # ------------------------------------------------------------------
+    from gpkg_streamed import _STREAM_PIXEL_THRESHOLD, build_full_gpkg_streamed
+    if full_h * full_w > _STREAM_PIXEL_THRESHOLD:
+        log.info("  Full-KG raster %.0f Mpx > %.0f Mpx threshold — using streamed builder",
+                 full_h * full_w / 1e6, _STREAM_PIXEL_THRESHOLD / 1e6)
+        return build_full_gpkg_streamed(
+            kg_code, tile_seg_results, all_objects, obs_year,
+            mark_uncertain, out_path, full_h, full_w, full_left, full_top,
+            full_right, full_bottom, full_tf, res,
+            _write_segment_vectors=_write_segment_vectors,
+            _write_segment_points=_write_segment_points,
+            _write_gpkg_all_styles=_write_gpkg_all_styles,
+            _fix_gpkg_raster_crs=_fix_gpkg_raster_crs,
+            _merge_boundary_segments=_merge_boundary_segments,
+            SEGMENT_COLORS=SEGMENT_COLORS,
+        )
+
+    # ------------------------------------------------------------------
     # Allocate full-KG rasters (weighted accumulation for seamless blending)
     # ------------------------------------------------------------------
     # For continuous rasters (DTM/DSM/nDSM), use weighted accumulation

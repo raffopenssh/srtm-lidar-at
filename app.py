@@ -1872,6 +1872,38 @@ def api_query():
                 min_confidence=mc, bbox=tf_bbox,
                 limit=limit, offset=offset))
 
+        # Cross-KG segment-level power queries
+        # e.g. ?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
+        # e.g. ?segments=true&object_type=excavation&sort=volume&min_rf_confidence=0.7
+        # e.g. ?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05
+        if args.get('segments', '').lower() in ('true', '1', 'yes'):
+            seg_bbox = None
+            if args.get('bbox'):
+                bp = [float(x) for x in args['bbox'].split(',')]
+                if len(bp) == 4:
+                    seg_bbox = tuple(bp)
+            seg_kwargs = dict(
+                object_type=args.get('object_type') or args.get('type'),
+                min_rf_confidence=float(args['min_rf_confidence']) if args.get('min_rf_confidence') else None,
+                max_rf_confidence=float(args['max_rf_confidence']) if args.get('max_rf_confidence') else None,
+                min_confidence=float(args['min_confidence']) if args.get('min_confidence') else None,
+                max_confidence=float(args['max_confidence']) if args.get('max_confidence') else None,
+                min_area_sqm=float(args['min_area_sqm']) if args.get('min_area_sqm') else None,
+                max_area_sqm=float(args['max_area_sqm']) if args.get('max_area_sqm') else None,
+                min_height=float(args['min_height']) if args.get('min_height') else None,
+                max_height=float(args['max_height']) if args.get('max_height') else None,
+                min_volume=float(args['min_volume']) if args.get('min_volume') else None,
+                max_volume=float(args['max_volume']) if args.get('max_volume') else None,
+                bbox=seg_bbox,
+                state=args.get('state'),
+                district=args.get('district'),
+                sort=args.get('sort', 'height_max_m'),
+                sort_dir=args.get('sort_dir', 'desc'),
+                percentile=float(args['percentile']) if args.get('percentile') else None,
+                limit=limit, offset=offset,
+            )
+            return jsonify(idx.query_segments(**seg_kwargs))
+
         # Spatial bbox
         if args.get('bbox'):
             parts = [float(x) for x in args['bbox'].split(',')]

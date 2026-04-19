@@ -373,9 +373,20 @@ Async support: Slow queries (parcels_by_type, top_features) support async=true.
   Async results auto-cleaned after 4 hours.
 
 Speed tiers:
-  FAST (<25ms)   Index queries: bbox, admin, type ranking, confidence, divergence, compound
+  FAST (<25ms)   Index queries: bbox, admin, type ranking, confidence, divergence, compound, segments
   MEDIUM (~1s)   JSON scan (pre-filtered): parcels_by_type, top_features, parcel lookup
   SLOW (~10s)    GPKG download+query: /api/v1/kg/<code>/buildings, segments, etc.
+
+Confidence types:
+  rf_confidence   Raw Random Forest model prediction score (0-1). The direct output
+                  of the trained RF classifier. Available on all RF-classified segments.
+  confidence      Final/combined score after calibration and overrides (0-1). May differ
+                  from rf_confidence when: (a) a segment's type was changed by calibration
+                  (e.g. RF said "road" but calibration changed to "grass"), (b) confidence
+                  was penalised for anchor-weak or edge-clipped segments, or (c) rules-based
+                  classification was used as fallback. For undiverted RF segments, rf_confidence
+                  == confidence. For diverged segments, confidence is typically lower.
+  Use min_rf_confidence= for strict ML-based filtering. Use min_confidence= for overall quality.
 
 Common questions → endpoints:
   "Parcels where tree RF conf > 0.8, area > 1500m²"      → parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500
@@ -383,6 +394,23 @@ Common questions → endpoints:
   "New buildings in area X with RF roof conf > 0.75"     → top_features=new_buildings&min_confidence=0.75&bbox=...
   "Infrastructure masts with RF conf > 0.8"              → top_features=infrastructure&type=mast&min_confidence=0.8
   "Multiple types + terrain + no buildings"              → POST /api/v1/query/compound (see below)
+  "Top 1% tallest trees with RF conf > 90%"             → segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
+  "Top 5% largest tree loss areas, RF conf > 0.8"       → segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm
+  "Top excavations by volume, RF conf > 0.7"            → segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume
+  "Tallest roofs with high combined confidence"          → segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m
+  "All segments by area across types"                    → segments=true&sort=area_sqm
+
+Live examples (clickable):
+  Top 1% tallest trees, RF confidence > 90%:
+    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
+  Top 5% largest tree loss areas, RF confidence > 80%:
+    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm
+  Top 10 excavations by volume, RF confidence > 70%:
+    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume&limit=10
+  Tallest 5 roofs with combined confidence > 70%:
+    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m&limit=5
+  KG 91109 (Gaissau) full index record:
+    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109
 
 Query modes (pick one):
   q=<text>                Full-text search (KG/gemeinde/district/state names)

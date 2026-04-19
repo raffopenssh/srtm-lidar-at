@@ -3519,6 +3519,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         schema_nb = {'geometry': 'MultiPolygon', 'properties': [
             ('type', 'str'), ('area_sqm', 'float'), ('max_height_m', 'float'),
             ('stories_est', 'int'), ('roof_type_hint', 'str'), ('confidence', 'float'),
+            ('rf_confidence', 'float'), ('rf_type', 'str'), ('classifier', 'str'),
             ('centroid_lon', 'float'), ('centroid_lat', 'float'), ('edge_clipped', 'bool')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='new_buildings',
                         schema=schema_nb, crs=from_epsg(4326)) as dst:
@@ -3527,6 +3528,9 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     'type': nb.get('type','roof'), 'area_sqm': nb.get('area_sqm',0),
                     'max_height_m': nb.get('max_height_m',0), 'stories_est': nb.get('stories_est',1),
                     'roof_type_hint': nb.get('roof_type_hint',''), 'confidence': nb.get('confidence',0),
+                    'rf_confidence': nb.get('rf_confidence', 0),
+                    'rf_type': nb.get('rf_type', ''),
+                    'classifier': nb.get('classifier_source', 'rules'),
                     'centroid_lon': nb.get('centroid_lon'), 'centroid_lat': nb.get('centroid_lat'),
                     'edge_clipped': nb.get('edge_clipped', False)}})
 
@@ -3535,7 +3539,9 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         schema_i = {'geometry': 'MultiPolygon', 'properties': [
             ('type', 'str'), ('area_sqm', 'float'), ('volume_m3', 'float'),
             ('max_height_m', 'float'), ('est_parking_spots', 'int'),
-            ('confidence', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('confidence', 'float'), ('rf_confidence', 'float'),
+            ('rf_type', 'str'), ('classifier', 'str'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'),
             ('edge_clipped', 'bool')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='infrastructure',
                         schema=schema_i, crs=from_epsg(4326)) as dst:
@@ -3545,6 +3551,9 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     'volume_m3': inf.get('volume_m3'), 'max_height_m': inf.get('max_height_m'),
                     'est_parking_spots': inf.get('est_parking_spots'),
                     'confidence': inf.get('confidence',0),
+                    'rf_confidence': inf.get('rf_confidence', 0),
+                    'rf_type': inf.get('rf_type', ''),
+                    'classifier': inf.get('classifier_source', 'rules'),
                     'centroid_lon': inf.get('centroid_lon'), 'centroid_lat': inf.get('centroid_lat'),
                     'edge_clipped': inf.get('edge_clipped', False)}})
 
@@ -3794,7 +3803,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         landscape["vegetated_fraction"] = round(vp/total_px, 4)
         landscape["is_vegetated"] = vp/total_px > 0.5
     summary["landscape"] = landscape
-    # --- Top 10 objects/trees ---
+    # --- Top 10 objects/trees (legacy) + top_by_type (power queries) ---
     if objects:
         summary["top_10_objects"] = []
         for o in sorted(objects, key=lambda o: o.height_max, reverse=True)[:10]:
@@ -3835,6 +3844,47 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 "total_canopy_sqm": round(sum(t.area_sqm for t in trees), 1),
                 "mean_height_m": round(sum(t.height_max for t in trees)/len(trees), 2),
                 "est_stem_volume_m3": round(sum(0.3*t.area_sqm*t.height_max/3 for t in trees), 1)}
+
+        # --- top_by_type: top 50 segments per type, sorted by primary metric ---
+        # Primary metric per type:
+        #   tree → height_max, excavation/fill → abs(volume_change_m3),
+        #   tree_loss → area_sqm, roof/greenhouse/solar_panel/construction → height_max,
+        #   everything else → area_sqm
+        _VOLUME_TYPES = {'excavation', 'fill'}
+        _HEIGHT_TYPES = {'tree', 'roof', 'greenhouse', 'solar_panel', 'construction',
+                         'mast', 'fence', 'wall', 'hedge', 'shrub'}
+        _TOP_N = 50
+        by_type = defaultdict(list)
+        for o in objects:
+            by_type[o.obj_type].append(o)
+        top_by_type = {}
+        for otype, objs in by_type.items():
+            if otype in _VOLUME_TYPES:
+                objs_sorted = sorted(objs, key=lambda o: abs(o.volume_change_m3), reverse=True)
+            elif otype in _HEIGHT_TYPES:
+                objs_sorted = sorted(objs, key=lambda o: o.height_max, reverse=True)
+            else:
+                objs_sorted = sorted(objs, key=lambda o: o.area_sqm, reverse=True)
+            entries = []
+            for o in objs_sorted[:_TOP_N]:
+                c = None
+                try:
+                    lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                    c = {"lon": round(lon, 7), "lat": round(lat, 7)}
+                except Exception:
+                    pass
+                entries.append({
+                    "type": o.obj_type,
+                    "height_max_m": round(o.height_max, 2),
+                    "height_mean_m": round(o.height_mean, 2),
+                    "area_sqm": round(o.area_sqm, 1),
+                    "volume_change_m3": round(o.volume_change_m3, 1),
+                    "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
+                    "confidence": round(o.confidence, 3),
+                    "coordinate": c,
+                })
+            top_by_type[otype] = entries
+        summary["top_by_type"] = top_by_type
     # --- Terrain ---
     summary["terrain"] = {}
     if terrain_stats:
@@ -3914,7 +3964,11 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                       "max_height_m": nb.get("max_height_m"), "stories_est": nb.get("stories_est"),
                       "roof_type_hint": nb.get("roof_type_hint"),
                       "centroid_lon": nb.get("centroid_lon"), "centroid_lat": nb.get("centroid_lat"),
-                      "confidence": nb.get("confidence"), "edge_clipped": nb.get("edge_clipped", False)}
+                      "confidence": nb.get("confidence"),
+                      "rf_confidence": nb.get("rf_confidence", 0.0),
+                      "rf_type": nb.get("rf_type", ""),
+                      "classifier_source": nb.get("classifier_source", "rules"),
+                      "edge_clipped": nb.get("edge_clipped", False)}
                      for nb in new_buildings]}
     ibt = defaultdict(list)
     for inf in infrastructure: ibt[inf["type"]].append(inf)

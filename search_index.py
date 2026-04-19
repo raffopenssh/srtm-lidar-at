@@ -209,6 +209,21 @@ class SearchIndex:
                 count INTEGER DEFAULT 0,
                 PRIMARY KEY (kg_code, rf_type, final_type)
             )''',
+            # === Per-type top segments (top 50 per type per KG) ===
+            '''CREATE TABLE IF NOT EXISTS kg_type_top (
+                kg_code TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                lon REAL,
+                lat REAL,
+                area_sqm REAL,
+                height_max_m REAL,
+                height_mean_m REAL,
+                volume_change_m3 REAL,
+                rf_confidence REAL,
+                confidence REAL,
+                PRIMARY KEY (kg_code, object_type, rank)
+            )''',
             # === Index metadata ===
             '''CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
@@ -238,6 +253,13 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_cls_type ON kg_classification(object_type)',
             'CREATE INDEX IF NOT EXISTS idx_div_rf ON kg_divergence(rf_type)',
             'CREATE INDEX IF NOT EXISTS idx_div_final ON kg_divergence(final_type)',
+            # === Per-type top segment indexes ===
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type ON kg_type_top(object_type)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_height ON kg_type_top(object_type, height_max_m DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_area ON kg_type_top(object_type, area_sqm DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_volume ON kg_type_top(object_type, volume_change_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_rf_conf ON kg_type_top(object_type, rf_confidence DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_conf ON kg_type_top(object_type, confidence DESC)',
             'CREATE INDEX IF NOT EXISTS idx_kg_diverged ON kg(rf_diverged_pct)',
             'CREATE INDEX IF NOT EXISTS idx_kg_confidence ON kg(mean_confidence)',
             'CREATE INDEX IF NOT EXISTS idx_kg_rf_confidence ON kg(rf_mean_confidence)',
@@ -317,7 +339,7 @@ class SearchIndex:
         with self._write_lock:
             c = self._conn()
             # Drop and recreate — ensures schema changes are picked up
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'index_meta'):
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'index_meta'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
             for t in ('kg_rtree', 'fts_kg'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
@@ -591,6 +613,28 @@ class SearchIndex:
                     c.executemany(
                         'INSERT INTO kg_divergence VALUES (?,?,?,?)', div_rows)
 
+        # Per-type top segments (for cross-KG power queries)
+        top_by_type = data.get('top_by_type', {})
+        if top_by_type:
+            c.execute('DELETE FROM kg_type_top WHERE kg_code=?', (code,))
+            top_rows = []
+            for otype, entries in top_by_type.items():
+                for rank, entry in enumerate(entries, 1):
+                    coord = entry.get('coordinate') or {}
+                    top_rows.append((
+                        code, otype, rank,
+                        coord.get('lon'), coord.get('lat'),
+                        entry.get('area_sqm'),
+                        entry.get('height_max_m'),
+                        entry.get('height_mean_m'),
+                        entry.get('volume_change_m3'),
+                        entry.get('rf_confidence'),
+                        entry.get('confidence'),
+                    ))
+            if top_rows:
+                c.executemany(
+                    'INSERT INTO kg_type_top VALUES (?,?,?,?,?,?,?,?,?,?,?)', top_rows)
+
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing."""
         with self._write_lock:
@@ -637,6 +681,8 @@ class SearchIndex:
             ('avg_rf_classified_pct', 'SELECT ROUND(AVG(rf_classified_pct),1) FROM kg WHERE rf_classified_pct IS NOT NULL'),
             ('avg_rf_diverged_pct', 'SELECT ROUND(AVG(rf_diverged_pct),1) FROM kg WHERE rf_diverged_pct IS NOT NULL'),
             ('total_divergence_pairs', 'SELECT COUNT(DISTINCT rf_type || final_type) FROM kg_divergence'),
+            ('indexed_segments', 'SELECT COUNT(*) FROM kg_type_top'),
+            ('indexed_segment_types', 'SELECT COUNT(DISTINCT object_type) FROM kg_type_top'),
         ]:
             r = c.execute(q).fetchone()
             s[name] = round(r[0], 2) if r[0] is not None else 0
@@ -1389,6 +1435,186 @@ class SearchIndex:
             'limit': limit,
             'results': results[offset:offset + limit],
         }
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: cross-KG segment-level power queries (via kg_type_top)
+    # ════════════════════════════════════════════════════════════════
+
+    def query_segments(self, object_type=None, min_rf_confidence=None,
+                       max_rf_confidence=None, min_confidence=None,
+                       max_confidence=None,
+                       min_area_sqm=None, max_area_sqm=None,
+                       min_height=None, max_height=None,
+                       min_volume=None, max_volume=None,
+                       bbox=None, state=None, district=None,
+                       sort='height_max_m', sort_dir='desc',
+                       percentile=None,
+                       limit=100, offset=0):
+        """Cross-KG query over individual segments from kg_type_top.
+
+        Queries the pre-indexed top-50 segments per type per KG.
+        Supports filtering by rf_confidence (raw RF score) and confidence
+        (final/combined score after calibration), area, height, volume,
+        spatial bounds, and admin hierarchy.
+
+        percentile: float 0-1, e.g. 0.01 for top 1%, 0.05 for top 5%.
+                    Computes threshold from all matching segments, returns
+                    only those above/below the threshold.
+
+        Returns {total, results: [{kg_code, object_type, lon, lat, ...}],
+                 percentile_threshold, percentile_count}
+        """
+        c = self._conn()
+        joins = []
+        where = []
+        params = []
+
+        # Type filter
+        if object_type:
+            where.append('t.object_type = ?')
+            params.append(object_type)
+
+        # Confidence filters — both RF and combined
+        if min_rf_confidence is not None:
+            where.append('t.rf_confidence >= ?')
+            params.append(min_rf_confidence)
+        if max_rf_confidence is not None:
+            where.append('t.rf_confidence <= ?')
+            params.append(max_rf_confidence)
+        if min_confidence is not None:
+            where.append('t.confidence >= ?')
+            params.append(min_confidence)
+        if max_confidence is not None:
+            where.append('t.confidence <= ?')
+            params.append(max_confidence)
+
+        # Area filters
+        if min_area_sqm is not None:
+            where.append('t.area_sqm >= ?')
+            params.append(min_area_sqm)
+        if max_area_sqm is not None:
+            where.append('t.area_sqm <= ?')
+            params.append(max_area_sqm)
+
+        # Height filters
+        if min_height is not None:
+            where.append('t.height_max_m >= ?')
+            params.append(min_height)
+        if max_height is not None:
+            where.append('t.height_max_m <= ?')
+            params.append(max_height)
+
+        # Volume filters (absolute value comparison)
+        if min_volume is not None:
+            where.append('ABS(t.volume_change_m3) >= ?')
+            params.append(min_volume)
+        if max_volume is not None:
+            where.append('ABS(t.volume_change_m3) <= ?')
+            params.append(max_volume)
+
+        # Spatial filter via KG bbox
+        if bbox and len(bbox) == 4:
+            joins.append('JOIN kg_rtree r ON r.id = k.rowid')
+            where.append('r.max_lon >= ? AND r.min_lon <= ? AND r.max_lat >= ? AND r.min_lat <= ?')
+            params.extend([bbox[0], bbox[2], bbox[1], bbox[3]])
+
+        # Admin filters
+        if state:
+            where.append('(k.state_code = ? OR k.state_name = ?)')
+            params.extend([state, state])
+        if district:
+            where.append('k.district_code = ?')
+            params.append(district)
+
+        # Only processed KGs
+        where.append('k.processed = 1')
+
+        # Null coordinate filter
+        where.append('t.lon IS NOT NULL AND t.lat IS NOT NULL')
+
+        join_sql = '\n            '.join(joins)
+        where_sql = ' AND '.join(where) if where else '1=1'
+
+        # Sort column validation
+        _valid_sorts = {'height_max_m', 'height_mean_m', 'area_sqm',
+                        'volume_change_m3', 'rf_confidence', 'confidence',
+                        'ABS(volume_change_m3)'}
+        if sort == 'volume':
+            sort = 'ABS(volume_change_m3)'
+        elif sort not in _valid_sorts:
+            sort = 'height_max_m'
+        sort_direction = 'DESC' if sort_dir.lower() == 'desc' else 'ASC'
+
+        # Percentile query: first count total, then compute threshold
+        percentile_threshold = None
+        percentile_count = None
+        if percentile is not None and 0 < percentile < 1:
+            # Count total matching segments
+            count_sql = f'''SELECT COUNT(*) FROM kg_type_top t
+                JOIN kg k ON k.kg_code = t.kg_code
+                {join_sql}
+                WHERE {where_sql}'''
+            total_matching = c.execute(count_sql, params).fetchone()[0]
+            if total_matching > 0:
+                percentile_count = max(1, int(total_matching * percentile))
+                # Get the threshold value at the percentile boundary
+                threshold_sql = f'''SELECT {sort} FROM kg_type_top t
+                    JOIN kg k ON k.kg_code = t.kg_code
+                    {join_sql}
+                    WHERE {where_sql}
+                    ORDER BY {sort} {sort_direction}
+                    LIMIT 1 OFFSET ?'''
+                threshold_row = c.execute(threshold_sql,
+                                         params + [percentile_count - 1]).fetchone()
+                if threshold_row:
+                    percentile_threshold = threshold_row[0]
+                    # Add threshold filter
+                    if sort_direction == 'DESC':
+                        where.append(f'{sort} >= ?')
+                    else:
+                        where.append(f'{sort} <= ?')
+                    params.append(percentile_threshold)
+                    where_sql = ' AND '.join(where)
+
+        # Total count
+        count_sql = f'''SELECT COUNT(*) FROM kg_type_top t
+            JOIN kg k ON k.kg_code = t.kg_code
+            {join_sql}
+            WHERE {where_sql}'''
+        total = c.execute(count_sql, params).fetchone()[0]
+
+        # Fetch results
+        query_sql = f'''SELECT t.*, k.kg_name, k.gemeinde_name,
+                k.district_name, k.state_name
+            FROM kg_type_top t
+            JOIN kg k ON k.kg_code = t.kg_code
+            {join_sql}
+            WHERE {where_sql}
+            ORDER BY {sort} {sort_direction}
+            LIMIT ? OFFSET ?'''
+        rows = c.execute(query_sql, params + [limit, offset]).fetchall()
+
+        results = []
+        for r in rows:
+            d = dict(r)
+            d['_links'] = {
+                'kg': f'{BASE_URL}/api/v1/kg/{d["kg_code"]}',
+                'map': f'https://www.google.com/maps?q={d["lat"]},{d["lon"]}'
+                       if d.get('lat') and d.get('lon') else None,
+            }
+            results.append(d)
+
+        out = {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+        if percentile is not None:
+            out['percentile'] = percentile
+            out['percentile_threshold'] = percentile_threshold
+            out['percentile_count'] = percentile_count
+        return out
 
     def query_compound(self, filters, limit=50, offset=0):
         """Compound query: filter KGs by any combination of index columns,

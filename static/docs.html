@@ -795,6 +795,11 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohls
 <span class="tok-comment"># Download from share (specific layers)</span>
 curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg?layers=dtm,ortho-2024"</span> <span class="tok-flag">-o</span> layers.gpkg</code></pre>
   </div>
+
+  <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">
+    <strong>QGIS tip:</strong> If QGIS shows a <code>?</code> for raster layer CRS (does not auto-detect it),
+    manually set the coordinate reference system to <strong>EPSG:3035 &ndash; ETRS89-extended / LAEA Europe</strong>.
+  </div>
 </div>
 
 <div class="endpoint-card" id="ep-mbtiles">

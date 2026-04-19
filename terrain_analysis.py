@@ -26,24 +26,45 @@ def compute_aspect(dtm: np.ndarray, res: float = 1.0) -> np.ndarray:
 
 def compute_tri(dtm: np.ndarray) -> np.ndarray:
     """Terrain Ruggedness Index (Riley et al. 1999).
-    Mean absolute elevation difference to 8 neighbours."""
-    kernel = np.ones((3, 3))
-    kernel[1, 1] = 0
-    sum_sq_diff = np.zeros_like(dtm, dtype=np.float64)
+    Mean absolute elevation difference to 8 neighbours.
+    NaN-safe: fills NaN with local median before computing, then restores NaN mask."""
+    nan_mask = np.isnan(dtm)
+    if np.any(nan_mask):
+        filled = dtm.copy()
+        # Fill NaN with median of valid values (neutral for TRI at edges)
+        med = np.nanmedian(dtm)
+        filled[nan_mask] = med
+    else:
+        filled = dtm
+    sum_sq_diff = np.zeros_like(filled, dtype=np.float64)
     for dr in [-1, 0, 1]:
         for dc in [-1, 0, 1]:
             if dr == 0 and dc == 0:
                 continue
-            shifted = ndimage.shift(dtm, (dr, dc), mode='nearest')
-            sum_sq_diff += (dtm - shifted) ** 2
-    return np.sqrt(sum_sq_diff / 8.0).astype(np.float32)
+            shifted = ndimage.shift(filled, (dr, dc), mode='nearest')
+            sum_sq_diff += (filled - shifted) ** 2
+    result = np.sqrt(sum_sq_diff / 8.0).astype(np.float32)
+    if np.any(nan_mask):
+        result[nan_mask] = np.nan
+    return result
 
 
 def compute_tpi(dtm: np.ndarray, radius: int = 10) -> np.ndarray:
-    """Topographic Position Index: elevation minus mean of neighbourhood."""
+    """Topographic Position Index: elevation minus mean of neighbourhood.
+    NaN-safe: fills NaN with local median before computing, then restores NaN mask."""
+    nan_mask = np.isnan(dtm)
+    if np.any(nan_mask):
+        filled = dtm.copy()
+        med = np.nanmedian(dtm)
+        filled[nan_mask] = med
+    else:
+        filled = dtm
     kernel_size = 2 * radius + 1
-    mean = ndimage.uniform_filter(dtm.astype(np.float64), size=kernel_size, mode='nearest')
-    return (dtm - mean).astype(np.float32)
+    mean = ndimage.uniform_filter(filled.astype(np.float64), size=kernel_size, mode='nearest')
+    result = (filled - mean).astype(np.float32)
+    if np.any(nan_mask):
+        result[nan_mask] = np.nan
+    return result
 
 
 def compute_curvature(dtm: np.ndarray, res: float = 1.0) -> dict[str, np.ndarray]:

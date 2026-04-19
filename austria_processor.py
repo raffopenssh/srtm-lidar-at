@@ -7006,6 +7006,7 @@ def main():
         # --- Check file-based retry queue for NEW additions ---
         # The file is no longer cleared on read; we track known codes to
         # detect new entries added by the API while the processor runs.
+        _insert_offset = 0
         for rq_code in _read_retry_queue():
             if rq_code in _known_queue_codes:
                 continue  # already injected this one
@@ -7018,7 +7019,7 @@ def main():
                         or any(d[1]["kg_code"] == rq_code
                                for d in _deferred_retries)
                         or any(p["kg_code"] == rq_code
-                               for p in pending[i+1:i+DEFER_GAP+2]))
+                               for p in pending[i+1:i+DEFER_GAP+2+_insert_offset]))
             if _already:
                 _known_queue_codes.add(rq_code)
                 continue
@@ -7027,13 +7028,14 @@ def main():
             if rq_kg:
                 rq_kg = dict(rq_kg)
                 rq_kg["_defer_attempt"] = 0
-                pending.insert(i + 1, rq_kg)
+                pending.insert(i + 1 + _insert_offset, rq_kg)
+                _insert_offset += 1
                 _known_queue_codes.add(rq_code)
                 # Also remove from failed sets so it actually runs
                 failed_kgs.discard(rq_code)
                 _save_failed_kgs(failed_kgs)
-                log.info("↻ New priority: KG %s inserted next in queue",
-                         rq_code)
+                log.info("↻ New priority: KG %s inserted at queue pos %d",
+                         rq_code, _insert_offset)
 
         i += 1
 

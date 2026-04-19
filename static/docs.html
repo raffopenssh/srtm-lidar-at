@@ -272,6 +272,46 @@ td code { font-size: 12px; }
     </div>
   </div>
   <div class="nav-group">
+    <div class="nav-group-title">Methods</div>
+    <a href="#methods-overview">Overview</a>
+    <a href="#methods-data-sources">Data Sources (8)</a>
+    <div class="nav-sub">
+      <a href="#ds-bev-lidar">BEV LiDAR</a>
+      <a href="#ds-bev-ortho">BEV Orthophoto</a>
+      <a href="#ds-sentinel2">Sentinel-2 NDVI</a>
+      <a href="#ds-worldcover">ESA WorldCover</a>
+      <a href="#ds-sentinel1">Sentinel-1 SAR</a>
+      <a href="#ds-hansen">Hansen Forest Change</a>
+      <a href="#ds-cadastre">Austrian Cadastre</a>
+      <a href="#ds-osm">OpenStreetMap</a>
+    </div>
+    <a href="#methods-segmentation">Segmentation Pipeline</a>
+    <div class="nav-sub">
+      <a href="#seg-gradient">Fused Gradient</a>
+      <a href="#seg-felzenszwalb">Felzenszwalb + RAG</a>
+      <a href="#seg-features">Feature Extraction</a>
+    </div>
+    <a href="#methods-classification">Classification</a>
+    <div class="nav-sub">
+      <a href="#cls-rf">Random Forest</a>
+      <a href="#cls-rules">Rule-Based Fallback</a>
+      <a href="#cls-grouping">Hierarchical Grouping</a>
+    </div>
+    <a href="#methods-training">RF Training Pipeline</a>
+    <div class="nav-sub">
+      <a href="#train-ground-truth">Ground Truth</a>
+      <a href="#train-process">Training Process</a>
+      <a href="#train-model-selection">Model Selection</a>
+    </div>
+    <a href="#methods-austria-processor">Austria-Wide Processing</a>
+    <div class="nav-sub">
+      <a href="#processor-architecture">Architecture</a>
+      <a href="#processor-outputs">Per-KG Outputs</a>
+      <a href="#processor-zenodo">Zenodo Integration</a>
+      <a href="#processor-monitoring">Monitoring</a>
+    </div>
+  </div>
+  <div class="nav-group">
     <div class="nav-group-title">Reference</div>
     <a href="#object-types">Object Types (25)</a>
     <a href="#group-types">Group Types (11)</a>
@@ -1259,6 +1299,967 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
 
 
 <!-- ==================== OBJECT TYPES ==================== -->
+<!-- ================================================================== -->
+<!-- METHODS                                                             -->
+<!-- ================================================================== -->
+
+<h2 id="methods-overview">Methods — Overview <a class="anchor-link" href="#methods-overview">#</a></h2>
+
+<p>
+  The analysis pipeline turns raw remote sensing data into a classified landscape map
+  through four stages:
+</p>
+<ol style="line-height:1.9;margin:10px 0 20px 20px">
+  <li><strong>Data acquisition</strong> — windowed reads from 8 independent data sources at 0.2–30 m resolution</li>
+  <li><strong>Segmentation</strong> — fused multi-layer gradient → Felzenszwalb over-segmentation → RAG boundary merge</li>
+  <li><strong>Feature extraction</strong> — 57 per-segment features spanning height, shape, spectral, texture, SAR, phenology, and temporal change</li>
+  <li><strong>Classification</strong> — Random Forest (trained on cadastre + OSM ground truth) with rule-based fallback and hierarchical grouping</li>
+</ol>
+
+<div style="background:#f0f4f8;border:1px solid #d0d7de;border-radius:8px;padding:16px 20px;margin:20px 0;font-size:14px;line-height:1.7">
+  <strong>Processing model:</strong> Areas are tiled into overlapping 1.5 km strips (100 m overlap).
+  Each tile is processed independently, then results are merged with centroid-ownership deduplication
+  at boundaries. This caps memory at ~90 MB per tile regardless of total area size.
+</div>
+
+<!-- ==================== DATA SOURCES ==================== -->
+
+<h2 id="methods-data-sources">Data Sources <a class="anchor-link" href="#methods-data-sources">#</a></h2>
+
+<p>
+  The system fuses eight independent remote sensing and reference data sources.
+  All raster data is accessed via HTTP range requests (GDAL <code>/vsicurl/</code>) or
+  the Copernicus openEO API — no bulk downloads required.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:30px">#</th><th>Source</th><th style="width:85px">Resolution</th><th style="width:80px">Access</th><th>Role in pipeline</th></tr></thead>
+  <tbody>
+    <tr><td><strong>1</strong></td><td>BEV ALS DTM + DSM</td><td>1 m</td><td>HTTP range</td><td>Height model, terrain, temporal change</td></tr>
+    <tr><td><strong>2</strong></td><td>BEV DOP Orthophoto</td><td>0.2 m</td><td>HTTP range</td><td>NDVI, spectral bands, texture (GLCM)</td></tr>
+    <tr><td><strong>3</strong></td><td>Sentinel-2 NDVI</td><td>10 m</td><td>openEO</td><td>Growing-season NDVI, monthly time series, phenology</td></tr>
+    <tr><td><strong>4</strong></td><td>ESA WorldCover</td><td>10 m</td><td>AWS COG</td><td>Land cover prior (built, tree, crop, grass, water)</td></tr>
+    <tr><td><strong>5</strong></td><td>Sentinel-1 SAR</td><td>10 m</td><td>openEO</td><td>VV/VH backscatter (cloud-proof ground classification)</td></tr>
+    <tr><td><strong>6</strong></td><td>Hansen GFC</td><td>30 m</td><td>HTTP range</td><td>Forest cover 2000, annual loss/gain 2001–2024</td></tr>
+    <tr><td><strong>7</strong></td><td>Austrian Cadastre</td><td>mm-level</td><td>REST API</td><td>Building footprints, parcel boundaries (ground truth)</td></tr>
+    <tr><td><strong>8</strong></td><td>OpenStreetMap</td><td>varies</td><td>Overpass API</td><td>Roads, paths, waterways, landcover (ground truth)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- --- BEV LiDAR --- -->
+<h3 id="ds-bev-lidar">1. BEV Airborne Laser Scanning (DTM + DSM) <a class="anchor-link" href="#ds-bev-lidar">#</a></h3>
+
+<p>
+  <a href="https://www.bev.gv.at/" target="_blank" rel="noopener">BEV (Bundesamt für Eich- und Vermessungswesen)</a>
+  publishes Austria-wide Digital Terrain Models (DTM) and Digital Surface Models (DSM) derived from
+  airborne LiDAR scanning (ALS) at <strong>1 m resolution</strong> in <strong>EPSG:3035</strong>.
+</p>
+<p>
+  Three acquisition dates are available, enabling temporal change detection:
+</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Dataset</th><th>Date</th><th>Base URL</th></tr></thead>
+  <tbody>
+    <tr><td>DTM / DSM</td><td>2022-09-15</td><td><code><a href="https://data.bev.gv.at/download/ALS/DTM/20220915/" target="_blank" rel="noopener">data.bev.gv.at/download/ALS/DTM/20220915/</a></code></td></tr>
+    <tr><td>DTM / DSM</td><td>2023-09-15</td><td><code><a href="https://data.bev.gv.at/download/ALS/DTM/20230915/" target="_blank" rel="noopener">data.bev.gv.at/download/ALS/DTM/20230915/</a></code></td></tr>
+    <tr><td>DTM / DSM</td><td>2024-09-15</td><td><code><a href="https://data.bev.gv.at/download/ALS/DTM/20240915/" target="_blank" rel="noopener">data.bev.gv.at/download/ALS/DTM/20240915/</a></code></td></tr>
+  </tbody>
+</table>
+</div>
+<p>
+  Tiles are Cloud-Optimised GeoTIFFs (COG) organised in a 55-tile grid.
+  Only the pixels needed for the analysis area are read via GDAL's <code>/vsicurl/</code>
+  virtual filesystem, avoiding downloading full 12 GB tiles.
+  The normalised Digital Surface Model (<strong>nDSM = DSM − DTM</strong>) gives object heights
+  above ground (tree canopy, building height).
+</p>
+<p><strong>Derived products:</strong></p>
+<ul>
+  <li><strong>nDSM</strong> — object height above ground (canopy height, building height)</li>
+  <li><strong>Slope, aspect, TRI, TPI, curvature</strong> — terrain derivatives from DTM</li>
+  <li><strong>Temporal change</strong> — DTM/nDSM differences between dates detect excavation, fill, tree loss, and new construction</li>
+</ul>
+
+<!-- --- BEV Ortho --- -->
+<h3 id="ds-bev-ortho">2. BEV DOP Orthophoto (RGBI) <a class="anchor-link" href="#ds-bev-ortho">#</a></h3>
+
+<p>
+  BEV publishes 4-band (Red, Green, Blue, Near-Infrared) orthophotos at <strong>0.2 m resolution</strong>.
+  Austria is divided into 47 <em>Operates</em> (regional survey units), each flown in different years.
+  A fallback <em>DOP</em> (Digitale Orthophoto) mosaic covers areas where individual Operates aren't available.
+</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Release</th><th>Base URL</th></tr></thead>
+  <tbody>
+    <tr><td>2022-01-28</td><td><code><a href="https://data.bev.gv.at/download/DOP/20220128/" target="_blank" rel="noopener">data.bev.gv.at/download/DOP/20220128/</a></code></td></tr>
+    <tr><td>2022-10-27</td><td><code><a href="https://data.bev.gv.at/download/DOP/20221027/" target="_blank" rel="noopener">data.bev.gv.at/download/DOP/20221027/</a></code></td></tr>
+    <tr><td>2024-06-25</td><td><code><a href="https://data.bev.gv.at/download/DOP/20240625/" target="_blank" rel="noopener">data.bev.gv.at/download/DOP/20240625/</a></code></td></tr>
+    <tr><td>2025-04-15</td><td><code><a href="https://data.bev.gv.at/download/DOP/20250415/" target="_blank" rel="noopener">data.bev.gv.at/download/DOP/20250415/</a></code></td></tr>
+  </tbody>
+</table>
+</div>
+<p><strong>Derived products:</strong></p>
+<ul>
+  <li><strong>NDVI</strong> — <code>(NIR − Red) / (NIR + Red)</code> at 1 m (resampled from 0.2 m) — best spatial resolution available</li>
+  <li><strong>Fused NDVI</strong> — BEV 1 m spatial detail + Sentinel-2 seasonal correction</li>
+  <li><strong>Spectral bands</strong> — red, green, blue, NIR mean per segment, brightness, green ratio, NIR/red ratio</li>
+  <li><strong>GLCM texture</strong> — contrast, homogeneity, entropy, dissimilarity, energy from Grey-Level Co-occurrence Matrix on the greyscale ortho</li>
+</ul>
+
+<!-- --- Sentinel-2 --- -->
+<h3 id="ds-sentinel2">3. Sentinel-2 NDVI <a class="anchor-link" href="#ds-sentinel2">#</a></h3>
+
+<p>
+  <a href="https://dataspace.copernicus.eu/" target="_blank" rel="noopener">Copernicus Data Space Ecosystem</a>
+  provides Sentinel-2 L2A imagery via the <a href="https://openeo.dataspace.copernicus.eu/" target="_blank" rel="noopener">openEO API</a>
+  at <strong>10 m resolution</strong>.
+</p>
+<p>Two products are computed:</p>
+<ul>
+  <li><strong>NDVI composite</strong> — cloud-masked temporal median over the growing season (April–September), using the SCL (Scene Classification Layer) to exclude clouds, shadows, snow, and saturated pixels</li>
+  <li><strong>Monthly NDVI time series</strong> — 8 monthly medians (one per month, April–November) fitted with a harmonic function to extract phenology: mean, amplitude, phase, and RMSE</li>
+</ul>
+<p>
+  The monthly time series is the primary discriminator between <em>crop</em> (high amplitude, summer peak),
+  <em>pasture</em> (moderate mean, low amplitude), and <em>road</em> (low mean and amplitude).
+</p>
+<p>
+  All Copernicus products are cached in a grid-snapped tile cache (0.1° tiles) so adjacent areas
+  share cached results. Tiles are also persisted to
+  <a href="https://zenodo.org/" target="_blank" rel="noopener">Zenodo</a> as ZIP archives
+  for long-term storage.
+</p>
+
+<!-- --- WorldCover --- -->
+<h3 id="ds-worldcover">4. ESA WorldCover <a class="anchor-link" href="#ds-worldcover">#</a></h3>
+
+<p>
+  <a href="https://esa-worldcover.org/en" target="_blank" rel="noopener">ESA WorldCover v200 (2021)</a>
+  is a global 10 m land cover map derived from Sentinel-1 and Sentinel-2 data.
+  It classifies each pixel into one of 11 classes (tree cover, shrubland, grassland, cropland,
+  built-up, bare/sparse vegetation, snow/ice, permanent water, herbaceous wetland, mangroves, moss/lichen).
+</p>
+<p>
+  Data is read directly as Cloud-Optimised GeoTIFFs from AWS:
+</p>
+<div class="code-wrap">
+  <div class="code-header"><span>URL pattern</span></div>
+  <pre><code>https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_N{lat}E{lon}_Map.tif</code></pre>
+</div>
+<p>
+  Austria requires 6 tiles (N45E009, N45E012, N45E015, N48E009, N48E012, N48E015).
+  Per-segment fractions are computed for each land cover class (e.g. <code>esa_tree_frac</code>,
+  <code>esa_crop_frac</code>) and used as <strong>spatial priors</strong> in both the RF model and the
+  rule-based classifier.
+</p>
+
+<!-- --- SAR --- -->
+<h3 id="ds-sentinel1">5. Sentinel-1 SAR <a class="anchor-link" href="#ds-sentinel1">#</a></h3>
+
+<p>
+  <a href="https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-1" target="_blank" rel="noopener">Sentinel-1</a>
+  C-band SAR backscatter is fetched via openEO at <strong>10 m resolution</strong>.
+  Both <strong>VV</strong> (co-polarisation) and <strong>VH</strong> (cross-polarisation) channels are used.
+</p>
+<p>
+  SAR provides cloud-proof ground classification:
+</p>
+<ul>
+  <li><strong>Low VH</strong> — specular surfaces (roads, parking, bare soil)</li>
+  <li><strong>High VH relative to VV</strong> — volume scattering (dense vegetation, forests)</li>
+  <li><strong>VV/VH ratio</strong> — separates built-up surfaces from natural ground</li>
+</ul>
+<p>
+  Especially valuable when NDVI harmonic data is unavailable — SAR distinguishes
+  paved surfaces from vegetated ground without relying on optical data.
+</p>
+
+<!-- --- Hansen --- -->
+<h3 id="ds-hansen">6. Hansen Global Forest Change <a class="anchor-link" href="#ds-hansen">#</a></h3>
+
+<p>
+  <a href="https://glad.earthengine.app/view/global-forest-change" target="_blank" rel="noopener">Hansen GFC-2024-v1.12</a>
+  (University of Maryland) provides global tree cover data at <strong>30 m resolution</strong>.
+  Tiles are WGS84 GeoTIFFs hosted on Google Cloud Storage:
+</p>
+<div class="code-wrap">
+  <div class="code-header"><span>Base URL</span></div>
+  <pre><code>https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/</code></pre>
+</div>
+<p><strong>Layers used:</strong></p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Layer</th><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>treecover2000</code></td><td>uint8 (0–100)</td><td>Percent canopy cover in year 2000</td></tr>
+    <tr><td><code>lossyear</code></td><td>uint8 (0–24)</td><td>Year of forest loss (1 = 2001, …, 24 = 2024; 0 = no loss)</td></tr>
+    <tr><td><code>gain</code></td><td>uint8 (0/1)</td><td>Forest gain between 2000 and 2012</td></tr>
+    <tr><td><code>datamask</code></td><td>uint8</td><td>0 = nodata, 1 = land, 2 = water</td></tr>
+  </tbody>
+</table>
+</div>
+<p>
+  Hansen features are used both for classification (current forest fraction, recent loss detection)
+  and as <strong>labelling criteria for tree_loss</strong> training samples.
+  Austria spans two tiles: <code>50N_000E</code> and <code>50N_010E</code>.
+</p>
+
+<!-- --- Cadastre --- -->
+<h3 id="ds-cadastre">7. Austrian Cadastre <a class="anchor-link" href="#ds-cadastre">#</a></h3>
+
+<p>
+  The <a href="https://cadastre-process-api.exe.xyz/api/v1/docs/llm.txt" target="_blank" rel="noopener">Austrian Cadastre API</a>
+  provides <strong>mm-precision</strong> vector data for all ~8,440 Katastralgemeinden (cadastral municipalities):
+</p>
+<ul>
+  <li><strong>Building footprints</strong> — used as ground truth labels for <code>roof</code> class during RF training</li>
+  <li><strong>Parcel boundaries</strong> — land-use codes (Benützungsart) mapped to landscape types via a
+    <a href="#train-ground-truth">50-code lookup table</a></li>
+  <li><strong>Parcel land-use codes</strong> — BEV BA codes (e.g. 42 = Gebäude → <code>roof</code>, 51 = Acker → <code>crop</code>, 56 = Wald → <code>tree</code>)</li>
+</ul>
+<div class="code-wrap">
+  <div class="code-header"><span>Base URL</span></div>
+  <pre><code>https://cadastre-process-api.exe.xyz/api/v1</code></pre>
+</div>
+
+<!-- --- OSM --- -->
+<h3 id="ds-osm">8. OpenStreetMap <a class="anchor-link" href="#ds-osm">#</a></h3>
+
+<p>
+  <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">OpenStreetMap</a> data
+  is fetched via the <a href="https://overpass-api.de/" target="_blank" rel="noopener">Overpass API</a>
+  and rasterised onto the 1 m LiDAR grid for use as supplementary ground truth labels.
+</p>
+<p><strong>Feature categories:</strong></p>
+<ul>
+  <li><strong>Roads &amp; paths</strong> — <code>highway=motorway|trunk|primary|secondary|tertiary|residential|service|track</code> → <code>road</code> / <code>path</code> labels, buffered to match road width</li>
+  <li><strong>Waterways</strong> — rivers, streams, canals → <code>water</code> labels</li>
+  <li><strong>Land cover</strong> — <code>landuse=forest|farmland|meadow|orchard|vineyard|quarry</code> + <code>natural=water|wood|scrub|rock</code> → corresponding type labels</li>
+</ul>
+<p>
+  Queries use <code>out geom;</code> format (inline coordinates) to avoid expensive node recursion,
+  with 5 s pauses between sequential queries to respect rate limits.
+</p>
+<div class="code-wrap">
+  <div class="code-header"><span>Endpoints</span></div>
+  <pre><code>https://z.overpass-api.de/api/interpreter  (primary)
+https://overpass-api.de/api/interpreter     (fallback)</code></pre>
+</div>
+
+<!-- ==================== SEGMENTATION PIPELINE ==================== -->
+
+<h2 id="methods-segmentation">Segmentation Pipeline <a class="anchor-link" href="#methods-segmentation">#</a></h2>
+
+<p>
+  The segmentation pipeline converts raw raster layers into discrete landscape objects.
+  It runs in three stages: gradient computation, over-segmentation, and region merging.
+</p>
+
+<h3 id="seg-gradient">Step 1 — Fused Multi-Layer Gradient <a class="anchor-link" href="#seg-gradient">#</a></h3>
+
+<p>
+  Object boundaries are detected as ridges in a weighted sum of Sobel edge gradients
+  computed independently on each available data layer. Each layer is smoothed with a
+  Gaussian filter (σ = 0.8), edge-detected with the Sobel operator, and normalised to [0, 1].
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Layer</th><th>Weight</th><th>Detects</th></tr></thead>
+  <tbody>
+    <tr><td>CHM (nDSM)</td><td>0.25</td><td>Tree canopy edges, building outlines</td></tr>
+    <tr><td>DTM</td><td>0.20</td><td>Roads, embankments, ditches</td></tr>
+    <tr><td>DSM</td><td>0.10</td><td>Surface breaks (building roofs, canopy edges)</td></tr>
+    <tr><td>NDVI</td><td>0.20</td><td>Vegetation / non-vegetation boundaries</td></tr>
+    <tr><td>NIR</td><td>0.15</td><td>Material transitions (vegetation vs. artificial)</td></tr>
+    <tr><td>Green</td><td>0.05</td><td>Fine spectral detail</td></tr>
+    <tr><td>Red</td><td>0.03</td><td>Fine spectral detail</td></tr>
+    <tr><td>Blue</td><td>0.02</td><td>Fine spectral detail</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+  The fused gradient captures boundaries that are strong in <em>any</em> layer — a tree edge
+  that's invisible in NDVI is still detected in the CHM, and a road that's hidden in
+  the DSM is visible in NDVI and NIR.
+</p>
+
+<h3 id="seg-felzenszwalb">Step 2 — Felzenszwalb Over-Segmentation + RAG Merge <a class="anchor-link" href="#seg-felzenszwalb">#</a></h3>
+
+<p>
+  Segmentation uses a <strong>two-layer approach</strong>: ground (nDSM &lt; 0.3 m) and elevated
+  (nDSM ≥ 0.3 m) pixels are segmented separately to prevent tree crowns from
+  merging with adjacent ground.
+</p>
+
+<h4>Felzenszwalb graph-based segmentation</h4>
+<p>
+  <a href="https://link.springer.com/article/10.1023/B:VISI.0000022288.19776.77" target="_blank" rel="noopener">Felzenszwalb &amp; Huttenlocher (2004)</a>
+  over-segments the gradient image. Parameters are tuned separately per layer:
+</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Parameter</th><th>Elevated</th><th>Ground</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>scale</code></td><td>150</td><td>180</td><td>Higher → fewer, larger segments</td></tr>
+    <tr><td><code>sigma</code></td><td>0.5</td><td>0.5</td><td>Pre-smoothing of input</td></tr>
+    <tr><td><code>min_size</code></td><td>30 px (30 m²)</td><td>60 px (60 m²)</td><td>Minimum segment area</td></tr>
+  </tbody>
+</table>
+</div>
+<p>
+  Ground gets coarser parameters (scale × 1.2, min_size × 2) because ground features
+  (fields, roads) are spatially larger than elevated objects (individual trees, roofs).
+</p>
+
+<h4>RAG boundary merge</h4>
+<p>
+  A Region Adjacency Graph (RAG) is built from the over-segmented result. Adjacent segments
+  with similar mean gradient values are merged hierarchically using a <strong>threshold of 0.12</strong>.
+  This reduces over-segmentation while preserving strong boundaries (gradient ridge &gt; threshold).
+</p>
+
+<h3 id="seg-features">Step 3 — Feature Extraction (57 Features) <a class="anchor-link" href="#seg-features">#</a></h3>
+
+<p>
+  Each segment is described by 57 features spanning seven categories.
+  All features are computed per-segment from the underlying raster data.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Category</th><th>Count</th><th>Features</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Height &amp; terrain</strong></td><td>8</td>
+      <td><code>h_mean</code>, <code>h_max</code>, <code>h_std</code>, <code>h_p90</code>, <code>slope_mean</code>, <code>slope_std</code>, <code>dsm_roughness</code>, <code>dtm_roughness</code></td>
+    </tr>
+    <tr>
+      <td><strong>Shape</strong></td><td>5</td>
+      <td><code>compactness</code>, <code>elongation</code>, <code>solidity</code>, <code>extent</code>, <code>area</code></td>
+    </tr>
+    <tr>
+      <td><strong>DSM edges</strong></td><td>1</td>
+      <td><code>dsm_edge_strength</code></td>
+    </tr>
+    <tr>
+      <td><strong>Spectral (BEV ortho)</strong></td><td>11</td>
+      <td><code>ndvi_mean</code>, <code>ndvi_std</code>, <code>brightness_mean</code>, <code>nir_mean</code>, <code>red_mean</code>, <code>green_mean</code>, <code>blue_mean</code>, <code>green_ratio</code>, <code>rg_index</code>, <code>nir_brightness_ratio</code>, <code>nir_red_ratio</code></td>
+    </tr>
+    <tr>
+      <td><strong>Copernicus spectral</strong></td><td>3</td>
+      <td><code>cop_ndvi_mean</code>, <code>fused_ndvi_mean</code>, <code>fused_ndvi_std</code></td>
+    </tr>
+    <tr>
+      <td><strong>ESA WorldCover</strong></td><td>5</td>
+      <td><code>esa_built_frac</code>, <code>esa_tree_frac</code>, <code>esa_crop_frac</code>, <code>esa_grass_frac</code>, <code>esa_water_frac</code></td>
+    </tr>
+    <tr>
+      <td><strong>Temporal</strong></td><td>8</td>
+      <td><code>h_change</code>, <code>dtm_change</code>, <code>dtm_change_abs</code>, <code>temporal_h_std</code>, <code>stability</code>, <code>volume_change_m3</code>, <code>volume_change_abs_m3</code>, <code>dtm_change_max</code>, <code>dtm_change_frac_03m</code></td>
+    </tr>
+    <tr>
+      <td><strong>GLCM texture</strong></td><td>6</td>
+      <td><code>glcm_contrast</code>, <code>glcm_homogeneity</code>, <code>glcm_entropy</code>, <code>glcm_dissimilarity</code>, <code>glcm_energy</code>, <code>texture_complexity</code></td>
+    </tr>
+    <tr>
+      <td><strong>SAR</strong></td><td>3</td>
+      <td><code>sar_vv</code>, <code>sar_vh</code>, <code>sar_ratio</code></td>
+    </tr>
+    <tr>
+      <td><strong>NDVI harmonics</strong></td><td>4</td>
+      <td><code>harm_mean</code>, <code>harm_amplitude</code>, <code>harm_phase</code>, <code>harm_rmse</code></td>
+    </tr>
+    <tr>
+      <td><strong>Hansen forest</strong></td><td>6</td>
+      <td><code>hansen_treecover2000</code>, <code>hansen_loss_frac</code>, <code>hansen_recent_loss_frac</code>, <code>hansen_loss_3yr_frac</code>, <code>hansen_gain_frac</code>, <code>hansen_current_forest_frac</code></td>
+    </tr>
+    <tr>
+      <td><strong>Additional</strong></td><td>5</td>
+      <td><code>ndvi_max</code>, <code>slope_max</code>, <code>h_p10</code>, <code>perimeter</code>, <code>esa_dominant_lc</code></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:13px;color:#666;margin-top:4px">
+  Note: the temporal category has 8 features listed but <code>volume_change_m3</code> and <code>volume_change_abs_m3</code> are counted separately, giving 57 total.
+</p>
+
+<!-- ==================== CLASSIFICATION ==================== -->
+
+<h2 id="methods-classification">Classification <a class="anchor-link" href="#methods-classification">#</a></h2>
+
+<p>
+  Each segment is classified into one of <a href="#object-types">25 object types</a> via a two-tier system:
+  Random Forest as primary classifier with a hand-tuned rule-based decision tree as fallback.
+</p>
+
+<h3 id="cls-rf">Random Forest Classifier <a class="anchor-link" href="#cls-rf">#</a></h3>
+
+<p>
+  The primary classifier is a <strong>scikit-learn <code>RandomForestClassifier</code></strong> trained on
+  cadastre + OSM ground truth (see <a href="#methods-training">Training Pipeline</a>).
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Hyperparameter</th><th>Value</th><th>Rationale</th></tr></thead>
+  <tbody>
+    <tr><td><code>n_estimators</code></td><td>200</td><td>Enough trees for stable OOB estimate; diminishing returns beyond 200</td></tr>
+    <tr><td><code>max_depth</code></td><td>20</td><td>Deep enough to capture complex interactions without severe overfitting</td></tr>
+    <tr><td><code>min_samples_leaf</code></td><td>5</td><td>Prevents leaves with single samples; smooths predictions</td></tr>
+    <tr><td><code>class_weight</code></td><td><code>"balanced"</code></td><td>Inversely weights class frequencies — prevents dominant classes from drowning rare ones</td></tr>
+    <tr><td><code>oob_score</code></td><td><code>True</code></td><td>Out-of-bag estimate used for model selection without held-out set</td></tr>
+    <tr><td><code>n_jobs</code></td><td>2</td><td>Limited parallelism to cap memory usage</td></tr>
+    <tr><td><code>random_state</code></td><td>42</td><td>Reproducibility</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>Prediction workflow:</strong></p>
+<ol style="line-height:1.9;margin:8px 0 16px 20px">
+  <li>Extract 57-feature vector for the segment</li>
+  <li>RF predicts class and per-class probabilities</li>
+  <li>If confidence ≥ threshold → accept RF prediction</li>
+  <li>If confidence &lt; threshold → fall back to rule-based classifier</li>
+  <li>If <code>mark_uncertain=True</code> and confidence &lt; 0.15 → label as <code>unclassified</code></li>
+</ol>
+
+<p>
+  The RF classifies <strong>16 learnable types</strong> — three types (<code>wind_turbine</code>,
+  <code>substation</code>, <code>solar_panel</code>) are excluded from RF training because they require
+  spatial context from infrastructure databases rather than pixel-level features.
+  <code>excavation</code> and <code>fill</code> are merged into <code>earthwork</code> for training, then
+  split back at inference using DTM change direction.
+</p>
+
+<h3 id="cls-rules">Rule-Based Fallback Classifier <a class="anchor-link" href="#cls-rules">#</a></h3>
+
+<p>
+  When no RF model is loaded, or when RF confidence is below threshold, a hand-tuned
+  decision tree classifies segments. The rules are ordered by discriminative power:
+</p>
+
+<h4>Priority 0 — Infrastructure spatial match</h4>
+<p>
+  If an infrastructure database (austria-power API) identifies a known solar farm,
+  wind turbine, or electrical substation near the segment, and the physical signature
+  matches (height, area, compactness, NDVI), the segment is classified immediately.
+</p>
+
+<h4>Priority 1 — Temporal disturbance</h4>
+<p>
+  Recent changes have highest priority — they override steady-state classification:
+</p>
+<ul>
+  <li><strong>DTM change > 0.8 m</strong> + non-vegetated → <code>excavation</code> (lowered) or <code>fill</code> (raised)</li>
+  <li><strong>nDSM dropped > 2 m</strong> + currently low → <code>tree_loss</code> (terrain intact) or <code>construction</code> (terrain reshaped)</li>
+  <li><strong>nDSM grew > 2 m</strong> + not vegetation → <code>construction</code></li>
+  <li><strong>Volume change > 50 m³</strong> + on ground → earthwork</li>
+  <li>NDVI > 0.5 vetoes all disturbance labels (surface has regrown)</li>
+</ul>
+
+<h4>Priority 2 — Water</h4>
+<p>
+  ESA WorldCover water fraction > 50% + NDVI &lt; 0.1 + flat → <code>water</code>.
+  Also: very low NIR (&lt; 30) + negative NDVI + flat → <code>water</code>.
+</p>
+
+<h4>Priority 3 — Elevated objects (nDSM > 0.5 m)</h4>
+<p>
+  A <strong>building score</strong> is computed from DSM roughness, height variance, slope,
+  compactness, NDVI, texture, and SAR. Calibrated thresholds from empirical distributions:
+</p>
+<ul>
+  <li><strong>Building score ≥ 5</strong> → <code>roof</code> (smooth DSM, uniform height, compact, low NDVI)</li>
+  <li>Further refined: <code>greenhouse</code> (high NIR transmittance), <code>solar_panel</code> (very smooth + bright)</li>
+  <li><strong>Building score &lt; 0</strong> → vegetation: <code>tree</code> (> 4 m), <code>shrub</code> (0.5–4 m), <code>hedge</code> (elongation > 4)</li>
+  <li><strong>Bridge</strong>: elevated road over gap (elongated, smooth, non-vegetation, above void)</li>
+</ul>
+
+<h4>Priority 4 — Ground objects (nDSM ≤ 0.5 m)</h4>
+<p>
+  Uses NDVI, harmonics, SAR, texture, shape, and ESA priors:
+</p>
+<ul>
+  <li><strong>NDVI harmonics</strong> (strongest signal when available): high amplitude → <code>crop</code>, low mean + low amplitude → <code>road</code>, moderate mean → <code>grass</code></li>
+  <li><strong>SAR fallback</strong> (when no harmonics): low VH + smooth → <code>road</code>/<code>parking</code>, high VH + green → <code>crop</code>/<code>grass</code></li>
+  <li><strong>Shape</strong>: elongation > 3 → <code>road</code>/<code>path</code>, compact + large → <code>parking</code></li>
+  <li><strong>Terrain</strong>: slope > 30° + rough → <code>rock</code>, low NDVI + bright → <code>bare_soil</code></li>
+  <li><strong>ESA priors</strong>: crop fraction > 30% + NDVI evidence → <code>crop</code>, grass fraction → <code>grass</code></li>
+  <li><strong>Context</strong>: moderate NDVI + small area + near buildings → <code>garden</code></li>
+</ul>
+
+<h4>NDVI selection hierarchy</h4>
+<p>
+  The best available NDVI source is used in priority order:
+  <strong>fused NDVI</strong> (1 m spatial + seasonal correction) >
+  <strong>BEV ortho NDVI</strong> (1 m, possibly wrong season) >
+  <strong>Copernicus 10 m NDVI</strong> (right season, but bleeds into adjacent land covers at boundaries).
+  When relying on coarse 10 m NDVI, the classifier applies additional caution —
+  e.g. moderate NDVI on smooth ground is more likely road with vegetation bleed
+  than actual vegetation.
+</p>
+
+<h3 id="cls-grouping">Hierarchical Grouping <a class="anchor-link" href="#cls-grouping">#</a></h3>
+
+<p>
+  After classification, adjacent segments with compatible types are merged into
+  <a href="#group-types">11 higher-level groups</a>. Merge rules define which types can combine:
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Group</th><th>Constituent types</th></tr></thead>
+  <tbody>
+    <tr><td><strong>forest</strong></td><td>tree + shrub + hedge</td></tr>
+    <tr><td><strong>woodland</strong></td><td>shrub + hedge</td></tr>
+    <tr><td><strong>hedgerow</strong></td><td>hedge</td></tr>
+    <tr><td><strong>waterbody</strong></td><td>water</td></tr>
+    <tr><td><strong>building</strong></td><td>roof + wall + solar_panel + greenhouse + substation</td></tr>
+    <tr><td><strong>road_network</strong></td><td>road + path + parking</td></tr>
+    <tr><td><strong>cropland</strong></td><td>crop + grass</td></tr>
+    <tr><td><strong>pasture</strong></td><td>grass + garden</td></tr>
+    <tr><td><strong>orchard_grove</strong></td><td>orchard + vineyard</td></tr>
+    <tr><td><strong>quarry</strong></td><td>excavation + fill</td></tr>
+    <tr><td><strong>construction_site</strong></td><td>construction + excavation + fill + tree_loss + bare_soil</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+  Grouping uses spatial adjacency: two segments merge only if they share a boundary
+  <em>and</em> their types appear together in the merge rules. The resulting group inherits
+  the dominant type name from the <code>_GROUP_NAME_MAP</code> lookup table.
+</p>
+
+<!-- ==================== TRAINING PIPELINE ==================== -->
+
+<h2 id="methods-training">RF Training Pipeline <a class="anchor-link" href="#methods-training">#</a></h2>
+
+<p>
+  The Random Forest is trained on ground truth from the Austrian cadastre and OpenStreetMap,
+  using a continuous background training process that iterates over hundreds of randomly
+  selected Katastralgemeinden (KGs).
+</p>
+
+<h3 id="train-ground-truth">Ground Truth Labelling <a class="anchor-link" href="#train-ground-truth">#</a></h3>
+
+<p>
+  Training labels come from three independent sources, overlaid onto the 1 m segmentation grid:
+</p>
+
+<h4>Source A — Cadastre land-use codes</h4>
+<p>
+  Each Austrian parcel has a Benützungsart (BA) code recording its official land use.
+  These are mapped to landscape types via a 50-entry lookup table:
+</p>
+<div class="table-wrap" style="max-height:260px;overflow-y:auto">
+<table>
+  <thead><tr><th style="width:70px">BA Code</th><th>Austrian name</th><th>Mapped type</th></tr></thead>
+  <tbody>
+    <tr><td>42–47</td><td>Gebäude (buildings)</td><td><code>roof</code></td></tr>
+    <tr><td>41</td><td>Baufläche (paved)</td><td><code>parking</code></td></tr>
+    <tr><td>51, 62</td><td>Acker (arable field)</td><td><code>crop</code></td></tr>
+    <tr><td>52–55, 58, 61</td><td>Wiese / Weide / Grünland</td><td><code>grass</code></td></tr>
+    <tr><td>56</td><td>Wald (forest)</td><td><code>tree</code></td></tr>
+    <tr><td>57</td><td>Krummholz / Strauchwald</td><td><code>shrub</code></td></tr>
+    <tr><td>63</td><td>Weingarten (vineyard)</td><td><code>vineyard</code></td></tr>
+    <tr><td>64</td><td>Hausgarten</td><td><code>garden</code></td></tr>
+    <tr><td>65</td><td>Obstgarten (orchard)</td><td><code>orchard</code></td></tr>
+    <tr><td>48, 73</td><td>Straße (road)</td><td><code>road</code></td></tr>
+    <tr><td>74</td><td>Weg (path)</td><td><code>path</code></td></tr>
+    <tr><td>70, 71</td><td>Gewässer (water)</td><td><code>water</code></td></tr>
+    <tr><td>80, 81, 93</td><td>Abbaufläche / Deponie</td><td><code>earthwork</code></td></tr>
+    <tr><td>83, 84</td><td>Felsen / Geröll</td><td><code>rock</code></td></tr>
+    <tr><td>59, 90</td><td>Ödland / sonstige</td><td><code>bare_soil</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Source B — OpenStreetMap</h4>
+<p>
+  OSM road/path geometries are buffered to physical width and rasterised.
+  Land-use polygons (<code>landuse=</code>, <code>natural=</code>) provide supplementary labels
+  for forest, farmland, water, and quarries.
+</p>
+
+<h4>Source C — Hansen tree loss</h4>
+<p>
+  The <code>tree_loss</code> class has no cadastre or OSM equivalent. Labels are created
+  synthetically in a post-processing step:
+</p>
+<ul>
+  <li>Segment was originally labelled <code>tree</code>, <code>shrub</code>, <code>grass</code>, <code>bare_soil</code>, or <code>crop</code></li>
+  <li>Hansen <code>recent_loss_frac ≥ 0.15</code> and <code>treecover2000 ≥ 20%</code></li>
+  <li>Current height &lt; 5 m <strong>or</strong> height change &lt; −2 m (evidence of cleared canopy)</li>
+</ul>
+<p>
+  To prevent <strong>label circularity</strong> (the RF learning "hansen_recent_loss_frac > 0.15 → tree_loss"),
+  the two Hansen features used as labelling criteria (<code>hansen_recent_loss_frac</code> and
+  <code>hansen_treecover2000</code>) are <strong>zeroed out</strong> for all tree_loss training samples.
+  The model must learn from independent signals (height drop, NDVI change, spectral, texture).
+</p>
+
+<h4>Label filtering</h4>
+<ul>
+  <li><code>excavation</code> + <code>fill</code> are merged → <code>earthwork</code> (split back at inference by DTM change sign)</li>
+  <li><code>wind_turbine</code>, <code>substation</code>, <code>solar_panel</code> are excluded (require spatial context, not pixel features)</li>
+  <li>Dominant classes are <strong>downsampled</strong> to 5× the median class count to reduce imbalance</li>
+</ul>
+
+<h3 id="train-process">Training Process <a class="anchor-link" href="#train-process">#</a></h3>
+
+<p>
+  Training runs as a background systemd service (<code>rf_train.service</code>), iterating over
+  randomly-selected KGs:
+</p>
+<ol style="line-height:1.9;margin:10px 0 16px 20px">
+  <li>Select ~300 random KGs with > 5 buildings (seed 42 for reproducibility), plus additional KGs containing known infrastructure (solar, wind, substations)</li>
+  <li>For each KG:
+    <ul style="margin:4px 0">
+      <li>Fetch cadastre building footprints + parcel boundaries with land-use codes</li>
+      <li>Fetch OSM roads, waterways, and land cover polygons</li>
+      <li>Read all raster data (LiDAR DTM/DSM, ortho RGBI, Sentinel-2 NDVI, WorldCover, SAR, Hansen)</li>
+      <li>Run Felzenszwalb segmentation → extract 57 features per segment</li>
+      <li>Match segments to ground truth polygons → assign labels</li>
+      <li>Save checkpoint to <code>rf_training_data/checkpoints/kg_XXXXX.npz</code></li>
+    </ul>
+  </li>
+  <li>Every 10 successful KGs, retrain the RF on all accumulated samples and save to <code>/tmp/learned_classifier/</code></li>
+  <li>The API automatically picks up the new model file</li>
+</ol>
+
+<p>
+  Each KG runs in a <strong>separate subprocess</strong> (via <code>multiprocessing</code>) with a
+  20-minute timeout to isolate memory and prevent stuck processes.
+  Checkpoints are saved before model training, so restarts skip already-processed KGs.
+</p>
+
+<h3 id="train-model-selection">Model Selection <a class="anchor-link" href="#train-model-selection">#</a></h3>
+
+<p>
+  Rather than simply using the latest checkpoint, the system evaluates the
+  <strong>learning curve</strong> to find the optimal training data volume:
+</p>
+
+<h4>OOB curve evaluation</h4>
+<p>
+  The <code>evaluate_checkpoints.py</code> script trains RF models at every 5-KG increment
+  and traces the Out-of-Bag (OOB) accuracy as a function of training data volume.
+  Multiple random seeds are tested at each point (5 seeds for ≤ 30 KGs, 3 for ≤ 60, 1 beyond)
+  to measure sensitivity to data composition.
+</p>
+
+<h4>Composite quality score</h4>
+<p>
+  Models are ranked by a <strong>composite score</strong> that rewards balanced per-class accuracy:
+</p>
+<div class="code-wrap">
+  <div class="code-header"><span>formula</span></div>
+  <pre><code>composite = 0.40 × OOB + 0.35 × mean_per_class_accuracy + 0.25 × worst_class_accuracy</code></pre>
+</div>
+<p>
+  This penalises models that sacrifice rare classes (rock, earthwork) for overall accuracy.
+  A model with 75% OOB but all classes ≥ 50% beats one with 77% OOB where rare classes score 0%.
+</p>
+
+<h4>Best model preservation</h4>
+<p>
+  The checkpoint count + seed combination with the highest composite score is saved to
+  <code>data/best_model/</code>. The API prefers this over the live training model.
+  The <a href="/training.html">Training Monitor</a> dashboard visualises the learning curve,
+  per-class OOB scores, convergence detection, and best model history.
+</p>
+
+<h4>Deployed model</h4>
+<p>
+  The current production model was selected from the learning curve at the point of peak composite score:
+</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>Training KGs</td><td><strong>55</strong> (seed 2)</td></tr>
+    <tr><td>Training samples</td><td>87,496</td></tr>
+    <tr><td>Classes</td><td>16</td></tr>
+    <tr><td>Trees / depth / min leaf</td><td>200 / 20 / 5</td></tr>
+    <tr><td>OOB accuracy</td><td><strong>69.9%</strong></td></tr>
+    <tr><td>Composite score</td><td><strong>59.0%</strong> (0.4×OOB + 0.35×mean_cls + 0.25×worst_cls)</td></tr>
+    <tr><td>Mean per-class OOB</td><td>65.0%</td></tr>
+    <tr><td>Worst class OOB</td><td>33.0% (earthwork)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Per-class OOB accuracy</h4>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Category</th><th>Class</th><th style="width:80px">OOB</th><th style="width:200px"></th></tr></thead>
+  <tbody>
+    <tr><td rowspan="7">Vegetation</td><td><strong>tree</strong></td><td>86%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:86%"></div></td></tr>
+    <tr><td><strong>crop</strong></td><td>83%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:83%"></div></td></tr>
+    <tr><td><strong>garden</strong></td><td>80%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:80%"></div></td></tr>
+    <tr><td><strong>shrub</strong></td><td>63%</td><td><div style="background:#58a6ff;height:12px;border-radius:2px;width:63%"></div></td></tr>
+    <tr><td><strong>grass</strong></td><td>59%</td><td><div style="background:#58a6ff;height:12px;border-radius:2px;width:59%"></div></td></tr>
+    <tr><td><strong>vineyard</strong></td><td>54%</td><td><div style="background:#d29922;height:12px;border-radius:2px;width:54%"></div></td></tr>
+    <tr><td><strong>orchard</strong></td><td>44%</td><td><div style="background:#d29922;height:12px;border-radius:2px;width:44%"></div></td></tr>
+    <tr><td>Water</td><td><strong>water</strong></td><td>52%</td><td><div style="background:#d29922;height:12px;border-radius:2px;width:52%"></div></td></tr>
+    <tr><td rowspan="2">Buildings</td><td><strong>roof</strong></td><td>68%</td><td><div style="background:#58a6ff;height:12px;border-radius:2px;width:68%"></div></td></tr>
+    <tr><td><strong>parking</strong></td><td>77%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:77%"></div></td></tr>
+    <tr><td rowspan="2">Transport</td><td><strong>road</strong></td><td>72%</td><td><div style="background:#58a6ff;height:12px;border-radius:2px;width:72%"></div></td></tr>
+    <tr><td><strong>path</strong></td><td>35%</td><td><div style="background:#f85149;height:12px;border-radius:2px;width:35%"></div></td></tr>
+    <tr><td rowspan="3">Terrain</td><td><strong>bare_soil</strong></td><td>78%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:78%"></div></td></tr>
+    <tr><td><strong>rock</strong></td><td>56%</td><td><div style="background:#d29922;height:12px;border-radius:2px;width:56%"></div></td></tr>
+    <tr><td><strong>earthwork</strong></td><td>33%</td><td><div style="background:#f85149;height:12px;border-radius:2px;width:33%"></div></td></tr>
+    <tr><td>Change</td><td><strong>tree_loss</strong></td><td>100%</td><td><div style="background:#3fb950;height:12px;border-radius:2px;width:100%"></div></td></tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:13px;color:#666;margin-top:6px">
+  Greyed-out classes (<code>hedge</code>, <code>fence</code>, <code>wall</code>, <code>mast</code>,
+  <code>wind_turbine</code>, <code>substation</code>, <code>solar_panel</code>, <code>greenhouse</code>,
+  <code>bridge</code>, <code>excavation</code>, <code>fill</code>, <code>construction</code>)
+  are handled by the rule-based classifier, not the RF.
+</p>
+
+<h4>Top feature importances</h4>
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:50px">Rank</th><th>Feature</th><th style="width:80px">Importance</th><th>Category</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>hansen_loss_frac</code></td><td>3.5%</td><td>Hansen forest</td></tr>
+    <tr><td>2</td><td><code>hansen_treecover2000</code></td><td>3.5%</td><td>Hansen forest</td></tr>
+    <tr><td>3</td><td><code>dtm_roughness</code></td><td>3.2%</td><td>Terrain</td></tr>
+    <tr><td>4</td><td><code>fused_ndvi_mean</code></td><td>3.2%</td><td>Spectral</td></tr>
+    <tr><td>5</td><td><code>slope_mean</code></td><td>3.2%</td><td>Terrain</td></tr>
+    <tr><td>6</td><td><code>h_mean</code></td><td>2.7%</td><td>Height</td></tr>
+    <tr><td>7</td><td><code>dtm_change_abs</code></td><td>2.6%</td><td>Temporal</td></tr>
+    <tr><td>8</td><td><code>temporal_h_std</code></td><td>2.3%</td><td>Temporal</td></tr>
+    <tr><td>9</td><td><code>h_p90</code></td><td>2.3%</td><td>Height</td></tr>
+    <tr><td>10</td><td><code>h_p10</code></td><td>2.2%</td><td>Height</td></tr>
+    <tr><td>11</td><td><code>nir_mean</code></td><td>2.2%</td><td>Spectral</td></tr>
+    <tr><td>12</td><td><code>dtm_change_max</code></td><td>2.2%</td><td>Temporal</td></tr>
+    <tr><td>13</td><td><code>harm_rmse</code></td><td>2.1%</td><td>Phenology</td></tr>
+    <tr><td>14</td><td><code>stability</code></td><td>2.1%</td><td>Temporal</td></tr>
+    <tr><td>15</td><td><code>ndvi_mean</code></td><td>2.0%</td><td>Spectral</td></tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:13px;color:#666;margin-top:6px">
+  Feature importances are broadly distributed (no single dominant feature), indicating the model
+  uses a diverse mix of terrain, spectral, temporal, and forest change signals. Hansen features
+  rank high because they are the primary discriminator for tree_loss vs tree (which are otherwise
+  spectrally similar). <code>tree_loss</code> achieves 100% OOB because the labelling criteria
+  (Hansen evidence) are highly predictive — but the circular features are zeroed at training time,
+  so the model learns from height-drop and NDVI-change signals instead.
+</p>
+
+<h4>OOB learning curve</h4>
+<p>
+  The chart below shows how model quality evolves as more KGs are added to training.
+  The composite score peaks at 55 KGs, then gradually declines — additional data introduces
+  label noise from cadastre/OSM misalignment faster than it adds genuinely new examples.
+</p>
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:16px;margin:16px 0">
+  <canvas id="docs-oob-chart" style="width:100%;height:220px"></canvas>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+(function() {
+  const data = [
+    {n:5,oob:71.7,comp:56.6},{n:10,oob:71.0,comp:57.1},{n:15,oob:68.9,comp:58.4},
+    {n:20,oob:68.7,comp:57.8},{n:25,oob:71.9,comp:57.3},{n:30,oob:68.1,comp:56.5},
+    {n:35,oob:70.5,comp:55.2},{n:40,oob:68.7,comp:56.7},{n:45,oob:67.9,comp:57.6},
+    {n:50,oob:68.8,comp:57.5},{n:55,oob:69.9,comp:59.0},{n:60,oob:69.2,comp:58.0},
+    {n:65,oob:66.7,comp:54.3},{n:70,oob:66.7,comp:54.1},{n:75,oob:67.2,comp:53.9},
+    {n:80,oob:66.5,comp:53.3},{n:85,oob:66.5,comp:53.4},{n:90,oob:66.0,comp:53.8},
+    {n:95,oob:65.9,comp:53.2},{n:100,oob:65.6,comp:52.6},{n:105,oob:65.7,comp:52.9},
+    {n:110,oob:65.4,comp:54.0},{n:115,oob:65.3,comp:53.9},{n:120,oob:65.5,comp:54.0},
+    {n:125,oob:65.2,comp:53.4},{n:130,oob:65.5,comp:53.5},{n:135,oob:65.0,comp:52.7},
+    {n:140,oob:64.6,comp:52.7}
+  ];
+  const bestIdx = data.findIndex(d => d.n === 55);
+  const canvas = document.getElementById('docs-oob-chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.n),
+      datasets: [
+        {
+          label: 'OOB accuracy (%)',
+          data: data.map(d => d.oob),
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.1)',
+          borderWidth: 2, pointRadius: 2, tension: 0.3,
+        },
+        {
+          label: 'Composite score (%)',
+          data: data.map(d => d.comp),
+          borderColor: '#3fb950',
+          backgroundColor: 'rgba(63,185,80,0.1)',
+          borderWidth: 2, pointRadius: 2, tension: 0.3,
+        },
+        {
+          label: 'Deployed (55 KGs)',
+          data: data.map((d,i) => i === bestIdx ? d.comp : null),
+          borderColor: '#d29922',
+          backgroundColor: '#d29922',
+          pointRadius: 8, pointStyle: 'star',
+          showLine: false,
+        }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#8b949e', font: { family: 'monospace', size: 11 } } },
+        tooltip: { callbacks: { title: items => items[0].label + ' KGs' } }
+      },
+      scales: {
+        x: { title: { display: true, text: 'Training KGs', color: '#8b949e' },
+             ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } },
+        y: { title: { display: true, text: '%', color: '#8b949e' },
+             min: 45, max: 80,
+             ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } }
+      }
+    }
+  });
+})();
+</script>
+
+<div style="margin:16px 0 24px;padding:12px 16px;background:#0d1117;border:1px solid #30363d;border-radius:8px;font-size:14px">
+  📊 <a href="/training.html" style="color:#58a6ff;font-weight:600">Open Training Monitor Dashboard</a>
+  <span style="color:#8b949e;font-size:12px;margin-left:8px">— live OOB curve, per-class accuracy, convergence tracking, best model history</span>
+</div>
+
+<!-- ==================== AUSTRIA-WIDE PROCESSING ==================== -->
+
+<h2 id="methods-austria-processor">Austria-Wide Processing <a class="anchor-link" href="#methods-austria-processor">#</a></h2>
+
+<p>
+  Beyond interactive per-area analysis, the system includes a <strong>background processor</strong>
+  that applies the full pipeline to every one of Austria's ~8,440 Katastralgemeinden (KGs),
+  uploading the results to <a href="https://zenodo.org/" target="_blank" rel="noopener">Zenodo</a>
+  as open-access persistent datasets.
+</p>
+
+<h3 id="processor-architecture">Architecture <a class="anchor-link" href="#processor-architecture">#</a></h3>
+
+<p>
+  The processor (<code>austria_processor.py</code>, ~5,100 lines) runs as a systemd service
+  (<code>austria_processor.service</code>). Each KG is processed in an isolated subprocess
+  via <code>multiprocessing.Pool(1)</code> so that memory is fully reclaimed between KGs.
+  Large KGs are divided into overlapping 1.5 km tiles (100 m overlap) with centroid-ownership
+  deduplication at boundaries, capping peak memory at ~500 MB regardless of KG size.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Component</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Parent process</strong></td><td>KG iteration, retry logic, Zenodo upload, progress tracking</td></tr>
+    <tr><td><strong>Child process</strong> (per KG)</td><td>All data I/O, segmentation, GPKG/JSON building</td></tr>
+    <tr><td><strong>Tile checkpoints</strong></td><td>Completed tiles are pickled to disk; on crash/restart only the interrupted tile is re-processed</td></tr>
+    <tr><td><strong>Tile cache</strong></td><td>Copernicus (0.1°) and Hansen (0.5°) tiles are grid-snapped so adjacent KGs share cached data</td></tr>
+    <tr><td><strong>Zenodo cache</strong></td><td>Copernicus/Hansen tiles are also persisted to Zenodo as ZIP archives and restored via HTTP range reads on local cache miss</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="processor-outputs">Per-KG Outputs <a class="anchor-link" href="#processor-outputs">#</a></h3>
+
+<p>Three files are produced for each KG and uploaded to Zenodo:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>File</th><th>Contents</th><th>Typical size</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>{kg}_full.gpkg</code></td>
+      <td>All raster layers (DTM, DSM, nDSM, ortho RGBI, segment type) + vector segment polygons in a single GeoPackage</td>
+      <td>~400 MB</td>
+    </tr>
+    <tr>
+      <td><code>{kg}_light.gpkg</code></td>
+      <td>Segment raster + vector, all parcels with DTM heights, all buildings with object heights, new buildings, infrastructure</td>
+      <td>~100 MB</td>
+    </tr>
+    <tr>
+      <td><code>{kg}.json</code></td>
+      <td>JSON summary: area statistics, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score</td>
+      <td>~1 MB</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="processor-zenodo">Zenodo Integration <a class="anchor-link" href="#processor-zenodo">#</a></h3>
+
+<p>
+  Each KG gets its own <a href="https://zenodo.org/" target="_blank" rel="noopener">Zenodo</a> deposit
+  with the three output files. Deposits are published with DOIs for long-term citability.
+  The <a href="#search-index">search index</a> stores download URLs for each KG:
+</p>
+<ul>
+  <li><code>zenodo_json_url</code> — JSON summary</li>
+  <li><code>zenodo_light_gpkg_url</code> — segments + enriched parcels/buildings</li>
+  <li><code>zenodo_full_gpkg_url</code> — all raster layers + vectors</li>
+</ul>
+<p>
+  The <code><a href="#query-api">/api/v1/query</a></code> and <code>/api/v1/kg/&lt;code&gt;</code>
+  endpoints include these URLs when available, so any consumer can download the full
+  analysis for a specific municipality directly from Zenodo.
+</p>
+
+<h3 id="processor-monitoring">Monitoring <a class="anchor-link" href="#processor-monitoring">#</a></h3>
+
+<div style="margin:12px 0 16px;padding:12px 16px;background:#0d1117;border:1px solid #30363d;border-radius:8px;font-size:14px">
+  📡 <a href="/process.html" style="color:#58a6ff;font-weight:600">Open Processor Dashboard</a>
+  <span style="color:#8b949e;font-size:12px;margin-left:8px">— live progress, map, tile status, log stream, Zenodo manifest</span>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/processing/status</code></td><td>Current state: KG being processed, step, tile progress, rates, ETA</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/processing/start</code></td><td>Start processor (optional: <code>state=</code>, <code>kg=</code>)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/processing/pause</code></td><td>Pause (SIGSTOP)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/processing/resume</code></td><td>Resume (SIGCONT)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/processing/stop</code></td><td>Stop (SIGTERM)</td></tr>
+    <tr><td><span class="method method-post">POST</span></td><td><code>/api/v1/processing/single?kg=X</code></td><td>Process a single KG</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/processing/log</code></td><td>Recent processor log lines</td></tr>
+    <tr><td><span class="method method-get">GET</span></td><td><code>/api/v1/processing/manifest</code></td><td>Zenodo manifest: upload status per KG</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="processor-retry">Fault Tolerance <a class="anchor-link" href="#processor-retry">#</a></h3>
+
+<p>
+  The processor is designed for unattended multi-week runs:
+</p>
+<ul>
+  <li><strong>Tile checkpoints</strong> — each completed tile is pickled to disk; crashes only lose the in-progress tile</li>
+  <li><strong>Automatic retry</strong> — on timeout (90 min), the parent retries once with checkpoints restored; transient failures get deferred retry 5 KGs later (up to 2×)</li>
+  <li><strong>OOM recovery</strong> — systemd's <code>MemoryMax=4G</code> kills runaway processes; the service auto-restarts and resumes</li>
+  <li><strong>Disk management</strong> — LRU cache eviction keeps disk under 5 GB; processing pauses automatically below 3 GB free</li>
+  <li><strong>Copernicus circuit breaker</strong> — when openEO returns 503s, Copernicus is skipped for a cooldown period instead of burning timeouts</li>
+  <li><strong>Permanent failure tracking</strong> — KGs that fail repeatedly are recorded in <code>failed_kgs.json</code> and skipped on restart</li>
+</ul>
+
+<!-- ================================================================== -->
+<!-- REFERENCE (original sections continue below)                       -->
+<!-- ================================================================== -->
+
 <h2 id="object-types">Object Types (25) <a class="anchor-link" href="#object-types">#</a></h2>
 
 <p>

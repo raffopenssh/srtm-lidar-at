@@ -8,16 +8,168 @@ Watershed segmentation + Random Forest classifier over 6 remote sensing layers.
 Classifies landscape into 25 object types + 11 group types.
 Focused on distinguishing man-made vs natural and detecting terrain modification.
 
-## Data Sources
+## Data Sources (8)
 
-| # | Source | Resolution | Notes |
-|---|--------|-----------|-------|
-| 1 | BEV ALS DTM+DSM | 1m | 3 dates: 2022, 2023, 2024 |
-| 2 | BEV DOP RGBI Orthophoto | 0.2m | 47 operates + DOP fallback |
-| 3 | Sentinel-2 NDVI | 10m | Growing-season composite via openEO |
-| 4 | ESA WorldCover | 10m | Land cover classification |
-| 5 | Sentinel-1 SAR | 10m | VV+VH backscatter |
-| 6 | Austrian Cadastre | mm | Building footprint ground truth |
+| # | Source | Resolution | Access | Role |
+|---|--------|-----------|--------|------|
+| 1 | BEV ALS DTM+DSM | 1m | HTTP range /vsicurl/ | Height model, terrain, temporal change (3 dates: 2022/2023/2024) |
+| 2 | BEV DOP RGBI Orthophoto | 0.2m | HTTP range /vsicurl/ | NDVI, spectral bands, GLCM texture (47 operates + DOP fallback) |
+| 3 | Sentinel-2 NDVI | 10m | openEO (openeo.dataspace.copernicus.eu) | Growing-season NDVI composite + monthly time series → phenology |
+| 4 | ESA WorldCover v200 | 10m | AWS COG (esa-worldcover.s3.eu-central-1.amazonaws.com) | Land cover prior (built/tree/crop/grass/water fractions) |
+| 5 | Sentinel-1 SAR | 10m | openEO | VV+VH backscatter (cloud-proof ground classification) |
+| 6 | Hansen GFC-2024-v1.12 | 30m | HTTP range (storage.googleapis.com) | Forest cover 2000, annual loss/gain 2001–2024 |
+| 7 | Austrian Cadastre | mm | REST API (cadastre-process-api.exe.xyz) | Building footprints, parcel boundaries, land-use codes (ground truth) |
+| 8 | OpenStreetMap | varies | Overpass API | Roads, paths, waterways, landcover (supplementary ground truth) |
+
+BEV LiDAR URLs: data.bev.gv.at/download/ALS/{DTM,DSM}/{20220915,20230915,20240915}/
+BEV Ortho URLs: data.bev.gv.at/download/DOP/{20220128,20221027,20240625,20250415}/
+Hansen URL: storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/
+All raster data accessed via GDAL /vsicurl/ (HTTP range requests) — no bulk downloads.
+
+## Methods — Segmentation Pipeline
+
+Pipeline: fused gradient → Felzenszwalb over-segmentation → RAG merge → feature extraction → classification → grouping.
+
+### Step 1: Fused Multi-Layer Gradient
+Sobel edge detection on each data layer, weighted sum:
+- CHM (nDSM=DSM−DTM): 0.25 — canopy/building edges
+- DTM: 0.20 — terrain breaks (roads, embankments)
+- DSM: 0.10 — surface breaks
+- NDVI: 0.20 — vegetation boundaries
+- NIR: 0.15 — material transitions
+- Green/Red/Blue: 0.05/0.03/0.02 — fine spectral detail
+Each layer smoothed (Gaussian σ=0.8), Sobel-filtered, normalised to [0,1].
+
+### Step 2: Two-Layer Felzenszwalb + RAG
+Ground (nDSM<0.3m) and elevated (≥0.3m) segmented separately to prevent tree/ground merging.
+- Felzenszwalb: scale=150 (elevated) / 180 (ground), sigma=0.5, min_size=30px / 60px
+- RAG merge: threshold=0.12 — adjacent segments with similar gradient are merged
+
+### Step 3: Feature Extraction (57 features per segment)
+- Height & terrain (8): h_mean, h_max, h_std, h_p90, slope_mean, slope_std, dsm_roughness, dtm_roughness
+- Shape (5): compactness, elongation, solidity, extent, area
+- DSM edges (1): dsm_edge_strength
+- Spectral/BEV (11): ndvi_mean, ndvi_std, brightness_mean, nir_mean, red/green/blue_mean, green_ratio, rg_index, nir_brightness_ratio, nir_red_ratio
+- Copernicus (3): cop_ndvi_mean, fused_ndvi_mean, fused_ndvi_std
+- ESA WorldCover (5): esa_built_frac, esa_tree_frac, esa_crop_frac, esa_grass_frac, esa_water_frac
+- Temporal (8): h_change, dtm_change, dtm_change_abs, temporal_h_std, stability, volume_change_m3, volume_change_abs_m3, dtm_change_max, dtm_change_frac_03m
+- GLCM texture (6): glcm_contrast, glcm_homogeneity, glcm_entropy, glcm_dissimilarity, glcm_energy, texture_complexity
+- SAR (3): sar_vv, sar_vh, sar_ratio
+- NDVI harmonics (4): harm_mean, harm_amplitude, harm_phase, harm_rmse
+- Hansen (6): hansen_treecover2000, hansen_loss_frac, hansen_recent_loss_frac, hansen_loss_3yr_frac, hansen_gain_frac, hansen_current_forest_frac
+- Additional (5): ndvi_max, slope_max, h_p10, perimeter, esa_dominant_lc
+
+## Methods — Classification
+
+Two-tier: Random Forest (primary) with rule-based decision tree (fallback).
+
+### Random Forest Classifier
+- scikit-learn RandomForestClassifier: n_estimators=200, max_depth=20, min_samples_leaf=5, class_weight="balanced", oob_score=True
+- 16 learnable classes: tree, shrub, grass, crop, road, path, parking, roof, water, bare_soil, rock, earthwork, garden, orchard, vineyard, tree_loss
+- 3 excluded (rule-based only): wind_turbine, substation, solar_panel (need spatial context)
+- excavation + fill merged → earthwork for training; split back at inference by DTM change sign
+- If RF confidence < threshold → falls back to rule-based classifier
+
+### Rule-Based Fallback (decision tree, ordered by priority)
+0. Infrastructure spatial match: known solar/wind/substation locations from austria-power API → early exit
+1. Temporal disturbance: DTM change >0.8m → excavation/fill; nDSM drop >2m → tree_loss/construction; nDSM grow >2m → construction. NDVI>0.5 vetoes disturbance.
+2. Water: ESA water >50% + NDVI <0.1 + flat; or very low NIR + negative NDVI
+3. Elevated (nDSM>0.5m): building score from DSM roughness + height variance + compactness + NDVI + texture + SAR. High score → roof/greenhouse/solar_panel. Low score → tree/shrub/hedge.
+4. Ground (nDSM≤0.5m): NDVI harmonics primary (high amplitude→crop, low mean→road, moderate→grass). SAR fallback. Shape (elongated→road). ESA priors. Terrain (steep+rough→rock).
+
+NDVI selection hierarchy: fused NDVI (1m+seasonal) > BEV ortho NDVI (1m) > Copernicus 10m NDVI.
+Coarse 10m NDVI triggers extra caution (vegetation bleed into roads at boundaries).
+
+### Hierarchical Grouping
+Adjacent compatible segments merge into 11 group types:
+- forest (tree+shrub+hedge), woodland (shrub+hedge), hedgerow (hedge)
+- waterbody (water)
+- building (roof+wall+solar_panel+greenhouse+substation)
+- road_network (road+path+parking)
+- cropland (crop+grass), pasture (grass+garden), orchard_grove (orchard+vineyard)
+- quarry (excavation+fill), construction_site (construction+excavation+fill+tree_loss)
+
+## Methods — RF Training Pipeline
+
+### Ground Truth Sources
+1. Cadastre land-use codes (Benützungsart): 50-entry BA→type mapping (42→roof, 51→crop, 56→tree, 48→road, etc.)
+2. OSM: roads/paths buffered to width → road/path labels; landuse/natural polygons → forest/farmland/water/quarry labels
+3. Hansen tree_loss: synthetically labelled where hansen_recent_loss_frac≥0.15 + treecover2000≥20% + (height<5m or h_change<-2m)
+   - Label circularity fix: hansen_recent_loss_frac and hansen_treecover2000 features zeroed for tree_loss samples
+
+### Training Process
+Runs as systemd service (rf_train.service). Iterates ~300 random KGs (seed 42, >5 buildings each) + infrastructure KGs:
+1. For each KG: fetch cadastre + OSM ground truth, read all raster data, segment, extract 57 features, match to labels
+2. Each KG checkpointed to rf_training_data/checkpoints/kg_XXXXX.npz (skipped on restart)
+3. Every 10 KGs: retrain RF on all accumulated samples, save to /tmp/learned_classifier/
+4. Dominant classes downsampled to 5× median class count to reduce imbalance
+
+### Model Selection
+- evaluate_checkpoints.py trains RF at every 5-KG increment, multiple seeds
+- Composite score: 0.4×OOB + 0.35×mean_per_class_accuracy + 0.25×worst_class_accuracy
+- Best checkpoint+seed saved to data/best_model/ — API prefers this over live model
+- Training Monitor dashboard: /training.html (live OOB curve, per-class accuracy, convergence)
+
+### Deployed Model (data/best_model/)
+Selected at peak composite score from learning curve:
+- Training: 55 KGs, seed 2, 87,496 samples, 16 classes
+- Hyperparams: n_estimators=200, max_depth=20, min_samples_leaf=5, class_weight="balanced"
+- OOB accuracy: 69.9%, composite: 59.0%, mean per-class: 65.0%, worst class: 33.0% (earthwork)
+
+Per-class OOB accuracy:
+  Vegetation: tree 86%, crop 83%, garden 80%, shrub 63%, grass 59%, vineyard 54%, orchard 44%
+  Water: water 52%
+  Buildings: parking 77%, roof 68%
+  Transport: road 72%, path 35%
+  Terrain: bare_soil 78%, rock 56%, earthwork 33%
+  Change: tree_loss 100%
+
+Top 10 feature importances:
+  hansen_loss_frac 3.5%, hansen_treecover2000 3.5%, dtm_roughness 3.2%,
+  fused_ndvi_mean 3.2%, slope_mean 3.2%, h_mean 2.7%, dtm_change_abs 2.6%,
+  temporal_h_std 2.3%, h_p90 2.3%, h_p10 2.2%
+
+Learning curve: composite peaks at 55 KGs then declines (additional data introduces label noise
+from cadastre/OSM misalignment faster than new signal). OOB and composite both trend down after 60 KGs.
+
+## Austria-Wide Processing (Austria Processor)
+
+Background processor (austria_processor.py, ~5100 lines) applies the full pipeline to all ~8,440 Austrian Katastralgemeinden (KGs), uploading results to Zenodo as open-access datasets.
+
+### Architecture
+- Runs as systemd service (austria_processor.service, MemoryMax=4G)
+- Each KG processed in isolated subprocess (multiprocessing.Pool(1)) — full memory reclaim between KGs
+- Large KGs tiled into 1.5km overlapping strips (100m overlap), centroid-ownership deduplication
+- Tile checkpoints: completed tiles pickled to disk; on crash only interrupted tile re-processed
+- Grid-snapped caches: Copernicus (0.1°) and Hansen (0.5°) tiles shared by adjacent KGs
+- Zenodo cache: Copernicus/Hansen tiles persisted as ZIP archives, restored via HTTP range reads on local miss
+
+### Per-KG Outputs (uploaded to Zenodo)
+- {kg}_full.gpkg (~400MB): all raster layers (DTM/DSM/nDSM/ortho/segment_type) + vector segment polygons
+- {kg}_light.gpkg (~100MB): segment raster+vector, parcels with DTM heights, buildings with object heights, new buildings, infrastructure
+- {kg}.json (~1MB): area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
+
+### Zenodo Integration
+Each KG gets its own Zenodo deposit with DOI. Search index stores download URLs:
+- zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
+- /api/v1/query and /api/v1/kg/<code> include these URLs when available
+
+### Fault Tolerance
+- Tile checkpoints survive crashes/restarts
+- Automatic retry on timeout (90min), deferred retry 5 KGs later for transient failures
+- OOM: systemd kills + auto-restarts, checkpoints preserved
+- Disk management: LRU eviction, auto-pause below 3GB free
+- Copernicus circuit breaker: skip openEO on 503s for cooldown period
+- failed_kgs.json: permanently failed KGs skipped on restart
+
+### Processor Dashboard & API
+- Dashboard: /process.html (live progress, map, tile status, log, Zenodo manifest)
+- GET /api/v1/processing/status — current state, KG, step, tile progress, rates
+- POST /api/v1/processing/start — start (optional: state=, kg=)
+- POST /api/v1/processing/pause|resume|stop — control
+- POST /api/v1/processing/single?kg=X — process single KG
+- GET /api/v1/processing/log — recent log lines
+- GET /api/v1/processing/manifest — Zenodo manifest entries
 
 ## Geometry Input (all POST endpoints)
 

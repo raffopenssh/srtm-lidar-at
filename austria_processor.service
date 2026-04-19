@@ -9,7 +9,9 @@ WorkingDirectory=/home/exedev/srtm-lidar
 ExecStart=/usr/bin/python3 austria_processor.py --mark-uncertain
 Restart=on-failure
 RestartSec=60
-MemoryMax=4G
+MemoryMax=7G
+MemoryHigh=6G
+OOMScoreAdjust=100
 OOMPolicy=stop
 
 Environment=PYTHONUNBUFFERED=1

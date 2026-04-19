@@ -3905,8 +3905,70 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "by_type": {t: {"count": len(items), "total_area_sqm": round(sum(i.get("area_sqm",0) for i in items),1),
                         "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
                    for t, items in ibt.items()}}
-    # --- Pre-load DTM data once per tile for parcel/building enrichment ---
+    # --- Helpers for per-parcel/building segment stats ---
     obj_map = {o.obj_id: o for o in objects} if objects else {}
+
+    def _classification_stats_from_objs(seg_objs):
+        """Compute classification dict from a list of segment objects."""
+        if not seg_objs:
+            return None
+        n_total = len(seg_objs)
+        rf_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rf']
+        all_conf = [o.confidence for o in seg_objs]
+        rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in rf_objs]
+        diverged = [o for o in seg_objs if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
+        div_pairs = Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else Counter()
+        top_div = [{'rf_type': rf, 'final_type': fin, 'count': cnt}
+                   for (rf, fin), cnt in div_pairs.most_common(5)]
+        cls = {
+            'rf_classified': len(rf_objs),
+            'total_segments': n_total,
+            'mean_confidence': round(sum(all_conf) / n_total, 3),
+            'rf_mean_confidence': round(sum(rf_conf) / len(rf_conf), 3) if rf_conf else None,
+            'diverged_count': len(diverged),
+            'diverged_pct': round(100 * len(diverged) / n_total, 1),
+        }
+        if top_div:
+            cls['divergences'] = top_div
+        return cls
+
+    def _parcel_segment_stats(geom_3035, labels, ndsm, transform, shape):
+        """Compute area_summary, height_dist, vegetation, nDSM, classification for a parcel."""
+        from rasterio.features import rasterize as rio_rasterize
+        pm = rio_rasterize([(geom_3035, 1)], out_shape=shape,
+                           transform=transform, fill=0, dtype=np.uint8,
+                           all_touched=True).astype(bool)
+        pl = labels[pm]; pn = ndsm[pm]
+        tc_ = Counter(); th_ = defaultdict(list); seg_objs = []
+        for lbl in np.unique(pl):
+            obj = obj_map.get(int(lbl))
+            if obj:
+                npx = int((pl == lbl).sum())
+                tc_[obj.obj_type] += npx
+                th_[obj.obj_type].append(obj.height_max)
+                seg_objs.append(obj)
+        result = {}
+        if tc_:
+            tpx = max(int(pm.sum()), 1)
+            result['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx, 4)}
+                                      for t, px in tc_.most_common()}
+            result['height_distribution'] = {t: {'min': round(min(hs_), 2), 'max': round(max(hs_), 2),
+                                                  'mean': round(sum(hs_) / len(hs_), 2)}
+                                              for t, hs_ in th_.items() if hs_}
+        veg = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard', 'vineyard', 'garden'}
+        vpx = sum(v for k, v in tc_.items() if k in veg); tpx = max(int(pm.sum()), 1)
+        result['vegetated_fraction'] = round(vpx / tpx, 4)
+        result['is_vegetated'] = vpx / tpx > 0.5
+        vh = pn[np.isfinite(pn)]
+        if len(vh) > 0:
+            result['ndsm_max_m'] = round(float(np.max(vh)), 2)
+            result['ndsm_mean_m'] = round(float(np.mean(vh)), 2)
+        cls = _classification_stats_from_objs(seg_objs)
+        if cls:
+            result['classification'] = cls
+        return result
+
+    # --- Pre-load DTM data once per tile for parcel/building enrichment ---
     _tile_data_cache = {}  # tile_idx → tdata dict
     for ti_idx, tr in enumerate(tile_seg_results):
         try:
@@ -3973,30 +4035,17 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
                         v = patch[np.isfinite(patch)]
                         if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
+                # Segment analysis (happy path)
+                if tr.get("labels") is not None and objects:
+                    pss = _parcel_segment_stats(geom_3035, tr["labels"], tdata["ndsm"],
+                                                tdata["transform"], tdata["shape"])
+                    pd.update(pss)
             else:
                 n_parcel_no_tile += 1
                 # Fallback: direct DTM point read
                 elev = _point_elevation_fallback(c3.x, c3.y)
                 if elev is not None:
                     pd["elevation_m"] = elev
-                if tr.get("labels") is not None and objects:
-                    from rasterio.features import rasterize as rio_rasterize
-                    pm = rio_rasterize([(geom_3035,1)], out_shape=tr["shape"],
-                                       transform=tr["transform"], fill=0, dtype=np.uint8,
-                                       all_touched=True).astype(bool)
-                    pl = tr["labels"][pm]; pn = tdata["ndsm"][pm]
-                    tc_ = Counter(); th_ = defaultdict(list)
-                    for lbl in np.unique(pl):
-                        obj = obj_map.get(int(lbl))
-                        if obj: npx = int((pl==lbl).sum()); tc_[obj.obj_type] += npx; th_[obj.obj_type].append(obj.height_max)
-                    if tc_:
-                        pd["area_summary"] = {t: {"area_sqm": px, "fraction": round(px/max(int(pm.sum()),1),4)} for t, px in tc_.most_common()}
-                        pd["height_distribution"] = {t: {"min": round(min(hs_),2), "max": round(max(hs_),2), "mean": round(sum(hs_)/len(hs_),2)} for t, hs_ in th_.items() if hs_}
-                    veg = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
-                    vpx = sum(v for k,v in tc_.items() if k in veg); tpx = max(int(pm.sum()),1)
-                    pd["vegetated_fraction"] = round(vpx/tpx, 4); pd["is_vegetated"] = vpx/tpx > 0.5
-                    vh = pn[np.isfinite(pn)]
-                    if len(vh) > 0: pd["ndsm_max_m"] = round(float(np.max(vh)),2); pd["ndsm_mean_m"] = round(float(np.mean(vh)),2)
         except Exception as e:
             log.debug("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
@@ -4070,11 +4119,16 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
                     bd["stories_est"] = max(1, round(mh/3.0))
                 if tr.get("labels") is not None and objects:
-                    bl = tr["labels"][bm]; tc_ = Counter()
+                    bl = tr["labels"][bm]; tc_ = Counter(); seg_objs = []
                     for lbl in np.unique(bl):
                         obj = obj_map.get(int(lbl))
-                        if obj: tc_[obj.obj_type] += int((bl==lbl).sum())
+                        if obj:
+                            tc_[obj.obj_type] += int((bl==lbl).sum())
+                            seg_objs.append(obj)
                     if tc_: bd["segment_types"] = {t:px for t,px in tc_.most_common()}
+                    cls = _classification_stats_from_objs(seg_objs)
+                    if cls:
+                        bd["classification"] = cls
             else:
                 n_bld_no_tile += 1
                 # Fallback: at least get elevation for the centroid

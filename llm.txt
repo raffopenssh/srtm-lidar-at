@@ -271,6 +271,16 @@ Response for single KG (kg= or query_kg):
   - Full GPKG (~400MB): all raster layers (DTM/DSM/nDSM/ortho) + segment vectors
   Links appear once the KG has been uploaded to Zenodo. Null otherwise.
 
+  Per-parcel details (parcels.details[]): parcel_id, area_sqm, centroid, elevation_m,
+    area_summary (type→{area_sqm,fraction}), height_distribution, vegetated_fraction,
+    is_vegetated, ndsm_max_m, ndsm_mean_m, classification.
+  Per-building details (building_footprints.details[]): building_id, footprint_area_sqm,
+    centroid, max_height_m, mean_height_m, dsm_std, roof_type_hint, stories_est,
+    segment_types, full_address, classification.
+  classification dict (per-parcel/building): rf_classified, total_segments,
+    mean_confidence, rf_mean_confidence, diverged_count, diverged_pct,
+    divergences (top 5 [{rf_type, final_type, count}]).
+
 Response for aggregate (state/district/gemeinde/country):
   {name, level, total_kgs, processed_kgs, total_area_km2, total_parcels,
    total_buildings, total_trees, tree_canopy_km2, total_new_buildings,

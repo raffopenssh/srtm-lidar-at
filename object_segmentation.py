@@ -2221,6 +2221,13 @@ def _compute_stats(objects: list[SegmentedObject]) -> dict:
             100 * sum(o.area_sqm for o in objects if o.is_manmade) / max(total_area, 1), 1),
         "mean_confidence": round(
             sum(o.confidence for o in objects) / max(len(objects), 1), 3),
+        "rf_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'rf'),
+        "rules_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'rules'),
+        "infra_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'infra'),
+        "rf_diverged": sum(1 for o in objects if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type),
+        "rf_mean_confidence": round(
+            sum(getattr(o, 'rf_confidence', 0.0) for o in objects if getattr(o, 'rf_type', '')) /
+            max(sum(1 for o in objects if getattr(o, 'rf_type', '')), 1), 3),
     }
 
 

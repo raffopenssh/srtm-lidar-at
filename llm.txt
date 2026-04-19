@@ -58,6 +58,7 @@ Async flow:
 
 Result: FeatureCollection. Per-feature properties:
   type, type_code, group_id, group_type, is_manmade, confidence,
+  classifier_source ("rf"|"rules"|"infra"), rf_type (original RF prediction), rf_confidence,
   height_max_m, height_mean_m, height_p90_m, area_sqm,
   compactness, elongation, solidity, extent, dsm_edge_strength,
   slope_mean, roughness, ndvi_mean, ndvi_fused, nir_mean,
@@ -214,6 +215,11 @@ Query modes (pick one):
   type=<object_type>      Rank KGs by object type (metric=area|fraction|count|height)
   hansen=true             Hansen forest loss query (year_from, year_to, min_loss)
   new_buildings=true      KGs with new uncadastred buildings (min_count=N)
+  divergence=true         KGs ranked by RF→final type divergence (min_divergence=N, rf_type=X, final_type=X)
+  divergence_pairs=true   Most common RF→final type mismatches across all KGs
+  low_confidence=true     KGs with lowest classification confidence (max_confidence=N)
+  confidence_rank=asc|desc  Rank KGs by classification confidence
+  type_confidence=<type>  Rank KGs by RF confidence for a specific object type
 
 Modifiers:
   aggregate=true          Return aggregate stats instead of KG list
@@ -246,8 +252,12 @@ Response for single KG (kg= or query_kg):
    zenodo_light_gpkg_url, zenodo_light_gpkg_size,
    zenodo_full_gpkg_url, zenodo_full_gpkg_size,
    zenodo_depo_id,
+   mean_confidence, rf_classified_pct, rf_mean_confidence,
+   rf_diverged_count, rf_diverged_pct,
    landcover: [{object_type, area_sqm, fraction, n_objects, height_{min,max,mean,p90}}, ...],
    hansen_loss: [{loss_year, loss_pixels}, ...],
+   classification: [{object_type, rf_mean_confidence, rf_min_confidence, rf_count, diverged_count}, ...],
+   divergence: [{rf_type, final_type, count}, ...],
    _links: {
      json: "https://srtm-lidar-at.exe.xyz:8000/api/v1/kg/<code>",
      zenodo_json: "https://zenodo.org/api/files/<bucket>/<code>.json",
@@ -539,4 +549,19 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&min_cou
 
 # List processed KGs
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?processed_only=true'
+
+# Classification divergence — KGs where RF and final types disagree most
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?divergence=true&limit=20'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?divergence=true&rf_type=grass&final_type=crop'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?divergence=true&min_divergence=10'
+
+# Most common divergence pairs across all KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?divergence_pairs=true'
+
+# Classification confidence — lowest confidence KGs
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?low_confidence=true&max_confidence=0.4'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?confidence_rank=asc&limit=20'
+
+# RF confidence for a specific type
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type_confidence=tree&limit=20'
 ```

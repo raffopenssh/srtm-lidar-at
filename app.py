@@ -1517,6 +1517,15 @@ def api_query():
       year_to=<YYYY>            End year for hansen/temporal filter
       new_buildings=true         Query KGs with new buildings
       min_count=<N>             Min count for new_buildings
+      divergence=true           Query KGs ranked by RF→final type divergence
+      min_divergence=<pct>      Min divergence % (0-100, with divergence=true)
+      rf_type=<type>            Filter divergences FROM this RF type
+      final_type=<type>         Filter divergences TO this final type
+      low_confidence=true       Query KGs with lowest confidence
+      max_confidence=<float>    Max confidence threshold (with low_confidence=true)
+      confidence_rank=asc|desc  Rank KGs by classification confidence
+      type_confidence=<type>    Rank KGs by RF confidence for specific type
+      divergence_pairs=true     Get most common RF→final divergence pairs
       processed_only=true       Only return processed KGs
       aggregate=true            Return aggregate stats instead of KG list
       limit=<N>                 Max results (default 100)
@@ -1585,6 +1594,36 @@ def api_query():
         if args.get('new_buildings', '').lower() in ('true', '1', 'yes'):
             mc = int(args.get('min_count', 1))
             return jsonify(idx.query_new_buildings(min_count=mc, limit=limit))
+
+        # Classification divergence
+        if args.get('divergence', '').lower() in ('true', '1', 'yes'):
+            min_div = float(args.get('min_divergence', 0))
+            rf_t = args.get('rf_type')
+            fin_t = args.get('final_type')
+            return jsonify(idx.query_divergence(
+                min_pct=min_div, rf_type=rf_t, final_type=fin_t,
+                limit=limit, offset=offset))
+
+        # Divergence pairs (most common RF→final mismatches across all KGs)
+        if args.get('divergence_pairs', '').lower() in ('true', '1', 'yes'):
+            return jsonify(idx.query_divergence_pairs(limit=limit))
+
+        # Low confidence KGs
+        if args.get('low_confidence', '').lower() in ('true', '1', 'yes'):
+            mc = float(args.get('max_confidence', 0.5))
+            return jsonify(idx.query_low_confidence(
+                max_confidence=mc, limit=limit, offset=offset))
+
+        # Confidence ranking
+        if args.get('confidence_rank'):
+            order = args['confidence_rank']
+            return jsonify(idx.query_confidence_ranking(
+                order=order, limit=limit, offset=offset))
+
+        # Per-type RF confidence ranking
+        if args.get('type_confidence'):
+            return jsonify(idx.query_type_confidence(
+                args['type_confidence'], limit=limit))
 
         # Spatial bbox
         if args.get('bbox'):
@@ -2526,6 +2565,9 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "roughness": obj.roughness,
             "is_manmade": obj.is_manmade,
             "confidence": obj.confidence,
+            "classifier_source": obj.classifier_source,
+            "rf_type": obj.rf_type,
+            "rf_confidence": obj.rf_confidence,
         }
         if include_ortho or include_copernicus:
             props["ndvi_mean"] = obj.ndvi_mean

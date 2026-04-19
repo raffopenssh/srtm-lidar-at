@@ -153,6 +153,12 @@ class SearchIndex:
                 -- coverage
                 n_tiles INTEGER,
                 building_height_coverage_pct REAL,
+                -- classification
+                mean_confidence REAL,
+                rf_classified_pct REAL,
+                rf_mean_confidence REAL,
+                rf_diverged_count INTEGER DEFAULT 0,
+                rf_diverged_pct REAL,
                 --
                 quality_score REAL,
                 quality_grade TEXT,
@@ -181,6 +187,24 @@ class SearchIndex:
                 loss_pixels INTEGER DEFAULT 0,
                 PRIMARY KEY (kg_code, loss_year)
             )''',
+            # === Per-type classification stats (RF vs final) ===
+            '''CREATE TABLE IF NOT EXISTS kg_classification (
+                kg_code TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                rf_mean_confidence REAL,
+                rf_min_confidence REAL,
+                rf_count INTEGER DEFAULT 0,
+                diverged_count INTEGER DEFAULT 0,
+                PRIMARY KEY (kg_code, object_type)
+            )''',
+            # === RF divergence pairs (rf_type→final_type) ===
+            '''CREATE TABLE IF NOT EXISTS kg_divergence (
+                kg_code TEXT NOT NULL,
+                rf_type TEXT NOT NULL,
+                final_type TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (kg_code, rf_type, final_type)
+            )''',
             # === Index metadata ===
             '''CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
@@ -207,6 +231,12 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_kg_new_bldg ON kg(new_building_count)',
             'CREATE INDEX IF NOT EXISTS idx_lc_type ON kg_landcover(object_type)',
             'CREATE INDEX IF NOT EXISTS idx_hansen_year ON kg_hansen(loss_year)',
+            'CREATE INDEX IF NOT EXISTS idx_cls_type ON kg_classification(object_type)',
+            'CREATE INDEX IF NOT EXISTS idx_div_rf ON kg_divergence(rf_type)',
+            'CREATE INDEX IF NOT EXISTS idx_div_final ON kg_divergence(final_type)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_diverged ON kg(rf_diverged_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_confidence ON kg(mean_confidence)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_rf_confidence ON kg(rf_mean_confidence)',
         ]
 
     def _migrate(self):
@@ -216,6 +246,26 @@ class SearchIndex:
                 c.execute(s)
             except Exception as e:
                 log.warning('migrate: %s: %s', s[:60], e)
+        # Add classification columns to existing kg table (idempotent)
+        for col, ctype, default in [
+            ('mean_confidence', 'REAL', None),
+            ('rf_classified_pct', 'REAL', None),
+            ('rf_mean_confidence', 'REAL', None),
+            ('rf_diverged_count', 'INTEGER', 0),
+            ('rf_diverged_pct', 'REAL', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
+        # Re-run indexes that may have failed before ALTER TABLE
+        for s in self._schema_stmts():
+            if 'CREATE INDEX' in s:
+                try:
+                    c.execute(s)
+                except Exception:
+                    pass
         c.commit()
 
     # ════════════════════════════════════════════════════════════════
@@ -240,7 +290,7 @@ class SearchIndex:
         with self._write_lock:
             c = self._conn()
             # Drop and recreate — ensures schema changes are picked up
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'index_meta'):
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'index_meta'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
             for t in ('kg_rtree', 'fts_kg'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
@@ -305,6 +355,7 @@ class SearchIndex:
                     None, None, None,  # temporal change
                     None,  # phenology
                     None, None,  # coverage
+                    None, None, None, 0, None,  # classification (mean_conf, rf_pct, rf_mean_conf, div_count, div_pct)
                     None, None,  # quality
                     _zenodo_url(zj), zj.get('size'),
                     _zenodo_url(zl), zl.get('size'),
@@ -318,7 +369,7 @@ class SearchIndex:
 
             c.executemany(
                 '''INSERT OR REPLACE INTO kg VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ''', kg_rows)
             c.executemany('INSERT INTO fts_kg VALUES (?,?,?,?,?)', fts_rows)
             c.executemany('INSERT INTO kg_rtree VALUES (?,?,?,?,?)', rtree_rows)
@@ -367,6 +418,7 @@ class SearchIndex:
         harm = data.get('ndvi_harmonics', {})
         phen = data.get('phenology', {})
         cov = data.get('coverage', {})
+        cls = data.get('classification', {})
 
         # --- Building aggregate stats ---
         bf_details = bf.get('details', [])
@@ -403,6 +455,8 @@ class SearchIndex:
             dtm_change_mean_m=?, n_changed_segments=?, total_disturbed_volume_m3=?,
             phenology_dominant=?,
             n_tiles=?, building_height_coverage_pct=?,
+            mean_confidence=?, rf_classified_pct=?, rf_mean_confidence=?,
+            rf_diverged_count=?, rf_diverged_pct=?,
             quality_score=?, quality_grade=?
             WHERE kg_code=?''',
             (
@@ -440,6 +494,10 @@ class SearchIndex:
                 phen_dominant,
                 # coverage
                 cov.get('n_tiles'), cov.get('building_height_coverage_pct'),
+                # classification
+                cls.get('mean_confidence'), cls.get('rf_classified_pct'),
+                cls.get('rf_mean_confidence'),
+                cls.get('diverged_count', 0), cls.get('diverged_pct'),
                 # quality
                 dq.get('quality_score'), dq.get('quality_grade'),
                 code,
@@ -475,6 +533,40 @@ class SearchIndex:
                     pass
             if h_rows:
                 c.executemany('INSERT INTO kg_hansen VALUES (?,?,?)', h_rows)
+
+        # Classification per-type confidence + divergence
+        if cls:
+            ptc = cls.get('per_type_confidence', {})
+            if ptc:
+                c.execute('DELETE FROM kg_classification WHERE kg_code=?', (code,))
+                cls_rows = []
+                for otype, info in ptc.items():
+                    cls_rows.append((
+                        code, otype,
+                        info.get('mean'), info.get('min'),
+                        info.get('count', 0), 0,  # diverged_count filled below
+                    ))
+                if cls_rows:
+                    c.executemany(
+                        'INSERT INTO kg_classification VALUES (?,?,?,?,?,?)', cls_rows)
+
+            top_div = cls.get('top_divergences', [])
+            if top_div:
+                c.execute('DELETE FROM kg_divergence WHERE kg_code=?', (code,))
+                div_rows = [(code, d['rf_type'], d['final_type'], d['count'])
+                            for d in top_div if d.get('rf_type') and d.get('final_type')]
+                if div_rows:
+                    c.executemany(
+                        'INSERT INTO kg_divergence VALUES (?,?,?,?)', div_rows)
+                # Update per-type diverged_count in kg_classification
+                from collections import Counter as _Counter
+                rf_div_counts = _Counter()
+                for d in top_div:
+                    if d.get('final_type'):
+                        rf_div_counts[d['final_type']] += d.get('count', 0)
+                for otype, cnt in rf_div_counts.items():
+                    c.execute('UPDATE kg_classification SET diverged_count=? WHERE kg_code=? AND object_type=?',
+                              (cnt, code, otype))
 
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing."""
@@ -518,6 +610,10 @@ class SearchIndex:
             ('districts_covered', 'SELECT COUNT(DISTINCT district_code) FROM kg WHERE district_code != ""'),
             ('landcover_types', 'SELECT COUNT(DISTINCT object_type) FROM kg_landcover'),
             ('avg_quality_score', 'SELECT ROUND(AVG(quality_score),2) FROM kg WHERE quality_score IS NOT NULL'),
+            ('avg_confidence', 'SELECT ROUND(AVG(mean_confidence),3) FROM kg WHERE mean_confidence IS NOT NULL'),
+            ('avg_rf_classified_pct', 'SELECT ROUND(AVG(rf_classified_pct),1) FROM kg WHERE rf_classified_pct IS NOT NULL'),
+            ('avg_rf_diverged_pct', 'SELECT ROUND(AVG(rf_diverged_pct),1) FROM kg WHERE rf_diverged_pct IS NOT NULL'),
+            ('total_divergence_pairs', 'SELECT COUNT(DISTINCT rf_type || final_type) FROM kg_divergence'),
         ]:
             r = c.execute(q).fetchone()
             s[name] = round(r[0], 2) if r[0] is not None else 0
@@ -543,6 +639,12 @@ class SearchIndex:
         # Hansen
         d['hansen_loss'] = [dict(r) for r in
             c.execute('SELECT loss_year, loss_pixels FROM kg_hansen WHERE kg_code=? ORDER BY loss_year', (kg_code,))]
+        # Classification per-type confidence
+        d['classification'] = [dict(r) for r in
+            c.execute('SELECT * FROM kg_classification WHERE kg_code=? ORDER BY rf_count DESC', (kg_code,))]
+        # Divergence pairs
+        d['divergence'] = [dict(r) for r in
+            c.execute('SELECT rf_type, final_type, count FROM kg_divergence WHERE kg_code=? ORDER BY count DESC', (kg_code,))]
         # Links
         d['_links'] = self._build_links(d)
         return d
@@ -742,6 +844,10 @@ class SearchIndex:
                    ROUND(AVG(CASE WHEN processed=1 THEN slope_mean_deg END), 2) as avg_slope_deg,
                    ROUND(AVG(CASE WHEN processed=1 THEN ndvi_mean END), 3) as avg_ndvi,
                    ROUND(AVG(CASE WHEN processed=1 THEN quality_score END), 2) as avg_quality_score,
+                   ROUND(AVG(CASE WHEN processed=1 THEN mean_confidence END), 3) as avg_confidence,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_classified_pct END), 1) as avg_rf_classified_pct,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_mean_confidence END), 3) as avg_rf_confidence,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_diverged_pct END), 1) as avg_rf_diverged_pct,
                    ROUND(SUM(CASE WHEN processed=1 THEN net_volume_change_m3 ELSE 0 END), 0) as total_net_volume_change_m3,
                    MIN(min_lon) as min_lon, MIN(min_lat) as min_lat,
                    MAX(max_lon) as max_lon, MAX(max_lat) as max_lat
@@ -863,6 +969,110 @@ class SearchIndex:
             ORDER BY kg_name LIMIT ? OFFSET ?
         ''', (limit, offset)).fetchall()
         return [self._kg_summary(r) for r in rows]
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: classification divergence & confidence
+    # ════════════════════════════════════════════════════════════════
+
+    def query_divergence(self, min_pct=0, rf_type=None, final_type=None,
+                         limit=50, offset=0):
+        """Find KGs where RF classification diverges most from final type.
+
+        Args:
+            min_pct: minimum divergence percentage (0-100)
+            rf_type: filter to divergences FROM this RF type
+            final_type: filter to divergences TO this final type
+            limit: max results
+        """
+        c = self._conn()
+        if rf_type or final_type:
+            # Query via kg_divergence table for specific type pairs
+            where_parts = []
+            params = []
+            if rf_type:
+                where_parts.append('d.rf_type=?')
+                params.append(rf_type)
+            if final_type:
+                where_parts.append('d.final_type=?')
+                params.append(final_type)
+            where = ' AND '.join(where_parts)
+            rows = c.execute(f'''
+                SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
+                       k.state_name, k.rf_diverged_pct, k.rf_diverged_count,
+                       k.mean_confidence, k.rf_mean_confidence,
+                       d.rf_type, d.final_type, d.count as pair_count
+                FROM kg_divergence d
+                JOIN kg k ON k.kg_code = d.kg_code
+                WHERE {where}
+                ORDER BY d.count DESC
+                LIMIT ? OFFSET ?
+            ''', params + [limit, offset]).fetchall()
+            return [dict(r) for r in rows]
+        else:
+            # Query via kg table for overall divergence ranking
+            rows = c.execute('''
+                SELECT * FROM kg
+                WHERE processed=1 AND rf_diverged_pct >= ?
+                ORDER BY rf_diverged_pct DESC
+                LIMIT ? OFFSET ?
+            ''', (min_pct, limit, offset)).fetchall()
+            return [self._kg_summary(r) for r in rows]
+
+    def query_low_confidence(self, max_confidence=0.5, limit=50, offset=0):
+        """Find KGs with lowest mean classification confidence."""
+        c = self._conn()
+        rows = c.execute('''
+            SELECT * FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+                  AND mean_confidence <= ?
+            ORDER BY mean_confidence ASC
+            LIMIT ? OFFSET ?
+        ''', (max_confidence, limit, offset)).fetchall()
+        return [self._kg_summary(r) for r in rows]
+
+    def query_confidence_ranking(self, order='asc', limit=50, offset=0):
+        """Rank KGs by classification confidence.
+
+        Args:
+            order: 'asc' for lowest first, 'desc' for highest first
+        """
+        c = self._conn()
+        direction = 'ASC' if order == 'asc' else 'DESC'
+        rows = c.execute(f'''
+            SELECT * FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+            ORDER BY mean_confidence {direction}
+            LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
+        return [self._kg_summary(r) for r in rows]
+
+    def query_type_confidence(self, object_type, limit=50):
+        """Rank KGs by RF confidence for a specific object type."""
+        c = self._conn()
+        rows = c.execute('''
+            SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
+                   k.state_name, cl.rf_mean_confidence, cl.rf_min_confidence,
+                   cl.rf_count, cl.diverged_count
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+            ORDER BY cl.rf_mean_confidence ASC
+            LIMIT ?
+        ''', (object_type, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_divergence_pairs(self, limit=50):
+        """Get the most common RF→final type divergence pairs across all KGs."""
+        c = self._conn()
+        rows = c.execute('''
+            SELECT rf_type, final_type, SUM(count) as total_count,
+                   COUNT(DISTINCT kg_code) as n_kgs
+            FROM kg_divergence
+            GROUP BY rf_type, final_type
+            ORDER BY total_count DESC
+            LIMIT ?
+        ''', (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     # ════════════════════════════════════════════════════════════════
     # Lazy-load detail from light GPKG (Zenodo or local)

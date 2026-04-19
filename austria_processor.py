@@ -3718,6 +3718,52 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             "p90": round(float(np.percentile(hs,90)),2), "count": len(hs)}
         for t, hs in type_heights.items() if hs
     }
+    # --- Classification summary ---
+    if objects:
+        n_total = len(objects)
+        rf_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'rf']
+        rules_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'rules']
+        infra_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'infra']
+        # Divergence: RF predicted one type but final type differs (after calibration/override)
+        diverged = [o for o in objects if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
+        # Confidence distribution
+        all_conf = [o.confidence for o in objects]
+        rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in objects if getattr(o, 'rf_type', '')]
+        # Per-type divergence breakdown
+        from collections import Counter as _Counter
+        div_pairs = _Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else _Counter()
+        top_divergences = [
+            {"rf_type": rf, "final_type": fin, "count": cnt}
+            for (rf, fin), cnt in div_pairs.most_common(20)
+        ]
+        # Per-type RF confidence
+        type_rf_conf = defaultdict(list)
+        for o in objects:
+            if getattr(o, 'rf_confidence', 0) > 0:
+                type_rf_conf[o.obj_type].append(o.rf_confidence)
+        per_type_confidence = {
+            t: {"mean": round(sum(cs)/len(cs), 3),
+                "min": round(min(cs), 3),
+                "p10": round(float(np.percentile(cs, 10)), 3),
+                "count": len(cs)}
+            for t, cs in type_rf_conf.items()
+        }
+        summary["classification"] = {
+            "total_segments": n_total,
+            "rf_classified": len(rf_objs),
+            "rf_classified_pct": round(100 * len(rf_objs) / max(n_total, 1), 1),
+            "rules_classified": len(rules_objs),
+            "infra_classified": len(infra_objs),
+            "mean_confidence": round(sum(all_conf) / max(n_total, 1), 3),
+            "rf_mean_confidence": round(sum(rf_conf) / max(len(rf_conf), 1), 3) if rf_conf else None,
+            "confidence_p10": round(float(np.percentile(all_conf, 10)), 3) if all_conf else None,
+            "confidence_p25": round(float(np.percentile(all_conf, 25)), 3) if all_conf else None,
+            "confidence_p50": round(float(np.percentile(all_conf, 50)), 3) if all_conf else None,
+            "diverged_count": len(diverged),
+            "diverged_pct": round(100 * len(diverged) / max(n_total, 1), 1),
+            "top_divergences": top_divergences,
+            "per_type_confidence": per_type_confidence,
+        }
     # --- Landscape ---
     landscape = {}
     if terrain_stats: landscape["terrain"] = terrain_stats
@@ -3747,6 +3793,9 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 "type": o.obj_type, "height_max_m": round(o.height_max,2),
                 "height_mean_m": round(o.height_mean,2), "area_sqm": round(o.area_sqm,1),
                 "coordinate": c, "confidence": round(o.confidence,3),
+                "classifier_source": getattr(o, 'classifier_source', 'rules'),
+                "rf_type": getattr(o, 'rf_type', ''),
+                "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
                 "is_manmade": o.is_manmade, "observation_year": obs_year})
         trees = [o for o in objects if o.obj_type == 'tree']
         summary["top_10_trees"] = []

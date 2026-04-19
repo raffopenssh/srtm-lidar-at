@@ -1245,14 +1245,20 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/progr
 <h3 id="query-compound">Compound Filter <a class="anchor-link" href="#query-compound">#</a></h3>
 <div class="endpoint">
   <div class="ep-header">
-    <span class="method method-post">POST</span>
+    <span class="method method-get">GET</span><span class="method method-post" style="margin-left:4px">POST</span>
     <code class="ep-path">/api/v1/query/compound</code>
     <span class="ep-summary">Filter KGs by any combination of attributes</span>
   </div>
   <p class="ep-desc">
-    POST a JSON body with filter keys. All filters are pure SQL on indexed columns — very fast.
+    GET with query params or POST a JSON body. All filters are pure SQL on indexed columns — very fast.
     Returns paginated <code>{total, offset, limit, results}</code>.
-    Supports <code>"async": true</code> in body; poll with <code>{"task_id": "..."}</code>.
+    Supports <code>async=true</code>; poll with <code>task_id=&lt;id&gt;</code>.
+  </p>
+  <p class="ep-desc" style="font-size:12px;color:#666">
+    <strong>GET syntax:</strong> flat params (<code>state=Vorarlberg&amp;min_slope=15</code>),
+    <code>aspect=S,SW,W</code> (comma-separated),
+    <code>type_filter=tree:0.8:800</code> (repeatable, type:confidence:area),
+    <code>landcover_filter=grass:1300:0.1</code> (repeatable, type:area:fraction).
   </p>
   <div class="table-wrap">
   <table>
@@ -1273,18 +1279,11 @@ curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/progr
   </div>
   <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
   <pre><code><span class="tok-comment"># Trees + grass with high RF confidence, no buildings, rugged terrain</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
-  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
-  <span class="tok-flag">-d</span> '{"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},
-    {"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],
-    "max_buildings":0,"aspect":["S","SW","W"],"min_roughness":2.0}'
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;type_filter=grass:0.8:1300&amp;max_buildings=0&amp;aspect=S,SW,W&amp;min_roughness=2.0" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;type_filter=grass:0.8:1300&amp;max_buildings=0&amp;aspect=S,SW,W&amp;min_roughness=2.0"</a>
 <span class="tok-comment"># → {"total": 47, "offset": 0, "limit": 50, "results": [...]}</span>
 
 <span class="tok-comment"># High-elevation steep terrain with lots of trees, page 3</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
-  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
-  <span class="tok-flag">-d</span> '{"min_elevation":1500,"min_slope":15,"min_tree_count":100,
-    "sort":"tree_canopy_sqm","sort_dir":"desc","limit":20,"offset":40}'</code></pre></div>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?min_elevation=1500&amp;min_slope=15&amp;min_tree_count=100&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;limit=20&amp;offset=40" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?min_elevation=1500&amp;min_slope=15&amp;min_tree_count=100&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;limit=20&amp;offset=40"</a></code></pre></div>
 </div>
 
 
@@ -1520,12 +1519,11 @@ curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_shannon_divers
 <span class="tok-comment"># Active landscape change + high quality classification</span>
 curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true"</a>
 
-<span class="tok-comment"># ── Per-parcel terrain filter (POST /api/v1/parcels/batch) ──</span>
+<span class="tok-comment"># ── Per-parcel terrain filter (GET /api/v1/parcels/batch) ──</span>
+<span class="tok-comment"># Compound filters as flat params, parcel filters with pf_ prefix</span>
 
 <span class="tok-comment"># All east-facing level parcels — returns parcel IDs with cadastre data</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch</span> \
-  <span class="tok-flag">-H</span> <span class="tok-string">'Content-Type: application/json'</span> \
-  <span class="tok-flag">-d</span> <span class="tok-string">'{"compound":{"state":"Vorarlberg"},"parcel_filters":{"aspect":["E"],"terrain_class":"level"},"limit":100}'</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?state=Vorarlberg&amp;pf_aspect=E&amp;pf_terrain_class=level&amp;limit=100" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?state=Vorarlberg&amp;pf_aspect=E&amp;pf_terrain_class=level&amp;limit=100"</a>
 <span class="tok-comment"># → 125 parcels with aspect_dominant=E and terrain_class=level</span></code></pre>
 </div>
 
@@ -1563,16 +1561,10 @@ curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infra
 curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&bbox=9.5,47.4,9.7,47.6&min_confidence=0.7&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&amp;bbox=9.5,47.4,9.7,47.6&amp;min_confidence=0.7&amp;async=true"</a>
 
 <span class="tok-comment"># ── compound filter (async): complex multi-attribute KG search ──</span>
-<span class="tok-comment"># POST body with "async": true — same poll mechanism via task_id</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
-  <span class="tok-flag">-H</span> <span class="tok-string">'Content-Type: application/json'</span> \
-  <span class="tok-flag">-d</span> <span class="tok-string">'{"type_filters": [{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}],
-    "min_elevation": 1000, "aspect": ["S", "SW"],
-    "min_ndvi": 0.5, "max_buildings": 10,
-    "sort": "tree_canopy_sqm", "sort_dir": "desc",
-    "async": true}'</span>
+<span class="tok-comment"># GET with async=true — same poll mechanism via task_id</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;min_elevation=1000&amp;aspect=S,SW&amp;min_ndvi=0.5&amp;max_buildings=10&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;min_elevation=1000&amp;aspect=S,SW&amp;min_ndvi=0.5&amp;max_buildings=10&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;async=true"</a>
 <span class="tok-comment"># → 202 {"task_id": "def-456", ...}</span>
-<span class="tok-comment"># Poll: POST same endpoint with {"task_id": "def-456"}</span></code></pre>
+<span class="tok-comment"># Poll: /api/v1/query/compound?task_id=def-456</span></code></pre>
 </div>
 
 <div style="background:#e8f4fd;border:1px solid #b3d9f2;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">

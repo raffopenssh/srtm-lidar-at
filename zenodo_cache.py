@@ -728,20 +728,55 @@ class ZenodoCache:
         for (product, strip_s, strip_n), files in sorted(groups.items()):
             zip_name = _zip_filename(product, strip_s, strip_n)
 
-            # Skip upload if Zenodo already has >= as many tiles for this
-            # strip.  This prevents overwriting a full ZIP with a smaller
-            # one after local cache eviction.
+            # Build set of entry names we have locally
+            local_entries = {}
+            for local_path, w, s, e, n, extra in files:
+                entry_name = _npz_entry_name(product, w, s, e, n, **extra)
+                local_entries[entry_name] = local_path
+
+            # Check what Zenodo already has for this strip
             existing = self.manifest.get_file(zip_name)
-            if existing and existing.get("tile_count", 0) >= len(files):
+            remote_idx = self._get_zip_index(zip_name) if existing else None
+            remote_entry_names = set(remote_idx.list_entries()) if remote_idx else set()
+
+            # If remote already contains every local entry, skip
+            if remote_entry_names and set(local_entries.keys()).issubset(remote_entry_names):
                 stats["zips_skipped"] = stats.get("zips_skipped", 0) + 1
                 continue
 
-            zip_path = _build_zip_for_strip(product, strip_s, strip_n, files)
-            if zip_path is None:
-                continue
+            # Merge: start with local files, then pull remote-only entries
+            # so we never lose tiles that were uploaded before eviction.
+            merged_count = len(local_entries)
+            remote_only = remote_entry_names - set(local_entries.keys())
+            remote_data: Dict[str, bytes] = {}  # entry_name → raw NPZ bytes
+            if remote_only and remote_idx:
+                for rname in remote_only:
+                    try:
+                        data = remote_idx.read_entry(rname)
+                        if data:
+                            remote_data[rname] = data
+                            merged_count += 1
+                    except Exception as exc:
+                        log.debug("Could not fetch remote entry %s: %s", rname, exc)
+
+            # Build merged ZIP
+            tmp_dir = Path(tempfile.mkdtemp())
+            zip_path = tmp_dir / zip_name
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Local files
+                for entry_name, local_path in local_entries.items():
+                    zf.write(local_path, entry_name)
+                # Remote-only entries
+                for entry_name, data in remote_data.items():
+                    zf.writestr(entry_name, data)
+
+            size_mb = zip_path.stat().st_size / 1024 / 1024
+            log.info("Built %s: %d tiles (%d local + %d remote), %.1f MB",
+                     zip_name, merged_count, len(local_entries),
+                     len(remote_data), size_mb)
 
             stats["zips_built"] += 1
-            stats["tiles_total"] += len(files)
+            stats["tiles_total"] += merged_count
             stats["bytes_total"] += zip_path.stat().st_size
 
             if not dry_run:
@@ -754,10 +789,14 @@ class ZenodoCache:
                         url=f"{self.base_url}/records/{depo_id}/files/{zip_name}",
                         size=zip_path.stat().st_size,
                         checksum=checksum,
-                        tile_count=len(files),
+                        tile_count=merged_count,
                         updated_at=datetime.now(timezone.utc).isoformat(),
                     )
                     self.manifest.save()
+                    # Invalidate cached ZipIndex — the file just changed
+                    self._zip_indices.pop(zip_name, None)
+                    idx_cache = _ZIP_INDEX_CACHE_DIR / f"{hashlib.md5(self.manifest.get_file(zip_name)['url'].encode()).hexdigest()[:12]}.json"
+                    idx_cache.unlink(missing_ok=True)
                     stats["zips_uploaded"] += 1
                 except Exception as e:
                     log.error("Failed to upload %s: %s", zip_name, e)
@@ -765,7 +804,7 @@ class ZenodoCache:
             # Clean up temp ZIP
             try:
                 zip_path.unlink()
-                zip_path.parent.rmdir()
+                tmp_dir.rmdir()
             except OSError:
                 pass
 

@@ -1526,6 +1526,11 @@ def api_query():
       confidence_rank=asc|desc  Rank KGs by classification confidence
       type_confidence=<type>    Rank KGs by RF confidence for specific type
       divergence_pairs=true     Get most common RF→final divergence pairs
+      high_confidence_type=<type>  KGs where type has high RF confidence
+      parcels_by_type=<type>    Per-parcel filter by type RF confidence+area
+      top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG top features
+      min_confidence=<float>    Min RF confidence (with high_confidence_type/parcels_by_type/top_features)
+      min_area_sqm=<float>      Min area m² (with high_confidence_type/parcels_by_type)
       processed_only=true       Only return processed KGs
       aggregate=true            Return aggregate stats instead of KG list
       limit=<N>                 Max results (default 100)
@@ -1624,6 +1629,35 @@ def api_query():
         if args.get('type_confidence'):
             return jsonify(idx.query_type_confidence(
                 args['type_confidence'], limit=limit))
+
+        # High-confidence type filter (KG-level)
+        # e.g. ?high_confidence_type=tree&min_confidence=0.8&min_area_sqm=1500
+        if args.get('high_confidence_type'):
+            mc = float(args.get('min_confidence', 0.7))
+            ma = float(args.get('min_area_sqm', 0))
+            return jsonify(idx.query_high_confidence_type(
+                args['high_confidence_type'], min_confidence=mc,
+                min_area_sqm=ma, limit=limit, offset=offset))
+
+        # Per-parcel type+confidence filter (scans KG JSONs)
+        # e.g. ?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500
+        if args.get('parcels_by_type'):
+            mc = float(args.get('min_confidence', 0.7))
+            ma = float(args.get('min_area_sqm', 0))
+            return jsonify(idx.query_parcels_by_type_confidence(
+                args['parcels_by_type'], min_confidence=mc,
+                min_area_sqm=ma, limit=limit, offset=offset))
+
+        # Cross-KG top features (trees/objects/new_buildings/infrastructure)
+        # e.g. ?top_features=trees&min_confidence=0.9
+        # e.g. ?top_features=new_buildings&min_confidence=0.75
+        # e.g. ?top_features=infrastructure&type=mast&min_confidence=0.8
+        if args.get('top_features'):
+            mc = float(args.get('min_confidence', 0))
+            otype = args.get('type')
+            return jsonify(idx.query_top_features(
+                args['top_features'], object_type=otype,
+                min_confidence=mc, limit=limit, offset=offset))
 
         # Spatial bbox
         if args.get('bbox'):

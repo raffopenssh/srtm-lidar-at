@@ -220,6 +220,11 @@ Query modes (pick one):
   low_confidence=true     KGs with lowest classification confidence (max_confidence=N)
   confidence_rank=asc|desc  Rank KGs by classification confidence
   type_confidence=<type>  Rank KGs by RF confidence for a specific object type
+  high_confidence_type=<type>  KGs where type has RF confidence >= min_confidence AND area >= min_area_sqm
+  parcels_by_type=<type>  Per-parcel filter: parcels where type has RF confidence >= min_confidence AND area >= min_area_sqm (scans KG JSONs)
+  top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG features filtered by min_confidence, optionally type=<object_type>
+  min_confidence=<float>  Min RF confidence threshold (used with high_confidence_type, parcels_by_type, top_features)
+  min_area_sqm=<float>    Min area m² for type (used with high_confidence_type, parcels_by_type)
 
 Modifiers:
   aggregate=true          Return aggregate stats instead of KG list
@@ -277,9 +282,11 @@ Response for single KG (kg= or query_kg):
   Per-building details (building_footprints.details[]): building_id, footprint_area_sqm,
     centroid, max_height_m, mean_height_m, dsm_std, roof_type_hint, stories_est,
     segment_types, full_address, classification.
-  classification dict (per-parcel/building): rf_classified, total_segments,
-    mean_confidence, rf_mean_confidence, diverged_count, diverged_pct,
-    divergences (top 5 [{rf_type, final_type, count}]).
+  classification dict (per-parcel/building): rf_classified, rules_classified,
+    total_segments, mean_confidence, rf_mean_confidence, diverged_count,
+    diverged_pct, divergences (top 5 [{rf_type, final_type, count}]),
+    by_type: {<type>: {segments, area_sqm, mean_confidence, rf_count,
+    rules_count, rf_mean_confidence, diverged_count}}.
 
 Response for aggregate (state/district/gemeinde/country):
   {name, level, total_kgs, processed_kgs, total_area_km2, total_parcels,
@@ -574,4 +581,19 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?confidence_rank=asc&limit=
 
 # RF confidence for a specific type
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type_confidence=tree&limit=20'
+
+# KGs where tree RF confidence > 0.8 and tree area > 1500 m²
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?high_confidence_type=tree&min_confidence=0.8&min_area_sqm=1500'
+
+# Individual parcels where tree RF confidence > 0.8 and tree area > 1500 m²
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500'
+
+# Tallest trees across all KGs with RF confidence > 0.9
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9'
+
+# New building footprints with RF roof confidence > 0.75
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75'
+
+# Infrastructure (e.g. masts) with RF confidence > 0.8
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8'
 ```

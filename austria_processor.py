@@ -935,6 +935,9 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
                 "centroid_lat": round(c_wgs.y, 7),
                 "geometry_wgs": mapping(poly_wgs),
                 "confidence": round(obj.confidence, 2),
+                "classifier_source": getattr(obj, 'classifier_source', 'rules'),
+                "rf_type": getattr(obj, 'rf_type', ''),
+                "rf_confidence": round(getattr(obj, 'rf_confidence', 0.0), 3),
                 "edge_clipped": at_edge,
             })
         except Exception:
@@ -1024,6 +1027,9 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
                 "centroid_lat": round(c_wgs.y, 7),
                 "geometry_wgs": mapping(poly_wgs),
                 "confidence": round(obj.confidence, 2),
+                "classifier_source": getattr(obj, 'classifier_source', 'rules'),
+                "rf_type": getattr(obj, 'rf_type', ''),
+                "rf_confidence": round(getattr(obj, 'rf_confidence', 0.0), 3),
                 "edge_clipped": at_edge,
             }
 
@@ -3736,18 +3742,26 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             {"rf_type": rf, "final_type": fin, "count": cnt}
             for (rf, fin), cnt in div_pairs.most_common(20)
         ]
-        # Per-type RF confidence
+        # Per-type RF confidence + area + divergence
         type_rf_conf = defaultdict(list)
+        type_div_count = Counter()
         for o in objects:
             if getattr(o, 'rf_confidence', 0) > 0:
                 type_rf_conf[o.obj_type].append(o.rf_confidence)
-        per_type_confidence = {
-            t: {"mean": round(sum(cs)/len(cs), 3),
+            if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type:
+                type_div_count[o.obj_type] += 1
+        per_type_confidence = {}
+        for t, cs in type_rf_conf.items():
+            entry = {
+                "mean": round(sum(cs)/len(cs), 3),
                 "min": round(min(cs), 3),
                 "p10": round(float(np.percentile(cs, 10)), 3),
-                "count": len(cs)}
-            for t, cs in type_rf_conf.items()
-        }
+                "count": len(cs),
+                "area_sqm": type_counts.get(t, 0),
+            }
+            if type_div_count.get(t):
+                entry["diverged_count"] = type_div_count[t]
+            per_type_confidence[t] = entry
         summary["classification"] = {
             "total_segments": n_total,
             "rf_classified": len(rf_objs),
@@ -3810,7 +3824,11 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 "height_p90_m": round(t.height_p90,2), "coordinate": c,
                 "area_sqm": round(t.area_sqm,1), "ndvi_mean": round(t.ndvi_mean,4),
                 "ndvi_fused": round(t.ndvi_fused,4), "height_change_m": round(t.height_change,3),
-                "phenology_class": t.phenology_class or '', "observation_year": obs_year})
+                "phenology_class": t.phenology_class or '', "observation_year": obs_year,
+                "confidence": round(t.confidence, 3),
+                "classifier_source": getattr(t, 'classifier_source', 'rules'),
+                "rf_type": getattr(t, 'rf_type', ''),
+                "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3)})
         if trees:
             summary["tree_stats"] = {
                 "count": len(trees),
@@ -3908,25 +3926,68 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     # --- Helpers for per-parcel/building segment stats ---
     obj_map = {o.obj_id: o for o in objects} if objects else {}
 
-    def _classification_stats_from_objs(seg_objs):
-        """Compute classification dict from a list of segment objects."""
+    def _classification_stats_from_objs(seg_objs, type_area_sqm=None):
+        """Compute classification dict from a list of segment objects.
+
+        type_area_sqm: optional dict {obj_type: pixel_count_sqm} for area.
+                       If None, uses obj.area_sqm summed per type.
+        """
         if not seg_objs:
             return None
         n_total = len(seg_objs)
         rf_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rf']
+        rules_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rules']
         all_conf = [o.confidence for o in seg_objs]
         rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in rf_objs]
         diverged = [o for o in seg_objs if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
         div_pairs = Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else Counter()
         top_div = [{'rf_type': rf, 'final_type': fin, 'count': cnt}
                    for (rf, fin), cnt in div_pairs.most_common(5)]
+        # Per-type breakdown
+        _by_type_rf = defaultdict(list)   # obj_type → [rf_confidence, ...]
+        _by_type_all = defaultdict(list)  # obj_type → [confidence, ...]
+        _by_type_src = defaultdict(lambda: {'rf': 0, 'rules': 0})
+        _by_type_div = Counter()          # obj_type → diverged count
+        for o in seg_objs:
+            t = o.obj_type
+            _by_type_all[t].append(o.confidence)
+            src = getattr(o, 'classifier_source', 'rules')
+            if src in ('rf', 'rules'):
+                _by_type_src[t][src] += 1
+            if getattr(o, 'rf_confidence', 0) > 0:
+                _by_type_rf[t].append(o.rf_confidence)
+            if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type:
+                _by_type_div[t] += 1
+        # Compute area per type
+        if type_area_sqm is None:
+            _area = defaultdict(float)
+            for o in seg_objs:
+                _area[o.obj_type] += o.area_sqm
+        else:
+            _area = type_area_sqm
+        by_type = {}
+        for t in _by_type_all:
+            entry = {
+                'segments': len(_by_type_all[t]),
+                'area_sqm': round(float(_area.get(t, 0)), 1),
+                'mean_confidence': round(sum(_by_type_all[t]) / len(_by_type_all[t]), 3),
+                'rf_count': _by_type_src[t]['rf'],
+                'rules_count': _by_type_src[t]['rules'],
+            }
+            if _by_type_rf.get(t):
+                entry['rf_mean_confidence'] = round(sum(_by_type_rf[t]) / len(_by_type_rf[t]), 3)
+            if _by_type_div.get(t):
+                entry['diverged_count'] = _by_type_div[t]
+            by_type[t] = entry
         cls = {
             'rf_classified': len(rf_objs),
+            'rules_classified': len(rules_objs),
             'total_segments': n_total,
             'mean_confidence': round(sum(all_conf) / n_total, 3),
             'rf_mean_confidence': round(sum(rf_conf) / len(rf_conf), 3) if rf_conf else None,
             'diverged_count': len(diverged),
             'diverged_pct': round(100 * len(diverged) / n_total, 1),
+            'by_type': by_type,
         }
         if top_div:
             cls['divergences'] = top_div
@@ -3963,7 +4024,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         if len(vh) > 0:
             result['ndsm_max_m'] = round(float(np.max(vh)), 2)
             result['ndsm_mean_m'] = round(float(np.mean(vh)), 2)
-        cls = _classification_stats_from_objs(seg_objs)
+        cls = _classification_stats_from_objs(seg_objs, type_area_sqm=dict(tc_))
         if cls:
             result['classification'] = cls
         return result

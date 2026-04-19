@@ -195,6 +195,7 @@ class SearchIndex:
                 rf_min_confidence REAL,
                 rf_count INTEGER DEFAULT 0,
                 diverged_count INTEGER DEFAULT 0,
+                area_sqm REAL DEFAULT 0,
                 PRIMARY KEY (kg_code, object_type)
             )''',
             # === RF divergence pairs (rf_type→final_type) ===
@@ -259,6 +260,15 @@ class SearchIndex:
                 c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
             except Exception:
                 pass  # column already exists
+        # Add area_sqm to kg_classification (idempotent)
+        for col, ctype, default in [
+            ('area_sqm', 'REAL', 0),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg_classification ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass
         # Re-run indexes that may have failed before ALTER TABLE
         for s in self._schema_stmts():
             if 'CREATE INDEX' in s:
@@ -544,11 +554,13 @@ class SearchIndex:
                     cls_rows.append((
                         code, otype,
                         info.get('mean'), info.get('min'),
-                        info.get('count', 0), 0,  # diverged_count filled below
+                        info.get('count', 0),
+                        info.get('diverged_count', 0),
+                        info.get('area_sqm', 0),
                     ))
                 if cls_rows:
                     c.executemany(
-                        'INSERT INTO kg_classification VALUES (?,?,?,?,?,?)', cls_rows)
+                        'INSERT INTO kg_classification VALUES (?,?,?,?,?,?,?)', cls_rows)
 
             top_div = cls.get('top_divergences', [])
             if top_div:
@@ -558,15 +570,6 @@ class SearchIndex:
                 if div_rows:
                     c.executemany(
                         'INSERT INTO kg_divergence VALUES (?,?,?,?)', div_rows)
-                # Update per-type diverged_count in kg_classification
-                from collections import Counter as _Counter
-                rf_div_counts = _Counter()
-                for d in top_div:
-                    if d.get('final_type'):
-                        rf_div_counts[d['final_type']] += d.get('count', 0)
-                for otype, cnt in rf_div_counts.items():
-                    c.execute('UPDATE kg_classification SET diverged_count=? WHERE kg_code=? AND object_type=?',
-                              (cnt, code, otype))
 
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing."""
@@ -1052,7 +1055,7 @@ class SearchIndex:
         rows = c.execute('''
             SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
                    k.state_name, cl.rf_mean_confidence, cl.rf_min_confidence,
-                   cl.rf_count, cl.diverged_count
+                   cl.rf_count, cl.diverged_count, cl.area_sqm
             FROM kg_classification cl
             JOIN kg k ON k.kg_code = cl.kg_code
             WHERE cl.object_type=?
@@ -1060,6 +1063,143 @@ class SearchIndex:
             LIMIT ?
         ''', (object_type, limit)).fetchall()
         return [dict(r) for r in rows]
+
+    def query_high_confidence_type(self, object_type, min_confidence=0.7,
+                                   min_area_sqm=0, limit=50, offset=0):
+        """Find KGs where a specific type has RF confidence >= threshold AND area >= min.
+
+        Returns KG summaries with the matching type's classification stats.
+        """
+        c = self._conn()
+        rows = c.execute('''
+            SELECT k.*, cl.rf_mean_confidence AS type_rf_confidence,
+                   cl.rf_min_confidence AS type_rf_min_confidence,
+                   cl.rf_count AS type_rf_count,
+                   cl.diverged_count AS type_diverged_count,
+                   cl.area_sqm AS type_area_sqm
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+              AND cl.rf_mean_confidence >= ?
+              AND cl.area_sqm >= ?
+            ORDER BY cl.area_sqm DESC
+            LIMIT ? OFFSET ?
+        ''', (object_type, min_confidence, min_area_sqm, limit, offset)).fetchall()
+        results = []
+        for r in rows:
+            d = self._kg_summary(r)
+            d['type_rf_confidence'] = r['type_rf_confidence']
+            d['type_rf_min_confidence'] = r['type_rf_min_confidence']
+            d['type_rf_count'] = r['type_rf_count']
+            d['type_diverged_count'] = r['type_diverged_count']
+            d['type_area_sqm'] = r['type_area_sqm']
+            results.append(d)
+        return results
+
+    def query_parcels_by_type_confidence(self, object_type, min_confidence=0.7,
+                                         min_area_sqm=0, limit=100, offset=0):
+        """Find individual parcels where a specific type has high RF confidence.
+
+        Pre-filters via kg_classification index, then scans matching KG JSONs
+        for parcels whose classification.by_type[object_type].rf_mean_confidence
+        meets threshold.  Returns list of {kg_code, parcel_id, centroid, ...}.
+        """
+        c = self._conn()
+        # Pre-filter: KGs that have this type with at least some RF confidence
+        kg_rows = c.execute('''
+            SELECT cl.kg_code
+            FROM kg_classification cl
+            WHERE cl.object_type=? AND cl.rf_mean_confidence >= ?
+            ORDER BY cl.area_sqm DESC
+        ''', (object_type, min_confidence * 0.8)).fetchall()  # slightly relaxed for pre-filter
+        results = []
+        for kg_row in kg_rows:
+            if len(results) >= limit + offset:
+                break
+            kg_code = kg_row['kg_code']
+            jp = Path(f'data/austria_processor/json/{kg_code}.json')
+            if not jp.exists():
+                continue
+            try:
+                data = json.loads(jp.read_text())
+                for p in data.get('parcels', {}).get('details', []):
+                    cls = p.get('classification', {})
+                    bt = cls.get('by_type', {}).get(object_type)
+                    if not bt:
+                        continue
+                    rf_conf = bt.get('rf_mean_confidence', 0)
+                    area = bt.get('area_sqm', 0)
+                    if rf_conf >= min_confidence and area >= min_area_sqm:
+                        results.append({
+                            'kg_code': kg_code,
+                            'parcel_id': p.get('parcel_id'),
+                            'centroid': p.get('centroid'),
+                            'parcel_area_sqm': p.get('area_sqm'),
+                            'elevation_m': p.get('elevation_m'),
+                            'type': object_type,
+                            'type_area_sqm': area,
+                            'rf_mean_confidence': rf_conf,
+                            'rf_count': bt.get('rf_count', 0),
+                            'rules_count': bt.get('rules_count', 0),
+                            'diverged_count': bt.get('diverged_count', 0),
+                        })
+            except Exception as e:
+                log.warning('query_parcels_by_type_confidence %s: %s', kg_code, e)
+        return results[offset:offset + limit]
+
+    def query_top_features(self, feature_type, object_type=None,
+                           min_confidence=0.0, limit=100, offset=0):
+        """Cross-KG query for top trees / objects / new buildings / infrastructure.
+
+        feature_type: 'trees', 'objects', 'new_buildings', 'infrastructure'
+        Filters by rf_confidence >= min_confidence and optionally by object_type.
+        Returns features sorted by height (descending).
+        """
+        c = self._conn()
+        # Only scan processed KGs
+        kg_rows = c.execute(
+            'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code'
+        ).fetchall()
+        results = []
+        for kg_row in kg_rows:
+            kg_code = kg_row['kg_code']
+            jp = Path(f'data/austria_processor/json/{kg_code}.json')
+            if not jp.exists():
+                continue
+            try:
+                data = json.loads(jp.read_text())
+                if feature_type == 'trees':
+                    items = data.get('top_10_trees', [])
+                    sort_key = 'height_m'
+                elif feature_type == 'objects':
+                    items = data.get('top_10_objects', [])
+                    sort_key = 'height_max_m'
+                elif feature_type == 'new_buildings':
+                    items = data.get('new_buildings', {}).get('features', [])
+                    sort_key = 'max_height_m'
+                elif feature_type == 'infrastructure':
+                    items = []
+                    for tdata in data.get('infrastructure', {}).get('by_type', {}).values():
+                        items.extend(tdata.get('features', []))
+                    sort_key = 'area_sqm'
+                else:
+                    continue
+                for item in items:
+                    rf_conf = item.get('rf_confidence', 0)
+                    if rf_conf < min_confidence:
+                        continue
+                    if object_type:
+                        it = item.get('type', '')
+                        if it and it != object_type:
+                            continue
+                    item_out = dict(item)
+                    item_out['kg_code'] = kg_code
+                    results.append(item_out)
+            except Exception as e:
+                log.warning('query_top_features %s %s: %s', feature_type, kg_code, e)
+        # Sort by height/area descending
+        results.sort(key=lambda x: x.get(sort_key, 0) or 0, reverse=True)
+        return results[offset:offset + limit]
 
     def query_divergence_pairs(self, limit=50):
         """Get the most common RF→final type divergence pairs across all KGs."""

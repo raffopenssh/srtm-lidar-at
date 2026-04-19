@@ -5368,6 +5368,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 seg_pixels=tvalid,
             )
 
+            # Flush tile cache to Zenodo so expensive Copernicus/Hansen
+            # tiles survive OOM kills.  Throttled internally (5 min).
+            try:
+                flush_tile_cache_to_zenodo()
+            except Exception as _zfe:
+                log.debug("Zenodo cache flush after tile: %s", _zfe)
+
             # Free tile memory
             del tdata, t_labels, t_objects, seg_result, spectral
             del copernicus_data, hansen_data, dtm_dates, dsm_dates
@@ -5440,6 +5447,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["step"] = "done"
         # Clean up tile checkpoints on success
         _clear_tile_checkpoints()
+
+        # Final flush — ensure all tiles from this KG are persisted
+        # before the subprocess exits and memory is reclaimed.
+        try:
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as _zfe:
+            log.debug("Zenodo cache flush at KG end: %s", _zfe)
 
     except Exception as e:
         result["error"] = str(e)

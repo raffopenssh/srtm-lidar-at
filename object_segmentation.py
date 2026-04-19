@@ -169,6 +169,13 @@ class SegmentedObject:
     aspect_mean: float = -1.0  # aspect in degrees (0=N, 90=E, 180=S, 270=W), -1=flat
     aspect_dominant: str = "flat"  # 8-point compass: N/NE/E/SE/S/SW/W/NW/flat
     roughness: float = 0.0  # DSM local std within segment
+    elevation_mean: float = 0.0
+    elevation_min: float = 0.0
+    elevation_max: float = 0.0
+    tri_mean: float = 0.0
+    tpi_mean: float = 0.0
+    curvature_mean: float = 0.0
+    terrain_class: str = "level"
     # Spectral (from ortho or Sentinel-2)
     ndvi_mean: float = 0.0
     ndvi_std: float = 0.0
@@ -472,6 +479,11 @@ def extract_object_features(
     h, w = dtm.shape
     slope_arr = _slope(dtm)
     aspect_arr = _aspect(dtm)
+    from terrain_analysis import compute_tri, compute_tpi, compute_curvature
+    tri_arr = compute_tri(dtm)
+    tpi_arr = compute_tpi(dtm, radius=5)  # 5m radius for segment-scale
+    curv = compute_curvature(dtm)
+    curvature_arr = curv["profile_curvature"]
     dsm_rough = _local_std(dsm, 3)
     dtm_rough = _local_std(dtm, 3)
 
@@ -601,6 +613,38 @@ def extract_object_features(
         else:
             f["aspect_mean"] = -1.0
             f["aspect_dominant"] = "flat"
+
+        # Elevation
+        ev = dtm[seg_v]
+        ev_valid = ev[np.isfinite(ev)]
+        if len(ev_valid) > 0:
+            f["elevation_mean"] = float(np.nanmean(ev_valid))
+            f["elevation_min"] = float(np.nanmin(ev_valid))
+            f["elevation_max"] = float(np.nanmax(ev_valid))
+        else:
+            f["elevation_mean"] = 0.0
+            f["elevation_min"] = 0.0
+            f["elevation_max"] = 0.0
+
+        # TRI / TPI / Curvature
+        tri_seg = tri_arr[seg_v]
+        tri_v = tri_seg[np.isfinite(tri_seg)]
+        f["tri_mean"] = float(np.nanmean(tri_v)) if len(tri_v) > 0 else 0.0
+        tpi_seg = tpi_arr[seg_v]
+        tpi_v = tpi_seg[np.isfinite(tpi_seg)]
+        f["tpi_mean"] = float(np.nanmean(tpi_v)) if len(tpi_v) > 0 else 0.0
+        curv_seg = curvature_arr[seg_v]
+        curv_v = curv_seg[np.isfinite(curv_seg)]
+        f["curvature_mean"] = float(np.nanmean(curv_v)) if len(curv_v) > 0 else 0.0
+        # Terrain class from TRI
+        _tri = f["tri_mean"]
+        if _tri < 0.1: f["terrain_class"] = "level"
+        elif _tri < 0.3: f["terrain_class"] = "nearly_level"
+        elif _tri < 0.8: f["terrain_class"] = "slightly_rugged"
+        elif _tri < 1.5: f["terrain_class"] = "intermediately_rugged"
+        elif _tri < 3.0: f["terrain_class"] = "moderately_rugged"
+        elif _tri < 6.0: f["terrain_class"] = "highly_rugged"
+        else: f["terrain_class"] = "extremely_rugged"
 
         # Roughness
         f["dsm_roughness"] = float(np.nanmean(dsm_rough[seg_v]))
@@ -2059,6 +2103,13 @@ def segment_and_classify(
             aspect_mean=round(feat.get("aspect_mean", -1), 1),
             aspect_dominant=feat.get("aspect_dominant", "flat"),
             roughness=round(feat["dsm_roughness"], 3),
+            elevation_mean=round(feat.get("elevation_mean", 0), 2),
+            elevation_min=round(feat.get("elevation_min", 0), 2),
+            elevation_max=round(feat.get("elevation_max", 0), 2),
+            tri_mean=round(feat.get("tri_mean", 0), 3),
+            tpi_mean=round(feat.get("tpi_mean", 0), 3),
+            curvature_mean=round(feat.get("curvature_mean", 0), 4),
+            terrain_class=feat.get("terrain_class", "level"),
             ndvi_mean=round(feat.get("ndvi_mean", 0), 4),
             ndvi_std=round(feat.get("ndvi_std", 0), 4),
             ndvi_fused=round(feat.get("fused_ndvi_mean", 0), 4),

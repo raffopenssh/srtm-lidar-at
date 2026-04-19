@@ -1486,12 +1486,19 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             ('height_mean_m', 'float'),
             ('height_p90_m', 'float'),
             ('height_std_m', 'float'),
-            # Surface
+            # Surface / terrain
             ('slope_mean_deg', 'float'),
             ('aspect_mean_deg', 'float'),
             ('aspect_dominant', 'str'),
             ('roughness', 'float'),
             ('dsm_edge_strength', 'float'),
+            ('elevation_mean_m', 'float'),
+            ('elevation_min_m', 'float'),
+            ('elevation_max_m', 'float'),
+            ('tri_mean', 'float'),
+            ('tpi_mean', 'float'),
+            ('curvature_mean', 'float'),
+            ('terrain_class', 'str'),
             # Spectral
             ('ndvi_mean', 'float'),
             ('ndvi_std', 'float'),
@@ -1567,6 +1574,13 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
                     'aspect_dominant': obj.aspect_dominant or 'flat',
                     'roughness': round(obj.roughness, 3),
                     'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'elevation_mean_m': round(obj.elevation_mean, 2),
+                    'elevation_min_m': round(obj.elevation_min, 2),
+                    'elevation_max_m': round(obj.elevation_max, 2),
+                    'tri_mean': round(obj.tri_mean, 3),
+                    'tpi_mean': round(obj.tpi_mean, 3),
+                    'curvature_mean': round(obj.curvature_mean, 4),
+                    'terrain_class': obj.terrain_class or 'level',
                     'ndvi_mean': round(obj.ndvi_mean, 4),
                     'ndvi_std': round(obj.ndvi_std, 4),
                     'ndvi_fused': round(obj.ndvi_fused, 4),
@@ -1638,12 +1652,19 @@ def _write_segment_points(gpkg_path: str, objects: list,
             ('height_mean_m', 'float'),
             ('height_p90_m', 'float'),
             ('height_std_m', 'float'),
-            # Surface
+            # Surface / terrain
             ('slope_mean_deg', 'float'),
             ('aspect_mean_deg', 'float'),
             ('aspect_dominant', 'str'),
             ('roughness', 'float'),
             ('dsm_edge_strength', 'float'),
+            ('elevation_mean_m', 'float'),
+            ('elevation_min_m', 'float'),
+            ('elevation_max_m', 'float'),
+            ('tri_mean', 'float'),
+            ('tpi_mean', 'float'),
+            ('curvature_mean', 'float'),
+            ('terrain_class', 'str'),
             # Spectral
             ('ndvi_mean', 'float'),
             ('ndvi_fused', 'float'),
@@ -1718,6 +1739,13 @@ def _write_segment_points(gpkg_path: str, objects: list,
                     'aspect_dominant': obj.aspect_dominant or 'flat',
                     'roughness': round(obj.roughness, 3),
                     'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'elevation_mean_m': round(obj.elevation_mean, 2),
+                    'elevation_min_m': round(obj.elevation_min, 2),
+                    'elevation_max_m': round(obj.elevation_max, 2),
+                    'tri_mean': round(obj.tri_mean, 3),
+                    'tpi_mean': round(obj.tpi_mean, 3),
+                    'curvature_mean': round(obj.curvature_mean, 4),
+                    'terrain_class': obj.terrain_class or 'level',
                     'ndvi_mean': round(obj.ndvi_mean, 4),
                     'ndvi_fused': round(obj.ndvi_fused, 4),
                     'brightness_mean': round(obj.brightness_mean, 1),
@@ -3468,18 +3496,24 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     # --- Parcels (enriched from tiles) ---
     parcels = cadastre_data["parcels"]
     if parcels:
-        from terrain_analysis import compute_slope, compute_aspect
+        from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
         schema_p = {'geometry': 'MultiPolygon', 'properties': [
             ('parcel_id', 'str'), ('area_sqm', 'float'),
             ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-            ('slope_mean_deg', 'float'), ('aspect_mean_deg', 'float'), ('aspect_dominant', 'str')]}
+            ('elevation_min_m', 'float'), ('elevation_max_m', 'float'), ('elevation_range_m', 'float'),
+            ('slope_mean_deg', 'float'), ('aspect_mean_deg', 'float'), ('aspect_dominant', 'str'),
+            ('tri_mean', 'float'), ('tpi_mean', 'float'), ('terrain_class', 'str'),
+            ('vertex_heights', 'str')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='parcels',
                         schema=schema_p, crs=from_epsg(4326)) as dst:
             for p in parcels:
                 geom_wgs = p["geometry_wgs"]
                 props = {"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
                          "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None,
-                         "slope_mean_deg": None, "aspect_mean_deg": None, "aspect_dominant": None}
+                         "elevation_min_m": None, "elevation_max_m": None, "elevation_range_m": None,
+                         "slope_mean_deg": None, "aspect_mean_deg": None, "aspect_dominant": None,
+                         "tri_mean": None, "tpi_mean": None, "terrain_class": None,
+                         "vertex_heights": None}
                 try:
                     c3 = p["geometry"].centroid
                     c_wgs = transform_to_wgs(c3)
@@ -3488,25 +3522,46 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     tr, tdata = _gpkg_find_tile(c3.x, c3.y)
                     if tr and tdata:
                         tf = tdata["transform"]
+                        dtm_arr = tdata["dtm"]
+                        dh, dw = dtm_arr.shape
                         col = int((c3.x - tf.c) / tf.a)
                         row = int((tf.f - c3.y) / abs(tf.e))
-                        dh, dw = tdata["dtm"].shape
                         if 0 <= row < dh and 0 <= col < dw:
-                            val = float(tdata["dtm"][row, col])
+                            val = float(dtm_arr[row, col])
                             if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
-                        # Compute slope + aspect over parcel footprint
+                        # Full terrain over parcel footprint
                         try:
                             from rasterio.features import geometry_mask as _gm
                             pmask = _gm([mapping(p["geometry"])], out_shape=(dh, dw),
                                         transform=tf, invert=True)
-                            dtm_arr = tdata["dtm"]
                             pv = pmask & np.isfinite(dtm_arr)
                             if np.sum(pv) > 4:
+                                dtm_pv = dtm_arr[pv]
+                                e_min = float(np.nanmin(dtm_pv))
+                                e_max = float(np.nanmax(dtm_pv))
+                                props["elevation_min_m"] = round(e_min, 2)
+                                props["elevation_max_m"] = round(e_max, 2)
+                                props["elevation_range_m"] = round(e_max - e_min, 2)
                                 slope_full = compute_slope(dtm_arr)
                                 aspect_full = compute_aspect(dtm_arr)
-                                sl_vals = slope_full[pv]
+                                tri_full = compute_tri(dtm_arr)
+                                tpi_full = compute_tpi(dtm_arr, radius=5)
+                                props["slope_mean_deg"] = round(float(np.nanmean(slope_full[pv])), 1)
+                                tri_val = float(np.nanmean(tri_full[pv]))
+                                props["tri_mean"] = round(tri_val, 3)
+                                tpi_v = tpi_full[pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                                if len(tpi_v) > 0:
+                                    props["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
+                                # Terrain class from TRI
+                                if tri_val < 0.1: props["terrain_class"] = "level"
+                                elif tri_val < 0.3: props["terrain_class"] = "nearly_level"
+                                elif tri_val < 0.8: props["terrain_class"] = "slightly_rugged"
+                                elif tri_val < 1.5: props["terrain_class"] = "intermediately_rugged"
+                                elif tri_val < 3.0: props["terrain_class"] = "moderately_rugged"
+                                elif tri_val < 6.0: props["terrain_class"] = "highly_rugged"
+                                else: props["terrain_class"] = "extremely_rugged"
+                                # Aspect (circular mean)
                                 asp_vals = aspect_full[pv]
-                                props["slope_mean_deg"] = round(float(np.nanmean(sl_vals)), 1)
                                 asp_nf = asp_vals[asp_vals >= 0]
                                 if len(asp_nf) > 0:
                                     rad = np.radians(asp_nf)
@@ -3520,6 +3575,32 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                                 else:
                                     props["aspect_mean_deg"] = -1.0
                                     props["aspect_dominant"] = "flat"
+                        except Exception:
+                            pass
+                        # Vertex heights (AMS anchor points)
+                        try:
+                            verts = []
+                            if geom_wgs.geom_type == 'Polygon':
+                                rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
+                            elif geom_wgs.geom_type == 'MultiPolygon':
+                                rings = []
+                                for poly in geom_wgs.geoms:
+                                    rings.append(poly.exterior)
+                                    rings.extend(poly.interiors)
+                            else:
+                                rings = []
+                            for ring in rings:
+                                for x, y in ring.coords:
+                                    pt_3035 = _tx_to_3035.transform(x, y)
+                                    vc = int((pt_3035[0] - tf.c) / tf.a)
+                                    vr = int((tf.f - pt_3035[1]) / abs(tf.e))
+                                    dtm_val = None
+                                    if 0 <= vr < dh and 0 <= vc < dw:
+                                        v = float(dtm_arr[vr, vc])
+                                        if np.isfinite(v): dtm_val = round(v, 2)
+                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val}")
+                            if verts:
+                                props["vertex_heights"] = "|".join(verts)
                         except Exception:
                             pass
                 except Exception:
@@ -3558,7 +3639,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             ('max_height_m', 'float'), ('mean_height_m', 'float'),
             ('dsm_std', 'float'), ('roof_type_hint', 'str'),
             ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
-            ('centroid_lon', 'float'), ('centroid_lat', 'float')]}
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('centroid_dtm_m', 'float'), ('vertex_heights', 'str')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='buildings',
                         schema=schema_b, crs=from_epsg(4326)) as dst:
             for b in bldgs:
@@ -3571,7 +3653,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                          "max_height_m": None, "mean_height_m": None, "dsm_std": None,
                          "roof_type_hint": "", "stories_est": None,
                          "footprint_area_sqm": round(float(geom_3035.area), 1),
-                         "centroid_lon": None, "centroid_lat": None}
+                         "centroid_lon": None, "centroid_lat": None,
+                         "centroid_dtm_m": None, "vertex_heights": None}
                 if bp.get("ns"): props["ns"] = bp["ns"]
                 try:
                     c3 = geom_3035.centroid
@@ -3604,6 +3687,43 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                             props["dsm_std"] = round(float(np.std(dv)), 2) if len(dv) > 0 else 0.0
                             props["roof_type_hint"] = "flat" if props["dsm_std"] < 1.5 else "pitched"
                             props["stories_est"] = max(1, round(mh / 3.0))
+                        # Centroid DTM elevation
+                        tf_b = tdata["transform"]
+                        col_b = int((c3.x - tf_b.c) / tf_b.a)
+                        row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
+                        if 0 <= row_b < dh and 0 <= col_b < dw:
+                            dtm_v = float(tdata["dtm"][row_b, col_b])
+                            if np.isfinite(dtm_v):
+                                props["centroid_dtm_m"] = round(dtm_v, 2)
+                        # Vertex heights (AMS anchor points)
+                        try:
+                            verts = []
+                            if geom_wgs.geom_type == 'Polygon':
+                                b_rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
+                            elif geom_wgs.geom_type == 'MultiPolygon':
+                                b_rings = []
+                                for poly in geom_wgs.geoms:
+                                    b_rings.append(poly.exterior)
+                                    b_rings.extend(poly.interiors)
+                            else:
+                                b_rings = []
+                            dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
+                            for ring in b_rings:
+                                for x, y in ring.coords:
+                                    pt_3035 = _tx_to_3035.transform(x, y)
+                                    vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
+                                    vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
+                                    dtm_val = obj_h = None
+                                    if 0 <= vr < dh and 0 <= vc < dw:
+                                        dv2 = float(dtm_b[vr, vc])
+                                        if np.isfinite(dv2): dtm_val = round(dv2, 2)
+                                        nv = float(ndsm_b[vr, vc])
+                                        if np.isfinite(nv): obj_h = round(nv, 2)
+                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val},{obj_h}")
+                            if verts:
+                                props["vertex_heights"] = "|".join(verts)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
@@ -3990,6 +4110,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             "aspect_dominant": max(ad, key=ad.get) if ad else "",
             "aspect_distribution_pct": ad, "slope_classes_pct": ts.get("slope_classes_pct",{}),
             "roughness_mean": tri.get("mean"), "curvature_mean": None,
+            "terrain_class": tri.get("classification", ""),
             "elevation_min_m": elev.get("min"), "elevation_max_m": elev.get("max"),
             "elevation_range_m": elev.get("range"), "elevation_mean_m": elev.get("mean"),
             "method": "DTM slope/aspect/TRI, BEV ALS 1m, tiled"}
@@ -4245,17 +4366,39 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
                         v = patch[np.isfinite(patch)]
                         if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
-                # Slope + aspect over parcel footprint
+                # Full terrain over parcel footprint
                 try:
-                    from terrain_analysis import compute_slope, compute_aspect
+                    from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
                     from rasterio.features import geometry_mask as _gm_json
                     pmask = _gm_json([mapping(geom_3035)], out_shape=(dh, dw),
                                      transform=tf, invert=True)
                     pv = pmask & np.isfinite(dtm)
                     if np.sum(pv) > 4:
+                        dtm_pv = dtm[pv]
+                        e_min = float(np.nanmin(dtm_pv))
+                        e_max = float(np.nanmax(dtm_pv))
+                        pd["elevation_min_m"] = round(e_min, 2)
+                        pd["elevation_max_m"] = round(e_max, 2)
+                        pd["elevation_range_m"] = round(e_max - e_min, 2)
                         slope_f = compute_slope(dtm)
                         aspect_f = compute_aspect(dtm)
+                        tri_f = compute_tri(dtm)
+                        tpi_f = compute_tpi(dtm, radius=5)
                         pd["slope_mean_deg"] = round(float(np.nanmean(slope_f[pv])), 1)
+                        tri_val = float(np.nanmean(tri_f[pv]))
+                        pd["tri_mean"] = round(tri_val, 3)
+                        tpi_v = tpi_f[pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                        if len(tpi_v) > 0:
+                            pd["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
+                        # Terrain class from TRI
+                        if tri_val < 0.1: pd["terrain_class"] = "level"
+                        elif tri_val < 0.3: pd["terrain_class"] = "nearly_level"
+                        elif tri_val < 0.8: pd["terrain_class"] = "slightly_rugged"
+                        elif tri_val < 1.5: pd["terrain_class"] = "intermediately_rugged"
+                        elif tri_val < 3.0: pd["terrain_class"] = "moderately_rugged"
+                        elif tri_val < 6.0: pd["terrain_class"] = "highly_rugged"
+                        else: pd["terrain_class"] = "extremely_rugged"
+                        # Aspect (circular mean)
                         asp_nf = aspect_f[pv]
                         asp_nf = asp_nf[asp_nf >= 0]
                         if len(asp_nf) > 0:
@@ -4270,6 +4413,33 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         else:
                             pd["aspect_mean_deg"] = -1.0
                             pd["aspect_dominant"] = "flat"
+                except Exception:
+                    pass
+                # Vertex heights (AMS anchor points)
+                try:
+                    verts = []
+                    geom_w = p["geometry_wgs"]
+                    if geom_w.geom_type == 'Polygon':
+                        rings = [geom_w.exterior] + list(geom_w.interiors)
+                    elif geom_w.geom_type == 'MultiPolygon':
+                        rings = []
+                        for poly in geom_w.geoms:
+                            rings.append(poly.exterior)
+                            rings.extend(poly.interiors)
+                    else:
+                        rings = []
+                    for ring in rings:
+                        for x, y in ring.coords:
+                            pt_3035 = _tx_to_3035.transform(x, y)
+                            vc = int((pt_3035[0] - tf.c) / tf.a)
+                            vr = int((tf.f - pt_3035[1]) / abs(tf.e))
+                            dtm_val = None
+                            if 0 <= vr < dh and 0 <= vc < dw:
+                                v = float(dtm[vr, vc])
+                                if np.isfinite(v): dtm_val = round(v, 2)
+                            verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
+                    if verts:
+                        pd["vertex_heights"] = verts
                 except Exception:
                     pass
                 # Segment analysis (happy path)
@@ -4355,6 +4525,43 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     bd["dsm_std"] = round(float(np.std(dv)),2) if len(dv) > 0 else 0.0
                     bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
                     bd["stories_est"] = max(1, round(mh/3.0))
+                # Centroid DTM elevation
+                tf_b = tdata["transform"]
+                col_b = int((c3.x - tf_b.c) / tf_b.a)
+                row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
+                if 0 <= row_b < dh and 0 <= col_b < dw:
+                    dtm_v = float(tdata["dtm"][row_b, col_b])
+                    if np.isfinite(dtm_v): bd["centroid_dtm_m"] = round(dtm_v, 2)
+                # Vertex heights (AMS anchor points + object height)
+                try:
+                    geom_w = b["geometry_wgs"]
+                    if geom_w.geom_type == 'Polygon':
+                        b_rings = [geom_w.exterior] + list(geom_w.interiors)
+                    elif geom_w.geom_type == 'MultiPolygon':
+                        b_rings = []
+                        for poly in geom_w.geoms:
+                            b_rings.append(poly.exterior)
+                            b_rings.extend(poly.interiors)
+                    else:
+                        b_rings = []
+                    dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
+                    verts = []
+                    for ring in b_rings:
+                        for x, y in ring.coords:
+                            pt_3035 = _tx_to_3035.transform(x, y)
+                            vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
+                            vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
+                            dtm_val = obj_h = None
+                            if 0 <= vr < dh and 0 <= vc < dw:
+                                dv2 = float(dtm_b[vr, vc])
+                                if np.isfinite(dv2): dtm_val = round(dv2, 2)
+                                nv = float(ndsm_b[vr, vc])
+                                if np.isfinite(nv): obj_h = round(nv, 2)
+                            verts.append({"lat": round(y,7), "lon": round(x,7),
+                                          "dtm_m": dtm_val, "obj_height_m": obj_h})
+                    if verts: bd["vertex_heights"] = verts
+                except Exception:
+                    pass
                 if tr.get("labels") is not None and objects:
                     bl = tr["labels"][bm]; tc_ = Counter(); seg_objs = []
                     for lbl in np.unique(bl):
@@ -5683,6 +5890,17 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             # Check segments vector layer
             if 'segments' not in vector_tabs:
                 issues.append("FULL_GPKG: missing vector layer 'segments'")
+            else:
+                try:
+                    import fiona as _fiona_val
+                    with _fiona_val.open(full_path, layer='segments') as src:
+                        flds = set(src.schema['properties'].keys())
+                        for rf in ['aspect_mean_deg','aspect_dominant','elevation_mean_m',
+                                   'tri_mean','tpi_mean','terrain_class']:
+                            if rf not in flds:
+                                issues.append(f"FULL_GPKG: segments missing field '{rf}'")
+                except Exception:
+                    pass
             fsize = os.path.getsize(full_path)
             if fsize < 10_000:
                 issues.append(f"FULL_GPKG: suspiciously small ({fsize} bytes)")
@@ -5722,7 +5940,7 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             if "parcels" not in vector_tables:
                 issues.append("LIGHT_GPKG: missing vector layer 'parcels'")
 
-            # Count features in vector layers
+            # Count features in vector layers + check schemas
             try:
                 import fiona
                 for vt in vector_tables:
@@ -5731,6 +5949,26 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                         log.info("  LIGHT_GPKG: layer '%s' → %d features", vt, n)
                         if n == 0:
                             issues.append(f"LIGHT_GPKG: layer '{vt}' is empty")
+                        # Check required terrain fields
+                        flds = set(src.schema['properties'].keys())
+                        if vt == 'segments':
+                            for rf in ['aspect_mean_deg','aspect_dominant','elevation_mean_m',
+                                       'tri_mean','tpi_mean','terrain_class']:
+                                if rf not in flds:
+                                    issues.append(f"LIGHT_GPKG: segments missing field '{rf}'")
+                        if vt == 'parcels':
+                            for rf in ['slope_mean_deg','aspect_mean_deg','aspect_dominant',
+                                       'elevation_min_m','elevation_max_m','tri_mean',
+                                       'terrain_class','vertex_heights']:
+                                if rf not in flds:
+                                    issues.append(f"LIGHT_GPKG: parcels missing field '{rf}'")
+                            # Spot-check: at least 50% of parcels have terrain_class
+                            n_tc = 0
+                            for feat in src:
+                                if feat['properties'].get('terrain_class'):
+                                    n_tc += 1
+                            if n > 0 and n_tc < n * 0.5:
+                                issues.append(f"LIGHT_GPKG: only {n_tc}/{n} parcels have terrain_class")
             except Exception as e:
                 issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
 
@@ -5792,6 +6030,23 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                     if n_with_area == 0 and len(p_details) > 5:
                         # area_summary only available for parcels inside segmentation window
                         log.info("  JSON: no parcels have area_summary (may be outside seg window)")
+                    # Terrain enrichment checks
+                    n_with_terrain = sum(1 for p in p_details if p.get("terrain_class"))
+                    n_with_aspect = sum(1 for p in p_details if p.get("aspect_dominant"))
+                    n_with_verts = sum(1 for p in p_details if p.get("vertex_heights"))
+                    log.info("  JSON: %d/%d parcels with terrain_class, %d/%d with aspect, %d/%d with vertex_heights",
+                             n_with_terrain, len(p_details), n_with_aspect, len(p_details),
+                             n_with_verts, len(p_details))
+                    if n_with_terrain == 0:
+                        issues.append("JSON: no parcels have terrain_class")
+                    elif n_with_terrain < len(p_details) * 0.5:
+                        issues.append(f"JSON: only {n_with_terrain}/{len(p_details)} parcels have terrain_class")
+                    if n_with_aspect == 0:
+                        issues.append("JSON: no parcels have aspect_dominant")
+                    if n_with_verts == 0:
+                        issues.append("JSON: no parcels have vertex_heights")
+                    elif n_with_verts < len(p_details) * 0.5:
+                        issues.append(f"JSON: only {n_with_verts}/{len(p_details)} parcels have vertex_heights")
                     # Check largest parcel has full data
                     biggest = max(p_details, key=lambda p: p.get("area_sqm", 0))
                     if not biggest.get("parcel_id"):
@@ -5811,6 +6066,15 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                         issues.append("JSON: first building missing centroid")
                     if b0.get("max_height_m") is None:
                         issues.append("JSON: first building missing max_height_m")
+                    n_bld_verts = sum(1 for b in bf_details if b.get("vertex_heights"))
+                    n_bld_dtm = sum(1 for b in bf_details if b.get("centroid_dtm_m") is not None)
+                    n_bld_roof = sum(1 for b in bf_details if b.get("roof_type_hint"))
+                    log.info("  JSON: %d/%d buildings with vertex_heights, %d with centroid_dtm, %d with roof_type",
+                             n_bld_verts, len(bf_details), n_bld_dtm, n_bld_roof)
+                    if n_bld_verts == 0 and len(bf_details) > 5:
+                        issues.append("JSON: no buildings have vertex_heights")
+                    if n_bld_dtm == 0 and len(bf_details) > 5:
+                        issues.append("JSON: no buildings have centroid_dtm_m")
 
             # Check for NaN/None in critical numeric fields
             for t, vals in js.get("height_distribution", {}).items():

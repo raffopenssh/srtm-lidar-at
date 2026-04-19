@@ -121,6 +121,8 @@ class SearchIndex:
                 roughness_mean REAL,
                 steepness_max_deg REAL,
                 elevation_range_m REAL,
+                tri_mean REAL,
+                terrain_class TEXT,
                 ndvi_mean REAL,
                 tree_count INTEGER DEFAULT 0,
                 tree_canopy_sqm REAL DEFAULT 0,
@@ -266,6 +268,8 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_kg_roughness ON kg(roughness_mean)',
             'CREATE INDEX IF NOT EXISTS idx_kg_steepness_max ON kg(steepness_max_deg)',
             'CREATE INDEX IF NOT EXISTS idx_kg_elev_range ON kg(elevation_range_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_tri ON kg(tri_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_terrain_class ON kg(terrain_class)',
         ]
 
     def _migrate(self):
@@ -308,6 +312,16 @@ class SearchIndex:
                 c.execute(f'ALTER TABLE kg_classification ADD COLUMN {col} {ctype}{dflt}')
             except Exception:
                 pass
+        # Add terrain enrichment columns (idempotent)
+        for col, ctype, default in [
+            ('tri_mean', 'REAL', None),
+            ('terrain_class', 'TEXT', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
         # Re-run indexes that may have failed before ALTER TABLE
         for s in self._schema_stmts():
             if 'CREATE INDEX' in s:
@@ -394,6 +408,7 @@ class SearchIndex:
                     None, None, None, 0,  # landscape
                     None, None, None, None, None,  # terrain (elev min/max/mean, slope, aspect)
                     None, None, None,  # terrain detail (roughness, steepness, elev_range)
+                    None, None,  # tri_mean, terrain_class
                     None,  # ndvi
                     0, 0, None, 0,  # tree_stats
                     None, None,  # temporal
@@ -419,7 +434,7 @@ class SearchIndex:
 
             c.executemany(
                 '''INSERT OR REPLACE INTO kg VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ''', kg_rows)
             c.executemany('INSERT INTO fts_kg VALUES (?,?,?,?,?)', fts_rows)
             c.executemany('INSERT INTO kg_rtree VALUES (?,?,?,?,?)', rtree_rows)
@@ -451,6 +466,17 @@ class SearchIndex:
             c.commit()
             log.info('🔍 Search index built: %d KGs (%d processed) in %.1fs',
                      len(kg_rows), n_processed, elapsed)
+
+    @staticmethod
+    def _tri_class(tri):
+        if tri is None: return None
+        if tri < 0.1: return 'level'
+        if tri < 0.3: return 'nearly_level'
+        if tri < 0.8: return 'slightly_rugged'
+        if tri < 1.5: return 'intermediately_rugged'
+        if tri < 3.0: return 'moderately_rugged'
+        if tri < 6.0: return 'highly_rugged'
+        return 'extremely_rugged'
 
     def _enrich_kg(self, c, code, data):
         """Enrich a KG row with data from its JSON summary."""
@@ -494,6 +520,7 @@ class SearchIndex:
             elevation_min_m=?, elevation_max_m=?, elevation_mean_m=?,
             slope_mean_deg=?, aspect_dominant=?,
             roughness_mean=?, steepness_max_deg=?, elevation_range_m=?,
+            tri_mean=?, terrain_class=?,
             ndvi_mean=?,
             tree_count=?, tree_canopy_sqm=?, tree_mean_height_m=?, tree_stem_volume_m3=?,
             net_volume_change_m3=?, temporal_stability=?,
@@ -520,6 +547,7 @@ class SearchIndex:
                 tr.get('elevation_min_m'), tr.get('elevation_max_m'), tr.get('elevation_mean_m'),
                 tr.get('steepness_mean_deg'), tr.get('aspect_dominant'),
                 tr.get('roughness_mean'), tr.get('steepness_max_deg'), tr.get('elevation_range_m'),
+                tr.get('roughness_mean'), tr.get('terrain_class') or self._tri_class(tr.get('roughness_mean')),
                 nd.get('copernicus_mean') or nd.get('bev_nir_mean'),
                 ts.get('count', 0), ts.get('total_canopy_sqm', 0),
                 ts.get('mean_height_m'), ts.get('est_stem_volume_m3', 0),
@@ -1772,6 +1800,8 @@ class SearchIndex:
             ('min_ndvi_amplitude', 'ndvi_harm_amplitude', '>='),
             ('min_dtm_change', 'dtm_change_mean_m', '>='),
             ('max_dtm_change', 'dtm_change_mean_m', '<='),
+            ('min_tri', 'tri_mean', '>='),
+            ('max_tri', 'tri_mean', '<='),
         ]
         for fkey, col, op in _range_map:
             val = filters.get(fkey)
@@ -1786,6 +1816,9 @@ class SearchIndex:
         if filters.get('phenology'):
             where.append('k.phenology_dominant = ?')
             params.append(filters['phenology'])
+        if filters.get('terrain_class'):
+            where.append('k.terrain_class = ?')
+            params.append(filters['terrain_class'])
         if filters.get('quality_grade'):
             where.append('k.quality_grade = ?')
             params.append(filters['quality_grade'])

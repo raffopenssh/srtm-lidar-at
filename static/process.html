@@ -1149,6 +1149,27 @@ function renderLastKg(js) {
   const nTypes = Object.keys(area).length;
   items.push({l: 'Types', v: nTypes + ' types'});
 
+  // Classification / RF divergence
+  const cls = js.classification || {};
+  if (cls.total_segments) {
+    const rfPct = (cls.rf_classified_pct||0).toFixed(0);
+    const divPct = (cls.diverged_pct||0).toFixed(1);
+    const divCnt = cls.diverged_count || 0;
+    const meanConf = (cls.mean_confidence||0).toFixed(2);
+    const rfConf = cls.rf_mean_confidence != null ? cls.rf_mean_confidence.toFixed(2) : '\u2014';
+    items.push({l: 'RF Classified', v: rfPct + '% (' + fmt(cls.rf_classified) + '/' + fmt(cls.total_segments) + ')'});
+    items.push({l: 'Mean Conf', v: meanConf});
+    items.push({l: 'RF Conf', v: rfConf});
+    const divColor = cls.diverged_pct > 15 ? 'color:#e74c3c' : cls.diverged_pct > 5 ? 'color:#e67e22' : '';
+    items.push({l: 'RF Divergence', v: '<span style="' + divColor + '">' + divPct + '% (' + fmt(divCnt) + ')</span>'});
+    // Show top divergence pairs
+    const topDiv = cls.top_divergences || [];
+    if (topDiv.length > 0) {
+      const pairs = topDiv.slice(0, 5).map(d => d.rf_type + '\u2192' + d.final_type + ' (' + d.count + ')').join(', ');
+      items.push({l: 'Top Mismatches', v: '<span style="font-size:0.82em">' + pairs + '</span>'});
+    }
+  }
+
   g.innerHTML = items.map(i =>
     '<div class="lk-item"><span class="lk-lbl">' + i.l + '</span><br><span class="lk-val">' + i.v + '</span></div>'
   ).join('');

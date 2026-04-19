@@ -56,6 +56,7 @@ LOG_DIR = DATA_DIR / "logs"
 PROGRESS_FILE = DATA_DIR / "progress.json"
 KG_LIST_FILE = DATA_DIR / "kg_list.json"
 FAILED_KGS_FILE = DATA_DIR / "failed_kgs.json"
+FAILURE_COUNTS_FILE = DATA_DIR / "failure_counts.json"
 IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
 TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
@@ -5859,6 +5860,55 @@ def _save_retried_kgs(codes: set):
         pass
 
 
+MAX_FAILURES = 3  # after this many failures, KG is permanently failed
+
+
+def _load_failure_counts() -> dict:
+    """Load per-KG failure counts: {kg_code: count}."""
+    try:
+        if FAILURE_COUNTS_FILE.exists():
+            return json.loads(FAILURE_COUNTS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_failure_counts(counts: dict):
+    try:
+        FAILURE_COUNTS_FILE.write_text(json.dumps(counts, indent=2))
+    except Exception:
+        pass
+
+
+def _record_failure(kg_code: str, failure_counts: dict,
+                    failed_kgs: set, progress, kg_name: str,
+                    error: str, step: str) -> bool:
+    """Record a KG failure.  Returns True if permanently failed (>= MAX_FAILURES)."""
+    failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+    count = failure_counts[kg_code]
+    _save_failure_counts(failure_counts)
+
+    if count >= MAX_FAILURES:
+        failed_kgs.add(kg_code)
+        _save_failed_kgs(failed_kgs)
+        progress.add_failure(kg_code, kg_name, error, step)
+        progress.add_log(
+            "error",
+            f"KG {kg_code} permanently failed ({count} failures): {error}",
+            kg_code)
+        log.error("KG %s: PERMANENTLY FAILED (%d failures) at %s: %s",
+                  kg_code, count, step, error)
+        return True
+    else:
+        progress.add_log(
+            "warning",
+            f"KG {kg_code} failed ({count}/{MAX_FAILURES}) at {step}: {error}",
+            kg_code)
+        log.warning("KG %s: failure %d/%d at %s: %s",
+                    kg_code, count, MAX_FAILURES, step, error)
+        return False
+
+
 def _copernicus_probe() -> bool:
     """Try a tiny Copernicus request to check if credits are back."""
     try:
@@ -6009,6 +6059,7 @@ def main():
     # --- Load failed KGs + handle crash recovery ---
     failed_kgs = _load_failed_kgs()
     retried_kgs = _load_retried_kgs()
+    failure_counts = _load_failure_counts()
 
     # On restart, give previously-failed KGs one fresh attempt.
     # KGs that already got a retry pass stay permanently skipped.
@@ -6324,19 +6375,9 @@ def main():
                                     kg_code)
                                 progress.save()
                             else:
-                                log.error(
-                                    "KG %s: TIMEOUT at step %s on retry "
-                                    "— marking as failed",
-                                    kg_code, last_step)
-                                failed_kgs.add(kg_code)
-                                _save_failed_kgs(failed_kgs)
-                                progress.add_failure(
-                                    kg_code, kg_name, _err_msg, last_step)
-                                progress.add_log(
-                                    "error",
-                                    f"KG {kg_code} timed out at {last_step} "
-                                    f"after retry",
-                                    kg_code)
+                                _record_failure(
+                                    kg_code, failure_counts, failed_kgs,
+                                    progress, kg_name, _err_msg, last_step)
                                 progress.save()
                             with progress._lock:
                                 _ckg = progress._state.get("current_kg") or {}
@@ -6350,6 +6391,31 @@ def main():
                         step_thread = threading.Thread(target=_monitor_step_file, daemon=True)
                         step_thread.start()
                         continue
+                    except Exception as pool_exc:
+                        # Worker died unexpectedly — likely OOM kill (SIGKILL)
+                        _step_monitor_stop.set()
+                        step_thread.join(timeout=3)
+                        last_step = "unknown"
+                        try:
+                            sd = json.loads((DATA_DIR / "current_step.json").read_text())
+                            last_step = sd.get("step", "unknown")
+                        except Exception:
+                            pass
+                        pool.terminate()
+                        pool.join()
+
+                        _err_msg = f"worker killed (OOM?) at {last_step}: {pool_exc}"
+                        log.error("KG %s: %s", kg_code, _err_msg)
+                        _record_failure(
+                            kg_code, failure_counts, failed_kgs,
+                            progress, kg_name, _err_msg, last_step)
+                        with progress._lock:
+                            _ckg = progress._state.get("current_kg") or {}
+                            _ts = _ckg.get("tile_statuses", [])
+                        _save_tile_history(kg_code, _ts, "failed")
+                        progress.save()
+                        result = None
+                        break
                 finally:
                     pool.close()
                     pool.join()
@@ -6458,13 +6524,9 @@ def main():
                             f"deferred retry in {DEFER_GAP} KGs: {_err}",
                             kg_code)
                     else:
-                        progress.add_failure(
-                            kg_code, kg_name, _err, _stp)
-                        progress.add_log(
-                            "error",
-                            f"KG {kg_code} failed at {_stp}: {_err}",
-                            kg_code,
-                        )
+                        _record_failure(
+                            kg_code, failure_counts, failed_kgs,
+                            progress, kg_name, _err, _stp)
                         # Record failure in manifest for retry tracking
                         from zenodo_client import Entry
                         manifest.set(f"{kg_code}_error", Entry(
@@ -6479,9 +6541,6 @@ def main():
                             }),
                         ))
                         manifest.save()
-
-                        log.warning("KG %s: FAILED at %s: %s",
-                                    kg_code, _stp, _err)
                     # Persist tile dots for failed KG
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
@@ -6507,8 +6566,9 @@ def main():
                     f"{DEFER_GAP} KGs: {_err_str}",
                     kg_code)
             else:
-                progress.add_failure(kg_code, kg_name, _err_str, "exception")
-                progress.add_log("error", f"KG {kg_code} exception: {e}", kg_code)
+                _record_failure(
+                    kg_code, failure_counts, failed_kgs,
+                    progress, kg_name, _err_str, "exception")
             log.error("KG %s: EXCEPTION: %s", kg_code, traceback.format_exc())
             # Persist tile dots for exceptioned KG
             with progress._lock:

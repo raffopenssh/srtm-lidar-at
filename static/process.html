@@ -101,6 +101,12 @@
   .prio-tag .prio-rm:hover { opacity: 1; color: var(--red); }
   .prio-tag.dragging { opacity: 0.4; border-style: dashed; }
   .prio-tag.drag-over { border-color: var(--blue); background: rgba(88,166,255,0.18); }
+  .prio-tag.fail-1 { border-color: #6e4e15; background: rgba(210,153,34,0.1); }
+  .prio-tag.fail-1 .prio-code { color: var(--yellow); }
+  .prio-tag.fail-2 { border-color: #6e2015; background: rgba(248,81,73,0.1); }
+  .prio-tag.fail-2 .prio-code { color: var(--red); }
+  .prio-tag.fail-perm { border-color: #6e2015; background: rgba(248,81,73,0.15); cursor: default; }
+  .prio-tag.fail-perm .prio-code { color: var(--red); }
   .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
   .tile-dot {
     filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
@@ -341,6 +347,15 @@
     <span style="font-size:10px;color:var(--dim)">drag to reorder · click ✕ to remove</span>
   </div>
   <div id="prioQueueTags" class="prio-tags"></div>
+</div>
+
+<!-- Permanently Failed -->
+<div id="permFailedWrap" style="display:none">
+  <div class="sec-t" style="margin-bottom:4px;">
+    <span style="color:var(--red)">✘ Permanently Failed <span id="permFailedCount" style="color:var(--dim);font-weight:normal"></span></span>
+    <span style="font-size:10px;color:var(--dim)">≥ 3 failures · click to retry</span>
+  </div>
+  <div id="permFailedTags" class="prio-tags"></div>
 </div>
 
 <!-- Live Log -->
@@ -1162,7 +1177,8 @@ function renderLastKg(js) {
 let _prioDrawing = false;
 let _prioRect = null;
 let _prioStart = null;
-let _prioQueue = []; // [{code, name, gemeinde, district}]
+let _prioQueue = []; // [{code, name, gemeinde, district, failures}]
+let _permFailed = []; // [{code, name, gemeinde, district, failures}]
 
 function togglePriorityDraw() {
   if (_prioDrawing) { cancelPriority(); return; }
@@ -1272,8 +1288,24 @@ async function fetchPrioQueue() {
     if (!r.ok) return;
     const d = await r.json();
     _prioQueue = d.queue || [];
+    _permFailed = d.permanently_failed || [];
     renderPrioQueue();
+    renderPermFailed();
   } catch(e) { /* silent */ }
+}
+
+function _failClass(failures) {
+  if (failures >= 3) return 'fail-perm';
+  if (failures >= 2) return 'fail-2';
+  if (failures >= 1) return 'fail-1';
+  return '';
+}
+
+function _failBadge(failures) {
+  if (!failures) return '';
+  return ' <span style="font-size:9px;color:' +
+    (failures >= 2 ? 'var(--red)' : 'var(--yellow)') +
+    '" title="' + failures + ' failure(s)">⚠' + failures + '</span>';
 }
 
 function renderPrioQueue() {
@@ -1289,12 +1321,14 @@ function renderPrioQueue() {
   container.innerHTML = '';
   _prioQueue.forEach((kg, i) => {
     const tag = document.createElement('span');
-    tag.className = 'prio-tag';
+    const fc = _failClass(kg.failures);
+    tag.className = 'prio-tag' + (fc ? ' ' + fc : '');
     tag.draggable = true;
     tag.dataset.idx = i;
-    tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '');
+    tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
+      (kg.failures ? ' · ' + kg.failures + ' failure(s)' : '');
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) +
+      esc(kg.name) + _failBadge(kg.failures) +
       '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
     // Drag events
     tag.addEventListener('dragstart', e => {
@@ -1318,7 +1352,6 @@ function renderPrioQueue() {
       tag.classList.remove('drag-over');
       const from = parseInt(e.dataTransfer.getData('text/plain'), 10);
       if (isNaN(from) || from === i) return;
-      // Reorder
       const item = _prioQueue.splice(from, 1)[0];
       _prioQueue.splice(i, 0, item);
       renderPrioQueue();
@@ -1326,6 +1359,40 @@ function renderPrioQueue() {
     });
     container.appendChild(tag);
   });
+}
+
+function renderPermFailed() {
+  const wrap = document.getElementById('permFailedWrap');
+  const container = document.getElementById('permFailedTags');
+  const countEl = document.getElementById('permFailedCount');
+  if (!_permFailed.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'block';
+  countEl.textContent = '(' + _permFailed.length + ')';
+  container.innerHTML = '';
+  _permFailed.forEach(kg => {
+    const tag = document.createElement('span');
+    tag.className = 'prio-tag fail-perm';
+    tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
+      ' · ' + kg.failures + ' failure(s) · click to retry';
+    tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
+      esc(kg.name) + _failBadge(kg.failures);
+    tag.style.cursor = 'pointer';
+    tag.addEventListener('click', () => retryPermFailed(kg.code));
+    container.appendChild(tag);
+  });
+}
+
+async function retryPermFailed(code) {
+  if (!confirm('Retry permanently failed KG ' + code + '?')) return;
+  try {
+    const r = await fetch('/api/v1/processing/retry?kg=' + encodeURIComponent(code), {method:'POST'});
+    if (!r.ok) { alert('Retry failed: ' + await r.text()); return; }
+    fetchPrioQueue();
+    setTimeout(poll, 500);
+  } catch(e) { console.error(e); }
 }
 
 async function removePrioKg(event, idx) {

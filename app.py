@@ -1014,6 +1014,18 @@ def processing_retry():
         except Exception as e:
             log.warning('retry: retried_kgs.json: %s', e)
 
+    # Reset failure count
+    fc_path = data_dir / 'failure_counts.json'
+    if fc_path.exists():
+        try:
+            fc = json.loads(fc_path.read_text())
+            if kg in fc:
+                del fc[kg]
+                fc_path.write_text(json.dumps(fc, indent=2))
+                actions.append('reset failure count')
+        except Exception as e:
+            log.warning('retry: failure_counts.json: %s', e)
+
     # Remove from progress tracker failed_kgs list
     progress_path = data_dir / 'progress.json'
     if progress_path.exists():
@@ -1111,22 +1123,7 @@ def processing_prioritize():
 
     # Filter out already-processed KGs
     data_dir = Path('data/austria_processor')
-    processed = set()
-    manifest_path = data_dir / 'zenodo_manifest.json'
-    if manifest_path.exists():
-        try:
-            m = json.loads(manifest_path.read_text())
-            entries = m.get('entries', m)
-            for key in entries:
-                if key.endswith('_json') and 'error' not in entries[key].get('status', ''):
-                    processed.add(key.replace('_json', ''))
-        except Exception:
-            pass
-    json_dir = data_dir / 'json'
-    if json_dir.exists():
-        for jf in json_dir.glob('*.json'):
-            processed.add(jf.stem)
-
+    processed = _get_completed_kgs()
     unprocessed = [k for k in kgs if k not in processed]
     already_done = [k for k in kgs if k in processed]
 
@@ -1158,9 +1155,30 @@ def processing_prioritize():
     })
 
 
+def _get_completed_kgs() -> set:
+    """Return set of KG codes that have been successfully processed."""
+    data_dir = Path('data/austria_processor')
+    completed = set()
+    manifest_path = data_dir / 'zenodo_manifest.json'
+    if manifest_path.exists():
+        try:
+            m = json.loads(manifest_path.read_text())
+            entries = m.get('entries', m)
+            for key in entries:
+                if key.endswith('_json') and 'error' not in entries[key].get('status', ''):
+                    completed.add(key.replace('_json', ''))
+        except Exception:
+            pass
+    json_dir = data_dir / 'json'
+    if json_dir.exists():
+        for jf in json_dir.glob('*.json'):
+            completed.add(jf.stem)
+    return completed
+
+
 @app.route('/api/v1/processing/queue')
 def processing_queue_get():
-    """Read the priority queue with KG names."""
+    """Read the priority queue with KG names and failure counts."""
     data_dir = Path('data/austria_processor')
     retry_path = data_dir / 'retry_queue.json'
     codes = []
@@ -1169,25 +1187,62 @@ def processing_queue_get():
             codes = json.loads(retry_path.read_text())
         except Exception:
             pass
+    # Filter out already-completed KGs
+    completed = _get_completed_kgs()
+    dirty = len(codes)
+    codes = [c for c in codes if c not in completed]
+    if len(codes) < dirty:
+        # Persist the cleaned list
+        try:
+            retry_path.write_text(json.dumps(codes))
+        except Exception:
+            pass
+    # Load failure counts
+    failure_counts = {}
+    fc_path = data_dir / 'failure_counts.json'
+    if fc_path.exists():
+        try:
+            failure_counts = json.loads(fc_path.read_text())
+        except Exception:
+            pass
+    # Load permanently failed KGs — also filter out completed
+    perm_failed = []
+    failed_path = data_dir / 'failed_kgs.json'
+    if failed_path.exists():
+        try:
+            all_failed = json.loads(failed_path.read_text())
+            perm_failed = [c for c in all_failed if c not in completed]
+            if len(perm_failed) < len(all_failed):
+                failed_path.write_text(json.dumps(sorted(perm_failed), indent=2))
+        except Exception:
+            pass
     # Resolve names from search index
     items = []
+    perm_failed_items = []
     try:
         idx = si.get_index()
         conn = idx._conn()
-        for code in codes:
+        def _resolve(code):
             row = conn.execute(
                 'SELECT kg_name, gemeinde_name, district_name FROM kg WHERE kg_code=?',
                 (code,)
             ).fetchone()
             if row:
-                items.append({'code': code, 'name': row['kg_name'],
-                              'gemeinde': row['gemeinde_name'],
-                              'district': row['district_name']})
-            else:
-                items.append({'code': code, 'name': code})
+                return {'code': code, 'name': row['kg_name'],
+                        'gemeinde': row['gemeinde_name'],
+                        'district': row['district_name'],
+                        'failures': failure_counts.get(code, 0)}
+            return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0)}
+        items = [_resolve(c) for c in codes]
+        perm_failed_items = [_resolve(c) for c in perm_failed]
     except Exception:
-        items = [{'code': c, 'name': c} for c in codes]
-    return jsonify({'queue': items, 'count': len(items)})
+        items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0)} for c in codes]
+        perm_failed_items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0)} for c in perm_failed]
+    return jsonify({
+        'queue': items, 'count': len(items),
+        'permanently_failed': perm_failed_items,
+        'permanently_failed_count': len(perm_failed_items),
+    })
 
 
 @app.route('/api/v1/processing/queue', methods=['PUT'])

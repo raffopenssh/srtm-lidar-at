@@ -136,6 +136,10 @@ def check_disk_space(current_kg_code: str = "") -> bool:
                 deleted += fsize
                 freed_bytes += fsize
                 n_deleted += 1
+                # Also remove sidecar .meta.json if present
+                meta = fpath.with_name(fpath.stem + ".meta.json")
+                if meta.exists():
+                    meta.unlink(missing_ok=True)
             except OSError:
                 continue
         if deleted > 0:

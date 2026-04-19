@@ -35,6 +35,17 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _write_tile_meta(npz_path: Path, product: str,
+                     w: float, s: float, e: float, n: float,
+                     **extra):
+    """Write sidecar .meta.json for zenodo_cache reverse index."""
+    try:
+        from zenodo_cache import write_tile_meta
+        write_tile_meta(npz_path, product, w, s, e, n, **extra)
+    except Exception:
+        pass  # Non-critical — don't break cache writes
+
+
 def _atomic_savez(path: Path, **arrays) -> None:
     """Write an .npz file atomically via a temp file + rename.
 
@@ -212,6 +223,9 @@ class CopernicusTileCache:
 
     Snaps requests to 0.1° tiles (~10×7km at Austrian latitudes).
     Caches NDVI composites, ESA WorldCover, and SAR data.
+
+    On local cache miss, tries Zenodo persistent cache before falling
+    back to the expensive openEO API.  See ``zenodo_cache.py``.
     """
 
     GRID_STEP = 0.1  # degrees
@@ -220,6 +234,27 @@ class CopernicusTileCache:
     def __init__(self):
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._stats = {"hits": 0, "misses": 0, "errors": 0}
+        self._zenodo_cache = None  # lazy init
+        self._zenodo_tried = False
+
+    def _try_zenodo(self, product: str, tw: float, ts: float, te: float, tn: float,
+                    **extra) -> bool:
+        """Try to restore a tile from Zenodo.  Returns True if restored."""
+        try:
+            if self._zenodo_cache is None and not self._zenodo_tried:
+                self._zenodo_tried = True
+                from zenodo_cache import ZenodoCache, CacheManifest
+                manifest = CacheManifest()
+                if manifest.depo_id or manifest.all_files():
+                    self._zenodo_cache = ZenodoCache()
+            if self._zenodo_cache is None:
+                return False
+            result = self._zenodo_cache.fetch_copernicus(
+                product, tw, ts, te, tn, dest_dir=self.CACHE_DIR, **extra)
+            return result is not None
+        except Exception as e:
+            log.debug("Zenodo cache fetch failed for %s: %s", product, e)
+            return False
 
     def _tile_path(self, prefix: str, w: float, s: float, e: float, n: float,
                    **extra) -> Path:
@@ -252,8 +287,22 @@ class CopernicusTileCache:
                 log.warning("Corrupt Copernicus cache %s: %s", path.name, e)
                 path.unlink(missing_ok=True)
 
-        # Fetch from openEO for the full tile (with retry on server errors)
+        # Try Zenodo persistent cache before expensive API call
         self._stats["misses"] += 1
+        if self._try_zenodo("ndvi", tw, ts, te, tn, year=year) and path.exists():
+            self._stats["hits"] += 1
+            self._stats["misses"] -= 1
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                return {
+                    "ndvi": cached["ndvi"],
+                    "transform": _arr_to_affine(cached["transform"]),
+                    "crs": str(cached["crs"]),
+                }
+            except Exception:
+                path.unlink(missing_ok=True)
+
+        # Fetch from openEO for the full tile (with retry on server errors)
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
@@ -269,6 +318,7 @@ class CopernicusTileCache:
                     transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                     crs=str(result.get("crs", "EPSG:4326")),
                 )
+                _write_tile_meta(path, "ndvi", tw, ts, te, tn, year=year)
                 log.info("Copernicus NDVI tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
                          tw, ts, te, tn, result["ndvi"].shape[1], result["ndvi"].shape[0])
                 return result
@@ -308,6 +358,15 @@ class CopernicusTileCache:
                 path.unlink(missing_ok=True)
 
         self._stats["misses"] += 1
+        if self._try_zenodo("worldcover", tw, ts, te, tn) and path.exists():
+            self._stats["hits"] += 1
+            self._stats["misses"] -= 1
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                return cached["data"].item()
+            except Exception:
+                path.unlink(missing_ok=True)
+
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
@@ -316,6 +375,7 @@ class CopernicusTileCache:
                 _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
                 result = copernicus.get_land_cover(tile_bbox, _conn=_conn)
                 _atomic_savez(path, data=np.array(result, dtype=object))
+                _write_tile_meta(path, "worldcover", tw, ts, te, tn)
                 log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
                          tw, ts, te, tn)
                 return result
@@ -358,6 +418,19 @@ class CopernicusTileCache:
                 path.unlink(missing_ok=True)
 
         self._stats["misses"] += 1
+        if self._try_zenodo("sar", tw, ts, te, tn, year=year) and path.exists():
+            self._stats["hits"] += 1
+            self._stats["misses"] -= 1
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                return {
+                    "vv": cached["vv"], "vh": cached["vh"],
+                    "transform": _arr_to_affine(cached["transform"]),
+                    "crs": str(cached["crs"]),
+                }
+            except Exception:
+                path.unlink(missing_ok=True)
+
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
@@ -373,6 +446,7 @@ class CopernicusTileCache:
                     transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                     crs=str(result.get("crs", "EPSG:4326")),
                 )
+                _write_tile_meta(path, "sar", tw, ts, te, tn, year=year)
                 log.info("Copernicus SAR tile cached: %.2f,%.2f → %.2f,%.2f",
                          tw, ts, te, tn)
                 return result
@@ -427,6 +501,23 @@ class CopernicusTileCache:
                 path.unlink(missing_ok=True)
 
         self._stats["misses"] += 1
+        if self._try_zenodo("harmonics", tw, ts, te, tn, year=year) and path.exists():
+            self._stats["hits"] += 1
+            self._stats["misses"] -= 1
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                result = {}
+                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
+                    if k in cached:
+                        result[k] = cached[k]
+                if "transform" in cached:
+                    result["transform"] = _arr_to_affine(cached["transform"])
+                if "crs" in cached:
+                    result["crs"] = str(cached["crs"])
+                return result
+            except Exception:
+                path.unlink(missing_ok=True)
+
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
@@ -448,6 +539,7 @@ class CopernicusTileCache:
                         [tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
                 save_kw["crs"] = str(result.get("crs", "EPSG:4326"))
                 _atomic_savez(path, **save_kw)
+                _write_tile_meta(path, "harmonics", tw, ts, te, tn, year=year)
                 log.info("Copernicus harmonics tile cached: %.2f,%.2f → %.2f,%.2f",
                          tw, ts, te, tn)
                 return result
@@ -486,6 +578,9 @@ class HansenTileCache:
     Snaps requests to 0.5° tiles (~50×35km).
     Hansen GFC is one global tile per 10° square (50N_010E covers all Austria),
     read via /vsicurl/ HTTP range requests. Caching avoids redundant range reads.
+
+    On local cache miss, tries Zenodo persistent cache before falling
+    back to the slow UMD servers.  See ``zenodo_cache.py``.
     """
 
     GRID_STEP = 0.5  # degrees — larger tiles since Hansen is 30m
@@ -494,6 +589,8 @@ class HansenTileCache:
     def __init__(self):
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._stats = {"hits": 0, "misses": 0, "errors": 0}
+        self._zenodo_cache = None  # lazy init
+        self._zenodo_tried = False
 
     def _tile_path(self, w: float, s: float, e: float, n: float) -> Path:
         key = tile_key("hansen", w, s, e, n)
@@ -532,8 +629,35 @@ class HansenTileCache:
                 log.warning("Corrupt Hansen cache %s: %s", path.name, e)
                 path.unlink(missing_ok=True)
 
-        # Fetch from remote
+        # Try Zenodo persistent cache before remote fetch
         self._stats["misses"] += 1
+        try:
+            if self._zenodo_cache is None and not self._zenodo_tried:
+                self._zenodo_tried = True
+                from zenodo_cache import ZenodoCache, CacheManifest
+                manifest = CacheManifest()
+                if manifest.depo_id or manifest.all_files():
+                    self._zenodo_cache = ZenodoCache()
+        except Exception:
+            pass
+        if self._zenodo_cache is not None:
+            try:
+                restored = self._zenodo_cache.fetch_hansen(
+                    tw, ts, te, tn, dest_dir=self.CACHE_DIR)
+                if restored and path.exists():
+                    self._stats["hits"] += 1
+                    self._stats["misses"] -= 1
+                    cached = np.load(str(path), allow_pickle=True)
+                    result = {}
+                    for layer in ["treecover2000", "lossyear", "gain", "datamask"]:
+                        if layer in cached:
+                            result[layer] = cached[layer]
+                    result["transform"] = _arr_to_affine(cached["transform"])
+                    result["shape"] = tuple(cached["shape"])
+                    return result
+            except Exception as e:
+                log.debug("Zenodo Hansen fetch failed: %s", e)
+
         try:
             import hansen
             tile_bbox = (tw, ts, te, tn)
@@ -550,6 +674,7 @@ class HansenTileCache:
                 if layer in raw:
                     save_dict[layer] = raw[layer]
             _atomic_savez(path, **save_dict)
+            _write_tile_meta(path, "hansen", tw, ts, te, tn)
             log.info("Hansen tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
                      tw, ts, te, tn, raw["shape"][1], raw["shape"][0])
             return raw

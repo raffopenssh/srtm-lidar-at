@@ -774,7 +774,7 @@ Two modes in one endpoint:
 ```
 Max 200 parcels. Returns cadastre + landscape data + conservation score per parcel.
 
-**Mode 2 — Query-based (supports ALL cadastre query filters):**
+**Mode 2 — Cadastre query (supports ALL cadastre query filters):**
 ```json
 {
   "query": {
@@ -814,6 +814,51 @@ has_legal_refs, legal_context, bbox coords, sort).
 
 Response: {results: [{parcel_id, kg_code, cadastre: {...}, landscape: {...},
 conservation_score: 0-100}], total, offset, limit, meta}
+
+**Mode 3 — Landscape-first (compound → parcels) ← THE POWER QUERY:**
+Starts from our landscape index (compound query on KGs), finds matching KGs,
+loads per-parcel detail from our KG JSONs, applies per-parcel filters,
+optionally enriches with cadastre. This answers: "give me 100 parcels where
+tree confidence > 0.8, area > 800m², grass confidence > 0.8, no buildings,
+SW aspect, rugged terrain."
+
+```json
+{
+  "compound": {
+    "type_filters": [
+      {"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800},
+      {"type": "grass", "min_confidence": 0.8, "min_area_sqm": 1300}
+    ],
+    "max_buildings": 0,
+    "aspect": ["S", "SW", "W"],
+    "min_roughness": 2.0
+  },
+  "parcel_filters": {
+    "min_vegetated_fraction": 0.5,
+    "types": ["tree", "grass"],
+    "min_type_fraction": 0.1,
+    "cadastre_has_buildings": false,
+    "cadastre_landuse": "W",
+    "sort": "conservation_score"
+  },
+  "cadastre_enrich": true,
+  "limit": 100
+}
+```
+
+compound supports all SearchIndex.query_compound() filters:
+  bbox, state, district, gemeinde, aspect, dominant_type, phenology,
+  min_slope, min_roughness, min_elevation, max_elevation, min_ndvi,
+  min_vegetated_fraction, max_buildings, min_tree_count, min_tree_canopy_sqm,
+  min_confidence, min_rf_confidence, type_filters, landcover_filters, sort, sort_dir
+
+parcel_filters (per-parcel from our KG JSONs):
+  min_vegetated_fraction, max_vegetated_fraction, min_elevation, max_elevation,
+  types (list), min_type_fraction, min_ndsm_max, max_ndsm_max,
+  min_parcel_area, max_parcel_area, is_vegetated, min_rf_confidence,
+  cadastre_has_buildings, cadastre_landuse, cadastre_min_area, cadastre_max_area,
+  sort (conservation_score|vegetated_fraction|elevation|ndsm_max|parcel_area),
+  sort_dir (asc|desc)
 
 ### GET /api/v1/parcels/landscape
 Same as batch query mode but via GET params.

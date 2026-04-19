@@ -175,12 +175,19 @@ Contain: UI state + analysis result + cached overlay images.
 | GET | `/api/v1/cadastre/landuse/distribution` | Proxy: landuse distribution |
 | GET | `/api/v1/cadastre/landuse/codes` | Proxy: landuse reference codes |
 
-`POST /api/v1/parcels/batch` supports two modes:
+`POST /api/v1/parcels/batch` supports three modes:
 - **IDs mode**: `{"parcel_ids": ["63349-505/3", ...]}`  (max 200)
-- **Query mode**: `{"query": {<any cadastre /query params>}, "landscape_filters": {<landscape post-filters>}}`
+- **Cadastre query**: `{"query": {<cadastre /query params>}, "landscape_filters": {<post-filters>}}`
+- **Compound (landscape-first)**: `{"compound": {<compound filters>}, "parcel_filters": {<per-parcel filters>}}`
+  Starts from our landscape index → finds KGs → expands to parcels from KG JSONs → enriches with cadastre.
+  This is the power query. Answers: "100 parcels with tree conf>0.8 area>800 + no buildings + SW aspect + rugged."
 
-Landscape filters: `min_vegetated_fraction`, `min_ndvi`, `min_tree_canopy_sqm`,
-`min_elevation`, `max_elevation`, `min_conservation_score`, `dominant_type`, `sort`, `sort_dir`
+Compound filters: all `query_compound()` params (type_filters, landcover_filters, bbox, state,
+min_roughness, aspect, min_elevation, min_ndvi, etc.)
+
+Parcel filters: `min_vegetated_fraction`, `types`, `min_type_fraction`, `min_ndsm_max`,
+`min_elevation`, `min_parcel_area`, `is_vegetated`, `min_rf_confidence`,
+`cadastre_has_buildings`, `cadastre_landuse`, `cadastre_min_area`, `sort`, `sort_dir`
 
 Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
 Auto-rebuilt on startup and when new KG JSONs appear (60s poll).

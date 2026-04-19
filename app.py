@@ -1932,46 +1932,62 @@ def api_lookup():
 
 @app.route('/api/v1/parcels/batch', methods=['POST'])
 def api_parcels_batch():
-    """Batch parcel landscape enrichment.
-
-    Accepts either explicit parcel IDs or a cadastre query to find parcels,
-    then enriches each with landscape analysis data and conservation scoring.
+    """Batch parcel landscape enrichment — 3 modes.
 
     Mode 1 — Explicit IDs:
       Body: {"parcel_ids": ["63349-505/3", "75414-1314/1", ...]}
       Max 200 parcel IDs per request.
 
-    Mode 2 — Query:
+    Mode 2 — Cadastre query:
       Body: {
-        "query": {                    // Cadastre query filters
-          "kg": "63349",             // or gemeinde, district, state, plz
-          "landuse": "W",            // landuse code or abbreviation
-          "min_area": 1000,          // min parcel area sqm
-          "max_area": 50000,         // max parcel area sqm
-          "has_buildings": false,     // building presence filter
-          "has_legal_refs": true,     // legal reference filter
-          "legal_context": "nature_protection",
-          "sort": "area_desc"        // cadastre sort
+        "query": {<cadastre /query params>},
+        "landscape_filters": {<landscape post-filters>},
+        "limit": 50, "offset": 0
+      }
+
+    Mode 3 — Landscape-first (compound → parcels):
+      Start from our landscape index, find KGs matching compound filters,
+      then expand to individual parcels from our KG JSONs.
+      This is the power query for nature conservation screening.
+
+      Body: {
+        "compound": {                 // SearchIndex.query_compound() filters
+          "type_filters": [
+            {"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800},
+            {"type": "grass", "min_confidence": 0.8, "min_area_sqm": 1300}
+          ],
+          "max_buildings": 0,
+          "aspect": ["S", "SW", "W"],
+          "min_roughness": 2.0,
+          // also: bbox, state, district, gemeinde, min_slope, min_elevation,
+          // min_ndvi, min_vegetated_fraction, min_tree_count, phenology,
+          // landcover_filters, sort, sort_dir, etc.
         },
-        "landscape_filters": {        // Post-filter on landscape data
+        "parcel_filters": {           // Per-parcel post-filters on our JSON data
           "min_vegetated_fraction": 0.5,
-          "min_ndvi": 0.3,
-          "min_tree_canopy_sqm": 200,
           "min_elevation": 500,
           "max_elevation": 2000,
-          "min_conservation_score": 40,
-          "dominant_type": "tree",
-          "sort": "conservation_score",  // conservation_score|area|ndvi|tree_canopy|vegetated_fraction
+          "types": ["tree", "grass"],  // require these types in parcel
+          "min_type_fraction": 0.1,   // min fraction per required type
+          "min_ndsm_max": 5,          // min height above ground (m)
+          "min_parcel_area": 1000,    // min parcel area (sqm)
+          "is_vegetated": true,
+          "min_rf_confidence": 0.7,
+          // Cadastre-side filters (applied after enrichment):
+          "cadastre_has_buildings": false,
+          "cadastre_landuse": "W",
+          "cadastre_min_area": 5000,
+          "sort": "conservation_score", // |vegetated_fraction|elevation|ndsm_max
           "sort_dir": "desc"
         },
-        "limit": 50,
-        "offset": 0
+        "cadastre_enrich": true,      // fetch cadastre data (default true)
+        "limit": 100, "offset": 0
       }
 
     Returns:
-      {"results": [{"parcel_id": ..., "cadastre": {...}, "landscape": {...},
-                     "conservation_score": N}, ...],
-       "total": N, "meta": {...}}
+      {"results": [{"parcel_id": ..., "kg_code": ..., "landscape": {...},
+                     "cadastre": {...}|null, "conservation_score": N}, ...],
+       "total": N, "offset": N, "limit": N, "meta": {...}}
     """
     try:
         body = request.get_json(force=True) or {}
@@ -2007,7 +2023,25 @@ def api_parcels_batch():
             )
             return jsonify(result)
 
-        return jsonify({'error': 'Body must contain "parcel_ids" (list) or "query" (dict)'}), 400
+        # Mode 3: Landscape-first (compound query → parcels from our KG JSONs)
+        if 'compound' in body:
+            compound_filters = body['compound']
+            if not isinstance(compound_filters, dict) or not compound_filters:
+                return jsonify({'error': 'compound must be a non-empty dict of landscape filter params'}), 400
+            parcel_filters = body.get('parcel_filters') or {}
+            cadastre_enrich = body.get('cadastre_enrich', True)
+            limit = min(int(body.get('limit', 100)), 1000)
+            offset = int(body.get('offset', 0))
+            result = cb.landscape_parcel_query(
+                compound_filters=compound_filters,
+                parcel_filters=parcel_filters,
+                cadastre_enrich=cadastre_enrich,
+                limit=limit,
+                offset=offset,
+            )
+            return jsonify(result)
+
+        return jsonify({'error': 'Body must contain "parcel_ids" (list), "query" (dict), or "compound" (dict)'}), 400
 
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502

@@ -614,6 +614,301 @@ def batch_parcel_landscape_by_query(query_filters: dict, landscape_filters: dict
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Landscape-first parcel query (compound → parcels)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def landscape_parcel_query(compound_filters: dict,
+                           parcel_filters: dict | None = None,
+                           cadastre_enrich: bool = True,
+                           limit: int = 100, offset: int = 0) -> dict:
+    """Landscape-first parcel query: compound filter on KGs → expand to parcels.
+
+    This is the core power query. It starts from OUR landscape index
+    (RF classification confidence, aspect, roughness, elevation, NDVI, trees,
+    etc.), finds matching KGs, then loads per-parcel landscape detail from
+    our KG JSONs, applies parcel-level post-filters, and optionally enriches
+    with cadastre data.
+
+    Flow:
+        1. compound_filters → search index → matching KG codes
+        2. Load KG JSONs → extract per-parcel details (area_summary,
+           classification, heights, vegetated_fraction, elevation)
+        3. Apply parcel_filters (per-parcel landscape post-filters)
+        4. Optionally enrich with cadastre data (landuse, legal refs, etc.)
+        5. Score, sort, paginate, return
+
+    Args:
+        compound_filters: Any filters accepted by SearchIndex.query_compound():
+            bbox, state, district, gemeinde, aspect, dominant_type, phenology,
+            quality_grade, min_slope, min_roughness, min_elevation, max_elevation,
+            min_tree_count, min_tree_canopy_sqm, min_ndvi, min_vegetated_fraction,
+            max_buildings, min_new_buildings, min_confidence, min_rf_confidence,
+            type_filters: [{type, min_confidence, min_area_sqm}, ...],
+            landcover_filters: [{type, min_area_sqm, min_fraction}, ...],
+            sort, sort_dir.
+        parcel_filters: Per-parcel post-filters on our JSON data:
+            min_vegetated_fraction: float (0-1)
+            max_vegetated_fraction: float (0-1)
+            min_elevation: float (metres)
+            max_elevation: float (metres)
+            types: list[str] — require these types in parcel area_summary
+            min_type_fraction: float — min fraction for each required type
+            min_ndsm_max: float — min nDSM max height (metres)
+            max_ndsm_max: float — max nDSM max height
+            min_parcel_area: float — min parcel area (sqm)
+            max_parcel_area: float — max parcel area (sqm)
+            is_vegetated: bool — only vegetated parcels
+            min_rf_confidence: float — min mean RF confidence per parcel
+            cadastre_landuse: str — require cadastre landuse code/abbr
+            cadastre_has_buildings: bool — building presence filter
+            cadastre_min_area: float — min cadastre area (sqm)
+            cadastre_max_area: float — max cadastre area (sqm)
+            sort: str — conservation_score|vegetated_fraction|elevation|
+                        ndsm_max|parcel_area
+            sort_dir: str — asc|desc (default desc)
+        cadastre_enrich: Whether to fetch cadastre data for matched parcels.
+        limit: Max results (default 100, max 1000).
+        offset: Pagination offset.
+
+    Returns:
+        {results: [{parcel_id, kg_code, kg_name, landscape: {...},
+                    cadastre: {...}|null, conservation_score}],
+         total, offset, limit,
+         meta: {kgs_matched, kgs_with_json, parcels_scanned, ...}}
+    """
+    warnings = []
+    idx = si.get_index()
+
+    # Step 1: Compound query to find matching KGs
+    # Fetch up to 500 KGs (we'll scan their JSONs for parcels)
+    kg_limit = min(compound_filters.pop('kg_limit', 500), 500)
+    kg_result = idx.query_compound(compound_filters, limit=kg_limit, offset=0)
+    kg_codes = [r['kg_code'] for r in kg_result.get('results', [])]
+
+    if not kg_codes:
+        return {
+            'results': [], 'total': 0, 'offset': offset, 'limit': limit,
+            'meta': {'kgs_matched': 0, 'kgs_with_json': 0, 'parcels_scanned': 0,
+                     'compound_total': kg_result.get('total', 0)}
+        }
+
+    # Step 2: Load KG JSONs, extract per-parcel details
+    pf = parcel_filters or {}
+    all_parcels = []
+    kgs_with_json = 0
+    parcels_scanned = 0
+
+    for kg_code in kg_codes:
+        kg_data = _load_kg_json(kg_code)
+        if not kg_data:
+            continue
+        kgs_with_json += 1
+
+        kg_name = kg_data.get('kg_name', '')
+        kg_state = kg_data.get('state', '')
+
+        for pd in kg_data.get('parcels', {}).get('details', []):
+            parcels_scanned += 1
+            pid = pd.get('parcel_id', '')
+            if not pid:
+                continue
+
+            # Step 3: Apply parcel-level filters
+
+            # Parcel area filter
+            p_area = pd.get('area_sqm', 0)
+            if pf.get('min_parcel_area') and p_area < pf['min_parcel_area']:
+                continue
+            if pf.get('max_parcel_area') and p_area > pf['max_parcel_area']:
+                continue
+
+            # Vegetation filter
+            veg_frac = pd.get('vegetated_fraction', 0) or 0
+            if pf.get('min_vegetated_fraction') is not None and veg_frac < pf['min_vegetated_fraction']:
+                continue
+            if pf.get('max_vegetated_fraction') is not None and veg_frac > pf['max_vegetated_fraction']:
+                continue
+            if pf.get('is_vegetated') is not None:
+                is_veg = pd.get('is_vegetated', False)
+                if pf['is_vegetated'] != is_veg:
+                    continue
+
+            # Elevation filter
+            elev = pd.get('elevation_m')
+            if elev is not None:
+                if pf.get('min_elevation') is not None and elev < pf['min_elevation']:
+                    continue
+                if pf.get('max_elevation') is not None and elev > pf['max_elevation']:
+                    continue
+
+            # nDSM height filter
+            ndsm_max = pd.get('ndsm_max_m')
+            if ndsm_max is not None:
+                if pf.get('min_ndsm_max') is not None and ndsm_max < pf['min_ndsm_max']:
+                    continue
+                if pf.get('max_ndsm_max') is not None and ndsm_max > pf['max_ndsm_max']:
+                    continue
+
+            # Type presence filter
+            area_summary = pd.get('area_summary', {})
+            required_types = pf.get('types')
+            if required_types:
+                min_frac = pf.get('min_type_fraction', 0)
+                if not all(
+                    area_summary.get(t, {}).get('fraction', 0) >= min_frac
+                    for t in required_types
+                ):
+                    continue
+
+            # RF confidence filter (per-parcel classification)
+            cls = pd.get('classification', {})
+            if pf.get('min_rf_confidence') is not None:
+                parcel_rf_conf = cls.get('rf_mean_confidence', 0) or cls.get('mean_confidence', 0)
+                if parcel_rf_conf < pf['min_rf_confidence']:
+                    continue
+
+            # Build landscape dict
+            landscape = _extract_landscape_from_parcel(pd)
+            landscape['_source'] = 'parcel_json'
+
+            entry = {
+                'parcel_id': pid,
+                'kg_code': kg_code,
+                'kg_name': kg_name,
+                'state': kg_state,
+                'landscape': landscape,
+                'cadastre': None,  # filled in step 4
+            }
+            if pd.get('centroid'):
+                entry['centroid'] = pd['centroid']
+            if pd.get('elevation_m') is not None:
+                entry['elevation_m'] = pd['elevation_m']
+
+            all_parcels.append(entry)
+
+    total_matched = len(all_parcels)
+
+    # Step 4: Optionally enrich with cadastre data
+    if cadastre_enrich and all_parcels:
+        # Group by KG, batch-query cadastre for each KG's parcels
+        from collections import defaultdict
+        kg_pids: dict[str, list[int]] = defaultdict(list)  # kg → indices into all_parcels
+        for i, entry in enumerate(all_parcels):
+            kg_pids[entry['kg_code']].append(i)
+
+        for kg_code, indices in kg_pids.items():
+            try:
+                cad_resp = cadastre_proxy('/search/parcel', params={
+                    'kg': kg_code,
+                    'limit': 10000,
+                })
+                # Build lookup by parcel_id
+                cad_map = {}
+                for item in cad_resp.get('data', []):
+                    cpid = item.get('parcel_id')
+                    if cpid:
+                        cad_map[cpid] = item
+
+                for idx_i in indices:
+                    pid = all_parcels[idx_i]['parcel_id']
+                    cad = cad_map.get(pid)
+                    if cad:
+                        all_parcels[idx_i]['cadastre'] = {
+                            'area_sqm': cad.get('area_sqm'),
+                            'landuse_codes': cad.get('landuse_codes'),
+                            'landuse_summary': cad.get('landuse_summary'),
+                            'ez': cad.get('ez'),
+                            'building_count': cad.get('building_count'),
+                            'legal_refs': cad.get('legal_refs'),
+                            'legal_contexts': cad.get('legal_contexts'),
+                        }
+            except CadastreError as e:
+                warnings.append(f'Cadastre enrichment failed for KG {kg_code}: {e}')
+
+        # Apply cadastre-side post-filters (only possible after enrichment)
+        if any(k.startswith('cadastre_') for k in pf):
+            filtered = []
+            for entry in all_parcels:
+                cad = entry.get('cadastre') or {}
+
+                if pf.get('cadastre_has_buildings') is not None:
+                    bc = cad.get('building_count', 0) or 0
+                    if pf['cadastre_has_buildings'] and bc == 0:
+                        continue
+                    if not pf['cadastre_has_buildings'] and bc > 0:
+                        continue
+
+                if pf.get('cadastre_min_area') is not None:
+                    ca = cad.get('area_sqm', 0) or 0
+                    if ca < pf['cadastre_min_area']:
+                        continue
+
+                if pf.get('cadastre_max_area') is not None:
+                    ca = cad.get('area_sqm', 0) or 0
+                    if ca > pf['cadastre_max_area']:
+                        continue
+
+                if pf.get('cadastre_landuse'):
+                    codes = cad.get('landuse_codes', '') or ''
+                    summary = cad.get('landuse_summary', {}) or {}
+                    target = pf['cadastre_landuse']
+                    # Match against codes string or summary keys
+                    if target not in codes and not any(target.lower() in k.lower() for k in summary):
+                        continue
+
+                filtered.append(entry)
+            all_parcels = filtered
+            total_matched = len(all_parcels)
+
+    # Compute conservation scores
+    for entry in all_parcels:
+        legal_refs = (entry.get('cadastre') or {}).get('legal_refs')
+        veg_frac = (entry.get('landscape') or {}).get('vegetated_fraction', 0) or 0
+        ndvi_val = (entry.get('landscape') or {}).get('ndvi_mean', 0) or 0
+        tree_sqm = (entry.get('landscape') or {}).get('tree_canopy_sqm', 0) or 0
+        entry['conservation_score'] = compute_conservation_score(
+            legal_refs=legal_refs,
+            vegetated_fraction=veg_frac,
+            ndvi=ndvi_val,
+            tree_canopy_sqm=tree_sqm,
+        )
+
+    # Sort
+    sort_key = pf.get('sort', 'conservation_score')
+    sort_desc = pf.get('sort_dir', 'desc').lower() != 'asc'
+    sort_funcs = {
+        'conservation_score': lambda e: e.get('conservation_score', 0),
+        'vegetated_fraction': lambda e: (e.get('landscape') or {}).get('vegetated_fraction', 0) or 0,
+        'elevation': lambda e: e.get('elevation_m') or 0,
+        'ndsm_max': lambda e: (e.get('landscape') or {}).get('ndsm_max_m', 0) or 0,
+        'parcel_area': lambda e: e.get('landscape', {}).get('area_summary', {}).get('tree', {}).get('area_sqm', 0),
+    }
+    sort_fn = sort_funcs.get(sort_key, sort_funcs['conservation_score'])
+    all_parcels.sort(key=sort_fn, reverse=sort_desc)
+
+    # Paginate
+    page = all_parcels[offset:offset + limit]
+
+    result = {
+        'results': page,
+        'total': total_matched,
+        'offset': offset,
+        'limit': limit,
+        'meta': {
+            'compound_total_kgs': kg_result.get('total', 0),
+            'kgs_matched': len(kg_codes),
+            'kgs_with_json': kgs_with_json,
+            'parcels_scanned': parcels_scanned,
+            'parcels_matched': total_matched,
+            'cadastre_enriched': cadastre_enrich,
+        },
+    }
+    if warnings:
+        result['_warnings'] = warnings
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Nature conservation screening
 # ═══════════════════════════════════════════════════════════════════════════
 

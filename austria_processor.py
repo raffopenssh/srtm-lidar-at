@@ -1120,99 +1120,52 @@ def resolve_edge_clipped_features(
 # === SECTION: GPKG CRS fix + style + vector writers (shared by full + light builders) ===
 
 def _fix_gpkg_raster_crs(gpkg_path: str):
-    """Ensure all raster layers in a GPKG have valid CRS registration.
+    """Ensure GPKG raster layers are properly registered for QGIS.
 
-    GDAL's GPKG driver registers uint8 rasters as data_type='tiles' instead of
-    '2d-gridded-coverage'. QGIS may not read CRS from 'tiles'-type layers,
-    showing a "Layer has no CRS" warning. This function:
-      1. Converts any 'tiles' entries in gpkg_contents to '2d-gridded-coverage'
-      2. Ensures the gpkg_2d_gridded_coverage_ancillary table + rows exist
-      3. Ensures the gpkg_2d_gridded_tile_ancillary table exists
-      4. Registers the gridded coverage extension in gpkg_extensions
+    Layers written by rasterio fall into two categories:
+    - float32 (DTM/DSM/etc): already '2d-gridded-coverage' with proper ancillary
+    - uint8 (Ortho/CIR/segment_type/WorldCover/Hansen): registered as 'tiles'
+
+    The 'tiles' data_type is the correct GPKG standard for PNG/JPEG tile pyramids.
+    GDAL and QGIS both read CRS from 'tiles' layers via gpkg_tile_matrix_set.srs_id.
+    Do NOT convert 'tiles' to '2d-gridded-coverage' — that extension is for
+    single-band gridded elevation data (TIFF tiles) and breaks multi-band
+    JPEG/PNG layers (Ortho, CIR) in QGIS, causing 'h_band null' errors and
+    the raster to appear at 0,0 without CRS.
+
+    This function only ensures the gpkg_spatial_ref_sys entry is complete
+    (has both WKT1 and WKT2 definitions) so all QGIS/GDAL versions can
+    resolve the CRS.
     """
     import sqlite3
     if not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0:
         return
     conn = sqlite3.connect(gpkg_path)
     try:
-        # Find raster layers registered as 'tiles' that should be '2d-gridded-coverage'
-        tile_rows = conn.execute(
-            "SELECT table_name FROM gpkg_contents WHERE data_type = 'tiles'"
-        ).fetchall()
-        if not tile_rows:
-            return  # nothing to fix
-
-        tile_names = [r[0] for r in tile_rows]
-        log.info("Fixing GPKG raster CRS for %d 'tiles' layers: %s",
-                 len(tile_names), tile_names)
-
-        # 1. Update data_type
-        conn.execute(
-            "UPDATE gpkg_contents SET data_type = '2d-gridded-coverage' "
-            "WHERE data_type = 'tiles'"
-        )
-
-        # 2. Ensure ancillary tables exist
-        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_coverage_ancillary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tile_matrix_set_name TEXT NOT NULL,
-            datatype TEXT NOT NULL DEFAULT 'integer',
-            scale REAL NOT NULL DEFAULT 1.0,
-            "offset" REAL NOT NULL DEFAULT 0.0,
-            precision REAL DEFAULT 1.0,
-            data_null REAL,
-            grid_cell_encoding TEXT DEFAULT 'grid-value-is-center',
-            uom TEXT,
-            field_name TEXT DEFAULT 'Height',
-            quantity_definition TEXT DEFAULT 'Height'
-        )''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_tile_ancillary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tpudt_name TEXT NOT NULL,
-            tpudt_id INTEGER NOT NULL,
-            scale REAL NOT NULL DEFAULT 1.0,
-            "offset" REAL NOT NULL DEFAULT 0.0,
-            min REAL DEFAULT NULL,
-            max REAL DEFAULT NULL,
-            mean REAL DEFAULT NULL,
-            std_dev REAL DEFAULT NULL
-        )''')
-
-        # 3. Add ancillary rows for newly-converted layers
-        for tname in tile_names:
-            existing = conn.execute(
-                "SELECT 1 FROM gpkg_2d_gridded_coverage_ancillary "
-                "WHERE tile_matrix_set_name = ?", (tname,)
-            ).fetchone()
-            if not existing:
+        # Ensure EPSG:3035 has both WKT1 (definition) and WKT2 (definition_12_063)
+        row = conn.execute(
+            "SELECT definition, definition_12_063 FROM gpkg_spatial_ref_sys "
+            "WHERE srs_id = 3035"
+        ).fetchone()
+        if row:
+            wkt1, wkt2 = row
+            needs_update = False
+            if not wkt1 or wkt1 == 'undefined':
+                from pyproj import CRS
+                wkt1 = CRS.from_epsg(3035).to_wkt('WKT1_GDAL')
+                needs_update = True
+            if not wkt2 or wkt2 == 'undefined':
+                from pyproj import CRS
+                wkt2 = CRS.from_epsg(3035).to_wkt('WKT2_2019')
+                needs_update = True
+            if needs_update:
                 conn.execute(
-                    'INSERT INTO gpkg_2d_gridded_coverage_ancillary '
-                    '(tile_matrix_set_name, datatype, scale, "offset") '
-                    'VALUES (?, ?, ?, ?)',
-                    (tname, 'integer', 1.0, 0.0)
+                    "UPDATE gpkg_spatial_ref_sys "
+                    "SET definition = ?, definition_12_063 = ? "
+                    "WHERE srs_id = 3035",
+                    (wkt1, wkt2)
                 )
-
-        # 4. Register the gridded coverage extension
-        try:
-            conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_extensions (
-                table_name TEXT,
-                column_name TEXT,
-                extension_name TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)
-            )''')
-            for tname in tile_names:
-                conn.execute(
-                    'INSERT OR IGNORE INTO gpkg_extensions '
-                    '(table_name, column_name, extension_name, definition, scope) '
-                    'VALUES (?, NULL, ?, ?, ?)',
-                    (tname, 'gpkg_2d_gridded_coverage',
-                     'http://www.geopackage.org/18-000.html', 'read-write')
-                )
-        except Exception:
-            pass  # extension table may already have constraints
-
+                log.info("Updated EPSG:3035 WKT definitions in %s", gpkg_path)
         conn.commit()
     except Exception as e:
         log.warning("GPKG CRS fix failed for %s: %s", gpkg_path, e)
@@ -1295,28 +1248,40 @@ def _viridis_rgb(t):
 
 def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
                                    color_mode: str = 'type'):
-    """Write a QGIS-compatible layer_styles table for auto-rendering."""
+    """Write a QGIS categorized renderer style for segment vectors.
+
+    Produces a proper legend with one entry per object type, coloured
+    to match the raster segment_type palette.
+    """
     import sqlite3
-    color_field = 'color_height' if color_mode == 'height' else 'color'
+    from object_segmentation import OBJECT_TYPES as _OT
+
+    # Build categorized renderer with one category per type
+    categories = []
+    symbols = []
+    for idx, (type_name, rgba) in enumerate(sorted(
+            SEGMENT_COLORS.items(), key=lambda x: _OT.get(x[0], 99))):
+        r, g, b, a = rgba
+        symbols.append(
+            f'<symbol type="fill" name="{idx}" alpha="0.7">'
+            f'<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
+            f'<Option type="Map">'
+            f'<Option type="QString" value="{r},{g},{b},{a}" name="color"/>'
+            f'<Option type="QString" value="50,50,50,180" name="outline_color"/>'
+            f'<Option type="QString" value="0.2" name="outline_width"/>'
+            f'</Option></layer></symbol>'
+        )
+        categories.append(
+            f'<category value="{type_name}" symbol="{idx}" label="{type_name}"/>'
+        )
+
     qml = (
         '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
         '<qgis version="3.34">'
-        '<renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0">'
-        '<symbols>'
-        '<symbol type="fill" name="0" clip_to_extent="1" alpha="0.7">'
-        '<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
-        '<Option type="Map">'
-        '<Option type="QString" value="solid" name="style"/>'
-        '<Option type="QString" value="0.35,0.35,0.35,255,rgb:0,0,0,1" name="outline_color"/>'
-        '<Option type="QString" value="0.2" name="outline_width"/>'
-        '</Option>'
-        f'<data_defined_properties><Property><Option type="Map">'
-        f'<Option type="Map" name="properties"><Option type="Map" name="fillColor">'
-        f'<Option type="bool" value="true" name="active"/>'
-        f'<Option type="QString" value="&quot;{color_field}&quot;" name="expression"/>'
-        f'<Option type="int" value="3" name="type"/>'
-        f'</Option></Option></Option></Property></data_defined_properties>'
-        '</layer></symbol></symbols></renderer-v2></qgis>'
+        '<renderer-v2 type="categorizedSymbol" attr="type" symbollevels="0">'
+        '<categories>' + ''.join(categories) + '</categories>'
+        '<symbols>' + ''.join(symbols) + '</symbols>'
+        '</renderer-v2></qgis>'
     )
     conn = sqlite3.connect(gpkg_path)
     try:
@@ -1418,6 +1383,10 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             # Classification
             ('confidence', 'float'),
             ('is_manmade', 'int'),
+            ('classifier', 'str'),
+            ('rf_model', 'str'),
+            ('rf_type', 'str'),
+            ('rf_confidence', 'float'),
             # Rendering
             ('color', 'str'),
             ('color_height', 'str'),
@@ -1481,6 +1450,10 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
                     'phenology_class': obj.phenology_class or '',
                     'confidence': round(obj.confidence, 3),
                     'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'classifier': getattr(obj, 'classifier_source', 'rules'),
+                    'rf_model': getattr(obj, 'rf_model_hash', ''),
+                    'rf_type': getattr(obj, 'rf_type', ''),
+                    'rf_confidence': round(getattr(obj, 'rf_confidence', 0.0), 3),
                     'color': hex_type,
                     'color_height': hex_height,
                     'obs_year': obs_year or 0,
@@ -1557,6 +1530,10 @@ def _write_segment_points(gpkg_path: str, objects: list,
             # Classification
             ('confidence', 'float'),
             ('is_manmade', 'int'),
+            ('classifier', 'str'),
+            ('rf_model', 'str'),
+            ('rf_type', 'str'),
+            ('rf_confidence', 'float'),
             # Rendering
             ('color', 'str'),
             ('color_height', 'str'),
@@ -1619,6 +1596,10 @@ def _write_segment_points(gpkg_path: str, objects: list,
                     'phenology_class': obj.phenology_class or '',
                     'confidence': round(obj.confidence, 3),
                     'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'classifier': getattr(obj, 'classifier_source', 'rules'),
+                    'rf_model': getattr(obj, 'rf_model_hash', ''),
+                    'rf_type': getattr(obj, 'rf_type', ''),
+                    'rf_confidence': round(getattr(obj, 'rf_confidence', 0.0), 3),
                     'color': hex_type,
                     'color_height': hex_height,
                     'obs_year': obs_year or 0,
@@ -1635,28 +1616,37 @@ def _write_segment_points(gpkg_path: str, objects: list,
 
 
 def _write_gpkg_point_style(gpkg_path: str, layer_name: str):
-    """Write QGIS-compatible point style using data-defined colour."""
+    """Write QGIS categorized point style matching segment type colours."""
     import sqlite3
+    from object_segmentation import OBJECT_TYPES as _OT
+
+    categories = []
+    symbols = []
+    for idx, (type_name, rgba) in enumerate(sorted(
+            SEGMENT_COLORS.items(), key=lambda x: _OT.get(x[0], 99))):
+        r, g, b, a = rgba
+        symbols.append(
+            f'<symbol type="marker" name="{idx}" alpha="0.8">'
+            f'<layer class="SimpleMarker" enabled="1" locked="0" pass="0">'
+            f'<Option type="Map">'
+            f'<Option type="QString" value="circle" name="name"/>'
+            f'<Option type="QString" value="3" name="size"/>'
+            f'<Option type="QString" value="{r},{g},{b},{a}" name="color"/>'
+            f'<Option type="QString" value="50,50,50,180" name="outline_color"/>'
+            f'<Option type="QString" value="0.2" name="outline_width"/>'
+            f'</Option></layer></symbol>'
+        )
+        categories.append(
+            f'<category value="{type_name}" symbol="{idx}" label="{type_name}"/>'
+        )
+
     qml = (
         '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
         '<qgis version="3.34">'
-        '<renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0">'
-        '<symbols>'
-        '<symbol type="marker" name="0" clip_to_extent="1" alpha="0.8">'
-        '<layer class="SimpleMarker" enabled="1" locked="0" pass="0">'
-        '<Option type="Map">'
-        '<Option type="QString" value="circle" name="name"/>'
-        '<Option type="QString" value="3" name="size"/>'
-        '<Option type="QString" value="0.35,0.35,0.35,255" name="outline_color"/>'
-        '<Option type="QString" value="0.2" name="outline_width"/>'
-        '</Option>'
-        '<data_defined_properties><Property><Option type="Map">'
-        '<Option type="Map" name="properties"><Option type="Map" name="fillColor">'
-        '<Option type="bool" value="true" name="active"/>'
-        '<Option type="QString" value="&quot;color&quot;" name="expression"/>'
-        '<Option type="int" value="3" name="type"/>'
-        '</Option></Option></Option></Property></data_defined_properties>'
-        '</layer></symbol></symbols></renderer-v2></qgis>'
+        '<renderer-v2 type="categorizedSymbol" attr="type" symbollevels="0">'
+        '<categories>' + ''.join(categories) + '</categories>'
+        '<symbols>' + ''.join(symbols) + '</symbols>'
+        '</renderer-v2></qgis>'
     )
     conn = sqlite3.connect(gpkg_path)
     try:
@@ -2147,7 +2137,7 @@ def _merge_boundary_segments(
     full_h, full_w = labels_full.shape
     obj_map = {o.obj_id: o for o in all_objects}
     if len(obj_map) < 2:
-        return 0
+        return 0, {}
 
     # ------------------------------------------------------------------
     # 1. Build a tile-ownership raster to identify cross-tile adjacency.
@@ -2227,7 +2217,7 @@ def _merge_boundary_segments(
     del tile_owner
 
     if not adj_pairs:
-        return 0
+        return 0, {}
 
     # ------------------------------------------------------------------
     # 3. Filter to compatible pairs and build union-find
@@ -2271,7 +2261,7 @@ def _merge_boundary_segments(
                 n_compat += 1
 
     if n_compat == 0:
-        return 0
+        return 0, {}
 
     # ------------------------------------------------------------------
     # 4. Build merge groups
@@ -2288,7 +2278,7 @@ def _merge_boundary_segments(
     merge_groups = {root: members for root, members in groups.items()
                     if len(members) > 1}
     if not merge_groups:
-        return 0
+        return 0, {}
 
     # ------------------------------------------------------------------
     # 5. Remap labels and recompute stats
@@ -2360,7 +2350,7 @@ def _merge_boundary_segments(
         n_merges += len(absorbed)
 
     if not remap:
-        return 0
+        return 0, {}
 
     # Save pre-merge types for anchor-density check in step 7
     _pre_merge_types = {o.obj_id: o.obj_type for o in all_objects}
@@ -2566,7 +2556,7 @@ def _merge_boundary_segments(
              "%d reclassified, %d anchor-weak",
              len(adj_pairs), n_merges, len(merge_groups),
              n_reclassified, n_anchor_weak)
-    return n_merges
+    return n_merges, remap
 
 
 # === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
@@ -2754,8 +2744,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     # ------------------------------------------------------------------
     # Merge boundary segments across tiles (before writing rasters)
     # ------------------------------------------------------------------
+    _label_remap = {}
     try:
-        _merge_boundary_segments(
+        _, _label_remap = _merge_boundary_segments(
             labels_full, seg_type_full, all_objects,
             tile_seg_results, full_left, full_top, res,
             ndsm_full=ndsm_full, mark_uncertain=mark_uncertain)
@@ -3153,12 +3144,12 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
              fsize / 1e6, table_count, len(tile_seg_results))
-    return out_path
+    return out_path, _label_remap
 
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
-                           obs_year=0, mark_uncertain=False):
+                           obs_year=0, mark_uncertain=False, label_remap=None):
     """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
     import rasterio, fiona
     import rasterio.transform
@@ -3266,14 +3257,34 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
 
         del best_cat_weight
 
-        # Merge boundary segments across tiles
-        try:
-            _merge_boundary_segments(
-                labels_full, seg_type_full, all_objects,
-                tile_seg_results, full_left, full_top, res,
-                mark_uncertain=mark_uncertain)
-        except Exception as e:
-            log.warning("Light GPKG boundary merge failed: %s", e)
+        # Apply label remap from full GPKG boundary merge (already done)
+        # The full GPKG build already merged boundary segments and mutated
+        # all_objects.  We just need to remap the label IDs in our freshly
+        # built labels_full so absorbed objects map to their survivor.
+        if label_remap:
+            max_label = int(labels_full.max())
+            lut = np.arange(max_label + 1, dtype=np.int32)
+            for old_id, new_id in label_remap.items():
+                if old_id <= max_label:
+                    lut[old_id] = new_id
+            labels_full[:] = lut[labels_full]
+            # Update seg_type_full for remapped labels
+            obj_map_l = {o.obj_id: o for o in all_objects}
+            for root_id in set(label_remap.values()):
+                survivor = obj_map_l.get(root_id)
+                if survivor:
+                    seg_type_full[labels_full == root_id] = survivor.type_code
+            log.info("  Light GPKG: applied %d label remaps from full GPKG merge",
+                     len(label_remap))
+        else:
+            # Fallback: run merge ourselves (e.g. if full GPKG was skipped)
+            try:
+                _merge_boundary_segments(
+                    labels_full, seg_type_full, all_objects,
+                    tile_seg_results, full_left, full_top, res,
+                    mark_uncertain=mark_uncertain)
+            except Exception as e:
+                log.warning("Light GPKG boundary merge failed: %s", e)
 
         # Write stitched segment rasters
         _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
@@ -5151,7 +5162,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
-        full_gpkg = build_full_gpkg_tiled(
+        full_gpkg, _boundary_remap = build_full_gpkg_tiled(
             kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         result["files"]["full_gpkg"] = full_gpkg
 
@@ -5161,7 +5172,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
-            obs_year=obs_year, mark_uncertain=mark_uncertain)
+            obs_year=obs_year, mark_uncertain=mark_uncertain,
+            label_remap=_boundary_remap)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 7. Build JSON summary ---

@@ -3236,88 +3236,51 @@ def _xml_escape(s):
 
 
 def _fix_gpkg_raster_crs(gpkg_path: str):
-    """Ensure all raster layers in a GPKG have valid CRS registration.
+    """Ensure GPKG raster layers are properly registered for QGIS.
 
-    GDAL's GPKG driver registers uint8 rasters as data_type='tiles' instead of
-    '2d-gridded-coverage'. QGIS may not read CRS from 'tiles'-type layers,
-    showing a "Layer has no CRS" warning. This function:
-      1. Converts any 'tiles' entries in gpkg_contents to '2d-gridded-coverage'
-      2. Ensures the gpkg_2d_gridded_coverage_ancillary table + rows exist
-      3. Registers the gridded coverage extension in gpkg_extensions
+    Layers written by rasterio fall into two categories:
+    - float32 (DTM/DSM/etc): already '2d-gridded-coverage' with proper ancillary
+    - uint8 (Ortho/CIR/segment_type/WorldCover/Hansen): registered as 'tiles'
+
+    The 'tiles' data_type is the correct GPKG standard for PNG/JPEG tile pyramids.
+    GDAL and QGIS both read CRS from 'tiles' layers via gpkg_tile_matrix_set.srs_id.
+    Do NOT convert 'tiles' to '2d-gridded-coverage' — that extension is for
+    single-band gridded elevation data (TIFF tiles) and breaks multi-band
+    JPEG/PNG layers (Ortho, CIR) in QGIS, causing 'h_band null' errors and
+    the raster to appear at 0,0 without CRS.
+
+    This function only ensures the gpkg_spatial_ref_sys entry is complete
+    (has both WKT1 and WKT2 definitions) so all QGIS/GDAL versions can
+    resolve the CRS.
     """
     import sqlite3 as _sq
     if not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0:
         return
     conn = _sq.connect(gpkg_path)
     try:
-        tile_rows = conn.execute(
-            "SELECT table_name FROM gpkg_contents WHERE data_type = 'tiles'"
-        ).fetchall()
-        if not tile_rows:
-            return
-        tile_names = [r[0] for r in tile_rows]
-        log.info("Fixing GPKG raster CRS for %d 'tiles' layers: %s",
-                 len(tile_names), tile_names)
-
-        conn.execute(
-            "UPDATE gpkg_contents SET data_type = '2d-gridded-coverage' "
-            "WHERE data_type = 'tiles'"
-        )
-        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_coverage_ancillary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tile_matrix_set_name TEXT NOT NULL,
-            datatype TEXT NOT NULL DEFAULT 'integer',
-            scale REAL NOT NULL DEFAULT 1.0,
-            "offset" REAL NOT NULL DEFAULT 0.0,
-            precision REAL DEFAULT 1.0,
-            data_null REAL,
-            grid_cell_encoding TEXT DEFAULT 'grid-value-is-center',
-            uom TEXT,
-            field_name TEXT DEFAULT 'Height',
-            quantity_definition TEXT DEFAULT 'Height'
-        )''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_2d_gridded_tile_ancillary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tpudt_name TEXT NOT NULL,
-            tpudt_id INTEGER NOT NULL,
-            scale REAL NOT NULL DEFAULT 1.0,
-            "offset" REAL NOT NULL DEFAULT 0.0,
-            min REAL DEFAULT NULL,
-            max REAL DEFAULT NULL,
-            mean REAL DEFAULT NULL,
-            std_dev REAL DEFAULT NULL
-        )''')
-        for tname in tile_names:
-            existing = conn.execute(
-                "SELECT 1 FROM gpkg_2d_gridded_coverage_ancillary "
-                "WHERE tile_matrix_set_name = ?", (tname,)
-            ).fetchone()
-            if not existing:
+        row = conn.execute(
+            "SELECT definition, definition_12_063 FROM gpkg_spatial_ref_sys "
+            "WHERE srs_id = 3035"
+        ).fetchone()
+        if row:
+            wkt1, wkt2 = row
+            needs_update = False
+            if not wkt1 or wkt1 == 'undefined':
+                from pyproj import CRS
+                wkt1 = CRS.from_epsg(3035).to_wkt('WKT1_GDAL')
+                needs_update = True
+            if not wkt2 or wkt2 == 'undefined':
+                from pyproj import CRS
+                wkt2 = CRS.from_epsg(3035).to_wkt('WKT2_2019')
+                needs_update = True
+            if needs_update:
                 conn.execute(
-                    'INSERT INTO gpkg_2d_gridded_coverage_ancillary '
-                    '(tile_matrix_set_name, datatype, scale, "offset") '
-                    'VALUES (?, ?, ?, ?)',
-                    (tname, 'integer', 1.0, 0.0)
+                    "UPDATE gpkg_spatial_ref_sys "
+                    "SET definition = ?, definition_12_063 = ? "
+                    "WHERE srs_id = 3035",
+                    (wkt1, wkt2)
                 )
-        try:
-            conn.execute('''CREATE TABLE IF NOT EXISTS gpkg_extensions (
-                table_name TEXT,
-                column_name TEXT,
-                extension_name TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)
-            )''')
-            for tname in tile_names:
-                conn.execute(
-                    'INSERT OR IGNORE INTO gpkg_extensions '
-                    '(table_name, column_name, extension_name, definition, scope) '
-                    'VALUES (?, NULL, ?, ?, ?)',
-                    (tname, 'gpkg_2d_gridded_coverage',
-                     'http://www.geopackage.org/18-000.html', 'read-write')
-                )
-        except Exception:
-            pass
+                log.info("Updated EPSG:3035 WKT definitions in %s", gpkg_path)
         conn.commit()
     except Exception as e:
         log.warning("GPKG CRS fix failed for %s: %s", gpkg_path, e)

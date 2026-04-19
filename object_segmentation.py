@@ -188,6 +188,10 @@ class SegmentedObject:
     # Classification
     confidence: float = 0.5
     is_manmade: bool = False
+    classifier_source: str = "rules"  # "rf", "rules", or "infra"
+    rf_model_hash: str = ""            # first 8 hex digits of model file MD5
+    rf_type: str = ""                  # RF predicted type (kept even if overridden)
+    rf_confidence: float = 0.0         # RF predicted confidence (kept even if overridden)
     # Group membership
     group_id: int = 0
     group_type: str = ""
@@ -1914,13 +1918,15 @@ def segment_and_classify(
     # --- Step 4: Classification ---
     # Try learned RF classifier first, fall back to rules
     use_rf = False
+    _rf_model_hash = ""
     try:
         from learned_classifier import get_classifier
         rf_clf = get_classifier()
         if rf_clf.is_trained:
             use_rf = True
-            log.info("Step 4: Object classification (RF classifier, OOB=%.3f)",
-                     rf_clf.oob_score)
+            _rf_model_hash = rf_clf.model_hash
+            log.info("Step 4: Object classification (RF classifier, OOB=%.3f, hash=%s)",
+                     rf_clf.oob_score, _rf_model_hash)
         else:
             log.info("Step 4: Object classification (rule-based, no RF model)")
     except Exception:
@@ -1949,8 +1955,14 @@ def segment_and_classify(
             if ce and cn:
                 _nearby = infra_lookup.find_nearby(ce, cn, radius_m=200)
 
+        _cls_source = "rules"  # track classification source
+        _rf_type = ""              # preserve RF raw prediction
+        _rf_conf = 0.0
         if use_rf and feat["label"] in rf_results:
             type_name, type_code, conf, is_mm = rf_results[feat["label"]]
+            _cls_source = "rf"
+            _rf_type = type_name    # save before any override
+            _rf_conf = conf
             # Even with RF result, check infrastructure for dropped classes
             # (wind_turbine, solar_panel, substation are not RF-predicted)
             if _nearby:
@@ -1967,6 +1979,7 @@ def segment_and_classify(
                 )
                 if _infra_result is not None:
                     type_name, type_code, conf, is_mm = _infra_result
+                    _cls_source = "infra"
         elif mark_uncertain:
             # mark_uncertain mode: no rule-based fallback, but still check infrastructure
             type_name, type_code, conf, is_mm = "unclassified", OBJECT_TYPES["unclassified"], 0.0, False
@@ -2029,6 +2042,10 @@ def segment_and_classify(
             phenology_class=_phenology_class(feat),
             confidence=round(conf, 3),
             is_manmade=is_mm,
+            classifier_source=_cls_source,
+            rf_model_hash=_rf_model_hash,
+            rf_type=_rf_type,
+            rf_confidence=round(_rf_conf, 3),
             features=feat,
         )
         objects.append(obj)

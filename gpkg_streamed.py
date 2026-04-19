@@ -293,6 +293,7 @@ def build_full_gpkg_streamed(
     del best_cat_weight
 
     # Boundary merge (in-place on labels_full / seg_type_full)
+    _label_remap = {}
     if not skip_boundary_merge:
         try:
             # Need a blended nDSM for the merge — stream-stitch just the nDSM
@@ -317,7 +318,7 @@ def build_full_gpkg_streamed(
             ndsm_full = np.where(has, ndsm_sum / ndsm_w, np.nan).astype(np.float32)
             del ndsm_sum, ndsm_w
 
-            _merge_boundary_segments(
+            _, _label_remap = _merge_boundary_segments(
                 labels_full, seg_type_full, all_objects,
                 tile_seg_results, full_left, full_top, res,
                 ndsm_full=ndsm_full, mark_uncertain=mark_uncertain)
@@ -757,7 +758,7 @@ def build_full_gpkg_streamed(
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  STREAMED GPKG: %.1f MB, %d tables, %d tiles",
              fsize / 1e6, table_count, len(tile_seg_results))
-    return out_path
+    return out_path, _label_remap
 
 
 # Re-read helper — same as austria_processor._read_dtm_for_tile

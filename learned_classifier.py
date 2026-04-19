@@ -207,6 +207,7 @@ class LearnedClassifier:
         self.oob_score: float = 0.0
         self.trained_at: str = ""
         self.n_kgs: int = 0
+        self.model_hash: str = ""  # first 8 hex of model file MD5
 
     def train(
         self,
@@ -410,7 +411,7 @@ class LearnedClassifier:
             return inst
 
         try:
-            import joblib
+            import joblib, hashlib
             inst.model = joblib.load(mp)
             meta = json.loads(mtp.read_text())
             inst.classes = meta.get("classes", [])
@@ -419,9 +420,13 @@ class LearnedClassifier:
             inst.feature_importances = meta.get("feature_importances", {})
             inst.trained_at = meta.get("trained_at", "")
             inst.n_kgs = meta.get("n_kgs", 0)
+            try:
+                inst.model_hash = hashlib.md5(mp.read_bytes()).hexdigest()[:8]
+            except Exception:
+                inst.model_hash = ""
             source = "best_model" if mp == BEST_MODEL_PATH else "live"
-            log.info("Loaded RF model (%s): %d classes, OOB=%.3f, n=%d, kgs=%d, trained=%s",
-                     source, len(inst.classes), inst.oob_score, inst.n_train,
+            log.info("Loaded RF model (%s, hash=%s): %d classes, OOB=%.3f, n=%d, kgs=%d, trained=%s",
+                     source, inst.model_hash, len(inst.classes), inst.oob_score, inst.n_train,
                      inst.n_kgs, inst.trained_at)
         except Exception as e:
             log.warning("Failed to load RF model from %s: %s", mp, e)

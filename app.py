@@ -1628,9 +1628,199 @@ def api_kg_layers(kg_code):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/v1/query/compound', methods=['POST'])
+# === SECTION: GET query param parsers for compound/parcel filters ===
+
+def _parse_compound_from_args(args):
+    """Parse compound filter dict from flat GET query params.
+
+    Supports all query_compound() filter keys as query params.
+    Special handling:
+      - bbox=w,s,e,n → [float, float, float, float]
+      - aspect=S,SW,W → ["S","SW","W"]
+      - type_filter=tree:0.8:800 (repeatable) → type_filters list
+      - landcover_filter=grass:1300:0.1 (repeatable) → landcover_filters list
+      - All min_*/max_* numeric params parsed as float/int
+    """
+    filters = {}
+
+    # bbox
+    if 'bbox' in args:
+        try:
+            filters['bbox'] = [float(x) for x in args['bbox'].split(',')]
+        except ValueError:
+            pass
+
+    # String params (exact match)
+    for k in ('state', 'district', 'gemeinde', 'dominant_type', 'phenology',
+              'terrain_class', 'quality_grade', 'sort', 'sort_dir'):
+        if k in args:
+            filters[k] = args[k]
+
+    # aspect — comma-separated list
+    if 'aspect' in args:
+        filters['aspect'] = [x.strip() for x in args['aspect'].split(',') if x.strip()]
+
+    # All numeric range params (min_*/max_*)
+    _numeric_keys = [
+        'min_slope', 'max_slope', 'min_roughness', 'min_elevation', 'max_elevation',
+        'min_elevation_min', 'max_elevation_min', 'min_elevation_max', 'max_elevation_max',
+        'min_elevation_range', 'min_steepness_max', 'min_tri', 'max_tri',
+        'min_total_area', 'max_total_area', 'min_parcels', 'max_parcels',
+        'min_segments', 'max_segments',
+        'min_buildings', 'max_buildings', 'min_new_buildings', 'min_infrastructure',
+        'min_building_height', 'max_building_height',
+        'min_building_max_height', 'max_building_max_height',
+        'min_building_stories', 'max_building_stories',
+        'min_building_stories_max', 'max_building_stories_max',
+        'min_building_pitched_pct', 'max_building_pitched_pct',
+        'min_building_footprint', 'max_building_footprint',
+        'min_new_building_footprint', 'min_new_building_height', 'min_new_building_stories',
+        'min_building_height_coverage',
+        'min_tree_count', 'min_tree_height', 'min_tree_canopy_sqm', 'min_tree_volume',
+        'min_ndvi', 'max_ndvi', 'min_vegetated_fraction', 'max_vegetated_fraction',
+        'min_shannon_diversity',
+        'min_ndvi_amplitude', 'min_ndvi_harm_mean', 'max_ndvi_harm_mean',
+        'min_ndvi_phase', 'max_ndvi_phase',
+        'min_sar_vv', 'max_sar_vv', 'min_sar_vh', 'max_sar_vh',
+        'min_dtm_change', 'max_dtm_change', 'min_volume_change', 'max_volume_change',
+        'min_changed_segments', 'min_disturbed_volume', 'min_temporal_stability',
+        'min_confidence', 'min_rf_confidence', 'max_diverged_pct',
+        'max_rf_diverged_count', 'min_rf_classified_pct', 'min_quality_score',
+    ]
+    for k in _numeric_keys:
+        if k in args:
+            try:
+                v = float(args[k])
+                filters[k] = int(v) if v == int(v) and 'pct' not in k and 'fraction' not in k and 'confidence' not in k and 'slope' not in k and 'roughness' not in k and 'elevation' not in k and 'height' not in k and 'ndvi' not in k and 'sar' not in k and 'tri' not in k and 'stability' not in k and 'score' not in k and 'change' not in k and 'volume' not in k and 'canopy' not in k and 'diversity' not in k and 'amplitude' not in k and 'phase' not in k and 'steepness' not in k and 'area' not in k and 'footprint' not in k and 'stories' not in k else v
+            except ValueError:
+                pass
+
+    # type_filter — repeatable: type_filter=tree:0.8:800&type_filter=grass:0.8:1300
+    tf_raw = args.getlist('type_filter')
+    if tf_raw:
+        type_filters = []
+        for raw in tf_raw:
+            parts = raw.split(':')
+            tf = {'type': parts[0]}
+            if len(parts) > 1 and parts[1]:
+                try: tf['min_confidence'] = float(parts[1])
+                except ValueError: pass
+            if len(parts) > 2 and parts[2]:
+                try: tf['min_area_sqm'] = float(parts[2])
+                except ValueError: pass
+            type_filters.append(tf)
+        filters['type_filters'] = type_filters
+
+    # landcover_filter — repeatable: landcover_filter=grass:1300:0.1
+    lf_raw = args.getlist('landcover_filter')
+    if lf_raw:
+        landcover_filters = []
+        for raw in lf_raw:
+            parts = raw.split(':')
+            lf = {'type': parts[0]}
+            if len(parts) > 1 and parts[1]:
+                try: lf['min_area_sqm'] = float(parts[1])
+                except ValueError: pass
+            if len(parts) > 2 and parts[2]:
+                try: lf['min_fraction'] = float(parts[2])
+                except ValueError: pass
+            if len(parts) > 3 and parts[3]:
+                try: lf['min_height_mean'] = float(parts[3])
+                except ValueError: pass
+            if len(parts) > 4 and parts[4]:
+                try: lf['max_height_mean'] = float(parts[4])
+                except ValueError: pass
+            landcover_filters.append(lf)
+        filters['landcover_filters'] = landcover_filters
+
+    return filters
+
+
+def _parse_parcel_filters_from_args(args):
+    """Parse parcel_filters dict from GET query params with pf_ prefix.
+
+    All parcel filter params use a 'pf_' prefix to avoid collision with compound filters.
+    Examples:
+      pf_aspect=E,SE → aspect: ["E","SE"]
+      pf_terrain_class=level → terrain_class: "level"
+      pf_min_vegetated_fraction=0.5 → min_vegetated_fraction: 0.5
+      pf_types=tree,grass → types: ["tree","grass"]
+      pf_type_confidence=tree:0.7:500 (repeatable)
+      pf_sort=conservation_score, pf_sort_dir=desc
+    """
+    pf = {}
+
+    # String params
+    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse'):
+        pk = f'pf_{k}'
+        if pk in args:
+            pf[k] = args[pk]
+
+    # Bool params
+    for k in ('is_vegetated', 'cadastre_has_buildings'):
+        pk = f'pf_{k}'
+        if pk in args:
+            pf[k] = args[pk].lower() in ('true', '1', 'yes')
+
+    # Comma-separated list params
+    for k in ('aspect', 'types'):
+        pk = f'pf_{k}'
+        if pk in args:
+            pf[k] = [x.strip() for x in args[pk].split(',') if x.strip()]
+
+    # Numeric params
+    _pf_numeric = [
+        'min_vegetated_fraction', 'max_vegetated_fraction',
+        'min_elevation', 'max_elevation',
+        'min_type_fraction', 'min_ndsm_max', 'max_ndsm_max',
+        'min_parcel_area', 'max_parcel_area',
+        'min_slope', 'max_slope', 'min_tri', 'max_tri',
+        'min_confidence', 'min_rf_confidence',
+        'cadastre_min_area', 'cadastre_max_area',
+    ]
+    for k in _pf_numeric:
+        pk = f'pf_{k}'
+        if pk in args:
+            try:
+                pf[k] = float(args[pk])
+            except ValueError:
+                pass
+
+    # pf_type_confidence — repeatable: pf_type_confidence=tree:0.7:500
+    tc_raw = args.getlist('pf_type_confidence')
+    if tc_raw:
+        type_confidence = []
+        for raw in tc_raw:
+            parts = raw.split(':')
+            tc = {'type': parts[0]}
+            if len(parts) > 1 and parts[1]:
+                try: tc['min_confidence'] = float(parts[1])
+                except ValueError: pass
+            if len(parts) > 2 and parts[2]:
+                try: tc['min_area_sqm'] = float(parts[2])
+                except ValueError: pass
+            if len(parts) > 3 and parts[3]:
+                try: tc['min_rf_confidence'] = float(parts[3])
+                except ValueError: pass
+            type_confidence.append(tc)
+        pf['type_confidence'] = type_confidence
+
+    return pf
+
+
+@app.route('/api/v1/query/compound', methods=['GET', 'POST'])
 def api_query_compound():
     """Compound query: filter KGs by any combination of attributes.
+
+    Accepts both POST (JSON body) and GET (query params).
+
+    GET query params map directly to filter keys. Special syntax:
+      - bbox=w,s,e,n
+      - aspect=S,SW,W (comma-separated)
+      - type_filter=tree:0.8:800 (repeatable, type:min_confidence:min_area_sqm)
+      - landcover_filter=grass:1300:0.1 (repeatable, type:min_area_sqm:min_fraction)
+      - All min_*/max_* numeric params
+      - limit, offset, async, task_id as query params
 
     POST JSON body with filter keys (all optional):
       bbox: [w, s, e, n]
@@ -1690,13 +1880,26 @@ def api_query_compound():
     """
     try:
         idx = si.get_index()
-        body = request.get_json(force=True) or {}
-        limit = min(int(body.pop('limit', 50)), 1000)
-        offset = int(body.pop('offset', 0))
-        do_async = str(body.pop('async', '')).lower() in ('true', '1', 'yes')
+        # Accept both POST JSON body and GET query params
+        if request.method == 'POST' and request.content_type and 'json' in request.content_type:
+            body = request.get_json(force=True) or {}
+        elif request.method == 'POST':
+            # POST with no JSON — try to parse, fall back to query args
+            try:
+                body = request.get_json(force=True) or {}
+            except Exception:
+                body = _parse_compound_from_args(request.args)
+        else:
+            # GET — parse from query params
+            body = _parse_compound_from_args(request.args)
+        limit = min(int(body.pop('limit', None) or request.args.get('limit', 50)), 1000)
+        offset = int(body.pop('offset', None) or request.args.get('offset', 0))
+        _async_val = body.pop('async', None) or request.args.get('async', '')
+        do_async = str(_async_val).lower() in ('true', '1', 'yes')
         # Poll existing task
-        if body.get('task_id'):
-            task_id = body['task_id']
+        _task_id_val = body.pop('task_id', None) or request.args.get('task_id')
+        if _task_id_val:
+            task_id = _task_id_val
             p = _PROGRESS_DIR / f"{task_id}.json"
             if not p.exists():
                 return jsonify({'error': 'Unknown task_id'}), 404
@@ -2120,9 +2323,22 @@ def api_lookup():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/v1/parcels/batch', methods=['POST'])
+@app.route('/api/v1/parcels/batch', methods=['GET', 'POST'])
 def api_parcels_batch():
     """Batch parcel landscape enrichment — 3 modes.
+
+    Accepts both POST (JSON body) and GET (query params).
+
+    GET maps to Mode 3 (compound → parcels). Compound filters use direct
+    query params; parcel filters use pf_ prefix.
+
+    GET examples:
+      /api/v1/parcels/batch?state=Vorarlberg&pf_aspect=E&pf_terrain_class=level&limit=100
+      /api/v1/parcels/batch?min_tree_count=50&pf_min_vegetated_fraction=0.5&pf_sort=conservation_score
+      /api/v1/parcels/batch?type_filter=tree:0.8:800&pf_types=tree,grass&limit=50
+      /api/v1/parcels/batch?parcel_ids=63349-505/3,75414-1314/1  (Mode 1 via GET)
+
+    POST modes:
 
     Mode 1 — Explicit IDs:
       Body: {"parcel_ids": ["63349-505/3", "75414-1314/1", ...]}
@@ -2186,15 +2402,42 @@ def api_parcels_batch():
                      "cadastre": {...}|null, "conservation_score": N}, ...],
        "total": N, "offset": N, "limit": N, "meta": {...}}
     """
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({'error': 'Invalid JSON body'}), 400
+    # --- Parse body: POST JSON or GET query params ---
+    if request.method == 'POST':
+        try:
+            body = request.get_json(force=True) or {}
+        except Exception:
+            return jsonify({'error': 'Invalid JSON body'}), 400
+    else:
+        # GET — parse from query params
+        args = request.args
+        body = {}
+        # Mode 1 via GET: parcel_ids=id1,id2,...
+        if 'parcel_ids' in args:
+            body['parcel_ids'] = [x.strip() for x in args['parcel_ids'].split(',') if x.strip()]
+        else:
+            # Mode 3 via GET: compound filters from query params, parcel filters from pf_ prefix
+            compound = _parse_compound_from_args(args)
+            if compound:
+                body['compound'] = compound
+                pf = _parse_parcel_filters_from_args(args)
+                if pf:
+                    body['parcel_filters'] = pf
+                if 'cadastre_enrich' in args:
+                    body['cadastre_enrich'] = args['cadastre_enrich'].lower() in ('true', '1', 'yes')
+            # Check for Mode 2 via GET: query params with cq_ prefix
+            # (not commonly used via GET, but supported)
+        if 'limit' in args:
+            body.setdefault('limit', int(args['limit']))
+        if 'offset' in args:
+            body.setdefault('offset', int(args['offset']))
 
     try:
         # Mode 1: Explicit parcel IDs
         if 'parcel_ids' in body:
             parcel_ids = body['parcel_ids']
+            if isinstance(parcel_ids, str):
+                parcel_ids = [x.strip() for x in parcel_ids.split(',') if x.strip()]
             if not isinstance(parcel_ids, list):
                 return jsonify({'error': 'parcel_ids must be a list'}), 400
             if len(parcel_ids) > 200:
@@ -2238,7 +2481,7 @@ def api_parcels_batch():
             )
             return jsonify(result)
 
-        return jsonify({'error': 'Body must contain "parcel_ids" (list), "query" (dict), or "compound" (dict)'}), 400
+        return jsonify({'error': 'No filters provided. Use query params (state=, min_slope=, etc.) or POST JSON body with parcel_ids/query/compound.'}), 400
 
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502

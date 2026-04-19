@@ -165,7 +165,7 @@ Contain: UI state + analysis result + cached overlay images.
 | Method | Path | Purpose |
 |--------|------|----------|
 | GET | `/api/v1/lookup` | Cadastre EDM lookup proxy (diacritics-insensitive) |
-| POST | `/api/v1/parcels/batch` | Batch parcel enrichment — explicit IDs or query-based |
+| GET\|POST | `/api/v1/parcels/batch` | Batch parcel enrichment — explicit IDs or query-based (GET uses query params with pf_ prefix for parcel filters) |
 | GET | `/api/v1/parcels/landscape` | Query parcels with landscape filters (GET version of batch) |
 | GET | `/api/v1/query/nature` | Nature conservation opportunity finder (conservation score 0-100) |
 | GET | `/api/v1/parcel/<id>/detail` | Full combined parcel detail (both APIs) |

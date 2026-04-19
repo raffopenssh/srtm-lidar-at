@@ -43,6 +43,7 @@ import hansen  # Hansen Global Forest Change calibration
 import temporal_analysis as tca
 import geo_parse
 import search_index as si
+import cadastre_bridge as cb
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -1896,6 +1897,373 @@ def api_query():
     except Exception as e:
         log.exception('query error')
         return jsonify({'error': str(e)}), 500
+
+
+# === SECTION: Cross-API bridge (cadastre + landscape) ===
+
+@app.route('/api/v1/lookup')
+def api_lookup():
+    """Proxy to cadastre lookup — fuzzy diacritics-insensitive search.
+
+    Searches Austria's federal register (EDM): Gemeinden, KGs, Ortschaften, PLZ.
+    Handles umlauts gracefully ("Kofla" → "Köflach").
+
+    Params:
+      q (required): Search text (name, PLZ, code)
+      type: Filter by entity type (plz|gemeinde|kg|ortschaft)
+      limit: Max results (default 20, max 200)
+    """
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({'error': 'q parameter required'}), 400
+    try:
+        result = cb.lookup(
+            q=q,
+            type=request.args.get('type'),
+            limit=int(request.args.get('limit', 20)),
+        )
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_lookup error')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/parcels/batch', methods=['POST'])
+def api_parcels_batch():
+    """Batch parcel landscape enrichment.
+
+    Accepts either explicit parcel IDs or a cadastre query to find parcels,
+    then enriches each with landscape analysis data and conservation scoring.
+
+    Mode 1 — Explicit IDs:
+      Body: {"parcel_ids": ["63349-505/3", "75414-1314/1", ...]}
+      Max 200 parcel IDs per request.
+
+    Mode 2 — Query:
+      Body: {
+        "query": {                    // Cadastre query filters
+          "kg": "63349",             // or gemeinde, district, state, plz
+          "landuse": "W",            // landuse code or abbreviation
+          "min_area": 1000,          // min parcel area sqm
+          "max_area": 50000,         // max parcel area sqm
+          "has_buildings": false,     // building presence filter
+          "has_legal_refs": true,     // legal reference filter
+          "legal_context": "nature_protection",
+          "sort": "area_desc"        // cadastre sort
+        },
+        "landscape_filters": {        // Post-filter on landscape data
+          "min_vegetated_fraction": 0.5,
+          "min_ndvi": 0.3,
+          "min_tree_canopy_sqm": 200,
+          "min_elevation": 500,
+          "max_elevation": 2000,
+          "min_conservation_score": 40,
+          "dominant_type": "tree",
+          "sort": "conservation_score",  // conservation_score|area|ndvi|tree_canopy|vegetated_fraction
+          "sort_dir": "desc"
+        },
+        "limit": 50,
+        "offset": 0
+      }
+
+    Returns:
+      {"results": [{"parcel_id": ..., "cadastre": {...}, "landscape": {...},
+                     "conservation_score": N}, ...],
+       "total": N, "meta": {...}}
+    """
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    try:
+        # Mode 1: Explicit parcel IDs
+        if 'parcel_ids' in body:
+            parcel_ids = body['parcel_ids']
+            if not isinstance(parcel_ids, list):
+                return jsonify({'error': 'parcel_ids must be a list'}), 400
+            if len(parcel_ids) > 200:
+                return jsonify({'error': f'Max 200 parcels per request, got {len(parcel_ids)}'}), 400
+            if len(parcel_ids) == 0:
+                return jsonify({'results': [], 'total': 0})
+            result = cb.batch_parcel_landscape(parcel_ids)
+            return jsonify(result)
+
+        # Mode 2: Query-based batch
+        if 'query' in body:
+            query_filters = body['query']
+            if not isinstance(query_filters, dict) or not query_filters:
+                return jsonify({'error': 'query must be a non-empty dict of cadastre filter params'}), 400
+            landscape_filters = body.get('landscape_filters') or {}
+            limit = min(int(body.get('limit', 50)), 500)
+            offset = int(body.get('offset', 0))
+            result = cb.batch_parcel_landscape_by_query(
+                query_filters=query_filters,
+                landscape_filters=landscape_filters,
+                limit=limit,
+                offset=offset,
+            )
+            return jsonify(result)
+
+        return jsonify({'error': 'Body must contain "parcel_ids" (list) or "query" (dict)'}), 400
+
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_parcels_batch error')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/parcels/landscape')
+def api_parcels_landscape():
+    """Query parcels with landscape analysis context.
+
+    Forwards cadastre query params to the cadastre /query endpoint, then enriches
+    results with landscape data from our index/JSON files.
+
+    Cadastre params (forwarded to cadastre /query):
+      q, kg, gemeinde, district, state, plz, landuse, min_area, max_area,
+      has_buildings, status, ez, has_legal_refs, legal_context,
+      min_lon, min_lat, max_lon, max_lat, sort
+
+    Landscape params (post-filter on our data):
+      min_vegetated_fraction, max_vegetated_fraction: 0-1
+      min_ndvi, max_ndvi: float
+      min_tree_canopy_sqm: float
+      min_elevation, max_elevation: float
+      min_conservation_score: 0-100
+      dominant_type: landscape object type
+      landscape_sort: conservation_score|area|ndvi|tree_canopy|vegetated_fraction
+      landscape_sort_dir: asc|desc
+
+    Pagination: limit (default 50, max 500), offset
+    """
+    args = request.args
+
+    # Separate cadastre params from landscape params
+    cadastre_keys = {
+        'q', 'kg', 'gemeinde', 'district', 'state', 'plz', 'landuse',
+        'min_area', 'max_area', 'has_buildings', 'status', 'ez',
+        'has_legal_refs', 'legal_context',
+        'min_lon', 'min_lat', 'max_lon', 'max_lat', 'sort',
+    }
+    landscape_keys = {
+        'min_vegetated_fraction', 'max_vegetated_fraction',
+        'min_ndvi', 'max_ndvi', 'min_tree_canopy_sqm',
+        'min_elevation', 'max_elevation', 'min_conservation_score',
+        'dominant_type', 'landscape_sort', 'landscape_sort_dir',
+    }
+
+    query_filters = {k: args[k] for k in cadastre_keys if k in args}
+    if not query_filters:
+        return jsonify({'error': 'At least one cadastre filter param required'}), 400
+
+    landscape_filters = {}
+    for k in landscape_keys:
+        if k in args:
+            # Convert numeric landscape filters
+            if k.startswith('min_') or k.startswith('max_'):
+                try:
+                    landscape_filters[k] = float(args[k])
+                except ValueError:
+                    return jsonify({'error': f'Invalid numeric value for {k}'}), 400
+            elif k == 'landscape_sort':
+                landscape_filters['sort'] = args[k]
+            elif k == 'landscape_sort_dir':
+                landscape_filters['sort_dir'] = args[k]
+            else:
+                landscape_filters[k] = args[k]
+
+    limit = min(int(args.get('limit', 50)), 500)
+    offset = int(args.get('offset', 0))
+
+    try:
+        result = cb.batch_parcel_landscape_by_query(
+            query_filters=query_filters,
+            landscape_filters=landscape_filters,
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_parcels_landscape error')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/query/nature')
+def api_query_nature():
+    """Nature conservation opportunity finder.
+
+    Cross-references cadastre, protected areas, legal refs, and landscape
+    analysis to find and rank parcels by conservation value.
+
+    Params:
+      bbox=w,s,e,n            Spatial filter (WGS84)
+      state                   State name or code
+      district                District code
+      gemeinde                Gemeinde code or name
+      protected_area=<name>   Near/in a WDPA protected area
+      legal_context=<ctx>     Filter by legal context
+                              (national_park, nature_protection, landscape_protection,
+                               water_protection, species_protection, etc.)
+      min_vegetated_fraction  Min vegetation fraction from landscape (0-1)
+      min_ndvi                Min NDVI from landscape analysis
+      min_tree_canopy_sqm     Min tree canopy area (sq metres)
+      min_area_sqm            Min parcel area
+      max_area_sqm            Max parcel area
+      landuse                 Cadastre landuse code or abbreviation (W=Wald, LN=Landwirtschaft)
+      has_buildings           Building presence filter (true|false)
+      sort                    Sort key: conservation_score|area|ndvi|tree_canopy|vegetated_fraction
+      limit (default 50), offset
+    """
+    args = request.args
+    try:
+        result = cb.nature_conservation_screen(
+            bbox=args.get('bbox'),
+            state=args.get('state'),
+            district=args.get('district'),
+            gemeinde=args.get('gemeinde'),
+            protected_area=args.get('protected_area'),
+            legal_context=args.get('legal_context'),
+            min_vegetated_fraction=_float_or_none(args.get('min_vegetated_fraction')),
+            min_ndvi=_float_or_none(args.get('min_ndvi')),
+            min_tree_canopy_sqm=_float_or_none(args.get('min_tree_canopy_sqm')),
+            min_area_sqm=_float_or_none(args.get('min_area_sqm')),
+            max_area_sqm=_float_or_none(args.get('max_area_sqm')),
+            landuse=args.get('landuse'),
+            has_buildings=_bool_or_none(args.get('has_buildings')),
+            sort=args.get('sort', 'conservation_score'),
+            limit=min(int(args.get('limit', 50)), 500),
+            offset=int(args.get('offset', 0)),
+        )
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_query_nature error')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/parcel/<path:parcel_id>/detail')
+def api_parcel_detail(parcel_id):
+    """Full combined detail for a single parcel (both APIs).
+
+    Combines cadastre data (area, landuse, EZ, buildings, legal refs) with
+    landscape analysis (elevation, NDVI, vegetation, classification, heights).
+    Also checks protected area containment and computes conservation score.
+    """
+    try:
+        result = cb.parcel_landscape_detail(parcel_id)
+        if 'error' in result:
+            return jsonify(result), 400
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_parcel_detail error')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/kg/<kg_code>/profile')
+def api_kg_profile(kg_code):
+    """Combined KG profile from both APIs.
+
+    Merges cadastre data (parcels, buildings, landuse distribution, legal refs)
+    with landscape analysis (landcover, elevation, NDVI, trees, new buildings).
+    """
+    try:
+        result = cb.kg_combined_profile(kg_code)
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_kg_profile error')
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Cadastre proxy endpoints ---
+
+@app.route('/api/v1/cadastre/legal/search')
+def api_cadastre_legal_search():
+    """Proxy to cadastre legal search — find parcels referenced in Austrian law.
+
+    Params: q (text), context (legal_context), type (listed|boundary_walk),
+            bundesland, kg (KG code), limit, offset
+    """
+    try:
+        params = {k: v for k, v in request.args.items()}
+        result = cb.cadastre_proxy('/legal/search', params=params)
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/cadastre/protected_areas')
+def api_cadastre_protected_areas():
+    """Proxy to cadastre protected area search — 43 WDPA areas in Austria.
+
+    Params: q (text), near_lon+near_lat (sort by proximity),
+            contains_lon+contains_lat (point-in-polygon), limit, offset
+    """
+    try:
+        params = {k: v for k, v in request.args.items()}
+        result = cb.cadastre_proxy('/search/protected_area', params=params)
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/cadastre/landuse/distribution')
+def api_cadastre_landuse_distribution():
+    """Proxy to cadastre landuse distribution — aggregated by geography.
+
+    Params: kg, gemeinde, district, state, code, abbr, group_by, limit, offset
+    """
+    try:
+        params = {k: v for k, v in request.args.items()}
+        result = cb.cadastre_proxy('/landuse/distribution', params=params)
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/cadastre/landuse/codes')
+def api_cadastre_landuse_codes():
+    """Proxy to cadastre landuse codes — reference table of all Austrian codes."""
+    try:
+        result = cb.cadastre_proxy('/landuse/codes')
+        return jsonify(result)
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _float_or_none(val: str | None) -> float | None:
+    """Parse a float from a query param, or return None."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _bool_or_none(val: str | None) -> bool | None:
+    """Parse a bool from a query param, or return None."""
+    if val is None:
+        return None
+    return val.lower() in ('true', '1', 'yes')
 
 
 # === SECTION: Geometry + parameter helpers ===

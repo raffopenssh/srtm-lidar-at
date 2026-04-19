@@ -34,6 +34,11 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 |------|----------|
 | `search_index.py` | SQLite FTS5 + R-tree index over all 8440 KGs. Spatial/text/admin/aggregate queries <25ms. Auto-rebuilds on new JSONs. |
 
+### Cross-API Bridge
+| File | Purpose |
+|------|----------|
+| `cadastre_bridge.py` | Joins cadastre API (parcels, legal refs, protected areas) with landscape analysis. Batch parcel enrichment, nature conservation scoring, query-based batch with all cadastre filter options + landscape post-filters. |
+
 ### Data I/O
 | File | Purpose |
 |------|----------|
@@ -155,6 +160,27 @@ Contain: UI state + analysis result + cached overlay images.
 `/api/v1/query` params: `q=`, `kg=`, `parcel=`, `bbox=w,s,e,n`, `point=lon,lat`,
 `state=`, `district=`, `gemeinde=`, `type=`, `hansen=true`, `new_buildings=true`,
 `aggregate=true`, `processed_only=true`, `limit=`, `offset=`
+
+### Cross-API Bridge (cadastre + landscape)
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/lookup` | Cadastre EDM lookup proxy (diacritics-insensitive) |
+| POST | `/api/v1/parcels/batch` | Batch parcel enrichment — explicit IDs or query-based |
+| GET | `/api/v1/parcels/landscape` | Query parcels with landscape filters (GET version of batch) |
+| GET | `/api/v1/query/nature` | Nature conservation opportunity finder (conservation score 0-100) |
+| GET | `/api/v1/parcel/<id>/detail` | Full combined parcel detail (both APIs) |
+| GET | `/api/v1/kg/<code>/profile` | Combined KG profile (both APIs) |
+| GET | `/api/v1/cadastre/legal/search` | Proxy: legal refs search |
+| GET | `/api/v1/cadastre/protected_areas` | Proxy: WDPA protected areas |
+| GET | `/api/v1/cadastre/landuse/distribution` | Proxy: landuse distribution |
+| GET | `/api/v1/cadastre/landuse/codes` | Proxy: landuse reference codes |
+
+`POST /api/v1/parcels/batch` supports two modes:
+- **IDs mode**: `{"parcel_ids": ["63349-505/3", ...]}`  (max 200)
+- **Query mode**: `{"query": {<any cadastre /query params>}, "landscape_filters": {<landscape post-filters>}}`
+
+Landscape filters: `min_vegetated_fraction`, `min_ndvi`, `min_tree_canopy_sqm`,
+`min_elevation`, `max_elevation`, `min_conservation_score`, `dominant_type`, `sort`, `sort_dir`
 
 Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
 Auto-rebuilt on startup and when new KG JSONs appear (60s poll).

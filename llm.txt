@@ -744,3 +744,168 @@ curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
 # → 202 {"task_id": "...", "status": "running", "poll": "/api/v1/query/compound"}
 # Poll: POST {"task_id": "..."} to the same endpoint
 ```
+
+---
+
+## Cross-API Bridge (Cadastre + Landscape)
+
+These endpoints combine Austrian cadastral data (parcels, buildings, legal refs,
+protected areas) with landscape analysis data (NDVI, vegetation, RF classification,
+elevation, Hansen forest loss) for nature conservation assessment and parcel
+purchase opportunity analysis.
+
+The cadastre API at https://cadastre-process-api.exe.xyz provides land registry,
+legal references, and protected areas. Our API provides remote sensing analysis.
+The bridge endpoints join them automatically.
+
+### GET /api/v1/lookup
+Proxy to cadastre EDM lookup — diacritics-insensitive search across Austria's
+federal register (Gemeinden, KGs, Ortschaften, PLZ).
+Params: q (required), type (plz|gemeinde|kg|ortschaft), limit (default 20)
+Example: /api/v1/lookup?q=Kofla → finds "Köflach"
+Example: /api/v1/lookup?q=8580 → finds PLZ 8580 entries
+
+### POST /api/v1/parcels/batch ← BATCH PARCEL ENRICHMENT
+Two modes in one endpoint:
+
+**Mode 1 — Explicit parcel IDs:**
+```json
+{"parcel_ids": ["63349-505/3", "75414-1314/1"]}
+```
+Max 200 parcels. Returns cadastre + landscape data + conservation score per parcel.
+
+**Mode 2 — Query-based (supports ALL cadastre query filters):**
+```json
+{
+  "query": {
+    "kg": "63349",
+    "landuse": "W",
+    "min_area": 1000,
+    "max_area": 50000,
+    "has_buildings": "false",
+    "has_legal_refs": "true",
+    "legal_context": "nature_protection",
+    "state": "Steiermark",
+    "district": "Voitsberg",
+    "gemeinde": "Köflach",
+    "plz": "8580",
+    "status": "G",
+    "sort": "area_desc"
+  },
+  "landscape_filters": {
+    "min_vegetated_fraction": 0.5,
+    "min_ndvi": 0.3,
+    "min_tree_canopy_sqm": 200,
+    "min_elevation": 500,
+    "max_elevation": 2000,
+    "min_conservation_score": 40,
+    "dominant_type": "tree",
+    "sort": "conservation_score",
+    "sort_dir": "desc"
+  },
+  "limit": 50,
+  "offset": 0
+}
+```
+Query mode first queries cadastre, then enriches with landscape data and applies
+landscape post-filters. Supports all cadastre /query params (q, kg, gemeinde,
+district, state, plz, landuse, min_area, max_area, has_buildings, status, ez,
+has_legal_refs, legal_context, bbox coords, sort).
+
+Response: {results: [{parcel_id, kg_code, cadastre: {...}, landscape: {...},
+conservation_score: 0-100}], total, offset, limit, meta}
+
+### GET /api/v1/parcels/landscape
+Same as batch query mode but via GET params.
+Cadastre params: q, kg, gemeinde, district, state, plz, landuse, min_area,
+  max_area, has_buildings, status, ez, has_legal_refs, legal_context,
+  min_lon, min_lat, max_lon, max_lat, sort
+Landscape params: min_vegetated_fraction, max_vegetated_fraction, min_ndvi,
+  max_ndvi, min_tree_canopy_sqm, min_elevation, max_elevation,
+  min_conservation_score, dominant_type, landscape_sort, landscape_sort_dir
+Example: /api/v1/parcels/landscape?kg=63330&landuse=W&min_area=50000
+Example: /api/v1/parcels/landscape?state=Steiermark&legal_context=nature_protection&min_conservation_score=40
+
+### GET /api/v1/query/nature ← NATURE CONSERVATION FINDER
+Cross-references cadastre parcels, WDPA protected areas, RIS legal refs, and
+landscape analysis. Returns parcels ranked by conservation value score (0-100).
+
+Conservation score breakdown:
+  Legal protection (in any Austrian law): +30
+  Within WDPA protected area: +20 (near: +10)
+  Vegetation fraction: 0-20 (linear)
+  NDVI quality: 0-15 (linear, clamped 0-0.8)
+  Tree canopy area: 0-15 (log scale)
+
+Params:
+  bbox=w,s,e,n            Spatial filter
+  state, district, gemeinde  Admin filter
+  protected_area=<name>   Filter to WDPA area (e.g. "Kalkalpen", "Donau-Auen")
+  legal_context=<ctx>     national_park|nature_protection|landscape_protection|
+                          water_protection|species_protection|nature_park|etc.
+  min_vegetated_fraction  0-1
+  min_ndvi               float
+  min_tree_canopy_sqm    float
+  min_area_sqm, max_area_sqm  parcel area filter (sqm)
+  landuse                cadastre landuse (W=Wald, LN=Landwirtschaft)
+  has_buildings           true|false
+  sort                   conservation_score|area|ndvi|tree_canopy|vegetated_fraction
+  limit, offset
+
+Example: /api/v1/query/nature?protected_area=Kalkalpen&limit=10
+Example: /api/v1/query/nature?state=Steiermark&legal_context=nature_protection&min_area_sqm=10000
+Example: /api/v1/query/nature?gemeinde=61630&landuse=W&has_buildings=false
+
+### GET /api/v1/parcel/<parcel_id>/detail
+Full combined detail for one parcel from both APIs.
+Includes: cadastre data, legal refs, protected area containment check,
+landscape analysis (elevation, NDVI, vegetation, classification), conservation score.
+Example: /api/v1/parcel/63330-913/detail
+
+### GET /api/v1/kg/<kg_code>/profile
+Combined KG profile merging cadastre + landscape.
+Includes: cadastre info, landuse distribution, legal refs, landscape metrics.
+Example: /api/v1/kg/63330/profile
+
+### Cadastre Proxy Endpoints
+These proxy useful cadastre endpoints through our API:
+
+GET /api/v1/cadastre/legal/search
+  Params: q, context, type (listed|boundary_walk), bundesland, kg, limit, offset
+  Example: /api/v1/cadastre/legal/search?context=national_park
+
+GET /api/v1/cadastre/protected_areas
+  Params: q, near_lon+near_lat, contains_lon+contains_lat, limit
+  Example: /api/v1/cadastre/protected_areas?q=Nationalpark
+
+GET /api/v1/cadastre/landuse/distribution
+  Params: kg, gemeinde, district, state, code, abbr, group_by, limit
+  Example: /api/v1/cadastre/landuse/distribution?kg=63330
+
+GET /api/v1/cadastre/landuse/codes
+  Returns all Austrian cadastre landuse type codes.
+  Example: /api/v1/cadastre/landuse/codes
+
+### Cross-API Query Examples
+
+```bash
+# Find national park parcels with landscape enrichment
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/nature?protected_area=Kalkalpen&limit=5'
+
+# Forest parcels in Voitsberg with no buildings, landscape-enriched
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/landscape?district=Voitsberg&landuse=W&has_buildings=false&min_area=10000'
+
+# Batch query: all legally protected parcels in Steiermark forests > 1ha
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"state": "Steiermark", "landuse": "W", "min_area": 10000, "has_legal_refs": "true"}, "landscape_filters": {"min_conservation_score": 30}, "limit": 20}'
+
+# Full parcel detail (cadastre + landscape + legal + protected areas)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcel/49407-1531/3/detail'
+
+# Combined KG profile
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/kg/63330/profile'
+
+# Diacritics-insensitive lookup
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/lookup?q=Premstatten&type=kg'
+```

@@ -1158,6 +1158,68 @@ def processing_prioritize():
     })
 
 
+@app.route('/api/v1/processing/queue')
+def processing_queue_get():
+    """Read the priority queue with KG names."""
+    data_dir = Path('data/austria_processor')
+    retry_path = data_dir / 'retry_queue.json'
+    codes = []
+    if retry_path.exists():
+        try:
+            codes = json.loads(retry_path.read_text())
+        except Exception:
+            pass
+    # Resolve names from search index
+    items = []
+    try:
+        idx = si.get_index()
+        conn = idx._conn()
+        for code in codes:
+            row = conn.execute(
+                'SELECT kg_name, gemeinde_name, district_name FROM kg WHERE kg_code=?',
+                (code,)
+            ).fetchone()
+            if row:
+                items.append({'code': code, 'name': row['kg_name'],
+                              'gemeinde': row['gemeinde_name'],
+                              'district': row['district_name']})
+            else:
+                items.append({'code': code, 'name': code})
+    except Exception:
+        items = [{'code': c, 'name': c} for c in codes]
+    return jsonify({'queue': items, 'count': len(items)})
+
+
+@app.route('/api/v1/processing/queue', methods=['PUT'])
+def processing_queue_put():
+    """Save reordered priority queue."""
+    data = request.get_json(silent=True) or {}
+    codes = data.get('queue', [])
+    if not isinstance(codes, list):
+        return jsonify({'error': 'queue must be an array of KG codes'}), 400
+    retry_path = Path('data/austria_processor/retry_queue.json')
+    retry_path.write_text(json.dumps(codes))
+    return jsonify({'status': 'saved', 'count': len(codes)})
+
+
+@app.route('/api/v1/processing/queue', methods=['DELETE'])
+def processing_queue_delete():
+    """Remove a KG from the priority queue."""
+    code = request.args.get('kg') or (request.get_json(silent=True) or {}).get('kg', '')
+    if not code:
+        return jsonify({'error': 'kg parameter required'}), 400
+    retry_path = Path('data/austria_processor/retry_queue.json')
+    try:
+        codes = json.loads(retry_path.read_text()) if retry_path.exists() else []
+        if code in codes:
+            codes.remove(code)
+            retry_path.write_text(json.dumps(codes))
+            return jsonify({'status': 'removed', 'kg': code, 'remaining': len(codes)})
+        return jsonify({'status': 'not_found', 'kg': code}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/processing/log')
 def processing_log():
     """Return recent processor log lines."""

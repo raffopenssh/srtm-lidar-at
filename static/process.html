@@ -84,6 +84,24 @@
   .leaflet-container { background: var(--bg) !important; }
   .leaflet-container.crosshair-cursor { cursor: crosshair !important; }
   .priority-drawing #btnDrawPriority { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.1); }
+
+  /* Priority queue tags */
+  #prioQueueWrap { margin-bottom: 14px; }
+  .prio-tags { display: flex; flex-wrap: wrap; gap: 4px; min-height: 26px;
+    padding: 6px 8px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 6px; max-height: 120px; overflow-y: auto; }
+  .prio-tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+    font-size: 11px; border-radius: 4px; border: 1px solid var(--border);
+    background: rgba(88,166,255,0.06); color: var(--text); cursor: grab;
+    user-select: none; white-space: nowrap; transition: border-color 0.15s, background 0.15s; }
+  .prio-tag:hover { border-color: var(--blue); background: rgba(88,166,255,0.12); }
+  .prio-tag .prio-code { color: var(--dim); font-size: 10px; }
+  .prio-tag .prio-rm { color: var(--dim); cursor: pointer; font-size: 10px; margin-left: 2px;
+    opacity: 0.5; transition: opacity 0.15s, color 0.15s; }
+  .prio-tag .prio-rm:hover { opacity: 1; color: var(--red); }
+  .prio-tag.dragging { opacity: 0.4; border-style: dashed; }
+  .prio-tag.drag-over { border-color: var(--blue); background: rgba(88,166,255,0.18); }
+  .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
   .tile-dot {
     filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
   }
@@ -304,17 +322,6 @@
   <button class="btn btn-g" id="btnResume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
   <button class="btn btn-r" id="btnStop" onclick="sendCmd('stop')" disabled>■ Stop</button>
   <span class="sep">│</span>
-  <span style="font-size:11px;color:var(--dim)">Single KG:</span>
-  <input type="text" class="inp" id="singleKg" placeholder="63349">
-  <button class="btn" onclick="processSingle()">Process</button>
-  <span class="sep">│</span>
-  <select class="inp" id="stateSelect">
-    <option value="">All states</option>
-    <option>Burgenland</option><option>Kärnten</option><option>Niederösterreich</option>
-    <option>Oberösterreich</option><option>Salzburg</option><option>Steiermark</option>
-    <option>Tirol</option><option>Vorarlberg</option><option>Wien</option>
-  </select>
-  <span class="sep">│</span>
   <button class="btn" id="btnDrawPriority" onclick="togglePriorityDraw()" title="Draw a rectangle on the map to prioritize KGs in that area">📌 Priority Area</button>
   <span id="priorityCoords" style="display:none;font-size:11px;color:var(--dim);">
     <input type="text" class="inp" id="prioWest" placeholder="W" style="width:62px" title="West longitude">
@@ -325,6 +332,15 @@
     <button class="btn" onclick="cancelPriority()">✕</button>
   </span>
   <span id="priorityStatus" style="font-size:11px;margin-left:4px;"></span>
+</div>
+
+<!-- Priority Queue -->
+<div id="prioQueueWrap" style="display:none">
+  <div class="sec-t" style="margin-bottom:4px;">
+    <span>📌 Priority Queue <span id="prioQueueCount" style="color:var(--dim);font-weight:normal"></span></span>
+    <span style="font-size:10px;color:var(--dim)">drag to reorder · click ✕ to remove</span>
+  </div>
+  <div id="prioQueueTags" class="prio-tags"></div>
 </div>
 
 <!-- Live Log -->
@@ -947,16 +963,6 @@ async function sendCmd(action) {
     setTimeout(poll, 400);
   } catch(e) { console.error(action, e); }
 }
-async function processSingle() {
-  const v = document.getElementById('singleKg').value.trim();
-  if (!v) return;
-  try {
-    const r = await fetch('/api/v1/processing/single?kg=' + encodeURIComponent(v), {method:'POST'});
-    if (!r.ok) alert('Failed: ' + await r.text());
-    else document.getElementById('singleKg').value = '';
-    setTimeout(poll, 400);
-  } catch(e) { console.error(e); }
-}
 async function retryKg(code) {
   try {
     const r = await fetch('/api/v1/processing/retry?kg=' + encodeURIComponent(code), {method:'POST'});
@@ -1156,6 +1162,7 @@ function renderLastKg(js) {
 let _prioDrawing = false;
 let _prioRect = null;
 let _prioStart = null;
+let _prioQueue = []; // [{code, name, gemeinde, district}]
 
 function togglePriorityDraw() {
   if (_prioDrawing) { cancelPriority(); return; }
@@ -1167,7 +1174,6 @@ function togglePriorityDraw() {
   document.getElementById('priorityStatus').style.color = 'var(--blue)';
   map.getContainer().classList.add('crosshair-cursor');
   map.on('mousedown', _prioMouseDown);
-  // Remove old rect if any
   if (_prioRect) { map.removeLayer(_prioRect); _prioRect = null; }
 }
 
@@ -1207,14 +1213,12 @@ function _prioMouseUp(e) {
   if (!_prioStart) return;
   const bounds = L.latLngBounds(_prioStart, e.latlng);
   _prioStart = null;
-  // Fill coord inputs
   document.getElementById('prioWest').value = bounds.getWest().toFixed(5);
   document.getElementById('prioSouth').value = bounds.getSouth().toFixed(5);
   document.getElementById('prioEast').value = bounds.getEast().toFixed(5);
   document.getElementById('prioNorth').value = bounds.getNorth().toFixed(5);
   document.getElementById('priorityStatus').textContent = 'Bbox set — click Queue to prioritize';
   document.getElementById('priorityStatus').style.color = 'var(--green)';
-  // Stop draw mode on map but keep coords visible
   map.getContainer().classList.remove('crosshair-cursor');
   map.off('mousedown', _prioMouseDown);
 }
@@ -1248,20 +1252,109 @@ async function submitPriority() {
     if (d.already_in_queue > 0) msg += `, ${d.already_in_queue} already queued`;
     document.getElementById('priorityStatus').textContent = msg;
     document.getElementById('priorityStatus').style.color = 'var(--green)';
-    // Flash the rect green briefly then clean up after 3s
     if (_prioRect) _prioRect.setStyle({color: '#3fb950'});
-    setTimeout(() => cancelPriority(), 4000);
-    setTimeout(poll, 500);
+    setTimeout(() => cancelPriority(), 3000);
+    // Refresh the queue display
+    fetchPrioQueue();
   } catch(err) {
     document.getElementById('priorityStatus').textContent = 'Error: ' + err.message;
     document.getElementById('priorityStatus').style.color = 'var(--red)';
   }
 }
 
+// ── Priority Queue Display ────────────────────────────────────────
+
+let _dragSrcIdx = null;
+
+async function fetchPrioQueue() {
+  try {
+    const r = await fetch('/api/v1/processing/queue');
+    if (!r.ok) return;
+    const d = await r.json();
+    _prioQueue = d.queue || [];
+    renderPrioQueue();
+  } catch(e) { /* silent */ }
+}
+
+function renderPrioQueue() {
+  const wrap = document.getElementById('prioQueueWrap');
+  const container = document.getElementById('prioQueueTags');
+  const countEl = document.getElementById('prioQueueCount');
+  if (!_prioQueue.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'block';
+  countEl.textContent = '(' + _prioQueue.length + ')';
+  container.innerHTML = '';
+  _prioQueue.forEach((kg, i) => {
+    const tag = document.createElement('span');
+    tag.className = 'prio-tag';
+    tag.draggable = true;
+    tag.dataset.idx = i;
+    tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '');
+    tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
+      esc(kg.name) +
+      '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
+    // Drag events
+    tag.addEventListener('dragstart', e => {
+      _dragSrcIdx = i;
+      tag.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', '' + i);
+    });
+    tag.addEventListener('dragend', () => {
+      tag.classList.remove('dragging');
+      _dragSrcIdx = null;
+    });
+    tag.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      tag.classList.add('drag-over');
+    });
+    tag.addEventListener('dragleave', () => tag.classList.remove('drag-over'));
+    tag.addEventListener('drop', e => {
+      e.preventDefault();
+      tag.classList.remove('drag-over');
+      const from = parseInt(e.dataTransfer.getData('text/plain'), 10);
+      if (isNaN(from) || from === i) return;
+      // Reorder
+      const item = _prioQueue.splice(from, 1)[0];
+      _prioQueue.splice(i, 0, item);
+      renderPrioQueue();
+      savePrioQueue();
+    });
+    container.appendChild(tag);
+  });
+}
+
+async function removePrioKg(event, idx) {
+  event.stopPropagation();
+  const kg = _prioQueue[idx];
+  if (!kg) return;
+  try {
+    await fetch('/api/v1/processing/queue?kg=' + encodeURIComponent(kg.code), {method: 'DELETE'});
+  } catch(e) { /* continue anyway */ }
+  _prioQueue.splice(idx, 1);
+  renderPrioQueue();
+}
+
+async function savePrioQueue() {
+  try {
+    await fetch('/api/v1/processing/queue', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({queue: _prioQueue.map(k => k.code)})
+    });
+  } catch(e) { /* silent */ }
+}
+
 // ── Init ────────────────────────────────────────────────────────
 initMap();
 poll();
+fetchPrioQueue();
 setInterval(poll, POLL * 1000);
+setInterval(fetchPrioQueue, 15000);
 setInterval(() => {
   cd--;
   if (cd <= 0) cd = POLL;

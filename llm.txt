@@ -205,6 +205,39 @@ Each KG gets its own Zenodo deposit with DOI. Search index stores download URLs:
 - POST /api/v1/processing/single?kg=X — process single KG
 - GET /api/v1/processing/log — recent log lines
 - GET /api/v1/processing/manifest — Zenodo manifest entries
+- GET /api/v1/processing/queue — read priority queue (items, names, failure counts, permanently failed)
+- POST /api/v1/processing/queue — add KGs at position (body: {kgs, position, skip_processed})
+- PUT /api/v1/processing/queue — replace entire queue (body: {queue: [...]})
+- DELETE /api/v1/processing/queue?kg=X — remove KG from queue
+
+Queue management: The processor reads retry_queue.json before its normal
+nearest-neighbor traversal. POST inserts KGs at a 0-based position (default -1 = append).
+Already-processed KGs are skipped by default. Duplicates in the queue are moved to
+the new position. Response includes resolved KG names, gemeinde, and final positions.
+
+Examples:
+  # Read the queue
+  curl https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue
+  # → {"queue": [{"code":"12105","name":"Dürnstein",...}, ...], "count": 28, "permanently_failed": [...]}
+
+  # Add Gesäuse + Kalkalpen national park KGs starting at position 2 (3rd place)
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"kgs":["49006","49013","49106","49311","49313","49321","49405","49406","49407","49409","49412","60102","60106","60107","67106","67107","67109","67111","67404","67405","67412","67501"],"position":2}'
+  # → {"status":"added","added_count":22,"queue_length":50,"added":[{"code":"49006","name":"Innerbreitenau","position":2},...]}
+
+  # Move a KG to the front of the queue
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"kgs":["91109"],"position":0}'
+
+  # Replace entire queue
+  curl -X PUT https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"queue":["49006","49013","60102"]}'
+
+  # Remove a KG from the queue
+  curl -X DELETE 'https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue?kg=49006'
 
 ## Geometry Input (all POST endpoints)
 
@@ -1164,127 +1197,145 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings
 # Infrastructure (e.g. masts) with RF confidence > 0.8
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8'
 
-# --- Compound Query (POST) ---
-# All filters combined in one request. Pure SQL, fast.
+# --- Compound Query (POST /api/v1/query/compound) ---
+# All filters combined in one request. Pure SQL on indexed columns, <25ms.
+# POST JSON body → {total, offset, limit, results}
 
-# Tree conf>0.8 area>800 + grass conf>0.8 area>1300 + no buildings + SW aspect + rugged terrain
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},{"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],"max_buildings":0,"aspect":["S","SW","W"],"min_roughness":2.0}'
+# ── Terrain & Elevation ──
 
-# High-elevation steep terrain with lots of trees, sorted by tree area
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"min_elevation":1500,"min_slope":15,"min_tree_count":100,"sort":"tree_canopy_sqm","sort_dir":"desc"}'
-
-# KGs with high NDVI, low SAR, evergreen phenology in Tirol
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"state":"Tirol","min_ndvi":0.6,"max_sar_vv":-10,"phenology":"evergreen"}'
-
-# Landcover filter: KGs with >20% crop area and mean crop height < 1m
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"landcover_filters":[{"type":"crop","min_fraction":0.2,"max_height_mean":1.0}]}'
-
-# Temporal change hotspots: high DTM change + low stability
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"min_dtm_change":0.5,"max_diverged_pct":5,"sort":"temporal_stability","sort_dir":"asc"}'
-
-# --- NEW: Building detail filters ---
-
-# KGs with tall buildings (mean > 12m, max > 20m) and > 60% pitched roofs
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"min_building_height":12,"min_building_max_height":20,"min_building_pitched_pct":60}'
-
-# KGs with multi-story buildings (avg > 3 stories, tallest > 5) and large footprint
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"min_building_stories":3,"min_building_stories_max":5,"min_building_footprint":50000,"sort":"building_max_height_m","sort_dir":"desc"}'
-
-# KGs with new construction: new buildings with footprint > 500m² and height > 5m
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"min_new_buildings":3,"min_new_building_footprint":500,"min_new_building_height":5}'
-
-# Rural KGs: no multi-story, small footprint, mostly pitched roofs
-curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
-  -H 'Content-Type: application/json' \
-  -d '{"max_building_stories_max":2,"max_building_footprint":10000,"min_building_pitched_pct":80,"state":"Burgenland"}'
-
-# --- NEW: Terrain detail filters ---
-
-# High alpine: valley floor > 1500m, ridge > 2500m, very rugged
+# High alpine: valley floor > 1500m, ridge top > 2500m, elevation range > 800m
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_elevation_min":1500,"min_elevation_max":2500,"min_elevation_range":800,"terrain_class":"highly_rugged"}'
 
-# Flat lowlands with large area and many parcels
+# Steep forested slopes: slope > 15°, 1000+ trees, sorted by canopy area
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
-  -d '{"terrain_class":"level","max_elevation":300,"min_total_area":5000000,"min_parcels":200}'
+  -d '{"min_slope":15,"min_tree_count":1000,"sort":"tree_canopy_sqm","sort_dir":"desc"}'
 
-# --- NEW: Temporal & disturbance filters ---
-
-# Active construction/earthworks: high volume change + many changed segments
+# Flat agricultural lowlands: level terrain, low elevation, many parcels
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
-  -d '{"min_changed_segments":20,"min_disturbed_volume":5000,"sort":"total_disturbed_volume_m3","sort_dir":"desc"}'
+  -d '{"terrain_class":"level","max_elevation":300,"min_parcels":200,"min_total_area":5000000}'
 
-# Erosion/subsidence: negative volume change + low stability
+# ── Buildings & Urban ──
+
+# Dense urban: 500+ buildings, multi-story (mean > 3, tallest > 5), large footprint
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
-  -d '{"max_volume_change":-1000,"min_temporal_stability":0,"sort":"net_volume_change_m3","sort_dir":"asc"}'
+  -d '{"min_buildings":500,"min_building_stories":3,"min_building_stories_max":5,"min_building_footprint":50000,"sort":"building_max_height_m","sort_dir":"desc"}'
 
-# --- NEW: Tree & vegetation detail ---
-
-# KGs with high stem volume (forestry interest) and good NDVI amplitude (seasonal)
+# Tall buildings with pitched roofs: max height > 20m, > 30% pitched
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
-  -d '{"min_tree_volume":10000,"min_ndvi_amplitude":0.15,"sort":"tree_stem_volume_m3","sort_dir":"desc"}'
+  -d '{"min_building_max_height":20,"min_building_pitched_pct":30}'
 
-# NDVI seasonal peak timing: late-season peak (phase > 7 = July+)
+# New construction hotspots: 3+ new buildings, > 500m² footprint, > 5m height
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_new_buildings":3,"min_new_building_footprint":500,"min_new_building_height":5}'
+
+# Rural character: no tall buildings, small footprint, mostly pitched roofs
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_building_stories_max":2,"max_building_footprint":10000,"min_building_pitched_pct":80}'
+
+# ── Trees & Vegetation ──
+
+# Forest-rich with high biomass: 1000+ trees, stem volume > 10000 m³, seasonal NDVI
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_tree_count":1000,"min_tree_volume":10000,"min_ndvi_amplitude":0.15,"sort":"tree_stem_volume_m3","sort_dir":"desc"}'
+
+# High biodiversity: Shannon > 2.0, NDVI > 0.4, > 60% vegetated
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_shannon_diversity":2.0,"min_ndvi":0.4,"min_vegetated_fraction":0.6}'
+
+# Per-type classification: tree confidence > 0.8, area > 800m² + grass > 1300m²
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},{"type":"grass","min_confidence":0.8,"min_area_sqm":1300}]}'
+
+# Landcover: > 20% crop area, mean crop height < 1m
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"landcover_filters":[{"type":"crop","min_fraction":0.2,"max_height_mean":1.0}]}'
+
+# ── SAR & Phenology ──
+
+# High SAR + evergreen in Tirol (conifer forests)
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Tirol","min_ndvi":0.6,"max_sar_vv":-10,"phenology":"evergreen"}'
+
+# Late-season NDVI peak (phase 7-9 = July-September), high mean NDVI
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_ndvi_phase":7,"max_ndvi_phase":9,"min_ndvi_harm_mean":0.5}'
 
-# --- NEW: Classification quality ---
+# ── Temporal Change & Disturbance ──
 
-# High-quality RF coverage: > 90% RF classified, low divergence
+# Active earthworks: high volume change + many changed segments
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_changed_segments":20,"min_disturbed_volume":5000,"sort":"total_disturbed_volume_m3","sort_dir":"desc"}'
+
+# Erosion/subsidence: negative volume change, sorted ascending
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_volume_change":-1000,"sort":"net_volume_change_m3","sort_dir":"asc"}'
+
+# ── Classification Quality ──
+
+# High quality: RF > 90% classified, low divergence, quality score > 80
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_rf_classified_pct":90,"max_rf_diverged_count":5,"min_quality_score":80}'
 
-# --- Pagination examples ---
-# Page through all KGs in Vorarlberg (25 per page)
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=0'
-# → {"total": 112, "offset": 0, "limit": 25, "results": [...]}
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=25'  # page 2
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=50'  # page 3
+# ── Terrain Deep Dive: slope, aspect, elevation, TRI, terrain_class ──
 
-# Compound query with pagination
+# NE-facing gentle slopes above 390m with buildings and trees (GET query)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?max_slope_mean=5&min_elevation_mean=390&min_building_count=100&min_tree_count=500&processed_only=true'
+
+# Full terrain filter set via compound: level terrain, low slope, low TRI, NE aspect, 350-500m
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
-  -d '{"min_elevation":1000,"limit":20,"offset":40}'
-# → {"total": 847, "offset": 40, "limit": 20, "results": [...]}
+  -d '{"terrain_class":"level","max_slope":3,"max_tri":0.5,"aspect":["NE"],"min_elevation":350,"max_elevation":500,"min_vegetated_fraction":0.5,"min_buildings":100}'
 
-# --- Async query examples (for slow JSON-scanning queries) ---
-# Start async top_features query
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true'
-# → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}
+# Steep SE-facing alpine meadows: slope > 20°, SE/S aspect, elevation 1000-2000m, high NDVI
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_slope":20,"aspect":["SE","S"],"min_elevation":1000,"max_elevation":2000,"min_ndvi":0.5,"min_vegetated_fraction":0.7}'
 
-# Poll until done (returns 202 while running, 200 with result when complete)
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123'
-# → 202 {"active": true, "task_id": "abc-123", "step": "running", "elapsed": 3.2}
-# ... eventually ...
-# → 200 {"total": 456, "offset": 0, "limit": 100, "results": [...]}
+# Valley floors: low elevation_min, high elevation_range (deep valleys), flat terrain
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_elevation_min":400,"min_elevation_range":500,"terrain_class":"level"}'
 
-# Async parcels_by_type
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500&async=true'
+# ── The Kitchen Sink: multi-domain compound ──
 
-# Async compound query
+# Wilderness candidates: no buildings, rugged, high trees, SW-facing, high NDVI, good RF
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_buildings":0,"aspect":["S","SW","W"],"min_roughness":2.0,"min_tree_count":100,"min_ndvi":0.5,"min_confidence":0.6,"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]}'
+
+# Urban + green: 200+ buildings, 500+ trees, high Shannon diversity, good quality
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_buildings":200,"min_tree_count":500,"min_shannon_diversity":2.0,"min_quality_score":0.8,"sort":"shannon_diversity","sort_dir":"desc"}'
+
+# ── Pagination ──
+
+# Page through compound results (25 per page)
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_elevation":1000,"limit":25,"offset":0}'
+# → {"total": 847, "offset": 0, "limit": 25, "results": [...]}
+
+# ── Async ──
+
+# Async compound query (for very complex filter sets)
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_elevation":1500,"async":true}'
@@ -1418,6 +1469,10 @@ compound supports all SearchIndex.query_compound() filters:
 
 parcel_filters (per-parcel from our KG JSONs):
   min_vegetated_fraction, max_vegetated_fraction, min_elevation, max_elevation,
+  min_slope, max_slope (slope_mean_deg per parcel),
+  min_tri, max_tri (terrain ruggedness index per parcel),
+  terrain_class: str (level, nearly_level, slightly_rugged, ...),
+  aspect: str or list (N, NE, E, SE, S, SW, W, NW — parcel aspect_dominant),
   types (list), min_type_fraction, min_ndsm_max, max_ndsm_max,
   min_parcel_area, max_parcel_area, is_vegetated,
   min_confidence (float, overall combined RF+rules confidence),
@@ -1448,6 +1503,13 @@ Landscape params: min_vegetated_fraction, max_vegetated_fraction, min_ndvi,
   min_conservation_score, dominant_type, landscape_sort, landscape_sort_dir
 Example: /api/v1/parcels/landscape?kg=63330&landuse=W&min_area=50000
 Example: /api/v1/parcels/landscape?state=Steiermark&legal_context=nature_protection&min_conservation_score=40
+
+Per-parcel terrain query (compound → parcel_filters):
+  # All east-facing level parcels in Gaissau
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
+    -H 'Content-Type: application/json' \
+    -d '{"compound":{"state":"Vorarlberg"},"parcel_filters":{"aspect":["E"],"terrain_class":"level"},"limit":100}'
+  # → 125 parcels with aspect_dominant=E and terrain_class=level
 
 ### GET /api/v1/query/nature ← NATURE CONSERVATION FINDER
 Cross-references cadastre parcels, WDPA protected areas, RIS legal refs, and

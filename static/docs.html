@@ -1287,6 +1287,7 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
     "sort":"tree_canopy_sqm","sort_dir":"desc","limit":20,"offset":40}'</code></pre></div>
 </div>
 
+
 <div class="endpoint">
   <div class="ep-header">
     <span class="method method-get">GET</span>
@@ -1303,6 +1304,69 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
     <span class="ep-summary">Rebuild search index</span>
   </div>
   <p class="ep-desc">Rebuilds from scratch (~0.3s). Picks up new processor results and Zenodo manifest entries.</p>
+</div>
+
+<h3 id="processing-queue">Processing Queue Management <a class="anchor-link" href="#processing-queue">#</a></h3>
+<p>Control which KGs get processed next. The priority queue is a persistent ordered list; the processor pops from the front.</p>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <code class="ep-path">/api/v1/processing/queue</code>
+    <span class="ep-summary">Read current priority queue</span>
+  </div>
+  <p class="ep-desc">Returns the ordered list of KG numbers waiting to be processed.</p>
+  <div class="code-wrap"><pre><code>curl https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue</code></pre></div>
+</div>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <code class="ep-path">/api/v1/processing/queue</code>
+    <span class="ep-summary">Add KGs at a specific position</span>
+  </div>
+  <p class="ep-desc">Insert one or more KGs into the queue at a given position. Use <code>skip_processed: true</code> to ignore already-processed KGs.</p>
+  <div class="code-wrap"><pre><code><span class="tok-kw">POST</span> /api/v1/processing/queue
+Content-Type: application/json
+
+{
+  "kgs": ["49006", "49013"],
+  "position": 2,
+  "skip_processed": true
+}</code></pre></div>
+  <p class="ep-desc" style="margin-top:10px">
+    <strong>Example — Prioritise Gesäuse + Kalkalpen national park KGs:</strong>
+  </p>
+  <div class="code-wrap"><pre><code>curl <span class="tok-flag">-X</span> POST https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue \
+  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
+  <span class="tok-flag">-d</span> '{"kgs": ["49006","49013","49106","49311","49313","49321","49405","49406","49407","49409","49412","60102","60106","60107","67106","67107","67109","67111","67404","67405","67412","67501"],
+    "position": 2, "skip_processed": true}'</code></pre></div>
+  <p style="font-size:13px;color:#94a3b8;margin-top:6px">Inserts Gesäuse &amp; Kalkalpen KGs at position 2, right after whatever is currently processing.</p>
+</div>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-put">PUT</span>
+    <code class="ep-path">/api/v1/processing/queue</code>
+    <span class="ep-summary">Replace entire queue</span>
+  </div>
+  <p class="ep-desc">Overwrites the full queue with a new ordered list.</p>
+  <div class="code-wrap"><pre><code><span class="tok-kw">PUT</span> /api/v1/processing/queue
+Content-Type: application/json
+
+{
+  "queue": ["12345", "67890", "91109"]
+}</code></pre></div>
+</div>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-delete">DELETE</span>
+    <code class="ep-path">/api/v1/processing/queue?kg=X</code>
+    <span class="ep-summary">Remove a KG from queue</span>
+  </div>
+  <p class="ep-desc">Removes the specified KG number from the processing queue.</p>
+  <div class="code-wrap"><pre><code>curl <span class="tok-flag">-X</span> DELETE 'https://srtm-lidar-at.exe.xyz:8000/api/v1/processing/queue?kg=49006'</code></pre></div>
 </div>
 
 <h3 id="query-filter-logic">Filter Logic: AND vs OR <a class="anchor-link" href="#query-filter-logic">#</a></h3>
@@ -1374,70 +1438,95 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
 <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
 <pre><code><span class="tok-comment"># Top 1% tallest trees with RF confidence &gt; 90%</span>
 <span class="tok-comment"># Returns 1 result: 35.43m tree near Gaissau, rf_conf=0.937</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;min_rf_confidence=0.9&amp;percentile=0.01"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;min_rf_confidence=0.9&amp;percentile=0.01"</a>
 
 <span class="tok-comment"># Top 5% largest tree loss areas, RF confidence &gt; 80%</span>
 <span class="tok-comment"># Returns segments ranked by area where forest has been lost</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree_loss&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree_loss&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</a>
 
 <span class="tok-comment"># Top 10 excavations by volume, RF confidence &gt; 70%</span>
 <span class="tok-comment"># Finds the largest ground disturbances measured in m³ of earth moved</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation&amp;min_rf_confidence=0.7&amp;sort=volume&amp;limit=10"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume&limit=10" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation&amp;min_rf_confidence=0.7&amp;sort=volume&amp;limit=10"</a>
 
 <span class="tok-comment"># Tallest 5 roofs with combined confidence &gt; 70%</span>
 <span class="tok-comment"># Identifies the tallest buildings (by nDSM height at segment peak)</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof&amp;min_confidence=0.7&amp;sort=height_max_m&amp;limit=5"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m&limit=5" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof&amp;min_confidence=0.7&amp;sort=height_max_m&amp;limit=5"</a>
 
 <span class="tok-comment"># All tall vegetation: trees OR shrubs OR hedges above 15m, high confidence</span>
 <span class="tok-comment"># Multi-type OR — comma-separated types act as OR, other filters AND</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree,shrub,hedge&amp;min_height=15&amp;min_rf_confidence=0.7&amp;sort=height_max_m"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree,shrub,hedge&min_height=15&min_rf_confidence=0.7&sort=height_max_m" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree,shrub,hedge&amp;min_height=15&amp;min_rf_confidence=0.7&amp;sort=height_max_m"</a>
 
 <span class="tok-comment"># Largest building structures: roofs OR greenhouses, sorted by footprint</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof,greenhouse&amp;sort=area_sqm&amp;sort_dir=desc&amp;min_confidence=0.7&amp;limit=10"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof,greenhouse&sort=area_sqm&sort_dir=desc&min_confidence=0.7&limit=10" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof,greenhouse&amp;sort=area_sqm&amp;sort_dir=desc&amp;min_confidence=0.7&amp;limit=10"</a>
 
 <span class="tok-comment"># All disturbance events ranked by volume of earth moved</span>
 <span class="tok-comment"># Combines excavation, fill, construction, and tree_loss into one query</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation,fill,construction,tree_loss&amp;sort=volume&amp;sort_dir=desc&amp;limit=20"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation,fill,construction,tree_loss&sort=volume&sort_dir=desc&limit=20" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation,fill,construction,tree_loss&amp;sort=volume&amp;sort_dir=desc&amp;limit=20"</a>
 
 <span class="tok-comment"># Trees in Bregenz district above 30m</span>
 <span class="tok-comment"># Combines type + spatial admin + height filter (all AND)</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;district=Bregenz&amp;min_height=30&amp;sort=height_max_m"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&district=Bregenz&min_height=30&sort=height_max_m" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;district=Bregenz&amp;min_height=30&amp;sort=height_max_m"</a>
 
 <span class="tok-comment"># Top 5% largest crop segments with high RF confidence</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=crop&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</span></code></pre>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=crop&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=crop&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</a></code></pre>
 </div>
 
 <h4 style="margin-top:16px">More Query Examples (non-segment)</h4>
 <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
 <pre><code><span class="tok-comment"># KG lookup by code — returns full index record with landcover, hansen, links</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109"</a>
 
 <span class="tok-comment"># Aggregate landscape stats for a state</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&amp;aggregate=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&aggregate=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&amp;aggregate=true"</a>
 
 <span class="tok-comment"># Aggregate stats for a district (by name)</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=Bregenz&amp;aggregate=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=Bregenz&aggregate=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=Bregenz&amp;aggregate=true"</a>
 
 <span class="tok-comment"># Text search (terms are AND'd) — finds KGs matching BOTH terms</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Bregenz+Gaissau"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Bregenz+Gaissau" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Bregenz+Gaissau"</a>
 
 <span class="tok-comment"># Point proximity — nearest KGs to a coordinate, sorted by distance</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48"</a>
 
 <span class="tok-comment"># Spatial bbox, processed KGs only</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&amp;processed_only=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&amp;processed_only=true"</a>
 
 <span class="tok-comment"># KGs ranked by tree coverage (by area)</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=tree&amp;metric=area"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=tree&metric=area" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=tree&amp;metric=area"</a>
 
 <span class="tok-comment"># Hansen forest loss in a year range</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?hansen=true&amp;year_from=2020&amp;year_to=2024"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?hansen=true&year_from=2020&year_to=2024" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?hansen=true&amp;year_from=2020&amp;year_to=2024"</a>
 
 <span class="tok-comment"># KGs with new uncadastred buildings</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&amp;processed_only=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&amp;processed_only=true"</a>
 
 <span class="tok-comment"># All KGs in Gaißau municipality</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?gemeinde=Gai%C3%9Fau"</span></code></pre>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?gemeinde=Gai%C3%9Fau" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?gemeinde=Gai%C3%9Fau"</a>
+
+<span class="tok-comment"># ── Terrain, slope, aspect, elevation filters ──</span>
+
+<span class="tok-comment"># NE-facing gentle slopes above 390m with buildings and trees</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?max_slope_mean=5&amp;min_elevation_mean=390&amp;min_building_count=100&amp;min_tree_count=500&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?max_slope_mean=5&amp;min_elevation_mean=390&amp;min_building_count=100&amp;min_tree_count=500&amp;processed_only=true"</a>
+
+<span class="tok-comment"># Low slope + lush vegetation + high NDVI</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_vegetated_fraction=0.5&amp;max_slope_mean=5&amp;min_ndvi=0.3&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_vegetated_fraction=0.5&amp;max_slope_mean=5&amp;min_ndvi=0.3&amp;processed_only=true"</a>
+
+<span class="tok-comment"># Dense settlements: 500+ buildings, multi-story, max height &gt; 20m</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_building_count=500&amp;min_building_stories=2&amp;min_building_max_height=20&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_building_count=500&amp;min_building_stories=2&amp;min_building_max_height=20&amp;processed_only=true"</a>
+
+<span class="tok-comment"># High biodiversity: Shannon &gt; 2.0, 1000+ trees, large canopy</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_shannon_diversity=2.0&amp;min_tree_count=1000&amp;min_tree_canopy_sqm=100000&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_shannon_diversity=2.0&amp;min_tree_count=1000&amp;min_tree_canopy_sqm=100000&amp;processed_only=true"</a>
+
+<span class="tok-comment"># Active landscape change + high quality classification</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true"</a>
+
+<span class="tok-comment"># ── Per-parcel terrain filter (POST /api/v1/parcels/batch) ──</span>
+
+<span class="tok-comment"># All east-facing level parcels — returns parcel IDs with cadastre data</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">'Content-Type: application/json'</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"compound":{"state":"Vorarlberg"},"parcel_filters":{"aspect":["E"],"terrain_class":"level"},"limit":100}'</span>
+<span class="tok-comment"># → 125 parcels with aspect_dominant=E and terrain_class=level</span></code></pre>
 </div>
 
 <h4 style="margin-top:16px">Slow Queries (async recommended)</h4>
@@ -1450,28 +1539,28 @@ curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?geme
 <pre><code><span class="tok-comment"># ── parcels_by_type: find individual parcels where a type has high RF confidence ──</span>
 <span class="tok-comment"># Scans KG JSONs → returns per-parcel results with centroid, elevation, areas</span>
 <span class="tok-comment"># Sync (fast if few KGs processed):</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500"</a>
 
 <span class="tok-comment"># Async (recommended when many KGs are processed):</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500&amp;async=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500&amp;async=true"</a>
 <span class="tok-comment"># → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}</span>
 <span class="tok-comment"># Poll until done:</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123"</a>
 <span class="tok-comment"># → 202 while running, 200 with full result when complete</span>
 
 <span class="tok-comment"># ── top_features: cross-KG ranked features from JSON summaries ──</span>
 
 <span class="tok-comment"># Tallest trees across all processed KGs, RF confidence &gt; 90%</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&amp;min_confidence=0.9&amp;async=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&amp;min_confidence=0.9&amp;async=true"</a>
 
 <span class="tok-comment"># Tallest new (uncadastred) buildings, confidence &gt; 75%</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&amp;min_confidence=0.75&amp;async=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&amp;min_confidence=0.75&amp;async=true"</a>
 
 <span class="tok-comment"># Infrastructure masts only, high confidence</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&amp;type=mast&amp;min_confidence=0.8&amp;async=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&amp;type=mast&amp;min_confidence=0.8&amp;async=true"</a>
 
 <span class="tok-comment"># Top objects within a spatial bbox (restricts which KGs are scanned)</span>
-curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&amp;bbox=9.5,47.4,9.7,47.6&amp;min_confidence=0.7&amp;async=true"</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&bbox=9.5,47.4,9.7,47.6&min_confidence=0.7&async=true" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&amp;bbox=9.5,47.4,9.7,47.6&amp;min_confidence=0.7&amp;async=true"</a>
 
 <span class="tok-comment"># ── compound filter (async): complex multi-attribute KG search ──</span>
 <span class="tok-comment"># POST body with "async": true — same poll mechanism via task_id</span>

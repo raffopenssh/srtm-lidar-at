@@ -1251,9 +1251,99 @@ def processing_queue_get():
     })
 
 
+@app.route('/api/v1/processing/queue', methods=['POST'])
+def processing_queue_add():
+    """Add KG codes to the priority queue at a specific position.
+
+    Body JSON:
+      kgs: list of KG codes to add (required)
+      position: 0-based insertion index (default 0 = front)
+               Use -1 or omit to append at end.
+      skip_processed: if true (default), silently drop already-processed KGs
+
+    Duplicates already in the queue are moved to the new position.
+    """
+    data = request.get_json(silent=True) or {}
+    new_codes = data.get('kgs') or data.get('kg_codes') or data.get('queue', [])
+    if isinstance(new_codes, str):
+        new_codes = [new_codes]
+    if not isinstance(new_codes, list) or not new_codes:
+        return jsonify({'error': 'kgs must be a non-empty array of KG codes'}), 400
+    new_codes = [str(c).strip() for c in new_codes if str(c).strip()]
+    position = data.get('position', -1)
+    skip_processed = data.get('skip_processed', True)
+
+    retry_path = Path('data/austria_processor/retry_queue.json')
+    try:
+        codes = json.loads(retry_path.read_text()) if retry_path.exists() else []
+    except Exception:
+        codes = []
+
+    # Optionally filter out already-processed
+    skipped = []
+    if skip_processed:
+        completed = _get_completed_kgs()
+        kept = []
+        for c in new_codes:
+            if c in completed:
+                skipped.append(c)
+            else:
+                kept.append(c)
+        new_codes = kept
+
+    if not new_codes:
+        return jsonify({
+            'status': 'nothing_to_add',
+            'skipped_processed': skipped,
+            'queue_length': len(codes),
+        })
+
+    # Remove duplicates from existing queue (they'll be re-inserted)
+    moved = [c for c in new_codes if c in codes]
+    codes = [c for c in codes if c not in set(new_codes)]
+
+    # Insert at position
+    if position < 0 or position >= len(codes):
+        codes.extend(new_codes)
+        actual_pos = len(codes) - len(new_codes)
+    else:
+        for i, c in enumerate(new_codes):
+            codes.insert(position + i, c)
+        actual_pos = position
+
+    retry_path.write_text(json.dumps(codes))
+
+    # Resolve names
+    added_info = []
+    try:
+        idx = si.get_index()
+        conn = idx._conn()
+        for c in new_codes:
+            row = conn.execute(
+                'SELECT kg_name, gemeinde_name, district_name FROM kg WHERE kg_code=?',
+                (c,)
+            ).fetchone()
+            added_info.append({
+                'code': c, 'name': row['kg_name'] if row else c,
+                'gemeinde': row['gemeinde_name'] if row else None,
+                'position': codes.index(c),
+            })
+    except Exception:
+        added_info = [{'code': c, 'position': codes.index(c)} for c in new_codes]
+
+    return jsonify({
+        'status': 'added',
+        'added': added_info,
+        'added_count': len(new_codes),
+        'moved_from_existing': moved,
+        'skipped_processed': skipped,
+        'queue_length': len(codes),
+    })
+
+
 @app.route('/api/v1/processing/queue', methods=['PUT'])
 def processing_queue_put():
-    """Save reordered priority queue."""
+    """Replace the entire priority queue."""
     data = request.get_json(silent=True) or {}
     codes = data.get('queue', [])
     if not isinstance(codes, list):

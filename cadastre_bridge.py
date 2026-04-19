@@ -673,6 +673,12 @@ def landscape_parcel_query(compound_filters: dict,
             min_parcel_area: float — min parcel area (sqm)
             max_parcel_area: float — max parcel area (sqm)
             is_vegetated: bool — only vegetated parcels
+            min_slope: float — min slope_mean_deg
+            max_slope: float — max slope_mean_deg
+            min_tri: float — min TRI (terrain ruggedness index)
+            max_tri: float — max TRI
+            terrain_class: str — exact match (level, nearly_level, slightly_rugged, ...)
+            aspect: str or list — dominant aspect (N, NE, E, SE, S, SW, W, NW)
 
             --- Per-type classification confidence (from classification.by_type) ---
             type_confidence: list[dict] — per-type confidence filters, e.g.:
@@ -767,6 +773,33 @@ def landscape_parcel_query(compound_filters: dict,
                 if pf.get('min_elevation') is not None and elev < pf['min_elevation']:
                     continue
                 if pf.get('max_elevation') is not None and elev > pf['max_elevation']:
+                    continue
+
+            # Slope filter
+            slope = pd.get('slope_mean_deg')
+            if slope is not None:
+                if pf.get('min_slope') is not None and slope < pf['min_slope']:
+                    continue
+                if pf.get('max_slope') is not None and slope > pf['max_slope']:
+                    continue
+
+            # TRI filter
+            tri = pd.get('tri_mean')
+            if tri is not None:
+                if pf.get('min_tri') is not None and tri < pf['min_tri']:
+                    continue
+                if pf.get('max_tri') is not None and tri > pf['max_tri']:
+                    continue
+
+            # Terrain class filter
+            if pf.get('terrain_class'):
+                if pd.get('terrain_class') != pf['terrain_class']:
+                    continue
+
+            # Aspect filter
+            if pf.get('aspect'):
+                aspects = pf['aspect'] if isinstance(pf['aspect'], list) else [pf['aspect']]
+                if pd.get('aspect_dominant') not in aspects:
                     continue
 
             # nDSM height filter

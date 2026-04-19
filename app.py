@@ -1457,6 +1457,44 @@ def api_kg_infrastructure(kg_code):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/buildings/search')
+def api_buildings_search():
+    """Search building records from the index (fast, no GPKG).
+
+    Params: kg=CODE  min_height=N  max_height=N  min_stories=N  max_stories=N
+            roof_type=flat|pitched  min_area=N  max_area=N  limit=N  offset=N
+    """
+    try:
+        idx = si.get_index()
+        result = idx.query_buildings_index(
+            kg_code=request.args.get('kg'),
+            min_height=_float_or_none(request.args.get('min_height')),
+            max_height=_float_or_none(request.args.get('max_height')),
+            min_stories=_int_or_none(request.args.get('min_stories')),
+            max_stories=_int_or_none(request.args.get('max_stories')),
+            roof_type=request.args.get('roof_type'),
+            min_area=_float_or_none(request.args.get('min_area')),
+            max_area=_float_or_none(request.args.get('max_area')),
+            limit=min(int(request.args.get('limit', 500)), 5000),
+            offset=int(request.args.get('offset', 0)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        log.warning('api_buildings_search: %s', e)
+        return jsonify({'error': str(e)}), 500
+
+
+def _float_or_none(v):
+    if v is None: return None
+    try: return float(v)
+    except (ValueError, TypeError): return None
+
+def _int_or_none(v):
+    if v is None: return None
+    try: return int(v)
+    except (ValueError, TypeError): return None
+
+
 @app.route('/api/v1/kg/<kg_code>/segments')
 def api_kg_segments(kg_code):
     """Segment polygons from the light GPKG.

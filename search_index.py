@@ -226,6 +226,24 @@ class SearchIndex:
                 confidence REAL,
                 PRIMARY KEY (kg_code, object_type, rank)
             )''',
+            # === Per-building detail (from JSON building_footprints.details) ===
+            '''CREATE TABLE IF NOT EXISTS kg_buildings (
+                kg_code TEXT NOT NULL,
+                building_id TEXT,
+                ns INTEGER,
+                roof_type_hint TEXT,
+                max_height_m REAL,
+                mean_height_m REAL,
+                stories_est INTEGER,
+                footprint_area_sqm REAL,
+                centroid_lon REAL,
+                centroid_lat REAL,
+                centroid_dtm_m REAL
+            )''',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg ON kg_buildings(kg_code)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_roof ON kg_buildings(roof_type_hint)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_stories ON kg_buildings(stories_est)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_height ON kg_buildings(max_height_m)',
             # === Index metadata ===
             '''CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
@@ -353,7 +371,7 @@ class SearchIndex:
         with self._write_lock:
             c = self._conn()
             # Drop and recreate — ensures schema changes are picked up
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'index_meta'):
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'index_meta'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
             for t in ('kg_rtree', 'fts_kg'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
@@ -662,6 +680,31 @@ class SearchIndex:
             if top_rows:
                 c.executemany(
                     'INSERT INTO kg_type_top VALUES (?,?,?,?,?,?,?,?,?,?,?)', top_rows)
+
+        # Per-building details
+        bf = data.get('building_footprints', {})
+        bf_details = bf.get('details', [])
+        if bf_details:
+            c.execute('DELETE FROM kg_buildings WHERE kg_code=?', (code,))
+            bld_rows = []
+            for b in bf_details:
+                centroid = b.get('centroid', {})
+                bld_rows.append((
+                    code,
+                    b.get('building_id', ''),
+                    b.get('ns'),
+                    b.get('roof_type_hint', ''),
+                    b.get('max_height_m'),
+                    b.get('mean_height_m'),
+                    b.get('stories_est'),
+                    b.get('footprint_area_sqm'),
+                    centroid.get('lon'),
+                    centroid.get('lat'),
+                    b.get('centroid_dtm_m'),
+                ))
+            if bld_rows:
+                c.executemany(
+                    'INSERT INTO kg_buildings VALUES (?,?,?,?,?,?,?,?,?,?,?)', bld_rows)
 
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing."""
@@ -1922,6 +1965,47 @@ class SearchIndex:
     # ════════════════════════════════════════════════════════════════
     # Lazy-load detail from light GPKG (Zenodo or local)
     # ════════════════════════════════════════════════════════════════
+
+    def query_buildings_index(self, kg_code=None, min_height=None, max_height=None,
+                               min_stories=None, max_stories=None, roof_type=None,
+                               min_area=None, max_area=None,
+                               limit=500, offset=0):
+        """Query building records from the kg_buildings index table (fast, no GPKG)."""
+        c = self._conn()
+        where = []
+        params = []
+        if kg_code:
+            where.append('kg_code = ?')
+            params.append(kg_code)
+        if min_height is not None:
+            where.append('max_height_m >= ?')
+            params.append(min_height)
+        if max_height is not None:
+            where.append('max_height_m <= ?')
+            params.append(max_height)
+        if min_stories is not None:
+            where.append('stories_est >= ?')
+            params.append(min_stories)
+        if max_stories is not None:
+            where.append('stories_est <= ?')
+            params.append(max_stories)
+        if roof_type:
+            where.append('roof_type_hint = ?')
+            params.append(roof_type)
+        if min_area is not None:
+            where.append('footprint_area_sqm >= ?')
+            params.append(min_area)
+        if max_area is not None:
+            where.append('footprint_area_sqm <= ?')
+            params.append(max_area)
+        where_sql = ' AND '.join(where) if where else '1=1'
+        count = c.execute(f'SELECT COUNT(*) FROM kg_buildings WHERE {where_sql}', params).fetchone()[0]
+        rows = c.execute(
+            f'SELECT * FROM kg_buildings WHERE {where_sql} ORDER BY max_height_m DESC LIMIT ? OFFSET ?',
+            params + [limit, offset]).fetchall()
+        cols = [d[0] for d in c.execute('SELECT * FROM kg_buildings LIMIT 0').description]
+        results = [dict(zip(cols, r)) for r in rows]
+        return {'total': count, 'offset': offset, 'limit': limit, 'results': results}
 
     def query_buildings(self, kg_code, bbox=None, limit=500, offset=0):
         """Return height-enriched building footprints for a KG.

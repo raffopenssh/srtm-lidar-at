@@ -1,4 +1,4 @@
-# Austrian Landscape Analysis API — v5.2
+# Austrian Landscape Analysis API — v5.3
 # Base: https://srtm-lidar-at.exe.xyz:8000
 # Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
 
@@ -149,6 +149,41 @@ Background processor (austria_processor.py, ~5100 lines) applies the full pipeli
 - {kg}_light.gpkg (~100MB): segment raster+vector, parcels with DTM heights, buildings with object heights, new buildings, infrastructure
 - {kg}.json (~1MB): area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
 
+#### GPKG parcels layer — per-parcel terrain & AMS anchor fields
+  elevation_min_m           float, min DTM elevation within parcel
+  elevation_max_m           float, max DTM elevation within parcel
+  elevation_range_m         float, elevation_max − elevation_min
+  slope_mean_deg            float, mean slope in degrees
+  aspect_mean_deg           float, mean aspect 0-360 (-1 = flat)
+  aspect_dominant           str, compass octant (N/NE/E/SE/S/SW/W/NW/flat)
+  tri_mean                  float, Terrain Ruggedness Index (mean)
+  tpi_mean                  float, Topographic Position Index (mean)
+  terrain_class             str, Riley classification (level … extremely_rugged)
+  vertex_heights            AMS anchor points: DTM elevation at every boundary vertex
+    GPKG format: pipe-separated string "lat,lon,dtm_m|lat,lon,dtm_m|..."
+    JSON format (in KG .json summary): array of {lat, lon, dtm_m} objects
+
+#### GPKG buildings layer — enhanced building footprints
+  building_id               str, cadastre building identifier
+  ns                        str, Nutzungssymbol (cadastre usage symbol)
+  full_address              str, composed address
+  house_number              str
+  street                    str
+  postal_code               str
+  location                  str, locality/Ortschaft name
+  max_height_m              float, DSM max − DTM at footprint
+  mean_height_m             float, DSM mean − DTM at footprint
+  dsm_std                   float, DSM standard deviation within footprint
+  roof_type_hint            str, "flat" or "pitched" (inferred from dsm_std)
+  stories_est               int, estimated storey count from max_height_m
+  footprint_area_sqm        float, polygon area in m²
+  centroid_lon              float, WGS84 longitude of centroid
+  centroid_lat              float, WGS84 latitude of centroid
+  centroid_dtm_m            float, DTM elevation at centroid
+  vertex_heights            AMS anchor points: DTM + object height at every footprint vertex
+    GPKG format: pipe-separated "lat,lon,dtm_m,obj_height_m|lat,lon,dtm_m,obj_height_m|..."
+    JSON format (in KG .json summary): array of {lat, lon, dtm_m, obj_height_m} objects
+
 ### Zenodo Integration
 Each KG gets its own Zenodo deposit with DOI. Search index stores download URLs:
 - zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
@@ -217,6 +252,19 @@ Result: FeatureCollection. Per-feature properties:
   brightness_mean, height_change, dtm_change, temporal_stability,
   glcm_entropy, glcm_homogeneity, texture_complexity,
   sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class
+
+  Terrain enrichment (per-segment, also in GPKG segments layer):
+  aspect_mean_deg          float, 0-360 degrees (-1 = flat terrain)
+  aspect_dominant           str, compass octant: N/NE/E/SE/S/SW/W/NW/flat
+  elevation_mean_m          float, mean DTM elevation in metres
+  elevation_min_m           float, minimum DTM elevation
+  elevation_max_m           float, maximum DTM elevation
+  tri_mean                  float, Terrain Ruggedness Index (mean within segment)
+  tpi_mean                  float, Topographic Position Index (mean; +ve=ridge, -ve=valley)
+  curvature_mean            float, profile curvature (mean; +ve=convex, -ve=concave)
+  terrain_class             str, Riley et al. classification: level / nearly_level /
+                            slightly_rugged / intermediately_rugged / moderately_rugged /
+                            highly_rugged / extremely_rugged
 
 Completed async tasks are auto-saved as shares (auto-<task_id[:8]>).
 
@@ -590,6 +638,7 @@ Response for single KG (kg= or query_kg):
    processed, generated_at, primary_year,
    dominant_type, vegetated_fraction, shannon_diversity, n_segments,
    elevation_{min,max,mean}_m, slope_mean_deg, aspect_dominant, ndvi_mean,
+   tri_mean, tpi_mean, terrain_class,
    tree_{count,canopy_sqm,mean_height_m,stem_volume_m3},
    net_volume_change_m3, temporal_stability,
    new_building_count, infrastructure_count,
@@ -626,10 +675,18 @@ Response for single KG (kg= or query_kg):
 
   Per-parcel details (parcels.details[]): parcel_id, area_sqm, centroid, elevation_m,
     area_summary (type→{area_sqm,fraction}), height_distribution, vegetated_fraction,
-    is_vegetated, ndsm_max_m, ndsm_mean_m, classification.
+    is_vegetated, ndsm_max_m, ndsm_mean_m, classification,
+    elevation_min_m, elevation_max_m, elevation_range_m,
+    slope_mean_deg, aspect_mean_deg, aspect_dominant,
+    tri_mean, tpi_mean, terrain_class,
+    vertex_heights: [{lat, lon, dtm_m}, ...] (AMS anchor points at every boundary vertex).
   Per-building details (building_footprints.details[]): building_id, footprint_area_sqm,
-    centroid, max_height_m, mean_height_m, dsm_std, roof_type_hint, stories_est,
-    segment_types, full_address, classification.
+    centroid, centroid_dtm_m, max_height_m, mean_height_m, dsm_std,
+    roof_type_hint, stories_est, segment_types,
+    ns, full_address, house_number, street, postal_code, location,
+    footprint_area_sqm, centroid_lon, centroid_lat,
+    vertex_heights: [{lat, lon, dtm_m, obj_height_m}, ...] (AMS anchor points),
+    classification.
   classification dict (per-parcel/building): rf_classified, rules_classified,
     total_segments, mean_confidence, rf_mean_confidence, diverged_count,
     diverged_pct, divergences (top 5 [{rf_type, final_type, count}]),
@@ -652,8 +709,10 @@ Filter keys (all optional):
   state, district, gemeinde: str         admin filter
   aspect: ["S","SW","W"]                dominant aspect direction
   dominant_type, phenology, quality_grade: str  exact match
+  terrain_class: str                     exact match, e.g. "level", "moderately_rugged"
   Numeric ranges (prefix min_ or max_):
     slope, roughness, elevation, elevation_range, steepness_max,
+    tri (Terrain Ruggedness Index),
     buildings, new_buildings, tree_count, tree_height, tree_canopy_sqm,
     ndvi, vegetated_fraction, shannon_diversity, confidence, rf_confidence,
     quality_score, temporal_stability, infrastructure, building_height,
@@ -668,6 +727,17 @@ Filter keys (all optional):
   task_id: str             Poll an async compound query
 
 All filters are fast (pure SQL on indexed columns). Returns {total, offset, limit, results}.
+
+### Search Index Schema Additions
+
+New columns on the kg table (indexed):
+  tri_mean        REAL    — mean Terrain Ruggedness Index for the KG
+  terrain_class   TEXT    — Riley classification (level … extremely_rugged)
+
+New table: kg_buildings (per-building records, joined to kg via kg_code):
+  building_id, kg_code, roof_type_hint (flat/pitched), max_height_m (REAL),
+  stories_est (INT), footprint_area_sqm (REAL), centroid_lon (REAL), centroid_lat (REAL)
+  Enables compound queries that filter on building-level attributes.
 
 Async flow:
   1. POST {"min_elevation": 1500, "async": true} → 202 {task_id, status, poll}
@@ -694,13 +764,34 @@ Parcel lookup via search index + local JSON detail.
 #### GET /api/v1/kg/<kg_code>/buildings
 Height-enriched building footprints (GeoJSON features from light GPKG).
 Lazy-loads from Zenodo on first access, cached locally (1GB LRU).
-Properties: max_height_m, mean_height_m, dsm_std, roof_type_hint, stories_est, footprint_area_sqm.
+Properties: building_id, ns, full_address, house_number, street, postal_code, location,
+  max_height_m, mean_height_m, dsm_std, roof_type_hint (flat/pitched), stories_est,
+  footprint_area_sqm, centroid_lon, centroid_lat, centroid_dtm_m,
+  vertex_heights (pipe-separated "lat,lon,dtm_m,obj_height_m|..." in GPKG;
+  array of {lat, lon, dtm_m, obj_height_m} in JSON).
 Params: bbox=w,s,e,n  limit=N(default 500, max 5000)  offset=N
 
 #### GET /api/v1/kg/<kg_code>/new_buildings
 Detected new buildings not in cadastre (from light GPKG).
 Properties: type, area_sqm, max_height_m, stories_est, roof_type_hint, confidence.
 Params: bbox=w,s,e,n  limit=N  offset=N
+
+#### GET /api/v1/buildings/search
+Fast building search across the index (no GPKG needed). Queries the kg_buildings table.
+Params:
+  kg=CODE            Filter to a single KG
+  min_height=N       max_height_m >= N
+  max_height=N       max_height_m <= N
+  min_stories=N      stories_est >= N
+  max_stories=N      stories_est <= N
+  roof_type=flat|pitched  exact match on roof_type_hint
+  min_area=N         footprint_area_sqm >= N
+  max_area=N         footprint_area_sqm <= N
+  limit=N (default 500, max 5000)  offset=N
+Returns: {total, offset, limit, results: [{kg_code, building_id, ns,
+  roof_type_hint, max_height_m, mean_height_m, stories_est, footprint_area_sqm,
+  centroid_lon, centroid_lat, centroid_dtm_m}, ...]}
+Speed: fast (<25ms), pure index lookup.
 
 #### GET /api/v1/kg/<kg_code>/infrastructure
 Detected infrastructure features (from light GPKG).
@@ -709,7 +800,9 @@ Params: bbox=w,s,e,n  limit=N  offset=N
 
 #### GET /api/v1/kg/<kg_code>/segments
 Segment polygons with classification (from light GPKG).
-Properties: id, type, type_code, group_type, height_class, area_sqm, etc.
+Properties: id, type, type_code, group_type, height_class, area_sqm,
+  aspect_mean_deg, aspect_dominant, elevation_mean_m, elevation_min_m, elevation_max_m,
+  tri_mean, tpi_mean, curvature_mean, terrain_class, etc.
 Params: bbox=w,s,e,n  type=tree,roof,...  limit=N  offset=N
 
 #### GET /api/v1/kg/<kg_code>/layers
@@ -1159,10 +1252,11 @@ SW aspect, rugged terrain."
 ```
 
 compound supports all SearchIndex.query_compound() filters:
-  bbox, state, district, gemeinde, aspect, dominant_type, phenology,
+  bbox, state, district, gemeinde, aspect, dominant_type, phenology, terrain_class,
   min_slope, min_roughness, min_elevation, max_elevation, min_ndvi,
   min_vegetated_fraction, max_buildings, min_tree_count, min_tree_canopy_sqm,
-  min_confidence, min_rf_confidence, type_filters, landcover_filters, sort, sort_dir
+  min_confidence, min_rf_confidence, min_tri, max_tri,
+  type_filters, landcover_filters, sort, sort_dir
 
 parcel_filters (per-parcel from our KG JSONs):
   min_vegetated_fraction, max_vegetated_fraction, min_elevation, max_elevation,

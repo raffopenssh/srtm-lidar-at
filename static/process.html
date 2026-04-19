@@ -82,6 +82,8 @@
   /* Map */
   #kgMap { height: 200px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px; }
   .leaflet-container { background: var(--bg) !important; }
+  .leaflet-container.crosshair-cursor { cursor: crosshair !important; }
+  .priority-drawing #btnDrawPriority { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.1); }
   .tile-dot {
     filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
   }
@@ -312,6 +314,17 @@
     <option>Oberösterreich</option><option>Salzburg</option><option>Steiermark</option>
     <option>Tirol</option><option>Vorarlberg</option><option>Wien</option>
   </select>
+  <span class="sep">│</span>
+  <button class="btn" id="btnDrawPriority" onclick="togglePriorityDraw()" title="Draw a rectangle on the map to prioritize KGs in that area">📌 Priority Area</button>
+  <span id="priorityCoords" style="display:none;font-size:11px;color:var(--dim);">
+    <input type="text" class="inp" id="prioWest" placeholder="W" style="width:62px" title="West longitude">
+    <input type="text" class="inp" id="prioSouth" placeholder="S" style="width:62px" title="South latitude">
+    <input type="text" class="inp" id="prioEast" placeholder="E" style="width:62px" title="East longitude">
+    <input type="text" class="inp" id="prioNorth" placeholder="N" style="width:62px" title="North latitude">
+    <button class="btn btn-g" onclick="submitPriority()">Queue</button>
+    <button class="btn" onclick="cancelPriority()">✕</button>
+  </span>
+  <span id="priorityStatus" style="font-size:11px;margin-left:4px;"></span>
 </div>
 
 <!-- Live Log -->
@@ -1137,6 +1150,113 @@ function renderLastKg(js) {
 
 // ── Tile Cache Overlays ─────────────────────────────────────────
 
+
+// ── Priority Area Drawing ─────────────────────────────────────────
+
+let _prioDrawing = false;
+let _prioRect = null;
+let _prioStart = null;
+
+function togglePriorityDraw() {
+  if (_prioDrawing) { cancelPriority(); return; }
+  _prioDrawing = true;
+  _prioStart = null;
+  document.getElementById('controls').classList.add('priority-drawing');
+  document.getElementById('priorityCoords').style.display = 'inline';
+  document.getElementById('priorityStatus').textContent = 'Click map to set corners, or enter coords';
+  document.getElementById('priorityStatus').style.color = 'var(--blue)';
+  map.getContainer().classList.add('crosshair-cursor');
+  map.on('mousedown', _prioMouseDown);
+  // Remove old rect if any
+  if (_prioRect) { map.removeLayer(_prioRect); _prioRect = null; }
+}
+
+function cancelPriority() {
+  _prioDrawing = false;
+  _prioStart = null;
+  document.getElementById('controls').classList.remove('priority-drawing');
+  document.getElementById('priorityCoords').style.display = 'none';
+  document.getElementById('priorityStatus').textContent = '';
+  map.getContainer().classList.remove('crosshair-cursor');
+  map.off('mousedown', _prioMouseDown);
+  map.off('mousemove', _prioMouseMove);
+  map.off('mouseup', _prioMouseUp);
+  if (_prioRect) { map.removeLayer(_prioRect); _prioRect = null; }
+  ['prioWest','prioSouth','prioEast','prioNorth'].forEach(id => document.getElementById(id).value = '');
+}
+
+function _prioMouseDown(e) {
+  if (!_prioDrawing) return;
+  _prioStart = e.latlng;
+  map.dragging.disable();
+  map.on('mousemove', _prioMouseMove);
+  map.on('mouseup', _prioMouseUp);
+}
+
+function _prioMouseMove(e) {
+  if (!_prioStart) return;
+  const bounds = L.latLngBounds(_prioStart, e.latlng);
+  if (_prioRect) { _prioRect.setBounds(bounds); }
+  else { _prioRect = L.rectangle(bounds, {color:'#58a6ff', weight:2, fillOpacity:0.1, dashArray:'6 3'}).addTo(map); }
+}
+
+function _prioMouseUp(e) {
+  map.dragging.enable();
+  map.off('mousemove', _prioMouseMove);
+  map.off('mouseup', _prioMouseUp);
+  if (!_prioStart) return;
+  const bounds = L.latLngBounds(_prioStart, e.latlng);
+  _prioStart = null;
+  // Fill coord inputs
+  document.getElementById('prioWest').value = bounds.getWest().toFixed(5);
+  document.getElementById('prioSouth').value = bounds.getSouth().toFixed(5);
+  document.getElementById('prioEast').value = bounds.getEast().toFixed(5);
+  document.getElementById('prioNorth').value = bounds.getNorth().toFixed(5);
+  document.getElementById('priorityStatus').textContent = 'Bbox set — click Queue to prioritize';
+  document.getElementById('priorityStatus').style.color = 'var(--green)';
+  // Stop draw mode on map but keep coords visible
+  map.getContainer().classList.remove('crosshair-cursor');
+  map.off('mousedown', _prioMouseDown);
+}
+
+async function submitPriority() {
+  const w = parseFloat(document.getElementById('prioWest').value);
+  const s = parseFloat(document.getElementById('prioSouth').value);
+  const e = parseFloat(document.getElementById('prioEast').value);
+  const n = parseFloat(document.getElementById('prioNorth').value);
+  if (isNaN(w) || isNaN(s) || isNaN(e) || isNaN(n)) {
+    document.getElementById('priorityStatus').textContent = 'Enter valid coordinates';
+    document.getElementById('priorityStatus').style.color = 'var(--red)';
+    return;
+  }
+  document.getElementById('priorityStatus').textContent = 'Resolving KGs...';
+  document.getElementById('priorityStatus').style.color = 'var(--yellow)';
+  try {
+    const r = await fetch('/api/v1/processing/prioritize', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({bbox: {west: w, south: s, east: e, north: n}})
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      document.getElementById('priorityStatus').textContent = d.error || 'Failed';
+      document.getElementById('priorityStatus').style.color = 'var(--red)';
+      return;
+    }
+    let msg = `✓ ${d.queued} KGs queued`;
+    if (d.already_processed > 0) msg += `, ${d.already_processed} already done`;
+    if (d.already_in_queue > 0) msg += `, ${d.already_in_queue} already queued`;
+    document.getElementById('priorityStatus').textContent = msg;
+    document.getElementById('priorityStatus').style.color = 'var(--green)';
+    // Flash the rect green briefly then clean up after 3s
+    if (_prioRect) _prioRect.setStyle({color: '#3fb950'});
+    setTimeout(() => cancelPriority(), 4000);
+    setTimeout(poll, 500);
+  } catch(err) {
+    document.getElementById('priorityStatus').textContent = 'Error: ' + err.message;
+    document.getElementById('priorityStatus').style.color = 'var(--red)';
+  }
+}
 
 // ── Init ────────────────────────────────────────────────────────
 initMap();

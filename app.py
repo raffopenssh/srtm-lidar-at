@@ -1056,6 +1056,108 @@ def processing_retry():
     })
 
 
+@app.route('/api/v1/processing/prioritize', methods=['POST'])
+def processing_prioritize():
+    """Prioritize KGs for processing — by bbox or explicit codes.
+
+    Accepts JSON body with either:
+      - bbox: {west, south, east, north} — resolves to KG codes via cadastre API
+      - kgs: ["63349", "63350", ...] — explicit KG codes
+
+    Filters out already-processed KGs and writes remaining to retry_queue.json.
+    The running processor picks these up as next-in-queue.
+    """
+    data = request.get_json(silent=True) or {}
+    # Also accept query params for bbox
+    bbox = data.get('bbox')
+    kgs = data.get('kgs', [])
+
+    if not bbox and not kgs:
+        # Try query params
+        try:
+            bbox = {
+                'west': float(request.args['west']),
+                'south': float(request.args['south']),
+                'east': float(request.args['east']),
+                'north': float(request.args['north']),
+            }
+        except (KeyError, ValueError):
+            pass
+
+    if not bbox and not kgs:
+        return jsonify({'error': 'Provide bbox (west/south/east/north) or kgs array'}), 400
+
+    # Resolve bbox to KG codes via cadastre API
+    if bbox:
+        try:
+            import requests as req
+            r = req.get(
+                'https://cadastre-process-api.exe.xyz/api/v1/spatial/kgs',
+                params={
+                    'west': bbox['west'], 'south': bbox['south'],
+                    'east': bbox['east'], 'north': bbox['north'],
+                    'fields': 'kg_code,kg_name',
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            resp = r.json()
+            kgs = resp.get('data', {}).get('kg_codes', [])
+        except Exception as e:
+            return jsonify({'error': f'Failed to resolve bbox to KGs: {e}'}), 502
+
+    if not kgs:
+        return jsonify({'error': 'No KGs found in the given area'}), 404
+
+    # Filter out already-processed KGs
+    data_dir = Path('data/austria_processor')
+    processed = set()
+    manifest_path = data_dir / 'zenodo_manifest.json'
+    if manifest_path.exists():
+        try:
+            m = json.loads(manifest_path.read_text())
+            entries = m.get('entries', m)
+            for key in entries:
+                if key.endswith('_json') and 'error' not in entries[key].get('status', ''):
+                    processed.add(key.replace('_json', ''))
+        except Exception:
+            pass
+    json_dir = data_dir / 'json'
+    if json_dir.exists():
+        for jf in json_dir.glob('*.json'):
+            processed.add(jf.stem)
+
+    unprocessed = [k for k in kgs if k not in processed]
+    already_done = [k for k in kgs if k in processed]
+
+    # Write unprocessed to retry queue
+    queued = []
+    if unprocessed:
+        retry_path = data_dir / 'retry_queue.json'
+        try:
+            existing = []
+            if retry_path.exists():
+                existing = json.loads(retry_path.read_text())
+            for code in unprocessed:
+                if code not in existing:
+                    existing.append(code)
+                    queued.append(code)
+            retry_path.write_text(json.dumps(existing))
+        except Exception as e:
+            return jsonify({'error': f'Failed to write retry queue: {e}'}), 500
+
+    return jsonify({
+        'status': 'prioritized',
+        'total_kgs': len(kgs),
+        'queued': len(queued),
+        'already_processed': len(already_done),
+        'already_in_queue': len(unprocessed) - len(queued),
+        'queued_codes': queued,
+        'already_done_codes': already_done,
+        'note': f'{len(queued)} KGs queued for priority processing.' if queued else 'All KGs already processed.',
+    })
+
+
 @app.route('/api/v1/processing/log')
 def processing_log():
     """Return recent processor log lines."""

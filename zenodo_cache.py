@@ -726,6 +726,16 @@ class ZenodoCache:
         depo_id = None if dry_run else self._ensure_deposit()
 
         for (product, strip_s, strip_n), files in sorted(groups.items()):
+            zip_name = _zip_filename(product, strip_s, strip_n)
+
+            # Skip upload if Zenodo already has >= as many tiles for this
+            # strip.  This prevents overwriting a full ZIP with a smaller
+            # one after local cache eviction.
+            existing = self.manifest.get_file(zip_name)
+            if existing and existing.get("tile_count", 0) >= len(files):
+                stats["zips_skipped"] = stats.get("zips_skipped", 0) + 1
+                continue
+
             zip_path = _build_zip_for_strip(product, strip_s, strip_n, files)
             if zip_path is None:
                 continue
@@ -735,7 +745,6 @@ class ZenodoCache:
             stats["bytes_total"] += zip_path.stat().st_size
 
             if not dry_run:
-                zip_name = zip_path.name
                 try:
                     result = self._upload_file(depo_id, zip_path, zip_name)
                     checksum = result.get("checksum", "")

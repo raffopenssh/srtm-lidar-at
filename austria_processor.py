@@ -93,6 +93,43 @@ _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 
 # === SECTION: Disk cache management (LRU cleanup, free-space checks) ===
 
+# Track the last time we flushed tile cache to Zenodo (epoch seconds).
+_last_zenodo_cache_flush: float = 0.0
+# Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
+_ZENODO_CACHE_FLUSH_INTERVAL = 300  # 5 minutes
+
+
+def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
+    """Upload local Copernicus/Hansen tile cache to Zenodo for persistence.
+
+    Called proactively after each KG and reactively before disk cleanup
+    would evict expensive tiles.  Skips if fewer than 5 minutes since the
+    last flush (unless *force* is True).
+
+    Returns True if upload ran, False if skipped.
+    """
+    global _last_zenodo_cache_flush
+    import time as _t
+    now = _t.time()
+    if not force and (now - _last_zenodo_cache_flush) < _ZENODO_CACHE_FLUSH_INTERVAL:
+        return False
+
+    try:
+        from zenodo_cache import ZenodoCache
+        cache = ZenodoCache()
+        stats = cache.upload_all()
+        n_tiles = stats.get("tiles_total", 0)
+        n_zips = stats.get("zips_uploaded", 0)
+        if n_tiles > 0:
+            log.info("Zenodo cache flush: uploaded %d tiles in %d ZIPs (%.1f MB)",
+                     n_tiles, n_zips, stats.get("bytes_total", 0) / 1e6)
+        _last_zenodo_cache_flush = _t.time()
+        return True
+    except Exception as e:
+        log.warning("Zenodo cache flush failed: %s", e)
+        return False
+
+
 def check_disk_space(current_kg_code: str = "") -> bool:
     """Check free disk space and clean caches if below threshold.
 
@@ -201,8 +238,12 @@ def check_disk_space(current_kg_code: str = "") -> bool:
 
     if not _enough_freed():
         _log.warning("  Tier-1 caches insufficient (freed %.1f MB, need %.1f MB) "
-                     "— evicting expensive Copernicus/Hansen tiles",
+                     "— flushing tiles to Zenodo before evicting",
                      freed_bytes / 1e6, need_bytes / 1e6)
+
+        # Flush tile cache to Zenodo BEFORE evicting expensive tiles,
+        # so they can be restored later via HTTP range reads (~2-3 requests).
+        flush_tile_cache_to_zenodo(force=True)
 
         # 5. Hansen tiles (LRU) — moderately expensive
         hansen_cache = DATA_DIR / "hansen_tiles"
@@ -6380,6 +6421,10 @@ def main():
                     _ckg = progress._state.get("current_kg") or {}
                     _ts = _ckg.get("tile_statuses", [])
                 _save_tile_history(kg_code, _ts, "completed")
+
+                # Proactively flush tile cache to Zenodo so tiles
+                # survive disk cleanup between KGs.
+                flush_tile_cache_to_zenodo()
             else:
                 # --- Copernicus credits exhausted? Don't mark as permanently failed ---
                 is_credits_issue = (result.get("copernicus_exhausted")

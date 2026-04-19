@@ -1127,7 +1127,7 @@ def processing_prioritize():
     unprocessed = [k for k in kgs if k not in processed]
     already_done = [k for k in kgs if k in processed]
 
-    # Write unprocessed to retry queue
+    # Write unprocessed to front of retry queue (priority = first)
     queued = []
     if unprocessed:
         retry_path = data_dir / 'retry_queue.json'
@@ -1135,10 +1135,12 @@ def processing_prioritize():
             existing = []
             if retry_path.exists():
                 existing = json.loads(retry_path.read_text())
+            existing_set = set(existing)
             for code in unprocessed:
-                if code not in existing:
-                    existing.append(code)
+                if code not in existing_set:
                     queued.append(code)
+            # Prepend new KGs to front of queue
+            existing = queued + existing
             retry_path.write_text(json.dumps(existing))
         except Exception as e:
             return jsonify({'error': f'Failed to write retry queue: {e}'}), 500

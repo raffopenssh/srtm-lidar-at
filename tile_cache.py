@@ -268,6 +268,167 @@ class CopernicusTileCache:
             bbox["west"], bbox["south"], bbox["east"], bbox["north"],
             self.GRID_STEP)
 
+    def _iter_cells(self, bbox_wgs: dict):
+        """Yield (w, s, e, n) for each 0.1° grid cell covering *bbox_wgs*."""
+        tw, ts, te, tn = self._snap(bbox_wgs)
+        step = self.GRID_STEP
+        w = tw
+        while w < te - 1e-9:
+            s_ = ts
+            while s_ < tn - 1e-9:
+                yield (round(w, 4), round(s_, 4),
+                       round(w + step, 4), round(s_ + step, 4))
+                s_ += step
+            w += step
+
+    def has_cached(self, bbox_wgs: dict, *, ndvi: bool = True,
+                   landcover: bool = True, sar: bool = False,
+                   harmonics: bool = False, year: int = 2024) -> bool:
+        """Check if all requested products are cached (local or Zenodo).
+
+        Iterates over individual 0.1° grid cells — the same granularity
+        that the Austria processor stores.  Does NOT download anything;
+        only checks file existence and Zenodo ZIP indices.
+        """
+        products = []
+        if ndvi:
+            products.append(("ndvi", {"year": year}))
+        if landcover:
+            products.append(("worldcover", {}))
+        if sar:
+            products.append(("sar", {"year": year}))
+        if harmonics:
+            products.append(("harmonics", {"year": year}))
+        if not products:
+            return True
+
+        # Lazy-init Zenodo index
+        try:
+            if self._zenodo_cache is None and not self._zenodo_tried:
+                self._zenodo_tried = True
+                from zenodo_cache import ZenodoCache, CacheManifest
+                manifest = CacheManifest()
+                if manifest.depo_id or manifest.all_files():
+                    self._zenodo_cache = ZenodoCache()
+        except Exception:
+            pass
+
+        for cw, cs, ce, cn in self._iter_cells(bbox_wgs):
+            for product, extra in products:
+                path = self._tile_path(product, cw, cs, ce, cn, **extra)
+                if path.exists():
+                    continue
+                # Check Zenodo ZIP index (no download)
+                if self._zenodo_cache is None:
+                    return False
+                try:
+                    from zenodo_cache import _strip_for_lat, _zip_filename, _npz_entry_name
+                    strip_s, strip_n = _strip_for_lat(cs)
+                    zip_name = _zip_filename(product, strip_s, strip_n)
+                    idx = self._zenodo_cache._get_zip_index(zip_name)
+                    if idx is None:
+                        return False
+                    entry_name = _npz_entry_name(product, cw, cs, ce, cn, **extra)
+                    if not idx.has_entry(entry_name):
+                        if product == "worldcover":
+                            entry_name = _npz_entry_name(product, cw, cs, ce, cn)
+                            if not idx.has_entry(entry_name):
+                                return False
+                        else:
+                            return False
+                except Exception:
+                    return False
+        return True
+
+    def _read_cell_npz(self, product: str, cw: float, cs: float,
+                       ce: float, cn: float, **extra) -> Optional[Path]:
+        """Ensure a single 0.1° cell NPZ is on local disk (from Zenodo if needed)."""
+        path = self._tile_path(product, cw, cs, ce, cn, **extra)
+        if path.exists():
+            return path
+        if self._try_zenodo(product, cw, cs, ce, cn, **extra) and path.exists():
+            return path
+        return None
+
+    def read_cached_product(self, bbox_wgs: dict, product: str,
+                            year: int = 2024) -> Optional[dict]:
+        """Read a product from per-cell cache and mosaic if needed.
+
+        Only reads from local files + Zenodo.  Never calls the live API.
+        Caller should verify ``has_cached()`` first.
+
+        Returns dict in the same format as ``get_ndvi()`` / ``get_sar()``
+        etc., or None on failure.
+        """
+        extra = {"year": year} if product in ("ndvi", "sar", "harmonics") else {}
+        cells = list(self._iter_cells(bbox_wgs))
+
+        if len(cells) == 1:
+            cw, cs, ce, cn = cells[0]
+            path = self._read_cell_npz(product, cw, cs, ce, cn, **extra)
+            if path is None:
+                return None
+            try:
+                cached = np.load(str(path), allow_pickle=True)
+                result = {}
+                for k in cached.files:
+                    if k in ("transform", "crs"):
+                        continue
+                    result[k] = cached[k]
+                if "transform" in cached:
+                    result["transform"] = _arr_to_affine(cached["transform"])
+                if "crs" in cached:
+                    result["crs"] = str(cached["crs"])
+                return result
+            except Exception as e:
+                log.warning("Cache read failed %s: %s", path.name, e)
+                return None
+
+        # Multiple cells — mosaic with rasterio
+        try:
+            import rasterio
+            from rasterio.merge import merge as rio_merge
+            from rasterio.transform import from_bounds
+            import tempfile, os
+
+            tmp_paths = []
+            datasets = []
+            for cw, cs, ce, cn in cells:
+                path = self._read_cell_npz(product, cw, cs, ce, cn, **extra)
+                if path is None:
+                    return None
+                cached = np.load(str(path), allow_pickle=True)
+                data_keys = [k for k in cached.files if k not in ("transform", "crs")]
+                if not data_keys:
+                    return None
+                arr = cached[data_keys[0]]
+                tf = _arr_to_affine(cached["transform"])
+                crs_str = str(cached["crs"])
+                # Write to temp GeoTIFF for rasterio merge
+                tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+                tmp_paths.append(tmp.name)
+                with rasterio.open(
+                    tmp.name, "w", driver="GTiff",
+                    height=arr.shape[0], width=arr.shape[1], count=1,
+                    dtype=arr.dtype, crs=crs_str, transform=tf,
+                ) as dst:
+                    dst.write(arr, 1)
+                datasets.append(rasterio.open(tmp.name))
+
+            mosaic, mosaic_tf = rio_merge(datasets)
+            for ds in datasets:
+                ds.close()
+            for p in tmp_paths:
+                os.unlink(p)
+
+            result = {data_keys[0]: mosaic[0]}
+            result["transform"] = mosaic_tf
+            result["crs"] = crs_str
+            return result
+        except Exception as e:
+            log.warning("Mosaic of cached cells failed: %s", e)
+            return None
+
     def get_ndvi(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
         """Get NDVI composite, using grid-snapped cache."""
         tw, ts, te, tn = self._snap(bbox_wgs)

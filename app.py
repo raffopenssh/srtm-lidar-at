@@ -1600,16 +1600,33 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
                     harmonics=False, year: int = 2023) -> dict | None:
     """Attempt to fetch Copernicus data for a geometry.
 
+    Always tries the tile cache (local files + Zenodo) first.  Falls back
+    to the live openEO API only when cache misses AND the Austria processor
+    is not running (to avoid credential conflicts).
+
     Parameters
     ----------
     year : int
         Observation year.  NDVI composite and SAR backscatter are fetched
         for the growing season (Apr–Sep) of this year.
     """
+    bbox = geom_wgs84.bounds  # (minx, miny, maxx, maxy)
+    bbox_dict = {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}
+
+    # --- Fast path: serve from tile cache (local + Zenodo) ---
+    cached = _try_copernicus_cached(bbox_dict, ndvi=ndvi, landcover=landcover,
+                                    sar=sar, harmonics=harmonics, year=year)
+    if cached is not None:
+        return cached
+
+    # Cache miss — need live API.  Block if processor is running.
+    if _is_processor_running():
+        log.info('Copernicus cache miss — skipping (processor running)')
+        return None
+
+    # --- Slow path: live openEO API ---
     try:
         import copernicus
-        bbox = geom_wgs84.bounds  # (minx, miny, maxx, maxy) = (west, south, east, north)
-        bbox_dict = {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}
         result = {}
         if ndvi:
             try:
@@ -1652,6 +1669,60 @@ def _try_copernicus(geom_wgs84, *, ndvi=True, landcover=True, sar=False,
         return None
     except Exception as e:
         log.warning("Copernicus data failed: %s", e)
+        return None
+
+
+def _try_copernicus_cached(bbox_dict: dict, *, ndvi=True, landcover=True,
+                           sar=False, harmonics=False,
+                           year: int = 2023) -> dict | None:
+    """Serve Copernicus data from tile cache (local + Zenodo) only.
+
+    Reads per-cell (0.1°) cached tiles and mosaics them if the request
+    spans multiple cells.  Returns None on any miss so the caller can
+    fall back to the live API.
+    """
+    try:
+        from tile_cache import CopernicusTileCache
+        cache = CopernicusTileCache()
+
+        if not cache.has_cached(bbox_dict, ndvi=ndvi, landcover=landcover,
+                                sar=sar, harmonics=harmonics, year=year):
+            return None
+
+        log.info("Copernicus serving from tile cache")
+        result = {}
+        if ndvi:
+            d = cache.read_cached_product(bbox_dict, "ndvi", year=year)
+            if d and "ndvi" in d:
+                result["ndvi"] = d["ndvi"]
+                result["transform"] = d["transform"]
+                result["crs"] = d["crs"]
+            else:
+                return None
+        if landcover:
+            d = cache.read_cached_product(bbox_dict, "worldcover", year=year)
+            if d:
+                result["landcover"] = d
+            else:
+                return None
+        if sar:
+            d = cache.read_cached_product(bbox_dict, "sar", year=year)
+            if d and "vv" in d:
+                result["vv"] = d["vv"]
+                result["vh"] = d["vh"]
+                result["sar_transform"] = d["transform"]
+                result["sar_crs"] = d["crs"]
+            else:
+                return None
+        if harmonics:
+            d = cache.read_cached_product(bbox_dict, "harmonics", year=year)
+            if d:
+                result["harmonics"] = d
+            else:
+                return None
+        return result if result else None
+    except Exception as e:
+        log.debug("Copernicus cache read failed: %s", e)
         return None
 
 
@@ -2029,11 +2100,6 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
     include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
     include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-    _cop_disabled_by_processor = False
-    if include_copernicus and _is_processor_running():
-        include_copernicus = False
-        _cop_disabled_by_processor = True
-        log.info('Copernicus disabled for request — Austria processor is running')
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
@@ -2298,9 +2364,9 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         resp["cadastre_evaluation"] = all_evaluation
     if hansen_evaluation:
         resp["hansen_evaluation"] = hansen_evaluation
-    if _cop_disabled_by_processor:
+    if include_copernicus and copernicus_data is None and _is_processor_running():
         resp.setdefault('warnings', []).append(
-            'Copernicus (Sentinel-2/SAR) disabled — Austria processor is using openEO credentials')
+            'Copernicus data not in cache — served without Sentinel-2/SAR (processor running)')
 
     return resp
 
@@ -2599,8 +2665,6 @@ def segment_overlay():
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
         include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
         include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-        if include_copernicus and _is_processor_running():
-            include_copernicus = False
         include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
@@ -5076,7 +5140,18 @@ def layers_availability():
             "hansen": hansen_available,
         }
         if _is_processor_running():
-            resp["copernicus_disabled"] = True
+            # Check if tile cache covers this bbox — if so, Copernicus is
+            # still available from cache even while processor runs.
+            try:
+                from tile_cache import CopernicusTileCache
+                _cop_cache = CopernicusTileCache()
+                _cop_bbox = {"west": lon_min, "south": lat_min,
+                             "east": lon_max, "north": lat_max}
+                if not _cop_cache.has_cached(_cop_bbox, ndvi=True, landcover=True,
+                                            sar=True, harmonics=True):
+                    resp["copernicus_disabled"] = True
+            except Exception:
+                resp["copernicus_disabled"] = True
         return jsonify(resp)
     except ValueError as e:
         return _error(str(e))

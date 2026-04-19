@@ -579,6 +579,46 @@ sudo systemctl stop austria_processor && sudo systemctl start austria_processor
 # https://srtm-lidar-at.exe.xyz:8000/process.html
 ```
 
+### Restarting at a Different KG
+
+To stop the processor and restart it beginning with a specific KG (e.g. to
+prioritise a particular area):
+
+```bash
+# 1. Stop the processor
+sudo systemctl stop austria_processor
+
+# 2. Clean up stale in-progress marker (prevents re-processing the interrupted KG)
+rm -f data/austria_processor/in_progress_kg.txt
+
+# 3. Edit the retry queue — items here are processed before the normal NN order
+#    Put desired KG code(s) at the front of the list.
+python3 -c "
+import json
+q = json.load(open('data/austria_processor/retry_queue.json'))
+# Remove target KG if already in queue, then prepend
+for code in ['TARGET_CODE']:
+    if code in q: q.remove(code)
+q = ['TARGET_CODE'] + q
+json.dump(q, open('data/austria_processor/retry_queue.json', 'w'))
+print('Queue now:', len(q), 'items, starts with', q[:3])
+"
+
+# 4. (Optional) Remove tile checkpoints if the KG was mid-processing
+#    This forces a clean restart for that KG. Skip if the KG wasn't in progress.
+rm -rf data/austria_processor/tile_checkpoints/TARGET_CODE/
+
+# 5. Start the processor — it reads retry_queue.json first
+sudo systemctl start austria_processor
+
+# 6. Verify
+tail -5 data/austria_processor/logs/processor.log
+```
+
+Replace `TARGET_CODE` with the KG code (e.g. `91109`). The retry queue is
+consumed in order and prepended to the normal nearest-neighbor traversal.
+Multiple KGs can be queued — just put them all at the front of the list.
+
 ### Re-processing a KG (after bad output or code fix)
 
 ```bash

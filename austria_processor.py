@@ -1211,16 +1211,18 @@ def _fix_gpkg_raster_crs(gpkg_path: str):
     JPEG/PNG layers (Ortho, CIR) in QGIS, causing 'h_band null' errors and
     the raster to appear at 0,0 without CRS.
 
-    This function only ensures the gpkg_spatial_ref_sys entry is complete
-    (has both WKT1 and WKT2 definitions) so all QGIS/GDAL versions can
-    resolve the CRS.
+    This function:
+    1. Ensures the gpkg_spatial_ref_sys entry is complete (WKT1 + WKT2)
+    2. Repairs uint8 layers that were wrongly converted to '2d-gridded-coverage'
+       by an older version of this code (reverts them to 'tiles' and cleans up
+       bogus extension/ancillary entries)
     """
     import sqlite3
     if not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0:
         return
     conn = sqlite3.connect(gpkg_path)
     try:
-        # Ensure EPSG:3035 has both WKT1 (definition) and WKT2 (definition_12_063)
+        # --- 1. Ensure EPSG:3035 has both WKT1 and WKT2 definitions ---
         row = conn.execute(
             "SELECT definition, definition_12_063 FROM gpkg_spatial_ref_sys "
             "WHERE srs_id = 3035"
@@ -1244,6 +1246,60 @@ def _fix_gpkg_raster_crs(gpkg_path: str):
                     (wkt1, wkt2)
                 )
                 log.info("Updated EPSG:3035 WKT definitions in %s", gpkg_path)
+
+        # --- 2. Repair uint8 layers wrongly registered as 2d-gridded-coverage ---
+        # Legitimate float32 gridded layers have column_name='tile_data' in
+        # gpkg_extensions.  Bogus uint8 layers (from old code) have
+        # column_name IS NULL.  Revert those to 'tiles' data_type and clean
+        # up the spurious extension + ancillary rows.
+        try:
+            bogus = conn.execute(
+                "SELECT table_name FROM gpkg_extensions "
+                "WHERE extension_name = 'gpkg_2d_gridded_coverage' "
+                "AND column_name IS NULL "
+                "AND table_name NOT IN "
+                "  ('gpkg_2d_gridded_coverage_ancillary', "
+                "   'gpkg_2d_gridded_tile_ancillary')"
+            ).fetchall()
+            if bogus:
+                bogus_names = [r[0] for r in bogus]
+                log.info("Repairing %d uint8 layers wrongly registered as "
+                         "2d-gridded-coverage: %s", len(bogus_names), bogus_names)
+                for tname in bogus_names:
+                    # Revert data_type to 'tiles'
+                    conn.execute(
+                        "UPDATE gpkg_contents SET data_type = 'tiles' "
+                        "WHERE table_name = ? AND data_type = '2d-gridded-coverage'",
+                        (tname,)
+                    )
+                    # Remove bogus extension entry
+                    conn.execute(
+                        "DELETE FROM gpkg_extensions "
+                        "WHERE table_name = ? "
+                        "AND extension_name = 'gpkg_2d_gridded_coverage' "
+                        "AND column_name IS NULL",
+                        (tname,)
+                    )
+                    # Remove bogus ancillary rows
+                    try:
+                        conn.execute(
+                            "DELETE FROM gpkg_2d_gridded_coverage_ancillary "
+                            "WHERE tile_matrix_set_name = ?",
+                            (tname,)
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        conn.execute(
+                            "DELETE FROM gpkg_2d_gridded_tile_ancillary "
+                            "WHERE tpudt_name = ?",
+                            (tname,)
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug("GPKG repair check skipped (no extensions table?): %s", e)
+
         conn.commit()
     except Exception as e:
         log.warning("GPKG CRS fix failed for %s: %s", gpkg_path, e)

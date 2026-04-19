@@ -683,7 +683,7 @@ function updateCards(d) {
   const ms = mf.total_size_bytes || d.upload_size_bytes || 0;
   document.getElementById('cZenVal').textContent = mc + ' uploaded';
   let zenDet = fmtB(ms) + ' total';
-  if (zc.zenodo_tiles) zenDet += '<br>Cache: ' + fmt(zc.zenodo_tiles) + ' tiles in ' + fmt(zc.zenodo_files||0) + '/35 ZIPs';
+  if (zc.zenodo_tiles) zenDet += '<br>Cache: ' + fmt(zc.zenodo_tiles) + ' tiles in ' + fmt(zc.zenodo_files||0) + '/35 ZIPs · ' + fmtB(zc.zenodo_size_bytes||0) + '/50 GB';
   document.getElementById('cZenDet').innerHTML = zenDet;
 
 }

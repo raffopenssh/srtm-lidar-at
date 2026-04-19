@@ -919,6 +919,7 @@ class ZenodoCache:
             "record_id": self.manifest.record_id,
             "zenodo_files": len(self.manifest.all_files()),
             "zenodo_tiles": self.manifest.tile_count(),
+            "zenodo_size_bytes": sum(f.get("size", 0) for f in self.manifest.all_files().values()),
             "local_copernicus": {k: len(v) for k, v in local_cop.items()},
             "local_hansen": len(local_hansen),
         }

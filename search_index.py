@@ -909,13 +909,25 @@ class SearchIndex:
     # Query: aggregates
     # ════════════════════════════════════════════════════════════════
 
-    def aggregate_district(self, district_code):
+    def aggregate_district(self, district_code_or_name):
         """Aggregate landscape stats for a Bezirk."""
-        return self._aggregate('district_code', district_code)
+        val = district_code_or_name
+        if not val.isdigit():
+            for code, name in DISTRICT_NAMES.items():
+                if name.lower() == val.lower():
+                    val = code
+                    break
+        return self._aggregate('district_code', val)
 
-    def aggregate_gemeinde(self, gemeinde_code):
+    def aggregate_gemeinde(self, gemeinde_code_or_name):
         """Aggregate landscape stats for a Gemeinde."""
-        return self._aggregate('gemeinde_code', gemeinde_code)
+        val = gemeinde_code_or_name
+        if not val.isdigit():
+            c = self._conn()
+            row = c.execute('SELECT gemeinde_code FROM kg WHERE gemeinde_name = ? LIMIT 1', (val,)).fetchone()
+            if row:
+                val = row[0]
+        return self._aggregate('gemeinde_code', val)
 
     def aggregate_state(self, state_code_or_name):
         """Aggregate landscape stats for a Bundesland."""

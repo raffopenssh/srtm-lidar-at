@@ -1763,10 +1763,24 @@ def api_query():
                         break
             return jsonify(idx.query_admin('state', sc, processed_only=processed_only, limit=limit, offset=offset))
         if args.get('district'):
-            return jsonify(idx.query_admin('district', args['district'],
+            dc = args['district']
+            # Accept name or code
+            if not dc.isdigit():
+                for code, name in si.DISTRICT_NAMES.items():
+                    if name.lower() == dc.lower():
+                        dc = code
+                        break
+            return jsonify(idx.query_admin('district', dc,
                                            processed_only=processed_only, limit=limit, offset=offset))
         if args.get('gemeinde'):
-            return jsonify(idx.query_admin('gemeinde', args['gemeinde'],
+            gm = args['gemeinde']
+            # Accept name or code — look up in DB if name given
+            if not gm.isdigit():
+                c = idx._conn()
+                row = c.execute('SELECT gemeinde_code FROM kg WHERE gemeinde_name = ? LIMIT 1', (gm,)).fetchone()
+                if row:
+                    gm = row[0]
+            return jsonify(idx.query_admin('gemeinde', gm,
                                            processed_only=processed_only, limit=limit, offset=offset))
 
         # Object type ranking

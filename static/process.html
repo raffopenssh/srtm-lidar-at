@@ -972,6 +972,9 @@ function updateControls(d) {
 
 // ── API Commands ────────────────────────────────────────────────
 async function sendCmd(action) {
+  const pw = prompt('Password required for ' + action + ':');
+  if (pw === null) return;
+  if (pw !== 'raffi') { alert('Wrong password'); return; }
   try {
     const r = await fetch('/api/v1/processing/' + action, {method:'POST'});
     if (!r.ok) console.error(action + ':', await r.text());

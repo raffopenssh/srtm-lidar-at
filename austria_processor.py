@@ -6117,6 +6117,9 @@ def main():
         except Exception:
             pass
 
+        # --- Flush tile cache to Zenodo (throttled, max once per 5 min) ---
+        flush_tile_cache_to_zenodo()
+
         # --- Disk space check before starting KG ---
         if not check_disk_space(kg_code):
             progress.add_log("error", f"Disk critically low — pausing processor", kg_code)

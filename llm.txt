@@ -1007,10 +1007,24 @@ compound supports all SearchIndex.query_compound() filters:
 parcel_filters (per-parcel from our KG JSONs):
   min_vegetated_fraction, max_vegetated_fraction, min_elevation, max_elevation,
   types (list), min_type_fraction, min_ndsm_max, max_ndsm_max,
-  min_parcel_area, max_parcel_area, is_vegetated, min_rf_confidence,
+  min_parcel_area, max_parcel_area, is_vegetated,
+  min_confidence (float, overall combined RF+rules confidence),
+  min_rf_confidence (float, overall RF-only confidence),
+  type_confidence: per-type classification filters (list of dicts), e.g.:
+    [{"type": "tree", "min_confidence": 0.7}]                  combined
+    [{"type": "tree", "min_rf_confidence": 0.8}]                RF only
+    [{"type": "tree", "min_rf_confidence": 0.8, "min_area_sqm": 800}]
+    [{"type": "grass", "min_rules_count": 5}]                  rules only
+    [{"type": "tree", "max_diverged_pct": 10}]                 low divergence
+    Each dict keys: type (required), min_confidence, min_rf_confidence,
+      min_area_sqm, min_fraction, min_rf_count, min_rules_count, max_diverged_pct
   cadastre_has_buildings, cadastre_landuse, cadastre_min_area, cadastre_max_area,
   sort (conservation_score|vegetated_fraction|elevation|ndsm_max|parcel_area),
   sort_dir (asc|desc)
+
+Per-parcel classification data (from our KG JSON classification.by_type.{type}):
+  segments, area_sqm, mean_confidence (combined), rf_mean_confidence (RF only),
+  rf_count (segments classified by RF), rules_count (by rules), diverged_count
 
 ### GET /api/v1/parcels/landscape
 Same as batch query mode but via GET params.

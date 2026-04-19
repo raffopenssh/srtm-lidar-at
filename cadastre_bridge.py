@@ -159,7 +159,14 @@ def _find_parcel_in_kg(kg_data: dict, parcel_id: str) -> dict | None:
 
 
 def _extract_landscape_from_parcel(parcel_detail: dict) -> dict:
-    """Extract landscape analysis fields from a parcel detail dict."""
+    """Extract landscape analysis fields from a parcel detail dict.
+
+    Carries through the full per-parcel data from our KG JSON:
+    - area_summary: {type: {area_sqm, fraction}} — segmentation result
+    - height_distribution: {type: {min, max, mean}} — nDSM heights per type
+    - classification: full RF/rules breakdown per type with confidence
+    - vegetation, elevation, nDSM, temporal change
+    """
     if not parcel_detail:
         return {}
 
@@ -170,7 +177,8 @@ def _extract_landscape_from_parcel(parcel_detail: dict) -> dict:
     if area_summary:
         landscape['area_summary'] = area_summary
         # Compute vegetation fraction from area_summary
-        veg_types = ('tree', 'grass', 'shrub', 'crop', 'wetland', 'garden')
+        veg_types = ('tree', 'grass', 'shrub', 'crop', 'hedge',
+                     'orchard', 'vineyard', 'garden')
         total_frac = sum(
             area_summary.get(t, {}).get('fraction', 0)
             for t in veg_types
@@ -182,24 +190,31 @@ def _extract_landscape_from_parcel(parcel_detail: dict) -> dict:
             landscape['tree_canopy_sqm'] = tree.get('area_sqm', 0)
             landscape['tree_fraction'] = tree.get('fraction', 0)
 
-    # Heights
-    if parcel_detail.get('heights'):
-        landscape['heights'] = parcel_detail['heights']
+    # Height distribution per type
+    if parcel_detail.get('height_distribution'):
+        landscape['height_distribution'] = parcel_detail['height_distribution']
 
-    # Classification confidence
+    # Classification — full per-type breakdown
+    # classification.by_type.{type}: segments, area_sqm, mean_confidence,
+    #   rf_count, rules_count, rf_mean_confidence, diverged_count
     if parcel_detail.get('classification'):
         landscape['classification'] = parcel_detail['classification']
 
-    # NDVI
-    for k in ('ndvi_mean', 'ndvi_min', 'ndvi_max', 'ndvi'):
-        if k in parcel_detail:
-            landscape[k] = parcel_detail[k]
+    # Vegetation flags
+    if 'vegetated_fraction' in parcel_detail:
+        landscape['vegetated_fraction'] = parcel_detail['vegetated_fraction']
+    if 'is_vegetated' in parcel_detail:
+        landscape['is_vegetated'] = parcel_detail['is_vegetated']
+
+    # nDSM heights
+    if parcel_detail.get('ndsm_max_m') is not None:
+        landscape['ndsm_max_m'] = parcel_detail['ndsm_max_m']
+    if parcel_detail.get('ndsm_mean_m') is not None:
+        landscape['ndsm_mean_m'] = parcel_detail['ndsm_mean_m']
 
     # Elevation
-    for k in ('elevation_mean', 'elevation_min', 'elevation_max',
-              'slope_mean', 'slope_max'):
-        if k in parcel_detail:
-            landscape[k] = parcel_detail[k]
+    if parcel_detail.get('elevation_m') is not None:
+        landscape['elevation_m'] = parcel_detail['elevation_m']
 
     # Temporal / Hansen
     for k in ('hansen_loss_pixels', 'temporal_change', 'volume_change_m3'):
@@ -658,7 +673,20 @@ def landscape_parcel_query(compound_filters: dict,
             min_parcel_area: float — min parcel area (sqm)
             max_parcel_area: float — max parcel area (sqm)
             is_vegetated: bool — only vegetated parcels
-            min_rf_confidence: float — min mean RF confidence per parcel
+
+            --- Per-type classification confidence (from classification.by_type) ---
+            type_confidence: list[dict] — per-type confidence filters, e.g.:
+              [{"type": "tree", "min_confidence": 0.7}]              combined
+              [{"type": "tree", "min_rf_confidence": 0.8}]           RF only
+              [{"type": "tree", "min_rules_count": 5}]              rules only
+              [{"type": "tree", "min_confidence": 0.7, "min_area_sqm": 500}]
+              [{"type": "tree", "max_diverged_pct": 10}]            low divergence
+              Each dict: type (required), min_confidence, min_rf_confidence,
+                         min_area_sqm, min_fraction, min_rf_count, min_rules_count,
+                         max_diverged_pct
+            min_confidence: float — min mean overall confidence (all types)
+            min_rf_confidence: float — min mean RF confidence (all types)
+
             cadastre_landuse: str — require cadastre landuse code/abbr
             cadastre_has_buildings: bool — building presence filter
             cadastre_min_area: float — min cadastre area (sqm)
@@ -760,11 +788,65 @@ def landscape_parcel_query(compound_filters: dict,
                 ):
                     continue
 
-            # RF confidence filter (per-parcel classification)
+            # Classification confidence filters
             cls = pd.get('classification', {})
+            by_type = cls.get('by_type', {})
+
+            # Overall confidence (combined RF + rules)
+            if pf.get('min_confidence') is not None:
+                if (cls.get('mean_confidence') or 0) < pf['min_confidence']:
+                    continue
+
+            # Overall RF confidence
             if pf.get('min_rf_confidence') is not None:
-                parcel_rf_conf = cls.get('rf_mean_confidence', 0) or cls.get('mean_confidence', 0)
-                if parcel_rf_conf < pf['min_rf_confidence']:
+                if (cls.get('rf_mean_confidence') or 0) < pf['min_rf_confidence']:
+                    continue
+
+            # Per-type confidence filters
+            # Each entry: {type, min_confidence, min_rf_confidence,
+            #   min_area_sqm, min_fraction, min_rf_count, min_rules_count,
+            #   max_diverged_pct}
+            type_conf_filters = pf.get('type_confidence')
+            if type_conf_filters:
+                skip = False
+                for tcf in type_conf_filters:
+                    t = tcf.get('type', '')
+                    bt = by_type.get(t, {})
+                    # Type must exist in parcel
+                    if not bt and not area_summary.get(t):
+                        skip = True; break
+                    # Combined confidence (RF or rules, whichever classified)
+                    if tcf.get('min_confidence') is not None:
+                        if (bt.get('mean_confidence') or 0) < tcf['min_confidence']:
+                            skip = True; break
+                    # RF-only confidence
+                    if tcf.get('min_rf_confidence') is not None:
+                        if (bt.get('rf_mean_confidence') or 0) < tcf['min_rf_confidence']:
+                            skip = True; break
+                    # Area (from classification or area_summary)
+                    if tcf.get('min_area_sqm') is not None:
+                        t_area = bt.get('area_sqm') or area_summary.get(t, {}).get('area_sqm', 0)
+                        if t_area < tcf['min_area_sqm']:
+                            skip = True; break
+                    # Fraction (from area_summary)
+                    if tcf.get('min_fraction') is not None:
+                        if area_summary.get(t, {}).get('fraction', 0) < tcf['min_fraction']:
+                            skip = True; break
+                    # RF count (how many segments classified by RF)
+                    if tcf.get('min_rf_count') is not None:
+                        if (bt.get('rf_count') or 0) < tcf['min_rf_count']:
+                            skip = True; break
+                    # Rules count
+                    if tcf.get('min_rules_count') is not None:
+                        if (bt.get('rules_count') or 0) < tcf['min_rules_count']:
+                            skip = True; break
+                    # Divergence (RF predicted X but final was Y)
+                    if tcf.get('max_diverged_pct') is not None:
+                        segs = bt.get('segments', 0) or 1
+                        div = bt.get('diverged_count', 0) or 0
+                        if (100 * div / segs) > tcf['max_diverged_pct']:
+                            skip = True; break
+                if skip:
                     continue
 
             # Build landscape dict

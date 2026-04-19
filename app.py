@@ -1972,7 +1972,14 @@ def api_parcels_batch():
           "min_ndsm_max": 5,          // min height above ground (m)
           "min_parcel_area": 1000,    // min parcel area (sqm)
           "is_vegetated": true,
-          "min_rf_confidence": 0.7,
+          // Per-type classification confidence:
+          "type_confidence": [
+            {"type": "tree", "min_confidence": 0.7, "min_area_sqm": 500},
+            {"type": "grass", "min_rf_confidence": 0.8},
+            // Also: min_rf_count, min_rules_count, min_fraction, max_diverged_pct
+          ],
+          "min_confidence": 0.6,       // overall combined confidence
+          "min_rf_confidence": 0.7,    // overall RF confidence
           // Cadastre-side filters (applied after enrichment):
           "cadastre_has_buildings": false,
           "cadastre_landuse": "W",

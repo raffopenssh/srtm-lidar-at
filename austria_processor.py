@@ -5979,15 +5979,35 @@ RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.json"
 
 
 def _read_retry_queue() -> list[str]:
-    """Read and clear the retry queue file.  Returns list of KG codes."""
+    """Read the retry queue file WITHOUT clearing it.
+
+    Returns the current list of KG codes.  The file is preserved so that
+    priority KGs survive processor restarts and remain visible in the
+    dashboard.  Individual KGs are removed via _remove_from_retry_queue()
+    after they succeed or permanently fail.
+    """
     try:
         if RETRY_QUEUE_FILE.exists():
             codes = json.loads(RETRY_QUEUE_FILE.read_text())
-            RETRY_QUEUE_FILE.write_text("[]")
             return [c for c in codes if isinstance(c, str)]
     except Exception:
         pass
     return []
+
+
+def _remove_from_retry_queue(kg_code: str):
+    """Remove a single KG code from the retry queue file (atomic)."""
+    try:
+        if not RETRY_QUEUE_FILE.exists():
+            return
+        codes = json.loads(RETRY_QUEUE_FILE.read_text())
+        if kg_code in codes:
+            codes = [c for c in codes if c != kg_code]
+            tmp = RETRY_QUEUE_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(codes))
+            tmp.replace(RETRY_QUEUE_FILE)
+    except Exception:
+        pass
 
 
 def _append_retry_queue(kg_code: str):
@@ -6069,6 +6089,7 @@ def _record_failure(kg_code: str, failure_counts: dict,
     if count >= MAX_FAILURES:
         failed_kgs.add(kg_code)
         _save_failed_kgs(failed_kgs)
+        _remove_from_retry_queue(kg_code)
         progress.add_failure(kg_code, kg_name, error, step)
         progress.add_log(
             "error",
@@ -6270,7 +6291,33 @@ def main():
                if kg["kg_code"] not in completed_codes
                and kg["kg_code"] not in failed_kgs]
 
-    # Sort by nearest-neighbor traversal for maximum cache reuse
+    # --- Load priority queue and prepend to pending ---
+    priority_codes = _read_retry_queue()
+    # Filter out completed / permanently-failed from the file too
+    priority_codes = [c for c in priority_codes
+                      if c not in completed_codes and c not in failed_kgs]
+    priority_set = set(priority_codes)
+
+    if priority_codes:
+        log.info("Priority queue: %d KGs to process first: %s",
+                 len(priority_codes),
+                 priority_codes[:10])
+        # Separate priority KGs from the rest
+        priority_kgs = []
+        non_priority = []
+        for kg_item in pending:
+            if kg_item["kg_code"] in priority_set:
+                priority_kgs.append(kg_item)
+            else:
+                non_priority.append(kg_item)
+        # Build lookup for ordering priority_kgs to match the file order
+        prio_order = {c: idx for idx, c in enumerate(priority_codes)}
+        priority_kgs.sort(key=lambda k: prio_order.get(k["kg_code"], 999999))
+    else:
+        priority_kgs = []
+        non_priority = pending
+
+    # Sort non-priority by nearest-neighbor traversal for maximum cache reuse
     from tile_cache import order_kgs_nearest_neighbor
     # Resume from last completed KG if available
     resume_from = None
@@ -6280,8 +6327,14 @@ def main():
         if json_files:
             resume_from = json_files[-1].stem
             log.info("Resuming nearest-neighbor traversal from last KG: %s", resume_from)
-    pending = order_kgs_nearest_neighbor(pending, start_code=resume_from)
-    log.info("KGs ordered by nearest-neighbor traversal for cache locality")
+    non_priority = order_kgs_nearest_neighbor(non_priority, start_code=resume_from)
+    log.info("Non-priority KGs ordered by nearest-neighbor traversal for cache locality")
+
+    # Priority KGs go first, then nearest-neighbor ordered rest
+    pending = priority_kgs + non_priority
+    if priority_kgs:
+        log.info("Pending starts with %d priority KGs, then %d nearest-neighbor",
+                 len(priority_kgs), len(non_priority))
 
     log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
              len(kgs), len(completed_codes), len(failed_kgs), len(pending))
@@ -6308,6 +6361,10 @@ def main():
 
     # Deferred retry queue: list of (inject_after_index, kg_dict, attempt_num)
     _deferred_retries: list[tuple[int, dict, int]] = []
+
+    # Track which retry-queue KG codes we've already injected into pending,
+    # so we only pick up *new* additions from the file each iteration.
+    _known_queue_codes: set[str] = set(priority_codes)
 
     i = 0
     while i < len(pending):
@@ -6669,6 +6726,9 @@ def main():
                     _ts = _ckg.get("tile_statuses", [])
                 _save_tile_history(kg_code, _ts, "completed")
 
+                # Remove from priority queue file now that it's done
+                _remove_from_retry_queue(kg_code)
+
                 # Proactively flush tile cache to Zenodo so tiles
                 # survive disk cleanup between KGs.
                 flush_tile_cache_to_zenodo()
@@ -6833,9 +6893,14 @@ def main():
                      s["rate_kgs_per_hour"],
                      s["eta_seconds"] / 3600 if s["eta_seconds"] else 0)
 
-        # --- Check file-based retry queue (written by API or transient handler) ---
+        # --- Check file-based retry queue for NEW additions ---
+        # The file is no longer cleared on read; we track known codes to
+        # detect new entries added by the API while the processor runs.
         for rq_code in _read_retry_queue():
+            if rq_code in _known_queue_codes:
+                continue  # already injected this one
             if rq_code == kg_code:
+                _known_queue_codes.add(rq_code)
                 continue  # just processed this one
             # Only inject if not already in deferred list or pending
             _already = (rq_code in failed_kgs
@@ -6845,6 +6910,7 @@ def main():
                         or any(p["kg_code"] == rq_code
                                for p in pending[i+1:i+DEFER_GAP+2]))
             if _already:
+                _known_queue_codes.add(rq_code)
                 continue
             # Find the KG dict from full list
             rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
@@ -6852,10 +6918,11 @@ def main():
                 rq_kg = dict(rq_kg)
                 rq_kg["_defer_attempt"] = 0
                 pending.insert(i + 1, rq_kg)
+                _known_queue_codes.add(rq_code)
                 # Also remove from failed sets so it actually runs
                 failed_kgs.discard(rq_code)
                 _save_failed_kgs(failed_kgs)
-                log.info("↻ Manual retry: KG %s inserted next in queue",
+                log.info("↻ New priority: KG %s inserted next in queue",
                          rq_code)
 
         i += 1

@@ -1481,10 +1481,16 @@ class SearchIndex:
         where = []
         params = []
 
-        # Type filter
+        # Type filter (single value or comma-separated OR list)
         if object_type:
-            where.append('t.object_type = ?')
-            params.append(object_type)
+            types = [t.strip() for t in object_type.split(',') if t.strip()]
+            if len(types) == 1:
+                where.append('t.object_type = ?')
+                params.append(types[0])
+            else:
+                placeholders = ','.join('?' * len(types))
+                where.append(f't.object_type IN ({placeholders})')
+                params.extend(types)
 
         # Confidence filters — both RF and combined
         if min_rf_confidence is not None:
@@ -1535,8 +1541,14 @@ class SearchIndex:
             where.append('(k.state_code = ? OR k.state_name = ?)')
             params.extend([state, state])
         if district:
+            dc = district
+            if not dc.isdigit():
+                for code, name in DISTRICT_NAMES.items():
+                    if name.lower() == dc.lower():
+                        dc = code
+                        break
             where.append('k.district_code = ?')
-            params.append(district)
+            params.append(dc)
 
         # Only processed KGs
         where.append('k.processed = 1')

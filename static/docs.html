@@ -269,6 +269,8 @@ td code { font-size: 12px; }
       <a href="#query-pagination">Pagination</a>
       <a href="#query-async">Async Queries</a>
       <a href="#query-compound">Compound Filter</a>
+      <a href="#query-filter-logic">AND vs OR</a>
+      <a href="#query-segments">Power Queries</a>
     </div>
   </div>
   <div class="nav-group">
@@ -1179,6 +1181,7 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
       <tr><td>type</td><td>string</td><td>Rank KGs by object type. Combine with <code>metric=</code></td></tr>
       <tr><td>hansen</td><td>boolean</td><td>Hansen forest loss query. Combine with <code>year_from</code>, <code>year_to</code></td></tr>
       <tr><td>new_buildings</td><td>boolean</td><td>KGs with new uncadastred buildings</td></tr>
+      <tr><td>segments</td><td>boolean</td><td>Segment-level power queries. See <a href="#query-segments">Segment Power Queries</a> below.</td></tr>
       <tr><td>divergence</td><td>boolean</td><td>KGs ranked by RF→final type divergence</td></tr>
       <tr><td>parcels_by_type</td><td>string</td><td>Per-parcel filter by type + RF confidence (slow, async-capable)</td></tr>
       <tr><td>top_features</td><td>string</td><td>Cross-KG features: <code>trees|objects|new_buildings|infrastructure</code> (slow, async-capable)</td></tr>
@@ -1300,6 +1303,194 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-li
     <span class="ep-summary">Rebuild search index</span>
   </div>
   <p class="ep-desc">Rebuilds from scratch (~0.3s). Picks up new processor results and Zenodo manifest entries.</p>
+</div>
+
+<h3 id="query-filter-logic">Filter Logic: AND vs OR <a class="anchor-link" href="#query-filter-logic">#</a></h3>
+<p>
+  All filters within a single query combine with <strong>AND</strong>. For example:
+</p>
+<div class="code-wrap"><pre><code>segments=true &amp; object_type=tree &amp; min_rf_confidence=0.9 &amp; min_height=20 &amp; state=Vorarlberg</code></pre></div>
+<p style="font-size:13px;color:#666;margin-top:6px">means: type = tree <strong>AND</strong> rf_conf &ge; 0.9 <strong>AND</strong> height &ge; 20m <strong>AND</strong> state = Vorarlberg</p>
+
+<p style="margin-top:12px">
+  <strong>Multiple types</strong> in <code>object_type</code> combine with <strong>OR</strong> (comma-separated):
+</p>
+<div class="code-wrap"><pre><code>object_type=tree,shrub,hedge</code></pre></div>
+<p style="font-size:13px;color:#666;margin-top:6px">means: (type = tree <strong>OR</strong> shrub <strong>OR</strong> hedge) <strong>AND</strong> all other filters.</p>
+
+<p style="margin-top:12px">
+  <strong>Text search</strong> (<code>q=</code>) tokenises by whitespace; terms are AND&rsquo;d:
+  <code>q=Bregenz Gaissau</code> matches KGs whose name/admin contains <em>both</em> terms.
+</p>
+<p style="margin-top:8px;font-size:13px;color:#666">
+  <code>district=</code> and <code>gemeinde=</code> accept names (e.g. <code>district=Bregenz</code>) or numeric codes (<code>district=802</code>).
+  <code>state=</code> accepts names (e.g. <code>state=Vorarlberg</code>) or single-digit codes (<code>state=8</code>).
+</p>
+
+<h3 id="query-segments">Segment Power Queries <a class="anchor-link" href="#query-segments">#</a></h3>
+<p>
+  The search index stores the <strong>top 50 individual segments per object type per KG</strong>.
+  This enables cross-KG queries at segment level &mdash; find specific objects across
+  all of Austria without scanning full GeoPackage files.
+  Add <code>segments=true</code> to <code>/api/v1/query</code>.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:200px">Parameter</th><th style="width:100px">Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>object_type</code></td><td>string</td><td>Single type or comma-separated OR list: <code>tree</code>, <code>tree,shrub,hedge</code></td></tr>
+    <tr><td><code>min_rf_confidence</code></td><td>float</td><td>Raw RF model score lower bound (0&ndash;1)</td></tr>
+    <tr><td><code>max_rf_confidence</code></td><td>float</td><td>Raw RF model score upper bound</td></tr>
+    <tr><td><code>min_confidence</code></td><td>float</td><td>Combined/calibrated score lower bound</td></tr>
+    <tr><td><code>max_confidence</code></td><td>float</td><td>Combined/calibrated score upper bound</td></tr>
+    <tr><td><code>min_area_sqm</code></td><td>float</td><td>Minimum segment area (m&sup2;)</td></tr>
+    <tr><td><code>max_area_sqm</code></td><td>float</td><td>Maximum segment area</td></tr>
+    <tr><td><code>min_height</code></td><td>float</td><td>Minimum height_max_m (metres)</td></tr>
+    <tr><td><code>max_height</code></td><td>float</td><td>Maximum height_max_m</td></tr>
+    <tr><td><code>min_volume</code></td><td>float</td><td>Minimum |volume_change_m&sup3;| (absolute)</td></tr>
+    <tr><td><code>max_volume</code></td><td>float</td><td>Maximum |volume_change_m&sup3;|</td></tr>
+    <tr><td><code>bbox</code></td><td>string</td><td>Spatial filter: <code>w,s,e,n</code></td></tr>
+    <tr><td><code>state</code></td><td>string</td><td>State name or code</td></tr>
+    <tr><td><code>district</code></td><td>string</td><td>District name or code</td></tr>
+    <tr><td><code>sort</code></td><td>string</td><td><code>height_max_m</code> (default), <code>height_mean_m</code>, <code>area_sqm</code>, <code>volume</code>, <code>rf_confidence</code>, <code>confidence</code></td></tr>
+    <tr><td><code>sort_dir</code></td><td>string</td><td><code>desc</code> (default) or <code>asc</code></td></tr>
+    <tr><td><code>percentile</code></td><td>float</td><td>0&ndash;1: return only top N% (e.g. 0.01 = top 1%). Threshold computed from all matching segments, then applied as filter.</td></tr>
+    <tr><td><code>limit</code>, <code>offset</code></td><td>int</td><td>Pagination (default limit=100, max 1000)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p style="margin-top:12px">
+  Each result includes <code>kg_code</code>, <code>object_type</code>, <code>lon</code>/<code>lat</code>,
+  <code>area_sqm</code>, <code>height_max_m</code>, <code>height_mean_m</code>, <code>volume_change_m3</code>,
+  <code>rf_confidence</code>, <code>confidence</code>, <code>rank</code>, admin names,
+  and <code>_links</code> with a <code>kg</code> API URL and a <code>map</code> Google Maps link.
+  When <code>percentile</code> is used, the response also includes <code>percentile_threshold</code>
+  and <code>percentile_count</code>.
+</p>
+
+<h4 style="margin-top:16px">Example Queries</h4>
+<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
+<pre><code><span class="tok-comment"># Top 1% tallest trees with RF confidence &gt; 90%</span>
+<span class="tok-comment"># Returns 1 result: 35.43m tree near Gaissau, rf_conf=0.937</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;min_rf_confidence=0.9&amp;percentile=0.01"</span>
+
+<span class="tok-comment"># Top 5% largest tree loss areas, RF confidence &gt; 80%</span>
+<span class="tok-comment"># Returns segments ranked by area where forest has been lost</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree_loss&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</span>
+
+<span class="tok-comment"># Top 10 excavations by volume, RF confidence &gt; 70%</span>
+<span class="tok-comment"># Finds the largest ground disturbances measured in m³ of earth moved</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation&amp;min_rf_confidence=0.7&amp;sort=volume&amp;limit=10"</span>
+
+<span class="tok-comment"># Tallest 5 roofs with combined confidence &gt; 70%</span>
+<span class="tok-comment"># Identifies the tallest buildings (by nDSM height at segment peak)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof&amp;min_confidence=0.7&amp;sort=height_max_m&amp;limit=5"</span>
+
+<span class="tok-comment"># All tall vegetation: trees OR shrubs OR hedges above 15m, high confidence</span>
+<span class="tok-comment"># Multi-type OR — comma-separated types act as OR, other filters AND</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree,shrub,hedge&amp;min_height=15&amp;min_rf_confidence=0.7&amp;sort=height_max_m"</span>
+
+<span class="tok-comment"># Largest building structures: roofs OR greenhouses, sorted by footprint</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=roof,greenhouse&amp;sort=area_sqm&amp;sort_dir=desc&amp;min_confidence=0.7&amp;limit=10"</span>
+
+<span class="tok-comment"># All disturbance events ranked by volume of earth moved</span>
+<span class="tok-comment"># Combines excavation, fill, construction, and tree_loss into one query</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=excavation,fill,construction,tree_loss&amp;sort=volume&amp;sort_dir=desc&amp;limit=20"</span>
+
+<span class="tok-comment"># Trees in Bregenz district above 30m</span>
+<span class="tok-comment"># Combines type + spatial admin + height filter (all AND)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=tree&amp;district=Bregenz&amp;min_height=30&amp;sort=height_max_m"</span>
+
+<span class="tok-comment"># Top 5% largest crop segments with high RF confidence</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&amp;object_type=crop&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</span></code></pre>
+</div>
+
+<h4 style="margin-top:16px">More Query Examples (non-segment)</h4>
+<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
+<pre><code><span class="tok-comment"># KG lookup by code — returns full index record with landcover, hansen, links</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109"</span>
+
+<span class="tok-comment"># Aggregate landscape stats for a state</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&amp;aggregate=true"</span>
+
+<span class="tok-comment"># Aggregate stats for a district (by name)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=Bregenz&amp;aggregate=true"</span>
+
+<span class="tok-comment"># Text search (terms are AND'd) — finds KGs matching BOTH terms</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Bregenz+Gaissau"</span>
+
+<span class="tok-comment"># Point proximity — nearest KGs to a coordinate, sorted by distance</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48"</span>
+
+<span class="tok-comment"># Spatial bbox, processed KGs only</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&amp;processed_only=true"</span>
+
+<span class="tok-comment"># KGs ranked by tree coverage (by area)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?type=tree&amp;metric=area"</span>
+
+<span class="tok-comment"># Hansen forest loss in a year range</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?hansen=true&amp;year_from=2020&amp;year_to=2024"</span>
+
+<span class="tok-comment"># KGs with new uncadastred buildings</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?new_buildings=true&amp;processed_only=true"</span>
+
+<span class="tok-comment"># All KGs in Gaißau municipality</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?gemeinde=Gai%C3%9Fau"</span></code></pre>
+</div>
+
+<h4 style="margin-top:16px">Slow Queries (async recommended)</h4>
+<p style="font-size:13px;color:#666;margin-bottom:10px">
+  These queries scan KG JSON files on disk and can take seconds to minutes depending on how many KGs
+  are processed. Use <code>async=true</code> to avoid HTTP timeouts &mdash; you get back a <code>task_id</code>
+  immediately and poll for the result.
+</p>
+<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
+<pre><code><span class="tok-comment"># ── parcels_by_type: find individual parcels where a type has high RF confidence ──</span>
+<span class="tok-comment"># Scans KG JSONs → returns per-parcel results with centroid, elevation, areas</span>
+<span class="tok-comment"># Sync (fast if few KGs processed):</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500"</span>
+
+<span class="tok-comment"># Async (recommended when many KGs are processed):</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500&amp;async=true"</span>
+<span class="tok-comment"># → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}</span>
+<span class="tok-comment"># Poll until done:</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123"</span>
+<span class="tok-comment"># → 202 while running, 200 with full result when complete</span>
+
+<span class="tok-comment"># ── top_features: cross-KG ranked features from JSON summaries ──</span>
+
+<span class="tok-comment"># Tallest trees across all processed KGs, RF confidence &gt; 90%</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&amp;min_confidence=0.9&amp;async=true"</span>
+
+<span class="tok-comment"># Tallest new (uncadastred) buildings, confidence &gt; 75%</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&amp;min_confidence=0.75&amp;async=true"</span>
+
+<span class="tok-comment"># Infrastructure masts only, high confidence</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&amp;type=mast&amp;min_confidence=0.8&amp;async=true"</span>
+
+<span class="tok-comment"># Top objects within a spatial bbox (restricts which KGs are scanned)</span>
+curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&amp;bbox=9.5,47.4,9.7,47.6&amp;min_confidence=0.7&amp;async=true"</span>
+
+<span class="tok-comment"># ── compound filter (async): complex multi-attribute KG search ──</span>
+<span class="tok-comment"># POST body with "async": true — same poll mechanism via task_id</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
+  <span class="tok-flag">-H</span> <span class="tok-string">'Content-Type: application/json'</span> \
+  <span class="tok-flag">-d</span> <span class="tok-string">'{"type_filters": [{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}],
+    "min_elevation": 1000, "aspect": ["S", "SW"],
+    "min_ndvi": 0.5, "max_buildings": 10,
+    "sort": "tree_canopy_sqm", "sort_dir": "desc",
+    "async": true}'</span>
+<span class="tok-comment"># → 202 {"task_id": "def-456", ...}</span>
+<span class="tok-comment"># Poll: POST same endpoint with {"task_id": "def-456"}</span></code></pre>
+</div>
+
+<div style="background:#e8f4fd;border:1px solid #b3d9f2;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">
+  <strong>Speed guide:</strong>
+  <strong>Fast</strong> (&lt;25ms): <code>segments=true</code>, <code>q=</code>, <code>bbox=</code>, <code>point=</code>, <code>state=</code>, <code>district=</code>, <code>type=</code>, <code>hansen=</code>, <code>aggregate=</code> &mdash; pure index lookups.<br>
+  <strong>Medium</strong> (seconds): <code>compound</code> with <code>type_filters</code> or <code>landcover_filters</code> &mdash; joins on indexed tables.<br>
+  <strong>Slow</strong> (seconds–minutes): <code>parcels_by_type</code>, <code>top_features</code> &mdash; scan KG JSON files. Use <code>async=true</code>.
 </div>
 
 

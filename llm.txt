@@ -399,18 +399,150 @@ Common questions → endpoints:
   "Top excavations by volume, RF conf > 0.7"            → segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume
   "Tallest roofs with high combined confidence"          → segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m
   "All segments by area across types"                    → segments=true&sort=area_sqm
+  "All tall vegetation (tree OR shrub OR hedge) >15m"    → segments=true&object_type=tree,shrub,hedge&min_height=15
+  "Largest building structures (roof OR greenhouse)"     → segments=true&object_type=roof,greenhouse&sort=area_sqm&sort_dir=desc
+  "Disturbance events ranked by volume"                  → segments=true&object_type=excavation,fill,construction,tree_loss&sort=volume
+
+#### Filter logic: AND vs OR
+
+All filters within a single query combine with AND:
+  segments=true&object_type=tree&min_rf_confidence=0.9&min_height=20&state=Vorarlberg
+  means: type=tree AND rf_conf>=0.9 AND height>=20m AND state=Vorarlberg
+
+Multiple types in object_type combine with OR (comma-separated):
+  object_type=tree,shrub,hedge  means: type=tree OR type=shrub OR type=hedge
+  All other filters still AND with the type list.
+
+Full-text search (q=) tokenises by whitespace; terms are AND'd by default:
+  q=Bregenz Gaissau  matches KGs whose name/admin hierarchy contains BOTH terms.
+
+district= and gemeinde= accept names (e.g. district=Bregenz) or numeric codes (district=802).
+state= accepts names (e.g. state=Vorarlberg) or single-digit codes (state=8).
+
+#### Segment Power Queries (segments=true)
+
+The search index stores the top 50 individual segments per object type per KG.
+This enables cross-KG queries at segment level — find specific objects across
+all of Austria without scanning full GeoPackage files.
+
+Parameters (all optional, all AND'd together):
+  object_type       Single type or comma-separated OR list (tree,roof,shrub)
+  min_rf_confidence Raw RF model score lower bound (0-1)
+  max_rf_confidence Raw RF model score upper bound
+  min_confidence    Combined/calibrated score lower bound
+  max_confidence    Combined/calibrated score upper bound
+  min_area_sqm      Minimum segment area in m²
+  max_area_sqm      Maximum segment area
+  min_height        Minimum height_max_m (metres)
+  max_height        Maximum height_max_m
+  min_volume        Minimum |volume_change_m3| (absolute)
+  max_volume        Maximum |volume_change_m3|
+  bbox              Spatial filter: w,s,e,n (filters by KG bbox)
+  state             State name or code
+  district          District name or code
+  sort              Sort column: height_max_m (default), height_mean_m, area_sqm,
+                    volume (=|volume_change_m3|), rf_confidence, confidence
+  sort_dir          asc or desc (default: desc)
+  percentile        Float 0-1: return only top N% (e.g. 0.01 = top 1%)
+  limit, offset     Pagination (default limit=100, max 1000)
+
+Response: {total, offset, limit, results: [{kg_code, kg_name, object_type,
+  lon, lat, area_sqm, height_max_m, height_mean_m, volume_change_m3,
+  rf_confidence, confidence, rank, gemeinde_name, district_name, state_name,
+  _links: {kg, map}}],
+  percentile_threshold (if percentile used), percentile_count}
 
 Live examples (clickable):
-  Top 1% tallest trees, RF confidence > 90%:
-    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
-  Top 5% largest tree loss areas, RF confidence > 80%:
-    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm
-  Top 10 excavations by volume, RF confidence > 70%:
-    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume&limit=10
-  Tallest 5 roofs with combined confidence > 70%:
-    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m&limit=5
-  KG 91109 (Gaissau) full index record:
-    https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109
+
+  # Top 1% tallest trees, RF confidence > 90%
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
+
+  # Top 5% largest tree loss areas, RF confidence > 80%
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm
+
+  # Top 10 excavations by volume, RF confidence > 70%
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume&limit=10
+
+  # Tallest 5 roofs with combined confidence > 70%
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m&limit=5
+
+  # All tall vegetation (trees OR shrubs OR hedges) above 15m, high confidence
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree,shrub,hedge&min_height=15&min_rf_confidence=0.7&sort=height_max_m
+
+  # Largest building structures (roofs OR greenhouses), sorted by area
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=roof,greenhouse&sort=area_sqm&sort_dir=desc&min_confidence=0.7&limit=10
+
+  # All disturbance events (excavation/fill/construction/tree_loss) by volume
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=excavation,fill,construction,tree_loss&sort=volume&sort_dir=desc&limit=20
+
+  # Trees in Bregenz district above 30m
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=tree&district=Bregenz&min_height=30&sort=height_max_m
+
+  # Top 5% largest crop segments with high RF confidence
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?segments=true&object_type=crop&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm
+
+  # KG 91109 (Gaissau) full index record
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?kg=91109
+
+  # Aggregate stats for Vorarlberg
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&aggregate=true
+
+  # Aggregate stats for district Bregenz
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?district=Bregenz&aggregate=true
+
+  # Text search (AND of terms)
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Bregenz+Gaissau
+
+  # Point proximity (nearest KGs to a coordinate)
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48
+
+  # Spatial bbox, processed only
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&processed_only=true
+
+#### Slow Queries (async recommended)
+
+These scan KG JSON files on disk. Use async=true to avoid timeouts.
+You get back a task_id immediately and poll for the result.
+
+  # parcels_by_type — find individual parcels where a type has high RF confidence
+  # Returns per-parcel results: parcel_id, centroid, elevation, type area, rf_confidence
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500
+
+  # Same but async (recommended when many KGs processed):
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500&async=true
+  # → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}
+  # Poll: GET /api/v1/query?task_id=abc-123  → 202 while running, 200 when done
+
+  # top_features — cross-KG ranked features from JSON summaries
+  # feature_type: trees | objects | new_buildings | infrastructure
+  # Tallest trees across all KGs, RF confidence > 90%:
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true
+
+  # New (uncadastred) buildings, confidence > 75%:
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75&async=true
+
+  # Infrastructure masts, high confidence:
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8&async=true
+
+  # Top objects within a spatial bbox (restricts which KGs are scanned):
+  https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=objects&bbox=9.5,47.4,9.7,47.6&min_confidence=0.7&async=true
+
+  # compound filter (async) — complex multi-attribute KG search
+  curl -X POST https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound \
+    -H 'Content-Type: application/json' \
+    -d '{"type_filters": [{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}],
+      "min_elevation": 1000, "aspect": ["S", "SW"],
+      "min_ndvi": 0.5, "max_buildings": 10,
+      "sort": "tree_canopy_sqm", "sort_dir": "desc",
+      "async": true}'
+  # → 202 {"task_id": "def-456", ...}
+  # Poll: POST same endpoint with {"task_id": "def-456"}
+
+Speed guide:
+  Fast (<25ms):       segments=true, q=, bbox=, point=, state=, district=, type=,
+                      hansen=, aggregate= — pure index lookups
+  Medium (seconds):   compound with type_filters or landcover_filters — indexed joins
+  Slow (sec–minutes): parcels_by_type, top_features — scan KG JSONs. Use async=true.
 
 Query modes (pick one):
   q=<text>                Full-text search (KG/gemeinde/district/state names)
@@ -419,8 +551,8 @@ Query modes (pick one):
   bbox=<w,s,e,n>          Spatial R-tree query (KGs intersecting bbox)
   point=<lon,lat>         Point proximity query (sorted by distance)
   state=<code|name>       KGs in a Bundesland (or aggregate if aggregate=true)
-  district=<code>         KGs in a Bezirk (or aggregate if aggregate=true)
-  gemeinde=<code>         KGs in a Gemeinde (or aggregate if aggregate=true)
+  district=<code|name>   KGs in a Bezirk (or aggregate if aggregate=true)
+  gemeinde=<code|name>   KGs in a Gemeinde (or aggregate if aggregate=true)
   type=<object_type>      Rank KGs by object type (metric=area|fraction|count|height)
   hansen=true             Hansen forest loss query (year_from, year_to, min_loss)
   new_buildings=true      KGs with new uncadastred buildings (min_count=N)

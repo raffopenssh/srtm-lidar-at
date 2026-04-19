@@ -264,6 +264,12 @@ td code { font-size: 12px; }
     <a href="#one-stop-url">One-Stop URL</a>
     <a href="#shares">Shares</a>
     <a href="#utilities">Utilities</a>
+    <a href="#search-index">Search Index</a>
+    <div class="nav-sub">
+      <a href="#query-pagination">Pagination</a>
+      <a href="#query-async">Async Queries</a>
+      <a href="#query-compound">Compound Filter</a>
+    </div>
   </div>
   <div class="nav-group">
     <div class="nav-group-title">Reference</div>
@@ -1077,6 +1083,178 @@ curl <span class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/layers?bbo
 curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/parse-geometry</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Point","coordinates":[15.43,47.07]}'</span></code></pre>
+</div>
+
+
+<!-- ==================== SEARCH INDEX ==================== -->
+<h2 id="search-index">Search Index <a class="anchor-link" href="#search-index">#</a></h2>
+
+<p>
+  A pre-built SQLite FTS5 + R-tree index over all 8,440 Austrian Katastralgemeinden (KGs).
+  Queries are fast (&lt;25ms for index lookups) and support full-text search, spatial queries,
+  admin hierarchy, object type rankings, and compound filters.
+</p>
+
+<h3 id="query-pagination">Pagination <a class="anchor-link" href="#query-pagination">#</a></h3>
+<p>
+  All list-returning query modes return a <strong>paginated envelope</strong>:
+</p>
+<div class="code-wrap"><pre><code>{
+  "total": 1234,    <span class="tok-comment">// total matching records (before limit/offset)</span>
+  "offset": 0,      <span class="tok-comment">// current offset</span>
+  "limit": 100,     <span class="tok-comment">// page size</span>
+  "results": [...]  <span class="tok-comment">// array of KG records</span>
+}</code></pre></div>
+<p>
+  Use <code>limit=</code> and <code>offset=</code> query parameters to paginate.
+  Default limit is 100, max is 1000.
+  Single-item lookups (<code>kg=</code>, <code>parcel=</code>) return the item directly without the envelope.
+  Aggregate queries (<code>aggregate=true</code>) return aggregate stats directly.
+</p>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <code class="ep-path">/api/v1/query</code>
+    <span class="ep-summary">Unified query endpoint</span>
+  </div>
+  <p class="ep-desc">
+    Supports multiple query modes via query parameters. Pick one mode per request.
+  </p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th style="width:230px">Parameter</th><th style="width:90px">Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>q</td><td>string</td><td>Full-text search (KG/gemeinde/district/state names)</td></tr>
+      <tr><td>kg</td><td>string</td><td>Exact KG code lookup</td></tr>
+      <tr><td>parcel</td><td>string</td><td>Parcel lookup (format: KGCODE-GNR)</td></tr>
+      <tr><td>bbox</td><td>string</td><td>Spatial R-tree query: <code>w,s,e,n</code></td></tr>
+      <tr><td>point</td><td>string</td><td>Point proximity: <code>lon,lat</code> (sorted by distance)</td></tr>
+      <tr><td>state / district / gemeinde</td><td>string</td><td>Admin hierarchy filter (code or name)</td></tr>
+      <tr><td>type</td><td>string</td><td>Rank KGs by object type. Combine with <code>metric=</code></td></tr>
+      <tr><td>hansen</td><td>boolean</td><td>Hansen forest loss query. Combine with <code>year_from</code>, <code>year_to</code></td></tr>
+      <tr><td>new_buildings</td><td>boolean</td><td>KGs with new uncadastred buildings</td></tr>
+      <tr><td>divergence</td><td>boolean</td><td>KGs ranked by RF→final type divergence</td></tr>
+      <tr><td>parcels_by_type</td><td>string</td><td>Per-parcel filter by type + RF confidence (slow, async-capable)</td></tr>
+      <tr><td>top_features</td><td>string</td><td>Cross-KG features: <code>trees|objects|new_buildings|infrastructure</code> (slow, async-capable)</td></tr>
+      <tr><td colspan="3" style="background:#f8f9fa;font-weight:600;font-size:13px">Modifiers (combine with any mode above)</td></tr>
+      <tr><td>limit</td><td>int</td><td>Max results per page. <span class="param-default">Default: 100, max: 1000</span></td></tr>
+      <tr><td>offset</td><td>int</td><td>Pagination offset. <span class="param-default">Default: 0</span></td></tr>
+      <tr><td>async</td><td>boolean</td><td>Run slow queries asynchronously (parcels_by_type, top_features). Returns <code>task_id</code> to poll.</td></tr>
+      <tr><td>task_id</td><td>string</td><td>Poll an async query task. Returns 202 while running, result when done.</td></tr>
+      <tr><td>aggregate</td><td>boolean</td><td>Return aggregate stats instead of KG list</td></tr>
+      <tr><td>processed_only</td><td>boolean</td><td>Only return processed KGs</td></tr>
+      <tr><td>min_confidence</td><td>float</td><td>Min RF confidence threshold</td></tr>
+      <tr><td>min_area_sqm</td><td>float</td><td>Min area in m² for type filter</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
+  <pre><code><span class="tok-comment"># Paginated text search</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien&limit=10&offset=0</span>
+<span class="tok-comment"># → {"total": 23, "offset": 0, "limit": 10, "results": [...]}</span>
+
+<span class="tok-comment"># Page 2</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien&limit=10&offset=10</span>
+
+<span class="tok-comment"># Spatial query with pagination</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=15.0,47.0,16.0,48.0&limit=50&offset=0</span>
+
+<span class="tok-comment"># Admin hierarchy</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=0</span></code></pre></div>
+</div>
+
+<h3 id="query-async">Async Queries <a class="anchor-link" href="#query-async">#</a></h3>
+<p>
+  Slow queries that scan KG JSON files (<code>parcels_by_type</code>, <code>top_features</code>)
+  support asynchronous execution with <code>async=true</code>. This is recommended when querying
+  across many KGs to avoid HTTP timeouts.
+</p>
+<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
+<pre><code><span class="tok-comment"># 1. Start async query</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true</span>
+<span class="tok-comment"># → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}</span>
+
+<span class="tok-comment"># 2. Poll until done</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123</span>
+<span class="tok-comment"># → 202 {"active": true, "step": "running", "elapsed": 3.2} (while running)</span>
+<span class="tok-comment"># → 200 {"total": 456, "offset": 0, "limit": 100, "results": [...]} (when done)</span>
+
+<span class="tok-comment"># Alternative: dedicated progress endpoint</span>
+curl <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/progress?task_id=abc-123</span></code></pre></div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:200px">Endpoint</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /api/v1/query?task_id=X</code></td><td>Poll async query — returns 202 while running, result (200) when done, error (500) on failure</td></tr>
+    <tr><td><code>GET /api/v1/query/progress?task_id=X</code></td><td>Dedicated progress endpoint — same behavior</td></tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:13px;color:#666;">Async results are auto-cleaned after 4 hours.</p>
+
+<h3 id="query-compound">Compound Filter <a class="anchor-link" href="#query-compound">#</a></h3>
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <code class="ep-path">/api/v1/query/compound</code>
+    <span class="ep-summary">Filter KGs by any combination of attributes</span>
+  </div>
+  <p class="ep-desc">
+    POST a JSON body with filter keys. All filters are pure SQL on indexed columns — very fast.
+    Returns paginated <code>{total, offset, limit, results}</code>.
+    Supports <code>"async": true</code> in body; poll with <code>{"task_id": "..."}</code>.
+  </p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th style="width:230px">Filter key</th><th style="width:120px">Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>bbox</td><td>[w,s,e,n]</td><td>Spatial bounding box</td></tr>
+      <tr><td>state / district / gemeinde</td><td>string</td><td>Admin filter</td></tr>
+      <tr><td>aspect</td><td>["S","SW",...]</td><td>Dominant aspect direction</td></tr>
+      <tr><td>dominant_type / phenology / quality_grade</td><td>string</td><td>Exact match filters</td></tr>
+      <tr><td>min_/max_ + numeric field</td><td>float</td><td>Numeric ranges: slope, elevation, ndvi, tree_count, building_height, sar_vv, etc.</td></tr>
+      <tr><td>type_filters</td><td>array</td><td><code>[{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}]</code></td></tr>
+      <tr><td>landcover_filters</td><td>array</td><td><code>[{"type": "crop", "min_fraction": 0.2, "max_height_mean": 1.0}]</code></td></tr>
+      <tr><td>sort / sort_dir</td><td>string</td><td>Sort column + direction (<code>asc</code>/<code>desc</code>)</td></tr>
+      <tr><td>limit / offset</td><td>int</td><td>Pagination. Default limit=50, max 1000</td></tr>
+      <tr><td>async</td><td>boolean</td><td>Run asynchronously. Returns <code>{task_id}</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
+  <pre><code><span class="tok-comment"># Trees + grass with high RF confidence, no buildings, rugged terrain</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
+  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
+  <span class="tok-flag">-d</span> '{"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},
+    {"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],
+    "max_buildings":0,"aspect":["S","SW","W"],"min_roughness":2.0}'
+<span class="tok-comment"># → {"total": 47, "offset": 0, "limit": 50, "results": [...]}</span>
+
+<span class="tok-comment"># High-elevation steep terrain with lots of trees, page 3</span>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound</span> \
+  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
+  <span class="tok-flag">-d</span> '{"min_elevation":1500,"min_slope":15,"min_tree_count":100,
+    "sort":"tree_canopy_sqm","sort_dir":"desc","limit":20,"offset":40}'</code></pre></div>
+</div>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-get">GET</span>
+    <code class="ep-path">/api/v1/index/status</code>
+    <span class="ep-summary">Index statistics</span>
+  </div>
+  <p class="ep-desc">Returns kg_count, processed_count, total_area_km2, zenodo_kgs, and more.</p>
+</div>
+
+<div class="endpoint">
+  <div class="ep-header">
+    <span class="method method-post">POST</span>
+    <code class="ep-path">/api/v1/index/rebuild</code>
+    <span class="ep-summary">Rebuild search index</span>
+  </div>
+  <p class="ep-desc">Rebuilds from scratch (~0.3s). Picks up new processor results and Zenodo manifest entries.</p>
 </div>
 
 

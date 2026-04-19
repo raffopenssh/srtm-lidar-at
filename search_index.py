@@ -718,7 +718,7 @@ class SearchIndex:
     # ════════════════════════════════════════════════════════════════
 
     def query_bbox(self, min_lon, min_lat, max_lon, max_lat,
-                   processed_only=False, limit=500):
+                   processed_only=False, limit=500, offset=0):
         """Find KGs intersecting a bounding box via R-tree."""
         c = self._conn()
         # R-tree query: find KGs whose bbox overlaps the query bbox
@@ -732,45 +732,62 @@ class SearchIndex:
         q += ' LIMIT ?'
         params.append(limit)
         # Faster approach: use R-tree directly then join
-        q2 = '''SELECT k.* FROM kg_rtree r
+        q2_base = '''FROM kg_rtree r
                 JOIN kg k ON k.rowid = r.id
                 WHERE r.max_lon >= ? AND r.min_lon <= ?
                   AND r.max_lat >= ? AND r.min_lat <= ?'''
         params2 = [min_lon, max_lon, min_lat, max_lat]
         if processed_only:
-            q2 += ' AND k.processed=1'
-        q2 += ' LIMIT ?'
-        params2.append(limit)
-        return [self._kg_summary(r) for r in c.execute(q2, params2)]
+            q2_base += ' AND k.processed=1'
+        total = c.execute(f'SELECT COUNT(*) {q2_base}', params2).fetchone()[0]
+        q2 = f'SELECT k.* {q2_base} LIMIT ? OFFSET ?'
+        params2.extend([limit, offset])
+        results = [self._kg_summary(r) for r in c.execute(q2, params2)]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
-    def query_point(self, lon, lat, radius_km=5):
+    def query_point(self, lon, lat, radius_km=5, limit=50, offset=0):
         """Find KGs containing or near a point."""
         # Approximate degree offset for radius
         dlat = radius_km / 111.0
         dlon = radius_km / (111.0 * max(0.5, __import__('math').cos(__import__('math').radians(lat))))
-        results = self.query_bbox(lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+        bbox_result = self.query_bbox(lon - dlon, lat - dlat, lon + dlon, lat + dlat,
+                                      limit=10000)  # fetch all within bbox for sorting
+        all_results = bbox_result.get('results', [])
         # Sort by distance to centroid
         import math
-        for r in results:
+        for r in all_results:
             cx = r.get('centroid_lon', 0) or 0
             cy = r.get('centroid_lat', 0) or 0
             r['_distance_km'] = round(math.sqrt(
                 ((lon - cx) * 111 * math.cos(math.radians(lat))) ** 2 +
                 ((lat - cy) * 111) ** 2
             ), 2)
-        results.sort(key=lambda r: r.get('_distance_km', 999))
-        return results
+        all_results.sort(key=lambda r: r.get('_distance_km', 999))
+        total = len(all_results)
+        results = all_results[offset:offset + limit]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     # ════════════════════════════════════════════════════════════════
     # Query: admin hierarchy
     # ════════════════════════════════════════════════════════════════
 
-    def query_admin(self, level, code=None, name=None, processed_only=False, limit=500):
+    def query_admin(self, level, code=None, name=None, processed_only=False,
+                    limit=500, offset=0):
         """Query by admin level: state/district/gemeinde/kg.
         code: exact match. name: FTS search."""
         c = self._conn()
         if name:
-            return self.query_text(name, limit=limit)
+            return self.query_text(name, limit=limit, offset=offset)
 
         col_map = {
             'state': ('state_code', 'state_name'),
@@ -782,42 +799,65 @@ class SearchIndex:
             'kg': ('kg_code', 'kg_name'),
         }
         if level not in col_map:
-            return []
+            return {'total': 0, 'offset': offset, 'limit': limit, 'results': []}
         code_col, name_col = col_map[level]
-        q = f'SELECT * FROM kg WHERE {code_col}=?'
+        q_base = f'FROM kg WHERE {code_col}=?'
         params = [code]
         if processed_only:
-            q += ' AND processed=1'
-        q += f' ORDER BY {name_col} LIMIT ?'
-        params.append(limit)
-        return [self._kg_summary(r) for r in c.execute(q, params)]
+            q_base += ' AND processed=1'
+        total = c.execute(f'SELECT COUNT(*) {q_base}', params).fetchone()[0]
+        q = f'SELECT * {q_base} ORDER BY {name_col} LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
+        results = [self._kg_summary(r) for r in c.execute(q, params)]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
-    def query_text(self, q, limit=20):
+    def query_text(self, q, limit=20, offset=0):
         """Full-text search across KG/gemeinde/district/state names."""
         c = self._conn()
         # Tokenize query for FTS prefix matching
         terms = q.strip().split()
         if not terms:
-            return []
+            return {'total': 0, 'offset': offset, 'limit': limit, 'results': []}
         fts_q = ' '.join(t + '*' for t in terms)
         try:
+            total = c.execute('''
+                SELECT COUNT(*) FROM fts_kg f
+                JOIN kg k ON k.kg_code = f.kg_code
+                WHERE fts_kg MATCH ?
+            ''', (fts_q,)).fetchone()[0]
             rows = c.execute('''
                 SELECT k.* FROM fts_kg f
                 JOIN kg k ON k.kg_code = f.kg_code
                 WHERE fts_kg MATCH ?
-                ORDER BY rank LIMIT ?
-            ''', (fts_q, limit)).fetchall()
-            return [self._kg_summary(r) for r in rows]
+                ORDER BY rank LIMIT ? OFFSET ?
+            ''', (fts_q, limit, offset)).fetchall()
+            results = [self._kg_summary(r) for r in rows]
         except Exception:
             # Fallback to LIKE
             like = f'%{q}%'
+            total = c.execute('''
+                SELECT COUNT(*) FROM kg
+                WHERE kg_name LIKE ? OR gemeinde_name LIKE ?
+                   OR district_name LIKE ? OR state_name LIKE ?
+            ''', (like, like, like, like)).fetchone()[0]
             rows = c.execute('''
                 SELECT * FROM kg
                 WHERE kg_name LIKE ? OR gemeinde_name LIKE ?
                    OR district_name LIKE ? OR state_name LIKE ?
-                LIMIT ?
-            ''', (like, like, like, like, limit)).fetchall()
-            return [self._kg_summary(r) for r in rows]
+                LIMIT ? OFFSET ?
+            ''', (like, like, like, like, limit, offset)).fetchall()
+            results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     # ════════════════════════════════════════════════════════════════
     # Query: aggregates
@@ -930,12 +970,17 @@ class SearchIndex:
     # Query: rankings and filters
     # ════════════════════════════════════════════════════════════════
 
-    def query_type_ranking(self, object_type, metric='area', limit=20):
+    def query_type_ranking(self, object_type, metric='area', limit=20, offset=0):
         """Rank KGs by a specific object type."""
         c = self._conn()
         order = {'area': 'lc.area_sqm', 'fraction': 'lc.fraction',
                  'count': 'lc.n_objects', 'height': 'lc.height_mean'}
         col = order.get(metric, 'lc.area_sqm')
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg_landcover lc
+            JOIN kg k ON k.kg_code = lc.kg_code
+            WHERE lc.object_type=?
+        ''', (object_type,)).fetchone()[0]
         rows = c.execute(f'''
             SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name, k.state_name,
                    lc.area_sqm, lc.fraction, lc.n_objects,
@@ -944,11 +989,18 @@ class SearchIndex:
             JOIN kg k ON k.kg_code = lc.kg_code
             WHERE lc.object_type=?
             ORDER BY {col} DESC
-            LIMIT ?
-        ''', (object_type, limit)).fetchall()
-        return [dict(r) for r in rows]
+            LIMIT ? OFFSET ?
+        ''', (object_type, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
-    def query_hansen_loss(self, year_from=None, year_to=None, min_loss=0, limit=50):
+    def query_hansen_loss(self, year_from=None, year_to=None, min_loss=0,
+                          limit=50, offset=0):
         """Find KGs with forest loss in a year range."""
         c = self._conn()
         where_parts = []
@@ -960,6 +1012,16 @@ class SearchIndex:
             where_parts.append('h.loss_year <= ?')
             params.append(year_to)
         where = ('WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+        total = c.execute(f'''
+            SELECT COUNT(*) FROM (
+                SELECT h.kg_code
+                FROM kg_hansen h
+                JOIN kg k ON k.kg_code = h.kg_code
+                {where}
+                GROUP BY h.kg_code
+                HAVING SUM(h.loss_pixels) >= ?
+            )
+        ''', params + [min_loss]).fetchone()[0]
         rows = c.execute(f'''
             SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.state_name,
                    SUM(h.loss_pixels) as total_loss
@@ -969,29 +1031,52 @@ class SearchIndex:
             GROUP BY h.kg_code
             HAVING total_loss >= ?
             ORDER BY total_loss DESC
-            LIMIT ?
-        ''', params + [min_loss, limit]).fetchall()
-        return [dict(r) for r in rows]
+            LIMIT ? OFFSET ?
+        ''', params + [min_loss, limit, offset]).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
-    def query_new_buildings(self, min_count=1, limit=50):
+    def query_new_buildings(self, min_count=1, limit=50, offset=0):
         """Find KGs with new (uncadastred) buildings."""
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND new_building_count >= ?
+        ''', (min_count,)).fetchone()[0]
         rows = c.execute('''
             SELECT kg_code, kg_name, gemeinde_name, district_name, state_name,
                    new_building_count, total_area_sqm, quality_score
             FROM kg WHERE processed=1 AND new_building_count >= ?
-            ORDER BY new_building_count DESC LIMIT ?
-        ''', (min_count, limit)).fetchall()
-        return [dict(r) for r in rows]
+            ORDER BY new_building_count DESC LIMIT ? OFFSET ?
+        ''', (min_count, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_processed(self, limit=500, offset=0):
         """List all processed KGs."""
         c = self._conn()
+        total = c.execute('SELECT COUNT(*) FROM kg WHERE processed=1').fetchone()[0]
         rows = c.execute('''
             SELECT * FROM kg WHERE processed=1
             ORDER BY kg_name LIMIT ? OFFSET ?
         ''', (limit, offset)).fetchall()
-        return [self._kg_summary(r) for r in rows]
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     # ════════════════════════════════════════════════════════════════
     # Query: classification divergence & confidence
@@ -1019,6 +1104,11 @@ class SearchIndex:
                 where_parts.append('d.final_type=?')
                 params.append(final_type)
             where = ' AND '.join(where_parts)
+            total = c.execute(f'''
+                SELECT COUNT(*) FROM kg_divergence d
+                JOIN kg k ON k.kg_code = d.kg_code
+                WHERE {where}
+            ''', params).fetchone()[0]
             rows = c.execute(f'''
                 SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
                        k.state_name, k.rf_diverged_pct, k.rf_diverged_count,
@@ -1030,20 +1120,35 @@ class SearchIndex:
                 ORDER BY d.count DESC
                 LIMIT ? OFFSET ?
             ''', params + [limit, offset]).fetchall()
-            return [dict(r) for r in rows]
+            results = [dict(r) for r in rows]
         else:
             # Query via kg table for overall divergence ranking
+            total = c.execute('''
+                SELECT COUNT(*) FROM kg
+                WHERE processed=1 AND rf_diverged_pct >= ?
+            ''', (min_pct,)).fetchone()[0]
             rows = c.execute('''
                 SELECT * FROM kg
                 WHERE processed=1 AND rf_diverged_pct >= ?
                 ORDER BY rf_diverged_pct DESC
                 LIMIT ? OFFSET ?
             ''', (min_pct, limit, offset)).fetchall()
-            return [self._kg_summary(r) for r in rows]
+            results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_low_confidence(self, max_confidence=0.5, limit=50, offset=0):
         """Find KGs with lowest mean classification confidence."""
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+                  AND mean_confidence <= ?
+        ''', (max_confidence,)).fetchone()[0]
         rows = c.execute('''
             SELECT * FROM kg
             WHERE processed=1 AND mean_confidence IS NOT NULL
@@ -1051,7 +1156,13 @@ class SearchIndex:
             ORDER BY mean_confidence ASC
             LIMIT ? OFFSET ?
         ''', (max_confidence, limit, offset)).fetchall()
-        return [self._kg_summary(r) for r in rows]
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_confidence_ranking(self, order='asc', limit=50, offset=0):
         """Rank KGs by classification confidence.
@@ -1060,6 +1171,10 @@ class SearchIndex:
             order: 'asc' for lowest first, 'desc' for highest first
         """
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+        ''').fetchone()[0]
         direction = 'ASC' if order == 'asc' else 'DESC'
         rows = c.execute(f'''
             SELECT * FROM kg
@@ -1067,11 +1182,22 @@ class SearchIndex:
             ORDER BY mean_confidence {direction}
             LIMIT ? OFFSET ?
         ''', (limit, offset)).fetchall()
-        return [self._kg_summary(r) for r in rows]
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
-    def query_type_confidence(self, object_type, limit=50):
+    def query_type_confidence(self, object_type, limit=50, offset=0):
         """Rank KGs by RF confidence for a specific object type."""
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+        ''', (object_type,)).fetchone()[0]
         rows = c.execute('''
             SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
                    k.state_name, cl.rf_mean_confidence, cl.rf_min_confidence,
@@ -1080,9 +1206,15 @@ class SearchIndex:
             JOIN kg k ON k.kg_code = cl.kg_code
             WHERE cl.object_type=?
             ORDER BY cl.rf_mean_confidence ASC
-            LIMIT ?
-        ''', (object_type, limit)).fetchall()
-        return [dict(r) for r in rows]
+            LIMIT ? OFFSET ?
+        ''', (object_type, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_high_confidence_type(self, object_type, min_confidence=0.7,
                                    min_area_sqm=0, limit=50, offset=0):
@@ -1091,6 +1223,14 @@ class SearchIndex:
         Returns KG summaries with the matching type's classification stats.
         """
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*)
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+              AND cl.rf_mean_confidence >= ?
+              AND cl.area_sqm >= ?
+        ''', (object_type, min_confidence, min_area_sqm)).fetchone()[0]
         rows = c.execute('''
             SELECT k.*, cl.rf_mean_confidence AS type_rf_confidence,
                    cl.rf_min_confidence AS type_rf_min_confidence,
@@ -1114,7 +1254,12 @@ class SearchIndex:
             d['type_diverged_count'] = r['type_diverged_count']
             d['type_area_sqm'] = r['type_area_sqm']
             results.append(d)
-        return results
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     def query_parcels_by_type_confidence(self, object_type, min_confidence=0.7,
                                          min_area_sqm=0, limit=100, offset=0):
@@ -1165,7 +1310,13 @@ class SearchIndex:
                         })
             except Exception as e:
                 log.warning('query_parcels_by_type_confidence %s: %s', kg_code, e)
-        return results[offset:offset + limit]
+        total = len(results)
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results[offset:offset + limit],
+        }
 
     def query_top_features(self, feature_type, object_type=None,
                            min_confidence=0.0, bbox=None,
@@ -1231,7 +1382,13 @@ class SearchIndex:
                 log.warning('query_top_features %s %s: %s', feature_type, kg_code, e)
         # Sort by height/area descending
         results.sort(key=lambda x: x.get(sort_key, 0) or 0, reverse=True)
-        return results[offset:offset + limit]
+        total = len(results)
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results[offset:offset + limit],
+        }
 
     def query_compound(self, filters, limit=50, offset=0):
         """Compound query: filter KGs by any combination of index columns,
@@ -1453,18 +1610,31 @@ class SearchIndex:
             'results': results,
         }
 
-    def query_divergence_pairs(self, limit=50):
+    def query_divergence_pairs(self, limit=50, offset=0):
         """Get the most common RF→final type divergence pairs across all KGs."""
         c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM (
+                SELECT rf_type, final_type
+                FROM kg_divergence
+                GROUP BY rf_type, final_type
+            )
+        ''').fetchone()[0]
         rows = c.execute('''
             SELECT rf_type, final_type, SUM(count) as total_count,
                    COUNT(DISTINCT kg_code) as n_kgs
             FROM kg_divergence
             GROUP BY rf_type, final_type
             ORDER BY total_count DESC
-            LIMIT ?
-        ''', (limit,)).fetchall()
-        return [dict(r) for r in rows]
+            LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
 
     # ════════════════════════════════════════════════════════════════
     # Lazy-load detail from light GPKG (Zenodo or local)

@@ -275,6 +275,9 @@ def _cleanup_old_results(max_age_s: int = 14400):
         for f in _PROGRESS_DIR.glob('*.json'):
             if f.stat().st_mtime < cutoff:
                 f.unlink(missing_ok=True)
+        for f in _QUERY_RESULTS_DIR.glob('*.json.gz'):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -1545,11 +1548,107 @@ def api_query_compound():
         body = request.get_json(force=True) or {}
         limit = min(int(body.pop('limit', 50)), 1000)
         offset = int(body.pop('offset', 0))
+        do_async = str(body.pop('async', '')).lower() in ('true', '1', 'yes')
+        # Poll existing task
+        if body.get('task_id'):
+            task_id = body['task_id']
+            p = _PROGRESS_DIR / f"{task_id}.json"
+            if not p.exists():
+                return jsonify({'error': 'Unknown task_id'}), 404
+            try:
+                info = json.loads(p.read_text())
+            except Exception:
+                return jsonify({'active': False})
+            step = info.get('step', '')
+            elapsed = round(time.time() - info.get('t0', time.time()), 1)
+            if step == 'done':
+                result = _get_query_result(task_id)
+                if result is not None:
+                    try: p.unlink(missing_ok=True)
+                    except Exception: pass
+                    return jsonify(result)
+                return jsonify({'active': False, 'done': True, 'elapsed': elapsed})
+            if step == 'error':
+                try: p.unlink(missing_ok=True)
+                except Exception: pass
+                return jsonify({'error': info.get('detail', 'Query failed')}), 500
+            return jsonify({'active': True, 'task_id': task_id, 'step': step,
+                            'detail': info.get('detail', ''), 'elapsed': elapsed}), 202
+        if do_async:
+            task_id = str(uuid.uuid4())
+            t = threading.Thread(target=_query_worker, daemon=True,
+                args=(task_id, idx.query_compound, (body,),
+                      dict(limit=limit, offset=offset)))
+            t.start()
+            return jsonify({'task_id': task_id, 'status': 'running',
+                            'poll': f'/api/v1/query/compound'}), 202
         result = idx.query_compound(body, limit=limit, offset=offset)
         return jsonify(result)
     except Exception as e:
         log.warning('api_query_compound: %s', e)
         return jsonify({'error': str(e)}), 500
+
+
+# === SECTION: Async query task support ===
+_QUERY_RESULTS_DIR = Path('/tmp/query_results')
+_QUERY_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _query_worker(task_id, query_fn, args, kwargs):
+    """Run a slow query in a background thread."""
+    try:
+        _progress_start(task_id)
+        _progress_set(task_id, 'running', f'Scanning KG JSONs...')
+        result = query_fn(*args, **kwargs)
+        p = _QUERY_RESULTS_DIR / f"{task_id}.json.gz"
+        data = json.dumps(result).encode()
+        with gzip.open(str(p), 'wb') as f:
+            f.write(data)
+        _progress_done(task_id)
+    except Exception as e:
+        log.exception('async query %s failed', task_id)
+        _progress_error(task_id, str(e))
+
+def _get_query_result(task_id):
+    """Retrieve stored query result."""
+    p = _QUERY_RESULTS_DIR / f"{task_id}.json.gz"
+    if not p.exists():
+        return None
+    with gzip.open(str(p), 'rb') as f:
+        return json.loads(f.read())
+
+@app.route('/api/v1/query/progress')
+def query_progress():
+    """Poll progress of an async query task."""
+    task_id = request.args.get('task_id', '')
+    if not task_id:
+        return jsonify({'error': 'task_id required'}), 400
+    p = _PROGRESS_DIR / f"{task_id}.json"
+    if not p.exists():
+        return jsonify({'error': 'Unknown task_id'}), 404
+    try:
+        info = json.loads(p.read_text())
+    except Exception:
+        return jsonify({'active': False})
+    step = info.get('step', '')
+    elapsed = round(time.time() - info.get('t0', time.time()), 1)
+    if step == 'done':
+        result = _get_query_result(task_id)
+        if result is not None:
+            # Clean up progress file
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return jsonify(result)
+        return jsonify({'active': False, 'done': True, 'elapsed': elapsed})
+    if step == 'error':
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return jsonify({'error': info.get('detail', 'Query failed')}), 500
+    return jsonify({'active': True, 'step': step, 'detail': info.get('detail', ''),
+                    'elapsed': elapsed}), 202
 
 
 @app.route('/api/v1/query')
@@ -1599,6 +1698,37 @@ def api_query():
         offset = int(args.get('offset', 0))
         processed_only = args.get('processed_only', '').lower() in ('true', '1', 'yes')
         do_aggregate = args.get('aggregate', '').lower() in ('true', '1', 'yes')
+        do_async = args.get('async', '').lower() in ('true', '1', 'yes')
+
+        # Poll existing async query task
+        if args.get('task_id') and not args.get('q') and not args.get('kg'):
+            task_id = args['task_id']
+            p = _PROGRESS_DIR / f"{task_id}.json"
+            if not p.exists():
+                return jsonify({'error': 'Unknown task_id'}), 404
+            try:
+                info = json.loads(p.read_text())
+            except Exception:
+                return jsonify({'active': False})
+            step = info.get('step', '')
+            elapsed = round(time.time() - info.get('t0', time.time()), 1)
+            if step == 'done':
+                result = _get_query_result(task_id)
+                if result is not None:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return jsonify(result)
+                return jsonify({'active': False, 'done': True, 'elapsed': elapsed})
+            if step == 'error':
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return jsonify({'error': info.get('detail', 'Query failed')}), 500
+            return jsonify({'active': True, 'task_id': task_id, 'step': step,
+                            'detail': info.get('detail', ''), 'elapsed': elapsed}), 202
 
         # Single KG lookup
         if args.get('kg'):
@@ -1611,18 +1741,18 @@ def api_query():
             return jsonify(result) if result else (jsonify({'error': 'Parcel not found'}), 404)
 
         # Aggregate queries
-        if do_aggregate or args.get('state') and not args.get('q'):
+        # Aggregate queries (only when aggregate=true)
+        if do_aggregate:
             if args.get('state'):
                 return jsonify(idx.aggregate_state(args['state']))
             if args.get('district'):
                 return jsonify(idx.aggregate_district(args['district']))
             if args.get('gemeinde'):
                 return jsonify(idx.aggregate_gemeinde(args['gemeinde']))
-            if do_aggregate:
-                return jsonify(idx.aggregate_country())
+            return jsonify(idx.aggregate_country())
 
         # Admin hierarchy — list KGs in a state/district/gemeinde
-        if args.get('state') and not do_aggregate:
+        if args.get('state'):
             sc = args['state']
             # Accept name or code
             if not sc.isdigit():
@@ -1630,18 +1760,18 @@ def api_query():
                     if name.lower() == sc.lower():
                         sc = code
                         break
-            return jsonify(idx.query_admin('state', sc, processed_only=processed_only, limit=limit))
+            return jsonify(idx.query_admin('state', sc, processed_only=processed_only, limit=limit, offset=offset))
         if args.get('district'):
             return jsonify(idx.query_admin('district', args['district'],
-                                           processed_only=processed_only, limit=limit))
+                                           processed_only=processed_only, limit=limit, offset=offset))
         if args.get('gemeinde'):
             return jsonify(idx.query_admin('gemeinde', args['gemeinde'],
-                                           processed_only=processed_only, limit=limit))
+                                           processed_only=processed_only, limit=limit, offset=offset))
 
         # Object type ranking
         if args.get('type'):
             metric = args.get('metric', 'area')
-            return jsonify(idx.query_type_ranking(args['type'], metric=metric, limit=limit))
+            return jsonify(idx.query_type_ranking(args['type'], metric=metric, limit=limit, offset=offset))
 
         # Hansen forest loss
         if args.get('hansen', '').lower() in ('true', '1', 'yes'):
@@ -1649,12 +1779,12 @@ def api_query():
             yt = int(args['year_to']) if args.get('year_to') else None
             ml = int(args.get('min_loss', 0))
             return jsonify(idx.query_hansen_loss(year_from=yf, year_to=yt,
-                                                 min_loss=ml, limit=limit))
+                                                 min_loss=ml, limit=limit, offset=offset))
 
         # New buildings
         if args.get('new_buildings', '').lower() in ('true', '1', 'yes'):
             mc = int(args.get('min_count', 1))
-            return jsonify(idx.query_new_buildings(min_count=mc, limit=limit))
+            return jsonify(idx.query_new_buildings(min_count=mc, limit=limit, offset=offset))
 
         # Classification divergence
         if args.get('divergence', '').lower() in ('true', '1', 'yes'):
@@ -1667,7 +1797,7 @@ def api_query():
 
         # Divergence pairs (most common RF→final mismatches across all KGs)
         if args.get('divergence_pairs', '').lower() in ('true', '1', 'yes'):
-            return jsonify(idx.query_divergence_pairs(limit=limit))
+            return jsonify(idx.query_divergence_pairs(limit=limit, offset=offset))
 
         # Low confidence KGs
         if args.get('low_confidence', '').lower() in ('true', '1', 'yes'):
@@ -1684,7 +1814,7 @@ def api_query():
         # Per-type RF confidence ranking
         if args.get('type_confidence'):
             return jsonify(idx.query_type_confidence(
-                args['type_confidence'], limit=limit))
+                args['type_confidence'], limit=limit, offset=offset))
 
         # High-confidence type filter (KG-level)
         # e.g. ?high_confidence_type=tree&min_confidence=0.8&min_area_sqm=1500
@@ -1695,16 +1825,26 @@ def api_query():
                 args['high_confidence_type'], min_confidence=mc,
                 min_area_sqm=ma, limit=limit, offset=offset))
 
-        # Per-parcel type+confidence filter (scans KG JSONs)
+        # Per-parcel type+confidence filter (scans KG JSONs — supports async)
         # e.g. ?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500
         if args.get('parcels_by_type'):
             mc = float(args.get('min_confidence', 0.7))
             ma = float(args.get('min_area_sqm', 0))
+            if do_async:
+                task_id = args.get('task_id') or str(uuid.uuid4())
+                t = threading.Thread(target=_query_worker, daemon=True,
+                    args=(task_id, idx.query_parcels_by_type_confidence,
+                          (args['parcels_by_type'],),
+                          dict(min_confidence=mc, min_area_sqm=ma,
+                               limit=limit, offset=offset)))
+                t.start()
+                return jsonify({'task_id': task_id, 'status': 'running',
+                                'poll': f'/api/v1/query?task_id={task_id}'}), 202
             return jsonify(idx.query_parcels_by_type_confidence(
                 args['parcels_by_type'], min_confidence=mc,
                 min_area_sqm=ma, limit=limit, offset=offset))
 
-        # Cross-KG top features (trees/objects/new_buildings/infrastructure)
+        # Cross-KG top features (trees/objects/new_buildings/infrastructure — supports async)
         # e.g. ?top_features=trees&min_confidence=0.9
         # e.g. ?top_features=new_buildings&min_confidence=0.75
         # e.g. ?top_features=infrastructure&type=mast&min_confidence=0.8
@@ -1716,6 +1856,16 @@ def api_query():
                 bp = [float(x) for x in args['bbox'].split(',')]
                 if len(bp) == 4:
                     tf_bbox = tuple(bp)
+            if do_async:
+                task_id = args.get('task_id') or str(uuid.uuid4())
+                t = threading.Thread(target=_query_worker, daemon=True,
+                    args=(task_id, idx.query_top_features,
+                          (args['top_features'],),
+                          dict(object_type=otype, min_confidence=mc,
+                               bbox=tf_bbox, limit=limit, offset=offset)))
+                t.start()
+                return jsonify({'task_id': task_id, 'status': 'running',
+                                'poll': f'/api/v1/query?task_id={task_id}'}), 202
             return jsonify(idx.query_top_features(
                 args['top_features'], object_type=otype,
                 min_confidence=mc, bbox=tf_bbox,
@@ -1725,7 +1875,7 @@ def api_query():
         if args.get('bbox'):
             parts = [float(x) for x in args['bbox'].split(',')]
             if len(parts) == 4:
-                return jsonify(idx.query_bbox(*parts, processed_only=processed_only, limit=limit))
+                return jsonify(idx.query_bbox(*parts, processed_only=processed_only, limit=limit, offset=offset))
             return jsonify({'error': 'bbox must be w,s,e,n'}), 400
 
         # Point proximity
@@ -1733,12 +1883,12 @@ def api_query():
             parts = [float(x) for x in args['point'].split(',')]
             if len(parts) == 2:
                 radius = float(args.get('radius', 5))
-                return jsonify(idx.query_point(parts[0], parts[1], radius_km=radius))
+                return jsonify(idx.query_point(parts[0], parts[1], radius_km=radius, limit=limit, offset=offset))
             return jsonify({'error': 'point must be lon,lat'}), 400
 
         # Full-text search
         if args.get('q'):
-            return jsonify(idx.query_text(args['q'], limit=limit))
+            return jsonify(idx.query_text(args['q'], limit=limit, offset=offset))
 
         # Default: list processed KGs
         return jsonify(idx.query_processed(limit=limit, offset=offset))

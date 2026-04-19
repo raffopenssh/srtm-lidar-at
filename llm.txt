@@ -203,6 +203,23 @@ Rebuild search index from scratch (~0.3s).
 #### GET /api/v1/query ← UNIFIED QUERY ENDPOINT
 Supports multiple query modes via query params. All return JSON.
 
+Pagination: All list-returning query modes return a paginated envelope:
+  {"total": <int>, "offset": <int>, "limit": <int>, "results": [...]}
+  Use limit= and offset= params to paginate. Default limit=100, max 1000.
+  "total" is the full count of matching records (before limit/offset).
+  Single-item lookups (kg=, parcel=) return the item directly (no envelope).
+  Aggregate queries (aggregate=true) return the aggregate object directly.
+
+Async support: Slow queries (parcels_by_type, top_features) support async=true.
+  1. GET /api/v1/query?parcels_by_type=tree&min_confidence=0.8&async=true
+     → 202 {task_id, status: "running", poll: "/api/v1/query?task_id=..."}
+  2. GET /api/v1/query?task_id=<TASK_ID>
+     → 202 {active, task_id, step, detail, elapsed} while running
+     → 200 {total, offset, limit, results} when done
+     → 500 {error} on failure
+  Also available: GET /api/v1/query/progress?task_id=<TASK_ID>
+  Async results auto-cleaned after 4 hours.
+
 Speed tiers:
   FAST (<25ms)   Index queries: bbox, admin, type ranking, confidence, divergence, compound
   MEDIUM (~1s)   JSON scan (pre-filtered): parcels_by_type, top_features, parcel lookup
@@ -233,20 +250,27 @@ Query modes (pick one):
   confidence_rank=asc|desc  Rank KGs by classification confidence
   type_confidence=<type>  Rank KGs by RF confidence for a specific object type
   high_confidence_type=<type>  KGs where type has RF confidence >= min_confidence AND area >= min_area_sqm
-  parcels_by_type=<type>  Per-parcel filter: parcels where type has RF confidence >= min_confidence AND area >= min_area_sqm (scans KG JSONs)
-  top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG features filtered by min_confidence, optionally type=<object_type>, bbox=<w,s,e,n>
+  parcels_by_type=<type>  Per-parcel filter (async-capable): parcels where type has RF confidence >= min_confidence AND area >= min_area_sqm (scans KG JSONs)
+  top_features=<trees|objects|new_buildings|infrastructure>  Cross-KG features (async-capable): filtered by min_confidence, optionally type=<object_type>, bbox=<w,s,e,n>
   min_confidence=<float>  Min RF confidence threshold (used with high_confidence_type, parcels_by_type, top_features)
   min_area_sqm=<float>    Min area m² for type (used with high_confidence_type, parcels_by_type)
+  task_id=<UUID>          Poll an async query task (returns result when done, 202 while running)
 
 Modifiers:
   aggregate=true          Return aggregate stats instead of KG list
   processed_only=true     Only processed KGs
+  async=true              Run slow queries asynchronously (parcels_by_type, top_features)
   limit=N                 Max results (default 100, max 1000)
-  offset=N                Pagination offset
+  offset=N                Pagination offset (default 0)
   radius=N                Radius in km for point query (default 5)
   metric=<area|fraction|count|height>  For type= ranking
   year_from=YYYY          Start year for hansen filter
   year_to=YYYY            End year for hansen filter
+
+Response for list queries (paginated envelope):
+  {"total": 1234, "offset": 0, "limit": 100,
+   "results": [{kg_code, kg_name, ...}, ...]}
+  Iterate pages: offset=0, offset=100, offset=200, ... until offset >= total.
 
 Response for single KG (kg= or query_kg):
   {kg_code, kg_name, gemeinde_name, district_name, state_name,
@@ -308,6 +332,8 @@ Response for aggregate (state/district/gemeinde/country):
 
 #### POST /api/v1/query/compound ← COMPOUND FILTER
 Filter KGs by any combination of attributes. POST JSON body.
+Returns paginated: {total, offset, limit, results}.
+Supports async: add "async": true to body. Poll with {"task_id": "..."} in body.
 
 Filter keys (all optional):
   bbox: [w,s,e,n]                       spatial filter
@@ -326,13 +352,25 @@ Filter keys (all optional):
     Landcover area/fraction/height per type (joins kg_landcover)
   sort: str (column name), sort_dir: "asc"|"desc"
   limit: int (default 50, max 1000), offset: int
+  async: true              Run query asynchronously (returns task_id to poll)
+  task_id: str             Poll an async compound query
 
 All filters are fast (pure SQL on indexed columns). Returns {total, offset, limit, results}.
+
+Async flow:
+  1. POST {"min_elevation": 1500, "async": true} → 202 {task_id, status, poll}
+  2. POST {"task_id": "..."} → 202 while running, 200 with result when done
 
 Example: tree conf>0.8 area>800 + grass conf>0.8 area>1300 + no buildings + SW aspect + rugged:
   POST {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},
     {"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],
     "max_buildings":0, "aspect":["S","SW","W"], "min_roughness":2.0}
+
+#### GET /api/v1/query/progress?task_id=<UUID>
+Poll an async query task. Returns result directly when done.
+  202 {active, step, detail, elapsed} while running
+  200 {total, offset, limit, results} when complete (result delivered inline)
+  500 {error} on failure
 
 #### GET /api/v1/kg/<kg_code>
 Full KG JSON summary if processed locally, else index data with Zenodo links.
@@ -561,16 +599,18 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80'
 # Direct GPKG download from share
 curl -o analysis.gpkg 'https://srtm-lidar-at.exe.xyz:8000/api/v1/share/Kohlschwarz80/download.gpkg'
 
-# --- Search Index queries ---
+# --- Search Index queries (all list responses are paginated: {total, offset, limit, results}) ---
 # Index status
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/index/status'
 
-# Text search (fuzzy, supports KG/gemeinde/district/state names)
+# Text search with pagination
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Gaissau'
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien'
+# → {"total": 3, "offset": 0, "limit": 100, "results": [...]}
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien&limit=10&offset=0'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?q=Wien&limit=10&offset=10'  # page 2
 
-# Spatial queries
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=15.0,47.0,16.0,48.0'
+# Spatial queries (paginated)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?bbox=15.0,47.0,16.0,48.0&limit=50&offset=0'
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?point=9.59,47.48&radius=5'
 
 # Admin hierarchy
@@ -669,4 +709,38 @@ curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
 curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
   -H 'Content-Type: application/json' \
   -d '{"min_dtm_change":0.5,"max_diverged_pct":5,"sort":"temporal_stability","sort_dir":"asc"}'
+
+# --- Pagination examples ---
+# Page through all KGs in Vorarlberg (25 per page)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=0'
+# → {"total": 112, "offset": 0, "limit": 25, "results": [...]}
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=25'  # page 2
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?state=Vorarlberg&limit=25&offset=50'  # page 3
+
+# Compound query with pagination
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_elevation":1000,"limit":20,"offset":40}'
+# → {"total": 847, "offset": 40, "limit": 20, "results": [...]}
+
+# --- Async query examples (for slow JSON-scanning queries) ---
+# Start async top_features query
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true'
+# → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}
+
+# Poll until done (returns 202 while running, 200 with result when complete)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?task_id=abc-123'
+# → 202 {"active": true, "task_id": "abc-123", "step": "running", "elapsed": 3.2}
+# ... eventually ...
+# → 200 {"total": 456, "offset": 0, "limit": 100, "results": [...]}
+
+# Async parcels_by_type
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500&async=true'
+
+# Async compound query
+curl -X POST 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound' \
+  -H 'Content-Type: application/json' \
+  -d '{"min_elevation":1500,"async":true}'
+# → 202 {"task_id": "...", "status": "running", "poll": "/api/v1/query/compound"}
+# Poll: POST {"task_id": "..."} to the same endpoint
 ```

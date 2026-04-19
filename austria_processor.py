@@ -1488,6 +1488,8 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             ('height_std_m', 'float'),
             # Surface
             ('slope_mean_deg', 'float'),
+            ('aspect_mean_deg', 'float'),
+            ('aspect_dominant', 'str'),
             ('roughness', 'float'),
             ('dsm_edge_strength', 'float'),
             # Spectral
@@ -1561,6 +1563,8 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
                     'height_p90_m': round(obj.height_p90, 2),
                     'height_std_m': round(obj.height_std, 2),
                     'slope_mean_deg': round(obj.slope_mean, 1),
+                    'aspect_mean_deg': round(obj.aspect_mean, 1),
+                    'aspect_dominant': obj.aspect_dominant or 'flat',
                     'roughness': round(obj.roughness, 3),
                     'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
                     'ndvi_mean': round(obj.ndvi_mean, 4),
@@ -1636,6 +1640,8 @@ def _write_segment_points(gpkg_path: str, objects: list,
             ('height_std_m', 'float'),
             # Surface
             ('slope_mean_deg', 'float'),
+            ('aspect_mean_deg', 'float'),
+            ('aspect_dominant', 'str'),
             ('roughness', 'float'),
             ('dsm_edge_strength', 'float'),
             # Spectral
@@ -1708,6 +1714,8 @@ def _write_segment_points(gpkg_path: str, objects: list,
                     'height_p90_m': round(obj.height_p90, 2),
                     'height_std_m': round(obj.height_std, 2),
                     'slope_mean_deg': round(obj.slope_mean, 1),
+                    'aspect_mean_deg': round(obj.aspect_mean, 1),
+                    'aspect_dominant': obj.aspect_dominant or 'flat',
                     'roughness': round(obj.roughness, 3),
                     'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
                     'ndvi_mean': round(obj.ndvi_mean, 4),
@@ -3460,15 +3468,18 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     # --- Parcels (enriched from tiles) ---
     parcels = cadastre_data["parcels"]
     if parcels:
+        from terrain_analysis import compute_slope, compute_aspect
         schema_p = {'geometry': 'MultiPolygon', 'properties': [
             ('parcel_id', 'str'), ('area_sqm', 'float'),
-            ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float')]}
+            ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('slope_mean_deg', 'float'), ('aspect_mean_deg', 'float'), ('aspect_dominant', 'str')]}
         with fiona.open(out_path, 'w', driver='GPKG', layer='parcels',
                         schema=schema_p, crs=from_epsg(4326)) as dst:
             for p in parcels:
                 geom_wgs = p["geometry_wgs"]
                 props = {"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
-                         "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None}
+                         "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None,
+                         "slope_mean_deg": None, "aspect_mean_deg": None, "aspect_dominant": None}
                 try:
                     c3 = p["geometry"].centroid
                     c_wgs = transform_to_wgs(c3)
@@ -3483,6 +3494,34 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                         if 0 <= row < dh and 0 <= col < dw:
                             val = float(tdata["dtm"][row, col])
                             if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
+                        # Compute slope + aspect over parcel footprint
+                        try:
+                            from rasterio.features import geometry_mask as _gm
+                            pmask = _gm([mapping(p["geometry"])], out_shape=(dh, dw),
+                                        transform=tf, invert=True)
+                            dtm_arr = tdata["dtm"]
+                            pv = pmask & np.isfinite(dtm_arr)
+                            if np.sum(pv) > 4:
+                                slope_full = compute_slope(dtm_arr)
+                                aspect_full = compute_aspect(dtm_arr)
+                                sl_vals = slope_full[pv]
+                                asp_vals = aspect_full[pv]
+                                props["slope_mean_deg"] = round(float(np.nanmean(sl_vals)), 1)
+                                asp_nf = asp_vals[asp_vals >= 0]
+                                if len(asp_nf) > 0:
+                                    rad = np.radians(asp_nf)
+                                    mean_asp = float(np.degrees(np.arctan2(
+                                        np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
+                                    props["aspect_mean_deg"] = round(mean_asp, 1)
+                                    _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
+                                             ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
+                                    props["aspect_dominant"] = next(
+                                        (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
+                                else:
+                                    props["aspect_mean_deg"] = -1.0
+                                    props["aspect_dominant"] = "flat"
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
@@ -4206,6 +4245,33 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
                         v = patch[np.isfinite(patch)]
                         if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
+                # Slope + aspect over parcel footprint
+                try:
+                    from terrain_analysis import compute_slope, compute_aspect
+                    from rasterio.features import geometry_mask as _gm_json
+                    pmask = _gm_json([mapping(geom_3035)], out_shape=(dh, dw),
+                                     transform=tf, invert=True)
+                    pv = pmask & np.isfinite(dtm)
+                    if np.sum(pv) > 4:
+                        slope_f = compute_slope(dtm)
+                        aspect_f = compute_aspect(dtm)
+                        pd["slope_mean_deg"] = round(float(np.nanmean(slope_f[pv])), 1)
+                        asp_nf = aspect_f[pv]
+                        asp_nf = asp_nf[asp_nf >= 0]
+                        if len(asp_nf) > 0:
+                            rad = np.radians(asp_nf)
+                            mean_asp = float(np.degrees(np.arctan2(
+                                np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
+                            pd["aspect_mean_deg"] = round(mean_asp, 1)
+                            _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
+                                     ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
+                            pd["aspect_dominant"] = next(
+                                (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
+                        else:
+                            pd["aspect_mean_deg"] = -1.0
+                            pd["aspect_dominant"] = "flat"
+                except Exception:
+                    pass
                 # Segment analysis (happy path)
                 if tr.get("labels") is not None and objects:
                     pss = _parcel_segment_stats(geom_3035, tr["labels"], tdata["ndsm"],

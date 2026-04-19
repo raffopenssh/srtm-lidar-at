@@ -166,7 +166,9 @@ class SegmentedObject:
     height_std: float
     # Surface
     slope_mean: float
-    roughness: float  # DSM local std within segment
+    aspect_mean: float = -1.0  # aspect in degrees (0=N, 90=E, 180=S, 270=W), -1=flat
+    aspect_dominant: str = "flat"  # 8-point compass: N/NE/E/SE/S/SW/W/NW/flat
+    roughness: float = 0.0  # DSM local std within segment
     # Spectral (from ortho or Sentinel-2)
     ndvi_mean: float = 0.0
     ndvi_std: float = 0.0
@@ -224,6 +226,28 @@ def _slope(arr: np.ndarray, res: float = 1.0) -> np.ndarray:
     """Slope in degrees."""
     dy, dx = np.gradient(arr, res)
     return np.degrees(np.arctan(np.sqrt(dx**2 + dy**2))).astype(np.float32)
+
+
+def _aspect(arr: np.ndarray, res: float = 1.0) -> np.ndarray:
+    """Aspect in degrees (0=N, 90=E, 180=S, 270=W). -1 for flat."""
+    dy, dx = np.gradient(arr, res)
+    asp = np.degrees(np.arctan2(-dx, dy))
+    asp = np.where(asp < 0, asp + 360, asp)
+    flat = (np.abs(dx) < 1e-6) & (np.abs(dy) < 1e-6)
+    asp[flat] = -1
+    return asp.astype(np.float32)
+
+
+def _aspect_direction(deg: float) -> str:
+    """Convert aspect degrees to 8-point compass direction."""
+    if deg < 0:
+        return "flat"
+    dirs = [("N", 0, 45), ("NE", 45, 90), ("E", 90, 135), ("SE", 135, 180),
+            ("S", 180, 225), ("SW", 225, 270), ("W", 270, 315), ("NW", 315, 360)]
+    for name, lo, hi in dirs:
+        if lo <= deg < hi:
+            return name
+    return "N"  # 360 wraps to N
 
 
 # ===================================================================
@@ -447,6 +471,7 @@ def extract_object_features(
     _hansen_3yr_end   = min(_obs_year - 2000, 24)          # e.g. 2024→24
     h, w = dtm.shape
     slope_arr = _slope(dtm)
+    aspect_arr = _aspect(dtm)
     dsm_rough = _local_std(dsm, 3)
     dtm_rough = _local_std(dtm, 3)
 
@@ -562,6 +587,20 @@ def extract_object_features(
         f["slope_mean"] = float(np.nanmean(ss))
         f["slope_max"] = float(np.nanmax(ss))
         f["slope_std"] = float(np.nanstd(ss))
+
+        # Aspect (circular mean of non-flat pixels)
+        asp_seg = aspect_arr[seg_v]
+        asp_valid = asp_seg[asp_seg >= 0]  # exclude flat pixels
+        if len(asp_valid) > 0:
+            rad = np.radians(asp_valid)
+            mean_sin = float(np.mean(np.sin(rad)))
+            mean_cos = float(np.mean(np.cos(rad)))
+            mean_asp = np.degrees(np.arctan2(mean_sin, mean_cos)) % 360
+            f["aspect_mean"] = round(mean_asp, 1)
+            f["aspect_dominant"] = _aspect_direction(mean_asp)
+        else:
+            f["aspect_mean"] = -1.0
+            f["aspect_dominant"] = "flat"
 
         # Roughness
         f["dsm_roughness"] = float(np.nanmean(dsm_rough[seg_v]))
@@ -2017,6 +2056,8 @@ def segment_and_classify(
             height_p90=round(feat["h_p90"], 2),
             height_std=round(feat["h_std"], 2),
             slope_mean=round(feat["slope_mean"], 1),
+            aspect_mean=round(feat.get("aspect_mean", -1), 1),
+            aspect_dominant=feat.get("aspect_dominant", "flat"),
             roughness=round(feat["dsm_roughness"], 3),
             ndvi_mean=round(feat.get("ndvi_mean", 0), 4),
             ndvi_std=round(feat.get("ndvi_std", 0), 4),

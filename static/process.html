@@ -639,6 +639,7 @@ function updateCards(d) {
   document.getElementById('cRateDet').innerHTML = rdet || '—';
 
   // System
+  let zc = {};
   const hasRam = sys.ram_used_mb || sys.ram_total_mb || sys.cpu_pct != null;
   if (hasRam) {
     const procRam = sys.proc_ram_mb ? sys.proc_ram_mb + 'MB' : '—';
@@ -659,14 +660,9 @@ function updateCards(d) {
     if (hanTc.files) tcParts.push('Han ' + hanTc.files + ' tiles/' + (hanTc.size_mb||0) + 'MB');
     if (sys.json_cache_files) tcParts.push('JSON ' + sys.json_cache_files + '/' + (sys.json_cache_mb||0) + 'MB');
     if (sys.gpkg_temp_files) tcParts.push('Temp ' + sys.gpkg_temp_files + '/' + (sys.gpkg_temp_mb||0) + 'MB');
-    // Zenodo cache
-    const zc = sys.zenodo_cache || {};
-    const zcLc = zc.local_copernicus || {};
-    const zcLocalCop = (zcLc.ndvi||0) + (zcLc.sar||0) + (zcLc.worldcover||0) + (zcLc.harmonics||0);
-    const zcLocalHan = zc.local_hansen || 0;
-    if (zc.depo_id) {
-      tcParts.push('\u2601 ' + fmt(zc.zenodo_tiles) + ' Zenodo');
-    }
+    // Zenodo tile cache
+    zc = sys.zenodo_cache || {};
+    if (zc.zenodo_tiles) tcParts.push('Zen ' + fmt(zc.zenodo_tiles) + ' tiles/' + fmt(zc.zenodo_files||0) + ' ZIPs');
     if (tcParts.length) sd += '\n' + tcParts.join(' \u00b7 ');
     // Circuit breaker
     if (sys.copernicus_circuit === 'open') sd += '\n⚡ Copernicus circuit OPEN';
@@ -686,7 +682,9 @@ function updateCards(d) {
   const mc = mf.count || d.uploaded || 0;
   const ms = mf.total_size_bytes || d.upload_size_bytes || 0;
   document.getElementById('cZenVal').textContent = mc + ' uploaded';
-  document.getElementById('cZenDet').innerHTML = fmtB(ms) + ' total';
+  let zenDet = fmtB(ms) + ' total';
+  if (zc.zenodo_tiles) zenDet += '<br>Cache: ' + fmt(zc.zenodo_tiles) + ' tiles in ' + fmt(zc.zenodo_files||0) + '/35 ZIPs';
+  document.getElementById('cZenDet').innerHTML = zenDet;
 
 }
 

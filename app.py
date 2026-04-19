@@ -838,6 +838,12 @@ def processing_status():
                 data['system']['tile_caches'] = cache_summary()
             except Exception:
                 pass
+            # Zenodo persistent cache
+            try:
+                from zenodo_cache import ZenodoCache
+                data['system']['zenodo_cache'] = ZenodoCache().status()
+            except Exception:
+                pass
             # Manifest summary
             mf = _pl.Path('data/austria_processor/zenodo_manifest.json')
             if mf.exists():

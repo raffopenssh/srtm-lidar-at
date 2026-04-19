@@ -3484,6 +3484,15 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         except Exception:
             pass
 
+    # --- Pre-compute terrain arrays per tile (once, not per-parcel) ---
+    from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
+    for ti_idx, tdata in _gpkg_tile_data.items():
+        dtm_arr = tdata["dtm"]
+        tdata["slope"] = compute_slope(dtm_arr)
+        tdata["aspect"] = compute_aspect(dtm_arr)
+        tdata["tri"] = compute_tri(dtm_arr)
+        tdata["tpi"] = compute_tpi(dtm_arr, radius=5)
+
     def _gpkg_find_tile(e3035, n3035):
         for ti_idx, tr in enumerate(tile_seg_results):
             left, bottom, right, top = tr["bounds_3035"]
@@ -3496,7 +3505,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     # --- Parcels (enriched from tiles) ---
     parcels = cadastre_data["parcels"]
     if parcels:
-        from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
         schema_p = {'geometry': 'MultiPolygon', 'properties': [
             ('parcel_id', 'str'), ('area_sqm', 'float'),
             ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
@@ -3529,7 +3537,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                         if 0 <= row < dh and 0 <= col < dw:
                             val = float(dtm_arr[row, col])
                             if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
-                        # Full terrain over parcel footprint
+                        # Full terrain over parcel footprint (uses pre-computed terrain arrays)
                         try:
                             from rasterio.features import geometry_mask as _gm
                             pmask = _gm([mapping(p["geometry"])], out_shape=(dh, dw),
@@ -3542,14 +3550,10 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                                 props["elevation_min_m"] = round(e_min, 2)
                                 props["elevation_max_m"] = round(e_max, 2)
                                 props["elevation_range_m"] = round(e_max - e_min, 2)
-                                slope_full = compute_slope(dtm_arr)
-                                aspect_full = compute_aspect(dtm_arr)
-                                tri_full = compute_tri(dtm_arr)
-                                tpi_full = compute_tpi(dtm_arr, radius=5)
-                                props["slope_mean_deg"] = round(float(np.nanmean(slope_full[pv])), 1)
-                                tri_val = float(np.nanmean(tri_full[pv]))
+                                props["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
+                                tri_val = float(np.nanmean(tdata["tri"][pv]))
                                 props["tri_mean"] = round(tri_val, 3)
-                                tpi_v = tpi_full[pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                                tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
                                 if len(tpi_v) > 0:
                                     props["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
                                 # Terrain class from TRI
@@ -3561,7 +3565,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                                 elif tri_val < 6.0: props["terrain_class"] = "highly_rugged"
                                 else: props["terrain_class"] = "extremely_rugged"
                                 # Aspect (circular mean)
-                                asp_vals = aspect_full[pv]
+                                asp_vals = tdata["aspect"][pv]
                                 asp_nf = asp_vals[asp_vals >= 0]
                                 if len(asp_nf) > 0:
                                     rad = np.radians(asp_nf)
@@ -4308,6 +4312,16 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             log.warning("JSON: failed to pre-load DTM for tile %d: %s", ti_idx, e)
     log.info("JSON: pre-loaded DTM for %d/%d tiles", len(_tile_data_cache), len(tile_seg_results))
 
+    # --- Pre-compute terrain arrays per tile (once, not per-parcel) ---
+    from terrain_analysis import compute_slope as _js_slope, compute_aspect as _js_aspect, \
+        compute_tri as _js_tri, compute_tpi as _js_tpi
+    for ti_idx, tdata in _tile_data_cache.items():
+        dtm_arr = tdata["dtm"]
+        tdata["slope"] = _js_slope(dtm_arr)
+        tdata["aspect"] = _js_aspect(dtm_arr)
+        tdata["tri"] = _js_tri(dtm_arr)
+        tdata["tpi"] = _js_tpi(dtm_arr, radius=5)
+
     def _find_tile_with_data(e3035, n3035):
         """Find tile containing point AND return its cached tdata."""
         for ti_idx, tr in enumerate(tile_seg_results):
@@ -4366,9 +4380,8 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
                         v = patch[np.isfinite(patch)]
                         if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
-                # Full terrain over parcel footprint
+                # Full terrain over parcel footprint (uses pre-computed terrain arrays)
                 try:
-                    from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
                     from rasterio.features import geometry_mask as _gm_json
                     pmask = _gm_json([mapping(geom_3035)], out_shape=(dh, dw),
                                      transform=tf, invert=True)
@@ -4380,14 +4393,10 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         pd["elevation_min_m"] = round(e_min, 2)
                         pd["elevation_max_m"] = round(e_max, 2)
                         pd["elevation_range_m"] = round(e_max - e_min, 2)
-                        slope_f = compute_slope(dtm)
-                        aspect_f = compute_aspect(dtm)
-                        tri_f = compute_tri(dtm)
-                        tpi_f = compute_tpi(dtm, radius=5)
-                        pd["slope_mean_deg"] = round(float(np.nanmean(slope_f[pv])), 1)
-                        tri_val = float(np.nanmean(tri_f[pv]))
+                        pd["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
+                        tri_val = float(np.nanmean(tdata["tri"][pv]))
                         pd["tri_mean"] = round(tri_val, 3)
-                        tpi_v = tpi_f[pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                        tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
                         if len(tpi_v) > 0:
                             pd["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
                         # Terrain class from TRI
@@ -4399,7 +4408,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         elif tri_val < 6.0: pd["terrain_class"] = "highly_rugged"
                         else: pd["terrain_class"] = "extremely_rugged"
                         # Aspect (circular mean)
-                        asp_nf = aspect_f[pv]
+                        asp_nf = tdata["aspect"][pv]
                         asp_nf = asp_nf[asp_nf >= 0]
                         if len(asp_nf) > 0:
                             rad = np.radians(asp_nf)

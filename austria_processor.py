@@ -4198,7 +4198,16 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
                    for t, items in ibt.items()}}
     # --- Helpers for per-parcel/building segment stats ---
-    obj_map = {o.obj_id: o for o in objects} if objects else {}
+    # Build obj_map from ALL per-tile objects (not just core) so labels match.
+    # Core-only all_objects miss overlap-zone objects whose IDs ARE in labels.
+    obj_map = {}
+    for tr_ in tile_seg_results:
+        for o in (tr_.get('objects') or []):
+            obj_map[o.obj_id] = o
+    # Also include core objects (in case tile objects list was pruned)
+    if objects:
+        for o in objects:
+            obj_map[o.obj_id] = o
 
     def _classification_stats_from_objs(seg_objs, type_area_sqm=None):
         """Compute classification dict from a list of segment objects.
@@ -4496,10 +4505,15 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 except Exception:
                     pass
                 # Segment analysis (happy path)
+                # Use tr's own ndsm/transform/shape (consistent with labels).
+                # tdata is a re-read that may differ by 1-2 pixels.
                 if tr.get("labels") is not None and objects:
-                    pss = _parcel_segment_stats(geom_3035, tr["labels"], tdata["ndsm"],
-                                                tdata["transform"], tdata["shape"])
-                    pd.update(pss)
+                    try:
+                        pss = _parcel_segment_stats(geom_3035, tr["labels"], tr["ndsm"],
+                                                    tr["transform"], tr["shape"])
+                        pd.update(pss)
+                    except Exception:
+                        pass  # STRtree fallback below
                 # STRtree fallback: if _parcel_segment_stats didn't produce area_summary
                 if 'area_summary' not in pd:
                     p_idx = _parcel_idx_by_id[id(p)]
@@ -4600,7 +4614,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     if cls:
                         pd['classification'] = cls
         except Exception as e:
-            log.debug("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
+            log.warning("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
     if n_parcel_no_tile > 0:
         log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",

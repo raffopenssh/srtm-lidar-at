@@ -259,8 +259,19 @@ class CopernicusTileCache:
     def _tile_path(self, prefix: str, w: float, s: float, e: float, n: float,
                    **extra) -> Path:
         key = tile_key(prefix, w, s, e, n, **extra)
-        # Record bbox for map overlay
-        _record_tile_bbox("copernicus", w, s, e, n, "cached")
+        # Record individual 0.1° cells for map overlay (not the full snapped bbox,
+        # which can span multiple cells and renders as oversized rectangles).
+        step = self.GRID_STEP
+        cx = w
+        while cx < e - 1e-9:
+            cy = s
+            while cy < n - 1e-9:
+                _record_tile_bbox("copernicus",
+                                  round(cx, 5), round(cy, 5),
+                                  round(cx + step, 5), round(cy + step, 5),
+                                  "cached")
+                cy += step
+            cx += step
         return self.CACHE_DIR / f"{prefix}_{key}.npz"
 
     def _snap(self, bbox: dict) -> Tuple[float, float, float, float]:
@@ -755,7 +766,18 @@ class HansenTileCache:
 
     def _tile_path(self, w: float, s: float, e: float, n: float) -> Path:
         key = tile_key("hansen", w, s, e, n)
-        _record_tile_bbox("hansen", w, s, e, n, "cached")
+        # Record individual 0.5° cells for map overlay (not the full snapped bbox)
+        step = self.GRID_STEP
+        cx = w
+        while cx < e - 1e-9:
+            cy = s
+            while cy < n - 1e-9:
+                _record_tile_bbox("hansen",
+                                  round(cx, 5), round(cy, 5),
+                                  round(cx + step, 5), round(cy + step, 5),
+                                  "cached")
+                cy += step
+            cx += step
         return self.CACHE_DIR / f"hansen_{key}.npz"
 
     def _snap(self, bbox_wgs: tuple) -> Tuple[float, float, float, float]:

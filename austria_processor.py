@@ -97,7 +97,7 @@ _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 # Track the last time we flushed tile cache to Zenodo (epoch seconds).
 _last_zenodo_cache_flush: float = 0.0
 # Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
-_ZENODO_CACHE_FLUSH_INTERVAL = 7200  # 2 hours
+_ZENODO_CACHE_FLUSH_INTERVAL = 1800  # 30 minutes
 
 
 def flush_tile_cache_to_zenodo(force: bool = False) -> bool:

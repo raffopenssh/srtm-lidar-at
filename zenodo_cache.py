@@ -624,6 +624,17 @@ class ZenodoCache:
         self.manifest.save()
         return depo_id
 
+    def _delete_file(self, depo_id: int, filename: str) -> None:
+        """Delete a file from a Zenodo deposit."""
+        r_files = self._api("GET", f"/api/deposit/depositions/{depo_id}/files")
+        for f in r_files.json():
+            if f["filename"] == filename:
+                self._api("DELETE",
+                          f"/api/deposit/depositions/{depo_id}/files/{f['id']}")
+                log.info("Deleted %s from deposit %d", filename, depo_id)
+                return
+        log.warning("File %s not found in deposit %d", filename, depo_id)
+
     def _upload_file(self, depo_id: int, local_path: Path, filename: str
                      ) -> Dict:
         """Upload a file to a Zenodo deposit bucket."""
@@ -966,6 +977,197 @@ class ZenodoCache:
             tmp.unlink(missing_ok=True)
             return None
 
+    # --- Strip (remove faulty tiles from Zenodo ZIPs) ---
+
+    def strip_tiles(self, entries_to_remove: List[str],
+                    dry_run: bool = False) -> Dict[str, Any]:
+        """Remove specific NPZ entries from Zenodo ZIP archives.
+
+        Rebuilds affected ZIPs without the listed entries and re-uploads.
+        Also deletes corresponding local .npz and .tif cache files.
+
+        Parameters
+        ----------
+        entries_to_remove : list of str
+            Entry names like ``ndvi_48.3000_15.5000_48.4000_15.6000_2024.npz``
+            OR grid specs like ``ndvi:15.5,48.3,15.6,48.4`` (product:w,s,e,n).
+        dry_run : bool
+            If True, list what would be removed without changing anything.
+
+        Returns
+        -------
+        dict with strip statistics.
+        """
+        # Normalise entries: convert grid specs to entry names
+        resolved: List[str] = []
+        for spec in entries_to_remove:
+            if ":" in spec and "," in spec:
+                parts = spec.split(":", 1)
+                product = parts[0]
+                coords = parts[1].split(",")
+                if len(coords) == 4:
+                    w, s, e, n = (float(c) for c in coords)
+                    extra = {"year": 2024} if product in ("ndvi", "sar", "harmonics") else {}
+                    entry = _npz_entry_name(product, w, s, e, n, **extra)
+                    resolved.append(entry)
+                else:
+                    resolved.append(spec)
+            else:
+                resolved.append(spec)
+
+        to_remove_set = set(resolved)
+        log.info("Strip request: %d entries to remove%s",
+                 len(to_remove_set), " (dry run)" if dry_run else "")
+        for e in sorted(to_remove_set):
+            log.info("  → %s", e)
+
+        stats = {"entries_found": 0, "zips_rebuilt": 0,
+                 "local_deleted": 0, "dry_run": dry_run}
+
+        # Group entries by ZIP
+        zip_entries: Dict[str, List[str]] = {}  # zip_name → [entry_names]
+        for entry in to_remove_set:
+            # Parse entry name to find its ZIP
+            # Format: {product}_{s}_{w}_{n}_{e}[_{year}].npz
+            base = entry.rsplit(".", 1)[0]  # strip .npz
+            parts = base.split("_")
+            product = parts[0]
+            try:
+                s_val = float(parts[1])
+            except (IndexError, ValueError):
+                log.warning("Cannot parse entry name: %s", entry)
+                continue
+            strip_s, strip_n = _strip_for_lat(s_val)
+            zip_name = _zip_filename(product, strip_s, strip_n)
+            zip_entries.setdefault(zip_name, []).append(entry)
+
+        depo_id = None if dry_run else self._ensure_deposit()
+
+        for zip_name, remove_list in sorted(zip_entries.items()):
+            idx = self._get_zip_index(zip_name)
+            if not idx:
+                log.warning("ZIP %s not found on Zenodo — skipping", zip_name)
+                continue
+
+            all_entries = set(idx.list_entries())
+            found = set(remove_list) & all_entries
+            if not found:
+                log.info("ZIP %s: none of the target entries found", zip_name)
+                continue
+
+            keep = all_entries - found
+            stats["entries_found"] += len(found)
+            log.info("ZIP %s: removing %d/%d entries, keeping %d",
+                     zip_name, len(found), len(all_entries), len(keep))
+            for e in sorted(found):
+                log.info("  removing: %s", e)
+
+            if dry_run:
+                continue
+
+            if not keep:
+                # ZIP would be empty — delete it
+                try:
+                    self._delete_file(depo_id, zip_name)
+                    log.info("Deleted now-empty %s from deposit", zip_name)
+                except Exception as exc:
+                    log.error("Failed to delete %s: %s", zip_name, exc)
+                stats["zips_rebuilt"] += 1
+                continue
+
+            # Rebuild ZIP with only kept entries
+            tmp_dir = Path(tempfile.mkdtemp())
+            zip_path = tmp_dir / zip_name
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for entry_name in sorted(keep):
+                    try:
+                        data = idx.read_entry(entry_name)
+                        if data:
+                            zf.writestr(entry_name, data)
+                    except Exception as exc:
+                        log.warning("Failed to read %s: %s", entry_name, exc)
+
+            size_mb = zip_path.stat().st_size / 1024 / 1024
+            log.info("Rebuilt %s: %d entries, %.1f MB", zip_name, len(keep), size_mb)
+
+            try:
+                result = self._upload_file(depo_id, zip_path, zip_name)
+                checksum = result.get("checksum", "")
+                from datetime import datetime, timezone
+                self.manifest.set_file(
+                    zip_name,
+                    url=self._file_download_url(zip_name),
+                    size=zip_path.stat().st_size,
+                    checksum=checksum,
+                    tile_count=len(keep),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.manifest.save()
+                self._zip_indices.pop(zip_name, None)
+                stats["zips_rebuilt"] += 1
+            except Exception as exc:
+                log.error("Failed to upload rebuilt %s: %s", zip_name, exc)
+
+            try:
+                zip_path.unlink()
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+
+        # Delete matching local cache files
+        for entry in to_remove_set:
+            # Local npz in tile_cache dir
+            base = entry.rsplit(".", 1)[0]
+            parts = base.split("_")
+            product = parts[0]
+
+            # Find and delete local npz files matching this entry
+            cache_dir = COP_CACHE_DIR if product != "hansen" else HANSEN_CACHE_DIR
+            for f in cache_dir.glob(f"{product}_*.npz"):
+                if f.name == entry or _npz_matches_entry(f, entry, product):
+                    if dry_run:
+                        log.info("Would delete local: %s", f)
+                    else:
+                        f.unlink(missing_ok=True)
+                        log.info("Deleted local: %s", f)
+                    stats["local_deleted"] += 1
+
+        return stats
+
+    def strip_local_tif(self, pattern: str, dry_run: bool = False) -> int:
+        """Delete local .tif copernicus cache files matching a pattern.
+
+        Parameters
+        ----------
+        pattern : str
+            Glob pattern, e.g. ``ndvi_ts_v2_7579042d*.tif``
+        dry_run : bool
+            If True, just list files without deleting.
+
+        Returns count of deleted files.
+        """
+        import copernicus
+        cache_dir = Path(copernicus.CACHE_DIR)
+        deleted = 0
+        for f in cache_dir.glob(pattern):
+            if dry_run:
+                log.info("Would delete: %s", f)
+            else:
+                f.unlink(missing_ok=True)
+                log.info("Deleted: %s", f)
+            deleted += 1
+        # Also check _batch dirs
+        for d in cache_dir.glob(pattern.replace(".tif", "_batch")):
+            if d.is_dir():
+                import shutil
+                if dry_run:
+                    log.info("Would delete dir: %s", d)
+                else:
+                    shutil.rmtree(d, ignore_errors=True)
+                    log.info("Deleted dir: %s", d)
+                deleted += 1
+        return deleted
+
     # --- Status ---
 
     def status(self) -> Dict[str, Any]:
@@ -981,6 +1183,26 @@ class ZenodoCache:
             "local_copernicus": {k: len(v) for k, v in local_cop.items()},
             "local_hansen": len(local_hansen),
         }
+
+
+def _npz_matches_entry(local_path: Path, entry_name: str, product: str) -> bool:
+    """Check if a local NPZ file corresponds to a Zenodo entry name.
+
+    Local files use tile_key hashes, entry names use coordinates.
+    Match via .meta.json sidecar if available.
+    """
+    meta_path = local_path.with_suffix(".npz.meta.json")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            w, s_, e, n = meta["west"], meta["south"], meta["east"], meta["north"]
+            extra = {k: v for k, v in meta.items()
+                     if k not in ("product", "west", "south", "east", "north")}
+            reconstructed = _npz_entry_name(product, w, s_, e, n, **extra)
+            return reconstructed == entry_name
+        except Exception:
+            pass
+    return False
 
 
 # === SECTION: Convenience / CLI ===
@@ -1001,7 +1223,19 @@ if __name__ == "__main__":
 
     sub.add_parser("status", help="Show cache status")
     sub.add_parser("upload", help="Upload local tiles to Zenodo")
-    p_dry = sub.add_parser("dry-run", help="Build ZIPs without uploading")
+    sub.add_parser("dry-run", help="Build ZIPs without uploading")
+
+    p_strip = sub.add_parser("strip", help="Remove faulty tiles from Zenodo ZIPs + local cache")
+    p_strip.add_argument("entries", nargs="+",
+                         help="Entry names (e.g. ndvi_48.3000_15.5000_48.4000_15.6000_2024.npz) "
+                              "or grid specs (e.g. ndvi:15.5,48.3,15.6,48.4 = product:w,s,e,n)")
+    p_strip.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+    p_strip.add_argument("--local-tif", action="append", default=[],
+                         help="Also delete local .tif cache files matching this glob "
+                              "(e.g. ndvi_ts_v2_7579042d*.tif)")
+
+    p_list = sub.add_parser("list", help="List entries in a Zenodo ZIP")
+    p_list.add_argument("zip_name", help="ZIP filename (e.g. copernicus_ndvi_strip_48.0_48.5.zip)")
 
     args = parser.parse_args()
     cache = _default_cache()
@@ -1015,6 +1249,23 @@ if __name__ == "__main__":
     elif args.cmd == "dry-run":
         result = cache.upload_all(dry_run=True)
         print(json.dumps(result, indent=2))
+    elif args.cmd == "strip":
+        result = cache.strip_tiles(args.entries, dry_run=args.dry_run)
+        # Also handle --local-tif patterns
+        for pat in args.local_tif:
+            n = cache.strip_local_tif(pat, dry_run=args.dry_run)
+            result[f"local_tif_{pat}"] = n
+        print(json.dumps(result, indent=2))
+    elif args.cmd == "list":
+        idx = cache._get_zip_index(args.zip_name)
+        if idx:
+            for e in sorted(idx.list_entries()):
+                info = idx.entry_info(e)
+                size_kb = info.file_size / 1024 if info else 0
+                print(f"  {e}  ({size_kb:.0f} KB)")
+        else:
+            print(f"ZIP {args.zip_name} not found on Zenodo")
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

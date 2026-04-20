@@ -1751,7 +1751,7 @@ def _parse_parcel_filters_from_args(args):
     pf = {}
 
     # String params
-    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse'):
+    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse', 'roof_type'):
         pk = f'pf_{k}'
         if pk in args:
             pf[k] = args[pk]
@@ -1777,12 +1777,14 @@ def _parse_parcel_filters_from_args(args):
         'min_slope', 'max_slope', 'min_tri', 'max_tri',
         'min_confidence', 'min_rf_confidence',
         'cadastre_min_area', 'cadastre_max_area',
+        'min_stories', 'max_stories',
     ]
+    _pf_int = {'min_stories', 'max_stories'}
     for k in _pf_numeric:
         pk = f'pf_{k}'
         if pk in args:
             try:
-                pf[k] = float(args[pk])
+                pf[k] = int(args[pk]) if k in _pf_int else float(args[pk])
             except ValueError:
                 pass
 
@@ -2337,6 +2339,7 @@ def api_parcels_batch():
       /api/v1/parcels/batch?min_tree_count=50&pf_min_vegetated_fraction=0.5&pf_sort=conservation_score
       /api/v1/parcels/batch?type_filter=tree:0.8:800&pf_types=tree,grass&limit=50
       /api/v1/parcels/batch?parcel_ids=63349-505/3,75414-1314/1  (Mode 1 via GET)
+      /api/v1/parcels/batch?min_elevation=900&aspect=SE,S,SW&min_slope=17&max_building_stories_max=1&min_building_pitched_pct=80&pf_aspect=SE,S,SW&pf_min_slope=17&pf_min_elevation=900&pf_max_parcel_area=5000&pf_roof_type=pitched&pf_max_stories=1&pf_cadastre_has_buildings=true&limit=100
 
     POST modes:
 
@@ -2386,6 +2389,10 @@ def api_parcels_batch():
           ],
           "min_confidence": 0.6,       // overall combined confidence
           "min_rf_confidence": 0.7,    // overall RF confidence
+          // Building attribute filters (centroid → /spatial/points point-in-polygon):
+          "roof_type": "pitched",      // "pitched" or "flat"
+          "min_stories": 1,             // building stories_est >= N
+          "max_stories": 1,             // building stories_est <= N
           // Cadastre-side filters (applied after enrichment):
           "cadastre_has_buildings": false,
           "cadastre_landuse": "W",

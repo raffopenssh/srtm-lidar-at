@@ -632,6 +632,75 @@ def batch_parcel_landscape_by_query(query_filters: dict, landscape_filters: dict
 # Landscape-first parcel query (compound → parcels)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _resolve_buildings_to_parcels(
+        kg_codes: list[str],
+        kg_json_map: dict[str, dict],
+        roof_type: str | None = None,
+        min_stories: int | None = None,
+        max_stories: int | None = None,
+) -> set[str] | None:
+    """For each KG, collect building_footprints centroids that match the
+    roof_type / stories filters, batch-lookup their parcel via
+    POST /spatial/points (true point-in-polygon), and return the set of
+    parcel_ids that contain at least one matching building.
+
+    Returns None if no building filters are active (caller should not filter).
+    Returns an empty set if filters are active but no buildings match.
+    """
+    if roof_type is None and min_stories is None and max_stories is None:
+        return None
+
+    # Collect candidate buildings from all KG JSONs
+    candidates = []  # [{lon, lat, id=building_uid, stories, roof}]
+    for kg_code in kg_codes:
+        kg_data = kg_json_map.get(kg_code)
+        if not kg_data:
+            continue
+        for b in kg_data.get('building_footprints', {}).get('details', []):
+            s = b.get('stories_est')
+            r = b.get('roof_type_hint', '')
+            # Pre-filter: only buildings that match the criteria
+            if min_stories is not None and (s is None or s < min_stories):
+                continue
+            if max_stories is not None and (s is None or s > max_stories):
+                continue
+            if roof_type is not None and r != roof_type:
+                continue
+            c = b.get('centroid', {})
+            lon, lat = c.get('lon'), c.get('lat')
+            if lon is None or lat is None:
+                continue
+            # uid = kg_code + index for dedup (building_id may be empty)
+            uid = f"{kg_code}__{len(candidates)}"
+            candidates.append({'lon': lon, 'lat': lat, 'id': uid})
+
+    if not candidates:
+        return set()
+
+    # Batch POST /spatial/points in chunks of 1000
+    matched_parcel_ids: set[str] = set()
+    CHUNK = 1000
+    for i in range(0, len(candidates), CHUNK):
+        chunk = candidates[i:i + CHUNK]
+        try:
+            resp = cadastre_proxy(
+                '/spatial/points',
+                json_body={'points': chunk},
+                timeout=60,
+            )
+            for result in resp.get('results', []):
+                parcel = result.get('parcel')
+                if parcel and parcel.get('parcel_id'):
+                    matched_parcel_ids.add(parcel['parcel_id'])
+        except CadastreError as e:
+            log.warning('_resolve_buildings_to_parcels: cadastre error: %s', e)
+            # On error return None so caller skips filtering rather than
+            # incorrectly dropping all parcels
+            return None
+
+    return matched_parcel_ids
+
+
 def landscape_parcel_query(compound_filters: dict,
                            parcel_filters: dict | None = None,
                            cadastre_enrich: bool = True,
@@ -697,6 +766,12 @@ def landscape_parcel_query(compound_filters: dict,
             cadastre_has_buildings: bool — building presence filter
             cadastre_min_area: float — min cadastre area (sqm)
             cadastre_max_area: float — max cadastre area (sqm)
+
+            --- Building attribute filters (resolved via /spatial/points centroid lookup) ---
+            roof_type: str — "pitched" or "flat" — parcel must contain a building with this roof
+            min_stories: int — parcel must contain a building with stories_est >= N
+            max_stories: int — parcel must contain a building with stories_est <= N
+            (These three work together: parcel must have ≥1 building matching ALL active criteria.)
             sort: str — conservation_score|vegetated_fraction|elevation|
                         ndsm_max|parcel_area
             sort_dir: str — asc|desc (default desc)
@@ -732,11 +807,15 @@ def landscape_parcel_query(compound_filters: dict,
     kgs_with_json = 0
     parcels_scanned = 0
 
+    # Cache loaded KG JSONs so step 3b (building resolver) can reuse them
+    kg_json_map: dict[str, dict] = {}
+
     for kg_code in kg_codes:
         kg_data = _load_kg_json(kg_code)
         if not kg_data:
             continue
         kgs_with_json += 1
+        kg_json_map[kg_code] = kg_data
 
         kg_name = kg_data.get('kg_name', '')
         kg_state = kg_data.get('state', '')
@@ -900,6 +979,29 @@ def landscape_parcel_query(compound_filters: dict,
                 entry['elevation_m'] = pd['elevation_m']
 
             all_parcels.append(entry)
+
+    # Step 3b: Building attribute filter via /spatial/points centroid lookup
+    # Resolve which parcel_ids contain a building matching roof_type / stories.
+    # Uses building_footprint centroids from the KG JSON + cadastre point-in-polygon.
+    _roof_type   = pf.get('roof_type')
+    _min_stories = pf.get('min_stories')
+    _max_stories = pf.get('max_stories')
+    if _roof_type is not None or _min_stories is not None or _max_stories is not None:
+        matched_by_building = _resolve_buildings_to_parcels(
+            kg_codes=list(kg_json_map.keys()),
+            kg_json_map=kg_json_map,
+            roof_type=_roof_type,
+            min_stories=_min_stories,
+            max_stories=_max_stories,
+        )
+        if matched_by_building is not None:
+            # None = lookup failed (error) → skip filter to avoid false negatives
+            all_parcels = [e for e in all_parcels
+                           if e['parcel_id'] in matched_by_building]
+        else:
+            warnings.append(
+                'Building filter (roof_type/stories) skipped due to /spatial/points error'
+            )
 
     total_matched = len(all_parcels)
 

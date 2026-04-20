@@ -244,6 +244,8 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_bld_roof ON kg_buildings(roof_type_hint)',
             'CREATE INDEX IF NOT EXISTS idx_bld_stories ON kg_buildings(stories_est)',
             'CREATE INDEX IF NOT EXISTS idx_bld_height ON kg_buildings(max_height_m)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg_roof_stories ON kg_buildings(kg_code, roof_type_hint, stories_est)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg_loc ON kg_buildings(kg_code, centroid_lon, centroid_lat)',
             # === Per-parcel landscape detail (indexed for complex cross-KG queries) ===
             '''CREATE TABLE IF NOT EXISTS kg_parcels (
                 kg_code TEXT NOT NULL,

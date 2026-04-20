@@ -1022,34 +1022,52 @@ function renderTileOverlays(d) {
 
 // ── Zenodo Manifest ─────────────────────────────────────────────
 let lastManFetch = 0;
-async function fetchManifest() {
-  if (Date.now() - lastManFetch < 10000) return;
+let _lastManData = null;
+
+async function fetchManifestData() {
+  // Fetch manifest JSON and cache it; update summary always
+  if (Date.now() - lastManFetch < 10000) return _lastManData;
   lastManFetch = Date.now();
   try {
     const r = await fetch('/api/v1/processing/manifest');
-    if (!r.ok) return;
-    const d = await r.json();
-    document.getElementById('zenSummary').textContent =
-      fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
-    const entries = d.entries || {};
-    const keys = Object.keys(entries).sort();
-    const sorted = keys.map(k => ({key:k, ...entries[k]}))
-      .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''))
-      .slice(0, 200);
-    document.querySelector('#zenTbl tbody').innerHTML = sorted.map(e => {
-      const url = e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '';
-      const md5 = (e.checksum||'').substring(0,12);
-      return '<tr>' +
-        '<td>' + esc(e.key||'') + '</td>' +
-        '<td>' + (e.depo_id||'—') + '</td>' +
-        '<td>' + esc(e.filename||'—') + '</td>' +
-        '<td>' + fmtB(e.size||0) + '</td>' +
-        '<td title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
-        '<td>' + (e.uploaded_at ? new Date(e.uploaded_at).toLocaleString() : '—') + '</td>' +
-        '<td>' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)">↗</a>' : '—') + '</td>' +
-        '</tr>';
-    }).join('');
+    if (!r.ok) return _lastManData;
+    _lastManData = await r.json();
   } catch(e) { console.error('manifest:', e); }
+  return _lastManData;
+}
+
+async function fetchManifestSummary() {
+  // Called on every poll — updates summary badge regardless of panel state
+  const d = await fetchManifestData();
+  if (!d) return;
+  document.getElementById('zenSummary').textContent =
+    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
+}
+
+async function fetchManifest() {
+  // Called when panel is open — updates summary + full table
+  const d = await fetchManifestData();
+  if (!d) return;
+  document.getElementById('zenSummary').textContent =
+    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
+  const entries = d.entries || {};
+  const keys = Object.keys(entries).sort();
+  const sorted = keys.map(k => ({key:k, ...entries[k]}))
+    .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''))
+    .slice(0, 200);
+  document.querySelector('#zenTbl tbody').innerHTML = sorted.map(e => {
+    const url = e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '';
+    const md5 = (e.checksum||'').substring(0,12);
+    return '<tr>' +
+      '<td>' + esc(e.key||'') + '</td>' +
+      '<td>' + (e.depo_id||'—') + '</td>' +
+      '<td>' + esc(e.filename||'—') + '</td>' +
+      '<td>' + fmtB(e.size||0) + '</td>' +
+      '<td title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
+      '<td>' + (e.uploaded_at ? new Date(e.uploaded_at).toLocaleString() : '—') + '</td>' +
+      '<td>' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)">↗</a>' : '—') + '</td>' +
+      '</tr>';
+  }).join('');
 }
 
 // ── Main Poll ───────────────────────────────────────────────────
@@ -1073,6 +1091,7 @@ async function poll() {
     // Refresh tile overlays every 10s
     if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
+    else fetchManifestSummary();
     const commitHash = d.git_commit || '';
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString()
       + (commitHash ? ' · ' + commitHash : '');

@@ -1299,6 +1299,34 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?min_elevation=150
 # Poll: /api/v1/query/compound?task_id=<id>
 ```
 
+```bash
+# --- Per-Parcel Index Query (GET /api/v1/query/parcels) ---
+# Direct SQL on kg_parcels table. Returns individual parcels, <50ms.
+# Combines terrain, vegetation, classification, Hansen, and building attributes.
+
+# ── The example query: "Zeig mir alle Parzellen auf denen ein Haus mit nur einem
+# Stockwerk und einem Spitzdach steht, die eine Südhangneigung von über 30% haben
+# und kleiner als 5000 Quadratmeter ab einer Seehöhe von 900 Metern, mit wenig
+# Entwaldung in den letzten 5 Jahren." ──
+# (30% slope ≈ 17°)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?building_roof_type=pitched&building_max_stories=1&aspect=S,SE,SW&min_slope=17&max_area=5000&min_elevation=900&max_hansen_recent_5yr=5&sort=elevation_m&sort_dir=desc&limit=100'
+
+# Highly forested parcels above 1500m with no recent deforestation
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_forested_fraction=0.7&min_elevation=1500&max_hansen_recent_5yr=0&sort=forested_fraction&sort_dir=desc'
+
+# Large grassy parcels in Vorarlberg
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Vorarlberg&dominant_type=grass&min_area=10000&sort=area_sqm&sort_dir=desc'
+
+# Steep rocky terrain without vegetation (quarries, cliffs)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?dominant_type=rock&min_slope=25&max_vegetated_fraction=0.1&sort=slope_mean_deg&sort_dir=desc'
+
+# Flat low-elevation parcels with high vegetation and buildings (suburban gardens)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?terrain_class=level&max_elevation=400&min_vegetated_fraction=0.6&building_min_stories=1&sort=vegetated_fraction&sort_dir=desc'
+
+# Parcels with significant recent Hansen forest loss (monitoring deforestation)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_hansen_recent_5yr=20&min_forested_fraction=0.3&sort=hansen_recent_5yr_pixels&sort_dir=desc'
+```
+
 ---
 
 ## Cross-API Bridge (Cadastre + Landscape)

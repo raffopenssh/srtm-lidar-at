@@ -7047,6 +7047,8 @@ def main():
                                     "KG %s: TIMEOUT at step %s — transient, "
                                     "deferring %d KGs (attempt %d)",
                                     kg_code, last_step, DEFER_GAP, _defer_n + 1)
+                                failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                                _save_failure_counts(failure_counts)
                                 _append_retry_queue(kg_code)
                                 _deferred: dict = dict(kg)
                                 _deferred["_defer_attempt"] = _defer_n + 1
@@ -7200,6 +7202,8 @@ def main():
                             "KG %s: transient error at %s — deferring "
                             "%d KGs (attempt %d): %s",
                             kg_code, _stp, DEFER_GAP, _defer_n + 1, _err)
+                        failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                        _save_failure_counts(failure_counts)
                         _append_retry_queue(kg_code)
                         _deferred = dict(kg)
                         _deferred["_defer_attempt"] = _defer_n + 1
@@ -7242,6 +7246,8 @@ def main():
                     "KG %s: transient exception — deferring %d KGs "
                     "(attempt %d): %s",
                     kg_code, DEFER_GAP, _defer_n + 1, _err_str)
+                failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                _save_failure_counts(failure_counts)
                 _append_retry_queue(kg_code)
                 _deferred = dict(kg)
                 _deferred["_defer_attempt"] = _defer_n + 1

@@ -576,19 +576,11 @@ function updateTileDots(d) {
     tileDotsLayer.addLayer(m);
   });
 
-  // Auto-fit map to tile bounds on first load or KG change
+  // Auto-fit map to current KG tile bounds on first load or KG change
   if (currentKgCode !== _fittedKgCode) { _tilesFitted = false; _fittedKgCode = currentKgCode; }
   if (!_tilesFitted) {
-    // Include both current tile positions and history dots in bounds
     const lats = tiles.map(t => t.lat);
     const lngs = tiles.map(t => t.lng);
-    if (historyDotsLayer) {
-      historyDotsLayer.eachLayer(l => {
-        const p = l.getLatLng();
-        lats.push(p.lat);
-        lngs.push(p.lng);
-      });
-    }
     const bounds = L.latLngBounds(
       [Math.min(...lats) - 0.005, Math.min(...lngs) - 0.008],
       [Math.max(...lats) + 0.005, Math.max(...lngs) + 0.008]

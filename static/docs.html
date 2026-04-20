@@ -271,6 +271,7 @@ td code { font-size: 12px; }
       <a href="#query-compound">Compound Filter</a>
       <a href="#query-filter-logic">AND vs OR</a>
       <a href="#query-segments">Power Queries</a>
+      <a href="#query-parcels">Per-Parcel Index</a>
     </div>
   </div>
   <div class="nav-group">
@@ -1567,11 +1568,107 @@ curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/compound?type_filt
 <span class="tok-comment"># Poll: /api/v1/query/compound?task_id=def-456</span></code></pre>
 </div>
 
+<h3 id="query-parcels">Per-Parcel Index Query <a class="anchor-link" href="#query-parcels">#</a></h3>
+<p>
+  <code>GET /api/v1/query/parcels</code> runs direct SQL against the <code>kg_parcels</code> index table.
+  Every processed parcel is indexed with terrain, vegetation, classification, Hansen, and building
+  attributes &mdash; all queries return in <strong>&lt;&thinsp;50&thinsp;ms</strong>.
+  This is the endpoint for complex cross-KG parcel searches like
+  <em>&ldquo;south-facing parcels above 900&thinsp;m with a single-storey pitched-roof building,
+  under 5&thinsp;000&thinsp;m&sup2;, and little recent deforestation.&rdquo;</em>
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:220px">Parameter</th><th style="width:100px">Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Admin / spatial</td></tr>
+    <tr><td><code>kg</code></td><td>string</td><td>Filter by KG code</td></tr>
+    <tr><td><code>state</code></td><td>string</td><td>Bundesland name or code</td></tr>
+    <tr><td><code>district</code></td><td>string</td><td>Bezirk name or code</td></tr>
+    <tr><td><code>gemeinde</code></td><td>string</td><td>Gemeinde name or code</td></tr>
+    <tr><td><code>bbox</code></td><td>string</td><td>Spatial bounding box: <code>w,s,e,n</code></td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Area &amp; elevation</td></tr>
+    <tr><td><code>min_area</code> / <code>max_area</code></td><td>float</td><td>Parcel area in m&sup2;</td></tr>
+    <tr><td><code>min_elevation</code> / <code>max_elevation</code></td><td>float</td><td>Mean elevation in metres</td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Terrain</td></tr>
+    <tr><td><code>min_slope</code> / <code>max_slope</code></td><td>float</td><td>Mean slope in degrees</td></tr>
+    <tr><td><code>min_tri</code> / <code>max_tri</code></td><td>float</td><td>Terrain Roughness Index</td></tr>
+    <tr><td><code>terrain_class</code></td><td>string</td><td><code>level</code>, <code>nearly_level</code>, <code>slightly_rugged</code>, <code>rugged</code>, &hellip;</td></tr>
+    <tr><td><code>aspect</code></td><td>string</td><td>Comma-separated: <code>N,NE,E,SE,S,SW,W,NW</code></td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Vegetation &amp; land cover</td></tr>
+    <tr><td><code>dominant_type</code></td><td>string</td><td>Dominant segment type: <code>tree</code>, <code>grass</code>, <code>roof</code>, &hellip;</td></tr>
+    <tr><td><code>min_vegetated_fraction</code> / <code>max_vegetated_fraction</code></td><td>float</td><td>Vegetated fraction 0&ndash;1</td></tr>
+    <tr><td><code>min_forested_fraction</code> / <code>max_forested_fraction</code></td><td>float</td><td>Forested fraction 0&ndash;1</td></tr>
+    <tr><td><code>is_vegetated</code></td><td>bool</td><td><code>true</code> or <code>false</code></td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Height &amp; classification</td></tr>
+    <tr><td><code>min_ndsm_max</code> / <code>max_ndsm_max</code></td><td>float</td><td>Max nDSM height on parcel (m)</td></tr>
+    <tr><td><code>min_confidence</code></td><td>float</td><td>Min mean classification confidence</td></tr>
+    <tr><td><code>min_rf_confidence</code></td><td>float</td><td>Min RF model confidence</td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Hansen forest change</td></tr>
+    <tr><td><code>min_hansen_recent_5yr</code> / <code>max_hansen_recent_5yr</code></td><td>int</td><td>Recent 5-year loss pixels</td></tr>
+    <tr><td><code>min_hansen_total</code> / <code>max_hansen_total</code></td><td>int</td><td>Total loss pixels</td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Building join filters</td></tr>
+    <tr><td><code>building_roof_type</code></td><td>string</td><td><code>pitched</code> or <code>flat</code> &mdash; parcel must contain a matching building</td></tr>
+    <tr><td><code>building_min_stories</code></td><td>int</td><td>Minimum estimated building stories</td></tr>
+    <tr><td><code>building_max_stories</code></td><td>int</td><td>Maximum estimated building stories</td></tr>
+
+    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Sorting &amp; pagination</td></tr>
+    <tr><td><code>sort</code></td><td>string</td><td><code>elevation_m</code> (default), <code>area_sqm</code>, <code>slope_mean_deg</code>, <code>tri_mean</code>, <code>vegetated_fraction</code>, <code>forested_fraction</code>, <code>ndsm_max_m</code>, <code>hansen_recent_5yr_pixels</code>, <code>hansen_total_pixels</code>, <code>mean_confidence</code>, <code>rf_mean_confidence</code></td></tr>
+    <tr><td><code>sort_dir</code></td><td>string</td><td><code>desc</code> (default) or <code>asc</code></td></tr>
+    <tr><td><code>limit</code></td><td>int</td><td>Max results (default 100, max 1000)</td></tr>
+    <tr><td><code>offset</code></td><td>int</td><td>Pagination offset</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p style="margin-top:12px">
+  Each result includes all 27 parcel columns: <code>kg_code</code>, <code>parcel_id</code>,
+  <code>area_sqm</code>, <code>centroid_lon/lat</code>, <code>elevation_m</code> (+ min/max/range),
+  <code>slope_mean_deg</code>, <code>tri_mean</code>, <code>tpi_mean</code>, <code>terrain_class</code>,
+  <code>aspect_mean_deg</code>, <code>aspect_dominant</code>, <code>vegetated_fraction</code>,
+  <code>forested_fraction</code>, <code>dominant_type</code>, <code>ndsm_max_m</code>,
+  <code>ndsm_mean_m</code>, <code>is_vegetated</code>, classification counts + confidence,
+  and <code>hansen_total_pixels</code> / <code>hansen_recent_5yr_pixels</code>.
+  The response wraps results in <code>{"total": N, "offset": 0, "limit": 100, "results": [...]}</code>.
+</p>
+
+<h4 style="margin-top:16px">Example Queries</h4>
+<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
+<pre><code><span class="tok-comment"># ── &ldquo;Zeig mir alle Parzellen auf denen ein Haus mit nur einem Stockwerk und</span>
+<span class="tok-comment">#     einem Spitzdach steht, die eine S&uuml;dhangneigung von &uuml;ber 30% haben und</span>
+<span class="tok-comment">#     kleiner als 5000 Quadratmeter ab einer Seeh&ouml;he von 900 Metern, mit wenig</span>
+<span class="tok-comment">#     Entwaldung in den letzten 5 Jahren.&rdquo;</span>
+<span class="tok-comment"># (30% slope &asymp; 17&deg;)</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?building_roof_type=pitched&amp;building_max_stories=1&amp;aspect=S,SE,SW&amp;min_slope=17&amp;max_area=5000&amp;min_elevation=900&amp;max_hansen_recent_5yr=5&amp;sort=elevation_m&amp;sort_dir=desc&amp;limit=100" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?building_roof_type=pitched&amp;building_max_stories=1&amp;aspect=S,SE,SW&amp;min_slope=17&amp;max_area=5000&amp;min_elevation=900&amp;max_hansen_recent_5yr=5&amp;sort=elevation_m&amp;sort_dir=desc&amp;limit=100"</a>
+
+<span class="tok-comment"># Highly forested parcels above 1500m with no recent deforestation</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_forested_fraction=0.7&amp;min_elevation=1500&amp;max_hansen_recent_5yr=0&amp;sort=forested_fraction&amp;sort_dir=desc" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_forested_fraction=0.7&amp;min_elevation=1500&amp;max_hansen_recent_5yr=0&amp;sort=forested_fraction&amp;sort_dir=desc"</a>
+
+<span class="tok-comment"># Large grassy parcels in Vorarlberg</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Vorarlberg&amp;dominant_type=grass&amp;min_area=10000&amp;sort=area_sqm&amp;sort_dir=desc" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Vorarlberg&amp;dominant_type=grass&amp;min_area=10000&amp;sort=area_sqm&amp;sort_dir=desc"</a>
+
+<span class="tok-comment"># Steep rocky terrain without vegetation (quarries, cliffs)</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?dominant_type=rock&amp;min_slope=25&amp;max_vegetated_fraction=0.1&amp;sort=slope_mean_deg&amp;sort_dir=desc" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?dominant_type=rock&amp;min_slope=25&amp;max_vegetated_fraction=0.1&amp;sort=slope_mean_deg&amp;sort_dir=desc"</a>
+
+<span class="tok-comment"># Flat low-elevation parcels with high vegetation and buildings (suburban gardens)</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?terrain_class=level&amp;max_elevation=400&amp;min_vegetated_fraction=0.6&amp;building_min_stories=1&amp;sort=vegetated_fraction&amp;sort_dir=desc" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?terrain_class=level&amp;max_elevation=400&amp;min_vegetated_fraction=0.6&amp;building_min_stories=1&amp;sort=vegetated_fraction&amp;sort_dir=desc"</a>
+
+<span class="tok-comment"># Parcels with significant recent Hansen forest loss (monitoring deforestation)</span>
+curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_hansen_recent_5yr=20&amp;min_forested_fraction=0.3&amp;sort=hansen_recent_5yr_pixels&amp;sort_dir=desc" target="_blank" class="tok-url">"https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_hansen_recent_5yr=20&amp;min_forested_fraction=0.3&amp;sort=hansen_recent_5yr_pixels&amp;sort_dir=desc"</a></code></pre>
+</div>
+
 <div style="background:#e8f4fd;border:1px solid #b3d9f2;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">
   <strong>Speed guide:</strong>
-  <strong>Fast</strong> (&lt;25ms): <code>segments=true</code>, <code>q=</code>, <code>bbox=</code>, <code>point=</code>, <code>state=</code>, <code>district=</code>, <code>type=</code>, <code>hansen=</code>, <code>aggregate=</code> &mdash; pure index lookups.<br>
+  <strong>Fast</strong> (&lt;50ms): <code>/query/parcels</code>, <code>segments=true</code>, <code>q=</code>, <code>bbox=</code>, <code>point=</code>, <code>state=</code>, <code>district=</code>, <code>type=</code>, <code>hansen=</code>, <code>aggregate=</code> &mdash; pure SQL index lookups.<br>
   <strong>Medium</strong> (seconds): <code>compound</code> with <code>type_filters</code> or <code>landcover_filters</code> &mdash; joins on indexed tables.<br>
-  <strong>Slow</strong> (seconds–minutes): <code>parcels_by_type</code>, <code>top_features</code> &mdash; scan KG JSON files. Use <code>async=true</code>.
+  <strong>Slow</strong> (seconds&ndash;minutes): <code>parcels_by_type</code>, <code>top_features</code> &mdash; scan KG JSON files. Use <code>async=true</code>.
 </div>
 
 

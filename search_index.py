@@ -244,6 +244,52 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_bld_roof ON kg_buildings(roof_type_hint)',
             'CREATE INDEX IF NOT EXISTS idx_bld_stories ON kg_buildings(stories_est)',
             'CREATE INDEX IF NOT EXISTS idx_bld_height ON kg_buildings(max_height_m)',
+            # === Per-parcel landscape detail (indexed for complex cross-KG queries) ===
+            '''CREATE TABLE IF NOT EXISTS kg_parcels (
+                kg_code TEXT NOT NULL,
+                parcel_id TEXT NOT NULL,
+                area_sqm REAL DEFAULT 0,
+                centroid_lon REAL,
+                centroid_lat REAL,
+                elevation_m REAL,
+                elevation_min_m REAL,
+                elevation_max_m REAL,
+                elevation_range_m REAL,
+                slope_mean_deg REAL,
+                tri_mean REAL,
+                tpi_mean REAL,
+                terrain_class TEXT,
+                aspect_mean_deg REAL,
+                aspect_dominant TEXT,
+                vegetated_fraction REAL,
+                forested_fraction REAL,
+                dominant_type TEXT,
+                ndsm_max_m REAL,
+                ndsm_mean_m REAL,
+                is_vegetated INTEGER,
+                -- classification summary
+                rf_classified INTEGER DEFAULT 0,
+                rules_classified INTEGER DEFAULT 0,
+                mean_confidence REAL,
+                rf_mean_confidence REAL,
+                -- hansen
+                hansen_total_pixels INTEGER DEFAULT 0,
+                hansen_recent_5yr_pixels INTEGER DEFAULT 0,
+                PRIMARY KEY (kg_code, parcel_id)
+            )''',
+            'CREATE INDEX IF NOT EXISTS idx_prc_kg ON kg_parcels(kg_code)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_aspect ON kg_parcels(aspect_dominant)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_terrain ON kg_parcels(terrain_class)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_dominant ON kg_parcels(dominant_type)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_slope ON kg_parcels(slope_mean_deg)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_elevation ON kg_parcels(elevation_m)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_forested ON kg_parcels(forested_fraction)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_vegetated ON kg_parcels(vegetated_fraction)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_ndsm ON kg_parcels(ndsm_max_m)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_area ON kg_parcels(area_sqm)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_hansen ON kg_parcels(hansen_recent_5yr_pixels)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_rf_conf ON kg_parcels(rf_mean_confidence)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_is_veg ON kg_parcels(is_vegetated)',
             # === Index metadata ===
             '''CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
@@ -730,6 +776,50 @@ class SearchIndex:
             if bld_rows:
                 c.executemany(
                     'INSERT INTO kg_buildings VALUES (?,?,?,?,?,?,?,?,?,?,?)', bld_rows)
+
+        # Per-parcel landscape details
+        parcels = data.get('parcels', {})
+        p_details = parcels.get('details', [])
+        if p_details:
+            c.execute('DELETE FROM kg_parcels WHERE kg_code=?', (code,))
+            prc_rows = []
+            for p in p_details:
+                centroid = p.get('centroid', {})
+                cls = p.get('classification', {})
+                hansen = p.get('hansen_loss', {})
+                prc_rows.append((
+                    code,
+                    p.get('parcel_id', ''),
+                    p.get('area_sqm', 0),
+                    centroid.get('lon'),
+                    centroid.get('lat'),
+                    p.get('elevation_m'),
+                    p.get('elevation_min_m'),
+                    p.get('elevation_max_m'),
+                    p.get('elevation_range_m'),
+                    p.get('slope_mean_deg'),
+                    p.get('tri_mean'),
+                    p.get('tpi_mean'),
+                    p.get('terrain_class'),
+                    p.get('aspect_mean_deg'),
+                    p.get('aspect_dominant'),
+                    p.get('vegetated_fraction'),
+                    p.get('forested_fraction'),
+                    p.get('dominant_type'),
+                    p.get('ndsm_max_m'),
+                    p.get('ndsm_mean_m'),
+                    1 if p.get('is_vegetated') else 0,
+                    cls.get('rf_classified', 0),
+                    cls.get('rules_classified', 0),
+                    cls.get('mean_confidence'),
+                    cls.get('rf_mean_confidence'),
+                    hansen.get('total_pixels', 0),
+                    hansen.get('recent_5yr_pixels', 0),
+                ))
+            if prc_rows:
+                c.executemany(
+                    'INSERT INTO kg_parcels VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    prc_rows)
 
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing."""
@@ -2088,6 +2178,161 @@ class SearchIndex:
     # ════════════════════════════════════════════════════════════════
     # Lazy-load detail from light GPKG (Zenodo or local)
     # ════════════════════════════════════════════════════════════════
+
+    def query_parcels_index(self, kg_code=None,
+                             min_area=None, max_area=None,
+                             min_elevation=None, max_elevation=None,
+                             min_slope=None, max_slope=None,
+                             terrain_class=None, aspect=None,
+                             dominant_type=None,
+                             min_vegetated_fraction=None, max_vegetated_fraction=None,
+                             min_forested_fraction=None, max_forested_fraction=None,
+                             min_ndsm_max=None, max_ndsm_max=None,
+                             min_tri=None, max_tri=None,
+                             min_rf_confidence=None, min_confidence=None,
+                             max_hansen_recent_5yr=None, min_hansen_recent_5yr=None,
+                             max_hansen_total=None, min_hansen_total=None,
+                             is_vegetated=None,
+                             # building join filters
+                             building_roof_type=None,
+                             building_min_stories=None, building_max_stories=None,
+                             # spatial
+                             state=None, district=None, gemeinde=None,
+                             bbox=None,
+                             sort='elevation_m', sort_dir='desc',
+                             limit=100, offset=0):
+        """Query parcels from the kg_parcels index table (fast, SQL-only).
+
+        Supports building join: finds parcels that contain a building in
+        kg_buildings matching roof_type / stories.
+
+        Example: 1-storey pitched-roof house, south-facing slope >30%,
+        <5000 sqm, >900m elevation, low recent deforestation.
+        """
+        c = self._conn()
+        where = ['p.area_sqm > 0']
+        params = []
+        joins = []
+
+        # KG-level filters (join to kg table)
+        if state or district or gemeinde or bbox:
+            joins.append('JOIN kg k ON p.kg_code = k.kg_code')
+            if state:
+                where.append('(k.state_name = ? OR k.state_code = ?)')
+                params.extend([state, state])
+            if district:
+                where.append('(k.district_name = ? OR k.district_code = ?)')
+                params.extend([district, district])
+            if gemeinde:
+                where.append('(k.gemeinde_name = ? OR k.gemeinde_code = ?)')
+                params.extend([gemeinde, gemeinde])
+            if bbox:
+                w, s, e, n = bbox
+                where.append('k.min_lon <= ? AND k.max_lon >= ? AND k.min_lat <= ? AND k.max_lat >= ?')
+                params.extend([e, w, n, s])
+
+        if kg_code:
+            where.append('p.kg_code = ?')
+            params.append(kg_code)
+
+        # Parcel attribute filters
+        _num_filters = [
+            ('min_area', 'p.area_sqm', '>='),
+            ('max_area', 'p.area_sqm', '<='),
+            ('min_elevation', 'p.elevation_m', '>='),
+            ('max_elevation', 'p.elevation_m', '<='),
+            ('min_slope', 'p.slope_mean_deg', '>='),
+            ('max_slope', 'p.slope_mean_deg', '<='),
+            ('min_tri', 'p.tri_mean', '>='),
+            ('max_tri', 'p.tri_mean', '<='),
+            ('min_vegetated_fraction', 'p.vegetated_fraction', '>='),
+            ('max_vegetated_fraction', 'p.vegetated_fraction', '<='),
+            ('min_forested_fraction', 'p.forested_fraction', '>='),
+            ('max_forested_fraction', 'p.forested_fraction', '<='),
+            ('min_ndsm_max', 'p.ndsm_max_m', '>='),
+            ('max_ndsm_max', 'p.ndsm_max_m', '<='),
+            ('min_confidence', 'p.mean_confidence', '>='),
+            ('min_rf_confidence', 'p.rf_mean_confidence', '>='),
+            ('max_hansen_recent_5yr', 'p.hansen_recent_5yr_pixels', '<='),
+            ('min_hansen_recent_5yr', 'p.hansen_recent_5yr_pixels', '>='),
+            ('max_hansen_total', 'p.hansen_total_pixels', '<='),
+            ('min_hansen_total', 'p.hansen_total_pixels', '>='),
+        ]
+        local_vars = locals()
+        for param_name, col, op in _num_filters:
+            val = local_vars.get(param_name)
+            if val is not None:
+                where.append(f'{col} {op} ?')
+                params.append(val)
+
+        if terrain_class:
+            where.append('p.terrain_class = ?')
+            params.append(terrain_class)
+        if dominant_type:
+            where.append('p.dominant_type = ?')
+            params.append(dominant_type)
+        if aspect:
+            aspects = [a.strip() for a in aspect.split(',')] if isinstance(aspect, str) else aspect
+            placeholders = ','.join('?' * len(aspects))
+            where.append(f'p.aspect_dominant IN ({placeholders})')
+            params.extend(aspects)
+        if is_vegetated is not None:
+            where.append('p.is_vegetated = ?')
+            params.append(1 if is_vegetated else 0)
+
+        # Building join filter
+        if building_roof_type or building_min_stories is not None or building_max_stories is not None:
+            # Subquery: parcel must contain a building matching criteria
+            bld_where = []
+            bld_params = []
+            if building_roof_type:
+                bld_where.append('b.roof_type_hint = ?')
+                bld_params.append(building_roof_type)
+            if building_min_stories is not None:
+                bld_where.append('b.stories_est >= ?')
+                bld_params.append(building_min_stories)
+            if building_max_stories is not None:
+                bld_where.append('b.stories_est <= ?')
+                bld_params.append(building_max_stories)
+            bld_cond = ' AND '.join(bld_where) if bld_where else '1=1'
+            # Use spatial proximity: building centroid within ~30m of parcel centroid
+            # Actually join by kg_code and use a rough bounding check.
+            # Better: use the parcel_id prefix (kg_code) + spatial nearness.
+            where.append(f'''EXISTS (
+                SELECT 1 FROM kg_buildings b
+                WHERE b.kg_code = p.kg_code
+                AND ABS(b.centroid_lon - p.centroid_lon) < 0.001
+                AND ABS(b.centroid_lat - p.centroid_lat) < 0.001
+                AND {bld_cond}
+            )''')
+            params.extend(bld_params)
+
+        where_sql = ' AND '.join(where)
+        join_sql = ' '.join(joins)
+
+        # Validate sort column
+        _valid_sorts = {
+            'elevation_m', 'area_sqm', 'slope_mean_deg', 'tri_mean',
+            'vegetated_fraction', 'forested_fraction', 'ndsm_max_m',
+            'hansen_recent_5yr_pixels', 'hansen_total_pixels',
+            'mean_confidence', 'rf_mean_confidence',
+        }
+        if sort not in _valid_sorts:
+            sort = 'elevation_m'
+        order = 'DESC' if sort_dir.lower() == 'desc' else 'ASC'
+
+        count = c.execute(
+            f'SELECT COUNT(*) FROM kg_parcels p {join_sql} WHERE {where_sql}',
+            params).fetchone()[0]
+        rows = c.execute(
+            f'''SELECT p.* FROM kg_parcels p {join_sql}
+                WHERE {where_sql}
+                ORDER BY p.{sort} {order} NULLS LAST
+                LIMIT ? OFFSET ?''',
+            params + [limit, offset]).fetchall()
+        cols = [d[0] for d in c.execute('SELECT * FROM kg_parcels LIMIT 0').description]
+        results = [dict(zip(cols, r)) for r in rows]
+        return {'total': count, 'offset': offset, 'limit': limit, 'results': results}
 
     def query_buildings_index(self, kg_code=None, min_height=None, max_height=None,
                                min_stories=None, max_stories=None, roof_type=None,

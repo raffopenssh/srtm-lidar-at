@@ -216,8 +216,16 @@ def _extract_landscape_from_parcel(parcel_detail: dict) -> dict:
     if parcel_detail.get('elevation_m') is not None:
         landscape['elevation_m'] = parcel_detail['elevation_m']
 
+    # Forested fraction
+    if 'forested_fraction' in parcel_detail:
+        landscape['forested_fraction'] = parcel_detail['forested_fraction']
+
+    # Dominant type
+    if parcel_detail.get('dominant_type'):
+        landscape['dominant_type'] = parcel_detail['dominant_type']
+
     # Temporal / Hansen
-    for k in ('hansen_loss_pixels', 'temporal_change', 'volume_change_m3'):
+    for k in ('hansen_loss', 'hansen_loss_pixels', 'temporal_change', 'volume_change_m3'):
         if k in parcel_detail:
             landscape[k] = parcel_detail[k]
 
@@ -846,6 +854,37 @@ def landscape_parcel_query(compound_filters: dict,
                 if pf['is_vegetated'] != is_veg:
                     continue
 
+            # Forested fraction filter
+            forest_frac = pd.get('forested_fraction', 0) or 0
+            if pf.get('min_forested_fraction') is not None and forest_frac < pf['min_forested_fraction']:
+                continue
+            if pf.get('max_forested_fraction') is not None and forest_frac > pf['max_forested_fraction']:
+                continue
+
+            # Dominant type filter
+            if pf.get('dominant_type'):
+                if pd.get('dominant_type') != pf['dominant_type']:
+                    continue
+
+            # Hansen recent forest loss filter
+            hansen = pd.get('hansen_loss', {})
+            if pf.get('max_hansen_recent_5yr') is not None:
+                recent = hansen.get('recent_5yr_pixels', 0)
+                if recent > pf['max_hansen_recent_5yr']:
+                    continue
+            if pf.get('min_hansen_recent_5yr') is not None:
+                recent = hansen.get('recent_5yr_pixels', 0)
+                if recent < pf['min_hansen_recent_5yr']:
+                    continue
+            if pf.get('max_hansen_total') is not None:
+                total_h = hansen.get('total_pixels', 0)
+                if total_h > pf['max_hansen_total']:
+                    continue
+            if pf.get('min_hansen_total') is not None:
+                total_h = hansen.get('total_pixels', 0)
+                if total_h < pf['min_hansen_total']:
+                    continue
+
             # Elevation filter
             elev = pd.get('elevation_m')
             if elev is not None:
@@ -1096,9 +1135,12 @@ def landscape_parcel_query(compound_filters: dict,
     sort_funcs = {
         'conservation_score': lambda e: e.get('conservation_score', 0),
         'vegetated_fraction': lambda e: (e.get('landscape') or {}).get('vegetated_fraction', 0) or 0,
+        'forested_fraction': lambda e: (e.get('landscape') or {}).get('forested_fraction', 0) or 0,
         'elevation': lambda e: e.get('elevation_m') or 0,
         'ndsm_max': lambda e: (e.get('landscape') or {}).get('ndsm_max_m', 0) or 0,
         'parcel_area': lambda e: e.get('landscape', {}).get('area_summary', {}).get('tree', {}).get('area_sqm', 0),
+        'hansen_recent': lambda e: (e.get('landscape') or {}).get('hansen_loss', {}).get('recent_5yr_pixels', 0),
+        'hansen_total': lambda e: (e.get('landscape') or {}).get('hansen_loss', {}).get('total_pixels', 0),
     }
     sort_fn = sort_funcs.get(sort_key, sort_funcs['conservation_score'])
     all_parcels.sort(key=sort_fn, reverse=sort_desc)

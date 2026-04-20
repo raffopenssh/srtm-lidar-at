@@ -4294,6 +4294,13 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         vpx = sum(v for k, v in tc_.items() if k in veg); tpx = max(int(pm.sum()), 1)
         result['vegetated_fraction'] = round(vpx / tpx, 4)
         result['is_vegetated'] = vpx / tpx > 0.5
+        # Forested fraction
+        _forest_types = {'tree', 'shrub'}
+        fpx = sum(v for k, v in tc_.items() if k in _forest_types)
+        result['forested_fraction'] = round(fpx / tpx, 4)
+        # Dominant type
+        if tc_:
+            result['dominant_type'] = tc_.most_common(1)[0][0]
         vh = pn[np.isfinite(pn)]
         if len(vh) > 0:
             result['ndsm_max_m'] = round(float(np.max(vh)), 2)
@@ -4356,9 +4363,46 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             pass
         return None
 
+    # --- STRtree centroid-in-polygon: object → parcel assignment ---
+    # Used as fallback when raster-based _parcel_segment_stats doesn't fire,
+    # and for Hansen per-parcel enrichment which isn't raster-based.
+    _FOREST_TYPES = {'tree', 'shrub'}
+    _VEGETATED_TYPES = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard',
+                        'vineyard', 'garden'}
+    _parcel_obj_map = defaultdict(list)  # parcel_idx → [obj, ...]
+    if objects and cadastre_data["parcels"]:
+        try:
+            from shapely import STRtree
+            from shapely.geometry import Point
+            parcel_geoms = [p["geometry"] for p in cadastre_data["parcels"]]
+            tree = STRtree(parcel_geoms)
+            for obj in objects:
+                pt = Point(obj.centroid_e, obj.centroid_n)
+                idx = tree.nearest(pt)
+                # Verify containment (nearest isn't necessarily containing)
+                if parcel_geoms[idx].contains(pt):
+                    _parcel_obj_map[idx].append(obj)
+            log.info("JSON: STRtree assigned %d/%d objects to %d parcels",
+                     sum(len(v) for v in _parcel_obj_map.values()),
+                     len(objects), len(_parcel_obj_map))
+        except Exception as e:
+            log.warning("JSON: STRtree parcel assignment failed: %s", e)
+
+    # --- Per-parcel Hansen: build raster lookup per tile ---
+    # hansen_info["loss_years"] is a list of arrays, but they lack geo-referencing.
+    # Instead, use hansen_loss_year stored in tile_seg_results (same transform/shape).
+    _hansen_tile_data = []  # list of (bounds_3035, loss_year_array, transform, shape)
+    for tr in tile_seg_results:
+        ly = tr.get("hansen_loss_year")
+        if ly is not None:
+            _hansen_tile_data.append((
+                tr["bounds_3035"], ly, tr["transform"], tr["shape"]
+            ))
+
     # --- Per-parcel detail ---
     parcel_details = []
     n_parcel_no_tile = 0
+    _parcel_idx_by_id = {id(p): i for i, p in enumerate(cadastre_data["parcels"])}
     for p in cadastre_data["parcels"]:
         pd = {"parcel_id": p["parcel_id"], "area_sqm": round(p.get("area_sqm",0), 1)}
         geom_3035 = p["geometry"]
@@ -4456,12 +4500,105 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     pss = _parcel_segment_stats(geom_3035, tr["labels"], tdata["ndsm"],
                                                 tdata["transform"], tdata["shape"])
                     pd.update(pss)
+                # STRtree fallback: if _parcel_segment_stats didn't produce area_summary
+                if 'area_summary' not in pd:
+                    p_idx = _parcel_idx_by_id[id(p)]
+                    p_objs = _parcel_obj_map.get(p_idx, [])
+                    if p_objs:
+                        tc_f = Counter()
+                        th_f = defaultdict(list)
+                        for obj in p_objs:
+                            tc_f[obj.obj_type] += int(obj.area_sqm)
+                            th_f[obj.obj_type].append(obj.height_max)
+                        tpx_f = max(sum(tc_f.values()), 1)
+                        pd['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx_f, 4)}
+                                              for t, px in tc_f.most_common()}
+                        pd['height_distribution'] = {
+                            t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
+                                'mean': round(sum(hs) / len(hs), 2)}
+                            for t, hs in th_f.items() if hs}
+                        vpx = sum(v for k, v in tc_f.items() if k in _VEGETATED_TYPES)
+                        pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
+                        pd['is_vegetated'] = vpx / tpx_f > 0.5
+                        fpx = sum(v for k, v in tc_f.items() if k in _FOREST_TYPES)
+                        pd['forested_fraction'] = round(fpx / tpx_f, 4)
+                        pd['dominant_type'] = tc_f.most_common(1)[0][0] if tc_f else None
+                        hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
+                        if hmax_vals:
+                            pd['ndsm_max_m'] = round(max(hmax_vals), 2)
+                        cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(tc_f))
+                        if cls:
+                            pd['classification'] = cls
+                # Ensure forested_fraction and dominant_type are always present
+                if 'area_summary' in pd and 'forested_fraction' not in pd:
+                    as_ = pd['area_summary']
+                    tpx_a = max(sum(v.get('area_sqm', 0) for v in as_.values()), 1)
+                    fpx_a = sum(v.get('area_sqm', 0) for k, v in as_.items() if k in _FOREST_TYPES)
+                    pd['forested_fraction'] = round(fpx_a / tpx_a, 4)
+                if 'area_summary' in pd and 'dominant_type' not in pd:
+                    as_ = pd['area_summary']
+                    if as_:
+                        pd['dominant_type'] = max(as_, key=lambda t: as_[t].get('area_sqm', 0))
+                # Per-parcel Hansen forest loss
+                if _hansen_tile_data and 'hansen_loss' not in pd:
+                    try:
+                        from rasterio.features import rasterize as _hz_rasterize
+                        for h_bounds, h_ly, h_tf, h_shape in _hansen_tile_data:
+                            h_left, h_bot, h_right, h_top = h_bounds
+                            c3 = geom_3035.centroid
+                            if h_left <= c3.x <= h_right and h_bot <= c3.y <= h_top:
+                                hm = _hz_rasterize([(geom_3035, 1)], out_shape=h_shape,
+                                                   transform=h_tf, fill=0, dtype=np.uint8,
+                                                   all_touched=True).astype(bool)
+                                hl = h_ly[hm]
+                                hl = hl[hl > 0]
+                                if len(hl) > 0:
+                                    per_yr = Counter(int(y) for y in hl)
+                                    pd['hansen_loss'] = {
+                                        'total_pixels': int(len(hl)),
+                                        'by_year': {str(2000 + yr): int(cnt)
+                                                    for yr, cnt in sorted(per_yr.items())},
+                                    }
+                                    # Recent loss (last 5 years)
+                                    recent = sum(cnt for yr, cnt in per_yr.items() if yr >= 20)
+                                    pd['hansen_loss']['recent_5yr_pixels'] = recent
+                                break
+                    except Exception:
+                        pass
             else:
                 n_parcel_no_tile += 1
                 # Fallback: direct DTM point read
                 elev = _point_elevation_fallback(c3.x, c3.y)
                 if elev is not None:
                     pd["elevation_m"] = elev
+                # STRtree fallback for parcels outside all tile bounds
+                p_idx = _parcel_idx_by_id[id(p)]
+                p_objs = _parcel_obj_map.get(p_idx, [])
+                if p_objs:
+                    tc_f = Counter()
+                    th_f = defaultdict(list)
+                    for obj in p_objs:
+                        tc_f[obj.obj_type] += int(obj.area_sqm)
+                        th_f[obj.obj_type].append(obj.height_max)
+                    tpx_f = max(sum(tc_f.values()), 1)
+                    pd['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx_f, 4)}
+                                          for t, px in tc_f.most_common()}
+                    pd['height_distribution'] = {
+                        t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
+                            'mean': round(sum(hs) / len(hs), 2)}
+                        for t, hs in th_f.items() if hs}
+                    vpx = sum(v for k, v in tc_f.items() if k in _VEGETATED_TYPES)
+                    pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
+                    pd['is_vegetated'] = vpx / tpx_f > 0.5
+                    fpx = sum(v for k, v in tc_f.items() if k in _FOREST_TYPES)
+                    pd['forested_fraction'] = round(fpx / tpx_f, 4)
+                    pd['dominant_type'] = tc_f.most_common(1)[0][0] if tc_f else None
+                    hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
+                    if hmax_vals:
+                        pd['ndsm_max_m'] = round(max(hmax_vals), 2)
+                    cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(tc_f))
+                    if cls:
+                        pd['classification'] = cls
         except Exception as e:
             log.debug("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
@@ -5694,6 +5831,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 "ndsm": t_ndsm,
                 "mask": t_mask,
                 "bbox_wgs": (tw, ts, te, tn),
+                "hansen_loss_year": hansen_data.get("loss_year") if hansen_data else None,
             })
             total_seg_pixels += tvalid
 

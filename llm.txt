@@ -702,7 +702,9 @@ Response for single KG (kg= or query_kg):
 
   Per-parcel details (parcels.details[]): parcel_id, area_sqm, centroid, elevation_m,
     area_summary (type→{area_sqm,fraction}), height_distribution, vegetated_fraction,
+    forested_fraction (tree+shrub, 0–1), dominant_type (highest-area type),
     is_vegetated, ndsm_max_m, ndsm_mean_m, classification,
+    hansen_loss: {total_pixels, recent_5yr_pixels, by_year: {"2001": N, ...}},
     elevation_min_m, elevation_max_m, elevation_range_m,
     slope_mean_deg, aspect_mean_deg, aspect_dominant,
     tri_mean, tpi_mean, terrain_class,
@@ -1317,6 +1319,50 @@ Params: q (required), type (plz|gemeinde|kg|ortschaft), limit (default 20)
 Example: /api/v1/lookup?q=Kofla → finds "Köflach"
 Example: /api/v1/lookup?q=8580 → finds PLZ 8580 entries
 
+### GET /api/v1/query/parcels ← FAST PER-PARCEL INDEX QUERY
+Direct SQL query over the kg_parcels index table. No JSON loading or GPKG access.
+Returns parcels matching attribute + building + spatial filters in <50ms.
+
+Parcel attribute filters:
+  kg=<code>                         Filter by KG code
+  state=<name|code>                 Bundesland filter
+  district=<name|code>              Bezirk filter
+  gemeinde=<name|code>              Gemeinde filter
+  bbox=<w,s,e,n>                    Spatial bbox
+  min_area / max_area               Parcel area (m²)
+  min_elevation / max_elevation     Elevation (m)
+  min_slope / max_slope             Slope (degrees)
+  min_tri / max_tri                 Terrain Roughness Index
+  terrain_class=<str>               level|nearly_level|slightly_rugged|intermediately_rugged|moderately_rugged|highly_rugged|extremely_rugged
+  aspect=<N,NE,E,SE,S,SW,W,NW>     Comma-separated aspect directions
+  dominant_type=<str>               Dominant segment type (tree/grass/roof/crop/...)
+  min_vegetated_fraction / max_vegetated_fraction   0–1
+  min_forested_fraction / max_forested_fraction     0–1 (tree+shrub only)
+  min_ndsm_max / max_ndsm_max      Max nDSM height on parcel (m)
+  is_vegetated=true/false           Boolean vegetation flag
+  min_confidence / min_rf_confidence  Classification confidence thresholds
+  max_hansen_recent_5yr / min_hansen_recent_5yr   Hansen loss pixels (2020–2024)
+  max_hansen_total / min_hansen_total             Hansen loss pixels (all years)
+  building_roof_type=pitched/flat   Parcel must contain a building with this roof type
+  building_min_stories / building_max_stories      Building stories filter
+  sort=<col>                        Sort: elevation_m|area_sqm|slope_mean_deg|tri_mean|vegetated_fraction|forested_fraction|ndsm_max_m|hansen_recent_5yr_pixels|hansen_total_pixels|mean_confidence|rf_mean_confidence
+  sort_dir=asc/desc                 Default: desc
+  limit / offset                    Pagination (default 100, max 1000)
+
+Returns: {total, offset, limit, results: [{kg_code, parcel_id, area_sqm, centroid_lon, centroid_lat, elevation_m, slope_mean_deg, terrain_class, aspect_dominant, vegetated_fraction, forested_fraction, dominant_type, ndsm_max_m, hansen_total_pixels, hansen_recent_5yr_pixels, ...}]}
+
+Examples:
+```
+# 1-storey pitched-roof house, south slope >17°, <5000m², >900m, low recent deforestation
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?building_roof_type=pitched&building_max_stories=1&aspect=S,SE,SW&min_slope=17&max_area=5000&min_elevation=900&max_hansen_recent_5yr=5&sort=elevation_m&sort_dir=desc&limit=100'
+
+# Highly forested parcels above 1500m with little disturbance
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_forested_fraction=0.7&min_elevation=1500&max_hansen_total=10&sort=forested_fraction&sort_dir=desc'
+
+# Large grassy parcels in Vorarlberg
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Vorarlberg&dominant_type=grass&min_area=10000&sort=area_sqm&sort_dir=desc'
+```
+
 ### GET|POST /api/v1/parcels/batch ← BATCH PARCEL ENRICHMENT
 Accepts GET (query params) or POST (JSON body). Three modes:
 
@@ -1439,8 +1485,12 @@ parcel_filters (per-parcel from our KG JSONs):
     [{"type": "tree", "max_diverged_pct": 10}]                 low divergence
     Each dict keys: type (required), min_confidence, min_rf_confidence,
       min_area_sqm, min_fraction, min_rf_count, min_rules_count, max_diverged_pct
+  min_forested_fraction, max_forested_fraction (0–1, tree+shrub fraction),
+  dominant_type (str, required type to dominate parcel),
+  min_hansen_recent_5yr, max_hansen_recent_5yr (int, Hansen 2020–2024 loss pixels),
+  min_hansen_total, max_hansen_total (int, Hansen all-time loss pixels),
   cadastre_has_buildings, cadastre_landuse, cadastre_min_area, cadastre_max_area,
-  sort (conservation_score|vegetated_fraction|elevation|ndsm_max|parcel_area),
+  sort (conservation_score|vegetated_fraction|forested_fraction|elevation|ndsm_max|parcel_area|hansen_recent|hansen_total),
   sort_dir (asc|desc)
 
 Per-parcel classification data (from our KG JSON classification.by_type.{type}):
@@ -1462,6 +1512,9 @@ GET syntax for Mode 3 (compound → parcels):
   Compound filters: flat query params (state=, min_slope=, type_filter=, etc.)
   Parcel filters: pf_ prefix (pf_aspect=, pf_terrain_class=, pf_min_vegetated_fraction=, etc.)
   pf_types=tree,grass  pf_aspect=E,SE (comma-separated)
+  pf_dominant_type=tree  pf_min_forested_fraction=0.5
+  pf_min_hansen_recent_5yr=0  pf_max_hansen_recent_5yr=5
+  pf_min_hansen_total=0  pf_max_hansen_total=50
   pf_type_confidence=tree:0.7:500 (repeatable, type:min_confidence:min_area_sqm)
   pf_is_vegetated=true  pf_cadastre_has_buildings=false
   pf_sort=conservation_score  pf_sort_dir=desc

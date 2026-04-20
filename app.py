@@ -1751,7 +1751,7 @@ def _parse_parcel_filters_from_args(args):
     pf = {}
 
     # String params
-    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse', 'roof_type'):
+    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse', 'roof_type', 'dominant_type'):
         pk = f'pf_{k}'
         if pk in args:
             pf[k] = args[pk]
@@ -1771,6 +1771,7 @@ def _parse_parcel_filters_from_args(args):
     # Numeric params
     _pf_numeric = [
         'min_vegetated_fraction', 'max_vegetated_fraction',
+        'min_forested_fraction', 'max_forested_fraction',
         'min_elevation', 'max_elevation',
         'min_type_fraction', 'min_ndsm_max', 'max_ndsm_max',
         'min_parcel_area', 'max_parcel_area',
@@ -1778,8 +1779,11 @@ def _parse_parcel_filters_from_args(args):
         'min_confidence', 'min_rf_confidence',
         'cadastre_min_area', 'cadastre_max_area',
         'min_stories', 'max_stories',
+        'min_hansen_recent_5yr', 'max_hansen_recent_5yr',
+        'min_hansen_total', 'max_hansen_total',
     ]
-    _pf_int = {'min_stories', 'max_stories'}
+    _pf_int = {'min_stories', 'max_stories', 'min_hansen_recent_5yr',
+               'max_hansen_recent_5yr', 'min_hansen_total', 'max_hansen_total'}
     for k in _pf_numeric:
         pk = f'pf_{k}'
         if pk in args:
@@ -1808,6 +1812,104 @@ def _parse_parcel_filters_from_args(args):
         pf['type_confidence'] = type_confidence
 
     return pf
+
+
+@app.route('/api/v1/query/parcels')
+def api_query_parcels():
+    """Query parcels from the search index (fast SQL, no GPKG/JSON load).
+
+    Supports all per-parcel landscape attributes plus building join filters.
+    This is the endpoint for complex cross-KG parcel queries like:
+    "Show parcels with a 1-storey pitched-roof building, south-facing >30% slope,
+     <5000 sqm, above 900m, with little deforestation in the last 5 years."
+
+    Params:
+      kg=<code>                   Filter by KG code
+      state=<name|code>           Filter by Bundesland
+      district=<name|code>        Filter by Bezirk
+      gemeinde=<name|code>        Filter by Gemeinde
+      bbox=<w,s,e,n>              Spatial bbox filter
+      min_area / max_area         Parcel area m²
+      min_elevation / max_elevation  Elevation m
+      min_slope / max_slope       Slope degrees
+      min_tri / max_tri           Terrain Roughness Index
+      terrain_class=<str>         level / nearly_level / slightly_rugged / ...
+      aspect=<N,NE,E,SE,S,SW,W,NW>  Comma-separated aspect filter
+      dominant_type=<str>         Dominant segment type (tree/grass/roof/...)
+      min_vegetated_fraction / max_vegetated_fraction   0-1
+      min_forested_fraction / max_forested_fraction     0-1
+      min_ndsm_max / max_ndsm_max                      nDSM max height m
+      is_vegetated=true/false     Vegetation boolean
+      min_confidence              Min mean classification confidence
+      min_rf_confidence           Min RF classification confidence
+      max_hansen_recent_5yr       Max recent 5-year forest loss pixels
+      min_hansen_recent_5yr       Min recent 5-year forest loss pixels
+      max_hansen_total            Max total forest loss pixels
+      min_hansen_total            Min total forest loss pixels
+      building_roof_type=pitched/flat  Parcel must contain matching building
+      building_min_stories=<N>    Building stories filter
+      building_max_stories=<N>    Building stories filter
+      sort=<col>                  Sort column (default: elevation_m)
+      sort_dir=asc/desc           Sort direction (default: desc)
+      limit=<N>                   Max results (default 100, max 1000)
+      offset=<N>                  Pagination offset
+    """
+    try:
+        idx = si.get_index()
+        args = request.args
+        limit = min(int(args.get('limit', 100)), 1000)
+        offset = int(args.get('offset', 0))
+
+        # Parse bbox
+        bbox = None
+        if args.get('bbox'):
+            parts = [float(x) for x in args['bbox'].split(',')]
+            if len(parts) == 4:
+                bbox = tuple(parts)
+
+        # Numeric params
+        _num = {
+            'min_area': float, 'max_area': float,
+            'min_elevation': float, 'max_elevation': float,
+            'min_slope': float, 'max_slope': float,
+            'min_tri': float, 'max_tri': float,
+            'min_vegetated_fraction': float, 'max_vegetated_fraction': float,
+            'min_forested_fraction': float, 'max_forested_fraction': float,
+            'min_ndsm_max': float, 'max_ndsm_max': float,
+            'min_confidence': float, 'min_rf_confidence': float,
+            'max_hansen_recent_5yr': int, 'min_hansen_recent_5yr': int,
+            'max_hansen_total': int, 'min_hansen_total': int,
+            'building_min_stories': int, 'building_max_stories': int,
+        }
+        kwargs = {}
+        for k, conv in _num.items():
+            if k in args:
+                try:
+                    kwargs[k] = conv(args[k])
+                except ValueError:
+                    pass
+
+        result = idx.query_parcels_index(
+            kg_code=args.get('kg'),
+            terrain_class=args.get('terrain_class'),
+            aspect=args.get('aspect'),
+            dominant_type=args.get('dominant_type'),
+            building_roof_type=args.get('building_roof_type'),
+            is_vegetated=args.get('is_vegetated', '').lower() in ('true', '1') if 'is_vegetated' in args else None,
+            state=args.get('state'),
+            district=args.get('district'),
+            gemeinde=args.get('gemeinde'),
+            bbox=bbox,
+            sort=args.get('sort', 'elevation_m'),
+            sort_dir=args.get('sort_dir', 'desc'),
+            limit=limit,
+            offset=offset,
+            **kwargs,
+        )
+        return jsonify(result)
+    except Exception as e:
+        log.exception('query_parcels error')
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/v1/query/compound', methods=['GET', 'POST'])

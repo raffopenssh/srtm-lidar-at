@@ -32,7 +32,7 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 ### Search Index
 | File | Purpose |
 |------|----------|
-| `search_index.py` | SQLite FTS5 + R-tree index over all 8440 KGs. Spatial/text/admin/aggregate queries <25ms. Auto-rebuilds on new JSONs. |
+| `search_index.py` | SQLite FTS5 + R-tree index over all 8440 KGs + per-parcel `kg_parcels` table. Spatial/text/admin/aggregate/parcel queries <50ms. Auto-rebuilds on new JSONs. |
 
 ### Cross-API Bridge
 | File | Purpose |
@@ -165,6 +165,7 @@ Contain: UI state + analysis result + cached overlay images.
 | Method | Path | Purpose |
 |--------|------|----------|
 | GET | `/api/v1/lookup` | Cadastre EDM lookup proxy (diacritics-insensitive) |
+| GET | `/api/v1/query/parcels` | Fast SQL per-parcel index query — attribute + building + spatial filters, <50ms |
 | GET\|POST | `/api/v1/parcels/batch` | Batch parcel enrichment — explicit IDs or query-based (GET uses query params with pf_ prefix for parcel filters) |
 | GET | `/api/v1/parcels/landscape` | Query parcels with landscape filters (GET version of batch) |
 | GET | `/api/v1/query/nature` | Nature conservation opportunity finder (conservation score 0-100) |
@@ -195,9 +196,13 @@ tree_volume), vegetation (ndvi, vegetated_fraction, shannon_diversity), NDVI har
 classification quality (confidence, rf_confidence, diverged_pct, rf_diverged_count,
 rf_classified_pct, quality_score)
 
-Parcel filters: `min_vegetated_fraction`, `types`, `min_type_fraction`, `min_ndsm_max`,
-`min_elevation`, `min_parcel_area`, `is_vegetated`, `min_rf_confidence`,
-`cadastre_has_buildings`, `cadastre_landuse`, `cadastre_min_area`, `sort`, `sort_dir`
+Parcel filters: `min_vegetated_fraction`, `max_vegetated_fraction`, `min_forested_fraction`,
+`max_forested_fraction`, `dominant_type`, `types`, `min_type_fraction`, `min_ndsm_max`,
+`min_elevation`, `max_elevation`, `min_slope`, `max_slope`, `min_parcel_area`,
+`max_parcel_area`, `is_vegetated`, `min_rf_confidence`, `min_confidence`,
+`min_hansen_recent_5yr`, `max_hansen_recent_5yr`, `min_hansen_total`, `max_hansen_total`,
+`cadastre_has_buildings`, `cadastre_landuse`, `cadastre_min_area`, `roof_type`,
+`min_stories`, `max_stories`, `sort`, `sort_dir`
 
 Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
 Auto-rebuilt on startup and when new KG JSONs appear (60s poll).

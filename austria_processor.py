@@ -63,7 +63,7 @@ TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 
 MAX_KG_PIXELS = 4_000_000
-KG_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours — real errors abort early; timeout only catches silent hangs
+KG_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — real errors abort early; timeout only catches silent hangs
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup

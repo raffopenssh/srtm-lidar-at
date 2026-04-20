@@ -763,10 +763,19 @@ def get_ndvi_timeseries(
 
     def _download_month_sequential(label, m_start, m_end, month_cache):
         """Download a single month's NDVI using the current credential.
-        Returns (label, error_or_None)."""
+        Returns (label, error_or_None).
+
+        On transient 402 errors (credential probes OK but download fails),
+        retries up to 3 times with backoff, then rotates to a different
+        credential and retries again.  Gives up only after all credentials
+        have been tried."""
         import time as _time
-        max_retries = 3
-        for attempt in range(max_retries + 1):
+        max_retries_per_cred = 3
+        tried_creds: set[int] = set()  # credentials already exhausted via retries
+        attempt = 0
+        last_exc: Exception | None = None
+
+        while True:
             if credits_exhausted:
                 return label, CreditsExhaustedError("all exhausted")
             try:
@@ -801,16 +810,16 @@ def get_ndvi_timeseries(
                 return label, None
             except CredentialRotatedError:
                 logger.info("NDVI %s: credential rotated, retrying", label)
+                attempt = 0  # reset attempts for fresh credential
                 continue
             except CreditsExhaustedError as exc:
                 logger.error("NDVI %s: all credentials exhausted", label)
                 return label, exc
             except Exception as exc:
+                last_exc = exc
                 exc_str = str(exc)
 
                 # --- No data / overcast month detection ---
-                # openEO returns various errors when a month has no valid
-                # pixels after cloud masking (fully overcast).
                 is_nodata = False
                 nodata_patterns = [
                     'EmptyBounds', 'empty collection', 'no data available',
@@ -820,7 +829,6 @@ def get_ndvi_timeseries(
                     if pat.lower() in exc_str.lower():
                         is_nodata = True
                         break
-                # Also treat empty-file errors as no-data
                 if 'download produced empty file' in exc_str:
                     is_nodata = True
 
@@ -829,33 +837,57 @@ def get_ndvi_timeseries(
                         "NDVI %s: no cloud-free data available (likely overcast) — skipping",
                         label,
                     )
-                    return label, None  # not an error, just no data
+                    return label, None
 
                 # --- Handle 402 PaymentRequired ---
                 if '402' in exc_str and 'PaymentRequired' in exc_str:
-                    # Let _check_credits_error probe + rotate if needed
                     try:
                         _check_credits_error(exc)
-                        # Probe passed — transient 402.  Retry with backoff.
-                        if attempt < max_retries:
-                            wait_secs = 10 * (attempt + 1)
+                        # Probe passed — transient 402.
+                        attempt += 1
+                        if attempt < max_retries_per_cred:
+                            wait_secs = 10 * attempt
                             logger.warning(
                                 "NDVI %s: transient 402 (attempt %d/%d), "
                                 "backoff %ds...",
-                                label, attempt + 1, max_retries, wait_secs,
+                                label, attempt, max_retries_per_cred,
+                                wait_secs,
                             )
                             _time.sleep(wait_secs)
                             continue
-                    except CredentialRotatedError:
-                        # Rotated to fresh credential — retry immediately
-                        logger.info("NDVI %s: credential exhausted, rotated to next", label)
-                        if attempt < max_retries:
+                        # Exhausted retries on this credential — rotate.
+                        tried_creds.add(_credential_index)
+                        old_idx = _credential_index
+                        # Keep rotating until we find an untried credential
+                        found_fresh = False
+                        for _ in range(len(_CREDENTIALS)):
+                            rotated = rotate_credentials()
+                            if not rotated:
+                                break  # only 1 credential
+                            if _credential_index not in tried_creds:
+                                found_fresh = True
+                                break
+                        if found_fresh:
+                            logger.warning(
+                                "NDVI %s: transient 402 persisted after %d "
+                                "retries on credential %d — rotated to "
+                                "credential %d, retrying",
+                                label, max_retries_per_cred, old_idx + 1,
+                                _credential_index + 1,
+                            )
+                            attempt = 0  # fresh retries on new credential
                             continue
+                        # All credentials tried — give up.
+                    except CredentialRotatedError:
+                        logger.info("NDVI %s: credential exhausted, rotated to next", label)
+                        attempt = 0
+                        continue
                     except CreditsExhaustedError as ce:
                         return label, ce
                     logger.warning(
-                        "NDVI %s: persistent 402 after %d retries — skipping month",
-                        label, max_retries,
+                        "NDVI %s: persistent 402 after retries on %d credential(s) "
+                        "— skipping month",
+                        label, max(len(tried_creds), 1),
                     )
                     return label, exc
 
@@ -868,8 +900,9 @@ def get_ndvi_timeseries(
                     or "Server error" in exc_str
                     or "max connections" in exc_str
                 )
-                if _retryable and attempt < max_retries:
-                    wait_secs = 15 * (attempt + 1)
+                if _retryable and attempt < max_retries_per_cred:
+                    attempt += 1
+                    wait_secs = 15 * attempt
                     _reason = (
                         '429' if '429' in exc_str
                         else '500' if ('500' in exc_str or 'Internal' in exc_str or 'Server error' in exc_str)
@@ -878,7 +911,7 @@ def get_ndvi_timeseries(
                     logger.warning(
                         "NDVI %s: server error (%s), retry %d/%d in %ds...",
                         label, _reason,
-                        attempt + 1, max_retries, wait_secs,
+                        attempt, max_retries_per_cred, wait_secs,
                     )
                     _time.sleep(wait_secs)
                     continue
@@ -886,7 +919,8 @@ def get_ndvi_timeseries(
                 # --- Other errors — skip month ---
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
-        return label, Exception(f"NDVI {label}: retries exhausted")
+        # Should not reach here, but safety net
+        return label, last_exc or Exception(f"NDVI {label}: retries exhausted")
 
     if to_download:
         import time as _time

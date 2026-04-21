@@ -100,6 +100,12 @@ credits_exhausted: bool = False
 _credits_exhausted_at: Optional[str] = None  # ISO timestamp
 _exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 
+# IP-level throttle: all credentials return 402 but probes pass.
+# Unlike credits_exhausted (monthly cap), this recovers in ~2 hours.
+ip_throttled: bool = False
+_ip_throttled_at: float = 0  # monotonic timestamp
+_IP_THROTTLE_COOLDOWN = 7200  # 2 hours — observed recovery time
+
 # Short-term memory for NDVI months that recently failed with 500 (Spark timeout)
 # or persistent 402.  Key = (bbox_hash, month_label), value = expiry timestamp.
 # Skips re-downloading the same month for the same area within the cooldown period.
@@ -499,6 +505,19 @@ def _run_datacube(
         except OSError:
             pass
 
+    # Bail immediately if we're IP-throttled (all creds 402, recovers in ~2h)
+    global ip_throttled, _ip_throttled_at
+    import time as _time_check
+    if ip_throttled:
+        elapsed = _time_check.monotonic() - _ip_throttled_at
+        if elapsed < _IP_THROTTLE_COOLDOWN:
+            remaining_min = int((_IP_THROTTLE_COOLDOWN - elapsed) / 60)
+            raise RuntimeError(
+                f"Copernicus IP-throttled ({remaining_min}m remaining) — skipping")
+        else:
+            ip_throttled = False
+            logger.info("IP throttle cooldown expired — resuming Copernicus requests")
+
     # Skip sync for large areas — always times out, wastes 3 minutes
     skip_sync = False
     if bbox is not None:
@@ -558,7 +577,17 @@ def _run_datacube(
                     rotate_credentials()
                     _time.sleep(5)
                     continue
-                # If sync fails (e.g. too large), fall back to batch
+                # If 402 persisted after retry+rotation, we're IP-throttled.
+                # Don't waste time on batch (it'll 402 too).
+                if "402" in exc_str and "PaymentRequired" in exc_str:
+                    import time as _time2
+                    ip_throttled = True
+                    _ip_throttled_at = _time2.monotonic()
+                    logger.warning(
+                        "Copernicus IP-throttled (402 on %d credentials) "
+                        "— pausing openEO requests", attempt + 1)
+                    raise
+                # Other sync failures: fall back to batch
                 logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
                 break
 

@@ -5693,13 +5693,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             c_breaker["cooldown"] = min(600, 60 * (2 ** min(c_breaker["consecutive_failures"], 4)))
                         _write_circuit_breaker(c_breaker)
                     except Exception as e:
-                        from copernicus import CreditsExhaustedError
+                        from copernicus import CreditsExhaustedError, ip_throttled as _cop_throttled
                         if isinstance(e, CreditsExhaustedError) or \
                            isinstance(e.__cause__, CreditsExhaustedError):
                             log.error("KG %s: Copernicus credits exhausted", kg_code)
                             result["copernicus_exhausted"] = True
                             COPERNICUS_PAUSE_FILE.write_text(
                                 f"Credits exhausted at {datetime.now(timezone.utc).isoformat()}\n")
+                        elif _cop_throttled or 'IP-throttled' in str(e):
+                            log.warning("KG %s: Copernicus IP-throttled — "
+                                        "deferring remaining tiles", kg_code)
+                            result["copernicus_exhausted"] = True
+                            COPERNICUS_PAUSE_FILE.write_text(
+                                f"IP throttled at {datetime.now(timezone.utc).isoformat()}\n")
                         else:
                             log.warning("KG %s %s: Copernicus failed: %s",
                                         kg_code, tile_label, e)

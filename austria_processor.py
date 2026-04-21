@@ -4988,6 +4988,11 @@ def _fetch_copernicus_for_tile(
 
     def _try_fetch_single(bbox, label=""):
         """Attempt to fetch all Copernicus layers for one bbox."""
+        # Bail immediately if IP-throttled
+        import copernicus
+        if copernicus.ip_throttled:
+            from copernicus import IPThrottledError
+            raise IPThrottledError("Copernicus IP-throttled — skipping tile")
         cop = {}
 
         # NDVI composite (grid-snapped, usually fast)
@@ -5031,9 +5036,9 @@ def _fetch_copernicus_for_tile(
         if result is not None:
             return result
     except Exception as e:
-        from copernicus import CreditsExhaustedError
-        if isinstance(e, CreditsExhaustedError) or \
-           isinstance(e.__cause__, CreditsExhaustedError):
+        from copernicus import CreditsExhaustedError, IPThrottledError
+        if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+           isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
             raise
         log.warning("Copernicus full-tile fetch failed for %s: %s — trying sub-tiles",
                     tile_label, e)
@@ -5055,9 +5060,9 @@ def _fetch_copernicus_for_tile(
                 sr = _try_fetch_single(sb, label=sub_label)
                 sub_results.append((sb, sr))
             except Exception as e:
-                from copernicus import CreditsExhaustedError
-                if isinstance(e, CreditsExhaustedError) or \
-                   isinstance(e.__cause__, CreditsExhaustedError):
+                from copernicus import CreditsExhaustedError, IPThrottledError
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                     raise
                 log.warning("Copernicus quadrant %d/%d failed: %s",
                             si+1, n_pieces, e)
@@ -5693,19 +5698,28 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             c_breaker["cooldown"] = min(600, 60 * (2 ** min(c_breaker["consecutive_failures"], 4)))
                         _write_circuit_breaker(c_breaker)
                     except Exception as e:
-                        from copernicus import CreditsExhaustedError, ip_throttled as _cop_throttled
-                        if isinstance(e, CreditsExhaustedError) or \
-                           isinstance(e.__cause__, CreditsExhaustedError):
-                            log.error("KG %s: Copernicus credits exhausted", kg_code)
+                        from copernicus import CreditsExhaustedError, IPThrottledError, ip_throttled as _cop_throttled
+                        if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                           isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+                            log.error("KG %s: Copernicus throttled/exhausted — aborting KG for retry", kg_code)
                             result["copernicus_exhausted"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"copernicus_throttled_tile_{tile_idx+1}"
                             COPERNICUS_PAUSE_FILE.write_text(
-                                f"Credits exhausted at {datetime.now(timezone.utc).isoformat()}\n")
+                                f"Throttled at {datetime.now(timezone.utc).isoformat()}\n")
+                            # ABORT tile loop — completed tiles have checkpoints;
+                            # this tile will be re-processed on retry
+                            break
                         elif _cop_throttled or 'IP-throttled' in str(e):
-                            log.warning("KG %s: Copernicus IP-throttled — "
-                                        "deferring remaining tiles", kg_code)
+                            log.warning("KG %s: Copernicus IP-throttled — aborting KG for retry", kg_code)
                             result["copernicus_exhausted"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"copernicus_throttled_tile_{tile_idx+1}"
                             COPERNICUS_PAUSE_FILE.write_text(
                                 f"IP throttled at {datetime.now(timezone.utc).isoformat()}\n")
+                            break
                         else:
                             log.warning("KG %s %s: Copernicus failed: %s",
                                         kg_code, tile_label, e)
@@ -5944,6 +5958,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _tile_entry["n_objects"] = len(core_objects)
             _report_step(f"tile_{tile_idx+1}",
                          f"done: {len(core_objects)} objects")
+
+        # --- Abort early if Copernicus throttled mid-KG ---
+        if result.get("copernicus_exhausted") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to Copernicus throttle — "
+                        "tile checkpoints preserved for retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_copernicus"
+            return result
 
         # --- 4. Merge terrain stats ---
         terrain_stats = _merge_terrain_stats(terrain_stats_list)
@@ -6722,6 +6744,7 @@ def _copernicus_probe() -> bool:
     try:
         import copernicus
         copernicus.credits_exhausted = False
+        copernicus.ip_throttled = False  # Reset throttle flag for fresh probe
         copernicus._connection = None
         for k in list(copernicus._connections.keys()):
             copernicus._connections.pop(k, None)
@@ -7399,6 +7422,9 @@ def main():
                     progress.add_log("warning",
                                      f"KG {kg_code}: credits exhausted — not marking failed",
                                      kg_code)
+                    # Re-queue for retry after pause ends (tile checkpoints preserved)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
                 else:
                     _err = result.get("error", "unknown")
                     _stp = result.get("step", "unknown")

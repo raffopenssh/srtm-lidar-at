@@ -130,6 +130,11 @@ class CreditsExhaustedError(Exception):
     pass
 
 
+class IPThrottledError(RuntimeError):
+    """Raised when Copernicus API is IP-level rate-limited (all credentials 402)."""
+    pass
+
+
 class CredentialRotatedError(Exception):
     """Raised when a 402 was handled by rotating to a fresh credential.
     Callers should rebuild their connection/datacube and retry."""
@@ -165,8 +170,7 @@ def _probe_credential(cred_index: int) -> bool:
 
 
 def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
-    """If *exc* is a 402 PaymentRequired, mark the credential as exhausted
-    and rotate to the next one.
+    """If *exc* is a 402 PaymentRequired, handle credential rotation.
 
     Parameters
     ----------
@@ -176,10 +180,17 @@ def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
         The credential index that caused the 402.  If None, uses the
         global ``_credential_index``.
 
-    - If a fresh credential is available: raise ``CredentialRotatedError``
-      so callers can rebuild their datacube and retry.
-    - If ALL credentials are exhausted: raise ``CreditsExhaustedError``.
-    - If the exception is not a 402: do nothing (return silently).
+    Probes the credential to distinguish transient rate-limits from
+    genuine credit exhaustion:
+
+    - **Probe passes** (transient 402): rotate to the next credential
+      and raise ``CredentialRotatedError`` so the ``@_retry_on_rotation``
+      decorator rebuilds the connection + datacube with a fresh credential.
+      The credential is NOT marked exhausted.
+    - **Probe fails** (genuine exhaustion): mark the credential exhausted,
+      rotate, and raise ``CredentialRotatedError``.
+    - **All credentials exhausted**: raise ``CreditsExhaustedError``.
+    - **Not a 402**: return silently.
     """
     global credits_exhausted, _credits_exhausted_at, _credential_index
     msg = str(exc)
@@ -192,13 +203,17 @@ def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
 
     # Probe OUTSIDE the lock (network call — don't block other threads)
     if openeo is not None and _probe_credential(idx):
-        # Credential is still healthy — don't mark exhausted.
-        # Invalidate the cached connection for this cred so it reconnects.
+        # Credential is still healthy — transient rate-limit.
+        # Rotate to next credential so the decorator retries with it.
         with _cred_lock:
             _connections.pop(idx, None)
-        logger.info("Credential %d probe passed — not marking exhausted (transient 402)",
-                    idx + 1)
-        return  # caller should retry
+            rotate_credentials(_locked=True)
+        logger.info("Credential %d probe passed — transient 402, rotated to %d/%d",
+                    idx + 1, _credential_index + 1, len(_CREDENTIALS))
+        raise CredentialRotatedError(
+            f"Transient 402 on credential {idx + 1}, "
+            f"rotated to {_credential_index + 1}/{len(_CREDENTIALS)}"
+        ) from exc
 
     # Probe failed — mark as exhausted under the lock
     with _cred_lock:
@@ -249,12 +264,17 @@ def _retry_on_rotation(fn):
     active) and reruns the function from scratch so it builds a new
     connection + datacube with the fresh credential.  Gives up after
     ``len(_CREDENTIALS)`` rotations.
+
+    After exhausting all credentials, checks whether any were genuinely
+    exhausted (probe failed).  If none were — all 402s were transient,
+    meaning IP-level rate-limiting — raises ``IPThrottledError`` and
+    sets the module-level ``ip_throttled`` flag.
     """
     import functools
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        global _connection
+        global _connection, ip_throttled, _ip_throttled_at
         for attempt in range(len(_CREDENTIALS) + 1):
             try:
                 return fn(*args, **kwargs)
@@ -263,9 +283,27 @@ def _retry_on_rotation(fn):
                 logger.info("Credential rotated — retrying %s (attempt %d/%d)",
                             fn.__name__, attempt + 2, len(_CREDENTIALS) + 1)
                 continue
-            except CreditsExhaustedError:
-                raise  # all credentials exhausted — propagate
-        # Should not reach here, but just in case
+            except (CreditsExhaustedError, IPThrottledError):
+                raise  # propagate immediately
+        # All credential rotation attempts exhausted.
+        # Check: were any credentials genuinely exhausted (probe-failed)?
+        with _cred_lock:
+            n_exhausted = len(_exhausted_cred_indices)
+        if n_exhausted == 0:
+            # All probes passed — every credential is healthy but 402'd.
+            # This is IP-level (or account-level) rate-limiting.
+            import time as _ip_time
+            ip_throttled = True
+            _ip_throttled_at = _ip_time.monotonic()
+            logger.warning(
+                "All %d credentials returned transient 402 for %s — "
+                "IP-throttled, pausing for %d min",
+                len(_CREDENTIALS), fn.__name__,
+                _IP_THROTTLE_COOLDOWN // 60)
+            raise IPThrottledError(
+                f"All {len(_CREDENTIALS)} credentials returned transient 402 "
+                f"for {fn.__name__} — IP-level rate limit"
+            )
         raise CreditsExhaustedError("All credential rotation attempts failed")
     return wrapper
 
@@ -512,7 +550,7 @@ def _run_datacube(
         elapsed = _time_check.monotonic() - _ip_throttled_at
         if elapsed < _IP_THROTTLE_COOLDOWN:
             remaining_min = int((_IP_THROTTLE_COOLDOWN - elapsed) / 60)
-            raise RuntimeError(
+            raise IPThrottledError(
                 f"Copernicus IP-throttled ({remaining_min}m remaining) — skipping")
         else:
             ip_throttled = False
@@ -527,69 +565,43 @@ def _run_datacube(
                         area, SYNC_AREA_THRESHOLD, title)
             skip_sync = True
 
-    # Try synchronous download first (faster for small areas)
-    # Retry once on 429 Too Many Requests
-    # Use a thread with timeout to avoid blocking workers indefinitely
+    # Try synchronous download first (faster for small areas).
+    # On 402, _check_credits_error raises CredentialRotatedError which
+    # propagates to @_retry_on_rotation — that rebuilds the connection +
+    # datacube with the next credential and retries.  After cycling all
+    # credentials it raises IPThrottledError (transient) or
+    # CreditsExhaustedError (genuine).  No manual rotation needed here.
     import time as _time
     import concurrent.futures
     SYNC_DOWNLOAD_TIMEOUT = 180  # 3 minutes max for synchronous download
 
     if not skip_sync:
-        for attempt in range(2):
-            logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
-                        output_path, SYNC_DOWNLOAD_TIMEOUT)
-            try:
+        logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
+                    output_path, SYNC_DOWNLOAD_TIMEOUT)
+        try:
+            _cleanup_tmp()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(datacube.download, str(tmp_path), format)
+                future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+            # Verify non-empty before committing
+            if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                tmp_path.rename(output_path)
+                logger.info("Synchronous download complete: %s", output_path)
+                return output_path
+            else:
                 _cleanup_tmp()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(datacube.download, str(tmp_path), format)
-                    future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
-                # Verify non-empty before committing
-                if tmp_path.exists() and tmp_path.stat().st_size > 0:
-                    tmp_path.rename(output_path)
-                    logger.info("Synchronous download complete: %s", output_path)
-                    return output_path
-                else:
-                    _cleanup_tmp()
-                    logger.warning("Synchronous download produced empty file, falling back to batch job")
-                    break
-            except concurrent.futures.TimeoutError:
-                _cleanup_tmp()
-                logger.warning("Synchronous download timed out after %ds, falling back to batch job",
-                              SYNC_DOWNLOAD_TIMEOUT)
-                break
-            except Exception as exc:
-                _cleanup_tmp()
-                _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
-                exc_str = str(exc)
-                is_rate_limited = (
-                    "429" in exc_str or "503" in exc_str
-                    or "max connections" in exc_str
-                    or ("402" in exc_str and "PaymentRequired" in exc_str)
-                )
-                if is_rate_limited and attempt == 0:
-                    reason = (
-                        '402' if '402' in exc_str
-                        else '429' if '429' in exc_str
-                        else '503'
-                    )
-                    logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
-                                  reason)
-                    rotate_credentials()
-                    _time.sleep(5)
-                    continue
-                # If 402 persisted after retry+rotation, we're IP-throttled.
-                # Don't waste time on batch (it'll 402 too).
-                if "402" in exc_str and "PaymentRequired" in exc_str:
-                    import time as _time2
-                    ip_throttled = True
-                    _ip_throttled_at = _time2.monotonic()
-                    logger.warning(
-                        "Copernicus IP-throttled (402 on %d credentials) "
-                        "— pausing openEO requests", attempt + 1)
-                    raise
-                # Other sync failures: fall back to batch
-                logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
-                break
+                logger.warning("Synchronous download produced empty file, falling back to batch job")
+        except concurrent.futures.TimeoutError:
+            _cleanup_tmp()
+            logger.warning("Synchronous download timed out after %ds, falling back to batch job",
+                          SYNC_DOWNLOAD_TIMEOUT)
+        except Exception as exc:
+            _cleanup_tmp()
+            # 402 → CredentialRotatedError (propagates to decorator) or
+            #        CreditsExhaustedError/IPThrottledError (propagates out)
+            _check_credits_error(exc)
+            # Not a 402 — fall back to batch
+            logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
 
     # Batch job fallback
     logger.info("Submitting batch job: %s", title)
@@ -702,6 +714,8 @@ def get_ndvi_composite(
     # Download
     try:
         _run_datacube(ndvi_composite, cache_file, title=f"NDVI composite {year}", bbox=bbox)
+    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+        raise  # let @_retry_on_rotation handle these
     except Exception as exc:
         logger.error("Failed to download NDVI composite: %s", exc)
         raise RuntimeError(f"NDVI composite download failed: {exc}") from exc
@@ -866,11 +880,21 @@ def get_ndvi_timeseries(
                     pass
                 return label, None
             except CredentialRotatedError:
-                logger.info("NDVI %s: credential rotated, retrying", label)
+                tried_creds.add(cred_idx)
+                if len(tried_creds) >= len(_CREDENTIALS):
+                    logger.warning("NDVI %s: 402 on all %d credentials — IP-throttled",
+                                   label, len(tried_creds))
+                    return label, IPThrottledError(
+                        f"NDVI {label}: all {len(_CREDENTIALS)} credentials 402")
+                logger.info("NDVI %s: credential rotated to %d, retrying",
+                            label, _credential_index + 1)
                 attempt = 0  # reset attempts for fresh credential
                 continue
             except CreditsExhaustedError as exc:
                 logger.error("NDVI %s: all credentials exhausted", label)
+                return label, exc
+            except IPThrottledError as exc:
+                logger.warning("NDVI %s: IP-throttled", label)
                 return label, exc
             except Exception as exc:
                 last_exc = exc
@@ -899,57 +923,28 @@ def get_ndvi_timeseries(
                 # --- Handle 402 PaymentRequired ---
                 if '402' in exc_str and 'PaymentRequired' in exc_str:
                     try:
+                        # _check_credits_error probes the credential, then:
+                        #   probe passes → CredentialRotatedError (transient 402)
+                        #   probe fails  → CredentialRotatedError (rotated to next)
+                        #   all exhausted → CreditsExhaustedError
                         _check_credits_error(exc)
-                        # Probe passed — transient 402.
-                        attempt += 1
-                        if attempt < max_retries_per_cred:
-                            wait_secs = 10 * attempt
-                            logger.warning(
-                                "NDVI %s: transient 402 (attempt %d/%d), "
-                                "backoff %ds...",
-                                label, attempt, max_retries_per_cred,
-                                wait_secs,
-                            )
-                            _time.sleep(wait_secs)
-                            continue
-                        # 402 is IP-level rate-limiting — rotating credentials
-                        # doesn't help (0/10 success rate observed in logs).
-                        # Try once through an HTTP proxy to change our IP.
-                        tried_creds.add(_credential_index)
-                        if not getattr(_download_month_sequential, '_proxy_tried', False):
-                            try:
-                                import bev_proxy
-                                proxy_url = bev_proxy.next_proxy()
-                                if proxy_url:
-                                    logger.info(
-                                        "NDVI %s: 402 on direct — retrying via proxy %s",
-                                        label, proxy_url,
-                                    )
-                                    c = _get_connection()
-                                    old_proxies = dict(c.session.proxies)
-                                    c.session.proxies = {"https": proxy_url, "http": proxy_url}
-                                    _download_month_sequential._proxy_tried = True
-                                    attempt = 0
-                                    continue
-                            except Exception as pe:
-                                logger.debug("Proxy setup failed: %s", pe)
                     except CredentialRotatedError:
-                        logger.info("NDVI %s: credential exhausted, rotated to next", label)
+                        tried_creds.add(cred_idx)
+                        if len(tried_creds) >= len(_CREDENTIALS):
+                            # All credentials tried — IP-level throttle
+                            logger.warning(
+                                "NDVI %s: 402 on all %d credentials — "
+                                "IP-throttled", label, len(tried_creds))
+                            return label, IPThrottledError(
+                                f"NDVI {label}: all {len(_CREDENTIALS)} "
+                                f"credentials returned 402")
+                        logger.info("NDVI %s: 402, rotated to credential %d",
+                                    label, _credential_index + 1)
                         attempt = 0
                         continue
                     except CreditsExhaustedError as ce:
                         return label, ce
-                    # Clear proxy if we set one
-                    try:
-                        c = _get_connection()
-                        c.session.proxies.clear()
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "NDVI %s: persistent 402 after retries%s — skipping month",
-                        label,
-                        " (incl. proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "",
-                    )
+                    # Should not reach here (402 always raises above)
                     return label, exc
 
                 # --- Handle 429 / 500 / 503 with backoff ---
@@ -1026,8 +1021,10 @@ def get_ndvi_timeseries(
                         progress_fn(n_done, n_total)
                     except Exception:
                         pass
-            elif isinstance(exc, CreditsExhaustedError):
-                logger.warning("Stopping NDVI downloads — credits exhausted")
+            elif isinstance(exc, (CreditsExhaustedError, IPThrottledError)):
+                logger.warning("Stopping NDVI downloads — %s",
+                               "IP-throttled" if isinstance(exc, IPThrottledError)
+                               else "credits exhausted")
                 break
             else:
                 n_done += 1  # count failed months too for progress
@@ -1221,6 +1218,8 @@ def get_land_cover(
 
     try:
         _run_datacube(lc_flat, cache_file, title="ESA WorldCover", bbox=bbox)
+    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+        raise  # let @_retry_on_rotation handle these
     except Exception as exc:
         logger.error("Failed to download land cover: %s", exc)
         raise RuntimeError(f"Land cover download failed: {exc}") from exc
@@ -1305,6 +1304,8 @@ def get_sar_backscatter(
 
     try:
         _run_datacube(sar_composite, cache_file, title="SAR backscatter", bbox=bbox)
+    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+        raise  # let @_retry_on_rotation handle these
     except Exception as exc:
         logger.error("Failed to download SAR backscatter: %s", exc)
         raise RuntimeError(f"SAR backscatter download failed: {exc}") from exc

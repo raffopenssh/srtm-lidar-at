@@ -524,7 +524,7 @@ class CopernicusTileCache:
         """Fetch a single 0.1° NDVI cell from the API and cache it."""
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("ndvi", cw, cs, ce, cn, year=year)
-        from copernicus import CreditsExhaustedError
+        from copernicus import CreditsExhaustedError, IPThrottledError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
@@ -543,9 +543,10 @@ class CopernicusTileCache:
                          cw, cs, ce, cn, result["ndvi"].shape[1], result["ndvi"].shape[0])
                 return result
             except Exception as e:
-                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                     self._stats["errors"] += 1
-                    log.error("Copernicus NDVI: credits exhausted — pausing")
+                    log.error("Copernicus NDVI: credits exhausted / IP-throttled — pausing")
                     raise
                 last_exc = e
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
@@ -558,6 +559,10 @@ class CopernicusTileCache:
                     time.sleep(delay)
                     continue
                 break
+        # Check if failure was due to IP throttling
+        if last_exc and 'IP-throttled' in str(last_exc):
+            from copernicus import IPThrottledError as _IPT
+            raise _IPT(str(last_exc))
         self._stats["errors"] += 1
         log.warning("Copernicus NDVI cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
@@ -620,7 +625,7 @@ class CopernicusTileCache:
         """Fetch a single 0.1° WorldCover cell from the API and cache it."""
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("worldcover", cw, cs, ce, cn)
-        from copernicus import CreditsExhaustedError
+        from copernicus import CreditsExhaustedError, IPThrottledError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
@@ -633,9 +638,10 @@ class CopernicusTileCache:
                          cw, cs, ce, cn)
                 return result
             except Exception as e:
-                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                     self._stats["errors"] += 1
-                    log.error("Copernicus WorldCover: credits exhausted — pausing")
+                    log.error("Copernicus WorldCover: credits exhausted / IP-throttled — pausing")
                     raise
                 last_exc = e
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
@@ -648,6 +654,10 @@ class CopernicusTileCache:
                     time.sleep(delay)
                     continue
                 break
+        # Check if failure was due to IP throttling
+        if last_exc and 'IP-throttled' in str(last_exc):
+            from copernicus import IPThrottledError as _IPT
+            raise _IPT(str(last_exc))
         self._stats["errors"] += 1
         log.warning("Copernicus WorldCover cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
@@ -716,7 +726,7 @@ class CopernicusTileCache:
         """Fetch a single 0.1° SAR cell from the API and cache it."""
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("sar", cw, cs, ce, cn, year=year)
-        from copernicus import CreditsExhaustedError
+        from copernicus import CreditsExhaustedError, IPThrottledError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
@@ -736,9 +746,10 @@ class CopernicusTileCache:
                          cw, cs, ce, cn)
                 return result
             except Exception as e:
-                if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                     self._stats["errors"] += 1
-                    log.error("Copernicus SAR: credits exhausted — pausing")
+                    log.error("Copernicus SAR: credits exhausted / IP-throttled — pausing")
                     raise
                 last_exc = e
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
@@ -751,6 +762,10 @@ class CopernicusTileCache:
                     time.sleep(delay)
                     continue
                 break
+        # Check if failure was due to IP throttling
+        if last_exc and 'IP-throttled' in str(last_exc):
+            from copernicus import IPThrottledError as _IPT
+            raise _IPT(str(last_exc))
         self._stats["errors"] += 1
         log.warning("Copernicus SAR cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
@@ -823,7 +838,7 @@ class CopernicusTileCache:
         """Fetch a single 0.1° harmonics cell from the API and cache it."""
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("harmonics", cw, cs, ce, cn, year=year)
-        from copernicus import CreditsExhaustedError
+        from copernicus import CreditsExhaustedError, IPThrottledError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
@@ -849,8 +864,8 @@ class CopernicusTileCache:
                          cw, cs, ce, cn)
                 return result
             except Exception as e:
-                if isinstance(e, CreditsExhaustedError) or \
-                   isinstance(e.__cause__, CreditsExhaustedError):
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                     self._stats["errors"] += 1
                     raise
                 last_exc = e
@@ -863,6 +878,10 @@ class CopernicusTileCache:
                     time.sleep(delay)
                     continue
                 break
+        # Check if failure was due to IP throttling
+        if last_exc and 'IP-throttled' in str(last_exc):
+            from copernicus import IPThrottledError as _IPT
+            raise _IPT(str(last_exc))
         self._stats["errors"] += 1
         log.warning("Copernicus harmonics cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None

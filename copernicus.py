@@ -100,6 +100,13 @@ credits_exhausted: bool = False
 _credits_exhausted_at: Optional[str] = None  # ISO timestamp
 _exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 
+# Short-term memory for NDVI months that recently failed with 500 (Spark timeout)
+# or persistent 402.  Key = (bbox_hash, month_label), value = expiry timestamp.
+# Skips re-downloading the same month for the same area within the cooldown period.
+_FAILED_MONTH_COOLDOWNS: Dict[tuple, float] = {}
+_FAILED_MONTH_COOLDOWN_SECS = 1800  # 30 minutes for 500 (Spark timeout)
+_FAILED_MONTH_402_COOLDOWN_SECS = 300  # 5 minutes for 402 cascade
+
 # Threading lock for credential state — protects _credential_index,
 # _exhausted_cred_indices, credits_exhausted, CLIENT_ID, CLIENT_SECRET,
 # and _connection during concurrent access from parallel download workers.
@@ -926,11 +933,39 @@ def get_ndvi_timeseries(
         import time as _time
         n_total = len(tasks)
         n_done = n_total - len(to_download)  # already cached
-        logger.info("Downloading %d NDVI months (sequential, single credential)...", len(to_download))
+
+        # Compute a bbox hash for failed-month cooldown tracking
+        _bbox_hash = f"{bbox.get('west',0):.4f}_{bbox.get('south',0):.4f}_{bbox.get('east',0):.4f}_{bbox.get('north',0):.4f}"
+
+        # Prune expired cooldowns
+        _now = _time.time()
+        expired = [k for k, v in _FAILED_MONTH_COOLDOWNS.items() if v < _now]
+        for k in expired:
+            _FAILED_MONTH_COOLDOWNS.pop(k, None)
+
+        # Filter out months in cooldown (recently failed with 500 or persistent 402)
+        actually_download = []
         for label, m_start, m_end, month_cache in to_download:
+            cooldown_key = (_bbox_hash, label)
+            if cooldown_key in _FAILED_MONTH_COOLDOWNS:
+                remaining = int(_FAILED_MONTH_COOLDOWNS[cooldown_key] - _now)
+                logger.info(
+                    "NDVI %s: skipping (failed recently, cooldown %dm remaining)",
+                    label, remaining // 60,
+                )
+                n_done += 1  # count as processed for progress
+            else:
+                actually_download.append((label, m_start, m_end, month_cache))
+
+        if actually_download:
+            logger.info("Downloading %d NDVI months (sequential, single credential)...",
+                        len(actually_download))
+        consecutive_402 = 0  # track 402 cascade
+        for label, m_start, m_end, month_cache in actually_download:
             lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
             if exc is None:
                 n_done += 1
+                consecutive_402 = 0  # reset on success
                 logger.info("Month %s done (%d/%d)", lbl, n_done, n_total)
                 if progress_fn:
                     try:
@@ -942,12 +977,47 @@ def get_ndvi_timeseries(
                 break
             else:
                 n_done += 1  # count failed months too for progress
-                logger.debug("Month %s failed: %s", lbl, exc)
+                exc_str = str(exc)
+                # Determine cooldown duration based on error type
+                if '500' in exc_str or 'Spark' in exc_str or 'Server error' in exc_str:
+                    cooldown = _FAILED_MONTH_COOLDOWN_SECS  # 30 min for Spark timeout
+                    logger.warning("NDVI %s failed (server error) — cooldown %dm",
+                                   lbl, cooldown // 60)
+                elif '402' in exc_str:
+                    cooldown = _FAILED_MONTH_402_COOLDOWN_SECS  # 5 min for 402
+                    consecutive_402 += 1
+                else:
+                    cooldown = _FAILED_MONTH_402_COOLDOWN_SECS
+                    consecutive_402 = 0
+                _FAILED_MONTH_COOLDOWNS[(_bbox_hash, lbl)] = _time.time() + cooldown
+
                 if progress_fn:
                     try:
                         progress_fn(n_done, n_total)
                     except Exception:
                         pass
+
+                # 402 cascade breaker: if 2+ consecutive months fail with 402,
+                # the credential is rate-limited. Stop wasting time on remaining months.
+                if consecutive_402 >= 2:
+                    remaining_count = len(actually_download) - actually_download.index(
+                        (label, m_start, m_end, month_cache)) - 1
+                    if remaining_count > 0:
+                        logger.warning(
+                            "402 cascade detected (%d consecutive) — skipping "
+                            "%d remaining months (cooldown %dm)",
+                            consecutive_402, remaining_count,
+                            _FAILED_MONTH_402_COOLDOWN_SECS // 60,
+                        )
+                        # Put remaining months into cooldown too
+                        idx = actually_download.index(
+                            (label, m_start, m_end, month_cache))
+                        for rl, rm_s, rm_e, rmc in actually_download[idx + 1:]:
+                            _FAILED_MONTH_COOLDOWNS[(_bbox_hash, rl)] = (
+                                _time.time() + _FAILED_MONTH_402_COOLDOWN_SECS
+                            )
+                            n_done += 1
+                    break
             _time.sleep(2)  # gentle pacing between sequential downloads
 
     # Read all cached months

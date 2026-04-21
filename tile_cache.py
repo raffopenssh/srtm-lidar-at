@@ -361,6 +361,72 @@ class CopernicusTileCache:
             return path
         return None
 
+    def _try_legacy_cache(self, product: str, bbox_wgs: dict, **extra) -> Optional[Path]:
+        """Check for an old-style cache file keyed by the full snapped bbox.
+
+        Before the per-cell refactor, cache files were stored under one key
+        covering the entire snapped region.  This finds those files so they
+        still count as hits.
+        """
+        tw, ts, te, tn = self._snap(bbox_wgs)
+        path = self._tile_path(product, tw, ts, te, tn, **extra)
+        if path.exists():
+            return path
+        return None
+
+    def _mosaic_raster_cells(self, cell_results: list,
+                             data_keys: list[str]) -> Optional[dict]:
+        """Mosaic multiple per-cell raster results into one.
+
+        Each element of *cell_results* is a dict with the data arrays
+        listed in *data_keys*, plus ``transform`` (Affine) and ``crs``.
+
+        Returns a single dict with the same keys, covering the bounding
+        extent of all cells.
+        """
+        if len(cell_results) == 1:
+            return cell_results[0]
+
+        import rasterio
+        from rasterio.merge import merge as rio_merge
+        import tempfile
+        import os
+
+        # For each data key, mosaic independently
+        first_crs = str(cell_results[0].get("crs", "EPSG:4326"))
+        mosaic_result = {"crs": first_crs}
+        mosaic_tf = None
+
+        for dk in data_keys:
+            tmp_paths = []
+            datasets = []
+            try:
+                for cr in cell_results:
+                    arr = cr[dk]
+                    tf = cr["transform"]
+                    crs_str = str(cr.get("crs", "EPSG:4326"))
+                    tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+                    tmp_paths.append(tmp.name)
+                    with rasterio.open(
+                        tmp.name, "w", driver="GTiff",
+                        height=arr.shape[0], width=arr.shape[1], count=1,
+                        dtype=arr.dtype, crs=crs_str, transform=tf,
+                    ) as dst:
+                        dst.write(arr, 1)
+                    datasets.append(rasterio.open(tmp.name))
+                mosaic_arr, mt = rio_merge(datasets)
+                mosaic_result[dk] = mosaic_arr[0]
+                if mosaic_tf is None:
+                    mosaic_tf = mt
+            finally:
+                for ds in datasets:
+                    ds.close()
+                for p in tmp_paths:
+                    os.unlink(p)
+
+        mosaic_result["transform"] = mosaic_tf
+        return mosaic_result
+
     def read_cached_product(self, bbox_wgs: dict, product: str,
                             year: int = 2024) -> Optional[dict]:
         """Read a product from per-cell cache and mosaic if needed.
@@ -440,49 +506,31 @@ class CopernicusTileCache:
             log.warning("Mosaic of cached cells failed: %s", e)
             return None
 
-    def get_ndvi(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
-        """Get NDVI composite, using grid-snapped cache."""
-        tw, ts, te, tn = self._snap(bbox_wgs)
-        tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
-        path = self._tile_path("ndvi", tw, ts, te, tn, year=year)
+    def _load_ndvi_npz(self, path: Path) -> Optional[dict]:
+        """Load an NDVI result dict from an NPZ file."""
+        try:
+            cached = np.load(str(path), allow_pickle=True)
+            return {
+                "ndvi": cached["ndvi"],
+                "transform": _arr_to_affine(cached["transform"]),
+                "crs": str(cached["crs"]),
+            }
+        except Exception as e:
+            log.warning("Corrupt Copernicus NDVI cache %s: %s", path.name, e)
+            path.unlink(missing_ok=True)
+            return None
 
-        if path.exists():
-            self._stats["hits"] += 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return {
-                    "ndvi": cached["ndvi"],
-                    "transform": _arr_to_affine(cached["transform"]),
-                    "crs": str(cached["crs"]),
-                }
-            except Exception as e:
-                log.warning("Corrupt Copernicus cache %s: %s", path.name, e)
-                path.unlink(missing_ok=True)
-
-        # Try Zenodo persistent cache before expensive API call
-        self._stats["misses"] += 1
-        if self._try_zenodo("ndvi", tw, ts, te, tn, year=year) and path.exists():
-            self._stats["hits"] += 1
-            self._stats["misses"] -= 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return {
-                    "ndvi": cached["ndvi"],
-                    "transform": _arr_to_affine(cached["transform"]),
-                    "crs": str(cached["crs"]),
-                }
-            except Exception:
-                path.unlink(missing_ok=True)
-
-        # Fetch from openEO for the full tile (with retry on server errors)
+    def _fetch_ndvi_cell(self, cw, cs, ce, cn, year, cred_index):
+        """Fetch a single 0.1° NDVI cell from the API and cache it."""
+        cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
+        path = self._tile_path("ndvi", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
                 import copernicus
                 _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
-                result = copernicus.get_ndvi_composite(tile_bbox, year=year, _conn=_conn)
-                # Save to cache
+                result = copernicus.get_ndvi_composite(cell_bbox, year=year, _conn=_conn)
                 tf = result["transform"]
                 _atomic_savez(
                     path,
@@ -490,9 +538,9 @@ class CopernicusTileCache:
                     transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                     crs=str(result.get("crs", "EPSG:4326")),
                 )
-                _write_tile_meta(path, "ndvi", tw, ts, te, tn, year=year)
-                log.info("Copernicus NDVI tile cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
-                         tw, ts, te, tn, result["ndvi"].shape[1], result["ndvi"].shape[0])
+                _write_tile_meta(path, "ndvi", cw, cs, ce, cn, year=year)
+                log.info("Copernicus NDVI cell cached: %.2f,%.2f → %.2f,%.2f (%dx%d)",
+                         cw, cs, ce, cn, result["ndvi"].shape[1], result["ndvi"].shape[0])
                 return result
             except Exception as e:
                 if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
@@ -503,53 +551,86 @@ class CopernicusTileCache:
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
                     delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
                     log.warning(
-                        "Copernicus NDVI tile fetch failed (server error, attempt %d/%d), "
+                        "Copernicus NDVI cell fetch failed (server error, attempt %d/%d), "
                         "retrying in %ds: %s",
                         attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
                     )
                     time.sleep(delay)
                     continue
-                # Non-retryable error or retries exhausted
                 break
         self._stats["errors"] += 1
-        log.warning("Copernicus NDVI tile fetch failed: %s", last_exc)
+        log.warning("Copernicus NDVI cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
 
-    def get_landcover(self, bbox_wgs: dict, cred_index: int = None) -> Optional[dict]:
-        """Get ESA WorldCover, grid-snapped."""
-        tw, ts, te, tn = self._snap(bbox_wgs)
-        tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
-        path = self._tile_path("worldcover", tw, ts, te, tn)
+    def get_ndvi(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
+        """Get NDVI composite, using per-cell grid-snapped cache.
 
-        if path.exists():
-            self._stats["hits"] += 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return cached["data"].item()  # dict stored via allow_pickle
-            except Exception:
-                path.unlink(missing_ok=True)
+        Iterates 0.1° cells covering *bbox_wgs*.  For each cell, checks
+        local cache → Zenodo → API.  Mosaics when bbox spans 2+ cells.
+        Also checks for legacy (full-snapped-bbox) cache files.
+        """
+        # --- Legacy check: old-style full-bbox cache file ---
+        legacy = self._try_legacy_cache("ndvi", bbox_wgs, year=year)
+        if legacy is not None:
+            result = self._load_ndvi_npz(legacy)
+            if result is not None:
+                self._stats["hits"] += 1
+                return result
 
-        self._stats["misses"] += 1
-        if self._try_zenodo("worldcover", tw, ts, te, tn) and path.exists():
-            self._stats["hits"] += 1
-            self._stats["misses"] -= 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return cached["data"].item()
-            except Exception:
-                path.unlink(missing_ok=True)
+        # --- Per-cell iteration ---
+        cells = list(self._iter_cells(bbox_wgs))
+        cell_results = []
+        for cw, cs, ce, cn in cells:
+            # Local cache?
+            path = self._read_cell_npz("ndvi", cw, cs, ce, cn, year=year)
+            if path is not None:
+                loaded = self._load_ndvi_npz(path)
+                if loaded is not None:
+                    self._stats["hits"] += 1
+                    cell_results.append(loaded)
+                    continue
+            # Fetch from API
+            self._stats["misses"] += 1
+            fetched = self._fetch_ndvi_cell(cw, cs, ce, cn, year, cred_index)
+            if fetched is None:
+                return None  # one cell failed → whole product fails
+            cell_results.append(fetched)
 
+        if len(cell_results) == 1:
+            return cell_results[0]
+
+        # Mosaic multiple cells
+        try:
+            return self._mosaic_raster_cells(cell_results, ["ndvi"])
+        except Exception as e:
+            log.warning("NDVI mosaic failed: %s", e)
+            return None
+
+    def _load_worldcover_npz(self, path: Path) -> Optional[dict]:
+        """Load a WorldCover result dict from an NPZ file."""
+        try:
+            cached = np.load(str(path), allow_pickle=True)
+            return cached["data"].item()  # dict stored via allow_pickle
+        except Exception as e:
+            log.warning("Corrupt WorldCover cache %s: %s", path.name, e)
+            path.unlink(missing_ok=True)
+            return None
+
+    def _fetch_worldcover_cell(self, cw, cs, ce, cn, cred_index):
+        """Fetch a single 0.1° WorldCover cell from the API and cache it."""
+        cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
+        path = self._tile_path("worldcover", cw, cs, ce, cn)
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
                 import copernicus
                 _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
-                result = copernicus.get_land_cover(tile_bbox, _conn=_conn)
+                result = copernicus.get_land_cover(cell_bbox, _conn=_conn)
                 _atomic_savez(path, data=np.array(result, dtype=object))
-                _write_tile_meta(path, "worldcover", tw, ts, te, tn)
-                log.info("Copernicus WorldCover tile cached: %.2f,%.2f → %.2f,%.2f",
-                         tw, ts, te, tn)
+                _write_tile_meta(path, "worldcover", cw, cs, ce, cn)
+                log.info("Copernicus WorldCover cell cached: %.2f,%.2f → %.2f,%.2f",
+                         cw, cs, ce, cn)
                 return result
             except Exception as e:
                 if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
@@ -560,7 +641,7 @@ class CopernicusTileCache:
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
                     delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
                     log.warning(
-                        "Copernicus WorldCover tile fetch failed (server error, attempt %d/%d), "
+                        "Copernicus WorldCover cell fetch failed (server error, attempt %d/%d), "
                         "retrying in %ds: %s",
                         attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
                     )
@@ -568,41 +649,73 @@ class CopernicusTileCache:
                     continue
                 break
         self._stats["errors"] += 1
-        log.warning("Copernicus WorldCover tile fetch failed: %s", last_exc)
+        log.warning("Copernicus WorldCover cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
 
-    def get_sar(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
-        """Get SAR backscatter, grid-snapped."""
-        tw, ts, te, tn = self._snap(bbox_wgs)
-        tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
-        path = self._tile_path("sar", tw, ts, te, tn, year=year)
+    def get_landcover(self, bbox_wgs: dict, cred_index: int = None) -> Optional[dict]:
+        """Get ESA WorldCover, using per-cell grid-snapped cache.
 
-        if path.exists():
-            self._stats["hits"] += 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return {
-                    "vv": cached["vv"], "vh": cached["vh"],
-                    "transform": _arr_to_affine(cached["transform"]),
-                    "crs": str(cached["crs"]),
-                }
-            except Exception:
-                path.unlink(missing_ok=True)
+        Iterates 0.1° cells covering *bbox_wgs*.  For each cell, checks
+        local cache → Zenodo → API.  Mosaics when bbox spans 2+ cells.
+        Also checks for legacy (full-snapped-bbox) cache files.
+        """
+        # --- Legacy check: old-style full-bbox cache file ---
+        legacy = self._try_legacy_cache("worldcover", bbox_wgs)
+        if legacy is not None:
+            result = self._load_worldcover_npz(legacy)
+            if result is not None:
+                self._stats["hits"] += 1
+                return result
 
-        self._stats["misses"] += 1
-        if self._try_zenodo("sar", tw, ts, te, tn, year=year) and path.exists():
-            self._stats["hits"] += 1
-            self._stats["misses"] -= 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                return {
-                    "vv": cached["vv"], "vh": cached["vh"],
-                    "transform": _arr_to_affine(cached["transform"]),
-                    "crs": str(cached["crs"]),
-                }
-            except Exception:
-                path.unlink(missing_ok=True)
+        # --- Per-cell iteration ---
+        cells = list(self._iter_cells(bbox_wgs))
+        cell_results = []
+        for cw, cs, ce, cn in cells:
+            # Local cache?
+            path = self._read_cell_npz("worldcover", cw, cs, ce, cn)
+            if path is not None:
+                loaded = self._load_worldcover_npz(path)
+                if loaded is not None:
+                    self._stats["hits"] += 1
+                    cell_results.append(loaded)
+                    continue
+            # Fetch from API
+            self._stats["misses"] += 1
+            fetched = self._fetch_worldcover_cell(cw, cs, ce, cn, cred_index)
+            if fetched is None:
+                return None
+            cell_results.append(fetched)
 
+        if len(cell_results) == 1:
+            return cell_results[0]
+
+        # Mosaic multiple cells — WorldCover result has {map, transform, crs, classes}
+        try:
+            mosaic = self._mosaic_raster_cells(cell_results, ["map"])
+            mosaic["classes"] = cell_results[0].get("classes", {})
+            return mosaic
+        except Exception as e:
+            log.warning("WorldCover mosaic failed: %s", e)
+            return None
+
+    def _load_sar_npz(self, path: Path) -> Optional[dict]:
+        """Load a SAR result dict from an NPZ file."""
+        try:
+            cached = np.load(str(path), allow_pickle=True)
+            return {
+                "vv": cached["vv"], "vh": cached["vh"],
+                "transform": _arr_to_affine(cached["transform"]),
+                "crs": str(cached["crs"]),
+            }
+        except Exception as e:
+            log.warning("Corrupt SAR cache %s: %s", path.name, e)
+            path.unlink(missing_ok=True)
+            return None
+
+    def _fetch_sar_cell(self, cw, cs, ce, cn, year, cred_index):
+        """Fetch a single 0.1° SAR cell from the API and cache it."""
+        cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
+        path = self._tile_path("sar", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
@@ -610,7 +723,7 @@ class CopernicusTileCache:
                 import copernicus
                 _conn = copernicus._get_connection_for_cred(cred_index) if cred_index is not None else None
                 result = copernicus.get_sar_backscatter(
-                    tile_bbox, f"{year}-06-01", f"{year}-09-30", _conn=_conn)
+                    cell_bbox, f"{year}-06-01", f"{year}-09-30", _conn=_conn)
                 tf = result["transform"]
                 _atomic_savez(
                     path,
@@ -618,9 +731,9 @@ class CopernicusTileCache:
                     transform=np.array([tf.a, tf.b, tf.c, tf.d, tf.e, tf.f]),
                     crs=str(result.get("crs", "EPSG:4326")),
                 )
-                _write_tile_meta(path, "sar", tw, ts, te, tn, year=year)
-                log.info("Copernicus SAR tile cached: %.2f,%.2f → %.2f,%.2f",
-                         tw, ts, te, tn)
+                _write_tile_meta(path, "sar", cw, cs, ce, cn, year=year)
+                log.info("Copernicus SAR cell cached: %.2f,%.2f → %.2f,%.2f",
+                         cw, cs, ce, cn)
                 return result
             except Exception as e:
                 if isinstance(e, CreditsExhaustedError) or isinstance(e.__cause__, CreditsExhaustedError):
@@ -631,7 +744,7 @@ class CopernicusTileCache:
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
                     delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
                     log.warning(
-                        "Copernicus SAR tile fetch failed (server error, attempt %d/%d), "
+                        "Copernicus SAR cell fetch failed (server error, attempt %d/%d), "
                         "retrying in %ds: %s",
                         attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e,
                     )
@@ -639,70 +752,90 @@ class CopernicusTileCache:
                     continue
                 break
         self._stats["errors"] += 1
-        log.warning("Copernicus SAR tile fetch failed: %s", last_exc)
+        log.warning("Copernicus SAR cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
 
-    def get_harmonics(self, bbox_wgs: dict, year: int = 2024,
-                      cred_index: int = None,
-                      progress_fn=None) -> Optional[dict]:
-        """Get NDVI harmonic features, grid-snapped.
+    def get_sar(self, bbox_wgs: dict, year: int = 2024, cred_index: int = None) -> Optional[dict]:
+        """Get SAR backscatter, using per-cell grid-snapped cache.
 
-        Fetches monthly NDVI time series and computes harmonic fit
-        (mean, amplitude, phase, rmse) for the grid tile.  Subsequent
-        requests within the same 0.1° cell are instant cache hits.
+        Iterates 0.1° cells covering *bbox_wgs*.  For each cell, checks
+        local cache → Zenodo → API.  Mosaics when bbox spans 2+ cells.
+        Also checks for legacy (full-snapped-bbox) cache files.
         """
-        tw, ts, te, tn = self._snap(bbox_wgs)
-        tile_bbox = {"west": tw, "south": ts, "east": te, "north": tn}
-        path = self._tile_path("harmonics", tw, ts, te, tn, year=year)
-
-        if path.exists():
-            self._stats["hits"] += 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                result = {}
-                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
-                    if k in cached:
-                        result[k] = cached[k]
-                if "transform" in cached:
-                    result["transform"] = _arr_to_affine(cached["transform"])
-                if "crs" in cached:
-                    result["crs"] = str(cached["crs"])
+        # --- Legacy check: old-style full-bbox cache file ---
+        legacy = self._try_legacy_cache("sar", bbox_wgs, year=year)
+        if legacy is not None:
+            result = self._load_sar_npz(legacy)
+            if result is not None:
+                self._stats["hits"] += 1
                 return result
-            except Exception as e:
-                log.warning("Corrupt harmonics cache %s: %s", path.name, e)
-                path.unlink(missing_ok=True)
 
-        self._stats["misses"] += 1
-        if self._try_zenodo("harmonics", tw, ts, te, tn, year=year) and path.exists():
-            self._stats["hits"] += 1
-            self._stats["misses"] -= 1
-            try:
-                cached = np.load(str(path), allow_pickle=True)
-                result = {}
-                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
-                    if k in cached:
-                        result[k] = cached[k]
-                if "transform" in cached:
-                    result["transform"] = _arr_to_affine(cached["transform"])
-                if "crs" in cached:
-                    result["crs"] = str(cached["crs"])
-                return result
-            except Exception:
-                path.unlink(missing_ok=True)
+        # --- Per-cell iteration ---
+        cells = list(self._iter_cells(bbox_wgs))
+        cell_results = []
+        for cw, cs, ce, cn in cells:
+            # Local cache?
+            path = self._read_cell_npz("sar", cw, cs, ce, cn, year=year)
+            if path is not None:
+                loaded = self._load_sar_npz(path)
+                if loaded is not None:
+                    self._stats["hits"] += 1
+                    cell_results.append(loaded)
+                    continue
+            # Fetch from API
+            self._stats["misses"] += 1
+            fetched = self._fetch_sar_cell(cw, cs, ce, cn, year, cred_index)
+            if fetched is None:
+                return None
+            cell_results.append(fetched)
 
+        if len(cell_results) == 1:
+            return cell_results[0]
+
+        # Mosaic multiple cells
+        try:
+            return self._mosaic_raster_cells(cell_results, ["vv", "vh"])
+        except Exception as e:
+            log.warning("SAR mosaic failed: %s", e)
+            return None
+
+    _HARMONIC_KEYS = ["h_mean", "h_amplitude", "h_phase", "h_rmse"]
+
+    def _load_harmonics_npz(self, path: Path) -> Optional[dict]:
+        """Load a harmonics result dict from an NPZ file."""
+        try:
+            cached = np.load(str(path), allow_pickle=True)
+            result = {}
+            for k in self._HARMONIC_KEYS:
+                if k in cached:
+                    result[k] = cached[k]
+            if "transform" in cached:
+                result["transform"] = _arr_to_affine(cached["transform"])
+            if "crs" in cached:
+                result["crs"] = str(cached["crs"])
+            return result
+        except Exception as e:
+            log.warning("Corrupt harmonics cache %s: %s", path.name, e)
+            path.unlink(missing_ok=True)
+            return None
+
+    def _fetch_harmonics_cell(self, cw, cs, ce, cn, year, progress_fn):
+        """Fetch a single 0.1° harmonics cell from the API and cache it."""
+        cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
+        path = self._tile_path("harmonics", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError
         last_exc = None
         for attempt in range(_SERVER_ERROR_MAX_RETRIES + 1):
             try:
                 import ndvi_harmonics
                 result = ndvi_harmonics.get_harmonic_features(
-                    tile_bbox, year, progress_fn=progress_fn)
+                    cell_bbox, year, progress_fn=progress_fn)
                 if result is None:
                     self._stats["errors"] += 1
                     return None
                 # Save to cache
                 save_kw = {}
-                for k in ["h_mean", "h_amplitude", "h_phase", "h_rmse"]:
+                for k in self._HARMONIC_KEYS:
                     if k in result:
                         save_kw[k] = result[k]
                 tf = result.get("transform")
@@ -711,9 +844,9 @@ class CopernicusTileCache:
                         [tf.a, tf.b, tf.c, tf.d, tf.e, tf.f])
                 save_kw["crs"] = str(result.get("crs", "EPSG:4326"))
                 _atomic_savez(path, **save_kw)
-                _write_tile_meta(path, "harmonics", tw, ts, te, tn, year=year)
-                log.info("Copernicus harmonics tile cached: %.2f,%.2f → %.2f,%.2f",
-                         tw, ts, te, tn)
+                _write_tile_meta(path, "harmonics", cw, cs, ce, cn, year=year)
+                log.info("Copernicus harmonics cell cached: %.2f,%.2f → %.2f,%.2f",
+                         cw, cs, ce, cn)
                 return result
             except Exception as e:
                 if isinstance(e, CreditsExhaustedError) or \
@@ -724,15 +857,66 @@ class CopernicusTileCache:
                 if _is_server_error(e) and attempt < _SERVER_ERROR_MAX_RETRIES:
                     delay = _SERVER_ERROR_BACKOFF_SECS[attempt]
                     log.warning(
-                        "Copernicus harmonics fetch failed (attempt %d/%d), "
+                        "Copernicus harmonics cell fetch failed (attempt %d/%d), "
                         "retrying in %ds: %s",
                         attempt + 1, _SERVER_ERROR_MAX_RETRIES + 1, delay, e)
                     time.sleep(delay)
                     continue
                 break
         self._stats["errors"] += 1
-        log.warning("Copernicus harmonics tile fetch failed: %s", last_exc)
+        log.warning("Copernicus harmonics cell fetch failed (%.4f,%.4f): %s", cw, cs, last_exc)
         return None
+
+    def get_harmonics(self, bbox_wgs: dict, year: int = 2024,
+                      cred_index: int = None,
+                      progress_fn=None) -> Optional[dict]:
+        """Get NDVI harmonic features, using per-cell grid-snapped cache.
+
+        Fetches monthly NDVI time series and computes harmonic fit
+        (mean, amplitude, phase, rmse) for each 0.1° grid cell.
+        Subsequent requests within the same cell are instant cache hits.
+        Mosaics when bbox spans 2+ cells.
+        """
+        # --- Legacy check: old-style full-bbox cache file ---
+        legacy = self._try_legacy_cache("harmonics", bbox_wgs, year=year)
+        if legacy is not None:
+            result = self._load_harmonics_npz(legacy)
+            if result is not None:
+                self._stats["hits"] += 1
+                return result
+
+        # --- Per-cell iteration ---
+        cells = list(self._iter_cells(bbox_wgs))
+        cell_results = []
+        for cw, cs, ce, cn in cells:
+            # Local cache?
+            path = self._read_cell_npz("harmonics", cw, cs, ce, cn, year=year)
+            if path is not None:
+                loaded = self._load_harmonics_npz(path)
+                if loaded is not None:
+                    self._stats["hits"] += 1
+                    cell_results.append(loaded)
+                    continue
+            # Fetch from API
+            self._stats["misses"] += 1
+            fetched = self._fetch_harmonics_cell(
+                cw, cs, ce, cn, year, progress_fn)
+            if fetched is None:
+                return None
+            cell_results.append(fetched)
+
+        if len(cell_results) == 1:
+            return cell_results[0]
+
+        # Mosaic multiple cells
+        try:
+            # Only mosaic keys that are present in the first result
+            mosaic_keys = [k for k in self._HARMONIC_KEYS
+                           if k in cell_results[0]]
+            return self._mosaic_raster_cells(cell_results, mosaic_keys)
+        except Exception as e:
+            log.warning("Harmonics mosaic failed: %s", e)
+            return None
 
     @property
     def stats(self) -> dict:

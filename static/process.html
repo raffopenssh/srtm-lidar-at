@@ -303,9 +303,9 @@
       <span class="kg-sub" id="kgSub"></span>
     </div>
     <div style="display:flex;align-items:baseline;gap:8px">
-      <span class="kg-sub" id="kgTimer">—</span>
+      <span class="kg-sub" id="kgTimer"></span>
       <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
-        style="font-size:11px;padding:1px 7px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:4px;cursor:pointer;display:none"
+        style="font-family:inherit;font-size:11px;padding:1px 7px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:4px;cursor:pointer;display:none"
       >⏭ postpone</button>
     </div>
   </div>
@@ -477,8 +477,8 @@ function initMap() {
   L.control.layers(null, {
     'Tile dots': tileDotsLayer,
     'History dots': historyDotsLayer,
-    'Copernicus tiles (0.1°)': copLayer,
-    'Hansen tiles (0.5°)': hanLayer,
+    'Zenodo Copernicus cache': copLayer,
+    'Zenodo Hansen cache': hanLayer,
   }, {collapsed: true, position: 'topright'}).addTo(map);
   fetchTileOverlays();
 }
@@ -1025,19 +1025,15 @@ function renderTileOverlays(d) {
   copLayer.clearLayers();
   (d.copernicus || []).forEach(t => {
     const bounds = [[t.s, t.w], [t.n, t.e]];
-    const ev = t.status === 'evicted';
     copLayer.addLayer(L.rectangle(bounds, {
-      color: ev ? '#f85149' : '#58a6ff', weight: ev ? 0.8 : 1,
-      fillOpacity: 0, interactive: false, dashArray: ev ? '4 3' : null,
+      color: '#58a6ff', weight: 1, fillOpacity: 0.06, interactive: false,
     }));
   });
   hanLayer.clearLayers();
   (d.hansen || []).forEach(t => {
     const bounds = [[t.s, t.w], [t.n, t.e]];
-    const ev = t.status === 'evicted';
     hanLayer.addLayer(L.rectangle(bounds, {
-      color: ev ? '#d29922' : '#3fb950', weight: ev ? 0.8 : 1.5,
-      fillOpacity: 0, interactive: false, dashArray: ev ? '6 4' : null,
+      color: '#3fb950', weight: 1.5, fillOpacity: 0.06, interactive: false,
     }));
   });
 }

@@ -1412,11 +1412,51 @@ def processing_log():
 
 @app.route('/api/v1/processing/tiles')
 def processing_tiles():
-    """Return cache tile bboxes for map overlay in process.html."""
+    """Return Zenodo cache tile bboxes for map overlay in process.html.
+
+    Reads the locally-cached ZIP central-directory indices written by
+    ``zenodo_cache.ZipIndex``.  Each entry name encodes the grid bbox as
+    ``{product}_{s}_{w}_{n}_{e}[_{year}].npz``.
+    """
     try:
-        from tile_cache import rebuild_tile_bbox_index, get_tile_bbox_index
-        rebuild_tile_bbox_index()  # fast disk scan (~ms for <1000 files)
-        return jsonify(get_tile_bbox_index())
+        idx_dir = Path('data/austria_processor/zenodo_zip_index')
+        if not idx_dir.exists():
+            return jsonify({'copernicus': [], 'hansen': []})
+        cop_seen: set = set()
+        han_seen: set = set()
+        cop_tiles: list = []
+        han_tiles: list = []
+        for fp in idx_dir.iterdir():
+            if not fp.suffix == '.json':
+                continue
+            try:
+                raw = json.loads(fp.read_text())
+            except Exception:
+                continue
+            for name in raw:
+                base = name.replace('.npz', '')
+                parts = base.split('_')
+                product = parts[0]
+                floats = []
+                for p in parts[1:]:
+                    try:
+                        floats.append(float(p))
+                    except ValueError:
+                        break
+                if len(floats) < 4:
+                    continue
+                s, w, n, e = floats[0], floats[1], floats[2], floats[3]
+                if product == 'hansen':
+                    key = (w, s, e, n)
+                    if key not in han_seen:
+                        han_seen.add(key)
+                        han_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
+                else:
+                    key = (w, s, e, n)
+                    if key not in cop_seen:
+                        cop_seen.add(key)
+                        cop_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
+        return jsonify({'copernicus': cop_tiles, 'hansen': han_tiles})
     except Exception as e:
         return jsonify({'error': str(e), 'copernicus': [], 'hansen': []})
 

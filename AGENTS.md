@@ -296,23 +296,57 @@ Caches: `/tmp/copernicus_cache/`, `/tmp/hansen_cache/`
 Local Copernicus/Hansen tile caches get evicted when disk approaches 5GB.
 The Zenodo cache module persists these tiles on Zenodo so they survive eviction.
 
-**Upload**: Bundles local NPZ tiles into ZIP archives (one per product × 0.5° lat strip),
-uploads to a single Zenodo deposit. ~30 ZIPs, ~540 MB for all of Austria.
-Uses `data/austria_processor/cache_manifest.json` (NOT `zenodo_manifest.json`).
+**Architecture**: Each local NPZ tile has a `.meta.json` sidecar (written by
+`tile_cache._write_tile_meta()`) that records product type and grid coordinates.
+The uploader uses these sidecars to group tiles into ZIP archives by product ×
+0.5° latitude strip, then uploads to a single Zenodo deposit (depo 19650075).
 
-**Download**: On local cache miss, tile_cache checks Zenodo before calling the
-expensive API. Uses 2-3 HTTP range requests to read individual NPZ entries from
-remote ZIP files. Writes restored tile to local cache dir.
+**Upload flow** (`ZenodoCache.upload_all()`):
+1. `_build_reverse_index()` reads `.meta.json` sidecars (+ fallback from `tile_bbox_index.json`)
+2. Groups tiles by (product, lat strip)
+3. For each group, compares local entry names vs cached remote ZIP central directory
+4. If local ⊆ remote → skip. Otherwise, merge local + remote-only into new ZIP and upload.
+5. Invalidates cached ZIP index after upload.
+
+**Download**: On local cache miss, `tile_cache` calls `ZenodoCache.fetch_copernicus()`
+or `fetch_hansen()`. Uses 2-3 HTTP range requests to read individual NPZ entries
+from remote ZIP files via the cached central directory index.
+
+**When uploads happen**:
+- After each completed tile in the child subprocess (throttled to 30 min)
+- After KG completion (forced)
+- Before disk eviction of expensive tiles (forced)
+- Before each KG in the parent process (throttled to 30 min)
+
+**Key invariant**: Every `.npz` tile file MUST have a `.meta.json` sidecar.
+Orphan tiles (no sidecar) are invisible to the uploader and waste disk.
+`cleanup_orphan_tiles()` runs at processor startup to delete them.
+
+**Manifest files** (don't confuse them):
+- `data/austria_processor/cache_manifest.json` — Zenodo cache deposit (tiles)
+- `data/austria_processor/zenodo_manifest.json` — KG product uploads (GPKGs, JSONs)
+
+**Cached ZIP indices**: `data/austria_processor/zenodo_zip_index/*.json` — cached
+central directories of remote ZIPs, keyed by MD5 of download URL. Invalidated
+automatically after each upload. Stale indices cause false "local ⊆ remote" and
+skip uploads — delete the directory to force re-fetch.
 
 **Why not BEV/ortho?** BEV DTM/DSM/ortho are already COGs with efficient HTTP range
-reads. At 1m resolution, all Austria = ~4TB (infeasible for Zenodo). The per-KG
-full GPKG (already on Zenodo) contains all BEV layers.
+reads. At 1m resolution, all Austria = ~4TB (infeasible for Zenodo).
 
 ```bash
 python3 zenodo_cache.py status      # show local + Zenodo tile counts
 python3 zenodo_cache.py dry-run     # build ZIPs without uploading
 python3 zenodo_cache.py upload       # upload local tiles to Zenodo
 ```
+
+**Troubleshooting**:
+- `Upload complete: 0 ZIPs, 0 tiles` — either no new tiles (normal when same
+  Copernicus cells are reused across KGs), or all local tiles already on Zenodo.
+  Check `python3 zenodo_cache.py status` for local vs remote counts.
+- Tiles not uploading — check `.meta.json` sidecars exist alongside `.npz` files.
+  Missing sidecars = orphans. Run `python3 -c "from zenodo_cache import cleanup_orphan_tiles; cleanup_orphan_tiles()"`
+- Stale indices — `rm -rf data/austria_processor/zenodo_zip_index/` and re-flush.
 
 ## RF Training
 
@@ -523,7 +557,7 @@ All sections are marked with `# === SECTION: ... ===` comments. Use `grep -n '# 
 | Module | Size | What it does for the processor |
 |--------|------|-------------------------------|
 | `tile_cache.py` | ~950L | Grid-snapped 0.1° caches for Copernicus + Hansen. `CopernicusTileCache`, `HansenTileCache`, `order_kgs_nearest_neighbor()`. Zenodo fallback on miss. Re-raises `IPThrottledError`/`CreditsExhaustedError` (never swallows them). |
-| `zenodo_cache.py` | 952L | Persistent cache on Zenodo. Uploads tiles as ZIP archives (one per product × lat strip). Downloads via HTTP range reads (2-3 requests per tile). Separate `cache_manifest.json`. |
+| `zenodo_cache.py` | ~1530L | Persistent cache on Zenodo. Uploads tiles as ZIP archives (one per product × lat strip). Downloads via HTTP range reads (2-3 requests per tile). Separate `cache_manifest.json`. |
 | `object_segmentation.py` | 2218L | `segment_objects_in_area()` — Felzenszwalb + RAG + RF classify. Called once per tile. |
 | `copernicus.py` | ~1300L | openEO client: NDVI, WorldCover, SAR, harmonics. 4-credential rotation, sync→batch fallback, `IPThrottledError`/`CreditsExhaustedError` propagation. See **Copernicus Throttle & Retry** section. |
 | `ortho_io.py` | 992L | BEV orthophoto reader (RGBI, 47 Operates, DOP fallback). |
@@ -722,7 +756,7 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 |------|------|----------|
 | `austria_processor.py` | 5131L | Main processor (this section documents it) |
 | `zenodo_client.py` | 841L | Zenodo API client + `Manifest` class |
-| `zenodo_cache.py` | 952L | Zenodo-backed persistent cache: uploads/downloads Copernicus+Hansen tiles as ZIP archives |
+| `zenodo_cache.py` | ~1530L | Zenodo-backed persistent cache for Copernicus+Hansen tiles. See detailed section above. |
 | `tile_cache.py` | 900L | Grid-snapped Copernicus + Hansen caching, Zenodo fallback on miss |
 | `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure) |
 | `static/process.html` | 1117L | Dashboard UI (status, map, log, Zenodo manifest) |

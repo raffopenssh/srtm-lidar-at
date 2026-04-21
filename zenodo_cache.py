@@ -420,6 +420,38 @@ class ZipIndex:
 
 # === SECTION: Inventory (what's in local cache) ===
 
+
+def cleanup_orphan_tiles() -> int:
+    """Delete local cache tiles that have no .meta.json sidecar.
+
+    These are legacy tiles created before the per-cell refactor.  They
+    can't be mapped to grid coordinates and are invisible to the Zenodo
+    uploader.  They also can't serve cache hits because the hash-based
+    filename no longer matches any current key.
+
+    Returns the number of files deleted.
+    """
+    deleted = 0
+    freed = 0
+    for cache_dir in (COP_CACHE_DIR, HANSEN_CACHE_DIR):
+        if not cache_dir.exists():
+            continue
+        for f in cache_dir.glob("*.npz"):
+            meta = f.with_name(f.stem + ".meta.json")
+            if not meta.exists():
+                sz = f.stat().st_size
+                try:
+                    f.unlink()
+                    deleted += 1
+                    freed += sz
+                except OSError:
+                    pass
+    if deleted:
+        log.info("Cleaned up %d orphan tile cache files (%.1f MB)",
+                 deleted, freed / 1e6)
+    return deleted
+
+
 def _scan_local_copernicus() -> Dict[str, List[Path]]:
     """Scan local Copernicus tile cache, group by product type.
 

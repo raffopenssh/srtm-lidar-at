@@ -6987,6 +6987,13 @@ def main():
     )
     progress.save()
 
+    # --- Clean up orphan tile cache files (legacy variable-bbox tiles) ---
+    try:
+        from zenodo_cache import cleanup_orphan_tiles
+        cleanup_orphan_tiles()
+    except Exception as _e:
+        log.debug("Orphan tile cleanup: %s", _e)
+
     t_start = time.time()
     include_cop = not args.no_copernicus
     mark_uncertain = args.mark_uncertain

@@ -299,12 +299,12 @@
 <div class="kg-card" id="kgCard" style="display:none">
   <div style="display:flex;align-items:baseline;gap:6px">
     <span class="kg-title" id="kgTitle">—</span>
-    <span class="kg-sub" id="kgSub" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
     <span class="kg-sub" id="kgTimer"></span>
     <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
-      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
+      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;margin-left:auto;flex-shrink:0"
     >postpone</button>
   </div>
+  <div class="kg-sub" id="kgSub" style="min-height:1.3em"></div>
   <div class="tile-bar" id="tileBar" style="display:none">
     <span class="tile-lbl" id="tileLbl">tile 0/0</span>
     <div class="tile-track"><div class="tile-fill" id="tileFill" style="width:0%"></div></div>

@@ -542,9 +542,19 @@ def _run_datacube(
                 _cleanup_tmp()
                 _check_credits_error(exc)  # raises CredentialRotatedError or CreditsExhaustedError on 402
                 exc_str = str(exc)
-                if ("429" in exc_str or "503" in exc_str or "max connections" in exc_str) and attempt == 0:
+                is_rate_limited = (
+                    "429" in exc_str or "503" in exc_str
+                    or "max connections" in exc_str
+                    or ("402" in exc_str and "PaymentRequired" in exc_str)
+                )
+                if is_rate_limited and attempt == 0:
+                    reason = (
+                        '402' if '402' in exc_str
+                        else '429' if '429' in exc_str
+                        else '503'
+                    )
                     logger.warning("Rate limited/overloaded (%s), rotating credentials and retrying...",
-                                  '429' if '429' in exc_str else '503')
+                                  reason)
                     rotate_credentials()
                     _time.sleep(5)
                     continue

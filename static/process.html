@@ -297,17 +297,13 @@
 
 <!-- Current KG -->
 <div class="kg-card" id="kgCard" style="display:none">
-  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">
-    <div>
-      <span class="kg-title" id="kgTitle">—</span>
-      <span class="kg-sub" id="kgSub"></span>
-    </div>
-    <div style="display:flex;align-items:baseline;gap:8px">
-      <span class="kg-sub" id="kgTimer"></span>
-      <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
-        style="font-family:inherit;font-size:11px;padding:1px 7px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:4px;cursor:pointer;display:none"
-      >⏭ postpone</button>
-    </div>
+  <div style="display:flex;align-items:baseline;gap:6px">
+    <span class="kg-title" id="kgTitle">—</span>
+    <span class="kg-sub" id="kgSub" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+    <span class="kg-sub" id="kgTimer"></span>
+    <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
+      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
+    >postpone</button>
   </div>
   <div class="tile-bar" id="tileBar" style="display:none">
     <span class="tile-lbl" id="tileLbl">tile 0/0</span>
@@ -997,9 +993,9 @@ async function postponeKG() {
   if (!confirm('Postpone current KG? It will be re-queued 5 KGs later.')) return;
   try {
     const btn = document.getElementById('btnPostpone');
-    btn.disabled = true; btn.textContent = '⏳ postponing…';
+    btn.disabled = true; btn.textContent = 'postponing…';
     const r = await fetch('/api/v1/processing/postpone', {method:'POST'});
-    if (!r.ok) { alert('Postpone failed: ' + await r.text()); btn.disabled = false; btn.textContent = '⏭ postpone'; return; }
+    if (!r.ok) { alert('Postpone failed: ' + await r.text()); btn.disabled = false; btn.textContent = 'postpone'; return; }
     // Refresh queue + status after a short delay for processor to react
     setTimeout(() => { poll(); fetchPrioQueue(); }, 2000);
   } catch(e) { console.error(e); }

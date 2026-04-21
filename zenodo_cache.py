@@ -533,6 +533,106 @@ def write_tile_meta(npz_path: Path, product: str,
         pass
 
 
+# === SECTION: Tile validation ===
+
+# Minimum pixels per dimension for a tile to be considered valid.
+# A 0.1° tile at 10m resolution is ~750×1110 px; anything below 100
+# is clearly degenerate (partial download, empty response, etc.).
+_MIN_TILE_DIM = 100
+
+# Maximum fraction of NaN / nodata pixels before a tile is "polluted".
+_MAX_NAN_FRACTION = 0.95
+
+
+def validate_tile_npz(path_or_bytes, product: str) -> Tuple[bool, str]:
+    """Validate a cached tile NPZ before upload or after download.
+
+    Returns (ok, reason).  If ok is False, the tile should not be uploaded
+    to Zenodo / should be discarded after download.
+
+    Checks per product:
+      ndvi       — has 'ndvi' array, shape ≥ 100×100, <95% NaN, not constant
+      sar        — has 'vv'+'vh', matching shapes ≥ 100×100, <95% NaN
+      worldcover — unpickles to dict with 'map' ≥ 100×100, not all-zero
+      harmonics  — has h_mean/h_amplitude/h_phase ≥ 100×100, <95% NaN
+      hansen     — has treecover2000+lossyear ≥ 100×100, datamask not all-zero
+    """
+    try:
+        if isinstance(path_or_bytes, (str, Path)):
+            d = np.load(str(path_or_bytes), allow_pickle=True)
+        else:
+            d = np.load(io.BytesIO(path_or_bytes), allow_pickle=True)
+    except Exception as e:
+        return False, f"cannot load NPZ: {e}"
+
+    if product == "ndvi":
+        if "ndvi" not in d:
+            return False, "missing 'ndvi' key"
+        arr = d["ndvi"]
+        if arr.ndim < 2 or arr.shape[0] < _MIN_TILE_DIM or arr.shape[1] < _MIN_TILE_DIM:
+            return False, f"ndvi shape too small: {arr.shape}"
+        nan_frac = np.isnan(arr).mean()
+        if nan_frac >= _MAX_NAN_FRACTION:
+            return False, f"ndvi {nan_frac:.1%} NaN"
+        valid = arr[~np.isnan(arr)]
+        if len(valid) > 0 and valid.min() == valid.max():
+            return False, f"ndvi constant value {valid.min()}"
+
+    elif product == "sar":
+        for key in ("vv", "vh"):
+            if key not in d:
+                return False, f"missing '{key}' key"
+        vv, vh = d["vv"], d["vh"]
+        if vv.shape != vh.shape:
+            return False, f"vv/vh shape mismatch: {vv.shape} vs {vh.shape}"
+        if vv.ndim < 2 or vv.shape[0] < _MIN_TILE_DIM or vv.shape[1] < _MIN_TILE_DIM:
+            return False, f"sar shape too small: {vv.shape}"
+        nan_frac = np.isnan(vv).mean()
+        if nan_frac >= _MAX_NAN_FRACTION:
+            return False, f"sar vv {nan_frac:.1%} NaN"
+
+    elif product == "worldcover":
+        if "data" not in d:
+            return False, "missing 'data' key"
+        try:
+            obj = d["data"].item()
+        except Exception as e:
+            return False, f"cannot unpickle worldcover data: {e}"
+        if not isinstance(obj, dict) or "map" not in obj:
+            return False, "worldcover data is not a dict with 'map'"
+        m = obj["map"]
+        if m.ndim < 2 or m.shape[0] < _MIN_TILE_DIM or m.shape[1] < _MIN_TILE_DIM:
+            return False, f"worldcover map shape too small: {m.shape}"
+        if np.all(m == 0):
+            return False, "worldcover map all zeros"
+
+    elif product == "harmonics":
+        for key in ("h_mean", "h_amplitude", "h_phase"):
+            if key not in d:
+                return False, f"missing '{key}' key"
+        hm = d["h_mean"]
+        if hm.ndim < 2 or hm.shape[0] < _MIN_TILE_DIM or hm.shape[1] < _MIN_TILE_DIM:
+            return False, f"harmonics shape too small: {hm.shape}"
+        nan_frac = np.isnan(hm).mean()
+        if nan_frac >= _MAX_NAN_FRACTION:
+            return False, f"harmonics h_mean {nan_frac:.1%} NaN"
+
+    elif product == "hansen":
+        for key in ("treecover2000", "lossyear"):
+            if key not in d:
+                return False, f"missing '{key}' key"
+        tc = d["treecover2000"]
+        if tc.ndim < 2 or tc.shape[0] < _MIN_TILE_DIM or tc.shape[1] < _MIN_TILE_DIM:
+            return False, f"hansen shape too small: {tc.shape}"
+        if "datamask" in d and np.all(d["datamask"] == 0):
+            return False, "hansen datamask all zeros (no data coverage)"
+
+    else:
+        return False, f"unknown product '{product}'"
+
+    return True, "ok"
+
+
 # === SECTION: ZIP builder ===
 
 def _build_zip_for_strip(
@@ -757,10 +857,16 @@ class ZenodoCache:
         for (product, strip_s, strip_n), files in sorted(groups.items()):
             zip_name = _zip_filename(product, strip_s, strip_n)
 
-            # Build set of entry names we have locally
+            # Build set of entry names we have locally, validating each
             local_entries = {}
             for local_path, w, s, e, n, extra in files:
                 entry_name = _npz_entry_name(product, w, s, e, n, **extra)
+                ok, reason = validate_tile_npz(local_path, product)
+                if not ok:
+                    stats["tiles_rejected"] = stats.get("tiles_rejected", 0) + 1
+                    log.warning("Skipping polluted tile %s (%s): %s",
+                                entry_name, local_path.name, reason)
+                    continue
                 local_entries[entry_name] = local_path
 
             # Check what Zenodo already has for this strip
@@ -783,8 +889,14 @@ class ZenodoCache:
                     try:
                         data = remote_idx.read_entry(rname)
                         if data:
-                            remote_data[rname] = data
-                            merged_count += 1
+                            ok, reason = validate_tile_npz(data, product)
+                            if ok:
+                                remote_data[rname] = data
+                                merged_count += 1
+                            else:
+                                stats["tiles_rejected"] = stats.get("tiles_rejected", 0) + 1
+                                log.warning("Dropping polluted remote tile %s: %s",
+                                            rname, reason)
                     except Exception as exc:
                         log.debug("Could not fetch remote entry %s: %s", rname, exc)
 
@@ -913,6 +1025,13 @@ class ZenodoCache:
         if data is None:
             return None
 
+        # Validate before writing to local cache
+        ok, reason = validate_tile_npz(data, product)
+        if not ok:
+            log.warning("Rejected polluted %s tile from Zenodo (%s): %s",
+                        product, entry_name, reason)
+            return None
+
         # Write to local cache with the correct filename
         from tile_cache import tile_key as _tile_key
         if product in ("ndvi", "sar", "harmonics"):
@@ -957,6 +1076,13 @@ class ZenodoCache:
 
         data = idx.read_entry(entry_name)
         if data is None:
+            return None
+
+        # Validate before writing to local cache
+        ok, reason = validate_tile_npz(data, "hansen")
+        if not ok:
+            log.warning("Rejected polluted hansen tile from Zenodo (%s): %s",
+                        entry_name, reason)
             return None
 
         from tile_cache import tile_key as _tile_key
@@ -1234,6 +1360,12 @@ if __name__ == "__main__":
                          help="Also delete local .tif cache files matching this glob "
                               "(e.g. ndvi_ts_v2_7579042d*.tif)")
 
+    p_validate = sub.add_parser("validate", help="Validate local tile cache files")
+    p_validate.add_argument("--product", choices=COP_PRODUCTS + ("hansen",),
+                            help="Only check this product (default: all)")
+    p_validate.add_argument("--delete", action="store_true",
+                            help="Delete polluted tiles")
+
     p_list = sub.add_parser("list", help="List entries in a Zenodo ZIP")
     p_list.add_argument("zip_name", help="ZIP filename (e.g. copernicus_ndvi_strip_48.0_48.5.zip)")
 
@@ -1256,6 +1388,27 @@ if __name__ == "__main__":
             n = cache.strip_local_tif(pat, dry_run=args.dry_run)
             result[f"local_tif_{pat}"] = n
         print(json.dumps(result, indent=2))
+    elif args.cmd == "validate":
+        products = [args.product] if args.product else list(COP_PRODUCTS) + ["hansen"]
+        bad, good = 0, 0
+        for product in products:
+            if product == "hansen":
+                files = list(HANSEN_CACHE_DIR.glob("hansen_*.npz")) if HANSEN_CACHE_DIR.exists() else []
+            else:
+                files = list(COP_CACHE_DIR.glob(f"{product}_*.npz")) if COP_CACHE_DIR.exists() else []
+            for f in sorted(files):
+                ok, reason = validate_tile_npz(f, product)
+                if ok:
+                    good += 1
+                else:
+                    bad += 1
+                    print(f"  POLLUTED  {f.name}  ({reason})")
+                    if args.delete:
+                        f.unlink()
+                        meta = f.with_name(f.stem + ".meta.json")
+                        meta.unlink(missing_ok=True)
+                        print(f"    → deleted")
+        print(f"\nTotal: {good} valid, {bad} polluted")
     elif args.cmd == "list":
         idx = cache._get_zip_index(args.zip_name)
         if idx:

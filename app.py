@@ -1228,6 +1228,18 @@ def processing_queue_get():
             retry_path.write_text(json.dumps(codes))
         except Exception:
             pass
+    # Also filter out the currently-processing KG for display
+    # (it's already shown in the Current KG card)
+    current_kg = None
+    pf = data_dir / 'progress.json'
+    if pf.exists():
+        try:
+            pd = json.loads(pf.read_text())
+            current_kg = (pd.get('current_kg') or {}).get('code')
+        except Exception:
+            pass
+    if current_kg:
+        codes = [c for c in codes if c != current_kg]
     # Load failure counts
     failure_counts = {}
     fc_path = data_dir / 'failure_counts.json'

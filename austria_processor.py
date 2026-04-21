@@ -7212,6 +7212,8 @@ def main():
                             log.info("KG %s: POSTPONED by user at step %s — "
                                      "re-queuing %d KGs later (tile checkpoints preserved)",
                                      kg_code, last_step, DEFER_GAP)
+                            # Remove first so it moves to the end of the file
+                            _remove_from_retry_queue(kg_code)
                             _append_retry_queue(kg_code)
                             _deferred_kg: dict = dict(kg)
                             _deferred_kg["_defer_attempt"] = 0  # reset

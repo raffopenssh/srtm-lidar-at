@@ -1000,7 +1000,8 @@ async function postponeKG() {
     btn.disabled = true; btn.textContent = '⏳ postponing…';
     const r = await fetch('/api/v1/processing/postpone', {method:'POST'});
     if (!r.ok) { alert('Postpone failed: ' + await r.text()); btn.disabled = false; btn.textContent = '⏭ postpone'; return; }
-    setTimeout(poll, 1000);
+    // Refresh queue + status after a short delay for processor to react
+    setTimeout(() => { poll(); fetchPrioQueue(); }, 2000);
   } catch(e) { console.error(e); }
 }
 async function retryKg(code) {

@@ -353,7 +353,7 @@
 <div id="prioQueueWrap" style="display:none">
   <div class="sec-t" style="margin-bottom:4px;">
     <span>📌 Priority Queue <span id="prioQueueCount" style="color:var(--dim);font-weight:normal"></span></span>
-    <span style="font-size:10px;color:var(--dim)">drag to reorder · click ✕ to remove</span>
+    <span style="font-size:10px;color:var(--dim)">drag to reorder · click ✕ to remove · <a href="#" onclick="sortQueueSmallest(event)" style="color:var(--green);text-decoration:none" title="Sort by fewest tiles first">⚡ smallest first</a></span>
   </div>
   <div id="prioQueueTags" class="prio-tags"></div>
 </div>
@@ -1485,6 +1485,14 @@ async function removePrioKg(event, idx) {
   } catch(e) { /* continue anyway */ }
   _prioQueue.splice(idx, 1);
   renderPrioQueue();
+}
+
+function sortQueueSmallest(e) {
+  if (e) e.preventDefault();
+  if (!_prioQueue.length) return;
+  _prioQueue.sort((a, b) => (a.est_tiles || 9999) - (b.est_tiles || 9999));
+  renderPrioQueue();
+  savePrioQueue();
 }
 
 async function savePrioQueue() {

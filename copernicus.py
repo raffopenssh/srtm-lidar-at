@@ -68,7 +68,7 @@ MAX_BBOX_SPAN_DEG = 0.25
 
 # Synchronous download size threshold (area in sq-degrees).
 # Below this we use direct download(); above we use batch jobs.
-SYNC_AREA_THRESHOLD = 0.008  # ~0.09° × 0.09°
+SYNC_AREA_THRESHOLD = 0.012  # ~0.1° × 0.1° cells fit in sync path
 
 # ESA WorldCover class legend
 WORLDCOVER_CLASSES: Dict[int, str] = {
@@ -557,13 +557,17 @@ def _run_datacube(
     output_dir = output_path.parent / f"{output_path.stem}_batch"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    job = datacube.execute_batch(
-        outputfile=str(output_dir),
-        out_format=format,
-        title=title,
-        max_poll_interval=30,
-        print=lambda msg: logger.info("[batch] %s", msg),
-    )
+    try:
+        job = datacube.execute_batch(
+            outputfile=str(output_dir),
+            out_format=format,
+            title=title,
+            max_poll_interval=30,
+            print=lambda msg: logger.info("[batch] %s", msg),
+        )
+    except Exception as batch_exc:
+        _check_credits_error(batch_exc)  # raises CredentialRotatedError on 402
+        raise
     logger.info("Batch job %s finished", job.job_id)
 
     # Find the result file

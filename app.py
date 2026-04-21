@@ -954,6 +954,31 @@ def processing_stop():
     return jsonify({'status': 'stopped'})
 
 
+@app.route('/api/v1/processing/postpone', methods=['POST'])
+def processing_postpone():
+    """Postpone current KG — kill subprocess, re-queue 5 KGs later, no fail count bump."""
+    postpone_file = Path('data/austria_processor/postpone_signal.json')
+    # Read current KG from progress
+    pf = Path('data/austria_processor/progress.json')
+    kg_code = None
+    if pf.exists():
+        try:
+            d = json.loads(pf.read_text())
+            ckg = d.get('current_kg', {})
+            kg_code = ckg.get('code')
+        except Exception:
+            pass
+    if not kg_code:
+        return jsonify({'error': 'No current KG to postpone'}), 404
+    # Write signal file — processor main loop picks this up
+    import datetime as _dt
+    postpone_file.write_text(json.dumps({
+        'kg_code': kg_code,
+        'ts': _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }))
+    return jsonify({'status': 'postpone_requested', 'kg_code': kg_code})
+
+
 @app.route('/api/v1/processing/single', methods=['POST'])
 def processing_single():
     """Process a single KG (async in background)."""

@@ -61,9 +61,11 @@ IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
 TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
+POSTPONE_SIGNAL_FILE = DATA_DIR / "postpone_signal.json"
 
 MAX_KG_PIXELS = 4_000_000
-KG_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — real errors abort early; timeout only catches silent hangs
+KG_TIMEOUT_SECONDS = 12 * 60 * 60       # 12 hours — first attempt
+KG_RETRY_TIMEOUT_SECONDS = 3 * 60 * 60  # 3 hours — retry attempt (checkpoints restore completed tiles)
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
@@ -7169,8 +7171,29 @@ def main():
                         kwds={"include_copernicus": include_cop,
                               "mark_uncertain": mark_uncertain})
                     try:
-                        result = async_result.get(timeout=KG_TIMEOUT_SECONDS)
-                        break  # success — exit retry loop
+                        _timeout = KG_TIMEOUT_SECONDS if attempt_idx == 0 else KG_RETRY_TIMEOUT_SECONDS
+                        # Poll with 5s slices so we can detect postpone signal
+                        _deadline = time.time() + _timeout
+                        _postponed = False
+                        while True:
+                            try:
+                                result = async_result.get(timeout=5)
+                                break  # success
+                            except multiprocessing.TimeoutError:
+                                if time.time() >= _deadline:
+                                    raise  # real timeout — handled below
+                                # Check postpone signal
+                                if POSTPONE_SIGNAL_FILE.exists():
+                                    try:
+                                        _psig = json.loads(POSTPONE_SIGNAL_FILE.read_text())
+                                        if _psig.get("kg_code") == kg_code:
+                                            POSTPONE_SIGNAL_FILE.unlink(missing_ok=True)
+                                            _postponed = True
+                                            raise multiprocessing.TimeoutError("postponed")
+                                    except (json.JSONDecodeError, OSError):
+                                        pass
+                        if not _postponed:
+                            break  # success — exit retry loop
                     except multiprocessing.TimeoutError:
                         _step_monitor_stop.set()
                         step_thread.join(timeout=3)
@@ -7183,6 +7206,29 @@ def main():
                             pass
                         pool.terminate()
                         pool.join()
+
+                        if _postponed:
+                            # User-requested postpone — defer without fail count bump
+                            log.info("KG %s: POSTPONED by user at step %s — "
+                                     "re-queuing %d KGs later (tile checkpoints preserved)",
+                                     kg_code, last_step, DEFER_GAP)
+                            _append_retry_queue(kg_code)
+                            _deferred_kg: dict = dict(kg)
+                            _deferred_kg["_defer_attempt"] = 0  # reset
+                            _deferred_retries.append(
+                                (i + DEFER_GAP, _deferred_kg, 0))
+                            progress.add_log(
+                                "info",
+                                f"KG {kg_code} postponed — "
+                                f"will retry in {DEFER_GAP} KGs",
+                                kg_code)
+                            progress.save()
+                            with progress._lock:
+                                _ckg = progress._state.get("current_kg") or {}
+                                _ts = _ckg.get("tile_statuses", [])
+                            _save_tile_history(kg_code, _ts, "postponed")
+                            result = None
+                            break
 
                         if attempt_idx == 0:
                             # First timeout — retry once

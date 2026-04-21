@@ -105,6 +105,9 @@ HANSEN_CACHE_DIR = DATA_DIR / "hansen_tiles"
 # Download cache for Zenodo ZIP central directories
 _ZIP_INDEX_CACHE_DIR = DATA_DIR / "zenodo_zip_index"
 
+# Persistent pollution event log
+_POLLUTION_LOG_PATH = DATA_DIR / "pollution_log.jsonl"
+
 
 # === SECTION: Latitude strips ===
 
@@ -633,6 +636,70 @@ def validate_tile_npz(path_or_bytes, product: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _log_pollution_event(product: str, entry: str, reason: str,
+                         source: str, action: str = "rejected"):
+    """Append a pollution event to the persistent JSONL log.
+
+    Parameters
+    ----------
+    product : str    e.g. "ndvi", "hansen"
+    entry : str      tile identifier (entry name or local filename)
+    reason : str     validation failure reason
+    source : str     "local_upload", "remote_merge", "zenodo_download"
+    action : str     "rejected" (skipped) or "deleted" (removed)
+    """
+    from datetime import datetime, timezone
+    event = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "product": product,
+        "entry": entry,
+        "reason": reason,
+        "source": source,
+        "action": action,
+    }
+    try:
+        _POLLUTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_POLLUTION_LOG_PATH, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError:
+        pass
+
+
+def get_pollution_events(limit: int = 50) -> List[Dict]:
+    """Read recent pollution events from the persistent log."""
+    if not _POLLUTION_LOG_PATH.exists():
+        return []
+    try:
+        lines = _POLLUTION_LOG_PATH.read_text().strip().splitlines()
+        events = []
+        for line in lines[-limit:]:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+    except OSError:
+        return []
+
+
+def get_pollution_summary() -> Dict[str, Any]:
+    """Return a summary of all pollution events."""
+    events = get_pollution_events(limit=10000)
+    if not events:
+        return {"total": 0, "by_product": {}, "by_source": {}, "recent": []}
+    by_product: Dict[str, int] = {}
+    by_source: Dict[str, int] = {}
+    for ev in events:
+        by_product[ev.get("product", "?")] = by_product.get(ev.get("product", "?"), 0) + 1
+        by_source[ev.get("source", "?")] = by_source.get(ev.get("source", "?"), 0) + 1
+    return {
+        "total": len(events),
+        "by_product": by_product,
+        "by_source": by_source,
+        "recent": events[-5:],
+    }
+
+
 # === SECTION: ZIP builder ===
 
 def _build_zip_for_strip(
@@ -866,6 +933,8 @@ class ZenodoCache:
                     stats["tiles_rejected"] = stats.get("tiles_rejected", 0) + 1
                     log.warning("Skipping polluted tile %s (%s): %s",
                                 entry_name, local_path.name, reason)
+                    _log_pollution_event(product, entry_name, reason,
+                                         "local_upload")
                     continue
                 local_entries[entry_name] = local_path
 
@@ -897,6 +966,8 @@ class ZenodoCache:
                                 stats["tiles_rejected"] = stats.get("tiles_rejected", 0) + 1
                                 log.warning("Dropping polluted remote tile %s: %s",
                                             rname, reason)
+                                _log_pollution_event(product, rname, reason,
+                                                     "remote_merge")
                     except Exception as exc:
                         log.debug("Could not fetch remote entry %s: %s", rname, exc)
 
@@ -1030,6 +1101,8 @@ class ZenodoCache:
         if not ok:
             log.warning("Rejected polluted %s tile from Zenodo (%s): %s",
                         product, entry_name, reason)
+            _log_pollution_event(product, entry_name, reason,
+                                 "zenodo_download")
             return None
 
         # Write to local cache with the correct filename
@@ -1083,6 +1156,8 @@ class ZenodoCache:
         if not ok:
             log.warning("Rejected polluted hansen tile from Zenodo (%s): %s",
                         entry_name, reason)
+            _log_pollution_event("hansen", entry_name, reason,
+                                 "zenodo_download")
             return None
 
         from tile_cache import tile_key as _tile_key
@@ -1308,6 +1383,7 @@ class ZenodoCache:
             "zenodo_size_bytes": sum(f.get("size", 0) for f in self.manifest.all_files().values()),
             "local_copernicus": {k: len(v) for k, v in local_cop.items()},
             "local_hansen": len(local_hansen),
+            "pollution": get_pollution_summary(),
         }
 
 
@@ -1407,6 +1483,8 @@ if __name__ == "__main__":
                         f.unlink()
                         meta = f.with_name(f.stem + ".meta.json")
                         meta.unlink(missing_ok=True)
+                        _log_pollution_event(product, f.name, reason,
+                                             "local_validate", action="deleted")
                         print(f"    → deleted")
         print(f"\nTotal: {good} valid, {bad} polluted")
     elif args.cmd == "list":

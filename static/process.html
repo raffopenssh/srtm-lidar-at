@@ -721,6 +721,19 @@ function updateCards(d) {
   document.getElementById('cZenVal').textContent = mc + ' uploaded';
   let zenDet = fmtB(ms) + ' total';
   if (zc.zenodo_tiles) zenDet += '<br>Cache: ' + fmt(zc.zenodo_tiles) + ' tiles in ' + fmt(zc.zenodo_files||0) + '/35 ZIPs · ' + fmtB(zc.zenodo_size_bytes||0) + '/50 GB';
+  // Pollution tracking — append to Zenodo card
+  const poll = (zc.pollution) || {};
+  if (poll.total > 0) {
+    const bp = poll.by_product || {};
+    const pd = Object.entries(bp).map(([k,v]) => k+':'+v).join(' ');
+    zenDet += '<br><span style="color:var(--yellow)">⚠ ' + poll.total + ' polluted tiles rejected</span> (' + pd + ')';
+    const recent = poll.recent || [];
+    if (recent.length) {
+      const last = recent[recent.length - 1];
+      const ago = last.ts ? last.ts.slice(5,16).replace('T',' ') : '';
+      zenDet += '<br><span style="color:var(--dim)">Last: ' + esc(last.product + ' — ' + (last.reason||'')) + ' (' + ago + ')</span>';
+    }
+  }
   document.getElementById('cZenDet').innerHTML = zenDet;
 
 }

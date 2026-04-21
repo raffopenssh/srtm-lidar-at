@@ -105,7 +105,7 @@ _exhausted_cred_indices: set = set()  # tracks which credential indices got 402
 # Skips re-downloading the same month for the same area within the cooldown period.
 _FAILED_MONTH_COOLDOWNS: Dict[tuple, float] = {}
 _FAILED_MONTH_COOLDOWN_SECS = 1800  # 30 minutes for 500 (Spark timeout)
-_FAILED_MONTH_402_COOLDOWN_SECS = 300  # 5 minutes for 402 cascade
+_FAILED_MONTH_402_COOLDOWN_SECS = 1800  # 30 minutes — 402 is IP-level, recovery takes ~2h
 
 # Threading lock for credential state — protects _credential_index,
 # _exhausted_cred_indices, credits_exhausted, CLIENT_ID, CLIENT_SECRET,
@@ -781,6 +781,7 @@ def get_ndvi_timeseries(
         tried_creds: set[int] = set()  # credentials already exhausted via retries
         attempt = 0
         last_exc: Exception | None = None
+        _download_month_sequential._proxy_tried = False
 
         while True:
             if credits_exhausted:
@@ -813,7 +814,13 @@ def get_ndvi_timeseries(
                 except Exception:
                     tmp_month.unlink(missing_ok=True)
                     raise
-                logger.info("NDVI %s downloaded OK", label)
+                logger.info("NDVI %s downloaded OK%s", label,
+                            " (via proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "")
+                # Clear proxy on success
+                try:
+                    c.session.proxies.clear()
+                except Exception:
+                    pass
                 return label, None
             except CredentialRotatedError:
                 logger.info("NDVI %s: credential rotated, retrying", label)
@@ -862,39 +869,43 @@ def get_ndvi_timeseries(
                             )
                             _time.sleep(wait_secs)
                             continue
-                        # Exhausted retries on this credential — rotate.
+                        # 402 is IP-level rate-limiting — rotating credentials
+                        # doesn't help (0/10 success rate observed in logs).
+                        # Try once through an HTTP proxy to change our IP.
                         tried_creds.add(_credential_index)
-                        old_idx = _credential_index
-                        # Keep rotating until we find an untried credential
-                        found_fresh = False
-                        for _ in range(len(_CREDENTIALS)):
-                            rotated = rotate_credentials()
-                            if not rotated:
-                                break  # only 1 credential
-                            if _credential_index not in tried_creds:
-                                found_fresh = True
-                                break
-                        if found_fresh:
-                            logger.warning(
-                                "NDVI %s: transient 402 persisted after %d "
-                                "retries on credential %d — rotated to "
-                                "credential %d, retrying",
-                                label, max_retries_per_cred, old_idx + 1,
-                                _credential_index + 1,
-                            )
-                            attempt = 0  # fresh retries on new credential
-                            continue
-                        # All credentials tried — give up.
+                        if not getattr(_download_month_sequential, '_proxy_tried', False):
+                            try:
+                                import bev_proxy
+                                proxy_url = bev_proxy.next_proxy()
+                                if proxy_url:
+                                    logger.info(
+                                        "NDVI %s: 402 on direct — retrying via proxy %s",
+                                        label, proxy_url,
+                                    )
+                                    c = _get_connection()
+                                    old_proxies = dict(c.session.proxies)
+                                    c.session.proxies = {"https": proxy_url, "http": proxy_url}
+                                    _download_month_sequential._proxy_tried = True
+                                    attempt = 0
+                                    continue
+                            except Exception as pe:
+                                logger.debug("Proxy setup failed: %s", pe)
                     except CredentialRotatedError:
                         logger.info("NDVI %s: credential exhausted, rotated to next", label)
                         attempt = 0
                         continue
                     except CreditsExhaustedError as ce:
                         return label, ce
+                    # Clear proxy if we set one
+                    try:
+                        c = _get_connection()
+                        c.session.proxies.clear()
+                    except Exception:
+                        pass
                     logger.warning(
-                        "NDVI %s: persistent 402 after retries on %d credential(s) "
-                        "— skipping month",
-                        label, max(len(tried_creds), 1),
+                        "NDVI %s: persistent 402 after retries%s — skipping month",
+                        label,
+                        " (incl. proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "",
                     )
                     return label, exc
 

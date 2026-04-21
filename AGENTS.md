@@ -354,9 +354,11 @@ These are the dangerous changes — they touch many files and are easy to break.
 3. Retrain the model: existing `.joblib` files become incompatible if feature count changes
 
 **Changing the Copernicus credential set:**
-1. `copernicus.py` → `_CREDENTIALS` list
-2. Delete `data/austria_processor/copernicus_paused` if it exists
-3. Optionally reset circuit breaker: delete `data/austria_processor/openeo_circuit.json`
+1. `copernicus.py` → `_CREDENTIALS` list (line ~48, 4 tuples of `(client_id, client_secret)`)
+2. `rm -f data/austria_processor/copernicus_paused` (removes throttle pause)
+3. `rm -f data/austria_processor/openeo_circuit.json` (resets circuit breaker)
+4. Restart processor: `sudo systemctl restart austria_processor`
+5. **Important**: the `@_retry_on_rotation` decorator tries `len(_CREDENTIALS)+1` attempts. Adding/removing credentials changes retry behaviour automatically.
 
 **Changing tile grid / overlap:**
 1. `austria_processor.py` → `_compute_tile_grid()` (tile_km, overlap_km params)
@@ -520,10 +522,10 @@ All sections are marked with `# === SECTION: ... ===` comments. Use `grep -n '# 
 
 | Module | Size | What it does for the processor |
 |--------|------|-------------------------------|
-| `tile_cache.py` | 900L | Grid-snapped caches for Copernicus + Hansen. `CopernicusTileCache`, `HansenTileCache`, `order_kgs_nearest_neighbor()`. Zenodo fallback on miss. |
+| `tile_cache.py` | ~950L | Grid-snapped 0.1° caches for Copernicus + Hansen. `CopernicusTileCache`, `HansenTileCache`, `order_kgs_nearest_neighbor()`. Zenodo fallback on miss. Re-raises `IPThrottledError`/`CreditsExhaustedError` (never swallows them). |
 | `zenodo_cache.py` | 952L | Persistent cache on Zenodo. Uploads tiles as ZIP archives (one per product × lat strip). Downloads via HTTP range reads (2-3 requests per tile). Separate `cache_manifest.json`. |
 | `object_segmentation.py` | 2218L | `segment_objects_in_area()` — Felzenszwalb + RAG + RF classify. Called once per tile. |
-| `copernicus.py` | 1262L | openEO client: NDVI, WorldCover, SAR, harmonics. Has credential rotation + sync/batch fallback. |
+| `copernicus.py` | ~1300L | openEO client: NDVI, WorldCover, SAR, harmonics. 4-credential rotation, sync→batch fallback, `IPThrottledError`/`CreditsExhaustedError` propagation. See **Copernicus Throttle & Retry** section. |
 | `ortho_io.py` | 992L | BEV orthophoto reader (RGBI, 47 Operates, DOP fallback). |
 | `raster_io.py` | 359L | Windowed reads from BEV GeoTIFFs via `/vsicurl/`. |
 | `hansen.py` | 453L | Hansen Global Forest Change data reader. |
@@ -531,7 +533,7 @@ All sections are marked with `# === SECTION: ... ===` comments. Use `grep -n '# 
 | `terrain_analysis.py` | 157L | Slope, aspect, TRI, curvature from DTM. |
 | `learned_classifier.py` | 559L | RF model loading + 44-feature classification. |
 | `zenodo_client.py` | 841L | Zenodo deposit creation, file upload, publish. `Manifest` class for tracking. |
-| `bev_retry.py` | 252L | Exponential backoff + proxy rotation for `rasterio.open()`. |
+| `bev_retry.py` | 252L | Exponential backoff + proxy rotation for `rasterio.open()`. Proxy pool is free HTTPS proxies from GitHub lists — works for BEV GeoTIFFs, **not useful for Copernicus** (openEO auth is per-credential, not per-IP). |
 
 ### Data Flow Through a Single Tile
 
@@ -679,7 +681,8 @@ nearest-neighbor ordering relative to the last completed KG.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `copernicus: credits exhausted` | All openEO credentials used up | Update `_CREDENTIALS` in `copernicus.py`, delete `data/austria_processor/copernicus_paused` |
+| `IPThrottledError` / all 4 creds 402 | Copernicus rate-limiting (transient, all probes pass) | **Automatic**: aborts KG, writes `copernicus_paused`, polls every 15 min, re-queues KG. See **Copernicus Throttle & Retry**. |
+| `CreditsExhaustedError` | Genuine credit exhaustion (probe fails) | Update `_CREDENTIALS` in `copernicus.py`, delete `data/austria_processor/copernicus_paused` |
 | Timeout on large KG | Copernicus slow (NDVI downloads) | Automatic: retry once with checkpoints, then deferred retry 5 KGs later if transient |
 | OOM kill | KG exceeds 3GB MemoryMax | Automatic: systemd restarts, tile checkpoints preserved |
 | `Synchronous download timed out` | Normal Copernicus behavior | No action — falls back to batch job automatically |
@@ -735,12 +738,191 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | JSON summary wrong | `build_json_summary_tiled()` (line 2537) |
 | Parcel heights wrong | `enrich_parcels_with_heights()` (line 647) |
 | Tile boundary artifacts | Centroid-ownership dedup in `process_one_kg()` ~line 3830, `_segment_touches_edge()` |
-| Copernicus data missing | `tile_cache.py` → `copernicus.py` → credential rotation + circuit breaker |
+| Copernicus data missing | `tile_cache.py` → `copernicus.py` → credential rotation + `@_retry_on_rotation` decorator. See **Copernicus Throttle & Retry**. |
 | BEV data read failure | `raster_io.py` → `bev_retry.py` (exponential backoff + proxy rotation) |
 | Zenodo upload failure | `main()` ~line 4900, calls `zenodo_client.py` |
 | Dashboard not updating | `app.py` `/api/v1/processing/status` reads `progress.json`; check parent thread alive |
-| Copernicus quadrant fallback | `_quadrant_split()` ~line 4132, called from `_fetch_copernicus_for_tile()` |
+| Copernicus quadrant fallback | `_quadrant_split()` in `_fetch_copernicus_for_tile()`. Skipped entirely on `IPThrottledError`. |
+| Copernicus 402 / throttle | `copernicus.py` `_check_credits_error()` → `@_retry_on_rotation` (all 4 creds) → `IPThrottledError` → tile_cache re-raises → austria_processor writes pause file + aborts KG |
 
+
+### Copernicus Throttle & Retry — Mental Model
+
+**Read this before touching copernicus.py, tile_cache.py, or the Copernicus path in austria_processor.py.**
+
+#### The Problem
+
+Copernicus openEO returns HTTP 402 PaymentRequired when rate-limited. This is NOT always genuine credit exhaustion — often it's a transient rate-limit where the credential is still healthy (auth works, quota page shows credits remaining). We have 4 credentials. Sometimes only 1-2 are throttled; sometimes all 4 are. Recovery takes minutes to hours.
+
+#### Three-Layer Architecture
+
+```
+copernicus.py          tile_cache.py           austria_processor.py
+(API layer)            (cache layer)           (orchestrator)
+─────────────          ──────────────          ────────────────────
+402 detected           re-raises               writes pause file
+  │                    IPThrottledError        aborts tile loop
+  ├─ probe credential  and                     re-queues KG
+  │  passes? → rotate  CreditsExhaustedError   polls every 15 min
+  │  + CredentialRotatedError  (never returns     until probe passes
+  │                             None for these)
+  ├─ probe fails? → mark
+  │  exhausted + rotate
+  │  + CredentialRotatedError
+  │
+  └─ all exhausted?
+     → CreditsExhaustedError
+
+@_retry_on_rotation decorator
+  catches CredentialRotatedError
+  → rebuilds connection + datacube with next credential
+  → retries the entire function
+  → after len(_CREDENTIALS)+1 attempts:
+      all probes passed → IPThrottledError (transient)
+      some probes failed → CreditsExhaustedError (genuine)
+```
+
+#### Exception Types (copernicus.py)
+
+| Exception | Meaning | Caught by |
+|-----------|---------|----------|
+| `CredentialRotatedError` | One credential got 402, rotated to next | `@_retry_on_rotation` decorator (retries with fresh cred) |
+| `CreditsExhaustedError` | ALL credentials genuinely exhausted (probes failed) | tile_cache re-raises → austria_processor writes pause file |
+| `IPThrottledError(RuntimeError)` | ALL credentials got transient 402 (probes passed) | tile_cache re-raises → austria_processor writes pause file |
+
+**Critical rule**: `CredentialRotatedError`, `CreditsExhaustedError`, and `IPThrottledError` must NEVER be swallowed by generic `except Exception` blocks. The public functions (`get_ndvi_composite`, `get_land_cover`, `get_sar_backscatter`) have explicit `except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError): raise` before their generic handler.
+
+#### Credential Probing
+
+`_check_credits_error(exc)` is called on every 402. It:
+1. Authenticates the credential against the OIDC endpoint (not a data download)
+2. If auth succeeds → "transient 402" → rotates + `CredentialRotatedError`
+3. If auth fails with 402 → "genuinely exhausted" → marks credential, rotates + `CredentialRotatedError` (or `CreditsExhaustedError` if all gone)
+
+**Why probes always pass during rate-limiting**: the auth endpoint is separate from the processing endpoint. A credential can authenticate fine but still get 402 on downloads. This is why we must try ALL credentials — the rate-limit may be per-credential or per-IP or timing-dependent.
+
+#### Sync → Batch Fallback
+
+Each product download tries sync first (3 min timeout), then batch job:
+- Sync: `datacube.download()` — fast for 0.1° cells, often 402'd or times out
+- Batch: `datacube.execute_batch()` — slower (5-15 min) but more reliable
+- The `@_retry_on_rotation` decorator wraps the entire function, so a 402 on sync in credential 1 → retry the whole function with credential 2 (new sync attempt, then batch fallback)
+
+#### Per-Product Retry Flow
+
+**NDVI/WorldCover/SAR** (`get_ndvi_composite`, `get_land_cover`, `get_sar_backscatter`):
+```
+@_retry_on_rotation (up to 5 attempts with 4 creds)
+  └─ build datacube with current credential
+     └─ _run_datacube()
+        ├─ sync download (1 attempt)
+        │   402 → _check_credits_error → CredentialRotatedError → decorator retries
+        │   timeout → fall through to batch
+        └─ batch job
+            402 → _check_credits_error → CredentialRotatedError → decorator retries
+```
+
+**NDVI Time Series** (`get_ndvi_timeseries` → `_download_month_sequential`):
+- Downloads 8 months (Mar-Oct) sequentially
+- Each month has its own retry loop with credential tracking (`tried_creds` set)
+- After all 4 credentials fail for one month → returns `IPThrottledError` for that month
+- Download loop: if `IPThrottledError` or `CreditsExhaustedError` returned → breaks immediately (cascade breaker)
+- Also has per-month cooldown (`_FAILED_MONTH_COOLDOWNS`) — skips months that failed recently
+
+#### tile_cache.py Bridge
+
+All 4 `_fetch_*_cell` methods follow the same pattern:
+```python
+try:
+    result = copernicus.get_*(cell_bbox, ...)
+except (CreditsExhaustedError, IPThrottledError):
+    raise   # NEVER swallowed — propagates to austria_processor
+except server_error:
+    retry with backoff
+except other:
+    return None  # soft failure for non-throttle errors
+```
+
+Additional safety: if `last_exc` contains "IP-throttled", raises `IPThrottledError` even from the `return None` path.
+
+#### austria_processor.py Response
+
+**`_try_fetch_single(bbox)`**: Early-bails if `copernicus.ip_throttled` flag is set.
+
+**`_fetch_copernicus_for_tile()`**: On `IPThrottledError`/`CreditsExhaustedError`, re-raises immediately — no quadrant fallback. Quadrant fallback only triggers on timeouts/server errors.
+
+**Tile loop** (inside `process_one_kg`):
+```
+try:
+    copernicus_data = _fetch_copernicus_for_tile(...)
+except (CreditsExhaustedError, IPThrottledError):
+    result["copernicus_exhausted"] = True
+    result["success"] = False
+    COPERNICUS_PAUSE_FILE.write_text(...)   # data/austria_processor/copernicus_paused
+    break   # ABORT tile loop
+```
+
+After tile loop, if `copernicus_exhausted + success=False`: return early (skip GPKG/JSON build).
+
+**Parent process** (`main()`):
+1. Subprocess returns with `copernicus_exhausted=True` → `is_credits_issue` check
+2. KG added to `retry_queue.json` (tile checkpoints preserved)
+3. Enters pause loop: sleeps 15 min → `_copernicus_probe()` → if OK, deletes pause file + resumes
+4. `_copernicus_probe()` resets both `ip_throttled` and `credits_exhausted` flags, clears all cached connections, then tries a tiny NDVI download
+5. On resume, the re-queued KG is processed next (tile checkpoints restore completed tiles)
+
+#### Proxies — NOT Useful for Copernicus
+
+`bev_proxy.py` manages a pool of free HTTPS proxies from GitHub lists. These are useful for BEV GeoTIFF range reads but **do not help with Copernicus 402s** because:
+- openEO authentication is per-credential (OAuth client_credentials), not per-IP
+- Rate-limiting is tied to the credential's account, not the source IP
+- Free proxies are unreliable and slow for the data volumes openEO returns
+
+Historical note: proxy rotation for Copernicus was tried and removed. The solution is credential rotation (try all 4), not IP rotation.
+
+#### 4 Credentials (copernicus.py line ~48)
+
+| Index | Client ID prefix | Notes |
+|-------|-----------------|-------|
+| 1 | `sh-f36653c6` | Fresh 2026-04 |
+| 2 | `sh-8d8c685f` | Renews 2026-05-01 |
+| 3 | `sh-2ed25dbb` | Renews 2026-05-01 |
+| 4 | `sh-07af1740` | 30k credits |
+
+All share the same CDSE quota pools (openEO, Sentinel Hub, COG, S3). Currently only openEO is used. Each account has 10k openEO credits/month.
+
+#### Key Files & Flags
+
+| File/Flag | Location | Purpose |
+|-----------|----------|--------|
+| `copernicus_paused` | `data/austria_processor/` | Pause file — parent polls every 15 min when present |
+| `openeo_circuit.json` | `data/austria_processor/` | Circuit breaker — backs off on consecutive failures |
+| `copernicus.ip_throttled` | Module global (per-process) | Fast-bail flag — set by decorator after all creds fail |
+| `copernicus._exhausted_cred_indices` | Module global (per-process) | Set of credential indices confirmed genuinely exhausted |
+| `copernicus._IP_THROTTLE_COOLDOWN` | 7200 (2 hours) | How long `ip_throttled` stays True before auto-reset |
+| `_FAILED_MONTH_COOLDOWNS` | Module global dict | Per-(bbox,month) cooldown timestamps for NDVI TS |
+
+**Process architecture note**: Module globals (`ip_throttled`, `_exhausted_cred_indices`, etc.) live in the subprocess (one per KG). They reset when a new KG starts in a fresh subprocess. The pause file is the cross-process communication mechanism.
+
+#### Operational Commands
+
+```bash
+# Check if paused
+cat data/austria_processor/copernicus_paused
+
+# Force resume (probe will re-validate on next KG)
+rm -f data/austria_processor/copernicus_paused
+
+# Reset all throttle state
+rm -f data/austria_processor/copernicus_paused data/austria_processor/openeo_circuit.json
+sudo systemctl restart austria_processor
+
+# Check which credential is active in the subprocess
+grep 'Authenticated successfully\|Rotated to credential\|IP-throttled\|transient 402' \
+  data/austria_processor/logs/processor.log | tail -20
+```
+
+---
 
 ### Planned Refactor (next maintenance window)
 

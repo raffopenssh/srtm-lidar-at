@@ -108,6 +108,13 @@
   .prio-tag.fail-perm { border-color: #6e2015; background: rgba(248,81,73,0.15); cursor: default; }
   .prio-tag.fail-perm .prio-code { color: var(--red); }
   .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
+  .prio-tiles { display: inline-flex; align-items: center; gap: 1px; margin-left: 2px; margin-right: 1px; }
+  .prio-tiles .t-block { width: 3px; height: 8px; border-radius: 1px; opacity: 0.7; }
+  .prio-tiles .t-block.t-on { background: var(--blue); }
+  .prio-tiles .t-block.t-off { background: var(--border); opacity: 0.3; }
+  .prio-tiles-fast .t-block.t-on { background: var(--green); }
+  .prio-tiles-medium .t-block.t-on { background: var(--yellow); }
+  .prio-tiles-slow .t-block.t-on { background: var(--red); }
   .tile-dot {
     filter: drop-shadow(0 0 3px rgba(255,255,255,0.7));
   }
@@ -1352,6 +1359,20 @@ async function fetchPrioQueue() {
   } catch(e) { /* silent */ }
 }
 
+function _tileBadge(estTiles) {
+  if (!estTiles) return '';
+  // 5-bar indicator showing relative processing cost
+  // Color: green ≤6 tiles, yellow ≤20, red >20
+  const maxBars = 5;
+  const filled = estTiles <= 2 ? 1 : estTiles <= 6 ? 2 : estTiles <= 15 ? 3 : estTiles <= 40 ? 4 : 5;
+  const cls = estTiles <= 6 ? 'prio-tiles-fast' : estTiles <= 20 ? 'prio-tiles-medium' : 'prio-tiles-slow';
+  let bars = '';
+  for (let b = 0; b < maxBars; b++) {
+    bars += '<span class="t-block ' + (b < filled ? 't-on' : 't-off') + '"></span>';
+  }
+  return '<span class="prio-tiles ' + cls + '" title="~' + estTiles + ' tiles">' + bars + '</span>';
+}
+
 function _failClass(failures) {
   if (failures >= 3) return 'fail-perm';
   if (failures >= 2) return 'fail-2';
@@ -1384,9 +1405,10 @@ function renderPrioQueue() {
     tag.draggable = true;
     tag.dataset.idx = i;
     tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
-      (kg.failures ? ' · ' + kg.failures + ' failure(s)' : '');
+      (kg.failures ? ' · ' + kg.failures + ' failure(s)' : '') +
+      (kg.est_tiles ? ' · ~' + kg.est_tiles + ' tiles' : '');
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) + _failBadge(kg.failures) +
+      esc(kg.name) + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
       '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
     // Drag events
     tag.addEventListener('dragstart', e => {
@@ -1434,9 +1456,10 @@ function renderPermFailed() {
     const tag = document.createElement('span');
     tag.className = 'prio-tag fail-perm';
     tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
-      ' · ' + kg.failures + ' failure(s) · click to retry';
+      ' · ' + kg.failures + ' failure(s) · click to retry' +
+      (kg.est_tiles ? ' · ~' + kg.est_tiles + ' tiles' : '');
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) + _failBadge(kg.failures);
+      esc(kg.name) + _tileBadge(kg.est_tiles) + _failBadge(kg.failures);
     tag.style.cursor = 'pointer';
     tag.addEventListener('click', () => retryPermFailed(kg.code));
     container.appendChild(tag);

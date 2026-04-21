@@ -1263,18 +1263,30 @@ def processing_queue_get():
     items = []
     perm_failed_items = []
     try:
+        import math as _math
         idx = si.get_index()
         conn = idx._conn()
+        def _est_tiles(min_lon, min_lat, max_lon, max_lat, tile_km=1.5, overlap_km=0.1):
+            """Estimate number of processing tiles from KG bbox."""
+            if min_lon is None or min_lat is None:
+                return None
+            cos_lat = _math.cos(_math.radians((min_lat + max_lat) / 2))
+            step_x = (tile_km - overlap_km) / (111 * cos_lat)
+            step_y = (tile_km - overlap_km) / 111
+            nx = max(1, _math.ceil((max_lon - min_lon) / step_x))
+            ny = max(1, _math.ceil((max_lat - min_lat) / step_y))
+            return nx * ny
         def _resolve(code):
             row = conn.execute(
-                'SELECT kg_name, gemeinde_name, district_name FROM kg WHERE kg_code=?',
+                'SELECT kg_name, gemeinde_name, district_name, min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?',
                 (code,)
             ).fetchone()
             if row:
                 return {'code': code, 'name': row['kg_name'],
                         'gemeinde': row['gemeinde_name'],
                         'district': row['district_name'],
-                        'failures': failure_counts.get(code, 0)}
+                        'failures': failure_counts.get(code, 0),
+                        'est_tiles': _est_tiles(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat'])}
             return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0)}
         items = [_resolve(c) for c in codes]
         perm_failed_items = [_resolve(c) for c in perm_failed]

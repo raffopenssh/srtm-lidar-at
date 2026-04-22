@@ -6103,12 +6103,79 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             log.info("  Monster KG: freed %.0f MB of tile arrays (%.0f Mpx > %.0f Mpx limit)",
                      _freed_bytes / 1e6, _n_pixels / 1e6, _MAX_FULL_GPKG_PIXELS / 1e6)
 
+        # --- 4b. Evict caches not needed for GPKG build ---
+        # The GPKG build phase can produce multi-GB files.  Free disk
+        # space by purging tile checkpoints (all tiles are merged in
+        # memory already) and evicting stale data caches.
+        _report_step("disk_cleanup", "freeing disk for GPKG build")
+        try:
+            # Tile checkpoints are only needed for crash-recovery of
+            # the tile loop.  By this point all tiles are merged.
+            import shutil as _shutil_ev
+            _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+            if _ckpt_dir.exists():
+                _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
+                _shutil_ev.rmtree(_ckpt_dir, ignore_errors=True)
+                log.info("  Freed %.0f MB tile checkpoints before GPKG build",
+                         _ckpt_sz / 1e6)
+            # Evict BEV + ortho caches (cheap to re-fetch via COG range reads)
+            _usage = _shutil_ev.disk_usage("/")
+            _free_gb = _usage.free / (1024 ** 3)
+            _estimated_gpkg_gb = _n_pixels * 20 / 1e9  # ~20 bytes/px for full GPKG
+            if _free_gb < _estimated_gpkg_gb + 2.0:  # need headroom
+                log.info("  Disk: %.1f GB free, need ~%.1f GB for GPKG — evicting caches",
+                         _free_gb, _estimated_gpkg_gb)
+                for _cache_name in ["bev_tile_cache", "ortho_tile_cache",
+                                    "copernicus_tiles", "hansen_tiles"]:
+                    _cache_dir = DATA_DIR / _cache_name
+                    if _cache_dir.exists():
+                        _csz = sum(f.stat().st_size for f in _cache_dir.iterdir() if f.is_file())
+                        if _csz > 0:
+                            for _cf in sorted(_cache_dir.iterdir(),
+                                              key=lambda f: f.stat().st_mtime):
+                                if _cf.is_file():
+                                    try:
+                                        _cf.unlink()
+                                    except OSError:
+                                        pass
+                            log.info("    Evicted %s (%.0f MB)", _cache_name, _csz / 1e6)
+                _usage2 = _shutil_ev.disk_usage("/")
+                log.info("  Disk after eviction: %.1f GB free", _usage2.free / (1024 ** 3))
+        except Exception as _ev_e:
+            log.warning("  Cache eviction failed: %s", _ev_e)
+
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
         full_gpkg, _boundary_remap = build_full_gpkg_tiled(
             kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         result["files"]["full_gpkg"] = full_gpkg
+
+        # --- 5b. Stream full GPKG to Zenodo immediately ---
+        # For large KGs the full GPKG can be 4-15 GB.  Upload it now
+        # and delete the local copy BEFORE building the light GPKG,
+        # so both products never coexist on disk simultaneously.
+        _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
+        if _full_size > 0:
+            _report_step("upload_full_gpkg",
+                         f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
+            try:
+                from zenodo_client import Client as _ZClient, landscape_metadata as _lm
+                _zclient = _ZClient(token=ZENODO_TOKEN)
+                _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                    _qs=0, _qg="": \
+                    _lm(_kg, _name, v, "gpkg")
+                from zenodo_client import Manifest as _ZManifest
+                _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
+                _zclient.upload_stream(
+                    f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
+                    _zmanifest, delete_after=True)
+                log.info("  Full GPKG streamed to Zenodo and deleted locally")
+                # Mark as already uploaded so upload_kg_to_zenodo skips it
+                result["_full_gpkg_uploaded"] = True
+            except Exception as _ue:
+                log.warning("  Early full GPKG upload failed: %s — will retry later", _ue)
+        gc.collect()
 
         # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"
@@ -6581,7 +6648,12 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                         quality_grade: str = "",
                         available_layers: list = None,
                         missing_layers: list = None) -> dict:
-    """Upload KG files to Zenodo, verify, delete local GPKGs."""
+    """Upload KG files to Zenodo via streaming, verify, delete local GPKGs.
+
+    Uses ``Client.upload_stream()`` to stream files directly from disk
+    to Zenodo without loading them into memory.  This is critical for
+    large GPKGs (multi-GB) on a disk-constrained VM.
+    """
     from zenodo_client import Client, landscape_metadata
 
     client = Client(token=ZENODO_TOKEN)
@@ -6608,7 +6680,13 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
         try:
             fsize = os.path.getsize(local_path)
-            client.upload(zenodo_key, local_path, VERSION, meta_func, manifest)
+            # Stream upload: file is read from disk in chunks, never fully
+            # loaded into memory.  GPKGs are deleted immediately after
+            # upload to free disk for the next product.
+            delete_local = (file_key != "json")
+            client.upload_stream(
+                zenodo_key, local_path, VERSION, meta_func, manifest,
+                delete_after=delete_local)
 
             # Verify
             status = client.head_file(zenodo_key, manifest)
@@ -6619,11 +6697,6 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
             upload_stats["uploaded"].append(zenodo_key)
             upload_stats["total_bytes"] += fsize
-
-            # Delete GPKG locally (keep JSON)
-            if file_key != "json" and os.path.exists(local_path):
-                os.unlink(local_path)
-                log.info("KG %s: deleted local %s after verified upload", kg_code, file_key)
 
         except Exception as e:
             upload_stats["errors"].append({
@@ -7505,6 +7578,14 @@ def main():
                 # --- Upload to Zenodo ---
                 progress.set_step("upload")
                 progress.save()
+
+                # If the subprocess already streamed the full GPKG to
+                # Zenodo (to free disk), reload the manifest so we see
+                # the entry and don't try to re-upload a deleted file.
+                if result.get("_full_gpkg_uploaded"):
+                    manifest = Manifest(str(MANIFEST_PATH))
+                    log.info("KG %s: full GPKG was uploaded by subprocess — manifest reloaded",
+                             kg_code)
 
                 upload_stats = upload_kg_to_zenodo(
                     kg_code, kg_name, result["files"], manifest,

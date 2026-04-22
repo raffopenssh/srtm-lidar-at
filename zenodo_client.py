@@ -626,6 +626,157 @@ class Client:
         log.info("Manifest updated for key=%s (depo_id=%d)", key, entry.depo_id)
         return entry
 
+    # -- public API: streaming upload ----------------------------------------
+
+    def upload_stream(
+        self,
+        key: str,
+        local_path: str | Path,
+        version: str,
+        meta_func: MetadataFunc,
+        manifest: Manifest,
+        *,
+        delete_after: bool = False,
+    ) -> Entry:
+        """Upload a local file to Zenodo by streaming from disk.
+
+        Unlike :meth:`upload`, this method never loads the entire file into
+        memory.  It streams the file contents directly from disk to the
+        Zenodo bucket API, keeping memory usage constant regardless of
+        file size.
+
+        The MD5 checksum is computed in a streaming pass before upload.
+
+        Parameters
+        ----------
+        key:
+            Manifest key for this file.
+        local_path:
+            Path to the local file to upload.
+        version:
+            Version string stored in metadata and manifest.
+        meta_func:
+            Callable ``(key, filename, version) → dict`` producing the
+            Zenodo metadata payload.
+        manifest:
+            Manifest to update on success.
+        delete_after:
+            If ``True``, delete the local file after successful upload
+            and verification.
+
+        Returns
+        -------
+        Entry
+            The newly created / updated manifest entry.
+        """
+        self._assert_writable()
+        local_path = Path(local_path)
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Local file not found: {local_path}")
+
+        filename = local_path.name
+        file_size = local_path.stat().st_size
+
+        # Stream-compute MD5 without loading entire file.
+        md5 = hashlib.md5()
+        with open(local_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                md5.update(chunk)
+        md5_hex = md5.hexdigest()
+        log.info("upload_stream: %s  size=%.1f MB  md5=%s",
+                 filename, file_size / 1e6, md5_hex)
+
+        existing = manifest.get(key)
+
+        if existing is not None and existing.depo_id:
+            # ------ update existing deposition ----------------------------
+            log.info(
+                "Replacing file in existing deposition %d for key=%s",
+                existing.depo_id, key,
+            )
+            bucket_url = existing.bucket_url
+
+            # Delete old file (ignore 404).
+            if existing.filename:
+                del_url = f"{bucket_url}/{existing.filename}"
+                try:
+                    self._do_request("DELETE", del_url)
+                except ZenodoError as exc:
+                    if exc.status_code != 404:
+                        raise
+
+            # Stream-upload new file.
+            put_url = f"{bucket_url}/{filename}"
+            with open(local_path, "rb") as fh:
+                resp = self._do_request(
+                    "PUT", put_url,
+                    data=fh,
+                    content_type="application/octet-stream",
+                )
+            log.debug("Upload response: %s", resp.json())
+
+            # Update metadata.
+            meta_payload = meta_func(key, filename, version)
+            meta_url = self._url(f"/api/deposit/depositions/{existing.depo_id}")
+            self._do_request("PUT", meta_url, json_body=meta_payload,
+                             content_type="application/json")
+
+            depo_id = existing.depo_id
+
+        else:
+            # ------ create new deposition ---------------------------------
+            log.info("Creating new deposition for key=%s", key)
+
+            create_url = self._url("/api/deposit/depositions")
+            resp = self._do_request("POST", create_url, json_body={},
+                                     content_type="application/json")
+            depo = resp.json()
+            depo_id = depo["id"]
+            bucket_url = depo["links"]["bucket"]
+            log.info("Created draft deposition %d, bucket=%s", depo_id, bucket_url)
+
+            # Stream-upload file.
+            put_url = f"{bucket_url}/{filename}"
+            with open(local_path, "rb") as fh:
+                resp = self._do_request(
+                    "PUT", put_url,
+                    data=fh,
+                    content_type="application/octet-stream",
+                )
+            log.debug("Upload response: %s", resp.json())
+
+            # Set metadata.
+            meta_payload = meta_func(key, filename, version)
+            meta_url = self._url(f"/api/deposit/depositions/{depo_id}")
+            self._do_request("PUT", meta_url, json_body=meta_payload,
+                             content_type="application/json")
+
+        entry = Entry(
+            key=key,
+            depo_id=depo_id,
+            bucket_url=bucket_url,
+            filename=filename,
+            size=file_size,
+            checksum=f"md5:{md5_hex}",
+            uploaded_at=datetime.now(timezone.utc).isoformat(),
+            version=version,
+        )
+
+        # Persist to manifest.
+        manifest.set(key, entry)
+        manifest.save()
+        log.info("Manifest updated for key=%s (depo_id=%d, streamed)", key, entry.depo_id)
+
+        # Delete local file after verified upload.
+        if delete_after:
+            try:
+                local_path.unlink()
+                log.info("Deleted local %s after stream upload", local_path)
+            except OSError as exc:
+                log.warning("Failed to delete %s: %s", local_path, exc)
+
+        return entry
+
     # -- public API: download ------------------------------------------------
 
     def download(

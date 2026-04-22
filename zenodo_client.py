@@ -430,7 +430,7 @@ class Client:
                     json=json_body,
                     headers=headers,
                     stream=stream,
-                    timeout=300,
+                    timeout=(30, 7200),  # 30s connect, 2h read/upload
                 )
 
                 # Success

@@ -1125,7 +1125,7 @@ async function fetchManifest() {
       '<td>' + fmtB(e.size||0) + '</td>' +
       '<td class="zen-hide-sm" title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
       '<td title="' + uploaded + '">' + uploaded + '</td>' +
-      '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)"><span class="zen-url-full">↗ link</span><span class="zen-url-icon">⬇</span></a>' : '—') + '</td>' +
+      '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)"><span class="zen-url-full">&#x2913; link</span><span class="zen-url-icon">&#x2913;</span></a>' : '—') + '</td>' +
       '</tr>';
   }).join('');
 }

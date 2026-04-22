@@ -18,10 +18,17 @@ log = logging.getLogger("austria_processor")
 # 100 Mpx ≈ 10 km × 10 km.  Below this the in-memory path is fine.
 _STREAM_PIXEL_THRESHOLD = 100_000_000
 
-# If the categorical arrays alone would exceed this many pixels we also
-# skip the full-array boundary merge and do a lightweight tile-overlap
-# merge instead.  19 bytes/px × 350 Mpx ≈ 6.7 GB.
-_CATEGORICAL_PIXEL_LIMIT = 350_000_000
+# Skip full-array boundary merge above this (saves ~20 bytes/px).  At 120 Mpx
+# the categorical arrays alone are ~1.5 GB and adding ndsm merge (+2.3 GB)
+# would push a 7 GB cgroup over the edge.
+_CATEGORICAL_PIXEL_LIMIT = 120_000_000
+
+# Above this pixel count, skip the full GPKG entirely.  The full GPKG
+# contains DTM/DSM/ortho raster layers that require streaming re-reads of
+# remote BEV data — at 200+ Mpx that means 200+ remote tile reads per layer
+# and hours of wall time even without memory issues.  The light GPKG + JSON
+# summary are still produced and carry all the analytical value.
+_MAX_FULL_GPKG_PIXELS = 200_000_000
 
 
 # ---------------------------------------------------------------------------

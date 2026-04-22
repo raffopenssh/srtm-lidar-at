@@ -2788,10 +2788,18 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     # ------------------------------------------------------------------
     # For large KGs, use strip-streamed writing to stay within memory
     # ------------------------------------------------------------------
-    from gpkg_streamed import _STREAM_PIXEL_THRESHOLD, build_full_gpkg_streamed
-    if full_h * full_w > _STREAM_PIXEL_THRESHOLD:
+    from gpkg_streamed import _STREAM_PIXEL_THRESHOLD, _MAX_FULL_GPKG_PIXELS, build_full_gpkg_streamed
+    n_pixels = full_h * full_w
+    if n_pixels > _MAX_FULL_GPKG_PIXELS:
+        log.info("  Full-KG raster %.0f Mpx > %.0f Mpx — skipping full GPKG "
+                 "(light GPKG + JSON still produced)",
+                 n_pixels / 1e6, _MAX_FULL_GPKG_PIXELS / 1e6)
+        # Create an empty placeholder so upload code doesn't break
+        open(out_path, 'w').close()
+        return out_path, {}
+    if n_pixels > _STREAM_PIXEL_THRESHOLD:
         log.info("  Full-KG raster %.0f Mpx > %.0f Mpx threshold — using streamed builder",
-                 full_h * full_w / 1e6, _STREAM_PIXEL_THRESHOLD / 1e6)
+                 n_pixels / 1e6, _STREAM_PIXEL_THRESHOLD / 1e6)
         return build_full_gpkg_streamed(
             kg_code, tile_seg_results, all_objects, obs_year,
             mark_uncertain, out_path, full_h, full_w, full_left, full_top,
@@ -3354,7 +3362,11 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     # ------------------------------------------------------------------
     # Stitch segment rasters across all tiles into full-KG extent
     # ------------------------------------------------------------------
-    if tile_seg_results:
+    # Check if tile arrays are available (monster KGs free them before this step)
+    _has_labels = any(tr.get("labels") is not None for tr in tile_seg_results)
+    if tile_seg_results and not _has_labels:
+        log.info("  Light GPKG: skipping raster stitching (tile arrays freed for memory)")
+    if tile_seg_results and _has_labels:
         all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
         all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
         all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
@@ -3429,6 +3441,17 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
 
         del best_cat_weight
 
+        # Free heavy arrays from tile_seg_results — they've been copied
+        # into the full categorical arrays.  Reclaims ~10 bytes/px per
+        # tile (labels int32 + ndsm float32 + mask bool).
+        for tr in tile_seg_results:
+            tr.pop("labels", None)
+            tr.pop("ndsm", None)
+            tr.pop("mask", None)
+
+        from gpkg_streamed import _CATEGORICAL_PIXEL_LIMIT
+        _skip_merge = (full_h * full_w > _CATEGORICAL_PIXEL_LIMIT)
+
         # Apply label remap from full GPKG boundary merge (already done)
         # The full GPKG build already merged boundary segments and mutated
         # all_objects.  We just need to remap the label IDs in our freshly
@@ -3448,6 +3471,9 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     seg_type_full[labels_full == root_id] = survivor.type_code
             log.info("  Light GPKG: applied %d label remaps from full GPKG merge",
                      len(label_remap))
+        elif _skip_merge:
+            log.info("  Light GPKG: skipping boundary merge (%.0f Mpx > %.0f Mpx limit)",
+                     full_h * full_w / 1e6, _CATEGORICAL_PIXEL_LIMIT / 1e6)
         else:
             # Fallback: run merge ourselves (e.g. if full GPKG was skipped)
             try:
@@ -3478,28 +3504,38 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 log.warning("Light GPKG segment vectors failed: %s", e)
         del labels_full
 
-    # --- Pre-load DTM data once per tile for GPKG parcel/building enrichment ---
-    _gpkg_tile_data = {}  # ti_idx → tdata
-    for ti_idx, tr in enumerate(tile_seg_results):
-        try:
-            _gpkg_tile_data[ti_idx] = _read_dtm_for_tile(tr)
-        except Exception:
-            pass
-
-    # --- Pre-compute terrain arrays per tile (once, not per-parcel) ---
+    # --- Lazy DTM loading with LRU eviction for GPKG parcel/building enrichment ---
+    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
+    # DTM+terrain = ~4 GB).  Instead, load on demand and keep a bounded cache.
     from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
-    for ti_idx, tdata in _gpkg_tile_data.items():
+    from collections import OrderedDict
+    _MAX_CACHED_TILES = 6  # keep at most 6 tiles (~420 MB)
+    _gpkg_tile_data = OrderedDict()  # ti_idx → tdata (LRU order)
+
+    def _gpkg_load_tile(ti_idx, tr):
+        """Load DTM + terrain for one tile, evicting oldest if cache full."""
+        if ti_idx in _gpkg_tile_data:
+            _gpkg_tile_data.move_to_end(ti_idx)
+            return _gpkg_tile_data[ti_idx]
+        try:
+            tdata = _read_dtm_for_tile(tr)
+        except Exception:
+            return None
         dtm_arr = tdata["dtm"]
         tdata["slope"] = compute_slope(dtm_arr)
         tdata["aspect"] = compute_aspect(dtm_arr)
         tdata["tri"] = compute_tri(dtm_arr)
         tdata["tpi"] = compute_tpi(dtm_arr, radius=5)
+        _gpkg_tile_data[ti_idx] = tdata
+        while len(_gpkg_tile_data) > _MAX_CACHED_TILES:
+            _gpkg_tile_data.popitem(last=False)
+        return tdata
 
     def _gpkg_find_tile(e3035, n3035):
         for ti_idx, tr in enumerate(tile_seg_results):
             left, bottom, right, top = tr["bounds_3035"]
             if left <= e3035 <= right and bottom <= n3035 <= top:
-                td = _gpkg_tile_data.get(ti_idx)
+                td = _gpkg_load_tile(ti_idx, tr)
                 if td is not None:
                     return tr, td
         return None, None
@@ -4321,31 +4357,42 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             result['classification'] = cls
         return result
 
-    # --- Pre-load DTM data once per tile for parcel/building enrichment ---
-    _tile_data_cache = {}  # tile_idx → tdata dict
-    for ti_idx, tr in enumerate(tile_seg_results):
-        try:
-            _tile_data_cache[ti_idx] = _read_dtm_for_tile(tr)
-        except Exception as e:
-            log.warning("JSON: failed to pre-load DTM for tile %d: %s", ti_idx, e)
-    log.info("JSON: pre-loaded DTM for %d/%d tiles", len(_tile_data_cache), len(tile_seg_results))
-
-    # --- Pre-compute terrain arrays per tile (once, not per-parcel) ---
+    # --- Lazy DTM loading with LRU eviction for parcel/building enrichment ---
+    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
+    # DTM+terrain = ~4 GB).  Load on demand and keep a bounded cache.
     from terrain_analysis import compute_slope as _js_slope, compute_aspect as _js_aspect, \
         compute_tri as _js_tri, compute_tpi as _js_tpi
-    for ti_idx, tdata in _tile_data_cache.items():
+    from collections import OrderedDict
+    _JS_MAX_CACHED = 6  # ~420 MB peak
+    _tile_data_cache = OrderedDict()
+
+    def _js_load_tile(ti_idx, tr):
+        if ti_idx in _tile_data_cache:
+            _tile_data_cache.move_to_end(ti_idx)
+            return _tile_data_cache[ti_idx]
+        try:
+            tdata = _read_dtm_for_tile(tr)
+        except Exception as e:
+            log.warning("JSON: failed to load DTM for tile %d: %s", ti_idx, e)
+            return None
         dtm_arr = tdata["dtm"]
         tdata["slope"] = _js_slope(dtm_arr)
         tdata["aspect"] = _js_aspect(dtm_arr)
         tdata["tri"] = _js_tri(dtm_arr)
         tdata["tpi"] = _js_tpi(dtm_arr, radius=5)
+        _tile_data_cache[ti_idx] = tdata
+        while len(_tile_data_cache) > _JS_MAX_CACHED:
+            _tile_data_cache.popitem(last=False)
+        return tdata
+    log.info("JSON: using lazy DTM loading (cache=%d tiles) for %d tiles",
+             _JS_MAX_CACHED, len(tile_seg_results))
 
     def _find_tile_with_data(e3035, n3035):
-        """Find tile containing point AND return its cached tdata."""
+        """Find tile containing point AND return its lazily-loaded tdata."""
         for ti_idx, tr in enumerate(tile_seg_results):
             left, bottom, right, top = tr["bounds_3035"]
             if left <= e3035 <= right and bottom <= n3035 <= top:
-                tdata = _tile_data_cache.get(ti_idx)
+                tdata = _js_load_tile(ti_idx, tr)
                 if tdata is not None:
                     return tr, tdata
         return None, None
@@ -6028,6 +6075,34 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                  kg_code, len(all_objects), n_tiles,
                  len(all_new_buildings), len(all_infrastructure))
 
+        # --- Compute full-KG raster extent for memory decisions ---
+        from gpkg_streamed import _MAX_FULL_GPKG_PIXELS
+        _all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
+        _all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
+        _all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
+        _all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
+        _full_w = int(round((max(_all_rights) - min(_all_lefts))))
+        _full_h = int(round((max(_all_tops) - min(_all_bottoms))))
+        _n_pixels = _full_w * _full_h
+        log.info("  Full-KG raster: %d x %d px (%.0f Mpx), %d tiles",
+                 _full_w, _full_h, _n_pixels / 1e6, len(tile_seg_results))
+
+        # For monster KGs (>200 Mpx), free heavy arrays from tile_seg_results
+        # BEFORE GPKG phases.  The tile loop accumulated labels/ndsm/mask
+        # arrays for ALL tiles; at 10 bytes/px per tile, 200+ tiles
+        # exhausts a 7 GB cgroup.  Checkpoints on disk retain full data.
+        _monster_kg = _n_pixels > _MAX_FULL_GPKG_PIXELS
+        if _monster_kg:
+            _freed_bytes = 0
+            for tr in tile_seg_results:
+                for key in ("labels", "ndsm", "mask"):
+                    arr = tr.pop(key, None)
+                    if arr is not None:
+                        _freed_bytes += arr.nbytes
+            gc.collect()
+            log.info("  Monster KG: freed %.0f MB of tile arrays (%.0f Mpx > %.0f Mpx limit)",
+                     _freed_bytes / 1e6, _n_pixels / 1e6, _MAX_FULL_GPKG_PIXELS / 1e6)
+
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
@@ -6517,6 +6592,9 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
     for file_key, local_path in files.items():
         if not local_path or not os.path.exists(local_path):
+            continue
+        if os.path.getsize(local_path) == 0:
+            log.info("KG %s: skipping upload for %s (empty file)", kg_code, file_key)
             continue
 
         zenodo_key = f"{kg_code}_{file_key}"

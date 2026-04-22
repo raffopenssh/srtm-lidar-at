@@ -479,7 +479,7 @@ function fmtB(b) {
   if (b == null || b === 0) return '0 B';
   const u = ['B','KB','MB','GB','TB'];
   const i = Math.floor(Math.log(b) / Math.log(1024));
-  return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + u[i];
+  return Math.round(b / Math.pow(1024, i)) + ' ' + u[i];
 }
 function fmtT(iso) {
   if (!iso) return '—';

@@ -6272,14 +6272,20 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 # === SECTION: Output validation ===
 
 def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
-    """Validate all KG output products. Returns list of issues (empty = all OK)."""
+    """Validate KG output products present in *files* dict.
+
+    Only products whose key appears in *files* are checked.  This allows
+    callers to validate a single product (e.g. full_gpkg) without
+    spurious "missing" warnings for products not yet built.
+    """
     issues = []
 
     # --- Full GPKG ---
     full_path = files.get("full_gpkg", "")
-    if not full_path or not os.path.exists(full_path):
+    if "full_gpkg" in files:
+      if not full_path or not os.path.exists(full_path):
         issues.append("FULL_GPKG: missing")
-    else:
+      else:
         try:
             import re as _re
             expected_raster = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
@@ -6327,9 +6333,10 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
 
     # --- Light GPKG ---
     light_path = files.get("light_gpkg", "")
-    if not light_path or not os.path.exists(light_path):
+    if "light_gpkg" in files:
+      if not light_path or not os.path.exists(light_path):
         issues.append("LIGHT_GPKG: missing")
-    else:
+      else:
         try:
             import sqlite3
             import re as _re
@@ -6397,9 +6404,10 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
 
     # --- JSON summary ---
     json_path = files.get("json", "")
-    if not json_path or not os.path.exists(json_path):
+    if "json" in files:
+      if not json_path or not os.path.exists(json_path):
         issues.append("JSON: missing")
-    else:
+      else:
         try:
             with open(json_path) as f:
                 js = json.load(f)

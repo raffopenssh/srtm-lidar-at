@@ -257,19 +257,22 @@
   /* Zenodo manifest table — mobile-friendly */
   #zenTbl { width: 100%; table-layout: fixed; font-size: 12px; }
   #zenTbl td, #zenTbl th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #zenTbl .zen-th-key  { width: 10%; }
-  #zenTbl .zen-th-depo { width:  8%; }
-  #zenTbl .zen-th-name { width: 34%; }
-  #zenTbl .zen-th-size { width: 10%; }
-  #zenTbl .zen-th-md5  { width: 12%; }
-  #zenTbl .zen-th-date { width: 20%; }
-  #zenTbl .zen-th-url  { width:  6%; }
+  #zenTbl .zen-th-key  { width:  8%; }
+  #zenTbl .zen-th-depo { width:  7%; }
+  #zenTbl .zen-th-name { width: 33%; }
+  #zenTbl .zen-th-size { width:  9%; }
+  #zenTbl .zen-th-md5  { width: 10%; }
+  #zenTbl .zen-th-date { width: 21%; }
+  #zenTbl .zen-th-url  { width: 12%; }
+  .zen-url-icon { display: none; }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
     #zenTbl .zen-th-name { width: 46%; }
     #zenTbl .zen-th-size { width: 20%; }
     #zenTbl .zen-th-date { width: 26%; }
     #zenTbl .zen-th-url  { width:  8%; }
+    .zen-url-full { display: none; }
+    .zen-url-icon { display: inline; }
   }
 </style>
 </head>
@@ -429,7 +432,7 @@
             <th class="zen-th-size">Size</th>
             <th class="zen-hide-sm zen-th-md5">MD5</th>
             <th class="zen-th-date">Uploaded</th>
-            <th class="zen-th-url">URL</th>
+            <th class="zen-th-url"><span class="zen-url-full">Download</span><span class="zen-url-icon">⬇</span></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -1122,7 +1125,7 @@ async function fetchManifest() {
       '<td>' + fmtB(e.size||0) + '</td>' +
       '<td class="zen-hide-sm" title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
       '<td title="' + uploaded + '">' + uploaded + '</td>' +
-      '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)">↗</a>' : '—') + '</td>' +
+      '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)"><span class="zen-url-full">↗ link</span><span class="zen-url-icon">⬇</span></a>' : '—') + '</td>' +
       '</tr>';
   }).join('');
 }

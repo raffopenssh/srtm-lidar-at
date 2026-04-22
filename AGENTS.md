@@ -81,6 +81,7 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 |------|------|--------|
 | `srv.service` | gunicorn (2 workers, 4 threads, port 8000) | MemoryMax=3G, Restart=on-failure |
 | `rf_train.service` | RF training background job (4000 KGs) | Restart=on-failure, RestartSec=30 |
+| `austria_processor.service` | Austria processor (all KGs) | MemoryMax=8G, MemoryHigh=7G, Restart=on-failure |
 
 Both in `/etc/systemd/system/`. Source copies in repo root.
 
@@ -761,7 +762,7 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure) |
 | `static/process.html` | 1117L | Dashboard UI (status, map, log, Zenodo manifest) |
 | `data/austria_processor/MONITOR.md` | — | Monitoring checklist + expected timelines |
-| `gpkg_streamed.py` | ~500L | Strip-streamed full-GPKG builder for large KGs (auto-used >100 Mpx) |
+| `gpkg_streamed.py` | ~500L | Strip-streamed full-GPKG builder for large KGs (auto-used >100 Mpx, skipped >200 Mpx) |
 
 ### Where to Look When Debugging
 

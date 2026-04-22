@@ -257,17 +257,19 @@
   /* Zenodo manifest table — mobile-friendly */
   #zenTbl { width: 100%; table-layout: fixed; font-size: 12px; }
   #zenTbl td, #zenTbl th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #zenTbl col.zen-name  { width: 40%; }
-  #zenTbl col.zen-size  { width: 12%; }
-  #zenTbl col.zen-date  { width: 28%; }
-  #zenTbl col.zen-url   { width:  8%; }
-  #zenTbl col.zen-hide  { width: 12%; }
+  #zenTbl .zen-th-key  { width: 10%; }
+  #zenTbl .zen-th-depo { width:  8%; }
+  #zenTbl .zen-th-name { width: 34%; }
+  #zenTbl .zen-th-size { width: 10%; }
+  #zenTbl .zen-th-md5  { width: 12%; }
+  #zenTbl .zen-th-date { width: 20%; }
+  #zenTbl .zen-th-url  { width:  6%; }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
-    #zenTbl col.zen-name { width: 52%; }
-    #zenTbl col.zen-size { width: 18%; }
-    #zenTbl col.zen-date { width: 22%; }
-    #zenTbl col.zen-url  { width:  8%; }
+    #zenTbl .zen-th-name { width: 46%; }
+    #zenTbl .zen-th-size { width: 20%; }
+    #zenTbl .zen-th-date { width: 26%; }
+    #zenTbl .zen-th-url  { width:  8%; }
   }
 </style>
 </head>
@@ -420,23 +422,14 @@
     <div class="coll-b" id="zenBody">
       <div class="card" style="overflow-x:auto;padding:0;max-height:300px;overflow-y:auto">
         <table id="zenTbl">
-          <colgroup>
-            <col class="zen-hide"><!-- Key -->
-            <col class="zen-hide"><!-- Depo -->
-            <col class="zen-name"><!-- Filename -->
-            <col class="zen-size"><!-- Size -->
-            <col class="zen-hide"><!-- MD5 -->
-            <col class="zen-date"><!-- Uploaded -->
-            <col class="zen-url"> <!-- URL -->
-          </colgroup>
           <thead><tr>
-            <th class="zen-hide-sm">Key</th>
-            <th class="zen-hide-sm">Depo</th>
-            <th>Filename</th>
-            <th>Size</th>
-            <th class="zen-hide-sm">MD5</th>
-            <th>Uploaded</th>
-            <th>URL</th>
+            <th class="zen-hide-sm zen-th-key">Key</th>
+            <th class="zen-hide-sm zen-th-depo">Depo</th>
+            <th class="zen-th-name">Filename</th>
+            <th class="zen-th-size">Size</th>
+            <th class="zen-hide-sm zen-th-md5">MD5</th>
+            <th class="zen-th-date">Uploaded</th>
+            <th class="zen-th-url">URL</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -1114,9 +1107,14 @@ async function fetchManifest() {
     const url = e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '';
     const md5 = (e.checksum||'').substring(0,12);
     const fname = esc(e.filename||'—');
-    const uploaded = e.uploaded_at
-      ? new Date(e.uploaded_at).toLocaleString(undefined, {dateStyle:'short',timeStyle:'short'})
-      : '—';
+    const uploaded = e.uploaded_at ? (() => {
+      const dt = new Date(e.uploaded_at);
+      const dd = String(dt.getDate()).padStart(2,'0');
+      const mm = String(dt.getMonth()+1).padStart(2,'0');
+      const hh = String(dt.getHours()).padStart(2,'0');
+      const min = String(dt.getMinutes()).padStart(2,'0');
+      return dd+'/'+mm+' '+hh+':'+min;
+    })() : '—';
     return '<tr>' +
       '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
       '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +

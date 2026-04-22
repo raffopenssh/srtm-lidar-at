@@ -3028,7 +3028,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                 tdata = _read_dtm_for_tile(tr)
                 with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                     fut = _ex.submit(_oio.read_ortho_for_als, tdata, year=o_year)
-                    rgb_t, nir_t = fut.result(timeout=180)
+                    rgb_t, nir_t = fut.result(timeout=600)  # 10m — GPKG ortho read
                 del tdata
                 if rgb_t is not None:
                     got_rgb = True
@@ -5569,11 +5569,36 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tile_geom_3035 = transform_to_3035(tile_geom_wgs)
 
             # --- 3a. LiDAR (default date) ---
+            # DTM+DSM are essential — segmentation fails without them.
+            # Retry with escalating timeouts to handle BEV slowness.
             _report_step("lidar", f"{tile_label} — reading DTM/DSM")
-            try:
-                tdata = raster_io.read_dtm_dsm(tile_geom_3035, ti.DEFAULT_DATASET)
-            except Exception as e:
-                log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
+            tdata = None
+            _LIDAR_TIMEOUTS = [300, 600]  # 5m, 10m
+            for _lidar_attempt, _lidar_timeout in enumerate(_LIDAR_TIMEOUTS, 1):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _lidar_ex:
+                        _lidar_fut = _lidar_ex.submit(
+                            raster_io.read_dtm_dsm, tile_geom_3035, ti.DEFAULT_DATASET
+                        )
+                        tdata = _lidar_fut.result(timeout=_lidar_timeout)
+                    break  # success
+                except concurrent.futures.TimeoutError:
+                    if _lidar_attempt < len(_LIDAR_TIMEOUTS):
+                        log.warning(
+                            "KG %s %s: LiDAR read attempt %d/%d timed out after %ds, retrying...",
+                            kg_code, tile_label, _lidar_attempt, len(_LIDAR_TIMEOUTS),
+                            _lidar_timeout,
+                        )
+                    else:
+                        log.error(
+                            "KG %s %s: LiDAR read FAILED after %d attempts (timeout %ds)",
+                            kg_code, tile_label, _lidar_attempt, _lidar_timeout,
+                        )
+                except Exception as e:
+                    log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
+                    break  # non-timeout errors are not retried
+            if tdata is None:
+                log.warning("KG %s %s: LiDAR unavailable — skipping tile", kg_code, tile_label)
                 tile_data_availability.append(tile_avail)
                 _tile_entry["status"] = "error"
                 _tile_entry["issues"]["lidar"] = "fail"
@@ -5640,27 +5665,54 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 tile_avail["multi_date_dtm"] = True
 
             # --- 3d. Orthophoto ---
+            # Ortho is critical for segmentation quality (spectral features,
+            # NDVI, texture).  Retry aggressively with escalating timeouts.
+            # BEV servers occasionally go slow (not failing — just throttled),
+            # so GDAL HTTP timeouts (set in ortho_io.GDAL_ENV) prevent
+            # individual HTTP requests from hanging forever, while the
+            # per-attempt timeout here caps the total wall-clock per try.
             _report_step("ortho", tile_label)
             spectral = None
-            try:
-                import ortho_io
-                import concurrent.futures
-                ORTHO_TIMEOUT = 180
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
-                    fut = exe.submit(ortho_io.read_ortho_for_als, tdata)
-                    try:
-                        rgb, nir = fut.result(timeout=ORTHO_TIMEOUT)
-                        spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
-                        if rgb is not None:
-                            spectral["red"] = rgb[0].astype(np.float32)
-                            spectral["green"] = rgb[1].astype(np.float32)
-                            spectral["blue"] = rgb[2].astype(np.float32)
-                        if nir is not None:
-                            spectral["nir"] = nir.astype(np.float32)
-                    except concurrent.futures.TimeoutError:
-                        log.warning("KG %s %s: ortho timed out", kg_code, tile_label)
-            except Exception as e:
-                log.warning("KG %s %s: ortho failed: %s", kg_code, tile_label, e)
+            import ortho_io  # noqa: lazy import (subprocess boundary)
+            _ORTHO_TIMEOUTS = [300, 600, 900]  # 5m, 10m, 15m — escalating
+            for _ortho_attempt, _ortho_timeout in enumerate(_ORTHO_TIMEOUTS, 1):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                        fut = exe.submit(ortho_io.read_ortho_for_als, tdata)
+                        try:
+                            rgb, nir = fut.result(timeout=_ortho_timeout)
+                            spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+                            if rgb is not None:
+                                spectral["red"] = rgb[0].astype(np.float32)
+                                spectral["green"] = rgb[1].astype(np.float32)
+                                spectral["blue"] = rgb[2].astype(np.float32)
+                            if nir is not None:
+                                spectral["nir"] = nir.astype(np.float32)
+                            break  # success
+                        except concurrent.futures.TimeoutError:
+                            if _ortho_attempt < len(_ORTHO_TIMEOUTS):
+                                log.warning(
+                                    "KG %s %s: ortho attempt %d/%d timed out after %ds, retrying with %ds...",
+                                    kg_code, tile_label, _ortho_attempt, len(_ORTHO_TIMEOUTS),
+                                    _ortho_timeout, _ORTHO_TIMEOUTS[_ortho_attempt],
+                                )
+                            else:
+                                log.error(
+                                    "KG %s %s: ortho FAILED after %d attempts (last timeout %ds) — "
+                                    "tile will lack spectral features",
+                                    kg_code, tile_label, _ortho_attempt, _ortho_timeout,
+                                )
+                except Exception as e:
+                    if _ortho_attempt < len(_ORTHO_TIMEOUTS):
+                        log.warning(
+                            "KG %s %s: ortho attempt %d/%d failed (%s), retrying...",
+                            kg_code, tile_label, _ortho_attempt, len(_ORTHO_TIMEOUTS), e,
+                        )
+                    else:
+                        log.error(
+                            "KG %s %s: ortho FAILED after %d attempts: %s",
+                            kg_code, tile_label, _ortho_attempt, e,
+                        )
             if spectral is not None:
                 tile_avail["ortho"] = True
 

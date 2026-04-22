@@ -45,6 +45,10 @@ GDAL_ENV = {
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
     "GDAL_HTTP_MULTIPLEX": "YES",
     "GDAL_HTTP_VERSION": "2",
+    "GDAL_HTTP_TIMEOUT": "60",          # per-request timeout (seconds)
+    "GDAL_HTTP_CONNECTTIMEOUT": "15",    # TCP connect timeout
+    "GDAL_HTTP_MAX_RETRY": "3",          # GDAL-internal retries
+    "GDAL_HTTP_RETRY_DELAY": "2",        # delay between GDAL retries
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
     "VSI_CACHE": "TRUE",

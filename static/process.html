@@ -1087,12 +1087,19 @@ async function fetchManifestData() {
   return _lastManData;
 }
 
+let _zenAutoOpened = false;
 async function fetchManifestSummary() {
   // Called on every poll — updates summary badge regardless of panel state
   const d = await fetchManifestData();
   if (!d) return;
   document.getElementById('zenSummary').textContent =
     fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
+  // Auto-expand once when entries first appear
+  if (!_zenAutoOpened && (d.count||0) > 0) {
+    _zenAutoOpened = true;
+    const h = document.getElementById('zenHead');
+    if (!h.classList.contains('open')) toggle('zen');
+  }
 }
 
 async function fetchManifest() {

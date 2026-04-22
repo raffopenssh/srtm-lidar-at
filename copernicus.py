@@ -618,6 +618,16 @@ def _run_datacube(
         )
     except Exception as batch_exc:
         _check_credits_error(batch_exc)  # raises CredentialRotatedError on 402
+        # Batch job failed (status: error) — this is often transient or
+        # credential-specific.  Rotate to the next credential and let
+        # @_retry_on_rotation retry the whole function from scratch.
+        batch_msg = str(batch_exc)
+        if "didn't finish successfully" in batch_msg or "Status: error" in batch_msg:
+            logger.warning("Batch job failed (%s) — rotating credential for retry", batch_msg)
+            if rotate_credentials():
+                raise CredentialRotatedError(
+                    f"Batch job failed, rotated credential for retry: {batch_msg}"
+                )
         raise
     logger.info("Batch job %s finished", job.job_id)
 

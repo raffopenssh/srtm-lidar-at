@@ -5795,7 +5795,21 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             c_breaker["consecutive_failures"] += 1
                             c_breaker["last_failure"] = time.time()
                             c_breaker["cooldown"] = min(600, 60 * (2 ** min(c_breaker["consecutive_failures"], 4)))
+                            # Copernicus returned None (batch/server failure, not throttle).
+                            # Abort KG so it gets deferred for retry rather than producing
+                            # an incomplete result without Copernicus data.
+                            log.warning(
+                                "KG %s %s: Copernicus returned no data (server/batch failure) "
+                                "— aborting KG for deferred retry (circuit breaker: %d consecutive failures)",
+                                kg_code, tile_label, c_breaker["consecutive_failures"],
+                            )
+                            result["copernicus_failed"] = True
+                            result["success"] = False
+                            result["error"] = "Copernicus data unavailable (batch/server failure)"
+                            result["step"] = f"copernicus_failed_tile_{tile_idx+1}"
                         _write_circuit_breaker(c_breaker)
+                        if result.get("copernicus_failed"):
+                            break  # abort tile loop — defer KG for retry
                     except Exception as e:
                         from copernicus import CreditsExhaustedError, IPThrottledError, ip_throttled as _cop_throttled
                         if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
@@ -6058,12 +6072,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _report_step(f"tile_{tile_idx+1}",
                          f"done: {len(core_objects)} objects")
 
-        # --- Abort early if Copernicus throttled mid-KG ---
+        # --- Abort early if Copernicus throttled or failed mid-KG ---
         if result.get("copernicus_exhausted") and result.get("success") is False:
             log.warning("KG %s: aborting after tile %d/%d due to Copernicus throttle — "
                         "tile checkpoints preserved for retry",
                         kg_code, tile_idx + 1, n_tiles)
             result["step"] = "aborted_copernicus"
+            return result
+        if result.get("copernicus_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to Copernicus batch/server failure — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_copernicus_failed"
             return result
 
         # --- 4. Merge terrain stats ---
@@ -6844,6 +6864,8 @@ def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool
     _openeo_patterns = [
         "openeo", "batch job failed", "job timed out",
         "synchronous download timed out",
+        "batch/server failure", "copernicus data unavailable",
+        "didn't finish successfully",
     ]
     for pat in _openeo_patterns:
         if pat in err_lower:
@@ -7721,7 +7743,27 @@ def main():
                 is_credits_issue = (result.get("copernicus_exhausted")
                                     or '402' in str(result.get("error", ""))
                                     or 'PaymentRequired' in str(result.get("error", "")))
-                if is_credits_issue:
+                is_cop_batch_failure = result.get("copernicus_failed", False)
+                if is_cop_batch_failure:
+                    log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: Copernicus batch failure — deferred retry",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    # Save tile history for dashboard
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    # Use deferred retry — process other KGs first, then come back
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    if _defer_n < 2:
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _deferred_retries.append(
+                            (i + DEFER_GAP, _deferred, _defer_n + 1))
+                elif is_credits_issue:
                     log.warning("KG %s: Copernicus credits issue — will retry after credits restored", kg_code)
                     progress.add_log("warning",
                                      f"KG {kg_code}: credits exhausted — not marking failed",

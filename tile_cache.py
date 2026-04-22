@@ -214,6 +214,10 @@ def _is_server_error(exc: Exception) -> bool:
         "Internal Server Error", "Bad Gateway", "Service Unavailable",
         "Server error", "EjrApiError",
         "server error", "502 Bad Gateway", "503 Service",
+        # Batch job failures — openEO server-side errors, worth retrying
+        "didn't finish successfully",
+        "Status: error",
+        "JobFailedException",
     )
     return any(pat in combined for pat in server_patterns)
 

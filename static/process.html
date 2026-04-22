@@ -198,6 +198,26 @@
   select.inp { width: auto; min-width: 120px; }
   .sep { color: var(--border); }
 
+  /* KG autocomplete */
+  .kg-ac-wrap { position: relative; display: inline-flex; align-items: center; }
+  .kg-ac-wrap .inp { width: 150px; padding-right: 24px; }
+  .kg-ac-wrap .ac-icon { position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
+    font-size: 10px; color: var(--dim); pointer-events: none; }
+  .kg-ac-wrap .ac-spin { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); }
+  .kg-ac-dd { position: absolute; top: 100%; left: 0; margin-top: 2px; min-width: 280px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 9999; overflow: hidden;
+    max-height: 260px; overflow-y: auto; }
+  .kg-ac-dd .ac-item { display: flex; align-items: baseline; gap: 6px; padding: 5px 10px;
+    font-size: 11px; cursor: pointer; transition: background 0.1s; }
+  .kg-ac-dd .ac-item:hover, .kg-ac-dd .ac-item.ac-sel { background: rgba(88,166,255,0.1); }
+  .kg-ac-dd .ac-item .ac-name { color: var(--text); flex: 1; }
+  .kg-ac-dd .ac-item .ac-code { color: var(--dim); font-size: 10px; min-width: 40px; }
+  .kg-ac-dd .ac-item .ac-loc { color: var(--dim); font-size: 10px; }
+  .kg-ac-dd .ac-item .ac-done { color: var(--green); font-size: 9px; margin-left: 4px; }
+  .kg-ac-dd .ac-item .ac-queued { color: var(--yellow); font-size: 9px; margin-left: 4px; }
+  .kg-ac-dd .ac-empty { padding: 8px 10px; font-size: 11px; color: var(--dim); font-style: italic; }
+
   /* Collapsible */
   .coll-h { cursor: pointer; user-select: none; }
   .coll-h .arr { transition: transform 0.2s; display: inline-block; font-size: 9px; margin-right: 4px; }
@@ -359,6 +379,11 @@
   <button class="btn btn-r" id="btnStop" onclick="sendCmd('stop')" disabled>■ Stop</button>
   <span class="sep">│</span>
   <button class="btn" id="btnDrawPriority" onclick="togglePriorityDraw()" title="Draw a rectangle on the map to prioritize KGs in that area">📌 Priority Area</button>
+  <span class="kg-ac-wrap">
+    <input type="text" class="inp" id="kgAcInput" placeholder="Queue KG by name…" autocomplete="off" spellcheck="false" title="Type a KG name to add to the priority queue">
+    <span class="ac-icon" id="kgAcIcon">🔍</span>
+    <div class="kg-ac-dd" id="kgAcDropdown" style="display:none"></div>
+  </span>
   <span id="priorityCoords" style="display:none;font-size:11px;color:var(--dim);">
     <input type="text" class="inp" id="prioWest" placeholder="W" style="width:62px" title="West longitude">
     <input type="text" class="inp" id="prioSouth" placeholder="S" style="width:62px" title="South latitude">
@@ -1549,6 +1574,118 @@ async function savePrioQueue() {
     });
   } catch(e) { /* silent */ }
 }
+
+// ── KG Autocomplete ──────────────────────────────────────────────
+
+(function() {
+  const inp = document.getElementById('kgAcInput');
+  const dd = document.getElementById('kgAcDropdown');
+  const icon = document.getElementById('kgAcIcon');
+  let _acTimer = null;
+  let _acResults = [];
+  let _acSel = -1;
+  let _acAbort = null;
+
+  function queuedCodes() {
+    return new Set(_prioQueue.map(k => k.code));
+  }
+
+  async function doSearch(q) {
+    if (_acAbort) _acAbort.abort();
+    _acAbort = new AbortController();
+    icon.innerHTML = '<span class="spin" style="width:8px;height:8px"></span>';
+    try {
+      const r = await fetch('/api/v1/query?q=' + encodeURIComponent(q) + '&limit=10', {signal: _acAbort.signal});
+      const d = await r.json();
+      _acResults = (d.results || []).map(kg => ({
+        code: kg.kg_code,
+        name: kg.kg_name || '',
+        gemeinde: kg.gemeinde_name || '',
+        district: kg.district_name || '',
+        processed: !!kg.generated_at
+      }));
+      _acSel = -1;
+      renderAc();
+    } catch(e) {
+      if (e.name !== 'AbortError') { dd.style.display = 'none'; }
+    } finally {
+      icon.innerHTML = '🔍';
+    }
+  }
+
+  function renderAc() {
+    if (!_acResults.length) {
+      dd.innerHTML = '<div class="ac-empty">No matches</div>';
+      dd.style.display = 'block';
+      return;
+    }
+    const queued = queuedCodes();
+    dd.innerHTML = '';
+    _acResults.forEach((kg, i) => {
+      const el = document.createElement('div');
+      el.className = 'ac-item' + (i === _acSel ? ' ac-sel' : '');
+      let extra = '';
+      if (queued.has(kg.code)) extra = '<span class="ac-queued">queued</span>';
+      else if (kg.processed) extra = '<span class="ac-done">✓ done</span>';
+      const loc = [kg.gemeinde, kg.district].filter(Boolean).join(' · ');
+      el.innerHTML = '<span class="ac-code">' + esc(kg.code) + '</span>' +
+        '<span class="ac-name">' + esc(kg.name) + '</span>' +
+        (loc ? '<span class="ac-loc">' + esc(loc) + '</span>' : '') + extra;
+      el.addEventListener('mousedown', e => { e.preventDefault(); pickKg(kg); });
+      dd.appendChild(el);
+    });
+    dd.style.display = 'block';
+  }
+
+  async function pickKg(kg) {
+    dd.style.display = 'none';
+    inp.value = '';
+    // Add to head of queue
+    try {
+      const r = await fetch('/api/v1/processing/queue', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({kgs: [kg.code], position: 0, skip_processed: false})
+      });
+      const d = await r.json();
+      if (r.ok) {
+        inp.style.borderColor = 'var(--green)';
+        inp.placeholder = '✓ ' + kg.name + ' queued';
+        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 2000);
+        fetchPrioQueue();
+      } else {
+        inp.style.borderColor = 'var(--red)';
+        inp.placeholder = d.error || 'Failed';
+        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 2000);
+      }
+    } catch(e) {
+      console.error('Queue KG failed', e);
+    }
+  }
+
+  inp.addEventListener('input', () => {
+    clearTimeout(_acTimer);
+    const q = inp.value.trim();
+    if (q.length < 2) { dd.style.display = 'none'; _acResults = []; return; }
+    _acTimer = setTimeout(() => doSearch(q), 200);
+  });
+
+  inp.addEventListener('keydown', e => {
+    if (!_acResults.length || dd.style.display === 'none') return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); _acSel = Math.min(_acSel + 1, _acResults.length - 1); renderAc(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); _acSel = Math.max(_acSel - 1, 0); renderAc(); }
+    else if (e.key === 'Enter' && _acSel >= 0) { e.preventDefault(); pickKg(_acResults[_acSel]); }
+    else if (e.key === 'Escape') { dd.style.display = 'none'; }
+  });
+
+  inp.addEventListener('blur', () => {
+    setTimeout(() => { dd.style.display = 'none'; }, 150);
+  });
+
+  inp.addEventListener('focus', () => {
+    if (_acResults.length && inp.value.trim().length >= 2) renderAc();
+  });
+})();
 
 // ── Init ────────────────────────────────────────────────────────
 initMap();

@@ -6151,11 +6151,20 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         result["files"]["full_gpkg"] = full_gpkg
 
-        # --- 5b. Stream full GPKG to Zenodo immediately ---
-        # For large KGs the full GPKG can be 4-15 GB.  Upload it now
-        # and delete the local copy BEFORE building the light GPKG,
-        # so both products never coexist on disk simultaneously.
+        # --- 5b. Validate full GPKG, then stream to Zenodo ---
         _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
+        if _full_size > 0:
+            _report_step("validate_full_gpkg", "checking full GPKG")
+            _full_issues = validate_kg_outputs(kg_code, {"full_gpkg": full_gpkg})
+            if _full_issues:
+                for _fi in _full_issues:
+                    log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _fi)
+            else:
+                log.info("KG %s: full GPKG validated OK (%.0f MB)", kg_code, _full_size / 1e6)
+        # Stream full GPKG to Zenodo immediately.  For large KGs the
+        # full GPKG can be 4-15 GB.  Upload it now and delete the local
+        # copy BEFORE building the light GPKG, so both products never
+        # coexist on disk simultaneously.
         if _full_size > 0:
             _report_step("upload_full_gpkg",
                          f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
@@ -6187,6 +6196,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             label_remap=_boundary_remap)
         result["files"]["light_gpkg"] = light_gpkg
 
+        # --- 6b. Validate light GPKG ---
+        _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
+        if _light_size > 0:
+            _light_issues = validate_kg_outputs(kg_code, {"light_gpkg": light_gpkg})
+            if _light_issues:
+                for _li in _light_issues:
+                    log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _li)
+            else:
+                log.info("KG %s: light GPKG validated OK (%.0f MB)", kg_code, _light_size / 1e6)
+
         # --- 7. Build JSON summary ---
         result["step"] = "json"
         _report_step("json", "building summary")
@@ -6210,6 +6229,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         with open(json_path, 'w') as f:
             json.dump(json_summary, f, indent=2, default=str)
         result["files"]["json"] = json_path
+
+        # --- 7b. Validate JSON ---
+        _json_issues = validate_kg_outputs(kg_code, {"json": json_path})
+        if _json_issues:
+            for _ji in _json_issues:
+                log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _ji)
+        else:
+            log.info("KG %s: JSON validated OK", kg_code)
 
         result["success"] = True
         result["step"] = "done"
@@ -7558,9 +7585,14 @@ def main():
                 kg_succeeded = True
 
                 # --- Validate outputs ---
+                # Validation now runs in the subprocess (before early
+                # GPKG upload deletes files).  Here we only validate
+                # files that still exist on disk (light GPKG + JSON).
                 progress.set_step("validate")
                 progress.save()
-                issues = validate_kg_outputs(kg_code, result["files"])
+                _files_on_disk = {k: v for k, v in result["files"].items()
+                                  if v and os.path.exists(v)}
+                issues = validate_kg_outputs(kg_code, _files_on_disk)
                 if issues:
                     for iss in issues:
                         log.warning("KG %s VALIDATION: %s", kg_code, iss)

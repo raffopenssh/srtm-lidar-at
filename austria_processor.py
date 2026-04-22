@@ -6176,14 +6176,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     _lm(_kg, _name, v, "gpkg")
                 from zenodo_client import Manifest as _ZManifest
                 _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
+                def _sub_upload_cb(sent, total):
+                    pct = round(100 * sent / total) if total else 0
+                    _report_step("upload_full_gpkg",
+                                 f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
                 _zclient.upload_stream(
                     f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
-                    _zmanifest, delete_after=True)
+                    _zmanifest, delete_after=True,
+                    progress_callback=_sub_upload_cb)
                 log.info("  Full GPKG streamed to Zenodo and deleted locally")
                 # Mark as already uploaded so upload_kg_to_zenodo skips it
                 result["_full_gpkg_uploaded"] = True
             except Exception as _ue:
-                log.warning("  Early full GPKG upload failed: %s — will retry later", _ue)
+                log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
         gc.collect()
 
         # --- 6. Build light GPKG ---
@@ -6674,7 +6679,8 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                         manifest, quality_score: float = 0.0,
                         quality_grade: str = "",
                         available_layers: list = None,
-                        missing_layers: list = None) -> dict:
+                        missing_layers: list = None,
+                        progress_callback=None) -> dict:
     """Upload KG files to Zenodo via streaming, verify, delete local GPKGs.
 
     Uses ``Client.upload_stream()`` to stream files directly from disk
@@ -6711,9 +6717,15 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             # loaded into memory.  GPKGs are deleted immediately after
             # upload to free disk for the next product.
             delete_local = (file_key != "json")
+            _file_cb = None
+            if progress_callback:
+                _file_label = file_key
+                def _file_cb(sent, total, _label=_file_label):
+                    progress_callback(_label, sent, total)
             client.upload_stream(
                 zenodo_key, local_path, VERSION, meta_func, manifest,
-                delete_after=delete_local)
+                delete_after=delete_local,
+                progress_callback=_file_cb)
 
             # Verify
             status = client.head_file(zenodo_key, manifest)
@@ -7343,6 +7355,20 @@ def main():
                                 else:
                                     ckg.pop("step_detail", None)
                                     ckg.pop("step_detail_ts", None)
+                                # Parse upload progress from subprocess step detail
+                                if s.startswith("upload_") and "%" in detail:
+                                    import re as _re
+                                    _up_match = _re.search(r'(\d+)%.*?(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*MB', detail)
+                                    if _up_match:
+                                        _sent_mb = float(_up_match.group(2))
+                                        _total_mb = float(_up_match.group(3))
+                                        ckg["upload_progress"] = {
+                                            "file": "full_gpkg",
+                                            "sent": int(_sent_mb * 1e6),
+                                            "total": int(_total_mb * 1e6),
+                                        }
+                                elif s == "upload" or not s.startswith("upload_"):
+                                    ckg.pop("upload_progress", None)
                                 # Expose step issues to frontend
                                 ckg["step_issues"] = dict(_step_issues)
                                 # Relay per-tile statuses for map dots
@@ -7611,6 +7637,18 @@ def main():
                 progress.set_step("upload")
                 progress.save()
 
+                def _upload_progress_cb(file_key, bytes_sent, total_bytes):
+                    """Write upload progress into current_kg for dashboard."""
+                    with progress._lock:
+                        ckg = progress._state.get("current_kg")
+                        if ckg:
+                            ckg["upload_progress"] = {
+                                "file": file_key,
+                                "sent": bytes_sent,
+                                "total": total_bytes,
+                            }
+                    progress.save()
+
                 # If the subprocess already streamed the full GPKG to
                 # Zenodo (to free disk), reload the manifest so we see
                 # the entry and don't try to re-upload a deleted file.
@@ -7624,7 +7662,15 @@ def main():
                     quality_score=result.get("quality_score", 0),
                     quality_grade=result.get("quality_grade", ""),
                     available_layers=result.get("available_layers"),
-                    missing_layers=result.get("missing_layers"))
+                    missing_layers=result.get("missing_layers"),
+                    progress_callback=_upload_progress_cb)
+
+                # Clear upload progress
+                with progress._lock:
+                    ckg = progress._state.get("current_kg")
+                    if ckg:
+                        ckg.pop("upload_progress", None)
+                progress.save()
 
                 if upload_stats["errors"]:
                     for err in upload_stats["errors"]:

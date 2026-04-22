@@ -8,7 +8,7 @@
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9;
           --dim: #8b949e; --green: #3fb950; --yellow: #d29922; --red: #f85149;
-          --blue: #58a6ff; --purple: #bc8cff; }
+          --blue: #58a6ff; --purple: #bc8cff; --cyan: #56d4dd; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg);
          color: var(--text); padding: 16px 20px; line-height: 1.5; }
@@ -338,6 +338,8 @@
   <div class="card" id="cZenodo">
     <div class="lb">Zenodo</div>
     <div class="val" id="cZenVal">—</div>
+    <div class="bar" id="cZenBar" style="display:none"><div class="bar-fill" id="cZenBarFill" style="width:0;background:var(--cyan)"></div></div>
+    <div class="det" id="cZenBarLbl" style="display:none;color:var(--cyan)"></div>
     <div class="det" id="cZenDet">—</div>
   </div>
 
@@ -797,6 +799,22 @@ function updateCards(d) {
     }
   }
   document.getElementById('cZenDet').innerHTML = zenDet;
+
+  // Upload progress bar
+  const up = (d.current_kg && d.current_kg.upload_progress) || null;
+  const zenBar = document.getElementById('cZenBar');
+  const zenBarFill = document.getElementById('cZenBarFill');
+  const zenBarLbl = document.getElementById('cZenBarLbl');
+  if (up && up.total > 0) {
+    const pct = Math.min(100, Math.round(100 * up.sent / up.total));
+    zenBar.style.display = '';
+    zenBarFill.style.width = pct + '%';
+    zenBarLbl.style.display = '';
+    zenBarLbl.textContent = '⬆ ' + up.file + ' — ' + pct + '% (' + fmtB(up.sent) + '/' + fmtB(up.total) + ')';
+  } else {
+    zenBar.style.display = 'none';
+    zenBarLbl.style.display = 'none';
+  }
 
 }
 

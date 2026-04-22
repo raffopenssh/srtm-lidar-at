@@ -328,6 +328,38 @@ class ReadOnlyError(ZenodoError):
     """Raised when a mutating method is called on a read-only client."""
 
 
+class ProgressFileWrapper:
+    """Wrap a file object to track read progress during uploads."""
+
+    def __init__(self, fh, total_size: int, callback=None, callback_interval: float = 0.5):
+        self._fh = fh
+        self._total = total_size
+        self._sent = 0
+        self._callback = callback
+        self._interval = callback_interval
+        self._last_cb = 0.0
+
+    def read(self, size=-1):
+        data = self._fh.read(size)
+        if data:
+            self._sent += len(data)
+            now = time.time()
+            if self._callback and (now - self._last_cb >= self._interval):
+                self._callback(self._sent, self._total)
+                self._last_cb = now
+        return data
+
+    def seek(self, *args, **kwargs):
+        self._sent = 0
+        return self._fh.seek(*args, **kwargs)
+
+    def tell(self):
+        return self._fh.tell()
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
 class Client:
     """Zenodo API client with retry, backoff, and manifest integration.
 
@@ -637,6 +669,7 @@ class Client:
         manifest: Manifest,
         *,
         delete_after: bool = False,
+        progress_callback=None,
     ) -> Entry:
         """Upload a local file to Zenodo by streaming from disk.
 
@@ -708,11 +741,14 @@ class Client:
             # Stream-upload new file.
             put_url = f"{bucket_url}/{filename}"
             with open(local_path, "rb") as fh:
+                data = ProgressFileWrapper(fh, file_size, progress_callback) if progress_callback else fh
                 resp = self._do_request(
                     "PUT", put_url,
-                    data=fh,
+                    data=data,
                     content_type="application/octet-stream",
                 )
+            if progress_callback:
+                progress_callback(file_size, file_size)
             log.debug("Upload response: %s", resp.json())
 
             # Update metadata.
@@ -738,11 +774,14 @@ class Client:
             # Stream-upload file.
             put_url = f"{bucket_url}/{filename}"
             with open(local_path, "rb") as fh:
+                data = ProgressFileWrapper(fh, file_size, progress_callback) if progress_callback else fh
                 resp = self._do_request(
                     "PUT", put_url,
-                    data=fh,
+                    data=data,
                     content_type="application/octet-stream",
                 )
+            if progress_callback:
+                progress_callback(file_size, file_size)
             log.debug("Upload response: %s", resp.json())
 
             # Set metadata.

@@ -1912,6 +1912,9 @@ function renderDirector(d) {
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + (isActive ? ' ◀ active' : '') + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
+      if (p.online && p.processor_state === 'running') {
+        html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px;color:var(--yellow)" onclick="restartPeer(\'' + esc(p.id) + '\')" title="Force-restart processor (kills stuck subprocesses)">⟳ Restart</button>';
+      }
       if (!isActive && p.enabled && p.online && !isScheduled) {
         html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="activatePeer(\'' + esc(p.id) + '\')">Activate</button>';
       }
@@ -1986,6 +1989,19 @@ async function activatePeer(peerId) {
     });
     if (r.ok) fetchDirectorStatus();
   } catch(e) { console.error('activate:', e); }
+}
+
+async function restartPeer(peerId) {
+  if (!confirm('Force-restart processor on ' + peerId + '?\nThis kills all subprocesses (including stuck uploads).')) return;
+  try {
+    const r = await fetch('/api/v1/director/restart_peer', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({peer_id: peerId})
+    });
+    const d = await r.json();
+    console.log('restart peer:', d);
+    setTimeout(fetchDirectorStatus, 3000);
+  } catch(e) { console.error('restartPeer:', e); }
 }
 
 async function updatePeers() {

@@ -1451,16 +1451,22 @@ def processing_resume():
 
 @app.route('/api/v1/processing/stop', methods=['POST'])
 def processing_stop():
-    """Stop the processor (SIGTERM then SIGKILL).
+    """Stop the processor and ALL its child subprocesses.
 
-    Tries in order:
-    1. Kill the subprocess started via /api/v1/processing/start
-    2. systemctl stop austria_processor
-    3. pkill -f austria_processor.py (SIGTERM)
-    4. Wait 3s, then pkill -9 (SIGKILL) if still alive
+    The processor spawns children via multiprocessing.Pool(1) which can
+    get stuck in long I/O (e.g. SSL uploads).  We kill the entire
+    process group so nothing survives.
+
+    Strategy:
+    1. If we have the Popen handle → kill the whole process group
+       (parent started with start_new_session=True so its PID == PGID).
+    2. Else systemctl stop (sends SIGTERM to the cgroup).
+    3. Else pkill SIGTERM all matching processes.
+    4. Wait 3 s, then SIGKILL any survivors.
     """
     global _processor_process
     import subprocess as _sp
+    import signal as _sig
     method = None
 
     def _proc_alive():
@@ -1470,13 +1476,22 @@ def processing_stop():
         except Exception:
             return False
 
+    def _kill_process_group(pid, sig):
+        """Kill the entire process group rooted at *pid*."""
+        try:
+            os.killpg(os.getpgid(pid), sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
     if _processor_process is not None and _processor_process.poll() is None:
-        import signal as _sig
-        os.kill(_processor_process.pid, _sig.SIGTERM)
+        pid = _processor_process.pid
+        # Kill entire process group (parent + multiprocessing children)
+        _kill_process_group(pid, _sig.SIGTERM)
         _processor_process = None
-        method = 'subprocess'
+        method = 'subprocess_pgkill'
     else:
-        # Try systemctl stop (quick timeout — don't block)
+        # Try systemctl stop — this sends SIGTERM to the whole cgroup
         try:
             r = _sp.run(['sudo', 'systemctl', 'stop', 'austria_processor'],
                         capture_output=True, text=True, timeout=10)
@@ -1498,12 +1513,18 @@ def processing_stop():
     if method and _proc_alive():
         time.sleep(3)
         if _proc_alive():
-            try:
-                _sp.run(['pkill', '-9', '-f', 'austria_processor.py'],
-                        capture_output=True, text=True, timeout=5)
-                method = method + '+kill9'
-            except Exception:
-                pass
+            # SIGKILL via process-group first, then pkill as backstop
+            killed_pg = False
+            if _processor_process is not None:
+                killed_pg = _kill_process_group(
+                    _processor_process.pid, _sig.SIGKILL)
+            if not killed_pg:
+                try:
+                    _sp.run(['pkill', '-9', '-f', 'austria_processor.py'],
+                            capture_output=True, text=True, timeout=5)
+                except Exception:
+                    pass
+            method = method + '+kill9'
     elif not method:
         # Nothing worked with SIGTERM — go straight to SIGKILL
         try:
@@ -2315,6 +2336,54 @@ def admin_update():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/director/restart_peer', methods=['POST'])
+def director_restart_peer():
+    """Force-restart the processor on a specific peer (stop + start).
+
+    Body: {"peer_id": "at3"}  (or omit for active peer)
+
+    Calls processing/stop (kills parent + children) then processing/start.
+    """
+    body = request.get_json(silent=True) or {}
+    peer_id = body.get('peer_id')
+    cfg = pd.load_peers_config()
+    peer_url = None
+
+    if peer_id:
+        for p in cfg.get('peers', []):
+            if p['id'] == peer_id:
+                peer_url = p.get('url')
+                break
+        else:
+            return jsonify({'error': f'Unknown peer: {peer_id}'}), 404
+    else:
+        # Default to active peer
+        d = pd.get_director()
+        active_id = d.state.get('active_peer')
+        if not active_id:
+            return jsonify({'error': 'No active peer'}), 404
+        peer_id = active_id
+        for p in cfg.get('peers', []):
+            if p['id'] == active_id:
+                peer_url = p.get('url')
+                break
+
+    # Stop (kills entire process group including stuck subprocesses)
+    stop_result = pd.stop_peer_processor(peer_url)
+
+    # Wait for processes to die
+    time.sleep(3)
+
+    # Start
+    start_result = pd.start_peer_processor(peer_url)
+
+    return jsonify({
+        'peer_id': peer_id,
+        'stop': stop_result,
+        'start': start_result,
+    })
 
 
 @app.route('/api/v1/admin/restart_processor', methods=['POST'])

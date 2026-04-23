@@ -328,8 +328,21 @@ class ReadOnlyError(ZenodoError):
     """Raised when a mutating method is called on a read-only client."""
 
 
+# 4 MB read chunks — http.client.HTTPConnection.send() reads file-like
+# objects in blocksize (default 8 KB) chunks.  Each chunk goes through
+# TLS encrypt + sendall, so 8 KB × 183K calls for a 1.5 GB file is
+# extremely slow and can cause Zenodo to close the connection mid-stream
+# (SSL EOF).  By overriding __len__ we let requests set Content-Length,
+# and by buffering reads into 4 MB blocks we reduce TLS overhead ~500×.
+_UPLOAD_CHUNK = 4 * 1024 * 1024  # 4 MB
+
+
 class ProgressFileWrapper:
-    """Wrap a file object to track read progress during uploads."""
+    """Wrap a file object to track read progress during uploads.
+
+    Also acts as a ``__len__``-able object so ``requests`` sets
+    ``Content-Length`` without relying on ``fileno()``/``fstat``.
+    """
 
     def __init__(self, fh, total_size: int, callback=None, callback_interval: float = 0.5):
         self._fh = fh
@@ -339,7 +352,14 @@ class ProgressFileWrapper:
         self._interval = callback_interval
         self._last_cb = 0.0
 
+    # --- size introspection for requests/urllib3 ---
+    def __len__(self) -> int:
+        return self._total
+
     def read(self, size=-1):
+        # Force large reads even when http.client asks for 8 KB.
+        if 0 < size < _UPLOAD_CHUNK:
+            size = _UPLOAD_CHUNK
         data = self._fh.read(size)
         if data:
             self._sent += len(data)

@@ -302,6 +302,12 @@ def start_peer_processor(peer_url: str | None) -> dict:
             result = r.json()
             result['queue_sync'] = queue_result
             return result
+        if r.status_code == 409:
+            # Already running — that's fine
+            result = r.json()
+            result['queue_sync'] = queue_result
+            result['already_running'] = True
+            return result
         # API start failed (500 etc) — try systemd restart as fallback
         log.warning('API start on %s returned %d, trying systemd fallback', peer_url, r.status_code)
     except Exception as e:
@@ -416,10 +422,22 @@ class PeerDirector:
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        # Use a file lock to ensure only one director loop runs across
+        # all gunicorn workers. The lock is non-blocking; if another worker
+        # already holds it, this worker skips the director loop.
+        import fcntl
+        lock_path = DATA_DIR / 'director.lock'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._lock_fd = open(lock_path, 'w')
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            log.info('PeerDirector lock held by another worker — skipping')
+            return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        log.info('PeerDirector started')
+        log.info('PeerDirector started (lock acquired)')
 
     def stop(self):
         self._running = False

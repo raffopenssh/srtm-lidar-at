@@ -150,6 +150,16 @@
       "uploaded_at": "2026-04-22T18:43:06.699352+00:00",
       "version": "v1"
     },
+    "12366_json": {
+      "bucket_url": "https://zenodo.org/api/files/db2438e7-12e9-4086-8ea7-09df713f9830",
+      "checksum": "md5:94e3ea6d323e39bf75cbc2e08487ec94",
+      "depo_id": 19704054,
+      "filename": "12366.json",
+      "key": "12366_json",
+      "size": 3294000,
+      "uploaded_at": "2026-04-23T06:03:19.149899+00:00",
+      "version": "v1"
+    },
     "14124_full_gpkg": {
       "bucket_url": "https://zenodo.org/api/files/e2baaba5-4f6b-47a0-aab3-9abd4c1be1bd",
       "checksum": "md5:fe3504c5632fa493609b66b7621c7f61",
@@ -208,6 +218,16 @@
       "key": "91109_light_gpkg",
       "size": 131260416,
       "uploaded_at": "2026-04-20T09:54:24.213492+00:00",
+      "version": "v1"
+    },
+    "92116_full_gpkg": {
+      "bucket_url": "https://zenodo.org/api/files/871fb7b8-2720-4dd4-8a91-ba323a0df677",
+      "checksum": "md5:8d0a089358992d0f4f7b1dad65d45acd",
+      "depo_id": 19709911,
+      "filename": "92116_full.gpkg",
+      "key": "92116_full_gpkg",
+      "size": 1518518272,
+      "uploaded_at": "2026-04-23T14:39:09.846722+00:00",
       "version": "v1"
     }
   }

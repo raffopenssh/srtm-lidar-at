@@ -2096,6 +2096,34 @@ def processing_manifest():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/processing/manifest/<key>', methods=['DELETE'])
+def processing_manifest_delete(key):
+    """Delete a single entry from the Zenodo manifest."""
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    if not manifest_path.exists():
+        return jsonify({'error': 'no manifest'}), 404
+    try:
+        data = json.loads(manifest_path.read_text())
+        entries = data.get('entries', data)
+        if key not in entries:
+            return jsonify({'error': f'{key} not found'}), 404
+        del entries[key]
+        import tempfile as _tf
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'entries': entries}, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+        return jsonify({'deleted': key, 'remaining': len(entries)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # === SECTION: Bandwidth & Peer Director ===
 
 import peer_director as pd

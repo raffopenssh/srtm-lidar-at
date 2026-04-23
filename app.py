@@ -227,10 +227,8 @@ def _sync_peer_data():
                         r = req.get(peer_url.rstrip('/') + '/api/v1/processing/cache_manifest', timeout=15)
                         if r.status_code == 200:
                             peer_cm = r.json()
-                            # Adopt depo_id if we don't have one
-                            if peer_cm.get('depo_id') and not local_cm.get('depo_id'):
-                                local_cm['depo_id'] = peer_cm['depo_id']
-                            # Merge files by newest updated_at
+                            # Only merge file entries from peers — never adopt their depo_id.
+                            # The primary's depo_id is authoritative; peers get it via PUT.
                             for zn, entry in peer_cm.get('files', {}).items():
                                 existing = incoming_merged.get(zn)
                                 if existing is None or entry.get('updated_at', '') > existing.get('updated_at', ''):
@@ -239,11 +237,20 @@ def _sync_peer_data():
                         log.debug('Peer sync: cache manifest fetch from %s failed: %s', peer_url, e)
 
                 # Merge into local
+                import re as _re
                 local_files = local_cm.get('files', {})
+                local_depo = local_cm.get('depo_id')
                 cm_updated = 0
                 for zn, entry in incoming_merged.items():
                     loc = local_files.get(zn)
                     if loc is None or entry.get('updated_at', '') > loc.get('updated_at', ''):
+                        # Rewrite URL to point at our deposit
+                        if local_depo and entry.get('url'):
+                            entry = dict(entry)
+                            entry['url'] = _re.sub(
+                                r'/api/records/\d+/draft/files/',
+                                f'/api/records/{local_depo}/draft/files/',
+                                entry['url'])
                         local_files[zn] = entry
                         cm_updated += 1
                 if cm_updated > 0:
@@ -1208,11 +1215,25 @@ def processing_cache_manifest():
         if incoming.get('record_id'):
             local['record_id'] = incoming['record_id']
 
+        # Rewrite file URLs to point at the correct deposit
+        target_depo = local['depo_id']
+
+        def _rewrite_url(url, depo_id):
+            """Rewrite a Zenodo draft file URL to use the given deposit ID."""
+            if not url or not depo_id:
+                return url
+            import re
+            return re.sub(r'/api/records/\d+/draft/files/', f'/api/records/{depo_id}/draft/files/', url)
+
         # Merge files — keep the entry with the newer updated_at
         local_files = local.get('files', {})
         incoming_files = incoming.get('files', {})
         updated = 0
         for zip_name, inc_entry in incoming_files.items():
+            # Rewrite URL to target deposit
+            if inc_entry.get('url') and target_depo:
+                inc_entry = dict(inc_entry)
+                inc_entry['url'] = _rewrite_url(inc_entry['url'], target_depo)
             loc_entry = local_files.get(zip_name)
             if loc_entry is None:
                 local_files[zip_name] = inc_entry
@@ -1224,6 +1245,12 @@ def processing_cache_manifest():
                 if inc_ts > loc_ts:
                     local_files[zip_name] = inc_entry
                     updated += 1
+        # Also rewrite existing file URLs in case depo_id changed
+        if target_depo:
+            for zn, entry in local_files.items():
+                if entry.get('url'):
+                    local_files[zn] = dict(entry)
+                    local_files[zn]['url'] = _rewrite_url(entry['url'], target_depo)
         local['files'] = local_files
 
         # Atomic write

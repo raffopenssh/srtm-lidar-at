@@ -2131,6 +2131,26 @@ def admin_restart_processor():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/admin/disable_autostart', methods=['POST'])
+def admin_disable_autostart():
+    """Disable austria_processor systemd auto-start.
+
+    Called by the director to ensure peers don't restart their processor
+    independently via systemd. The director manages processor lifecycle.
+    """
+    try:
+        import subprocess as sp
+        # Stop the service if running
+        sp.run(['sudo', 'systemctl', 'stop', 'austria_processor'],
+               capture_output=True, text=True, timeout=15)
+        # Disable auto-start on boot and on failure
+        sp.run(['sudo', 'systemctl', 'disable', 'austria_processor'],
+               capture_output=True, text=True, timeout=5)
+        return jsonify({'status': 'disabled'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # Start the director background thread — only on the primary instance.
 # The director loop actively starts/stops processors on peers, so only one
 # instance should run it. Enabled by the flag file data/austria_processor/is_director.

@@ -298,16 +298,34 @@ def start_peer_processor(peer_url: str | None) -> dict:
             return {'error': str(e)}
     # Remote peer — sync priority queue before starting
     queue_result = sync_queue_to_peer(peer_url)
+    # Try API start first, fall back to systemd restart via admin endpoint
     try:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/processing/start',
-            timeout=PEER_TIMEOUT
+            json={},
+            timeout=PEER_TIMEOUT,
         )
-        result = r.json()
-        result['queue_sync'] = queue_result
-        return result
+        if r.ok:
+            result = r.json()
+            result['queue_sync'] = queue_result
+            return result
+        # API start failed (500 etc) — try systemd restart as fallback
+        log.warning('API start on %s returned %d, trying systemd fallback', peer_url, r.status_code)
     except Exception as e:
-        return {'error': str(e), 'queue_sync': queue_result}
+        log.warning('API start on %s failed: %s, trying systemd fallback', peer_url, e)
+    # Fallback: ask the peer to restart the processor via systemd
+    try:
+        r2 = requests.post(
+            peer_url.rstrip('/') + '/api/v1/admin/restart_processor',
+            json={},
+            timeout=30,
+        )
+        result = r2.json() if r2.ok else {'error': f'systemd fallback: {r2.status_code}'}
+        result['queue_sync'] = queue_result
+        result['method'] = 'systemd_fallback'
+        return result
+    except Exception as e2:
+        return {'error': str(e2), 'queue_sync': queue_result, 'method': 'both_failed'}
 
 
 def stop_peer_processor(peer_url: str | None) -> dict:

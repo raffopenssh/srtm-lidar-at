@@ -2048,6 +2048,24 @@ def admin_update():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/admin/restart_processor', methods=['POST'])
+def admin_restart_processor():
+    """Restart the austria_processor via systemd (called by director as fallback)."""
+    try:
+        import subprocess as sp
+        sp.run(['sudo', 'systemctl', 'restart', 'austria_processor'],
+               capture_output=True, text=True, timeout=15)
+        time.sleep(2)
+        status = sp.run(['systemctl', 'is-active', 'austria_processor'],
+                        capture_output=True, text=True, timeout=5)
+        return jsonify({
+            'status': 'restarted',
+            'service_state': status.stdout.strip(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # Start the director background thread
 def _start_director():
     time.sleep(3)  # let Flask boot first

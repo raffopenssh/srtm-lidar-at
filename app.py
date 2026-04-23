@@ -172,7 +172,7 @@ def _sync_peer_data():
                     if key not in merged_manifest_entries:
                         merged_manifest_entries[key] = entry
 
-            # Merge into local manifest
+            # Merge into local manifest (atomic read-modify-write)
             if merged_manifest_entries:
                 try:
                     local_manifest = {}
@@ -187,7 +187,18 @@ def _sync_peer_data():
                             added += 1
 
                     if added > 0:
-                        manifest_path.write_text(json.dumps({'entries': local_manifest}, indent=2))
+                        # Atomic write: temp file then rename (same pattern as Manifest.save())
+                        import tempfile as _tf
+                        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                json.dump({'entries': local_manifest}, f, indent=2, sort_keys=True)
+                            os.replace(tmp, manifest_path)
+                        except BaseException:
+                            try: os.unlink(tmp)
+                            except OSError: pass
+                            raise
                         log.info('Peer sync: merged %d manifest entries from peers', added)
                 except Exception as e:
                     log.warning('Peer sync: manifest merge failed: %s', e)

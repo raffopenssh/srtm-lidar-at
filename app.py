@@ -1269,19 +1269,50 @@ def processing_resume():
 
 @app.route('/api/v1/processing/stop', methods=['POST'])
 def processing_stop():
-    """Stop the processor (sends SIGTERM)."""
+    """Stop the processor (sends SIGTERM).
+
+    Tries in order:
+    1. Kill the subprocess started via /api/v1/processing/start
+    2. systemctl stop austria_processor
+    3. pkill -f austria_processor.py
+    """
     global _processor_process
-    if _processor_process is None or _processor_process.poll() is not None:
+    method = None
+    if _processor_process is not None and _processor_process.poll() is None:
+        import signal as _sig
+        os.kill(_processor_process.pid, _sig.SIGTERM)
+        _processor_process = None
+        method = 'subprocess'
+    else:
+        import subprocess as _sp
+        # Try systemctl stop
+        try:
+            r = _sp.run(['sudo', 'systemctl', 'stop', 'austria_processor'],
+                        capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                method = 'systemctl'
+        except Exception:
+            pass
+        # Fallback: pkill
+        if not method:
+            try:
+                r = _sp.run(['pkill', '-f', 'austria_processor.py'],
+                            capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    method = 'pkill'
+            except Exception:
+                pass
+    if not method:
         return jsonify({'error': 'Processor not running'}), 404
-    import signal as _sig
-    os.kill(_processor_process.pid, _sig.SIGTERM)
-    _processor_process = None
     pf = Path('data/austria_processor/progress.json')
     if pf.exists():
-        d = json.loads(pf.read_text())
-        d['state'] = 'stopped'
-        pf.write_text(json.dumps(d, indent=2, default=str))
-    return jsonify({'status': 'stopped'})
+        try:
+            d = json.loads(pf.read_text())
+            d['state'] = 'stopped'
+            pf.write_text(json.dumps(d, indent=2, default=str))
+        except Exception:
+            pass
+    return jsonify({'status': 'stopped', 'method': method})
 
 
 @app.route('/api/v1/processing/postpone', methods=['POST'])
@@ -1974,6 +2005,33 @@ def director_add_peer():
         'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
         'total_peers': len(cfg['peers']),
     })
+
+
+@app.route('/api/v1/director/peers/<peer_id>', methods=['DELETE'])
+def director_remove_peer(peer_id):
+    """Remove a peer from the director.
+
+    Stops the peer's processor and removes it from peers.json and peer_urls.txt.
+    Cannot remove the primary peer (url=null).
+    """
+    d = pd.get_director()
+    result = d.remove_peer(peer_id)
+    if 'error' in result:
+        return jsonify(result), 400 if 'Cannot remove' in result.get('error', '') else 404
+    return jsonify(result)
+
+
+@app.route('/api/v1/director/throttle', methods=['GET', 'POST'])
+def director_throttle():
+    """GET: current throttle state. POST: set and propagate throttle to all peers."""
+    d = pd.get_director()
+    if request.method == 'GET':
+        local = Path('data/austria_processor/upload_throttle').exists()
+        return jsonify({'throttle': local})
+    data = request.get_json(silent=True) or {}
+    enabled = data.get('throttle', True)
+    results = d.propagate_throttle(enabled)
+    return jsonify({'status': 'propagated', 'throttle': enabled, 'peers': results})
 
 
 @app.route('/api/v1/director/proxy/status')

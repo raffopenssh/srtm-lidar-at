@@ -282,18 +282,11 @@ def start_peer_processor(peer_url: str | None) -> dict:
     processes the same KGs in priority order.
     """
     if peer_url is None:
-        # Local start — use subprocess
+        # Local start — use the local API so _processor_process is tracked
         try:
-            import sys
-            log_file = DATA_DIR / 'logs' / 'processor.log'
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            log_fd = open(log_file, 'a')
-            proc = subprocess.Popen(
-                [sys.executable, 'austria_processor.py', '--mark-uncertain'],
-                stdout=log_fd, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            return {'status': 'started', 'pid': proc.pid}
+            r = requests.post('http://127.0.0.1:8000/api/v1/processing/start',
+                              json={}, timeout=PEER_TIMEOUT)
+            return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
     # Remote peer — sync priority queue before starting
@@ -330,27 +323,18 @@ def start_peer_processor(peer_url: str | None) -> dict:
 
 def stop_peer_processor(peer_url: str | None) -> dict:
     """Stop the processor on a peer."""
-    if peer_url is None:
-        try:
-            subprocess.run(
-                ['pkill', '-f', 'austria_processor.py'],
-                timeout=5
-            )
-            # Update progress
-            pf = DATA_DIR / 'progress.json'
-            if pf.exists():
-                d = json.loads(pf.read_text())
-                d['state'] = 'stopped'
-                pf.write_text(json.dumps(d, indent=2, default=str))
-            return {'status': 'stopped'}
-        except Exception as e:
-            return {'error': str(e)}
+    url = peer_url if peer_url else 'http://127.0.0.1:8000'
     try:
         r = requests.post(
-            peer_url.rstrip('/') + '/api/v1/processing/stop',
-            timeout=PEER_TIMEOUT
+            url.rstrip('/') + '/api/v1/processing/stop',
+            timeout=30  # stop can take a moment
         )
-        return r.json()
+        if r.ok:
+            return r.json()
+        # If 404 (not running), that's fine
+        if r.status_code == 404:
+            return {'status': 'already_stopped'}
+        return {'error': f'stop returned {r.status_code}'}
     except Exception as e:
         return {'error': str(e)}
 
@@ -442,6 +426,13 @@ class PeerDirector:
 
     def get_status(self) -> dict:
         """Full director status for the dashboard."""
+        # Always re-read config from disk so all gunicorn workers see new peers
+        try:
+            disk_cfg = load_peers_config()
+            with self._lock:
+                self.cfg = disk_cfg
+        except Exception:
+            pass
         with self._lock:
             cfg = self.cfg.copy()
             state = self.state.copy()
@@ -494,6 +485,71 @@ class PeerDirector:
     def reload_config(self):
         with self._lock:
             self.cfg = load_peers_config()
+
+    def propagate_throttle(self, enabled: bool) -> dict:
+        """Propagate throttle state to all remote peers."""
+        results = {}
+        with self._lock:
+            cfg = self.cfg.copy()
+        for peer in cfg.get('peers', []):
+            url = peer.get('url')
+            if url is None:
+                continue
+            try:
+                # First check current state
+                r = requests.get(url.rstrip('/') + '/api/v1/processing/throttle',
+                                 timeout=PEER_TIMEOUT)
+                current = r.json().get('throttle', False) if r.ok else None
+                if current == enabled:
+                    results[peer['id']] = 'already_' + ('on' if enabled else 'off')
+                    continue
+                # Toggle to match desired state
+                r2 = requests.post(url.rstrip('/') + '/api/v1/processing/throttle',
+                                   timeout=PEER_TIMEOUT)
+                if r2.ok:
+                    results[peer['id']] = 'set_' + ('on' if enabled else 'off')
+                else:
+                    results[peer['id']] = f'error_{r2.status_code}'
+            except Exception as e:
+                results[peer['id']] = f'error: {e}'
+        return results
+
+    def remove_peer(self, peer_id: str) -> dict:
+        """Remove a peer from config. Stops its processor first."""
+        with self._lock:
+            cfg = self.cfg
+        peer = get_peer_by_id(cfg, peer_id)
+        if not peer:
+            return {'error': f'Peer {peer_id} not found'}
+        if peer.get('url') is None:
+            return {'error': 'Cannot remove the primary peer'}
+        # Stop processor on the peer
+        url = peer['url']
+        try:
+            stop_peer_processor(url)
+        except Exception as e:
+            log.warning('Failed to stop peer %s before removal: %s', peer_id, e)
+        # Remove from config
+        with self._lock:
+            cfg['peers'] = [p for p in cfg.get('peers', []) if p['id'] != peer_id]
+            save_peers_config(cfg)
+            # Clear from state
+            self.state.get('peer_bandwidth', {}).pop(peer_id, None)
+            if self.state.get('active_peer') == peer_id:
+                self.state['active_peer'] = None
+            save_director_state(self.state)
+            self.cfg = cfg
+        # Remove from peer_urls.txt
+        peer_urls_path = DATA_DIR / 'peer_urls.txt'
+        if peer_urls_path.exists():
+            try:
+                urls = {u.strip() for u in peer_urls_path.read_text().splitlines() if u.strip()}
+                urls.discard(url)
+                peer_urls_path.write_text('\n'.join(sorted(urls)) + '\n' if urls else '')
+            except Exception:
+                pass
+        log.info('Removed peer %s (%s)', peer_id, url)
+        return {'status': 'removed', 'peer_id': peer_id}
 
     def _update_bandwidth(self):
         """Refresh bandwidth data for all peers."""
@@ -593,6 +649,17 @@ class PeerDirector:
                         self.state['active_peer'] = None
                         active_id = None
 
+        # Enforce single-active: stop any non-active peers that are running
+        # (they may have been started independently or before director took over)
+        if active_id:
+            for p in cfg.get('peers', []):
+                if p['id'] != active_id and p.get('url') is not None:
+                    ps = get_peer_status(p.get('url'))
+                    if ps.get('state') in ('running', 'processing'):
+                        log.warning('Non-active peer %s is running — stopping it '
+                                    '(only %s should be active)', p['id'], active_id)
+                        stop_peer_processor(p.get('url'))
+
         # If no active peer, choose one
         if not active_id:
             with self._lock:
@@ -657,6 +724,13 @@ class PeerDirector:
         sync_counter = 0
         while self._running:
             try:
+                # Re-read config from disk each tick so cross-worker changes are seen
+                try:
+                    disk_cfg = load_peers_config()
+                    with self._lock:
+                        self.cfg = disk_cfg
+                except Exception:
+                    pass
                 self._update_bandwidth()
                 self._check_and_switch()
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)

@@ -360,7 +360,7 @@
         <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
       </span>
     </div>
-    <div id="directorBody" style="margin-top:6px;">
+    <div id="directorBody" class="coll-b" style="margin-top:6px;">
       <div id="directorPeers" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;"></div>
     </div>
   </div>
@@ -1149,6 +1149,10 @@ async function toggleThrottle() {
     const r = await fetch('/api/v1/processing/throttle', {method:'POST'});
     const d = await r.json();
     updateThrottleBtn(d.throttle);
+    // Propagate to active peer via director
+    if (d.throttle !== undefined) {
+      fetch('/api/v1/director/throttle', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({throttle: d.throttle})}).catch(() => {});
+    }
   } catch(e) { console.error('throttle toggle failed', e); }
 }
 function updateThrottleBtn(on) {
@@ -1878,8 +1882,8 @@ function renderDirector(d) {
 
     // Determine if this peer is "inactive" (not active, not running)
     const isRunning = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
-    const isInactive = !isActive && (!isRunning || isScheduled);
     const isScheduled = p.scheduled;
+    const isInactive = !isActive && !isRunning;
 
     const border = isActive ? 'border-color:var(--blue);' : '';
 
@@ -1892,7 +1896,10 @@ function renderDirector(d) {
       html += ' · ' + (p.completed||0) + ' done';
       if (isScheduled && p.not_before) html += ' · <span style="color:var(--yellow)">⏳ until ' + esc(p.not_before) + '</span>';
       html += '</span>';
+      html += '<span style="display:flex;align-items:center;gap:4px">';
+      if (p.url !== null) html += '<span style="font-size:11px;color:var(--dim);cursor:pointer;opacity:0.5;transition:opacity 0.15s" onmouseover="this.style.opacity=1;this.style.color=\'var(--red)\'" onmouseout="this.style.opacity=0.5;this.style.color=\'var(--dim)\'" onclick="event.stopPropagation();deletePeer(\'' + esc(p.id) + '\')" title="Remove peer">✕</span>';
       html += '<span style="font-size:10px;color:var(--dim)">▼</span>';
+      html += '</span>';
       html += '</div>';
       // Hidden detail section
       html += '<div class="peer-detail" hidden style="margin-top:6px">';
@@ -1904,9 +1911,12 @@ function renderDirector(d) {
     if (!isInactive) {
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + (isActive ? ' ◀ active' : '') + '</span>';
+      html += '<span style="display:flex;align-items:center;gap:4px">';
       if (!isActive && p.enabled && p.online && !isScheduled) {
         html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="activatePeer(\'' + esc(p.id) + '\')">Activate</button>';
       }
+      if (p.url !== null) html += '<span style="font-size:11px;color:var(--dim);cursor:pointer;opacity:0.5;transition:opacity 0.15s" onmouseover="this.style.opacity=1;this.style.color=\'var(--red)\'" onmouseout="this.style.opacity=0.5;this.style.color=\'var(--dim)\'" onclick="deletePeer(\'' + esc(p.id) + '\')" title="Remove peer">✕</span>';
+      html += '</span>';
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
@@ -1951,6 +1961,21 @@ async function setDirectorMode(mode) {
     });
     if (r.ok) fetchDirectorStatus();
   } catch(e) { console.error('setMode:', e); }
+}
+
+async function deletePeer(peerId) {
+  if (!confirm('Remove peer "' + peerId + '"? This will stop its processor and remove it from the director.')) return;
+  try {
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId), {
+      method: 'DELETE'
+    });
+    if (r.ok) {
+      fetchDirectorStatus();
+    } else {
+      const d = await r.json().catch(() => ({}));
+      alert('Failed: ' + (d.error || r.statusText));
+    }
+  } catch(e) { alert('Error: ' + e); }
 }
 
 async function activatePeer(peerId) {

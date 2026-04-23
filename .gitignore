@@ -4,6 +4,11 @@ rf_training_data/checkpoints/
 
 data/shares/
 
+# Instance-specific peer config
+data/austria_processor/peers.json
+data/austria_processor/director_state.json
+data/austria_processor/peer_urls.txt
+
 # Large uncompressed model files (keep .xz compressed version)
 data/best_model/rf_model.joblib
 data/best_model/rf_model_pre_infra.joblib

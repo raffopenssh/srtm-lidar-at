@@ -1991,14 +1991,24 @@ const _GH_TOKEN = '<REDACTED_GITHUB_PAT>';
 function _directorPublicUrl() {
   return location.origin.includes('exe.xyz') ? location.origin : 'https://srtm-lidar-at.exe.xyz:8000';
 }
+function _nextPeerVmName() {
+  const peers = (_directorData && _directorData.peers) || [];
+  const ids = new Set(peers.map(p => p.id));
+  for (let i = 2; ; i++) {
+    const candidate = 'at' + i;
+    if (!ids.has(candidate)) return 'srtm-lidar-' + candidate;
+  }
+}
 function showAddPeerModal() {
-  document.getElementById('addPeerVmName').value = '';
+  const suggested = _nextPeerVmName();
+  document.getElementById('addPeerVmName').value = suggested;
   document.getElementById('addPeerId').value = '';
   document.getElementById('addPeerUrl').value = '';
   document.getElementById('addPeerStatus').style.display = 'none';
   updateDeployCmd();
   document.getElementById('addPeerModal').style.display = 'flex';
   document.getElementById('addPeerVmName').focus();
+  document.getElementById('addPeerVmName').select();
 }
 function updateDeployCmd() {
   const vm = document.getElementById('addPeerVmName').value.trim() || '<vm-name>';

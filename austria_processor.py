@@ -418,9 +418,10 @@ class ProgressTracker:
         elapsed = time.time() - started_at
         with self._lock:
             n = self._state["completed"]
+            n_session = n - self._state.get("_completed_at_start", 0)
             self._state["elapsed_seconds"] = int(elapsed)
-            if n > 0:
-                avg = elapsed / n
+            if n_session > 0:
+                avg = elapsed / n_session
                 self._state["avg_seconds_per_kg"] = round(avg, 1)
                 self._state["rate_kgs_per_hour"] = round(3600 / avg, 2)
                 remaining = self._state["total_kgs"] - n
@@ -7353,6 +7354,7 @@ def main():
         total_kgs=len(kgs),
         completed=len(completed_codes),
         success=len(completed_codes),
+        _completed_at_start=len(completed_codes),
         started_at=datetime.now(timezone.utc).isoformat(),
     )
     progress.save()

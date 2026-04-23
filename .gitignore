@@ -18,3 +18,4 @@ rf_training_data/copernicus_cache/
 rf_training_data/checkpoints_pre_infra_backup/
 rf_training_data/in_progress_kg.txt
 rf_training_data/openeo_circuit.json
+data/austria_processor/is_director

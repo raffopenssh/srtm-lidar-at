@@ -2124,9 +2124,15 @@ def admin_restart_processor():
         return jsonify({'error': str(e)}), 500
 
 
-# Start the director background thread
+# Start the director background thread — only on the primary instance.
+# The director loop actively starts/stops processors on peers, so only one
+# instance should run it. Enabled by the flag file data/austria_processor/is_director.
 def _start_director():
     time.sleep(3)  # let Flask boot first
+    flag = Path('data/austria_processor/is_director')
+    if not flag.exists():
+        log.info('Not a director instance (no %s) — director loop disabled', flag)
+        return
     d = pd.get_director()
     d.start()
 threading.Thread(target=_start_director, daemon=True).start()

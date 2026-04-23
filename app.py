@@ -980,6 +980,9 @@ def processing_status():
                     data['system']['proc_ram_mb'] = rss_kb // 1024
                 except Exception:
                     pass
+            elif data.get('state') in ('running', 'processing'):
+                # No processor PID found but progress.json says running → stale
+                data['state'] = 'stopped'
             # Tile caches
             try:
                 from tile_cache import cache_summary
@@ -1125,6 +1128,19 @@ def processing_peers_combined():
             local_rate = pd.get('rate_kgs_per_hour', 0)
         except Exception:
             pass
+    # Detect stale running state (no processor PID found)
+    if local_state in ('running', 'processing'):
+        _alive = False
+        try:
+            import subprocess as _sp
+            _sp.check_output(['pgrep', '-f', 'austria_processor.py'], text=True, timeout=2)
+            _alive = True
+        except Exception:
+            pass
+        if not _alive:
+            local_state = 'stopped'
+            local_current = None
+            local_rate = 0
 
     instances.append({
         'instance': os.environ.get('INSTANCE_ID', 'primary'),

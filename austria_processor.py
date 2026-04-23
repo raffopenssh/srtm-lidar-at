@@ -110,16 +110,15 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
     would evict expensive tiles.  Skips if fewer than 5 minutes since the
     last flush (unless *force* is True).
 
-    Skip entirely when upload throttle is enabled (secondary peers) to avoid
-    concurrent writes to the shared Zenodo cache deposit.
+    The tile cache is shared across all peers (same Zenodo deposit).
+    Concurrent writes are safe because the Peer Director enforces
+    single-active processing — only one peer writes at a time.
 
     Returns True if upload ran, False if skipped.
     """
     global _last_zenodo_cache_flush
     import time as _t
     now = _t.time()
-    if THROTTLE_FILE.exists():
-        return False  # Peers in throttle mode skip cache uploads (prevents deposit conflicts)
     if not force and (now - _last_zenodo_cache_flush) < _ZENODO_CACHE_FLUSH_INTERVAL:
         return False
 

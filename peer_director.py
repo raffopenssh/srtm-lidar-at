@@ -247,6 +247,33 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         return []
 
 
+def _sync_cache_manifest_to_peer(peer_url: str) -> None:
+    """Push local Zenodo tile-cache manifest to a remote peer.
+
+    Ensures the peer shares the same Zenodo cache deposit, so it can
+    read cached Copernicus/Hansen tiles instead of re-fetching them.
+    """
+    manifest_path = DATA_DIR / 'cache_manifest.json'
+    if not manifest_path.exists():
+        return
+    try:
+        local_cm = json.loads(manifest_path.read_text())
+        if not local_cm.get('depo_id'):
+            return
+        r = requests.put(
+            peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
+            json=local_cm, timeout=PEER_TIMEOUT,
+        )
+        if r.ok:
+            result = r.json()
+            log.info('Cache manifest sync to %s: %d entries updated',
+                     peer_url, result.get('updated', 0))
+        else:
+            log.warning('Cache manifest sync to %s: HTTP %d', peer_url, r.status_code)
+    except Exception as e:
+        log.warning('Cache manifest sync to %s failed: %s', peer_url, e)
+
+
 def sync_queue_to_peer(peer_url: str) -> dict:
     """Push the local priority queue to a remote peer.
 
@@ -289,7 +316,8 @@ def start_peer_processor(peer_url: str | None) -> dict:
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
-    # Remote peer — sync priority queue before starting
+    # Remote peer — sync cache manifest + priority queue before starting
+    _sync_cache_manifest_to_peer(peer_url)
     queue_result = sync_queue_to_peer(peer_url)
     # Try API start first, fall back to systemd restart via admin endpoint
     try:

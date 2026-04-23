@@ -211,6 +211,75 @@ def _sync_peer_data():
                 except Exception as e:
                     log.warning('Peer sync: index rebuild failed: %s', e)
 
+            # --- Sync Zenodo tile-cache manifest across peers ---
+            # Read our local cache_manifest, push to each peer, pull theirs.
+            # This ensures all peers share the same Zenodo cache deposit.
+            try:
+                cache_manifest_path = Path('data/austria_processor/cache_manifest.json')
+                local_cm = {}
+                if cache_manifest_path.exists():
+                    local_cm = json.loads(cache_manifest_path.read_text())
+
+                # Collect all peer manifests + merge incoming
+                incoming_merged = {}
+                for peer_url in peer_urls:
+                    try:
+                        r = req.get(peer_url.rstrip('/') + '/api/v1/processing/cache_manifest', timeout=15)
+                        if r.status_code == 200:
+                            peer_cm = r.json()
+                            # Adopt depo_id if we don't have one
+                            if peer_cm.get('depo_id') and not local_cm.get('depo_id'):
+                                local_cm['depo_id'] = peer_cm['depo_id']
+                            # Merge files by newest updated_at
+                            for zn, entry in peer_cm.get('files', {}).items():
+                                existing = incoming_merged.get(zn)
+                                if existing is None or entry.get('updated_at', '') > existing.get('updated_at', ''):
+                                    incoming_merged[zn] = entry
+                    except Exception as e:
+                        log.debug('Peer sync: cache manifest fetch from %s failed: %s', peer_url, e)
+
+                # Merge into local
+                local_files = local_cm.get('files', {})
+                cm_updated = 0
+                for zn, entry in incoming_merged.items():
+                    loc = local_files.get(zn)
+                    if loc is None or entry.get('updated_at', '') > loc.get('updated_at', ''):
+                        local_files[zn] = entry
+                        cm_updated += 1
+                if cm_updated > 0:
+                    local_cm['files'] = local_files
+                    import tempfile as _tf2
+                    cache_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                    fd2, tmp2 = _tf2.mkstemp(dir=cache_manifest_path.parent, suffix='.tmp', prefix='.cache_manifest_')
+                    try:
+                        with os.fdopen(fd2, 'w') as f:
+                            json.dump(local_cm, f, indent=2, sort_keys=True)
+                        os.replace(tmp2, cache_manifest_path)
+                    except BaseException:
+                        try: os.unlink(tmp2)
+                        except OSError: pass
+                        raise
+                    # Invalidate zip index cache
+                    zip_idx_dir = Path('data/austria_processor/zenodo_zip_index')
+                    if zip_idx_dir.exists():
+                        for zf in zip_idx_dir.iterdir():
+                            zf.unlink(missing_ok=True)
+                    log.info('Peer sync: merged %d cache manifest entries from peers', cm_updated)
+
+                # Push our (now merged) manifest to all peers
+                if local_cm.get('files'):
+                    for peer_url in peer_urls:
+                        try:
+                            req.put(
+                                peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
+                                json=local_cm, timeout=15
+                            )
+                        except Exception as e:
+                            log.debug('Peer sync: cache manifest push to %s failed: %s', peer_url, e)
+
+            except Exception as e:
+                log.warning('Peer sync: cache manifest sync failed: %s', e)
+
         except Exception as e:
             log.warning('Peer sync error: %s', e)
 
@@ -1102,6 +1171,84 @@ def processing_peers_status():
         result['manifest'] = {}
 
     return jsonify(result)
+
+
+@app.route('/api/v1/processing/cache_manifest', methods=['GET', 'PUT'])
+def processing_cache_manifest():
+    """GET/PUT the Zenodo tile-cache manifest (cache_manifest.json).
+
+    GET: returns the full manifest (depo_id, record_id, files).
+    PUT: merges incoming manifest data — only updates files whose
+         updated_at is newer than the local version.
+    """
+    manifest_path = Path('data/austria_processor/cache_manifest.json')
+
+    if request.method == 'GET':
+        if not manifest_path.exists():
+            return jsonify({})
+        try:
+            return jsonify(json.loads(manifest_path.read_text()))
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # PUT — merge incoming manifest
+    incoming = request.get_json(force=True)
+    if not incoming:
+        return jsonify({'error': 'empty body'}), 400
+
+    try:
+        local = {}
+        if manifest_path.exists():
+            local = json.loads(manifest_path.read_text())
+
+        # Always adopt depo_id / record_id if we don't have one
+        if incoming.get('depo_id') and not local.get('depo_id'):
+            local['depo_id'] = incoming['depo_id']
+        if incoming.get('record_id') and not local.get('record_id'):
+            local['record_id'] = incoming['record_id']
+
+        # Merge files — keep the entry with the newer updated_at
+        local_files = local.get('files', {})
+        incoming_files = incoming.get('files', {})
+        updated = 0
+        for zip_name, inc_entry in incoming_files.items():
+            loc_entry = local_files.get(zip_name)
+            if loc_entry is None:
+                local_files[zip_name] = inc_entry
+                updated += 1
+            else:
+                # Compare updated_at timestamps
+                loc_ts = loc_entry.get('updated_at', '')
+                inc_ts = inc_entry.get('updated_at', '')
+                if inc_ts > loc_ts:
+                    local_files[zip_name] = inc_entry
+                    updated += 1
+        local['files'] = local_files
+
+        # Atomic write
+        import tempfile as _tf
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.cache_manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(local, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+
+        # Invalidate cached ZipIndex entries so next fetch picks up new URLs
+        zip_idx_dir = Path('data/austria_processor/zenodo_zip_index')
+        if updated > 0 and zip_idx_dir.exists():
+            for f in zip_idx_dir.iterdir():
+                f.unlink(missing_ok=True)
+            log.info('Cache manifest: merged %d entries, cleared zip index cache', updated)
+
+        return jsonify({'updated': updated, 'total_files': len(local_files)})
+    except Exception as e:
+        log.warning('Cache manifest PUT failed: %s', e)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/v1/processing/peers/status')

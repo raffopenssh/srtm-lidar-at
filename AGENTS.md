@@ -764,6 +764,7 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | GET | `/api/v1/processing/peers/status` | Combined status across all peers (instances, combined_completed, rates) |
 | GET | `/api/v1/processing/log` | Recent processor log lines |
 | GET | `/api/v1/processing/manifest` | Zenodo manifest entries |
+| GET\|PUT | `/api/v1/processing/cache_manifest` | Zenodo tile-cache manifest (shared across peers) |
 | GET | `/api/v1/kg/<kg_code>` | KG JSON summary (local or Zenodo link) |
 | GET | `/api/v1/parcel/<parcel_id>` | Parcel lookup via KG JSON |
 
@@ -1007,7 +1008,7 @@ errors.
 │  • NO director loop (no is_director flag)             │
 │  • NO systemd autostart for austria_processor         │
 │  • Processor started/stopped ONLY by the director     │
-│  • Each peer has its own Zenodo cache deposit          │
+│  • Shares Zenodo tile-cache deposit with primary        │
 │  • Same codebase, same Copernicus credentials          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -1117,14 +1118,27 @@ curl -X POST http://localhost:8000/api/v1/director/throttle \
   -H 'Content-Type: application/json' -d '{"throttle": true}'
 ```
 
-#### Zenodo Cache on Peers
+#### Zenodo Cache on Peers (Shared Deposit)
 
-Each peer has its own Zenodo cache deposit (separate from the primary’s
-deposit 19650075). Peers build their local tile cache from Copernicus/Hansen,
-and upload to their own deposit. They do NOT share tile caches with the
-primary. This means a peer processing KGs near tiles the primary already
-cached will re-download them from Copernicus (not from Zenodo). This is
-acceptable — it uses openEO credits but not Zenodo bandwidth.
+All peers share the same Zenodo tile-cache deposit (depo 19650075) via
+`cache_manifest.json` sync. The manifest is:
+- **Pushed to the active peer** when the director starts its processor
+  (via `PUT /api/v1/processing/cache_manifest`)
+- **Synced bidirectionally** every 5 minutes by the peer-sync thread
+  in `app.py` (`_sync_peer_data`)
+
+This means a peer processing KGs near tiles the primary already cached
+will fetch them from Zenodo (HTTP range reads, ~2-3 requests per tile)
+instead of re-downloading from Copernicus. Saves openEO credits.
+
+Concurrency safety: the director enforces single-active processing, so
+only one peer writes to the deposit at a time. Tile cache uploads
+(`flush_tile_cache_to_zenodo`) proceed regardless of the upload throttle
+(throttle only blocks big GPKG uploads).
+
+**If a peer has a stale manifest**: `rm -rf data/austria_processor/zenodo_zip_index/`
+to force re-fetch of ZIP central directories. The next sync cycle will
+push the latest manifest.
 
 #### Director API Endpoints
 

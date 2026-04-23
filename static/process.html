@@ -345,13 +345,23 @@
 
 </div>
 
-<!-- Peer Status -->
-<div id="peerSection" style="display:none; margin-bottom:14px;">
+<!-- Director / Peer Status -->
+<div id="directorSection" style="margin-bottom:14px;">
   <div class="card">
-    <div class="lb coll-h" id="peerHead" onclick="toggle('peer')" style="cursor:pointer">
-      <span class="arr">▶</span>🌐 Peers <span id="peerSummary" style="color:var(--text);font-weight:600"></span>
+    <div class="lb" style="display:flex;align-items:center;justify-content:space-between">
+      <span style="cursor:pointer" id="directorHead" class="coll-h" onclick="toggle('director')">
+        <span class="arr">▶</span> 🌐 Peer Director
+        <span id="directorSummary" style="color:var(--text);font-weight:600;margin-left:6px"></span>
+      </span>
+      <span id="directorControls" style="display:flex;gap:4px;">
+        <button class="btn" id="btnDirAuto" onclick="setDirectorMode('auto')" style="font-size:10px;padding:1px 6px;" title="Auto-select peer by bandwidth">Auto</button>
+        <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
+        <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
+      </span>
     </div>
-    <div class="coll-b" id="peerBody" style="margin-top:6px;"></div>
+    <div id="directorBody" style="margin-top:6px;">
+      <div id="directorPeers" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;"></div>
+    </div>
   </div>
 </div>
 
@@ -836,13 +846,23 @@ function updateSubtitle(d) {
   const started = d.started_at ? ' · since ' + fmtT(d.started_at) : '';
   const extra = d.n_new_buildings_total ? ' · <b>' + fmt(d.n_new_buildings_total) + '</b> new buildings' : '';
   const infra = d.n_infrastructure_total ? ' · <b>' + fmt(d.n_infrastructure_total) + '</b> infrastructure' : '';
-  let peerInfo = '';
-  if (_peerData && _peerData.instances && _peerData.instances.length > 1) {
-    peerInfo = ' · <b>' + fmt(_peerData.combined_completed) + '</b>/' + fmt(_peerData.total_kgs) + ' combined (' + _peerData.instances.length + ' peers)';
+  let dirInfo = '';
+  if (_directorData) {
+    const dd = _directorData;
+    const totalDone = (dd.peers||[]).reduce((s,p) => s + (p.completed||0), 0);
+    const activeId = dd.active_peer;
+    const activeBw = activeId ? ((dd.peers||[]).find(p=>p.id===activeId)||{}).bandwidth||{} : {};
+    dirInfo = ' · <b>' + totalDone + '</b>/8440 combined';
+    if (activeBw.remaining_gb != null) {
+      dirInfo += ' · 📡 ' + activeBw.remaining_gb.toFixed(0) + ' GB left';
+    }
+    if (activeId && d._active_peer_id) {
+      dirInfo += ' · on <b>' + esc(d._active_peer_id) + '</b>';
+    }
   }
   el.innerHTML = '<b>' + fmt(d.completed||0) + '</b>/<b>' + fmt(d.total_kgs||0) + '</b> KGs · <b>' +
     fmt(d.success||0) + '</b> success · <b>' + fmt(d.uploaded||0) + '</b> uploaded' +
-    extra + infra + peerInfo + elapsed + started;
+    extra + infra + dirInfo + elapsed + started;
 }
 
 // ── Current KG ──────────────────────────────────────────────────
@@ -1097,9 +1117,16 @@ async function sendCmd(action) {
   if (pw === null) return;
   if (pw !== 'raffi') { alert('Wrong password'); return; }
   try {
-    const r = await fetch('/api/v1/processing/' + action, {method:'POST'});
-    if (!r.ok) console.error(action + ':', await r.text());
-    setTimeout(poll, 400);
+    // Use director for start/stop when it's managing peers
+    if (action === 'stop' && _directorData && _directorData.active_peer) {
+      await fetch('/api/v1/director/stop', {method:'POST'});
+    } else if (action === 'start' && _directorData) {
+      await fetch('/api/v1/director/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:'auto'})});
+    } else {
+      const r = await fetch('/api/v1/processing/' + action, {method:'POST'});
+      if (!r.ok) console.error(action + ':', await r.text());
+    }
+    setTimeout(() => { poll(); fetchDirectorStatus(); }, 400);
   } catch(e) { console.error(action, e); }
 }
 async function postponeKG() {
@@ -1219,7 +1246,13 @@ async function poll() {
   const dot = document.getElementById('pollDot');
   dot.style.background = 'var(--blue)';
   try {
-    const r = await fetch(API);
+    // If a remote peer is active, poll via director proxy; otherwise local
+    let apiUrl = API;
+    if (_directorData && _directorData.active_peer) {
+      const ap = (_directorData.peers || []).find(p => p.id === _directorData.active_peer);
+      if (ap && ap.url) apiUrl = '/api/v1/director/proxy/status';
+    }
+    const r = await fetch(apiUrl);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     updateSubtitle(d);
@@ -1741,47 +1774,138 @@ async function savePrioQueue() {
 
 // ── Peer Status ─────────────────────────────────────────────────
 let _peerData = null;
-async function fetchPeerStatus() {
+let _directorData = null;
+
+async function fetchDirectorStatus() {
   try {
-    const r = await fetch('/api/v1/processing/peers/status');
+    const r = await fetch('/api/v1/director/status');
     if (!r.ok) return;
-    const d = await r.json();
-    _peerData = d;
-    const sec = document.getElementById('peerSection');
-    if (!d.instances || d.instances.length <= 1) { sec.style.display = 'none'; return; }
-    sec.style.display = 'block';
+    _directorData = await r.json();
+    renderDirector(_directorData);
+  } catch(e) { console.error('director:', e); }
+}
 
-    document.getElementById('peerSummary').textContent =
-      '— ' + fmt(d.combined_completed) + '/' + fmt(d.total_kgs) + ' combined (' + d.instances.length + ' instances)';
+function renderDirector(d) {
+  const mode = d.mode || 'auto';
+  const active = d.active_peer;
+  const peers = d.peers || [];
+  const totalCompleted = peers.reduce((s,p) => s + (p.completed||0), 0);
 
-    const body = document.getElementById('peerBody');
-    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;">';
-    for (const inst of d.instances) {
-      const stCls = inst.online ? (inst.state === 'running' ? 'st-running' : 'st-idle') : 'st-stopped';
-      const stLabel = inst.online ? inst.state : 'offline';
-      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;">';
-      html += '<div style="font-size:12px;font-weight:600;">' + esc(inst.url ? inst.instance : inst.instance + ' (this)') + '</div>';
-      html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
-      if (inst.current) html += ' · KG ' + esc(String(inst.current));
-      html += '</div>';
-      html += '<div style="font-size:11px;color:var(--dim);">' + inst.completed + ' done';
-      if (inst.rate) html += ' · ' + inst.rate.toFixed(1) + '/hr';
-      html += '</div>';
-      html += '</div>';
+  // Summary line
+  const modeIcons = {auto: '\u{1f7e2}', manual: '\u{1f7e0}', paused: '\u{1f534}'};
+  let sumText = (modeIcons[mode]||'') + ' ' + mode.charAt(0).toUpperCase() + mode.slice(1);
+  if (active) {
+    const ap = peers.find(p => p.id === active);
+    sumText += ' \u00b7 Active: ' + active;
+    if (ap && ap.current_kg) sumText += ' (KG ' + ap.current_kg + ')';
+  } else {
+    sumText += ' \u00b7 No active peer';
+  }
+  sumText += ' \u00b7 ' + totalCompleted + ' total done';
+  document.getElementById('directorSummary').textContent = sumText;
+
+  // Highlight active mode button
+  document.getElementById('btnDirAuto').style.borderColor = mode === 'auto' ? 'var(--green)' : '';
+  document.getElementById('btnDirPause').style.borderColor = mode === 'paused' ? 'var(--red)' : '';
+
+  // Render peer cards
+  const container = document.getElementById('directorPeers');
+  let html = '';
+  for (const p of peers) {
+    const isActive = p.id === active;
+    const bw = p.bandwidth || {};
+    const usedGb = (bw.used_gb || 0);
+    const budgetGb = d.budget_gb || 95;
+    const remainGb = (bw.remaining_gb != null) ? bw.remaining_gb : (budgetGb - usedGb);
+    const bwPct = Math.min(100, Math.round(100 * usedGb / budgetGb));
+    const bwColor = bwPct > 90 ? 'var(--red)' : bwPct > 70 ? 'var(--yellow)' : 'var(--green)';
+
+    const stCls = !p.online ? 'st-stopped' :
+      p.processor_state === 'running' ? 'st-running' :
+      p.processor_state === 'stopped' ? 'st-stopped' : 'st-idle';
+    const stLabel = !p.online ? 'offline' : p.processor_state;
+
+    const border = isActive ? 'border-color:var(--blue);' : '';
+    html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;' + border + '">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center">';
+    html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + (isActive ? ' \u25c0 active' : '') + '</span>';
+    if (!isActive && p.enabled && p.online) {
+      html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="activatePeer(\'' + esc(p.id) + '\')">Activate</button>';
     }
     html += '</div>';
-    body.innerHTML = html;
-  } catch(e) { console.error('peerStatus:', e); }
+    html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
+    if (p.current_kg) html += ' \u00b7 KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
+    html += '</div>';
+    html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done</div>';
+    // Bandwidth bar
+    html += '<div style="margin-top:4px;font-size:10px;color:var(--dim);">';
+    html += '\u{1f4e1} ' + usedGb.toFixed(1) + ' / ' + budgetGb + ' GB (' + remainGb.toFixed(1) + ' GB left)';
+    html += '</div>';
+    html += '<div style="height:4px;border-radius:2px;background:var(--border);margin-top:2px;overflow:hidden;">';
+    html += '<div style="height:100%;width:' + bwPct + '%;background:' + bwColor + ';border-radius:2px;transition:width 0.5s"></div>';
+    html += '</div>';
+    if (!p.enabled) html += '<div style="font-size:10px;color:var(--yellow);margin-top:2px">\u26a0 disabled</div>';
+    html += '</div>';
+  }
+  container.innerHTML = html;
+}
+
+async function setDirectorMode(mode) {
+  try {
+    const r = await fetch('/api/v1/director/mode', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({mode})
+    });
+    if (r.ok) fetchDirectorStatus();
+  } catch(e) { console.error('setMode:', e); }
+}
+
+async function activatePeer(peerId) {
+  try {
+    const r = await fetch('/api/v1/director/activate', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({peer: peerId})
+    });
+    if (r.ok) fetchDirectorStatus();
+  } catch(e) { console.error('activate:', e); }
+}
+
+async function updatePeers() {
+  const btn = document.getElementById('btnDirUpdate');
+  btn.textContent = '\u23f3 Updating\u2026';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/v1/director/update_peers', {method:'POST'});
+    const d = await r.json();
+    btn.textContent = '\u2705 Done';
+    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
+  } catch(e) {
+    btn.textContent = '\u274c Failed';
+    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
+  }
+}
+
+// Compat: keep _peerData for subtitle
+async function fetchPeerStatus() {
+  // Merge from director data
+  if (!_directorData) return;
+  const peers = _directorData.peers || [];
+  _peerData = {
+    instances: peers.map(p => ({instance: p.id, online: p.online, state: p.processor_state, completed: p.completed})),
+    combined_completed: peers.reduce((s,p) => s + (p.completed||0), 0),
+    total_kgs: 8440,
+  };
+  // Old code checked for peerSection but we replaced it - no-op now
 }
 
 // ── Init ────────────────────────────────────────────────────────
 initMap();
 poll();
 fetchPrioQueue();
-fetchPeerStatus();
+fetchDirectorStatus();
 setInterval(poll, POLL * 1000);
 setInterval(fetchPrioQueue, 15000);
-setInterval(fetchPeerStatus, 30000);
+setInterval(fetchDirectorStatus, 15000);
 setInterval(() => {
   cd--;
   if (cd <= 0) cd = POLL;

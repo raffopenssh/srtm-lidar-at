@@ -1833,6 +1833,173 @@ def processing_manifest():
         return jsonify({'error': str(e)}), 500
 
 
+# === SECTION: Bandwidth & Peer Director ===
+
+import peer_director as pd
+
+@app.route('/api/v1/bandwidth')
+def api_bandwidth():
+    """Return bandwidth usage for this VM (from vnstat)."""
+    bw = pd.get_local_bandwidth()
+    bw['budget_gb'] = pd.load_peers_config().get('budget_gb', pd.BANDWIDTH_BUDGET_GB)
+    return jsonify(bw)
+
+
+@app.route('/api/v1/director/status')
+def director_status():
+    """Full director status: mode, active peer, bandwidth per peer."""
+    d = pd.get_director()
+    return jsonify(d.get_status())
+
+
+@app.route('/api/v1/director/mode', methods=['POST'])
+def director_set_mode():
+    """Set director mode: auto, manual, paused."""
+    mode = request.args.get('mode') or (request.json or {}).get('mode', '')
+    if mode not in ('auto', 'manual', 'paused'):
+        return jsonify({'error': 'mode must be auto, manual, or paused'}), 400
+    d = pd.get_director()
+    d.set_mode(mode)
+    return jsonify({'mode': mode})
+
+
+@app.route('/api/v1/director/activate', methods=['POST'])
+def director_activate_peer():
+    """Manually activate a specific peer."""
+    peer_id = request.args.get('peer') or (request.json or {}).get('peer', '')
+    if not peer_id:
+        return jsonify({'error': 'peer parameter required'}), 400
+    d = pd.get_director()
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return jsonify({'error': f'Unknown peer: {peer_id}'}), 404
+
+    # Stop current active peer if different
+    state = pd.load_director_state()
+    old_active = state.get('active_peer')
+    if old_active and old_active != peer_id:
+        old_peer = pd.get_peer_by_id(cfg, old_active)
+        if old_peer:
+            pd.stop_peer_processor(old_peer.get('url'))
+
+    # Start new peer
+    result = pd.start_peer_processor(peer.get('url'))
+    d.set_active_peer(peer_id)
+    d.set_mode('manual')
+    return jsonify({'status': 'activated', 'peer': peer_id, 'start_result': result})
+
+
+@app.route('/api/v1/director/stop', methods=['POST'])
+def director_stop_all():
+    """Stop all peers and pause the director."""
+    d = pd.get_director()
+    cfg = pd.load_peers_config()
+    results = {}
+    for peer in cfg.get('peers', []):
+        ps = pd.get_peer_status(peer.get('url'))
+        if ps.get('state') in ('running', 'processing'):
+            results[peer['id']] = pd.stop_peer_processor(peer.get('url'))
+    d.set_active_peer(None)
+    d.set_mode('paused')
+    return jsonify({'status': 'all_stopped', 'results': results})
+
+
+@app.route('/api/v1/director/peers', methods=['GET', 'POST'])
+def director_peers_config():
+    """GET: return peers config. POST: update it."""
+    if request.method == 'GET':
+        return jsonify(pd.load_peers_config())
+    # POST: update config
+    new_cfg = request.json
+    if not new_cfg or 'peers' not in new_cfg:
+        return jsonify({'error': 'peers array required'}), 400
+    pd.save_peers_config(new_cfg)
+    d = pd.get_director()
+    d.reload_config()
+    return jsonify({'status': 'updated', 'config': new_cfg})
+
+
+@app.route('/api/v1/director/proxy/status')
+def director_proxy_status():
+    """Proxy the active peer's processing status to the dashboard."""
+    d = pd.get_director()
+    status = d.get_status()
+    active_id = status.get('active_peer')
+    if not active_id:
+        return jsonify({'state': 'no_active_peer', 'director': status})
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, active_id)
+    if not peer:
+        return jsonify({'state': 'peer_not_found', 'director': status})
+    ps = pd.get_peer_status(peer.get('url'))
+    ps['_director'] = status
+    ps['_active_peer_id'] = active_id
+    ps['_active_peer_url'] = peer.get('url')
+    # Add bandwidth info
+    bw = status.get('peers', [])
+    for p in bw:
+        if p['id'] == active_id:
+            ps['_bandwidth'] = p.get('bandwidth', {})
+            break
+    return jsonify(ps)
+
+
+@app.route('/api/v1/director/proxy/log')
+def director_proxy_log():
+    """Proxy the active peer's processor log."""
+    d = pd.get_director()
+    state = d.state
+    active_id = state.get('active_peer')
+    lines = int(request.args.get('lines', 80))
+    if not active_id:
+        return jsonify({'lines': [], 'peer': None})
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, active_id)
+    if not peer:
+        return jsonify({'lines': [], 'peer': active_id})
+    log_lines = pd.get_peer_log(peer.get('url'), lines)
+    return jsonify({'lines': log_lines, 'peer': active_id})
+
+
+@app.route('/api/v1/director/update_peers', methods=['POST'])
+def director_update_peers():
+    """Tell all remote peers to git pull and restart their web servers."""
+    cfg = pd.load_peers_config()
+    results = {}
+    for peer in cfg.get('peers', []):
+        if peer.get('url'):  # skip local
+            results[peer['id']] = pd.trigger_peer_update(peer['url'])
+    return jsonify({'results': results})
+
+
+@app.route('/api/v1/admin/update', methods=['POST'])
+def admin_update():
+    """Git pull and restart the web server (called by director on peers)."""
+    try:
+        import subprocess as sp
+        # Git pull
+        pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
+                      timeout=30, cwd=str(Path(__file__).parent))
+        # Restart gunicorn
+        sp.run(['sudo', 'systemctl', 'restart', 'srv'], timeout=10)
+        return jsonify({
+            'status': 'updated',
+            'git': pull.stdout.strip(),
+            'git_err': pull.stderr.strip(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# Start the director background thread
+def _start_director():
+    time.sleep(3)  # let Flask boot first
+    d = pd.get_director()
+    d.start()
+threading.Thread(target=_start_director, daemon=True).start()
+
+
 # === SECTION: Search index API endpoints ===
 
 @app.route('/api/v1/index/status')

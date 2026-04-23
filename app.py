@@ -1201,10 +1201,11 @@ def processing_cache_manifest():
         if manifest_path.exists():
             local = json.loads(manifest_path.read_text())
 
-        # Always adopt depo_id / record_id if we don't have one
-        if incoming.get('depo_id') and not local.get('depo_id'):
+        # Always adopt depo_id / record_id from the incoming manifest.
+        # The primary is the authority — peers must use the shared deposit.
+        if incoming.get('depo_id'):
             local['depo_id'] = incoming['depo_id']
-        if incoming.get('record_id') and not local.get('record_id'):
+        if incoming.get('record_id'):
             local['record_id'] = incoming['record_id']
 
         # Merge files — keep the entry with the newer updated_at

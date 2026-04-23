@@ -345,6 +345,16 @@
 
 </div>
 
+<!-- Peer Status -->
+<div id="peerSection" style="display:none; margin-bottom:14px;">
+  <div class="card">
+    <div class="lb coll-h" id="peerHead" onclick="toggle('peer')" style="cursor:pointer">
+      <span class="arr">▶</span>🌐 Peers <span id="peerSummary" style="color:var(--text);font-weight:600"></span>
+    </div>
+    <div class="coll-b" id="peerBody" style="margin-top:6px;"></div>
+  </div>
+</div>
+
 <!-- Current KG -->
 <div class="kg-card" id="kgCard" style="display:none">
   <div style="display:flex;align-items:baseline;gap:6px">
@@ -826,9 +836,13 @@ function updateSubtitle(d) {
   const started = d.started_at ? ' · since ' + fmtT(d.started_at) : '';
   const extra = d.n_new_buildings_total ? ' · <b>' + fmt(d.n_new_buildings_total) + '</b> new buildings' : '';
   const infra = d.n_infrastructure_total ? ' · <b>' + fmt(d.n_infrastructure_total) + '</b> infrastructure' : '';
+  let peerInfo = '';
+  if (_peerData && _peerData.instances && _peerData.instances.length > 1) {
+    peerInfo = ' · <b>' + fmt(_peerData.combined_completed) + '</b>/' + fmt(_peerData.total_kgs) + ' combined (' + _peerData.instances.length + ' peers)';
+  }
   el.innerHTML = '<b>' + fmt(d.completed||0) + '</b>/<b>' + fmt(d.total_kgs||0) + '</b> KGs · <b>' +
     fmt(d.success||0) + '</b> success · <b>' + fmt(d.uploaded||0) + '</b> uploaded' +
-    extra + infra + elapsed + started;
+    extra + infra + peerInfo + elapsed + started;
 }
 
 // ── Current KG ──────────────────────────────────────────────────
@@ -1725,12 +1739,49 @@ async function savePrioQueue() {
   });
 })();
 
+// ── Peer Status ─────────────────────────────────────────────────
+let _peerData = null;
+async function fetchPeerStatus() {
+  try {
+    const r = await fetch('/api/v1/processing/peers/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    _peerData = d;
+    const sec = document.getElementById('peerSection');
+    if (!d.instances || d.instances.length <= 1) { sec.style.display = 'none'; return; }
+    sec.style.display = 'block';
+
+    document.getElementById('peerSummary').textContent =
+      '— ' + fmt(d.combined_completed) + '/' + fmt(d.total_kgs) + ' combined (' + d.instances.length + ' instances)';
+
+    const body = document.getElementById('peerBody');
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;">';
+    for (const inst of d.instances) {
+      const stCls = inst.online ? (inst.state === 'running' ? 'st-running' : 'st-idle') : 'st-stopped';
+      const stLabel = inst.online ? inst.state : 'offline';
+      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;">';
+      html += '<div style="font-size:12px;font-weight:600;">' + esc(inst.url ? inst.instance : inst.instance + ' (this)') + '</div>';
+      html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
+      if (inst.current) html += ' · KG ' + esc(String(inst.current));
+      html += '</div>';
+      html += '<div style="font-size:11px;color:var(--dim);">' + inst.completed + ' done';
+      if (inst.rate) html += ' · ' + inst.rate.toFixed(1) + '/hr';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+    body.innerHTML = html;
+  } catch(e) { console.error('peerStatus:', e); }
+}
+
 // ── Init ────────────────────────────────────────────────────────
 initMap();
 poll();
 fetchPrioQueue();
+fetchPeerStatus();
 setInterval(poll, POLL * 1000);
 setInterval(fetchPrioQueue, 15000);
+setInterval(fetchPeerStatus, 30000);
 setInterval(() => {
   cd--;
   if (cd <= 0) cd = POLL;

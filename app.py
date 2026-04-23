@@ -74,6 +74,139 @@ def _init_search_index():
         log.warning('Search index init failed: %s', e)
 threading.Thread(target=_init_search_index, daemon=True).start()
 
+
+def _get_peer_urls():
+    """Read peer URLs from peer_urls.txt or from systemd service --peers flag."""
+    pf = Path('data/austria_processor/peer_urls.txt')
+    if pf.exists():
+        return [u.strip() for u in pf.read_text().splitlines() if u.strip() and not u.startswith('#')]
+    # Fallback: parse from systemd service / drop-in configs
+    svc_paths = list(Path('/etc/systemd/system/austria_processor.service.d').glob('*.conf')) \
+        if Path('/etc/systemd/system/austria_processor.service.d').exists() else []
+    svc_paths.append(Path('/etc/systemd/system/austria_processor.service'))
+    for svc in svc_paths:
+        try:
+            if not svc.exists():
+                continue
+            for line in svc.read_text().splitlines():
+                if '--peers' in line:
+                    parts = line.split('--peers')[1].strip().split()
+                    urls = []
+                    for p in parts:
+                        if p.startswith('http'):
+                            urls.append(p)
+                        elif p.startswith('--'):
+                            break
+                    if urls:
+                        return urls
+        except PermissionError:
+            continue
+    return []
+
+
+def _sync_peer_data():
+    """Background thread: sync KG JSONs and manifest entries from peers."""
+    import requests as req
+    time.sleep(30)  # Wait for startup
+
+    json_dir = Path('data/austria_processor/json')
+    json_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+
+    while True:
+        try:
+            peer_urls = _get_peer_urls()
+            if not peer_urls:
+                time.sleep(300)
+                continue
+
+            new_count = 0
+            merged_manifest_entries = {}
+
+            for peer_url in peer_urls:
+                try:
+                    r = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers', timeout=15)
+                    r.raise_for_status()
+                    peer_data = r.json()
+                except Exception as e:
+                    log.debug('Peer sync: %s unreachable: %s', peer_url, e)
+                    continue
+
+                peer_manifest = peer_data.get('manifest', {})
+
+                # Download KG JSONs we don't have
+                for key, entry in peer_manifest.items():
+                    if not key.endswith('_json'):
+                        continue
+                    code = key.replace('_json', '')
+                    local_path = json_dir / f'{code}.json'
+                    if local_path.exists():
+                        continue
+
+                    # Construct download URL from bucket_url + filename
+                    link = entry.get('link', '')
+                    if not link and entry.get('bucket_url') and entry.get('filename'):
+                        link = f"{entry['bucket_url']}/{entry['filename']}"
+                    if not link:
+                        continue
+
+                    try:
+                        jr = req.get(link, timeout=120, stream=True)
+                        jr.raise_for_status()
+                        # Atomic write: temp file then rename
+                        tmp_path = local_path.with_suffix('.tmp')
+                        with open(tmp_path, 'wb') as f:
+                            for chunk in jr.iter_content(chunk_size=65536):
+                                f.write(chunk)
+                        tmp_path.rename(local_path)
+                        new_count += 1
+                        log.info('Peer sync: downloaded %s.json (%s bytes) from peer',
+                                 code, local_path.stat().st_size)
+                    except Exception as e:
+                        # Clean up partial download
+                        local_path.with_suffix('.tmp').unlink(missing_ok=True)
+                        log.warning('Peer sync: failed to download %s from %s: %s', code, link, e)
+
+                # Collect manifest entries to merge
+                for key, entry in peer_manifest.items():
+                    if key not in merged_manifest_entries:
+                        merged_manifest_entries[key] = entry
+
+            # Merge into local manifest
+            if merged_manifest_entries:
+                try:
+                    local_manifest = {}
+                    if manifest_path.exists():
+                        md = json.loads(manifest_path.read_text())
+                        local_manifest = md.get('entries', md)
+
+                    added = 0
+                    for key, entry in merged_manifest_entries.items():
+                        if key not in local_manifest:
+                            local_manifest[key] = entry
+                            added += 1
+
+                    if added > 0:
+                        manifest_path.write_text(json.dumps({'entries': local_manifest}, indent=2))
+                        log.info('Peer sync: merged %d manifest entries from peers', added)
+                except Exception as e:
+                    log.warning('Peer sync: manifest merge failed: %s', e)
+
+            if new_count > 0:
+                log.info('Peer sync: %d new KG JSONs downloaded, triggering index rebuild', new_count)
+                try:
+                    idx = si.get_index()
+                    idx.build()
+                except Exception as e:
+                    log.warning('Peer sync: index rebuild failed: %s', e)
+
+        except Exception as e:
+            log.warning('Peer sync error: %s', e)
+
+        time.sleep(300)  # Every 5 minutes
+
+threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
+
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
 # === SECTION: Processing queue (semaphore for concurrent heavy tasks) ===
@@ -943,7 +1076,103 @@ def processing_peers_status():
     else:
         result['failed'] = []
 
+    # Manifest entries (Zenodo URLs) — so peers can discover our uploads
+    manifest_path = data_dir / 'zenodo_manifest.json'
+    if manifest_path.exists():
+        try:
+            md = json.loads(manifest_path.read_text())
+            result['manifest'] = md.get('entries', md)
+        except Exception:
+            result['manifest'] = {}
+    else:
+        result['manifest'] = {}
+
     return jsonify(result)
+
+
+@app.route('/api/v1/processing/peers/status')
+def processing_peers_combined():
+    """Combined processing status across all peers + this instance."""
+    import requests as req
+
+    peer_urls = _get_peer_urls()
+
+    instances = []
+
+    # This instance
+    local_completed = _get_completed_kgs()
+    progress_file = Path('data/austria_processor/progress.json')
+    local_state = 'idle'
+    local_current = None
+    local_rate = 0
+    if progress_file.exists():
+        try:
+            pd = json.loads(progress_file.read_text())
+            local_state = pd.get('state', 'idle')
+            ckg = pd.get('current_kg') or {}
+            local_current = ckg.get('code')
+            local_rate = pd.get('rate_kgs_per_hour', 0)
+        except Exception:
+            pass
+
+    instances.append({
+        'instance': os.environ.get('INSTANCE_ID', 'primary'),
+        'url': None,  # self
+        'state': local_state,
+        'current': local_current,
+        'completed': len(local_completed),
+        'completed_codes': sorted(local_completed),
+        'rate': local_rate,
+        'online': True,
+    })
+
+    all_completed = set(local_completed)
+
+    # Peers
+    for peer_url in peer_urls:
+        entry = {
+            'instance': '?',
+            'url': peer_url,
+            'state': 'unknown',
+            'current': None,
+            'completed': 0,
+            'completed_codes': [],
+            'rate': 0,
+            'online': False,
+        }
+        try:
+            r = req.get(peer_url.rstrip('/') + '/api/v1/processing/status', timeout=10)
+            r.raise_for_status()
+            pd = r.json()
+            entry['state'] = pd.get('state', 'unknown')
+            ckg = pd.get('current_kg') or {}
+            entry['current'] = ckg.get('code')
+            entry['completed'] = pd.get('completed', 0)
+            entry['rate'] = pd.get('rate_kgs_per_hour', 0)
+            entry['online'] = True
+
+            # Also get peer identity from /peers
+            try:
+                r2 = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers', timeout=5)
+                r2.raise_for_status()
+                pd2 = r2.json()
+                entry['instance'] = pd2.get('instance', peer_url)
+                entry['completed_codes'] = pd2.get('completed', [])
+                all_completed.update(entry['completed_codes'])
+            except Exception:
+                pass
+        except Exception as e:
+            entry['error'] = str(e)
+
+        instances.append(entry)
+
+    return jsonify({
+        'instances': instances,
+        'total_kgs': 8440,
+        'combined_completed': len(all_completed),
+        'combined_completed_codes': sorted(all_completed),
+        'combined_rate': sum(i.get('rate', 0) for i in instances if i.get('online')),
+    })
 
 
 @app.route('/api/v1/processing/start', methods=['POST'])

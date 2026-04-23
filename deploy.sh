@@ -79,6 +79,10 @@ mkdir -p /tmp/copernicus_cache /tmp/hansen_cache
 [ -f data/austria_processor/retry_queue.json ] || echo '[]' > data/austria_processor/retry_queue.json
 [ -f data/austria_processor/failed_kgs.json ]  || echo '[]' > data/austria_processor/failed_kgs.json
 
+# Write peer URLs for the web API's peer sync thread
+echo "${PEER_URL}" > data/austria_processor/peer_urls.txt
+echo "  ✓ Peer URL written to data/austria_processor/peer_urls.txt"
+
 # ── 6. Install systemd services ──────────────────────────
 echo "\n[6/7] Installing systemd services..."
 

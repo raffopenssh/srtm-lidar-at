@@ -602,6 +602,7 @@ cadastre API ──→ cadastre ──→ ground truth  features  labels
 | `zenodo_manifest.json` | Parent (`Manifest`) | Parent + Dashboard | Upload tracking (success/error per KG) |
 | `failed_kgs.json` | Parent | Parent (on restart) | Permanently-failed KGs to skip |
 | `retry_queue.json` | API / transient handler | Parent (each iteration) | KG codes to insert next in queue (read + cleared) |
+| `peer_urls.txt` | deploy.sh / manual | app.py (`_sync_peer_data`, `_get_peer_urls`) | Peer instance URLs for data sync + combined dashboard |
 | `kg_list.json` | Parent | Parent | Cached list of ~8440 KGs (avoid repeated API calls) |
 
 ### Operations
@@ -747,7 +748,8 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | POST | `/api/v1/processing/single?kg=X` | Process single KG |
 | POST | `/api/v1/processing/retry?kg=X` | Retry failed KG |
 | GET\|POST | `/api/v1/processing/throttle` | Get/toggle bandwidth throttle (skip GPKG uploads) |
-| GET | `/api/v1/processing/peers` | Peer coordination state (completed, current, priority, failed) |
+| GET | `/api/v1/processing/peers` | Peer coordination state (completed, current, priority, failed, manifest) |
+| GET | `/api/v1/processing/peers/status` | Combined status across all peers (instances, combined_completed, rates) |
 | GET | `/api/v1/processing/log` | Recent processor log lines |
 | GET | `/api/v1/processing/manifest` | Zenodo manifest entries |
 | GET | `/api/v1/kg/<kg_code>` | KG JSON summary (local or Zenodo link) |
@@ -976,6 +978,18 @@ PEER_URL=https://srtm-lidar-at.exe.xyz:8000 bash deploy.sh
 its peers every 60s to learn completed/in-progress/priority KGs. These are
 skipped automatically. If a peer is unreachable, the last known state is used
 (graceful degradation). No shared database or lock service required.
+
+**Peer data sync**: A background thread in `app.py` (`_sync_peer_data()`) runs
+every 5 minutes. It fetches each peer's `/api/v1/processing/peers` endpoint
+(which includes the Zenodo manifest), downloads KG JSONs we don't have locally
+from Zenodo, merges manifest entries, and triggers a search index rebuild.
+This ensures every peer's search index knows about all processed KGs across
+all instances. Peer URLs are read from `data/austria_processor/peer_urls.txt`
+(one URL per line) or parsed from the systemd service/drop-in config.
+
+**Combined dashboard**: `process.html` polls `GET /api/v1/processing/peers/status`
+every 30s and shows a collapsible "Peers" section with per-instance cards
+(state, current KG, completed count, rate) plus combined totals in the subtitle.
 
 **CLI flags** for `austria_processor.py`:
 - `--peers URL [URL ...]` — peer instance URLs to coordinate with

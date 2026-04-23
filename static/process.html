@@ -1923,8 +1923,11 @@ async function updatePeers() {
 
 // ── Add Peer modal ──────────────────────────────────────────────
 function showAddPeerModal() {
-  const thisUrl = location.origin;
-  const cmd = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | PEER_URL=${thisUrl} bash`;
+  // Always use the public exe.xyz URL for the deploy command
+  const publicUrl = location.origin.includes('exe.xyz')
+    ? location.origin
+    : 'https://srtm-lidar-at.exe.xyz:8000';
+  const cmd = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | PEER_URL=${publicUrl} bash`;
   document.getElementById('addPeerCmd').textContent = cmd;
   document.getElementById('addPeerId').value = '';
   document.getElementById('addPeerUrl').value = '';

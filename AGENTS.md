@@ -24,10 +24,11 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 ### Core
 | File | Lines | Purpose |
 |------|------:|----------|
-| `app.py` | ~5700 | Flask API — all endpoints, async task system, progress tracking |
+| `app.py` | ~5900 | Flask API — all endpoints, async task system, progress tracking, director API |
 | `static/index.html` | ~3100 | Single-file Leaflet UI (all JS/CSS inline) |
 | `object_segmentation.py` | ~2200 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
 | `learned_classifier.py` | ~560 | Random Forest classifier (44 features, cadastre-trained) |
+| `peer_director.py` | ~770 | Peer Director — orchestrates processing across multiple VMs (see section below) |
 
 ### Search Index
 | File | Purpose |
@@ -79,11 +80,18 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 
 | Unit | What | Config |
 |------|------|--------|
-| `srv.service` | gunicorn (2 workers, 4 threads, port 8000) | MemoryMax=3G, Restart=on-failure |
+| `srv.service` | gunicorn (2 workers, 4 threads, port 8000) + peer director thread | MemoryMax=3G, Restart=on-failure |
 | `rf_train.service` | RF training background job (4000 KGs) | Restart=on-failure, RestartSec=30 |
 | `austria_processor.service` | Austria processor (all KGs) | MemoryMax=8G, MemoryHigh=7G, Restart=on-failure |
 
-Both in `/etc/systemd/system/`. Source copies in repo root.
+All in `/etc/systemd/system/`. Source copies in repo root.
+
+**On the primary**: `austria_processor.service` is disabled (director manages lifecycle).
+The director thread inside `srv.service` starts/stops the processor via the REST API.
+
+**On peers**: `austria_processor.service` is disabled (never auto-starts).
+The director on the primary starts the processor via `POST /api/v1/processing/start`.
+No `is_director` flag → no director loop in the peer’s gunicorn.
 
 ## API Endpoints
 
@@ -602,7 +610,11 @@ cadastre API ──→ cadastre ──→ ground truth  features  labels
 | `zenodo_manifest.json` | Parent (`Manifest`) | Parent + Dashboard | Upload tracking (success/error per KG) |
 | `failed_kgs.json` | Parent | Parent (on restart) | Permanently-failed KGs to skip |
 | `retry_queue.json` | API / transient handler | Parent (each iteration) | KG codes to insert next in queue (read + cleared) |
-| `peer_urls.txt` | deploy.sh / manual | app.py (`_sync_peer_data`, `_get_peer_urls`) | Peer instance URLs for data sync + combined dashboard |
+| `peer_urls.txt` | deploy.sh / director | app.py (`_sync_peer_data`), director | Peer URLs for data sync + director bandwidth polling |
+| `peers.json` | Director API / manual | `peer_director.py` | Peer config: IDs, URLs, enabled, not_before, budget |
+| `director_state.json` | Director loop | Director loop | Runtime: active peer, bandwidth per peer, mode |
+| `director.lock` | Director loop | Director loop | fcntl lock — single director across gunicorn workers |
+| `is_director` | Manual (primary only) | `app.py` (startup) | Flag: director loop only runs if this file exists |
 | `kg_list.json` | Parent | Parent | Cached list of ~8440 KGs (avoid repeated API calls) |
 
 ### Operations
@@ -763,8 +775,10 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | `zenodo_client.py` | 841L | Zenodo API client + `Manifest` class |
 | `zenodo_cache.py` | ~1530L | Zenodo-backed persistent cache for Copernicus+Hansen tiles. See detailed section above. |
 | `tile_cache.py` | 900L | Grid-snapped Copernicus + Hansen caching, Zenodo fallback on miss |
-| `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure) |
-| `static/process.html` | 1117L | Dashboard UI (status, map, log, Zenodo manifest) |
+| `austria_processor.service` | — | systemd unit (MemoryMax=4G, Restart=on-failure). Disabled on peers. |
+| `peer_director.py` | ~770L | Peer Director — bandwidth-based orchestration across VMs |
+| `deploy.sh` | ~160L | One-command deployment for new peer VMs |
+| `static/process.html` | ~2100L | Dashboard UI (status, map, log, Zenodo manifest, peer director cards) |
 | `data/austria_processor/MONITOR.md` | — | Monitoring checklist + expected timelines |
 | `gpkg_streamed.py` | ~500L | Strip-streamed full-GPKG builder for large KGs (auto-used >100 Mpx, skipped >200 Mpx) |
 
@@ -963,56 +977,229 @@ grep 'Authenticated successfully\|Rotated to credential\|IP-throttled\|transient
 
 ---
 
-### Multi-Instance Deployment
+### Peer Director — Multi-Instance Orchestration
 
-The processor can run on multiple exe.dev VMs simultaneously, each with its
-own 100 GB/month bandwidth allocation. Instances coordinate via API to avoid
-duplicate work.
+**Read this section before touching peer_director.py, deploy.sh, or any director API endpoint.**
 
-**Quick deploy on a new VM:**
-```bash
-PEER_URL=https://srtm-lidar-at.exe.xyz:8000 bash deploy.sh
+#### Architecture: One Director, Many Workers
+
+The system uses a **single director** (the primary instance, `srtm-lidar-at`) to
+orchestrate processing across multiple exe.dev VMs. Each VM has 100 GB/month
+bandwidth. **Only one peer processes at a time** because all instances share the
+same 4 Copernicus credentials — parallel processing would cause 402 rate-limit
+errors.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  PRIMARY (srtm-lidar-at)                            │
+│  ────────────────────────────────────                │
+│  • Runs the Peer Director loop (peer_director.py)    │
+│  • Has data/austria_processor/is_director flag        │
+│  • Monitors bandwidth via vnstat on all peers         │
+│  • Starts/stops processors on peers via REST API      │
+│  • Syncs priority queue to the active peer             │
+│  • Switches active peer when bandwidth < 2 GB         │
+│  • Hosts the search index + combined dashboard         │
+├─────────────────────────────────────────────────────┤
+│  PEER at2 (srtm-lidar-at2)                          │
+│  PEER at3 (srtm-lidar-at3)                          │
+│  ────────────────────────────────────                │
+│  • NO director loop (no is_director flag)             │
+│  • NO systemd autostart for austria_processor         │
+│  • Processor started/stopped ONLY by the director     │
+│  • Each peer has its own Zenodo cache deposit          │
+│  • Same codebase, same Copernicus credentials          │
+└─────────────────────────────────────────────────────┘
 ```
 
-**Peer coordination**: Each instance polls `GET /api/v1/processing/peers` on
-its peers every 60s to learn completed/in-progress/priority KGs. These are
-skipped automatically. If a peer is unreachable, the last known state is used
-(graceful degradation). No shared database or lock service required.
+**Critical invariant**: Only the primary runs the director loop. Peers are
+passive workers. If a peer were to run its own director loop, it would
+start/stop processors in conflict with the primary. This is enforced by the
+`data/austria_processor/is_director` flag file (only exists on the primary).
 
-**Peer data sync**: A background thread in `app.py` (`_sync_peer_data()`) runs
-every 5 minutes. It fetches each peer's `/api/v1/processing/peers` endpoint
-(which includes the Zenodo manifest), downloads KG JSONs we don't have locally
-from Zenodo, merges manifest entries, and triggers a search index rebuild.
-This ensures every peer's search index knows about all processed KGs across
-all instances. Peer URLs are read from `data/austria_processor/peer_urls.txt`
-(one URL per line) or parsed from the systemd service/drop-in config.
+#### How the Director Works
 
-**Combined dashboard**: `process.html` polls `GET /api/v1/processing/peers/status`
-every 30s and shows a collapsible "Peers" section with per-instance cards
-(state, current KG, completed count, rate) plus combined totals in the subtitle.
+`peer_director.py` (`PeerDirector` class) runs a background thread every 30s:
 
-**CLI flags** for `austria_processor.py`:
-- `--peers URL [URL ...]` — peer instance URLs to coordinate with
-- `--instance-id NAME` — identifier for this instance (default: hostname)
+1. **Re-reads `peers.json`** from disk (handles cross-worker/cross-process updates)
+2. **Polls bandwidth** on all peers via `GET /api/v1/bandwidth` (vnstat)
+3. **Checks active peer**:
+   - Budget exhausted (< 2 GB)? → Stop it, pick next peer with most bandwidth
+   - Scheduled (`not_before` in future)? → Skip it
+   - Stopped unexpectedly? → Restart it (if bandwidth remains)
+   - Unreachable? → Deactivate, pick another
+4. **Enforces single-active**: Stops any non-active peer found running
+5. **Syncs priority queue** to the active peer every ~2.5 min
+6. **Saves state** to `director_state.json`
 
-**Throttle mode**: Toggle via dashboard button or `POST /api/v1/processing/throttle`.
-When enabled, skips GPKG uploads to Zenodo (~700 MB/KG saved) but still uploads
-JSON summaries and Zenodo tile cache. GPKGs are deleted locally to free disk.
-New instances deploy with throttle ON by default.
+**File lock**: Only one gunicorn worker runs the director loop (fcntl file lock
+on `data/austria_processor/director.lock`). The other worker skips it.
 
-**Files**:
-- `deploy.sh` — one-command deployment script for new instances
-- `requirements.txt` — Python dependencies for `pip install -r`
-- `data/austria_processor/upload_throttle` — flag file for throttle mode
+#### Bandwidth Management
 
-**To add a peer to the PRIMARY instance** (after deploying a second VM):
+- Each exe.dev VM has 100 GB/month (resets on the 17th)
+- Budget set to 95 GB (5 GB headroom) in `peers.json`
+- When active peer drops below 2 GB remaining → director switches to the peer
+  with the most remaining bandwidth
+- When ALL peers are exhausted → director logs "no peers available" and waits
+- After bandwidth reset (17th) → vnstat reports drop, peers become eligible again
+
+#### Deploying a New Peer
+
 ```bash
-# Edit the systemd unit
-sudo systemctl edit austria_processor
-# Add: ExecStart= (empty to clear)
-#       ExecStart=/usr/bin/python3 austria_processor.py --mark-uncertain --peers https://NEW-VM.exe.xyz:8000
-sudo systemctl restart austria_processor
+# On the new exe.dev VM:
+SELF_URL=https://srtm-lidar-at4.exe.xyz:8000 \
+PEER_URL=https://srtm-lidar-at.exe.xyz:8000 \
+bash deploy.sh
 ```
+
+`deploy.sh` does:
+1. Clones repo, installs deps, decompresses RF model
+2. Installs `srv.service` (gunicorn) and `austria_processor.service`
+3. Starts the web server (`srv`) but does **NOT** enable/start the processor
+4. Enables throttle mode by default
+5. Auto-registers with the director via `POST /api/v1/director/peers/add`
+6. The director will start the processor when it’s this peer’s turn
+
+**What the peer does NOT have**:
+- No `data/austria_processor/is_director` flag → no director loop
+- `austria_processor.service` is disabled → no systemd auto-restart
+- No `peers.json` with remote peers → default config only
+
+**After deploy, make the VM public** (from the exe.dev shell):
+```bash
+share set-public srtm-lidar-at4
+```
+
+#### Updating All Peers
+
+Click **⬆ Update Peers** on the dashboard, or:
+```bash
+curl -X POST http://localhost:8000/api/v1/director/update_peers
+```
+
+This calls `POST /api/v1/admin/update` on each peer, which does `git pull --ff-only`
+then `sudo systemctl restart srv`. The timeout on the restart is expected (the
+process serving the request dies). Peers come back up in ~10s.
+
+**Important**: The update restarts `srv` (gunicorn) but does NOT restart the
+processor. If the processor is running on the active peer, it keeps running —
+only the web server restarts. Code changes to `austria_processor.py` take
+effect when the processor finishes the current KG and is restarted by the
+director.
+
+To force a processor restart on the active peer:
+```bash
+curl -X POST https://<peer>/api/v1/processing/stop
+# Director will restart it automatically on next tick (~30s)
+```
+
+#### Removing a Peer
+
+Click the ✕ button on the peer card in the dashboard, or:
+```bash
+curl -X DELETE http://localhost:8000/api/v1/director/peers/<peer_id>
+```
+
+This stops the peer’s processor, removes it from `peers.json` and
+`peer_urls.txt`, and clears its bandwidth state. The peer VM continues
+running its web server but won’t receive any work.
+
+#### Throttle Propagation
+
+The 🔋 Throttle button in the dashboard toggles locally AND propagates
+to all remote peers via `POST /api/v1/director/throttle`. This ensures
+consistent throttle state across all instances.
+
+```bash
+# Set throttle on all peers
+curl -X POST http://localhost:8000/api/v1/director/throttle \
+  -H 'Content-Type: application/json' -d '{"throttle": true}'
+```
+
+#### Zenodo Cache on Peers
+
+Each peer has its own Zenodo cache deposit (separate from the primary’s
+deposit 19650075). Peers build their local tile cache from Copernicus/Hansen,
+and upload to their own deposit. They do NOT share tile caches with the
+primary. This means a peer processing KGs near tiles the primary already
+cached will re-download them from Copernicus (not from Zenodo). This is
+acceptable — it uses openEO credits but not Zenodo bandwidth.
+
+#### Director API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/bandwidth` | Local vnstat bandwidth for this instance |
+| GET | `/api/v1/director/status` | Full director state: mode, active peer, bandwidth per peer |
+| POST | `/api/v1/director/mode` | Set mode: `auto`, `manual`, `paused` |
+| POST | `/api/v1/director/activate` | Manually activate a specific peer |
+| POST | `/api/v1/director/stop` | Stop all peers and pause the director |
+| GET\|POST | `/api/v1/director/peers` | Get/update full peers config |
+| POST | `/api/v1/director/peers/add` | Add a new peer dynamically |
+| DELETE | `/api/v1/director/peers/<id>` | Remove a peer (stops its processor) |
+| GET\|POST | `/api/v1/director/throttle` | Get/propagate throttle state to all peers |
+| GET | `/api/v1/director/proxy/status` | Proxy active peer’s processing status |
+| GET | `/api/v1/director/proxy/log` | Proxy active peer’s processor log |
+| POST | `/api/v1/director/update_peers` | Git pull + restart srv on all remote peers |
+| POST | `/api/v1/admin/update` | Git pull + restart srv (called BY director) |
+| POST | `/api/v1/admin/restart_processor` | Restart processor via systemd (fallback) |
+| POST | `/api/v1/admin/disable_autostart` | Disable austria_processor systemd unit |
+
+#### Director Files (all instance-specific, NOT in git)
+
+| File | Purpose |
+|------|----------|
+| `data/austria_processor/is_director` | Flag file — director loop only runs if this exists |
+| `data/austria_processor/peers.json` | Peer config: IDs, URLs, enabled, not_before |
+| `data/austria_processor/director_state.json` | Runtime state: active peer, bandwidth, mode |
+| `data/austria_processor/director.lock` | fcntl lock — ensures single director loop across workers |
+| `data/austria_processor/peer_urls.txt` | Peer URLs for the data sync thread |
+
+#### Director Modes
+
+| Mode | Behaviour |
+|------|----------|
+| `auto` | Director picks peer with most bandwidth, starts/stops automatically |
+| `manual` | Director keeps the manually-activated peer running, no auto-switch |
+| `paused` | Director does nothing — all peers stay in current state |
+
+#### Cross-Cutting Concerns (director changes)
+
+**Adding a peer**: Use the dashboard "+ Add Peer" button or API. This updates
+`peers.json` on the primary only. The director re-reads it each tick.
+
+**Removing a peer**: Use the ✕ button or DELETE API. Stops the processor,
+removes from config and peer_urls.txt.
+
+**Changing bandwidth budget**: Edit `peers.json` directly:
+```bash
+python3 -c "
+import json
+cfg = json.load(open('data/austria_processor/peers.json'))
+cfg['budget_gb'] = 90  # more conservative
+json.dump(cfg, open('data/austria_processor/peers.json', 'w'), indent=2)
+"
+```
+Director picks it up on next tick (re-reads from disk).
+
+**Scheduling a peer** (e.g. don’t use primary until next billing cycle):
+```bash
+python3 -c "
+import json
+cfg = json.load(open('data/austria_processor/peers.json'))
+for p in cfg['peers']:
+    if p['id'] == 'primary':
+        p['not_before'] = '2026-05-17'  # skip until bandwidth resets
+json.dump(cfg, open('data/austria_processor/peers.json', 'w'), indent=2)
+"
+```
+
+**Disaster recovery**: If the primary goes down, peers stop receiving work but
+don’t crash. To make a peer the new director:
+1. Create `data/austria_processor/is_director` on the peer
+2. Copy/create `peers.json` with all peer URLs
+3. Restart `srv` on the peer
 
 ---
 

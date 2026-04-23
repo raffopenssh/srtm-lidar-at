@@ -47,6 +47,7 @@ sudo apt-get install -y -qq \
     libgdal-dev gdal-bin \
     libgeos-dev libproj-dev \
     libspatialindex-dev \
+    vnstat \
     xz-utils \
     > /dev/null 2>&1
 

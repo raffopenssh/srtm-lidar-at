@@ -104,6 +104,13 @@ def _get_peer_urls():
     return []
 
 
+# Manifest keys deleted intentionally — don't re-merge from peers
+_MANIFEST_TOMBSTONES = set()
+_tombstone_path = Path('data/austria_processor/manifest_tombstones.json')
+if _tombstone_path.exists():
+    try: _MANIFEST_TOMBSTONES = set(json.loads(_tombstone_path.read_text()))
+    except Exception: pass
+
 def _sync_peer_data():
     """Background thread: sync KG JSONs and manifest entries from peers."""
     import requests as req
@@ -167,9 +174,9 @@ def _sync_peer_data():
                         local_path.with_suffix('.tmp').unlink(missing_ok=True)
                         log.warning('Peer sync: failed to download %s from %s: %s', code, link, e)
 
-                # Collect manifest entries to merge
+                # Collect manifest entries to merge (skip tombstoned keys)
                 for key, entry in peer_manifest.items():
-                    if key not in merged_manifest_entries:
+                    if key not in merged_manifest_entries and key not in _MANIFEST_TOMBSTONES:
                         merged_manifest_entries[key] = entry
 
             # Merge into local manifest (atomic read-modify-write)
@@ -2119,6 +2126,9 @@ def processing_manifest_delete(key):
             try: os.unlink(tmp)
             except OSError: pass
             raise
+        # Add tombstone so sync thread doesn't re-merge from peers
+        _MANIFEST_TOMBSTONES.add(key)
+        _tombstone_path.write_text(json.dumps(sorted(_MANIFEST_TOMBSTONES)))
         return jsonify({'deleted': key, 'remaining': len(entries)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

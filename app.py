@@ -1451,31 +1451,40 @@ def processing_resume():
 
 @app.route('/api/v1/processing/stop', methods=['POST'])
 def processing_stop():
-    """Stop the processor (sends SIGTERM).
+    """Stop the processor (SIGTERM then SIGKILL).
 
     Tries in order:
     1. Kill the subprocess started via /api/v1/processing/start
     2. systemctl stop austria_processor
-    3. pkill -f austria_processor.py
+    3. pkill -f austria_processor.py (SIGTERM)
+    4. Wait 3s, then pkill -9 (SIGKILL) if still alive
     """
     global _processor_process
+    import subprocess as _sp
     method = None
+
+    def _proc_alive():
+        try:
+            _sp.check_output(['pgrep', '-f', 'austria_processor.py'], text=True, timeout=2)
+            return True
+        except Exception:
+            return False
+
     if _processor_process is not None and _processor_process.poll() is None:
         import signal as _sig
         os.kill(_processor_process.pid, _sig.SIGTERM)
         _processor_process = None
         method = 'subprocess'
     else:
-        import subprocess as _sp
-        # Try systemctl stop
+        # Try systemctl stop (quick timeout — don't block)
         try:
             r = _sp.run(['sudo', 'systemctl', 'stop', 'austria_processor'],
-                        capture_output=True, text=True, timeout=15)
+                        capture_output=True, text=True, timeout=10)
             if r.returncode == 0:
                 method = 'systemctl'
         except Exception:
             pass
-        # Fallback: pkill
+        # Fallback: pkill SIGTERM
         if not method:
             try:
                 r = _sp.run(['pkill', '-f', 'austria_processor.py'],
@@ -1484,6 +1493,26 @@ def processing_stop():
                     method = 'pkill'
             except Exception:
                 pass
+
+    # Wait briefly, then SIGKILL if still alive
+    if method and _proc_alive():
+        time.sleep(3)
+        if _proc_alive():
+            try:
+                _sp.run(['pkill', '-9', '-f', 'austria_processor.py'],
+                        capture_output=True, text=True, timeout=5)
+                method = method + '+kill9'
+            except Exception:
+                pass
+    elif not method:
+        # Nothing worked with SIGTERM — go straight to SIGKILL
+        try:
+            r = _sp.run(['pkill', '-9', '-f', 'austria_processor.py'],
+                        capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                method = 'kill9'
+        except Exception:
+            pass
     if not method:
         return jsonify({'error': 'Processor not running'}), 404
     pf = Path('data/austria_processor/progress.json')

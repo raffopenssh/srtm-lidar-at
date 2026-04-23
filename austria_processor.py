@@ -62,6 +62,7 @@ CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
 TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 POSTPONE_SIGNAL_FILE = DATA_DIR / "postpone_signal.json"
+THROTTLE_FILE = DATA_DIR / "upload_throttle"
 
 MAX_KG_PIXELS = 4_000_000
 KG_TIMEOUT_SECONDS = 12 * 60 * 60       # 12 hours — first attempt
@@ -6186,29 +6187,39 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # copy BEFORE building the light GPKG, so both products never
         # coexist on disk simultaneously.
         if _full_size > 0:
-            _report_step("upload_full_gpkg",
-                         f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
-            try:
-                from zenodo_client import Client as _ZClient, landscape_metadata as _lm
-                _zclient = _ZClient(token=ZENODO_TOKEN)
-                _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
-                    _qs=0, _qg="": \
-                    _lm(_kg, _name, v, "gpkg")
-                from zenodo_client import Manifest as _ZManifest
-                _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
-                def _sub_upload_cb(sent, total):
-                    pct = round(100 * sent / total) if total else 0
-                    _report_step("upload_full_gpkg",
-                                 f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
-                _zclient.upload_stream(
-                    f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
-                    _zmanifest, delete_after=True,
-                    progress_callback=_sub_upload_cb)
-                log.info("  Full GPKG streamed to Zenodo and deleted locally")
-                # Mark as already uploaded so upload_kg_to_zenodo skips it
+            if THROTTLE_FILE.exists():
+                _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
+                log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
+                         kg_code, _full_size / 1e6)
+                try:
+                    os.unlink(full_gpkg)
+                except OSError:
+                    pass
                 result["_full_gpkg_uploaded"] = True
-            except Exception as _ue:
-                log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
+            else:
+                _report_step("upload_full_gpkg",
+                             f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
+                try:
+                    from zenodo_client import Client as _ZClient, landscape_metadata as _lm
+                    _zclient = _ZClient(token=ZENODO_TOKEN)
+                    _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                        _qs=0, _qg="": \
+                        _lm(_kg, _name, v, "gpkg")
+                    from zenodo_client import Manifest as _ZManifest
+                    _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
+                    def _sub_upload_cb(sent, total):
+                        pct = round(100 * sent / total) if total else 0
+                        _report_step("upload_full_gpkg",
+                                     f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
+                    _zclient.upload_stream(
+                        f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
+                        _zmanifest, delete_after=True,
+                        progress_callback=_sub_upload_cb)
+                    log.info("  Full GPKG streamed to Zenodo and deleted locally")
+                    # Mark as already uploaded so upload_kg_to_zenodo skips it
+                    result["_full_gpkg_uploaded"] = True
+                except Exception as _ue:
+                    log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
         gc.collect()
 
         # --- 6. Build light GPKG ---
@@ -6230,6 +6241,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _li)
             else:
                 log.info("KG %s: light GPKG validated OK (%.0f MB)", kg_code, _light_size / 1e6)
+
+        # Throttle mode: delete light GPKG immediately
+        if THROTTLE_FILE.exists() and _light_size > 0:
+            log.info("KG %s: throttle mode \u2014 deleting light GPKG locally (%.0f MB saved)",
+                     kg_code, _light_size / 1e6)
+            try:
+                os.unlink(light_gpkg)
+            except OSError:
+                pass
+            result["files"]["light_gpkg"] = ""  # prevent parent upload attempt
 
         # --- 7. Build JSON summary ---
         result["step"] = "json"
@@ -6730,6 +6751,14 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             log.info("KG %s: skipping upload for %s (empty file)", kg_code, file_key)
             continue
 
+        if THROTTLE_FILE.exists() and file_key.endswith('gpkg'):
+            log.info("KG %s: throttle mode \u2014 skipping %s upload", kg_code, file_key)
+            # Still delete local GPKG to free disk
+            if local_path and os.path.exists(local_path):
+                os.unlink(local_path)
+                log.info("KG %s: deleted local %s (throttle mode)", kg_code, local_path)
+            continue
+
         zenodo_key = f"{kg_code}_{file_key}"
         file_type = "gpkg" if file_key.endswith("gpkg") else "json"
 
@@ -7034,6 +7063,52 @@ def _copernicus_probe() -> bool:
         return False
 
 
+# === SECTION: Peer coordination ===
+
+# Cache for peer state — refreshed every 60s to avoid hammering peers
+_peer_cache: dict = {}       # url → {data, fetched_at}
+_PEER_POLL_INTERVAL = 60     # seconds between polls per peer
+_PEER_TIMEOUT = 10           # HTTP timeout for peer requests
+
+
+def _fetch_peer_state(peer_url: str) -> dict | None:
+    """Fetch peer's processing state. Returns None on failure (peer unreachable)."""
+    now = time.time()
+    cached = _peer_cache.get(peer_url)
+    if cached and (now - cached['fetched_at']) < _PEER_POLL_INTERVAL:
+        return cached['data']
+
+    url = peer_url.rstrip('/') + '/api/v1/processing/peers'
+    try:
+        r = requests.get(url, timeout=_PEER_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        _peer_cache[peer_url] = {'data': data, 'fetched_at': now}
+        return data
+    except Exception as e:
+        log.debug("Peer %s unreachable: %s", peer_url, e)
+        # Keep stale cache if available (graceful degradation)
+        if cached:
+            return cached['data']
+        return None
+
+
+def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
+    """Return set of KG codes claimed by any peer (completed + current + priority)."""
+    claimed = set()
+    for url in peer_urls:
+        state = _fetch_peer_state(url)
+        if state is None:
+            continue
+        claimed.update(state.get('completed', []))
+        if state.get('current'):
+            claimed.add(state['current'])
+        if state.get('in_progress'):
+            claimed.add(state['in_progress'])
+        claimed.update(state.get('priority', []))
+    return claimed
+
+
 def main():
     global _shutdown_requested
 
@@ -7048,6 +7123,10 @@ def main():
                         help="List KGs without processing")
     parser.add_argument("--mark-uncertain", action="store_true",
                         help="Label low-confidence RF segments as 'unclassified' instead of rule-based fallback")
+    parser.add_argument("--peers", nargs='*', default=[],
+                        help="Peer instance URLs for coordination (e.g. https://srtm-lidar-at.exe.xyz:8000)")
+    parser.add_argument("--instance-id", default=None,
+                        help="Instance identifier (default: hostname)")
     args = parser.parse_args()
 
     try:
@@ -7075,8 +7154,16 @@ def main():
     os.environ.setdefault('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
     os.environ.setdefault('CPL_VSIL_CURL_ALLOWED_EXTENSIONS', '.tif,.tiff')
 
+    # Set instance ID for the API to report
+    import socket as _socket
+    _instance_id = args.instance_id or _socket.gethostname()
+    os.environ['INSTANCE_ID'] = _instance_id
+    peer_urls = args.peers or []
+
     log.info("=" * 70)
-    log.info("🇦🇹 Austria Landscape Processor starting")
+    log.info("🇦🇹 Austria Landscape Processor starting (instance=%s)", _instance_id)
+    if peer_urls:
+        log.info("Peers: %s", peer_urls)
     log.info("=" * 70)
 
     # --- Load/create manifest ---
@@ -7191,9 +7278,16 @@ def main():
         log.info("Skipping %d permanently-failed KGs: %s",
                  len(failed_kgs), sorted(failed_kgs)[:20])
 
+    # --- Filter out KGs claimed by peers ---
+    peer_claimed = _get_peer_claimed_kgs(peer_urls) if peer_urls else set()
+    if peer_claimed:
+        log.info("Peers claim %d KGs (completed + in-progress + priority)",
+                 len(peer_claimed))
+
     pending = [kg for kg in kgs
                if kg["kg_code"] not in completed_codes
-               and kg["kg_code"] not in failed_kgs]
+               and kg["kg_code"] not in failed_kgs
+               and kg["kg_code"] not in peer_claimed]
 
     # --- Load priority queue and prepend to pending ---
     priority_codes = _read_retry_queue()
@@ -7301,6 +7395,14 @@ def main():
         kg_code = kg["kg_code"]
         kg_name = kg.get("kg_name", "")
         kg_state = kg.get("state_name", "")
+
+        # --- Peer coordination: skip if a peer has claimed this KG ---
+        if peer_urls:
+            peer_claimed = _get_peer_claimed_kgs(peer_urls)
+            if kg_code in peer_claimed:
+                log.info("Skipping KG %s — claimed by peer", kg_code)
+                i += 1
+                continue
 
         log.info("-" * 50)
         log.info("[%d/%d] Processing KG %s (%s, %s)",

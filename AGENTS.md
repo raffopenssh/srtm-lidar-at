@@ -746,6 +746,8 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | POST | `/api/v1/processing/stop` | Stop processor (SIGTERM) |
 | POST | `/api/v1/processing/single?kg=X` | Process single KG |
 | POST | `/api/v1/processing/retry?kg=X` | Retry failed KG |
+| GET\|POST | `/api/v1/processing/throttle` | Get/toggle bandwidth throttle (skip GPKG uploads) |
+| GET | `/api/v1/processing/peers` | Peer coordination state (completed, current, priority, failed) |
 | GET | `/api/v1/processing/log` | Recent processor log lines |
 | GET | `/api/v1/processing/manifest` | Zenodo manifest entries |
 | GET | `/api/v1/kg/<kg_code>` | KG JSON summary (local or Zenodo link) |
@@ -955,6 +957,47 @@ sudo systemctl restart austria_processor
 # Check which credential is active in the subprocess
 grep 'Authenticated successfully\|Rotated to credential\|IP-throttled\|transient 402' \
   data/austria_processor/logs/processor.log | tail -20
+```
+
+---
+
+### Multi-Instance Deployment
+
+The processor can run on multiple exe.dev VMs simultaneously, each with its
+own 100 GB/month bandwidth allocation. Instances coordinate via API to avoid
+duplicate work.
+
+**Quick deploy on a new VM:**
+```bash
+PEER_URL=https://srtm-lidar-at.exe.xyz:8000 bash deploy.sh
+```
+
+**Peer coordination**: Each instance polls `GET /api/v1/processing/peers` on
+its peers every 60s to learn completed/in-progress/priority KGs. These are
+skipped automatically. If a peer is unreachable, the last known state is used
+(graceful degradation). No shared database or lock service required.
+
+**CLI flags** for `austria_processor.py`:
+- `--peers URL [URL ...]` — peer instance URLs to coordinate with
+- `--instance-id NAME` — identifier for this instance (default: hostname)
+
+**Throttle mode**: Toggle via dashboard button or `POST /api/v1/processing/throttle`.
+When enabled, skips GPKG uploads to Zenodo (~700 MB/KG saved) but still uploads
+JSON summaries and Zenodo tile cache. GPKGs are deleted locally to free disk.
+New instances deploy with throttle ON by default.
+
+**Files**:
+- `deploy.sh` — one-command deployment script for new instances
+- `requirements.txt` — Python dependencies for `pip install -r`
+- `data/austria_processor/upload_throttle` — flag file for throttle mode
+
+**To add a peer to the PRIMARY instance** (after deploying a second VM):
+```bash
+# Edit the systemd unit
+sudo systemctl edit austria_processor
+# Add: ExecStart= (empty to clear)
+#       ExecStart=/usr/bin/python3 austria_processor.py --mark-uncertain --peers https://NEW-VM.exe.xyz:8000
+sudo systemctl restart austria_processor
 ```
 
 ---

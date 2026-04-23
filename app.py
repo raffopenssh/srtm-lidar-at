@@ -867,9 +867,83 @@ def processing_status():
                 data['tile_history'] = json.loads(th_path.read_text())
         except Exception:
             pass
+        data['throttle'] = Path('data/austria_processor/upload_throttle').exists()
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/processing/throttle', methods=['GET', 'POST'])
+def processing_throttle():
+    """Toggle bandwidth throttle mode (skip GPKG uploads to Zenodo)."""
+    throttle_file = Path('data/austria_processor/upload_throttle')
+    if request.method == 'GET':
+        return jsonify({'throttle': throttle_file.exists()})
+    # POST toggles
+    if throttle_file.exists():
+        throttle_file.unlink()
+        return jsonify({'throttle': False, 'message': 'Throttle disabled \u2014 full uploads resume'})
+    else:
+        throttle_file.write_text(time.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        return jsonify({'throttle': True, 'message': 'Throttle enabled \u2014 skipping GPKG uploads'})
+
+
+@app.route('/api/v1/processing/peers', methods=['GET'])
+def processing_peers_status():
+    """Return compact state for peer coordination.
+
+    Returns completed KG codes, current KG, priority queue, and failed KGs
+    so a peer instance can avoid duplicate work.
+    """
+    data_dir = Path('data/austria_processor')
+    result = {'instance': os.environ.get('INSTANCE_ID', 'primary')}
+
+    # Completed KGs
+    result['completed'] = sorted(_get_completed_kgs())
+
+    # Current KG being processed
+    current = None
+    pf = data_dir / 'progress.json'
+    if pf.exists():
+        try:
+            pd = json.loads(pf.read_text())
+            ckg = pd.get('current_kg') or {}
+            current = ckg.get('code')
+        except Exception:
+            pass
+    result['current'] = current
+
+    # In-progress marker (crash recovery file)
+    ipf = data_dir / 'in_progress_kg.txt'
+    if ipf.exists():
+        try:
+            ip = ipf.read_text().strip()
+            if ip and ip != current:
+                result['in_progress'] = ip
+        except Exception:
+            pass
+
+    # Priority queue
+    retry_path = data_dir / 'retry_queue.json'
+    if retry_path.exists():
+        try:
+            result['priority'] = json.loads(retry_path.read_text())
+        except Exception:
+            result['priority'] = []
+    else:
+        result['priority'] = []
+
+    # Failed KGs (permanent)
+    failed_path = data_dir / 'failed_kgs.json'
+    if failed_path.exists():
+        try:
+            result['failed'] = json.loads(failed_path.read_text())
+        except Exception:
+            result['failed'] = []
+    else:
+        result['failed'] = []
+
+    return jsonify(result)
 
 
 @app.route('/api/v1/processing/start', methods=['POST'])

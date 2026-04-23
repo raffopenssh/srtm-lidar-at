@@ -381,6 +381,7 @@
   <button class="btn btn-r" id="btnStop" onclick="sendCmd('stop')" disabled>■ Stop</button>
   <span class="sep">│</span>
   <button class="btn" id="btnDrawPriority" onclick="togglePriorityDraw()" title="Draw a rectangle on the map to prioritize KGs in that area">📌 Priority Area</button>
+  <button class="btn" id="btnThrottle" onclick="toggleThrottle()" title="Skip GPKG uploads to save bandwidth (still uploads JSON + tile cache)">🔋 Throttle</button>
   <span class="kg-ac-wrap">
     <input type="text" class="inp" id="kgAcInput" placeholder="Queue KG by name…" autocomplete="off" spellcheck="false" title="Type a KG name to add to the priority queue">
     <span class="ac-icon" id="kgAcIcon">🔍</span>
@@ -1055,6 +1056,25 @@ function updateControls(d) {
   } else {
     start.disabled = false; pause.disabled = true; resume.style.display = 'none'; stop.disabled = true;
   }
+  if (d.throttle !== undefined) updateThrottleBtn(d.throttle);
+}
+
+async function toggleThrottle() {
+  try {
+    const r = await fetch('/api/v1/processing/throttle', {method:'POST'});
+    const d = await r.json();
+    updateThrottleBtn(d.throttle);
+  } catch(e) { console.error('throttle toggle failed', e); }
+}
+function updateThrottleBtn(on) {
+  const btn = document.getElementById('btnThrottle');
+  if (!btn) return;
+  btn.textContent = on ? '\ud83d\udd0b Throttle ON' : '\ud83d\udd0b Throttle';
+  btn.style.background = on ? 'var(--yellow)' : '';
+  btn.style.color = on ? '#000' : '';
+  btn.title = on
+    ? 'Throttle ON \u2014 skipping GPKG uploads (click to disable)'
+    : 'Skip GPKG uploads to save bandwidth (click to enable)';
 }
 
 // ── API Commands ────────────────────────────────────────────────

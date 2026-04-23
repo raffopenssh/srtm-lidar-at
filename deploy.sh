@@ -152,8 +152,11 @@ fi
 touch data/austria_processor/upload_throttle
 echo "  ✓ Throttle mode enabled (GPKG uploads skipped — saves ~700 MB/KG)"
 
-sudo systemctl enable --now austria_processor
-echo "  ✓ Processor started with peer coordination"
+# Install the processor service but do NOT enable/start it.
+# The director on the primary instance will start it via the API when needed.
+# This avoids the peer running independently and conflicting with the director.
+sudo systemctl disable austria_processor 2>/dev/null || true
+echo "  ✓ Processor service installed (will be started by director)"
 
 # ── 8. Auto-register with director ─────────────────────────
 echo "\n[8/8] Auto-registering with director..."

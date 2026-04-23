@@ -1208,6 +1208,13 @@ def processing_start():
     global _processor_process
     if _processor_process is not None and _processor_process.poll() is None:
         return jsonify({'error': 'Processor already running', 'pid': _processor_process.pid}), 409
+    # Also check if processor is running externally (e.g. via systemd or another start)
+    import subprocess as _sp
+    try:
+        _sp.check_output(['pgrep', '-f', 'austria_processor.py'], text=True, timeout=2)
+        return jsonify({'error': 'Processor already running (external)'}), 409
+    except Exception:
+        pass
 
     args = [sys.executable, 'austria_processor.py']
     state = request.args.get('state') or request.json.get('state', '') if request.is_json else ''

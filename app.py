@@ -2140,12 +2140,11 @@ def admin_disable_autostart():
     """
     try:
         import subprocess as sp
-        # Stop the service if running
-        sp.run(['sudo', 'systemctl', 'stop', 'austria_processor'],
-               capture_output=True, text=True, timeout=15)
-        # Disable auto-start on boot and on failure
+        # Disable auto-start on boot (don't stop — let current KG finish)
         sp.run(['sudo', 'systemctl', 'disable', 'austria_processor'],
                capture_output=True, text=True, timeout=5)
+        # Mask prevents manual start too — use unmask to re-enable
+        # sp.run(['sudo', 'systemctl', 'mask', 'austria_processor'], ...)
         return jsonify({'status': 'disabled'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

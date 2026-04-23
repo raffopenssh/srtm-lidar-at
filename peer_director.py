@@ -367,10 +367,25 @@ def trigger_peer_update(peer_url: str) -> dict:
         return {'error': str(e)}
 
 
+def _peer_is_scheduled(peer: dict) -> bool:
+    """Check if a peer has a not_before date that hasn't passed yet."""
+    not_before = peer.get('not_before')
+    if not not_before:
+        return False
+    try:
+        nb = datetime.fromisoformat(not_before)
+        if nb.tzinfo is None:
+            nb = nb.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < nb
+    except (ValueError, TypeError):
+        return False
+
+
 def choose_active_peer(cfg: dict, state: dict) -> str | None:
     """Pick the best peer to run the processor on.
 
     Returns peer_id with most remaining bandwidth, or None if all exhausted.
+    Skips peers that are disabled or have a not_before date in the future.
     """
     budget_gb = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB)
     budget_bytes = budget_gb * (1024 ** 3)
@@ -379,6 +394,8 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
 
     for peer in cfg.get('peers', []):
         if not peer.get('enabled', True):
+            continue
+        if _peer_is_scheduled(peer):
             continue
         pid = peer['id']
         bw = state.get('peer_bandwidth', {}).get(pid, {})
@@ -441,6 +458,8 @@ class PeerDirector:
                 'id': pid,
                 'url': url,
                 'enabled': peer.get('enabled', True),
+                'not_before': peer.get('not_before'),
+                'scheduled': _peer_is_scheduled(peer),
                 'is_active': pid == state.get('active_peer'),
                 'processor_state': proc_status,
                 'current_kg': (ps.get('current_kg') or {}).get('code'),
@@ -515,6 +534,20 @@ class PeerDirector:
             state_copy = self.state.copy()
 
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
+
+        # Check if active peer is scheduled (not_before in the future)
+        if active_id:
+            active_peer_cfg = get_peer_by_id(cfg, active_id)
+            if active_peer_cfg and _peer_is_scheduled(active_peer_cfg):
+                nb = active_peer_cfg.get('not_before', '?')
+                log.info('Peer %s is scheduled not before %s, switching', active_id, nb)
+                peer = get_peer_by_id(cfg, active_id)
+                if peer:
+                    stop_peer_processor(peer.get('url'))
+                    time.sleep(SWITCH_COOLDOWN)
+                with self._lock:
+                    self.state['active_peer'] = None
+                    active_id = None
 
         # Check if active peer is over budget
         if active_id:

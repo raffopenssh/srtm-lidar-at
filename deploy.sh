@@ -14,18 +14,31 @@ set -euo pipefail
 # Environment variables (set before running, or edit below):
 #   PEER_URL     — URL of the primary instance for coordination
 #                  (e.g. https://srtm-lidar-at.exe.xyz:8000)
-#   INSTANCE_ID  — Name for this instance (default: hostname)
-#   GIT_REPO     — Git clone URL (default: the project repo)
+#   SELF_URL     — Public URL of THIS instance (e.g. https://srtm-lidar-at3.exe.xyz:8000)
+#                  Required for auto-registration with the director.
+#   INSTANCE_ID  — Name for this instance (default: derived from SELF_URL or hostname)
+#   GIT_REPO     — Git clone URL (default: the project repo with token)
 # =============================================================================
 
 PEER_URL="${PEER_URL:-https://srtm-lidar-at.exe.xyz:8000}"
-INSTANCE_ID="${INSTANCE_ID:-$(hostname)}"
-GIT_REPO="${GIT_REPO:-https://github.com/raffopenssh/srtm-lidar-at.git}"
+SELF_URL="${SELF_URL:-}"
+GITHUB_TOKEN="<REDACTED_GITHUB_PAT>"
+GIT_REPO="${GIT_REPO:-https://${GITHUB_TOKEN}@github.com/raffopenssh/srtm-lidar-at.git}"
+
+# Derive INSTANCE_ID from SELF_URL if not set
+# e.g. https://srtm-lidar-at3.exe.xyz:8000 -> srtm-lidar-at3
+if [ -n "${SELF_URL}" ]; then
+    _DERIVED_HOST=$(echo "${SELF_URL}" | sed 's|https://||;s|:.*||;s|\.exe\.xyz||')
+    INSTANCE_ID="${INSTANCE_ID:-${_DERIVED_HOST}}"
+else
+    INSTANCE_ID="${INSTANCE_ID:-$(hostname)}"
+fi
 PROJECT_DIR="/home/exedev/srtm-lidar"
 
 echo "══════════════════════════════════════════════════════"
 echo "  srtm-lidar-at deployment"
 echo "  Instance: ${INSTANCE_ID}"
+echo "  Self:     ${SELF_URL:-<not set>}"
 echo "  Peer:     ${PEER_URL}"
 echo "══════════════════════════════════════════════════════"
 
@@ -142,19 +155,50 @@ echo "  ✓ Throttle mode enabled (GPKG uploads skipped — saves ~700 MB/KG)"
 sudo systemctl enable --now austria_processor
 echo "  ✓ Processor started with peer coordination"
 
+# ── 8. Auto-register with director ─────────────────────────
+echo "\n[8/8] Auto-registering with director..."
+
+if [ -z "${SELF_URL}" ]; then
+    echo "  ⚠ SELF_URL not set — cannot auto-register."
+    echo "    Register manually via the director dashboard."
+else
+    # Derive peer ID from SELF_URL: https://srtm-lidar-at3.exe.xyz:8000 → at3
+    PEER_ID=$(echo "${SELF_URL}" | sed 's|https://||;s|:.*||;s|\.exe\.xyz||;s|^srtm-lidar-||')
+
+    # Check if this IS the director (don't self-register)
+    DIRECTOR_HOST=$(echo "${PEER_URL}" | sed 's|https://||;s|:.*||;s|\.exe\.xyz||;s|^srtm-lidar-||')
+    if [ "${PEER_ID}" = "${DIRECTOR_HOST}" ]; then
+        echo "  ✓ This IS the director instance — skipping self-registration"
+    else
+        echo "  Registering as '${PEER_ID}' at ${SELF_URL} with director ${PEER_URL}..."
+        # Wait for web server to be ready
+        sleep 3
+        REG_RESP=$(curl -sf -X POST \
+          -H "Content-Type: application/json" \
+          -d "{\"id\": \"${PEER_ID}\", \"url\": \"${SELF_URL}\"}" \
+          "${PEER_URL}/api/v1/director/peers/add" 2>&1) && \
+          echo "  ✓ Registered with director: ${REG_RESP}" || \
+          echo "  ⚠ Auto-registration failed (director may be down or peer already exists): ${REG_RESP}"
+    fi
+fi
+
+# Determine display URL
+DISPLAY_URL="${SELF_URL:-https://$(hostname).exe.xyz:8000}"
+
 echo ""
 echo "══════════════════════════════════════════════════════"
 echo "  Deployment complete!"
 echo ""
-echo "  Web UI:     https://$(hostname).exe.xyz:8000/"
-echo "  Dashboard:  https://$(hostname).exe.xyz:8000/process.html"
+echo "  Web UI:     ${DISPLAY_URL}/"
+echo "  Dashboard:  ${DISPLAY_URL}/process.html"
 echo "  Peer:       ${PEER_URL}"
 echo "  Throttle:   ON (toggle via dashboard)"
+if [ -n "${SELF_URL}" ]; then
+    echo ""
+    echo "  ❗ Make the VM public so the director can reach it:"
+    echo "    ssh exe.dev share set-public $(echo "${SELF_URL}" | sed 's|https://||;s|:.*||;s|\.exe\.xyz||')"
+fi
 echo ""
 echo "  Monitor:    journalctl -u srv -f"
 echo "              tail -f data/austria_processor/logs/processor.log"
-echo ""
-echo "  To also coordinate the PRIMARY instance with this one,"
-echo "  update the primary's systemd unit:"
-echo "    ExecStart=... --peers https://$(hostname).exe.xyz:8000"
 echo "══════════════════════════════════════════════════════"

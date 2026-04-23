@@ -2352,9 +2352,16 @@ def admin_update():
     """Git pull and restart the web server (called by director on peers)."""
     try:
         import subprocess as sp
+        repo = str(Path(__file__).parent)
+        # Stash local changes (e.g. manifest) so ff-only pull succeeds
+        sp.run(['git', 'stash', '--include-untracked'], capture_output=True, text=True,
+               timeout=15, cwd=repo)
         # Git pull
         pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
-                      timeout=30, cwd=str(Path(__file__).parent))
+                      timeout=30, cwd=repo)
+        # Pop stash (ignore errors if stash was empty)
+        sp.run(['git', 'stash', 'pop'], capture_output=True, text=True,
+               timeout=15, cwd=repo)
         # Restart gunicorn
         sp.run(['sudo', 'systemctl', 'restart', 'srv'], timeout=10)
         return jsonify({

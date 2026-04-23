@@ -404,16 +404,8 @@
       <input id="addPeerVmName" type="text" placeholder="srtm-lidar-at3" oninput="updateDeployCmd()" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:5px 8px;color:var(--text);font-size:12px;font-family:inherit;width:100%;box-sizing:border-box">
     </div>
 
-    <div style="margin-bottom:8px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">1. Create VM <span style="opacity:.6">(exe.dev REPL)</span>:</div>
-      <div style="position:relative">
-        <pre id="addPeerCreateCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px 40px 8px 10px;font-size:11px;color:#6ee7f5;white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.4">new &lt;vm-name&gt;</pre>
-        <button onclick="_copyPre('addPeerCreateCmd',this)" style="position:absolute;top:4px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy">📋</button>
-      </div>
-    </div>
-
-    <div style="margin-bottom:8px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">2. Deploy <span style="opacity:.6">(on the new VM)</span>:</div>
+    <div style="margin-bottom:10px">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">1. Create &amp; deploy <span style="opacity:.6">(exe.dev REPL)</span>:</div>
       <div style="position:relative">
         <pre id="addPeerCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px 40px 10px 10px;font-size:11px;color:var(--green);white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.5"></pre>
         <button onclick="_copyPre('addPeerCmd',this)" style="position:absolute;top:6px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy">📋</button>
@@ -421,7 +413,7 @@
     </div>
 
     <div style="margin-bottom:14px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">3. Make public <span style="opacity:.6">(exe.dev REPL)</span>:</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">2. Make public <span style="opacity:.6">(exe.dev REPL, after deploy finishes)</span>:</div>
       <div style="position:relative">
         <pre id="addPeerPublicCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px 40px 8px 10px;font-size:11px;color:var(--yellow);white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.4">share set-public &lt;vm-name&gt;</pre>
         <button onclick="_copyPre('addPeerPublicCmd',this)" style="position:absolute;top:4px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy">📋</button>
@@ -2012,15 +2004,14 @@ function showAddPeerModal() {
 }
 function updateDeployCmd() {
   const vm = document.getElementById('addPeerVmName').value.trim() || '<vm-name>';
-  const selfUrl = vm === '<vm-name>' ? '<vm-name>.exe.xyz:8000' : `https://${vm}.exe.xyz:8000`;
+  const selfUrl = vm === '<vm-name>' ? 'https://<vm-name>.exe.xyz:8000' : `https://${vm}.exe.xyz:8000`;
   const peerUrl = _directorPublicUrl();
-  const selfArg = vm === '<vm-name>' ? 'SELF_URL=https://<vm-name>.exe.xyz:8000 ' : `SELF_URL=${selfUrl} `;
-  const cmd = `curl -sL https://${_GH_TOKEN}@raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ${selfArg}PEER_URL=${peerUrl} bash`;
+  // Build the setup script that deploy.sh runs on first boot
+  const deployScript = `curl -sL https://${_GH_TOKEN}@raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
+  // exe.dev new --setup-script supports \n for newlines
+  const cmd = `new --name=${vm} --setup-script='${deployScript}'`;
   document.getElementById('addPeerCmd').textContent = cmd;
-  document.getElementById('addPeerCreateCmd').textContent = vm === '<vm-name>' ? 'new <vm-name>' : `new ${vm}`;
   document.getElementById('addPeerPublicCmd').textContent = vm === '<vm-name>' ? 'share set-public <vm-name>' : `share set-public ${vm}`;
-  // Also update the vm-name-ref spans
-  document.querySelectorAll('.vm-name-ref').forEach(el => el.textContent = vm);
 }
 function closeAddPeerModal() {
   document.getElementById('addPeerModal').style.display = 'none';

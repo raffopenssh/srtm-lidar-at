@@ -160,14 +160,30 @@ class CacheManifest:
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = {"depo_id": None, "record_id": None,
                                        "files": {}}
+        self._last_mtime: float = 0.0
         self._load()
 
     def _load(self):
         if self._path.exists():
             try:
                 self._data = json.loads(self._path.read_text())
+                self._last_mtime = self._path.stat().st_mtime
             except (json.JSONDecodeError, OSError) as e:
                 log.warning("Failed to load cache manifest: %s", e)
+
+    def reload_if_changed(self):
+        """Re-read from disk if the file has been modified externally."""
+        try:
+            if self._path.exists():
+                mtime = self._path.stat().st_mtime
+                if mtime > self._last_mtime:
+                    with self._lock:
+                        self._data = json.loads(self._path.read_text())
+                        self._last_mtime = mtime
+                    log.info("Cache manifest reloaded (depo_id=%s, %d files)",
+                             self._data.get('depo_id'), len(self._data.get('files', {})))
+        except Exception as e:
+            log.debug("Cache manifest reload check failed: %s", e)
 
     def save(self):
         """Persist to disk atomically."""
@@ -1105,6 +1121,12 @@ class ZenodoCache:
         -------
         Path to the local NPZ file, or None if not found on Zenodo.
         """
+        # Pick up manifest changes pushed by the peer-sync thread
+        old_depo = self.manifest.depo_id
+        self.manifest.reload_if_changed()
+        if self.manifest.depo_id != old_depo:
+            self._zip_indices.clear()  # URLs changed, invalidate cached indices
+
         strip_s, strip_n = _strip_for_lat(s)
         zip_name = _zip_filename(product, strip_s, strip_n)
 
@@ -1168,6 +1190,12 @@ class ZenodoCache:
 
         Same pattern as fetch_copernicus but for Hansen 0.5° grid.
         """
+        # Pick up manifest changes pushed by the peer-sync thread
+        old_depo = self.manifest.depo_id
+        self.manifest.reload_if_changed()
+        if self.manifest.depo_id != old_depo:
+            self._zip_indices.clear()
+
         strip_s, strip_n = _strip_for_lat(s)
         zip_name = _zip_filename("hansen", strip_s, strip_n)
         entry_name = _npz_entry_name("hansen", w, s, e, n)

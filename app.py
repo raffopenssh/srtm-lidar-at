@@ -1920,6 +1920,62 @@ def director_peers_config():
     return jsonify({'status': 'updated', 'config': new_cfg})
 
 
+@app.route('/api/v1/director/peers/add', methods=['POST'])
+def director_add_peer():
+    """Add a new peer dynamically.
+
+    Body JSON:
+      id: peer identifier (e.g. 'at3')
+      url: peer URL (e.g. 'https://srtm-lidar-at3.exe.xyz:8000')
+      enabled: bool (default true)
+    """
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get('id', '').strip()
+    peer_url = data.get('url', '').strip().rstrip('/')
+    enabled = data.get('enabled', True)
+    if not peer_id or not peer_url:
+        return jsonify({'error': 'id and url are required'}), 400
+    if not peer_url.startswith('https://'):
+        return jsonify({'error': 'url must start with https://'}), 400
+
+    cfg = pd.load_peers_config()
+    # Check for duplicate
+    existing_ids = {p['id'] for p in cfg.get('peers', [])}
+    existing_urls = {p.get('url') for p in cfg.get('peers', [])}
+    if peer_id in existing_ids:
+        return jsonify({'error': f'Peer {peer_id} already exists'}), 409
+    if peer_url in existing_urls:
+        return jsonify({'error': f'URL {peer_url} already registered'}), 409
+
+    # Test connectivity
+    online = False
+    try:
+        r = requests.get(peer_url + '/api/v1/info', timeout=10)
+        online = r.ok
+    except Exception:
+        pass
+
+    cfg['peers'].append({'id': peer_id, 'url': peer_url, 'enabled': enabled})
+    pd.save_peers_config(cfg)
+    d = pd.get_director()
+    d.reload_config()
+
+    # Also add to peer_urls.txt for the sync thread
+    peer_urls_path = Path('data/austria_processor/peer_urls.txt')
+    current_urls = set()
+    if peer_urls_path.exists():
+        current_urls = {u.strip() for u in peer_urls_path.read_text().splitlines() if u.strip()}
+    if peer_url not in current_urls:
+        current_urls.add(peer_url)
+        peer_urls_path.write_text('\n'.join(sorted(current_urls)) + '\n')
+
+    return jsonify({
+        'status': 'added',
+        'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
+        'total_peers': len(cfg['peers']),
+    })
+
+
 @app.route('/api/v1/director/proxy/status')
 def director_proxy_status():
     """Proxy the active peer's processing status to the dashboard."""

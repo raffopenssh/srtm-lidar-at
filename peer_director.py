@@ -247,8 +247,40 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         return []
 
 
+def sync_queue_to_peer(peer_url: str) -> dict:
+    """Push the local priority queue to a remote peer.
+
+    Reads the local retry_queue.json and POSTs it to the peer's
+    /api/v1/processing/queue endpoint (position=0 = front of queue).
+    Skips if queue is empty.
+    """
+    queue_path = DATA_DIR / 'retry_queue.json'
+    try:
+        queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+    except Exception:
+        queue = []
+    if not queue:
+        return {'status': 'empty_queue', 'synced': 0}
+    try:
+        r = requests.post(
+            peer_url.rstrip('/') + '/api/v1/processing/queue',
+            json={'kgs': queue, 'position': 0, 'skip_processed': True},
+            timeout=PEER_TIMEOUT,
+        )
+        result = r.json()
+        log.info('Queue sync to %s: pushed %d KGs — %s', peer_url, len(queue), result.get('status', '?'))
+        return result
+    except Exception as e:
+        log.warning('Queue sync to %s failed: %s', peer_url, e)
+        return {'error': str(e)}
+
+
 def start_peer_processor(peer_url: str | None) -> dict:
-    """Start the processor on a peer."""
+    """Start the processor on a peer.
+
+    For remote peers, syncs the local priority queue first so the peer
+    processes the same KGs in priority order.
+    """
     if peer_url is None:
         # Local start — use subprocess
         try:
@@ -264,14 +296,18 @@ def start_peer_processor(peer_url: str | None) -> dict:
             return {'status': 'started', 'pid': proc.pid}
         except Exception as e:
             return {'error': str(e)}
+    # Remote peer — sync priority queue before starting
+    queue_result = sync_queue_to_peer(peer_url)
     try:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/processing/start',
             timeout=PEER_TIMEOUT
         )
-        return r.json()
+        result = r.json()
+        result['queue_sync'] = queue_result
+        return result
     except Exception as e:
-        return {'error': str(e)}
+        return {'error': str(e), 'queue_sync': queue_result}
 
 
 def stop_peer_processor(peer_url: str | None) -> dict:
@@ -531,13 +567,52 @@ class PeerDirector:
             else:
                 log.info('No peers with sufficient bandwidth available')
 
+    def _sync_queue_to_active(self):
+        """Push the director's local priority queue to the active remote peer.
+
+        Only syncs if the queue has changed since the last sync (compares hash).
+        """
+        with self._lock:
+            active_id = self.state.get('active_peer')
+        if not active_id:
+            return
+        peer = get_peer_by_id(self.cfg, active_id)
+        if not peer or peer.get('url') is None:
+            return  # local peer doesn't need sync
+
+        # Read current queue
+        queue_path = DATA_DIR / 'retry_queue.json'
+        try:
+            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        except Exception:
+            queue = []
+
+        # Hash check — skip if unchanged
+        import hashlib
+        q_hash = hashlib.md5(json.dumps(queue).encode()).hexdigest()
+        with self._lock:
+            if self.state.get('_last_queue_hash') == q_hash:
+                return
+
+        # Push to peer
+        result = sync_queue_to_peer(peer['url'])
+        if 'error' not in result:
+            with self._lock:
+                self.state['_last_queue_hash'] = q_hash
+
     def _loop(self):
         """Main director loop."""
         time.sleep(5)  # startup delay
+        sync_counter = 0
         while self._running:
             try:
                 self._update_bandwidth()
                 self._check_and_switch()
+                # Sync queue every 5 iterations (~2.5 min at 30s interval)
+                sync_counter += 1
+                if sync_counter >= 5:
+                    self._sync_queue_to_active()
+                    sync_counter = 0
                 with self._lock:
                     save_director_state(self.state)
             except Exception:

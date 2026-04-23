@@ -357,6 +357,7 @@
         <button class="btn" id="btnDirAuto" onclick="setDirectorMode('auto')" style="font-size:10px;padding:1px 6px;" title="Auto-select peer by bandwidth">Auto</button>
         <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
         <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
+        <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
       </span>
     </div>
     <div id="directorBody" style="margin-top:6px;">
@@ -388,6 +389,41 @@
   <div class="lb">Last Completed KG — <span id="lastKgName">—</span></div>
   <div class="last-kg-grid" id="lastKgGrid"></div>
   <div class="ds-row" id="lastKgDatasources" style="margin-top:6px"></div>
+</div>
+
+<!-- Add Peer Modal -->
+<div id="addPeerModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;max-width:560px;width:90%;max-height:80vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <span style="font-size:15px;font-weight:700;color:var(--text)">Add New Peer Instance</span>
+      <button onclick="closeAddPeerModal()" style="background:none;border:none;color:var(--dim);font-size:18px;cursor:pointer;padding:0 4px">&times;</button>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">1. On the new VM, run this one-line deploy command:</div>
+      <div style="position:relative">
+        <pre id="addPeerCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px 40px 10px 10px;font-size:11px;color:var(--green);white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.5"></pre>
+        <button onclick="copyDeployCmd()" style="position:absolute;top:6px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy to clipboard">📋</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">2. Once deployed, register the peer here:</div>
+      <div style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center">
+        <label style="font-size:11px;color:var(--dim)">Peer ID</label>
+        <input id="addPeerId" type="text" placeholder="e.g. at3" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
+        <label style="font-size:11px;color:var(--dim)">Peer URL</label>
+        <input id="addPeerUrl" type="text" placeholder="https://srtm-lidar-at3.exe.xyz:8000" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
+      </div>
+    </div>
+
+    <div id="addPeerStatus" style="font-size:11px;margin-bottom:10px;display:none"></div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="closeAddPeerModal()" class="btn" style="font-size:11px;padding:4px 12px">Cancel</button>
+      <button onclick="registerPeer()" class="btn btn-g" style="font-size:11px;padding:4px 12px" id="btnRegisterPeer">Register Peer</button>
+    </div>
+  </div>
 </div>
 
 <!-- Map (compact) -->
@@ -1884,6 +1920,66 @@ async function updatePeers() {
     setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
   }
 }
+
+// ── Add Peer modal ──────────────────────────────────────────────
+function showAddPeerModal() {
+  const thisUrl = location.origin;
+  const cmd = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | PEER_URL=${thisUrl} bash`;
+  document.getElementById('addPeerCmd').textContent = cmd;
+  document.getElementById('addPeerId').value = '';
+  document.getElementById('addPeerUrl').value = '';
+  document.getElementById('addPeerStatus').style.display = 'none';
+  document.getElementById('addPeerModal').style.display = 'flex';
+}
+function closeAddPeerModal() {
+  document.getElementById('addPeerModal').style.display = 'none';
+}
+function copyDeployCmd() {
+  const txt = document.getElementById('addPeerCmd').textContent;
+  navigator.clipboard.writeText(txt).then(() => {
+    const btn = event.target;
+    btn.textContent = '\u2705';
+    setTimeout(() => btn.textContent = '\ud83d\udccb', 2000);
+  });
+}
+async function registerPeer() {
+  const id = document.getElementById('addPeerId').value.trim();
+  const url = document.getElementById('addPeerUrl').value.trim().replace(/\/+$/, '');
+  const st = document.getElementById('addPeerStatus');
+  if (!id || !url) {
+    st.style.display = 'block'; st.style.color = 'var(--red)';
+    st.textContent = 'Both Peer ID and URL are required.';
+    return;
+  }
+  const btn = document.getElementById('btnRegisterPeer');
+  btn.disabled = true; btn.textContent = 'Registering\u2026';
+  st.style.display = 'block'; st.style.color = 'var(--dim)';
+  st.textContent = 'Testing connectivity\u2026';
+  try {
+    const r = await fetch('/api/v1/director/peers/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, url})
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      st.style.color = 'var(--red)'; st.textContent = d.error || 'Failed';
+      btn.disabled = false; btn.textContent = 'Register Peer'; return;
+    }
+    st.style.color = 'var(--green)';
+    st.textContent = `\u2705 Peer "${id}" added` + (d.peer?.online ? ' (online)' : ' (offline \u2014 deploy first)');
+    btn.textContent = '\u2705 Added';
+    setTimeout(() => closeAddPeerModal(), 2000);
+    fetchDirectorStatus();  // refresh peer cards
+  } catch(e) {
+    st.style.color = 'var(--red)'; st.textContent = 'Network error: ' + e;
+    btn.disabled = false; btn.textContent = 'Register Peer';
+  }
+}
+// Close modal on backdrop click
+document.getElementById('addPeerModal').addEventListener('click', function(e) {
+  if (e.target === this) closeAddPeerModal();
+});
 
 // Compat: keep _peerData for subtitle
 async function fetchPeerStatus() {

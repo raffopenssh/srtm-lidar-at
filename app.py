@@ -105,10 +105,18 @@ def _get_peer_urls():
 
 
 # Manifest keys deleted intentionally — don't re-merge from peers
-_MANIFEST_TOMBSTONES = set()
+# Dict of key -> ISO timestamp when tombstoned. Entries newer than tombstone are allowed.
+_MANIFEST_TOMBSTONES: dict = {}
 _tombstone_path = Path('data/austria_processor/manifest_tombstones.json')
 if _tombstone_path.exists():
-    try: _MANIFEST_TOMBSTONES = set(json.loads(_tombstone_path.read_text()))
+    try:
+        raw = json.loads(_tombstone_path.read_text())
+        if isinstance(raw, list):
+            # Migrate old format (list of keys) → dict with current timestamp
+            _MANIFEST_TOMBSTONES = {k: datetime.utcnow().isoformat() for k in raw}
+            _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+        elif isinstance(raw, dict):
+            _MANIFEST_TOMBSTONES = raw
     except Exception: pass
 
 def _sync_peer_data():
@@ -177,9 +185,22 @@ def _sync_peer_data():
                         local_path.with_suffix('.tmp').unlink(missing_ok=True)
                         log.warning('Peer sync: failed to download %s from %s: %s', code, link, e)
 
-                # Collect manifest entries to merge (skip tombstoned keys)
+                # Collect manifest entries to merge (skip tombstoned keys unless newer)
                 for key, entry in peer_manifest.items():
-                    if key not in merged_manifest_entries and key not in _MANIFEST_TOMBSTONES:
+                    if key in merged_manifest_entries:
+                        continue
+                    tombstone_ts = _MANIFEST_TOMBSTONES.get(key)
+                    if tombstone_ts:
+                        # Allow if peer entry was uploaded after tombstone was created
+                        entry_ts = entry.get('uploaded_at', '')
+                        if entry_ts <= tombstone_ts:
+                            continue
+                        # Newer entry — clear the tombstone
+                        del _MANIFEST_TOMBSTONES[key]
+                        _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+                        log.info('Peer sync: tombstone cleared for %s (peer entry %s > tombstone %s)',
+                                 key, entry_ts, tombstone_ts)
+                    if True:  # always collect (guard above skips stale)
                         merged_manifest_entries[key] = entry
 
             # Merge into local manifest (atomic read-modify-write)
@@ -2136,9 +2157,9 @@ def processing_manifest_delete(key):
             try: os.unlink(tmp)
             except OSError: pass
             raise
-        # Add tombstone so sync thread doesn't re-merge from peers
-        _MANIFEST_TOMBSTONES.add(key)
-        _tombstone_path.write_text(json.dumps(sorted(_MANIFEST_TOMBSTONES)))
+        # Add tombstone so sync thread doesn't re-merge stale entries from peers
+        _MANIFEST_TOMBSTONES[key] = datetime.utcnow().isoformat()
+        _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
         return jsonify({'deleted': key, 'remaining': len(entries)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

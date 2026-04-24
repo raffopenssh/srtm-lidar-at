@@ -150,8 +150,11 @@ def _sync_peer_data():
                     if local_path.exists():
                         continue
 
-                    # Construct download URL from bucket_url + filename
+                    # Construct download URL – prefer explicit link, then draft API, then bucket
+                    from zenodo_client import DEFAULT_TOKEN
                     link = entry.get('link', '')
+                    if not link and entry.get('depo_id') and entry.get('filename'):
+                        link = f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/{entry['filename']}/content?access_token={DEFAULT_TOKEN}"
                     if not link and entry.get('bucket_url') and entry.get('filename'):
                         link = f"{entry['bucket_url']}/{entry['filename']}"
                     if not link:

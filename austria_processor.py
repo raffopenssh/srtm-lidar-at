@@ -7110,7 +7110,6 @@ def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
             claimed.add(state['current'])
         if state.get('in_progress'):
             claimed.add(state['in_progress'])
-        claimed.update(state.get('priority', []))
     return claimed
 
 

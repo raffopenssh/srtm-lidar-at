@@ -2225,7 +2225,8 @@ def processing_manifest_delete(key):
             except OSError: pass
             raise
         # Add tombstone so sync thread doesn't re-merge stale entries from peers
-        _MANIFEST_TOMBSTONES[key] = datetime.utcnow().isoformat()
+        import datetime as _dt
+        _MANIFEST_TOMBSTONES[key] = _dt.datetime.utcnow().isoformat()
         _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
         return jsonify({'deleted': key, 'remaining': len(entries)})
     except Exception as e:

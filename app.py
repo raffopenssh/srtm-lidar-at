@@ -1039,8 +1039,8 @@ def _detect_region() -> str:
         # own outbound IP, which may be NAT'd through a US gateway regardless of
         # actual datacenter location.
         public_ip = None
-        import re as _re
-        # Try traceroute to find first public NAT hop (more accurate than own IP)
+        import re as _re, ipaddress as _ipa
+        # Try traceroute to find first globally-routable NAT hop (more accurate than own IP)
         try:
             tr = _sp.run(
                 ['traceroute', '-m', '5', '-q', '1', '-w', '1', '8.8.8.8'],
@@ -1049,12 +1049,15 @@ def _detect_region() -> str:
                 if not _re.match(r'^\s*\d+\s', line):  # skip header line
                     continue
                 for part in line.split():
-                    if part.startswith(('10.', '192.168.', '172.')):
-                        continue
                     segs = part.split('.')
-                    if len(segs) == 4 and all(s.isdigit() for s in segs):
-                        public_ip = part
-                        break
+                    if len(segs) != 4 or not all(s.isdigit() for s in segs):
+                        continue
+                    try:
+                        if _ipa.ip_address(part).is_global:
+                            public_ip = part
+                            break
+                    except ValueError:
+                        continue
                 if public_ip:
                     break
         except Exception:

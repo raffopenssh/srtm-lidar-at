@@ -2019,10 +2019,11 @@ def processing_queue_add():
     except Exception:
         codes = []
 
-    # Optionally filter out already-processed
+    # Optionally filter out already-processed; otherwise tombstone their manifest entries
     skipped = []
+    tombstoned = []
+    completed = _get_completed_kgs()
     if skip_processed:
-        completed = _get_completed_kgs()
         kept = []
         for c in new_codes:
             if c in completed:
@@ -2030,6 +2031,38 @@ def processing_queue_add():
             else:
                 kept.append(c)
         new_codes = kept
+    else:
+        # Force re-process: tombstone existing manifest entries so sync doesn't re-import them
+        import datetime as _dt
+        manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+        if manifest_path.exists():
+            try:
+                mdata = json.loads(manifest_path.read_text())
+                mentries = mdata.get('entries', mdata)
+                ts = _dt.datetime.utcnow().isoformat()
+                changed = False
+                for c in new_codes:
+                    if c in completed:
+                        for suffix in ('_full_gpkg', '_light_gpkg', '_json'):
+                            key = c + suffix
+                            if key in mentries:
+                                del mentries[key]
+                                _MANIFEST_TOMBSTONES[key] = ts
+                                tombstoned.append(key)
+                                changed = True
+                if changed:
+                    import tempfile as _tf
+                    fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+                    try:
+                        with os.fdopen(fd, 'w') as f:
+                            json.dump({'entries': mentries}, f, indent=2, sort_keys=True)
+                        os.replace(tmp, manifest_path)
+                    except BaseException:
+                        try: os.unlink(tmp)
+                        except OSError: pass
+                    _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+            except Exception:
+                pass
 
     if not new_codes:
         return jsonify({
@@ -2077,6 +2110,7 @@ def processing_queue_add():
         'added_count': len(new_codes),
         'moved_from_existing': moved,
         'skipped_processed': skipped,
+        'tombstoned': tombstoned,
         'queue_length': len(codes),
     })
 
@@ -2478,12 +2512,35 @@ def admin_update():
         if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
             sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
                    capture_output=True, timeout=60)
+        # Defer restart if processor is mid-upload (avoid broken manifest entries)
+        current_step = ''
+        try:
+            step_data = json.loads((Path(__file__).parent / 'data/austria_processor/current_step.json').read_text())
+            current_step = step_data.get('step', '')
+        except Exception:
+            pass
+        upload_steps = {'upload_full_gpkg', 'upload'}
+        if current_step in upload_steps:
+            # Schedule restart after a short delay to let upload finish
+            def _delayed_restart():
+                import time as _t
+                _t.sleep(90)
+                sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
+            import threading as _th
+            _th.Thread(target=_delayed_restart, daemon=True).start()
+            return jsonify({
+                'status': 'updated',
+                'git': pull.stdout.strip(),
+                'git_err': pull.stderr.strip(),
+                'restart': 'deferred_upload',
+            })
         # Restart gunicorn in background so this response gets out first
         sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
         return jsonify({
             'status': 'updated',
             'git': pull.stdout.strip(),
             'git_err': pull.stderr.strip(),
+            'restart': 'immediate',
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500

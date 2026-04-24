@@ -1980,7 +1980,10 @@ async function savePrioQueue() {
   async function pickKg(kg) {
     dd.style.display = 'none';
     inp.value = '';
-    // Add to head of queue
+    // Confirm re-process for already-processed KGs (will tombstone manifest)
+    if (kg.processed && !confirm('KG ' + kg.code + ' ' + kg.name + ' is already processed.\nRe-queue for reprocessing? This will remove its manifest entries.')) {
+      return;
+    }
     try {
       const r = await fetch('/api/v1/processing/queue', {
         method: 'POST',
@@ -1989,9 +1992,10 @@ async function savePrioQueue() {
       });
       const d = await r.json();
       if (r.ok) {
+        const tombstoned = (d.tombstoned || []).length;
         inp.style.borderColor = 'var(--green)';
-        inp.placeholder = '✓ ' + kg.name + ' queued';
-        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 2000);
+        inp.placeholder = '✓ ' + kg.name + ' queued' + (tombstoned ? ' (manifest cleared)' : '');
+        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 3000);
         fetchPrioQueue();
       } else {
         inp.style.borderColor = 'var(--red)';

@@ -1020,20 +1020,46 @@ except Exception:
 
 # Region lookup (once at startup via ipinfo.io)
 def _detect_region() -> str:
+    """Detect exe.dev region by geolocating the first public NAT gateway hop."""
     _TZ_TO_REGION = {
-        'America/Los_Angeles': 'PDX', 'America/Vancouver': 'PDX',
-        'America/New_York': 'NYC', 'America/Toronto': 'NYC',
-        'Europe/Berlin': 'FRA', 'Europe/Frankfurt': 'FRA',
-        'Europe/London': 'LON', 'Asia/Tokyo': 'TYO',
-        'Australia/Sydney': 'SYD', 'Asia/Singapore': 'SGP',
+        'America/Los_Angeles': 'PDX',
+        'America/Vancouver':   'PDX',
+        'America/New_York':    'NYC',
+        'America/Toronto':     'NYC',
+        'Europe/Berlin':       'FRA',
+        'Europe/Frankfurt':    'FRA',
+        'Europe/London':       'LON',
+        'Asia/Tokyo':          'TYO',
+        'Australia/Sydney':    'SYD',
+        'Asia/Singapore':      'SGP',
     }
     try:
-        import urllib.request as _ur
-        d = json.loads(_ur.urlopen('https://ipinfo.io/json', timeout=4).read())
+        import subprocess as _sp, urllib.request as _ur
+        # Geolocate the first public (non-RFC1918) NAT hop instead of the VM's
+        # own outbound IP, which may be NAT'd through a US gateway regardless of
+        # actual datacenter location.
+        public_ip = None
+        import re as _re
+        tr = _sp.run(
+            ['traceroute', '-m', '5', '-q', '1', '-w', '1', '8.8.8.8'],
+            capture_output=True, text=True, timeout=12)
+        for line in tr.stdout.splitlines():
+            if not _re.match(r'^\s*\d+\s', line):  # skip header line
+                continue
+            for part in line.split():
+                if part.startswith(('10.', '192.168.', '172.')):
+                    continue
+                segs = part.split('.')
+                if len(segs) == 4 and all(s.isdigit() for s in segs):
+                    public_ip = part
+                    break
+            if public_ip:
+                break
+        url = f'https://ipinfo.io/{public_ip}/json' if public_ip else 'https://ipinfo.io/json'
+        d = json.loads(_ur.urlopen(url, timeout=5).read())
         tz = d.get('timezone', '')
-        for k, v in _TZ_TO_REGION.items():
-            if tz.startswith(k.split('/')[0]) or tz == k:
-                return v
+        if tz in _TZ_TO_REGION:
+            return _TZ_TO_REGION[tz]
         city = (d.get('city') or '').lower()
         if 'frankfurt' in city or 'berlin' in city: return 'FRA'
         if 'london' in city: return 'LON'

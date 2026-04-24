@@ -475,9 +475,9 @@
   <button class="btn btn-y" id="btnPause" onclick="sendCmd('pause')" disabled>‖ Pause</button>
   <button class="btn btn-g" id="btnResume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
   <button class="btn btn-r" id="btnStop" onclick="sendCmd('stop')" disabled>■ Stop</button>
+  <button class="btn" id="btnThrottle" onclick="toggleThrottle()" title="Skip GPKG uploads to save bandwidth (still uploads JSON + tile cache)">🔋 Throttle</button>
   <span class="sep">│</span>
   <button class="btn" id="btnDrawPriority" onclick="togglePriorityDraw()" title="Draw a rectangle on the map to prioritize KGs in that area">📌 Priority Area</button>
-  <button class="btn" id="btnThrottle" onclick="toggleThrottle()" title="Skip GPKG uploads to save bandwidth (still uploads JSON + tile cache)">🔋 Throttle</button>
   <span class="kg-ac-wrap">
     <input type="text" class="inp" id="kgAcInput" placeholder="Queue KG by name…" autocomplete="off" spellcheck="false" title="Type a KG name to add to the priority queue">
     <span class="ac-icon" id="kgAcIcon">🔍</span>
@@ -1179,6 +1179,9 @@ function updateControls(d) {
 }
 
 async function toggleThrottle() {
+  const pw = prompt('Password required for throttle toggle:');
+  if (pw === null) return;
+  if (pw !== 'raffi') { alert('Wrong password'); return; }
   try {
     const r = await fetch('/api/v1/processing/throttle', {method:'POST'});
     const d = await r.json();

@@ -1040,21 +1040,25 @@ def _detect_region() -> str:
         # actual datacenter location.
         public_ip = None
         import re as _re
-        tr = _sp.run(
-            ['traceroute', '-m', '5', '-q', '1', '-w', '1', '8.8.8.8'],
-            capture_output=True, text=True, timeout=12)
-        for line in tr.stdout.splitlines():
-            if not _re.match(r'^\s*\d+\s', line):  # skip header line
-                continue
-            for part in line.split():
-                if part.startswith(('10.', '192.168.', '172.')):
+        # Try traceroute to find first public NAT hop (more accurate than own IP)
+        try:
+            tr = _sp.run(
+                ['traceroute', '-m', '5', '-q', '1', '-w', '1', '8.8.8.8'],
+                capture_output=True, text=True, timeout=12)
+            for line in tr.stdout.splitlines():
+                if not _re.match(r'^\s*\d+\s', line):  # skip header line
                     continue
-                segs = part.split('.')
-                if len(segs) == 4 and all(s.isdigit() for s in segs):
-                    public_ip = part
+                for part in line.split():
+                    if part.startswith(('10.', '192.168.', '172.')):
+                        continue
+                    segs = part.split('.')
+                    if len(segs) == 4 and all(s.isdigit() for s in segs):
+                        public_ip = part
+                        break
+                if public_ip:
                     break
-            if public_ip:
-                break
+        except Exception:
+            pass  # fall back to own IP below
         url = f'https://ipinfo.io/{public_ip}/json' if public_ip else 'https://ipinfo.io/json'
         d = json.loads(_ur.urlopen(url, timeout=5).read())
         tz = d.get('timezone', '')
@@ -2466,6 +2470,10 @@ def admin_update():
         # Git pull
         pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
                       timeout=30, cwd=repo)
+        # Ensure traceroute is available (needed for region detection)
+        if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
+            sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
+                   capture_output=True, timeout=60)
         # Restart gunicorn in background so this response gets out first
         sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
         return jsonify({

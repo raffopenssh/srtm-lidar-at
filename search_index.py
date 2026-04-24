@@ -2497,10 +2497,22 @@ class SearchIndex:
 
 
 def _zenodo_url(entry):
-    """Build Zenodo download URL from manifest entry."""
-    if not entry or not entry.get('bucket_url'):
+    """Build Zenodo download URL from manifest entry.
+
+    Uses the draft record files/content endpoint which works for unpublished
+    depositions (requires auth token on the server side, but is the correct
+    direct link).  Format: /api/records/<depo_id>/draft/files/<filename>/content
+    """
+    if not entry:
         return None
-    return f"{entry['bucket_url']}/{entry['filename']}"
+    depo_id = entry.get('depo_id')
+    filename = entry.get('filename')
+    if depo_id and filename:
+        return f"https://zenodo.org/api/records/{depo_id}/draft/files/{filename}/content"
+    # Fallback to bucket_url if depo_id unavailable
+    if entry.get('bucket_url') and filename:
+        return f"{entry['bucket_url']}/{filename}"
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════

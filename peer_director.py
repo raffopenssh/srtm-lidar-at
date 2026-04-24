@@ -515,6 +515,7 @@ class PeerDirector:
                 'bandwidth': bw,
                 'online': proc_status != 'unreachable',
                 'git_commit': ps.get('git_commit', ''),
+                'region': ps.get('region', ''),
             })
 
         return {

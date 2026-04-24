@@ -1018,6 +1018,37 @@ try:
 except Exception:
     _GIT_COMMIT = 'unknown'
 
+# Region lookup (once at startup via ipinfo.io)
+def _detect_region() -> str:
+    _TZ_TO_REGION = {
+        'America/Los_Angeles': 'PDX', 'America/Vancouver': 'PDX',
+        'America/New_York': 'NYC', 'America/Toronto': 'NYC',
+        'Europe/Berlin': 'FRA', 'Europe/Frankfurt': 'FRA',
+        'Europe/London': 'LON', 'Asia/Tokyo': 'TYO',
+        'Australia/Sydney': 'SYD', 'Asia/Singapore': 'SGP',
+    }
+    try:
+        import urllib.request as _ur
+        d = json.loads(_ur.urlopen('https://ipinfo.io/json', timeout=4).read())
+        tz = d.get('timezone', '')
+        for k, v in _TZ_TO_REGION.items():
+            if tz.startswith(k.split('/')[0]) or tz == k:
+                return v
+        city = (d.get('city') or '').lower()
+        if 'frankfurt' in city or 'berlin' in city: return 'FRA'
+        if 'london' in city: return 'LON'
+        if 'tokyo' in city: return 'TYO'
+        if 'sydney' in city: return 'SYD'
+        if 'singapore' in city: return 'SGP'
+        if 'new york' in city: return 'NYC'
+        return tz or '???'
+    except Exception:
+        return '???'
+try:
+    _REGION = _detect_region()
+except Exception:
+    _REGION = '???'
+
 @app.route('/api/v1/processing/status')
 def processing_status():
     """Return Austria processor progress (read from progress.json)."""
@@ -1032,6 +1063,7 @@ def processing_status():
             'recent_log': [], 'failed_kgs': [],
             'parcels_total': 0, 'buildings_total': 0, 'started_at': None,
             'git_commit': _GIT_COMMIT,
+            'region': _REGION,
         })
     try:
         data = json.loads(progress_file.read_text())
@@ -1123,6 +1155,7 @@ def processing_status():
         except Exception:
             pass
         data['throttle'] = Path('data/austria_processor/upload_throttle').exists()
+        data['region'] = _REGION
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

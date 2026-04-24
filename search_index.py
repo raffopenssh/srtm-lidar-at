@@ -518,7 +518,11 @@ class SearchIndex:
                     _zenodo_url(zf), zf.get('size'),
                     zj.get('depo_id') or zl.get('depo_id') or zf.get('depo_id'),
                 ))
-                fts_rows.append((code, kg.get('kg_name', ''), kg.get('gemeinde_name', ''), dn, sn))
+                fts_rows.append((code,
+                    self._normalize_name(kg.get('kg_name', '')),
+                    self._normalize_name(kg.get('gemeinde_name', '')),
+                    self._normalize_name(dn),
+                    self._normalize_name(sn)))
                 rowid = i + 1
                 if mn_lon and mx_lon and mn_lat and mx_lat:
                     rtree_rows.append((rowid, mn_lon, mx_lon, mn_lat, mx_lat))
@@ -1050,11 +1054,18 @@ class SearchIndex:
             'results': results,
         }
 
+    @staticmethod
+    def _normalize_name(s: str) -> str:
+        """Normalize German ß→ss for FTS indexing and querying."""
+        return s.replace('ß', 'ss').replace('SS', 'SS') if s else s
+
     def query_text(self, q, limit=20, offset=0):
         """Full-text search across KG/gemeinde/district/state names."""
         c = self._conn()
+        # Normalize ß→ss so queries like 'Viess' match 'Vießling'
+        q_norm = self._normalize_name(q)
         # Tokenize query for FTS prefix matching
-        terms = q.strip().split()
+        terms = q_norm.strip().split()
         if not terms:
             return {'total': 0, 'offset': offset, 'limit': limit, 'results': []}
         fts_q = ' '.join(t + '*' for t in terms)
@@ -1071,6 +1082,9 @@ class SearchIndex:
                 ORDER BY rank LIMIT ? OFFSET ?
             ''', (fts_q, limit, offset)).fetchall()
             results = [self._kg_summary(r) for r in rows]
+            # FTS returned nothing — try LIKE fallback (handles partial ß variants)
+            if not results:
+                raise ValueError('fts_empty')
         except Exception:
             # Fallback to LIKE
             like = f'%{q}%'

@@ -1909,10 +1909,13 @@ def processing_queue_get():
             codes = json.loads(retry_path.read_text())
         except Exception:
             pass
-    # Filter out already-completed KGs
+    # Filter out already-completed KGs, BUT keep tombstoned ones (queued for reprocessing)
     completed = _get_completed_kgs()
+    # Extract KG code (leading digits) from tombstone keys like '12362_json', '12362_full_gpkg'
+    import re as _re
+    tombstoned_kgs = {_re.match(r'^(\d+)', key).group(1) for key in _MANIFEST_TOMBSTONES if _re.match(r'^\d+', key)}
     dirty = len(codes)
-    codes = [c for c in codes if c not in completed]
+    codes = [c for c in codes if c not in completed or c in tombstoned_kgs]
     if len(codes) < dirty:
         # Persist the cleaned list
         try:
@@ -1972,18 +1975,20 @@ def processing_queue_get():
                 'SELECT kg_name, gemeinde_name, district_name, min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?',
                 (code,)
             ).fetchone()
+            is_tombstoned = code in tombstoned_kgs
             if row:
                 return {'code': code, 'name': row['kg_name'],
                         'gemeinde': row['gemeinde_name'],
                         'district': row['district_name'],
                         'failures': failure_counts.get(code, 0),
-                        'est_tiles': _est_tiles(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat'])}
-            return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0)}
+                        'est_tiles': _est_tiles(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat']),
+                        'tombstoned': is_tombstoned}
+            return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0), 'tombstoned': is_tombstoned}
         items = [_resolve(c) for c in codes]
         perm_failed_items = [_resolve(c) for c in perm_failed]
     except Exception:
-        items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0)} for c in codes]
-        perm_failed_items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0)} for c in perm_failed]
+        items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0), 'tombstoned': c in tombstoned_kgs} for c in codes]
+        perm_failed_items = [{'code': c, 'name': c, 'failures': failure_counts.get(c, 0), 'tombstoned': c in tombstoned_kgs} for c in perm_failed]
     return jsonify({
         'queue': items, 'count': len(items),
         'permanently_failed': perm_failed_items,

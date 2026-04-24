@@ -107,6 +107,9 @@
   .prio-tag.fail-2 .prio-code { color: var(--red); }
   .prio-tag.fail-perm { border-color: #6e2015; background: rgba(248,81,73,0.15); cursor: default; }
   .prio-tag.fail-perm .prio-code { color: var(--red); }
+  .prio-tag.tombstoned { border-color: #7a5c00; background: rgba(210,153,34,0.13); }
+  .prio-tag.tombstoned .prio-code { color: var(--yellow); }
+  .prio-tag .tombstone-badge { font-size: 9px; color: var(--yellow); opacity: 0.9; margin-left: 2px; }
   .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
   .prio-tiles { display: inline-flex; align-items: center; gap: 1px; margin-left: 2px; margin-right: 1px; }
   .prio-tiles .t-block { width: 3px; height: 8px; border-radius: 1px; opacity: 0.7; }
@@ -216,6 +219,7 @@
   .kg-ac-dd .ac-item .ac-loc { color: var(--dim); font-size: 10px; }
   .kg-ac-dd .ac-item .ac-done { color: var(--green); font-size: 9px; margin-left: 4px; }
   .kg-ac-dd .ac-item .ac-queued { color: var(--yellow); font-size: 9px; margin-left: 4px; }
+  .kg-ac-dd .ac-item .ac-warn { color: #e3a020; font-size: 9px; margin-left: 4px; font-weight: 600; }
   .kg-ac-dd .ac-empty { padding: 8px 10px; font-size: 11px; color: var(--dim); font-style: italic; }
 
   /* Zenodo filter */
@@ -1738,13 +1742,19 @@ async function submitPriority() {
       document.getElementById('priorityStatus').style.color = 'var(--red)';
       return;
     }
-    let msg = `✓ ${d.queued} KGs queued`;
-    if (d.already_processed > 0) msg += `, ${d.already_processed} already done`;
+    let msg = d.queued > 0 ? `✓ ${d.queued} KGs queued` : 'No new KGs to queue';
     if (d.already_in_queue > 0) msg += `, ${d.already_in_queue} already queued`;
     document.getElementById('priorityStatus').textContent = msg;
-    document.getElementById('priorityStatus').style.color = 'var(--green)';
-    if (_prioRect) _prioRect.setStyle({color: '#3fb950'});
-    setTimeout(() => cancelPriority(), 3000);
+    document.getElementById('priorityStatus').style.color = d.queued > 0 ? 'var(--green)' : 'var(--dim)';
+    if (d.already_processed > 0) {
+      const warn = document.createElement('span');
+      warn.textContent = ` — ⚠ ${d.already_processed} already processed (skipped)`;
+      warn.style.color = '#e3a020';
+      const st = document.getElementById('priorityStatus');
+      st.appendChild(warn);
+    }
+    if (_prioRect) _prioRect.setStyle({color: d.queued > 0 ? '#3fb950' : '#e3a020'});
+    setTimeout(() => cancelPriority(), 4000);
     // Refresh the queue display
     fetchPrioQueue();
   } catch(err) {
@@ -1811,14 +1821,17 @@ function renderPrioQueue() {
   _prioQueue.forEach((kg, i) => {
     const tag = document.createElement('span');
     const fc = _failClass(kg.failures);
-    tag.className = 'prio-tag' + (fc ? ' ' + fc : '');
+    const isTomb = !!kg.tombstoned;
+    tag.className = 'prio-tag' + (isTomb ? ' tombstoned' : (fc ? ' ' + fc : ''));
     tag.draggable = true;
     tag.dataset.idx = i;
     tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
       (kg.failures ? ' · ' + kg.failures + ' failure(s)' : '') +
-      (kg.est_tiles ? ' · ~' + kg.est_tiles + ' tiles' : '');
+      (kg.est_tiles ? ' · ~' + kg.est_tiles + ' tiles' : '') +
+      (isTomb ? ' · queued for reprocessing (was already processed)' : '');
+    const tombBadge = isTomb ? '<span class="tombstone-badge" title="Previously processed — queued for reprocessing">↺</span>' : '';
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
+      esc(kg.name) + tombBadge + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
       '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
     // Drag events
     tag.addEventListener('dragstart', e => {
@@ -1966,7 +1979,7 @@ async function savePrioQueue() {
       el.className = 'ac-item' + (i === _acSel ? ' ac-sel' : '');
       let extra = '';
       if (queued.has(kg.code)) extra = '<span class="ac-queued">queued</span>';
-      else if (kg.processed) extra = '<span class="ac-done">✓ done</span>';
+      else if (kg.processed) extra = '<span class="ac-warn">⚠ already processed</span>';
       const loc = [kg.gemeinde, kg.district].filter(Boolean).join(' · ');
       el.innerHTML = '<span class="ac-code">' + esc(kg.code) + '</span>' +
         '<span class="ac-name">' + esc(kg.name) + '</span>' +
@@ -1980,9 +1993,18 @@ async function savePrioQueue() {
   async function pickKg(kg) {
     dd.style.display = 'none';
     inp.value = '';
-    // Confirm re-process for already-processed KGs (will tombstone manifest)
-    if (kg.processed && !confirm('KG ' + kg.code + ' ' + kg.name + ' is already processed.\nRe-queue for reprocessing? This will remove its manifest entries.')) {
-      return;
+    // Warn for already-processed KGs
+    if (kg.processed) {
+      const alreadyQueued = queuedCodes().has(kg.code);
+      if (alreadyQueued) {
+        inp.style.borderColor = 'var(--yellow)';
+        inp.placeholder = '⚠ ' + kg.name + ' is already in the queue';
+        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 3000);
+        return;
+      }
+      if (!confirm('⚠ KG ' + kg.code + ' "' + kg.name + '" has already been processed.\n\nRe-queue for reprocessing? Its Zenodo manifest entries will be cleared so the new result can be uploaded.')) {
+        return;
+      }
     }
     try {
       const r = await fetch('/api/v1/processing/queue', {
@@ -1994,8 +2016,8 @@ async function savePrioQueue() {
       if (r.ok) {
         const tombstoned = (d.tombstoned || []).length;
         inp.style.borderColor = 'var(--green)';
-        inp.placeholder = '✓ ' + kg.name + ' queued' + (tombstoned ? ' (manifest cleared)' : '');
-        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 3000);
+        inp.placeholder = '✓ ' + kg.name + (kg.processed ? ' queued for reprocessing' : ' queued') + (tombstoned ? ' (manifest cleared)' : '');
+        setTimeout(() => { inp.style.borderColor = ''; inp.placeholder = 'Queue KG by name…'; }, 3500);
         fetchPrioQueue();
       } else {
         inp.style.borderColor = 'var(--red)';

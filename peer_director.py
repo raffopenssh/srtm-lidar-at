@@ -26,6 +26,15 @@ import requests
 
 log = logging.getLogger(__name__)
 
+# Git commit hash (read once at import)
+try:
+    _LOCAL_GIT_COMMIT = subprocess.check_output(
+        ['git', 'rev-parse', '--short', 'HEAD'],
+        cwd=str(Path(__file__).parent), stderr=subprocess.DEVNULL
+    ).decode().strip()
+except Exception:
+    _LOCAL_GIT_COMMIT = 'unknown'
+
 DATA_DIR = Path('data/austria_processor')
 PEERS_CONFIG = DATA_DIR / 'peers.json'
 DIRECTOR_STATE = DATA_DIR / 'director_state.json'
@@ -205,10 +214,11 @@ def get_peer_status(peer_url: str | None) -> dict:
                 except Exception:
                     if d.get('state') in ('running', 'processing'):
                         d['state'] = 'stopped'
+                d.setdefault('git_commit', _LOCAL_GIT_COMMIT)
                 return d
             except Exception:
                 pass
-        return {'state': 'idle'}
+        return {'state': 'idle', 'git_commit': _LOCAL_GIT_COMMIT}
     try:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/processing/status',
@@ -504,6 +514,7 @@ class PeerDirector:
                 'completed': ps.get('completed', 0),
                 'bandwidth': bw,
                 'online': proc_status != 'unreachable',
+                'git_commit': ps.get('git_commit', ''),
             })
 
         return {

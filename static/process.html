@@ -1508,6 +1508,7 @@ async function poll() {
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     else fetchManifestSummary();
     const commitHash = d.git_commit || '';
+    _localCommit = commitHash;
     document.getElementById('lastPoll').textContent = new Date().toLocaleTimeString()
       + (commitHash ? ' · ' + commitHash : '');
     dot.style.background = 'var(--green)';
@@ -2013,6 +2014,7 @@ async function savePrioQueue() {
 // ── Peer Status ─────────────────────────────────────────────────
 let _peerData = null;
 let _directorData = null;
+let _localCommit = '';  // local git commit from polling status
 
 async function fetchDirectorStatus() {
   try {
@@ -2048,6 +2050,17 @@ function renderDirector(d) {
 
   // Render peer cards — active/running peers expanded, inactive collapsed
   const container = document.getElementById('directorPeers');
+  function versionTag(p) {
+    const commit = p.git_commit || '';
+    if (!commit) return '';
+    const stale = _localCommit && commit !== _localCommit;
+    const color = stale ? 'var(--yellow)' : 'var(--dim)';
+    let tag = '<span style="font-size:9px;color:' + color + ';font-family:monospace" title="git ' + esc(commit) + '">' + esc(commit) + '</span>';
+    if (stale && p.url !== null) {
+      tag += ' <button id="btn-update-' + esc(p.id) + '" class="btn" style="font-size:8px;padding:0 3px;line-height:14px;color:var(--yellow);border-color:var(--yellow)" onclick="event.stopPropagation();updateSinglePeer(\'' + esc(p.id) + '\')" title="Update to ' + esc(_localCommit) + '">⬆</button>';
+    }
+    return tag;
+  }
   let html = '';
   for (const p of peers) {
     const isActive = p.id === active;
@@ -2078,6 +2091,8 @@ function renderDirector(d) {
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
       html += ' · ' + (p.completed||0) + ' done';
       if (isScheduled && p.not_before) html += ' · <span style="color:var(--yellow)">⏳ until ' + esc(p.not_before) + '</span>';
+      const vtInline = versionTag(p);
+      if (vtInline) html += ' · ' + vtInline;
       html += '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
       if (p.url !== null) html += '<span style="font-size:11px;color:var(--dim);cursor:pointer;opacity:0.5;transition:opacity 0.15s" onmouseover="this.style.opacity=1;this.style.color=\'var(--red)\'" onmouseout="this.style.opacity=0.5;this.style.color=\'var(--dim)\'" onclick="event.stopPropagation();deletePeer(\'' + esc(p.id) + '\')" title="Remove peer">✕</span>';
@@ -2107,7 +2122,10 @@ function renderDirector(d) {
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
       html += '</div>';
-      html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done</div>';
+      html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done';
+      const vtExp = versionTag(p);
+      if (vtExp) html += ' · ' + vtExp;
+      html += '</div>';
     }
 
     // Bandwidth bar (always shown in detail)
@@ -2195,10 +2213,30 @@ async function updatePeers() {
     const r = await fetch('/api/v1/director/update_peers', {method:'POST'});
     const d = await r.json();
     btn.textContent = '\u2705 Done';
-    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
+    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; fetchDirectorStatus(); }, 3000);
   } catch(e) {
     btn.textContent = '\u274c Failed';
     setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
+  }
+}
+
+async function updateSinglePeer(peerId) {
+  const btn = document.getElementById('btn-update-' + peerId);
+  if (!btn) return;
+  btn.textContent = '\u23f3';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/v1/director/update_peers', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({peer_id: peerId})
+    });
+    const d = await r.json();
+    const res = (d.results || {})[peerId] || {};
+    btn.textContent = res.status === 'updated' ? '\u2705' : '\u274c';
+    setTimeout(() => { fetchDirectorStatus(); }, 3000);
+  } catch(e) {
+    btn.textContent = '\u274c';
+    setTimeout(() => { fetchDirectorStatus(); }, 3000);
   }
 }
 

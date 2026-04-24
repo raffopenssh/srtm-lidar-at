@@ -1031,6 +1031,7 @@ def processing_status():
             'elapsed_seconds': 0, 'eta_seconds': 0,
             'recent_log': [], 'failed_kgs': [],
             'parcels_total': 0, 'buildings_total': 0, 'started_at': None,
+            'git_commit': _GIT_COMMIT,
         })
     try:
         data = json.loads(progress_file.read_text())
@@ -2379,11 +2380,17 @@ def director_proxy_log():
 
 @app.route('/api/v1/director/update_peers', methods=['POST'])
 def director_update_peers():
-    """Tell all remote peers to git pull and restart their web servers."""
+    """Tell all remote peers to git pull and restart their web servers.
+    Optional body: {"peer_id": "at3"} to update a single peer.
+    """
+    body = request.get_json(silent=True) or {}
+    target_id = body.get('peer_id')
     cfg = pd.load_peers_config()
     results = {}
     for peer in cfg.get('peers', []):
         if peer.get('url'):  # skip local
+            if target_id and peer['id'] != target_id:
+                continue
             results[peer['id']] = pd.trigger_peer_update(peer['url'])
     return jsonify({'results': results})
 

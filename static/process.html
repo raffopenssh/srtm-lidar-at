@@ -2219,6 +2219,9 @@ async function setDirectorMode(mode) {
 }
 
 async function deletePeer(peerId) {
+  const pw = prompt('Password required to remove peer "' + peerId + '":');
+  if (pw === null) return;
+  if (pw !== 'raffi') { alert('Wrong password'); return; }
   if (!confirm('Remove peer "' + peerId + '"? This will stop its processor and remove it from the director.')) return;
   try {
     const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId), {

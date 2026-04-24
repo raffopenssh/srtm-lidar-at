@@ -6957,6 +6957,26 @@ def _remove_from_retry_queue(kg_code: str):
         pass
 
 
+def _clear_tombstones(kg_code: str):
+    """Remove manifest tombstone entries for a KG after successful reprocessing."""
+    tombstone_path = DATA_DIR / "manifest_tombstones.json"
+    try:
+        if not tombstone_path.exists():
+            return
+        tombstones = json.loads(tombstone_path.read_text())
+        keys_to_remove = [k for k in tombstones if k.startswith(kg_code + '_')]
+        if not keys_to_remove:
+            return
+        for k in keys_to_remove:
+            del tombstones[k]
+        tmp = tombstone_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(tombstones, indent=2))
+        tmp.replace(tombstone_path)
+        log.info("KG %s: cleared %d tombstone(s): %s", kg_code, len(keys_to_remove), keys_to_remove)
+    except Exception as e:
+        log.warning("KG %s: failed to clear tombstones: %s", kg_code, e)
+
+
 def _append_retry_queue(kg_code: str):
     """Append a KG code to the retry queue file (atomic)."""
     try:
@@ -7851,6 +7871,10 @@ def main():
 
                 # Remove from priority queue file now that it's done
                 _remove_from_retry_queue(kg_code)
+
+                # Clear any tombstone entries so the dashboard stops showing
+                # this KG as pending reprocessing.
+                _clear_tombstones(kg_code)
 
                 # Proactively flush tile cache to Zenodo so tiles
                 # survive disk cleanup between KGs.

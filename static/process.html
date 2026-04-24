@@ -218,6 +218,31 @@
   .kg-ac-dd .ac-item .ac-queued { color: var(--yellow); font-size: 9px; margin-left: 4px; }
   .kg-ac-dd .ac-empty { padding: 8px 10px; font-size: 11px; color: var(--dim); font-style: italic; }
 
+  /* Zenodo filter */
+  .zen-filter-bar { display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+    border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 0; z-index: 2; }
+  .zen-filter-bar .zen-filter-inp { flex: 1; min-width: 0; padding: 4px 8px; font-size: 11px;
+    border-radius: 4px; border: 1px solid var(--border); background: var(--card); color: var(--text);
+    outline: none; font-family: inherit; }
+  .zen-filter-bar .zen-filter-inp:focus { border-color: var(--blue); }
+  .zen-filter-bar .zen-filter-inp::placeholder { color: var(--dim); }
+  .zen-filter-clear { background: none; border: none; color: var(--dim); cursor: pointer;
+    font-size: 13px; padding: 0 2px; line-height: 1; }
+  .zen-filter-clear:hover { color: var(--text); }
+  .zen-filter-badge { font-size: 10px; color: var(--blue); white-space: nowrap; }
+  .zen-filter-wrap { position: relative; flex: 1; min-width: 0; }
+  .zen-filter-dd { position: absolute; top: 100%; left: 0; right: 0; margin-top: 2px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 9999; overflow: hidden;
+    max-height: 220px; overflow-y: auto; display: none; }
+  .zen-filter-dd .ac-item { display: flex; align-items: baseline; gap: 6px; padding: 5px 10px;
+    font-size: 11px; cursor: pointer; transition: background 0.1s; }
+  .zen-filter-dd .ac-item:hover, .zen-filter-dd .ac-item.ac-sel { background: rgba(88,166,255,0.1); }
+  .zen-filter-dd .ac-item .ac-name { color: var(--text); flex: 1; }
+  .zen-filter-dd .ac-item .ac-code { color: var(--dim); font-size: 10px; min-width: 40px; }
+  .zen-filter-dd .ac-item .ac-loc { color: var(--dim); font-size: 10px; }
+  .zen-filter-dd .ac-empty { padding: 8px 10px; font-size: 11px; color: var(--dim); font-style: italic; }
+
   /* Collapsible */
   .coll-h { cursor: pointer; user-select: none; }
   .coll-h .arr { transition: transform 0.2s; display: inline-block; font-size: 9px; margin-right: 4px; }
@@ -522,7 +547,16 @@
       <span><span class="arr">▶</span> Zenodo Manifest <span style="color:var(--dim)" id="zenSummary">0 entries · 0 B</span></span>
     </div>
     <div class="coll-b" id="zenBody">
-      <div class="card" style="overflow-x:auto;padding:0;max-height:300px;overflow-y:auto">
+      <div class="card" style="overflow-x:auto;padding:0;max-height:340px;overflow-y:auto">
+        <div class="zen-filter-bar">
+          <span style="font-size:11px;color:var(--dim)">🔍</span>
+          <div class="zen-filter-wrap">
+            <input type="text" class="zen-filter-inp" id="zenFilterInput" placeholder="Filter by KG code or name…" autocomplete="off" spellcheck="false">
+            <div class="zen-filter-dd" id="zenFilterDropdown"></div>
+          </div>
+          <span class="zen-filter-badge" id="zenFilterBadge"></span>
+          <button class="zen-filter-clear" id="zenFilterClear" title="Clear filter" style="display:none">✕</button>
+        </div>
         <table id="zenTbl">
           <thead><tr>
             <th class="zen-hide-sm zen-th-key">Key</th>
@@ -1261,6 +1295,34 @@ async function fetchManifestSummary() {
   }
 }
 
+let _zenFilterCode = '';  // active KG code filter for manifest
+let _zenFilterLabel = ''; // display label for active filter
+
+function _zenManifestRow(e) {
+  const url = e.download_url || (e.depo_id && e.filename
+    ? 'https://zenodo.org/api/records/' + e.depo_id + '/draft/files/' + encodeURIComponent(e.filename) + '/content'
+    : e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '');
+  const md5 = (e.checksum||'').substring(0,12);
+  const fname = esc(e.filename||'—');
+  const uploaded = e.uploaded_at ? (() => {
+    const dt = new Date(e.uploaded_at);
+    const dd = String(dt.getDate()).padStart(2,'0');
+    const mm = String(dt.getMonth()+1).padStart(2,'0');
+    const hh = String(dt.getHours()).padStart(2,'0');
+    const min = String(dt.getMinutes()).padStart(2,'0');
+    return dd+'/'+mm+' '+hh+':'+min;
+  })() : '—';
+  return '<tr>' +
+    '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
+    '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
+    '<td title="' + fname + '">' + fname + '</td>' +
+    '<td>' + fmtB(e.size||0) + '</td>' +
+    '<td class="zen-hide-sm" title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
+    '<td title="' + uploaded + '">' + uploaded + '</td>' +
+    '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)"><span class="zen-url-full">&#x2913; link</span><span class="zen-url-icon">&#x2913;</span></a>' : '—') + '</td>' +
+    '</tr>';
+}
+
 async function fetchManifest() {
   // Called when panel is open — updates summary + full table
   const d = await fetchManifestData();
@@ -1269,34 +1331,153 @@ async function fetchManifest() {
     fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
   const entries = d.entries || {};
   const keys = Object.keys(entries).sort();
-  const sorted = keys.map(k => ({key:k, ...entries[k]}))
-    .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''))
-    .slice(0, 200);
-  document.querySelector('#zenTbl tbody').innerHTML = sorted.map(e => {
-    const url = e.download_url || (e.depo_id && e.filename
-      ? 'https://zenodo.org/api/records/' + e.depo_id + '/draft/files/' + encodeURIComponent(e.filename) + '/content'
-      : e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '');
-    const md5 = (e.checksum||'').substring(0,12);
-    const fname = esc(e.filename||'—');
-    const uploaded = e.uploaded_at ? (() => {
-      const dt = new Date(e.uploaded_at);
-      const dd = String(dt.getDate()).padStart(2,'0');
-      const mm = String(dt.getMonth()+1).padStart(2,'0');
-      const hh = String(dt.getHours()).padStart(2,'0');
-      const min = String(dt.getMinutes()).padStart(2,'0');
-      return dd+'/'+mm+' '+hh+':'+min;
-    })() : '—';
-    return '<tr>' +
-      '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
-      '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
-      '<td title="' + fname + '">' + fname + '</td>' +
-      '<td>' + fmtB(e.size||0) + '</td>' +
-      '<td class="zen-hide-sm" title="' + esc(e.checksum||'') + '">' + (md5||'—') + '</td>' +
-      '<td title="' + uploaded + '">' + uploaded + '</td>' +
-      '<td style="text-align:center">' + (url ? '<a href="'+esc(url)+'" target="_blank" style="color:var(--blue)"><span class="zen-url-full">&#x2913; link</span><span class="zen-url-icon">&#x2913;</span></a>' : '—') + '</td>' +
-      '</tr>';
-  }).join('');
+  let sorted = keys.map(k => ({key:k, ...entries[k]}))
+    .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''));
+  // Apply filter
+  const fc = _zenFilterCode;
+  if (fc) {
+    sorted = sorted.filter(e => {
+      const fname = (e.filename || '').toLowerCase();
+      const key = (e.key || '').toLowerCase();
+      return fname.startsWith(fc.toLowerCase()) || key.toLowerCase().includes(fc.toLowerCase());
+    });
+    document.getElementById('zenFilterBadge').textContent = sorted.length + ' match' + (sorted.length !== 1 ? 'es' : '');
+  } else {
+    document.getElementById('zenFilterBadge').textContent = '';
+  }
+  sorted = sorted.slice(0, 200);
+  document.querySelector('#zenTbl tbody').innerHTML = sorted.map(_zenManifestRow).join('');
 }
+
+// ── Zenodo Filter ───────────────────────────────────────────────────────
+(function() {
+  const inp = document.getElementById('zenFilterInput');
+  const dd = document.getElementById('zenFilterDropdown');
+  const clearBtn = document.getElementById('zenFilterClear');
+  let _timer = null;
+  let _results = [];
+  let _sel = -1;
+  let _abort = null;
+
+  function applyFilter(code, label) {
+    _zenFilterCode = code;
+    _zenFilterLabel = label;
+    if (code) {
+      inp.value = label || code;
+      clearBtn.style.display = '';
+    } else {
+      inp.value = '';
+      clearBtn.style.display = 'none';
+    }
+    dd.style.display = 'none';
+    // Force re-render
+    lastManFetch = 0;
+    fetchManifest();
+  }
+
+  clearBtn.addEventListener('click', () => applyFilter('', ''));
+
+  async function doSearch(q) {
+    if (_abort) _abort.abort();
+    _abort = new AbortController();
+    try {
+      const r = await fetch('/api/v1/query?q=' + encodeURIComponent(q) + '&limit=8', {signal: _abort.signal});
+      const d = await r.json();
+      _results = (d.results || []).map(kg => ({
+        code: kg.kg_code,
+        name: kg.kg_name || '',
+        gemeinde: kg.gemeinde_name || '',
+        district: kg.district_name || '',
+      }));
+      // If query is a pure number, add direct code match at top
+      if (/^\d+$/.test(q) && !_results.find(r => r.code === q)) {
+        _results.unshift({code: q, name: '', gemeinde: '', district: '', directCode: true});
+      }
+      _sel = -1;
+      renderDd();
+    } catch(e) {
+      if (e.name !== 'AbortError') dd.style.display = 'none';
+    }
+  }
+
+  function renderDd() {
+    if (!_results.length) {
+      dd.innerHTML = '<div class="ac-empty">No matches</div>';
+      dd.style.display = 'block';
+      return;
+    }
+    dd.innerHTML = '';
+    _results.forEach((kg, i) => {
+      const el = document.createElement('div');
+      el.className = 'ac-item' + (i === _sel ? ' ac-sel' : '');
+      const loc = [kg.gemeinde, kg.district].filter(Boolean).join(' \u00b7 ');
+      if (kg.directCode) {
+        el.innerHTML = '<span class="ac-code">' + esc(kg.code) + '</span>' +
+          '<span class="ac-name" style="color:var(--dim)">filter by code</span>';
+      } else {
+        el.innerHTML = '<span class="ac-code">' + esc(kg.code) + '</span>' +
+          '<span class="ac-name">' + esc(kg.name) + '</span>' +
+          (loc ? '<span class="ac-loc">' + esc(loc) + '</span>' : '');
+      }
+      el.addEventListener('mousedown', e => {
+        e.preventDefault();
+        const label = kg.name ? kg.code + ' \u2014 ' + kg.name : kg.code;
+        applyFilter(kg.code, label);
+      });
+      dd.appendChild(el);
+    });
+    dd.style.display = 'block';
+  }
+
+  inp.addEventListener('input', () => {
+    clearTimeout(_timer);
+    const q = inp.value.trim();
+    if (q.length < 2) {
+      dd.style.display = 'none';
+      _results = [];
+      if (_zenFilterCode && q === '') applyFilter('', '');
+      return;
+    }
+    _timer = setTimeout(() => doSearch(q), 200);
+  });
+
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      dd.style.display = 'none';
+      return;
+    }
+    if (!_results.length || dd.style.display === 'none') {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const q = inp.value.trim();
+        if (q) applyFilter(q, q);
+      }
+      return;
+    }
+    if (e.key === 'ArrowDown') { e.preventDefault(); _sel = Math.min(_sel + 1, _results.length - 1); renderDd(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); _sel = Math.max(_sel - 1, 0); renderDd(); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (_sel >= 0 && _sel < _results.length) {
+        const kg = _results[_sel];
+        const label = kg.name ? kg.code + ' \u2014 ' + kg.name : kg.code;
+        applyFilter(kg.code, label);
+      } else {
+        const q = inp.value.trim();
+        if (q) applyFilter(q, q);
+      }
+    }
+  });
+
+  inp.addEventListener('blur', () => {
+    setTimeout(() => { dd.style.display = 'none'; }, 150);
+  });
+
+  inp.addEventListener('focus', () => {
+    if (_zenFilterCode) inp.select();
+    if (_results.length && inp.value.trim().length >= 2) renderDd();
+  });
+})();
 
 // ── Main Poll ───────────────────────────────────────────────────
 async function poll() {

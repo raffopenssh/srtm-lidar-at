@@ -2440,8 +2440,8 @@ def admin_update():
         # Git pull
         pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
                       timeout=30, cwd=repo)
-        # Restart gunicorn
-        sp.run(['sudo', 'systemctl', 'restart', 'srv'], timeout=10)
+        # Restart gunicorn in background so this response gets out first
+        sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
         return jsonify({
             'status': 'updated',
             'git': pull.stdout.strip(),

@@ -384,13 +384,22 @@ def stop_peer_processor(peer_url: str | None) -> dict:
 
 
 def trigger_peer_update(peer_url: str) -> dict:
-    """Tell a remote peer to git pull and restart its web server."""
+    """Tell a remote peer to git pull and restart its web server.
+    The peer kills itself on restart so the connection always drops — treat
+    any ConnectionError/ReadTimeout after the request was sent as success.
+    """
     try:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/admin/update',
-            timeout=60
+            timeout=15
         )
         return r.json()
+    except requests.exceptions.ConnectionError:
+        # Expected: peer restarted and dropped the connection
+        return {'status': 'restarting'}
+    except requests.exceptions.ReadTimeout:
+        # Expected: restart took longer than read timeout
+        return {'status': 'restarting'}
     except Exception as e:
         return {'error': str(e)}
 

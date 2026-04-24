@@ -1377,22 +1377,35 @@ async function fetchManifest() {
 
   clearBtn.addEventListener('click', () => applyFilter('', ''));
 
+  // Extract unique KG codes present in the manifest
+  function _manifestKgCodes() {
+    if (!_lastManData || !_lastManData.entries) return new Set();
+    const codes = new Set();
+    for (const [key, e] of Object.entries(_lastManData.entries)) {
+      const fname = e.filename || '';
+      const m = fname.match(/^(\d+)/);
+      if (m) codes.add(m[1]);
+    }
+    return codes;
+  }
+
   async function doSearch(q) {
     if (_abort) _abort.abort();
     _abort = new AbortController();
+    const manifestCodes = _manifestKgCodes();
     try {
-      const r = await fetch('/api/v1/query?q=' + encodeURIComponent(q) + '&limit=8', {signal: _abort.signal});
+      const r = await fetch('/api/v1/query?q=' + encodeURIComponent(q) + '&limit=50', {signal: _abort.signal});
       const d = await r.json();
-      _results = (d.results || []).map(kg => ({
-        code: kg.kg_code,
-        name: kg.kg_name || '',
-        gemeinde: kg.gemeinde_name || '',
-        district: kg.district_name || '',
-      }));
-      // If query is a pure number, add direct code match at top
-      if (/^\d+$/.test(q) && !_results.find(r => r.code === q)) {
-        _results.unshift({code: q, name: '', gemeinde: '', district: '', directCode: true});
-      }
+      // Only show KGs that exist in the manifest
+      _results = (d.results || [])
+        .filter(kg => manifestCodes.has(kg.kg_code))
+        .slice(0, 8)
+        .map(kg => ({
+          code: kg.kg_code,
+          name: kg.kg_name || '',
+          gemeinde: kg.gemeinde_name || '',
+          district: kg.district_name || '',
+        }));
       _sel = -1;
       renderDd();
     } catch(e) {

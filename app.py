@@ -2373,15 +2373,12 @@ def admin_update():
     try:
         import subprocess as sp
         repo = str(Path(__file__).parent)
-        # Stash local changes (e.g. manifest) so ff-only pull succeeds
-        sp.run(['git', 'stash', '--include-untracked'], capture_output=True, text=True,
-               timeout=15, cwd=repo)
+        # Reset any tracked files that have local modifications (e.g. manifest)
+        sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
+               timeout=10, cwd=repo)
         # Git pull
         pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
                       timeout=30, cwd=repo)
-        # Pop stash (ignore errors if stash was empty)
-        sp.run(['git', 'stash', 'pop'], capture_output=True, text=True,
-               timeout=15, cwd=repo)
         # Restart gunicorn
         sp.run(['sudo', 'systemctl', 'restart', 'srv'], timeout=10)
         return jsonify({

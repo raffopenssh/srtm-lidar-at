@@ -2066,6 +2066,11 @@ function renderDirector(d) {
 
   // Render peer cards — active/running peers expanded, inactive collapsed
   const container = document.getElementById('directorPeers');
+  function regionTag(id) {
+    const n = id === 'primary' ? 0 : parseInt((id.match(/\d+$/)||[0])[0]);
+    const region = (n >= 6 && n <= 10) ? 'FRA' : 'PDX';
+    return '<span style="font-size:9px;color:var(--dim);font-family:monospace">' + region + '</span>';
+  }
   function versionTag(p) {
     const commit = p.git_commit || '';
     if (!commit) return '';
@@ -2107,6 +2112,7 @@ function renderDirector(d) {
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
       html += ' · ' + (p.completed||0) + ' done';
       if (isScheduled && p.not_before) html += ' · <span style="color:var(--yellow)">⏳ until ' + esc(p.not_before) + '</span>';
+      html += ' · ' + regionTag(p.id);
       const vtInline = versionTag(p);
       if (vtInline) html += ' · ' + vtInline;
       html += '</span>';
@@ -2139,6 +2145,7 @@ function renderDirector(d) {
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
       html += '</div>';
       html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done';
+      html += ' · ' + regionTag(p.id);
       const vtExp = versionTag(p);
       if (vtExp) html += ' · ' + vtExp;
       html += '</div>';

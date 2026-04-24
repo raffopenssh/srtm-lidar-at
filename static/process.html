@@ -1273,9 +1273,9 @@ async function fetchManifest() {
     .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''))
     .slice(0, 200);
   document.querySelector('#zenTbl tbody').innerHTML = sorted.map(e => {
-    const url = e.depo_id && e.filename
+    const url = e.download_url || (e.depo_id && e.filename
       ? 'https://zenodo.org/api/records/' + e.depo_id + '/draft/files/' + encodeURIComponent(e.filename) + '/content'
-      : e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '';
+      : e.bucket_url ? e.bucket_url + '/' + (e.filename||'') : '');
     const md5 = (e.checksum||'').substring(0,12);
     const fname = esc(e.filename||'—');
     const uploaded = e.uploaded_at ? (() => {

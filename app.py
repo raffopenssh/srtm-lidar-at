@@ -2095,8 +2095,15 @@ def processing_manifest():
     if not manifest_path.exists():
         return jsonify({'entries': {}, 'count': 0})
     try:
+        from zenodo_client import DEFAULT_TOKEN
         data = json.loads(manifest_path.read_text())
         entries = data.get('entries', {})
+        # Add authenticated download URLs for the dashboard
+        for e in entries.values():
+            depo_id = e.get('depo_id')
+            fn = e.get('filename')
+            if depo_id and fn:
+                e['download_url'] = f'https://zenodo.org/api/records/{depo_id}/draft/files/{fn}/content?access_token={DEFAULT_TOKEN}'
         return jsonify({
             'count': len(entries),
             'entries': entries,

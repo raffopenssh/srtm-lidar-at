@@ -66,7 +66,7 @@ THROTTLE_FILE = DATA_DIR / "upload_throttle"
 
 MAX_KG_PIXELS = 4_000_000
 KG_TIMEOUT_SECONDS = 12 * 60 * 60       # 12 hours — first attempt
-KG_RETRY_TIMEOUT_SECONDS = 3 * 60 * 60  # 3 hours — retry attempt (checkpoints restore completed tiles)
+KG_RETRY_TIMEOUT_SECONDS = 9 * 60 * 60  # 9 hours — retry attempt (checkpoints restore completed tiles)
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
@@ -6131,19 +6131,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 4b. Evict caches not needed for GPKG build ---
         # The GPKG build phase can produce multi-GB files.  Free disk
-        # space by purging tile checkpoints (all tiles are merged in
-        # memory already) and evicting stale data caches.
+        # space by evicting stale data caches.  Tile checkpoints are
+        # intentionally kept here — if the GPKG build times out the
+        # retry attempt can restore all tiles and only redo the build.
+        # Checkpoints are deleted after the full GPKG is written (step 5b).
         _report_step("disk_cleanup", "freeing disk for GPKG build")
         try:
-            # Tile checkpoints are only needed for crash-recovery of
-            # the tile loop.  By this point all tiles are merged.
             import shutil as _shutil_ev
-            _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
-            if _ckpt_dir.exists():
-                _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
-                _shutil_ev.rmtree(_ckpt_dir, ignore_errors=True)
-                log.info("  Freed %.0f MB tile checkpoints before GPKG build",
-                         _ckpt_sz / 1e6)
             # Evict BEV + ortho caches (cheap to re-fetch via COG range reads)
             _usage = _shutil_ev.disk_usage("/")
             _free_gb = _usage.free / (1024 ** 3)
@@ -6226,6 +6220,22 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 except Exception as _ue:
                     log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
         gc.collect()
+
+        # --- 5c. Free tile checkpoints now that full GPKG is written ---
+        # The full GPKG (or its upload) is the last step that needs raster
+        # data from the tile results.  Deleting checkpoints here lets the
+        # retry path skip all tiles if it only timed out during the GPKG
+        # build phase.
+        try:
+            import shutil as _shutil_ckpt
+            _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+            if _ckpt_dir.exists():
+                _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
+                _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
+                log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
+                         _ckpt_sz / 1e6)
+        except Exception as _ckpt_e:
+            log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
 
         # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"

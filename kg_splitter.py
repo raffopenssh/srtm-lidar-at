@@ -23,7 +23,7 @@ from collections import defaultdict
 log = logging.getLogger(__name__)
 
 # Maximum tiles per block — tuned for hardware/time constraints
-MAX_TILES_PER_BLOCK = 28
+MAX_TILES_PER_BLOCK = 22
 
 
 def _compute_n_tiles(west, south, east, north, tile_km=1.5, overlap_km=0.1):

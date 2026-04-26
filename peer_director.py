@@ -49,7 +49,10 @@ DIRECTOR_POLL_INTERVAL = 30
 # Grace period after stopping a peer before starting another (seconds)
 SWITCH_COOLDOWN = 10
 # HTTP timeout for peer API calls
-PEER_TIMEOUT = 15
+PEER_TIMEOUT = 30
+# Number of consecutive unreachable polls before failover (avoids killing
+# peers during heavy GPKG builds that briefly starve gunicorn).
+UNREACHABLE_FAILOVER_THRESHOLD = 3
 
 
 def _default_peers_config() -> dict:
@@ -711,10 +714,27 @@ class PeerDirector:
                             self.state['active_peer'] = None
                             active_id = None
                 elif proc_state == 'unreachable':
-                    log.warning('Active peer %s unreachable', active_id)
+                    # Don't fail over on a single timeout — heavy GPKG builds
+                    # can briefly starve gunicorn. Require N consecutive misses.
                     with self._lock:
-                        self.state['active_peer'] = None
-                        active_id = None
+                        misses = self.state.get('unreachable_count', {})
+                        misses[active_id] = misses.get(active_id, 0) + 1
+                        self.state['unreachable_count'] = misses
+                        n = misses[active_id]
+                    if n >= UNREACHABLE_FAILOVER_THRESHOLD:
+                        log.warning('Active peer %s unreachable %d times — failing over',
+                                    active_id, n)
+                        with self._lock:
+                            self.state['unreachable_count'].pop(active_id, None)
+                            self.state['active_peer'] = None
+                            active_id = None
+                    else:
+                        log.info('Active peer %s unreachable (%d/%d) — waiting',
+                                 active_id, n, UNREACHABLE_FAILOVER_THRESHOLD)
+                else:
+                    # Reachable — clear miss counter
+                    with self._lock:
+                        self.state.get('unreachable_count', {}).pop(active_id, None)
 
         # Enforce single-active: stop any non-active peers that are running
         # (they may have been started independently or before director took over)

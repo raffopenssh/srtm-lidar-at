@@ -68,6 +68,8 @@ body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overf
       <option value="/api/v1/flags/match">/flags/match</option>
       <option value="/api/v1/flags/stats">/flags/stats</option>
       <option value="/api/v1/feedback">/feedback (list)</option>
+      <option value="/api/v1/flags/events">/flags/events (audit log)</option>
+      <option value="/api/v1/feedback/events">/feedback/events (audit log)</option>
       <option value="/api/v1/query/nature">/query/nature</option>
       <option value="/api/v1/query/compound">/query/compound</option>
     </select>
@@ -115,7 +117,26 @@ let selectedId = null;
 
 function initMap() {
   map = L.map('map', { zoomControl: true }).setView([47.7, 14.5], 7);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: 'OSM' }).addTo(map);
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, attribution: 'OSM' });
+  // ESRI World Imagery (free, no key) — great for visually verifying flags.
+  const sat = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, attribution: 'Esri World Imagery' });
+  // Austria basemap.at orthophoto (highest local resolution, EPSG:3857).
+  const basemapAt = L.tileLayer(
+    'https://maps{s}.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg',
+    { maxZoom: 20, subdomains: '1234',
+      attribution: 'basemap.at · BEV' });
+  const labels = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, attribution: '© Esri', opacity: 0.85 });
+  sat.addTo(map);
+  L.control.layers(
+    { 'Satellite (Esri)': sat, 'Ortho 30cm (basemap.at)': basemapAt, 'OpenStreetMap': osm },
+    { 'Place labels': labels },
+    { position: 'topleft', collapsed: true }
+  ).addTo(map);
   markersGroup = L.layerGroup().addTo(map);
 }
 
@@ -188,6 +209,7 @@ function extractItems(j) {
       flag_code: f.flag_code, obj_ref: f.obj_ref,
       height: f.height_max_m, area: f.area_sqm,
       title: f.flag_code + ' · ' + (f.obj_type||'?') + ' · ' + (f.kg_code||'') + (f.height_max_m!=null ? ' · '+f.height_max_m.toFixed(1)+'m':''),
+      weight: (f.aggregate||{}).total_weight, n_codes: ((f.aggregate||{}).codes||[]).length,
       raw: f, kind: 'flag',
     }));
   }
@@ -275,6 +297,7 @@ function render() {
     const meta = [];
     if (it.height != null) meta.push('h=' + fmtNum(it.height));
     if (it.area != null) meta.push('A=' + Math.round(it.area) + 'm²');
+    if (it.weight) meta.push('w=' + it.weight.toFixed(1) + (it.n_codes>1 ? ' · '+it.n_codes+' rules':''));
     if (it.lon != null && it.lat != null) meta.push(it.lon.toFixed(4)+','+it.lat.toFixed(4));
     if (it.obj_ref) meta.push('<a href="#" data-act="flag" data-ref="' + it.obj_ref + '">flag</a>');
     row.innerHTML = '<div class="r-head">' + sev + escapeHtml(it.title || '') + flagCode + '</div>'

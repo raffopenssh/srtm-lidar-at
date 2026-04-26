@@ -108,6 +108,11 @@ BUILDING_TYPES = {'roof', 'greenhouse', 'building'}
 # Soft severity ladder.
 SEV_ORDER = {'low': 0, 'medium': 1, 'high': 2, 'critical': 3}
 
+# Numeric weight per severity (used to score concern + agreement).
+# Multiple independent rules firing on the same object accumulate weight
+# ("agreement" — different evidence pointing the same way).
+SEV_WEIGHT = {'low': 1.0, 'medium': 2.0, 'high': 4.0, 'critical': 8.0}
+
 
 # ----------------------------------------------------------------------
 # Object inventory
@@ -251,7 +256,8 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
 # ----------------------------------------------------------------------
 
 def _flag(code: str, severity: str, msg: str, **extra) -> dict:
-    return {'flag_code': code, 'severity': severity, 'message': msg, 'attrs': extra}
+    return {'flag_code': code, 'severity': severity, 'message': msg,
+            'weight': SEV_WEIGHT.get(severity, 1.0), 'attrs': extra}
 
 
 def _h_severity(value, low_warn, high, critical=None):

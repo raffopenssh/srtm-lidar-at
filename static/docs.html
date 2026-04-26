@@ -273,6 +273,8 @@ td code { font-size: 12px; }
       <a href="#query-segments">Power Queries</a>
       <a href="#query-parcels">Per-Parcel Index</a>
     </div>
+    <a href="#query-explorer">Query Explorer (UI)</a>
+    <a href="#quality-flags">Quality Flags &amp; Feedback</a>
   </div>
   <div class="nav-group">
     <div class="nav-group-title">Methods</div>
@@ -1671,6 +1673,137 @@ curl <a href="https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_hansen
   <strong>Slow</strong> (seconds&ndash;minutes): <code>parcels_by_type</code>, <code>top_features</code> &mdash; scan KG JSON files. Use <code>async=true</code>.
 </div>
 
+
+<!-- ==================== QUERY EXPLORER (UI) ==================== -->
+<h2 id="query-explorer">Query Explorer (UI) <a class="anchor-link" href="#query-explorer">#</a></h2>
+
+<p>
+  <a href="/query.html" target="_blank"><code>/query.html</code></a> is a side-by-side
+  <strong>map + JSON playground</strong> for every query and feedback endpoint.
+  It is the fastest way to triage flags, drill into a candidate, eyeball it on satellite
+  imagery, and submit a confirm/reject/correction without leaving the page.
+</p>
+
+<ul style="line-height:1.9">
+  <li><strong>Endpoint dropdown</strong> with one-click presets: critical flags, tallest “trees”,
+      likely-mast misclassifications, ground-typed segments with non-zero height, RF high-confidence masts.</li>
+  <li><strong>Layer switcher</strong> on the map: ESRI satellite (default), basemap.at 30 cm orthophoto for Austria,
+      OSM streets, plus a labels overlay you can toggle independently.</li>
+  <li><strong>List ↔ map sync</strong>: clicking a row pans &amp; highlights the marker; clicking a marker
+      scrolls the row into view. Severity colour-coded (critical=red, high=dark red, medium=amber, low=grey).</li>
+  <li><strong>Per-row “flag” link</strong> opens the same SrtmFlag popover used in <code>/process.html</code>.
+      The popover shows: matched candidate(s), aliases (when several refs collapse to the same physical object),
+      aggregated rule weight, the action prediction (“will this flip community-effective type?”), and a notes field.</li>
+  <li><strong>Three result tabs</strong>: <em>Results</em> (rendered list), <em>Raw JSON</em>, <em>Summary</em>
+      (depth-limited tree view of the response shape).</li>
+  <li><strong>Permalinkable URL bar</strong>: the URL above the result list mirrors what is sent;
+      copy it for share-able exact queries.</li>
+</ul>
+
+<div class="callout" style="background:#fff8e6;border-left:4px solid #d29922;padding:12px 16px;margin:16px 0;border-radius:0 6px 6px 0;">
+  <strong>Tip.</strong> Any DOM ancestor with <code>data-srtm-kg</code>, <code>data-srtm-lon</code>,
+  <code>data-srtm-lat</code> scopes selection-based flagging. The Query Explorer sets these
+  on every result row so a click on “102.2m” in the row text already finds the right object.
+</div>
+
+<!-- ==================== QUALITY FLAGS / FEEDBACK ==================== -->
+<h2 id="quality-flags">Quality Flags &amp; Feedback <a class="anchor-link" href="#quality-flags">#</a></h2>
+
+<p>
+  Every classified object goes through a <strong>distribution-aware rule pass</strong>
+  (<code>quality_flags.py</code>) immediately after the per-KG JSON is written
+  &mdash; and the same pass runs on app start over every JSON already in
+  <code>data/austria_processor/json/</code>, so the rules apply uniformly to
+  the entire processed corpus, not only newly produced KGs.
+</p>
+
+<table>
+  <tr><th>Endpoint</th><th>Purpose</th></tr>
+  <tr><td><code>GET /api/v1/flags</code></td>
+      <td>List flags with filters: <code>kg=</code>, <code>severity=</code>, <code>code=</code>,
+          <code>type=</code>, <code>kind=</code>, <code>bbox=w,s,e,n</code>,
+          <code>min_value=</code>, <code>order=severity|value|recent</code>.
+          Each row carries an <code>aggregate</code> object with the
+          per-segment <code>total_weight</code>, <code>n_flags</code>, and
+          <code>codes</code>.</td></tr>
+  <tr><td><code>GET /api/v1/flags/stats</code></td>
+      <td>Counts by severity, code, object type, top-flagged KGs.</td></tr>
+  <tr><td><code>GET /api/v1/flags/match?text=&hellip;</code></td>
+      <td>Resolve a free-text snippet (e.g. <code>102.2m tree</code>)
+          to one or more concrete object refs. Supports <code>kg=</code>,
+          <code>lon=</code>, <code>lat=</code>, <code>radius_m=</code>.
+          Same-segment duplicates (<code>top_tree</code> /
+          <code>top_obj</code> / <code>top_by_type</code>) collapse to a
+          single candidate with the others returned in <code>aliases</code>.
+          Includes per-action <code>action_predictions</code>.</td></tr>
+  <tr><td><code>GET /api/v1/flags/predict</code></td>
+      <td>Forecast the effect of <code>kind=confirm|reject|correct_type</code>
+          on a given <code>obj_ref</code>: how much weight your role adds,
+          whether the action would <em>flip</em> the community-effective
+          type or trigger resampling.</td></tr>
+  <tr><td><code>GET /api/v1/flags/object/&lt;obj_ref&gt;</code></td>
+      <td>Full record for one segment: object, flags, all feedback, override
+          state, aggregate, audit history, and per-action predictions.</td></tr>
+  <tr><td><code>GET /api/v1/flags/events</code></td>
+      <td>Audit log of every <code>created</code> / <code>changed</code> /
+          <code>removed</code> rule flag. Filter by <code>kg=</code>,
+          <code>obj_ref=</code>, <code>kind=</code>, <code>since=epoch</code>.
+          Suitable for resampling the segments whose flag set has changed
+          across rule versions.</td></tr>
+  <tr><td><code>POST /api/v1/feedback</code></td>
+      <td>Submit one feedback row. Accepts <code>{obj_ref, kind, corrected_type, notes}</code>
+          or text/coord-only payloads that the server resolves through
+          <code>flags/match</code>.</td></tr>
+  <tr><td><code>GET /api/v1/feedback</code> /
+          <code>/api/v1/feedback/events</code></td>
+      <td>Active feedback rows / append-only event log of every submission,
+          supersession or withdrawal (with role and weight).</td></tr>
+  <tr><td><code>POST /api/v1/flags/rebuild</code></td>
+      <td>Re-scan one KG (<code>?kg=&hellip;</code>) or all local JSONs.
+          Idempotent; rule changes that yield different flags emit
+          <code>changed</code> / <code>removed</code> events automatically.</td></tr>
+</table>
+
+<h3>Severity weights</h3>
+<p>
+  Each rule emits a flag with a severity-derived <code>weight</code>:
+  <code>low=1</code>, <code>medium=2</code>, <code>high=4</code>, <code>critical=8</code>.
+  When several independent rules fire on the same object, the weights
+  accumulate &mdash; the <code>aggregate.total_weight</code> in
+  <code>/flags</code> and <code>/flags/match</code> is the
+  <em>de-duplicated</em> sum (max-by-flag-code across <code>top_*</code>
+  aliases) so it captures “how many independent pieces of evidence point
+  the same way”. Use it to rank or to set a confidence threshold for
+  resampling.
+</p>
+
+<h3>Audit log &amp; resampling</h3>
+<p>
+  Two append-only event tables are persisted in <code>data/feedback.sqlite</code>:
+</p>
+<ul style="line-height:1.8">
+  <li><code>flag_events</code> &mdash; one row per <em>creation</em>,
+      <em>change</em>, or <em>removal</em> of a rule flag, with full
+      <code>rule_version</code> + <code>attrs_json</code> at that moment.</li>
+  <li><code>feedback_events</code> &mdash; one row per user action,
+      with the <code>user_role</code>-weighted contribution and free-text notes.</li>
+</ul>
+<p>
+  Together these let you (a) reconstruct the exact flag state at any
+  point in time, (b) rebuild a re-sampling pool of segments whose flag
+  set or feedback changed since the last training cut, and (c) compute
+  inter-annotator agreement when two students hit the same object.
+</p>
+
+<h3>Embeddable flag widget</h3>
+<p>
+  <a href="/flag.js" target="_blank"><code>/flag.js</code></a> is a small
+  vanilla-JS module (zero deps). <code>SrtmFlag.install()</code> watches
+  text selections globally; <code>SrtmFlag.openFor({obj_ref|text|point})</code>
+  opens the popover programmatically. The popover now renders a
+  per-action <em>prediction preview</em> (“flips outcome”, “verify after
+  this confirm”, projected effective type) before the user submits.
+</p>
 
 <!-- ==================== OBJECT TYPES ==================== -->
 <!-- ================================================================== -->

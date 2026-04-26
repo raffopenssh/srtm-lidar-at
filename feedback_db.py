@@ -70,6 +70,7 @@ _SCHEMA = [
         kg_code TEXT NOT NULL,
         flag_code TEXT NOT NULL,
         severity TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 1.0,
         message TEXT,
         attrs_json TEXT,
         rule_version TEXT NOT NULL,
@@ -78,6 +79,40 @@ _SCHEMA = [
         computed_at INTEGER NOT NULL,
         UNIQUE(obj_ref, flag_code, rule_version)
     )''',
+    '''CREATE TABLE IF NOT EXISTS flag_events (
+        id INTEGER PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        kind TEXT NOT NULL,           -- 'created'|'removed'|'changed'
+        obj_ref TEXT NOT NULL,
+        kg_code TEXT NOT NULL,
+        flag_code TEXT NOT NULL,
+        severity TEXT,
+        weight REAL,
+        rule_version TEXT,
+        attrs_json TEXT
+    )''',
+    'CREATE INDEX IF NOT EXISTS fe_obj ON flag_events(obj_ref)',
+    'CREATE INDEX IF NOT EXISTS fe_kg ON flag_events(kg_code)',
+    'CREATE INDEX IF NOT EXISTS fe_ts ON flag_events(ts)',
+    'CREATE INDEX IF NOT EXISTS fe_kind ON flag_events(kind, ts)',
+    '''CREATE TABLE IF NOT EXISTS feedback_events (
+        id INTEGER PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        feedback_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,           -- 'submit'|'supersede'|'withdraw'|'resolve'
+        obj_ref TEXT,
+        kg_code TEXT,
+        action TEXT,                  -- confirm|reject|correct_type|...
+        corrected_type TEXT,
+        user_id TEXT,
+        user_role TEXT,
+        weight REAL,
+        notes TEXT
+    )''',
+    'CREATE INDEX IF NOT EXISTS fbe_obj ON feedback_events(obj_ref)',
+    'CREATE INDEX IF NOT EXISTS fbe_kg  ON feedback_events(kg_code)',
+    'CREATE INDEX IF NOT EXISTS fbe_ts  ON feedback_events(ts)',
+    'CREATE INDEX IF NOT EXISTS fbe_fid ON feedback_events(feedback_id)',
     'CREATE INDEX IF NOT EXISTS flags_kg ON flags(kg_code)',
     'CREATE INDEX IF NOT EXISTS flags_code ON flags(flag_code)',
     'CREATE INDEX IF NOT EXISTS flags_severity ON flags(severity)',
@@ -132,6 +167,10 @@ def ensure_schema(force: bool = False):
         c = _conn()
         for stmt in _SCHEMA:
             c.execute(stmt)
+        # Cheap migration: add `weight` column to flags if missing.
+        cols = {r[1] for r in c.execute('PRAGMA table_info(flags)')}
+        if 'weight' not in cols:
+            c.execute('ALTER TABLE flags ADD COLUMN weight REAL NOT NULL DEFAULT 1.0')
         c.commit(); c.close()
     _initialised = True
 
@@ -147,6 +186,12 @@ def write_objects_and_flags(objects: list, flags: list, rule_version: str):
     now = int(time.time())
     with _LOCK:
         c = _conn()
+        # Snapshot existing flag set per KG so we can emit removed/changed events.
+        prior = {}
+        for kg in kgs:
+            for r in c.execute('SELECT obj_ref, kg_code, flag_code, severity, weight, rule_version, attrs_json '
+                               'FROM flags WHERE kg_code=?', (kg,)):
+                prior[(r['obj_ref'], r['flag_code'])] = dict(r)
         # Delete prior rows for these KGs (we own them entirely)
         for kg in kgs:
             # remove rtree rows by rowid first
@@ -172,18 +217,43 @@ def write_objects_and_flags(objects: list, flags: list, rule_version: str):
             if lon is not None and lat is not None:
                 c.execute('INSERT INTO objects_rtree(rowid, min_lon, max_lon, min_lat, max_lat) VALUES (?,?,?,?,?)',
                           (rowid, lon, lon, lat, lat))
-        # insert flags
+        # insert flags + emit events
+        from quality_flags import SEV_WEIGHT  # local import to avoid cycle
+        seen = set()
         for f in flags:
+            w = f.get('weight') or SEV_WEIGHT.get(f.get('severity', 'low'), 1.0)
+            attrs_j = json.dumps(f.get('attrs') or {})
+            key = (f['obj_ref'], f['flag_code'])
+            seen.add(key)
             try:
                 c.execute('''INSERT OR IGNORE INTO flags
-                    (obj_ref, kg_code, flag_code, severity, message, attrs_json,
+                    (obj_ref, kg_code, flag_code, severity, weight, message, attrs_json,
                      rule_version, centroid_lon, centroid_lat, computed_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                    (f['obj_ref'], f['kg_code'], f['flag_code'], f['severity'],
-                     f.get('message'), json.dumps(f.get('attrs') or {}),
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                    (f['obj_ref'], f['kg_code'], f['flag_code'], f['severity'], w,
+                     f.get('message'), attrs_j,
                      rule_version, f.get('centroid_lon'), f.get('centroid_lat'), now))
             except sqlite3.IntegrityError:
                 pass
+            old = prior.get(key)
+            ev_kind = 'created' if not old else (
+                'changed' if (old.get('severity') != f.get('severity')
+                              or (old.get('rule_version') or '') != rule_version) else None)
+            if ev_kind:
+                c.execute('''INSERT INTO flag_events
+                    (ts, kind, obj_ref, kg_code, flag_code, severity, weight, rule_version, attrs_json)
+                    VALUES (?,?,?,?,?,?,?,?,?)''',
+                    (now, ev_kind, f['obj_ref'], f['kg_code'], f['flag_code'],
+                     f.get('severity'), w, rule_version, attrs_j))
+        # 'removed' events for flags that vanished after rescan
+        for key, old in prior.items():
+            if key in seen: continue
+            c.execute('''INSERT INTO flag_events
+                (ts, kind, obj_ref, kg_code, flag_code, severity, weight, rule_version, attrs_json)
+                VALUES (?,?,?,?,?,?,?,?,?)''',
+                (now, 'removed', key[0], old.get('kg_code') or '', key[1],
+                 old.get('severity'), old.get('weight'),
+                 old.get('rule_version'), old.get('attrs_json')))
         c.commit(); c.close()
 
 
@@ -314,8 +384,9 @@ def resolve_point(lon: float, lat: float, hint: dict = None,
                       'area_sqm': r.get('area_sqm'),
                       '_score': score})
     cands.sort(key=lambda x: x['_score'])
+    cands = _dedup_candidates(cands)
     best = cands[0]
-    if len(cands) > 1 and abs(cands[1]['_score'] - best['_score']) < 5:
+    if len(cands) > 1 and abs((cands[1].get('_score') or 0) - (best.get('_score') or 0)) < 5:
         status = 'ambiguous'
     else:
         status = 'resolved'
@@ -375,6 +446,50 @@ def parse_snippet(text: str) -> dict:
         else:
             h.setdefault('_value', val)
     return h
+
+
+_KIND_PRIORITY = {
+    'building': 0, 'parcel': 1, 'top_tree': 2, 'top_obj': 3,
+    'top_by_type': 4, 'new_building': 5, 'infra': 6,
+}
+
+def _dedup_candidates(cands: list, *, coord_decimals: int = 5,
+                      h_round: float = 0.5, a_round: float = 5.0) -> list:
+    """Collapse multiple obj_refs that point to the same physical object.
+
+    The pipeline emits the same segment as `top_tree`, `top_obj`, and
+    `top_by_type:<type>:rank` simultaneously — they share kg + centroid +
+    height + area but have distinct refs. For flagging, the user wants
+    *one* row to act on; we keep the most informative kind (lowest
+    _KIND_PRIORITY) and stash the duplicate refs under `aliases`.
+    """
+    buckets = {}
+    order = []
+    for c in cands:
+        lon = c.get('centroid_lon'); lat = c.get('centroid_lat')
+        h = c.get('height_max_m'); a = c.get('area_sqm')
+        key = (
+            c.get('kg_code') or '',
+            c.get('obj_type') or '',
+            None if lon is None else round(lon, coord_decimals),
+            None if lat is None else round(lat, coord_decimals),
+            None if h is None else round(h / h_round) * h_round,
+            None if a is None else round(a / a_round) * a_round,
+        )
+        if key not in buckets:
+            buckets[key] = c
+            c['aliases'] = []
+            order.append(key)
+        else:
+            keep = buckets[key]
+            new_p = _KIND_PRIORITY.get(c.get('kind'), 99)
+            old_p = _KIND_PRIORITY.get(keep.get('kind'), 99)
+            if new_p < old_p:
+                c['aliases'] = keep.get('aliases', []) + [keep.get('obj_ref')]
+                buckets[key] = c
+            else:
+                keep.setdefault('aliases', []).append(c.get('obj_ref'))
+    return [buckets[k] for k in order]
 
 
 def match_text(text: str, kg_code: str = None, lon: float = None, lat: float = None,
@@ -444,6 +559,7 @@ def match_text(text: str, kg_code: str = None, lon: float = None, lat: float = N
             'height_max_m': r['height_max_m'], 'area_sqm': r['area_sqm'],
             'rf_confidence': r['rf_confidence'],
         })
+    cands = _dedup_candidates(cands)
     if not cands:
         return {'status': 'no_object', 'hint': hint, 'candidates': []}
     status = 'resolved' if len(cands) == 1 or (
@@ -496,6 +612,8 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
         if row: resolved_kg_code = row['kg_code']
 
     now = int(time.time())
+    role_w = {'admin': 5.0, 'trusted': 2.0, 'student': 1.0, 'anon': 0.5}.get(user_role, 1.0)
+    fb_kind = payload.get('kind') or 'report'
     with _LOCK:
         c = _conn()
         cur = c.execute('''INSERT INTO feedback
@@ -508,12 +626,20 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
              resolved_obj_ref, resolved_kg_code, resolved_distance_m, resolution_status,
              payload.get('predicted_type'),
              json.dumps(payload.get('predicted_attrs') or {}),
-             payload.get('kind') or 'report',
+             fb_kind,
              payload.get('corrected_type'),
              json.dumps(payload.get('corrected_attrs') or {}),
              user_id, user_role, payload.get('confidence'),
              payload.get('notes'), source_app, context_text, now))
         fb_id = cur.lastrowid
+        c.execute('''INSERT INTO feedback_events
+            (ts, feedback_id, kind, obj_ref, kg_code, action, corrected_type,
+             user_id, user_role, weight, notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (now, fb_id, 'submit', resolved_obj_ref or obj_ref,
+             resolved_kg_code or kg_code, fb_kind,
+             payload.get('corrected_type'),
+             user_id, user_role, role_w, payload.get('notes')))
         c.commit(); c.close()
     return {'id': fb_id, 'resolved_obj_ref': resolved_obj_ref,
             'resolved_kg_code': resolved_kg_code,
@@ -598,6 +724,150 @@ def effective_overrides(obj_refs: Sequence[str]) -> dict:
 
 
 # ---------------------------------------------------------------- kg lookup helpers
+
+def predict_action_impact(obj_ref: str, kind: str = 'reject',
+                          corrected_type: str = None,
+                          user_role: str = 'student') -> dict:
+    """Forecast what would happen if a user submitted `kind` on `obj_ref` now.
+
+    Returns a dict the UI can display under each action option:
+        weight_added, total_after, would_verify, current_consensus,
+        flips_outcome, projected_effective_type, projected_status,
+        rationale.
+    """
+    ensure_schema()
+    role_w = {'admin': 5.0, 'trusted': 2.0, 'student': 1.0, 'anon': 0.5}.get(user_role, 1.0)
+    cur = effective_overrides([obj_ref]).get(obj_ref) or {
+        'effective_type': None, 'community_verified': False,
+        'n_confirms': 0, 'n_rejects': 0, 'n_corrections': 0}
+    c = _conn()
+    obj = c.execute('SELECT obj_type FROM objects WHERE obj_ref=?', (obj_ref,)).fetchone()
+    flag_w = c.execute('SELECT COALESCE(SUM(weight), 0) AS w, COUNT(*) AS n '
+                       'FROM flags WHERE obj_ref=?', (obj_ref,)).fetchone()
+    c.close()
+    predicted_type = (obj or {})['obj_type'] if obj else None
+    out = {
+        'current': dict(cur),
+        'flag_weight': float(flag_w['w']) if flag_w else 0.0,
+        'n_flags': int(flag_w['n']) if flag_w else 0,
+        'role_weight': role_w,
+        'kind': kind,
+        'predicted_type': predicted_type,
+    }
+    if kind == 'confirm':
+        out['rationale'] = (
+            'Adds weight to the existing prediction; once two students or one '
+            'trusted reviewer confirm, the prediction is locked as “community-verified”.'
+        )
+        out['n_confirms_after'] = cur['n_confirms'] + 1
+        out['flips_outcome'] = False
+    elif kind == 'reject':
+        out['rationale'] = (
+            'Records that the prediction is wrong but does not (yet) supply '
+            'a replacement. Two rejections downgrade quality; the segment '
+            'enters the resampling pool.'
+        )
+        out['n_rejects_after'] = cur['n_rejects'] + 1
+        out['flips_outcome'] = (cur['n_rejects'] + 1) >= 2 and not cur['community_verified']
+    elif kind in ('correct_type', 'correct'):
+        out['rationale'] = (
+            f"Suggests the correct type is '{corrected_type or '?'}'. "
+            'Two students agreeing OR one trusted reviewer makes it the '
+            'community-effective type — used in queries with '
+            '`use_overrides=true` and added to the resampling pool.'
+        )
+        # current votes
+        c = _conn()
+        votes = {}
+        for r in c.execute('''SELECT corrected_type, user_role FROM feedback
+                              WHERE status='active' AND resolved_obj_ref=?
+                              AND kind IN ('correct_type','correct')''', (obj_ref,)):
+            ct = r['corrected_type']; ur = r['user_role'] or 'student'
+            w = {'admin': 5, 'trusted': 2}.get(ur, 1)
+            votes[ct] = votes.get(ct, 0) + w
+        c.close()
+        votes[corrected_type or '?'] = votes.get(corrected_type or '?', 0) + (5 if user_role=='admin' else 2 if user_role=='trusted' else 1)
+        winner = max(votes.items(), key=lambda x: x[1]) if votes else (None, 0)
+        out['projected_votes'] = votes
+        out['projected_effective_type'] = winner[0] if winner[1] >= 2 or user_role in ('admin','trusted') else None
+        out['flips_outcome'] = (
+            out['projected_effective_type'] not in (None, predicted_type)
+        )
+    else:
+        out['rationale'] = 'Recorded for review; no automated effect.'
+        out['flips_outcome'] = False
+    return out
+
+
+def list_flag_events(kg_code=None, obj_ref=None, since=None,
+                     kind=None, limit=200, offset=0):
+    ensure_schema()
+    where = []; args = []
+    if kg_code: where.append('kg_code=?'); args.append(kg_code)
+    if obj_ref: where.append('obj_ref=?'); args.append(obj_ref)
+    if since:
+        try: where.append('ts >= ?'); args.append(int(since))
+        except Exception: pass
+    if kind: where.append('kind=?'); args.append(kind)
+    sql = 'SELECT * FROM flag_events'
+    if where: sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY ts DESC LIMIT ? OFFSET ?'; args += [limit, offset]
+    c = _conn(); rows = [dict(r) for r in c.execute(sql, args)]; c.close()
+    return rows
+
+
+def list_feedback_events(kg_code=None, obj_ref=None, since=None,
+                         user_id=None, limit=200, offset=0):
+    ensure_schema()
+    where = []; args = []
+    if kg_code: where.append('kg_code=?'); args.append(kg_code)
+    if obj_ref: where.append('obj_ref=?'); args.append(obj_ref)
+    if user_id: where.append('user_id=?'); args.append(user_id)
+    if since:
+        try: where.append('ts >= ?'); args.append(int(since))
+        except Exception: pass
+    sql = 'SELECT * FROM feedback_events'
+    if where: sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY ts DESC LIMIT ? OFFSET ?'; args += [limit, offset]
+    c = _conn(); rows = [dict(r) for r in c.execute(sql, args)]; c.close()
+    return rows
+
+
+def object_aggregates(obj_refs: Sequence[str]) -> dict:
+    """For each obj_ref return aggregate flag weight + count + max severity.
+
+    Useful in /flags and /flags/object responses so callers can sort or
+    filter by 'agreement' (sum of weights = how many independent rules
+    flagged this object, severity-weighted).
+    """
+    if not obj_refs: return {}
+    ensure_schema()
+    qmarks = ','.join(['?'] * len(obj_refs))
+    c = _conn()
+    rows = c.execute(
+        f'''SELECT obj_ref,
+                  COALESCE(SUM(weight),0) AS total_weight,
+                  COUNT(*) AS n_flags,
+                  GROUP_CONCAT(flag_code) AS codes,
+                  GROUP_CONCAT(severity) AS sevs
+            FROM flags WHERE obj_ref IN ({qmarks}) GROUP BY obj_ref''', list(obj_refs)).fetchall()
+    c.close()
+    out = {}
+    for r in rows:
+        sevs = (r['sevs'] or '').split(',')
+        rank = max((SEV_ORDER.get(s, -1) for s in sevs), default=-1)
+        max_sev = next((k for k,v in SEV_ORDER.items() if v == rank), None)
+        out[r['obj_ref']] = {
+            'total_weight': float(r['total_weight'] or 0),
+            'n_flags': int(r['n_flags'] or 0),
+            'codes': sorted(set((r['codes'] or '').split(','))) if r['codes'] else [],
+            'max_severity': max_sev,
+        }
+    return out
+
+
+SEV_ORDER = {'low': 0, 'medium': 1, 'high': 2, 'critical': 3}
+
 
 def kg_with_flag_counts() -> list:
     ensure_schema()

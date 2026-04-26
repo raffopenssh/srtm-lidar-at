@@ -8540,6 +8540,11 @@ def api_flags_list():
             limit=min(int(a.get('limit', 200)), 1000),
             offset=int(a.get('offset', 0)),
             order=a.get('order', 'severity'))
+        # Attach per-object aggregate (total_weight, n_flags, codes)
+        refs = list({r['obj_ref'] for r in rows if r.get('obj_ref')})
+        aggs = feedback_db.object_aggregates(refs) if refs else {}
+        for r in rows:
+            r['aggregate'] = aggs.get(r.get('obj_ref'))
         return jsonify({'count': len(rows), 'flags': rows})
     except Exception as e:
         log.exception('flags list')
@@ -8580,15 +8585,102 @@ def api_flags_match():
         lon = lat = None
     try:
         result = feedback_db.match_text(text, kg_code=kg, lon=lon, lat=lat, radius_m=radius)
-        # If a candidate exists, attach its known flags + nearby flags
+        # If a candidate exists, attach its known flags + nearby flags + agg
+        cand_refs = [c.get('obj_ref') for c in (result.get('candidates') or []) if c.get('obj_ref')]
+        # include any aliases collapsed during dedup
+        for c in (result.get('candidates') or []):
+            for al in (c.get('aliases') or []):
+                if al: cand_refs.append(al)
+        if result.get('obj_ref') and result['obj_ref'] not in cand_refs:
+            cand_refs.append(result['obj_ref'])
+        agg = feedback_db.object_aggregates(cand_refs) if cand_refs else {}
+        # Aggregate per *unique* (alias-collapsed) object: dedupe flags by
+        # flag_code, take the max weight, so summing across aliases
+        # doesn't triple-count when top_tree/top_obj/top_by_type point to
+        # the same physical segment.
+        import sqlite3 as _s2
+        feedback_db.ensure_schema()
+        _conn2 = _s2.connect(feedback_db.DB_PATH); _conn2.row_factory = _s2.Row
+        for c in (result.get('candidates') or []):
+            ref_pool = [c.get('obj_ref')] + (c.get('aliases') or [])
+            ref_pool = [r for r in ref_pool if r]
+            if not ref_pool:
+                c['agg'] = None; continue
+            qm = ','.join(['?'] * len(ref_pool))
+            rows = _conn2.execute(
+                f'SELECT flag_code, MAX(weight) AS w, severity FROM flags '
+                f'WHERE obj_ref IN ({qm}) GROUP BY flag_code', ref_pool).fetchall()
+            wsum = sum(r['w'] for r in rows)
+            codes = sorted({r['flag_code'] for r in rows})
+            max_sev = None; rank = -1
+            for r in rows:
+                ms = r['severity']
+                if ms and feedback_db.SEV_ORDER.get(ms, -1) > rank:
+                    rank = feedback_db.SEV_ORDER[ms]; max_sev = ms
+            c['agg'] = {'total_weight': round(wsum, 2),
+                        'codes': codes,
+                        'max_severity': max_sev}
+        _conn2.close()
         if result.get('obj_ref'):
-            obj_flags = feedback_db.list_flags(limit=10, kg_code=result.get('kg_code'))
-            obj_flags = [f for f in obj_flags if f['obj_ref'] == result['obj_ref']]
-            result['flags'] = obj_flags
+            obj_flags = feedback_db.list_flags(limit=200, kg_code=result.get('kg_code'))
+            primary_pool = set([result['obj_ref']])
+            for c in (result.get('candidates') or []):
+                if c.get('obj_ref') == result['obj_ref']:
+                    primary_pool.update(c.get('aliases') or [])
+                    break
+            result['flags'] = [f for f in obj_flags if f['obj_ref'] in primary_pool]
+            # Prediction previews for each action button
+            result['action_predictions'] = {
+                k: feedback_db.predict_action_impact(result['obj_ref'], kind=k)
+                for k in ('confirm', 'reject', 'correct_type')
+            }
         return jsonify(result)
     except Exception as e:
         log.exception('flags match')
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/flags/predict', methods=['GET'])
+def api_flags_predict():
+    """Forecast the effect of submitting `kind` on `obj_ref`. Used by the
+    flag widget to show users what their action will entail before they
+    commit. Read-only; nothing is persisted.
+    """
+    a = request.args
+    ref = a.get('obj_ref')
+    if not ref: return jsonify({'error': 'obj_ref required'}), 400
+    return jsonify(feedback_db.predict_action_impact(
+        ref, kind=a.get('kind', 'reject'),
+        corrected_type=a.get('corrected_type'),
+        user_role=a.get('role', 'student')))
+
+
+@app.route('/api/v1/flags/events', methods=['GET'])
+def api_flag_events():
+    """Audit log of every rule-based flag created/changed/removed.
+
+    Useful for resampling or for explaining model drift. Filter by kg,
+    obj_ref, kind, since=epoch.
+    """
+    a = request.args
+    rows = feedback_db.list_flag_events(
+        kg_code=a.get('kg'), obj_ref=a.get('obj_ref'),
+        since=a.get('since'), kind=a.get('kind'),
+        limit=min(int(a.get('limit', 200)), 1000),
+        offset=int(a.get('offset', 0)))
+    return jsonify({'count': len(rows), 'events': rows})
+
+
+@app.route('/api/v1/feedback/events', methods=['GET'])
+def api_feedback_events():
+    """Audit log of every user feedback submission/supersession."""
+    a = request.args
+    rows = feedback_db.list_feedback_events(
+        kg_code=a.get('kg'), obj_ref=a.get('obj_ref'),
+        since=a.get('since'), user_id=a.get('user'),
+        limit=min(int(a.get('limit', 200)), 1000),
+        offset=int(a.get('offset', 0)))
+    return jsonify({'count': len(rows), 'events': rows})
 
 
 @app.route('/api/v1/flags/object/<path:obj_ref>', methods=['GET'])
@@ -8609,9 +8701,19 @@ def api_flag_object(obj_ref):
     flags = [f for f in flags if f['obj_ref'] == obj_ref]
     fb = feedback_db.list_feedback(obj_ref=obj_ref, limit=50)
     overrides = feedback_db.effective_overrides([obj_ref])
+    agg = feedback_db.object_aggregates([obj_ref]).get(obj_ref)
+    flag_events = feedback_db.list_flag_events(obj_ref=obj_ref, limit=50)
+    fb_events = feedback_db.list_feedback_events(obj_ref=obj_ref, limit=50)
     c.close()
     return jsonify({'object': obj, 'flags': flags, 'feedback': fb,
-                    'override': overrides.get(obj_ref)})
+                    'override': overrides.get(obj_ref),
+                    'aggregate': agg,
+                    'flag_events': flag_events,
+                    'feedback_events': fb_events,
+                    'predictions': {
+                        k: feedback_db.predict_action_impact(obj_ref, kind=k)
+                        for k in ('confirm', 'reject', 'correct_type')
+                    }})
 
 
 @app.route('/api/v1/flags/rebuild', methods=['POST'])

@@ -92,6 +92,13 @@
       .srtm-pop .flag-high { background: #b62324; color: #fff; }
       .srtm-pop .flag-medium { background: #d29922; color: #000; }
       .srtm-pop .flag-low { background: #586069; color: #fff; }
+      .srtm-pop .pred { background: #0d1117; border: 1px solid #30363d;
+        border-radius: 4px; padding: 6px 8px; margin: 4px 0;
+        font-size: 10.5px; color: #8b949e; line-height: 1.4; }
+      .srtm-pop .pred b { color: #c9d1d9; font-weight: 600; }
+      .srtm-pop .pred .flip { color: #d29922; }
+      .srtm-pop .pred .verify { color: #3fb950; }
+      .srtm-pop .agg { color: #d29922; font-size: 10px; margin-left: 4px; }
       .srtm-pop .err { color: #f85149; font-size: 11px; }
       .srtm-pop .ok { color: #3fb950; font-size: 11px; }
       .srtm-hl { background: rgba(212, 153, 34, .35); outline: 1px solid #d29922;
@@ -224,10 +231,53 @@
     if (c.area_sqm != null) meta.push(Math.round(c.area_sqm) + 'm²');
     if (c.distance_m != null) meta.push(c.distance_m.toFixed(0) + 'm away');
     if (c.rf_confidence != null) meta.push('rf=' + c.rf_confidence.toFixed(2));
+    const aliasN = (c.aliases || []).filter(Boolean).length;
+    const aliasNote = aliasN ? ' · +' + aliasN + ' alias' + (aliasN===1?'':'es') : '';
+    let agg = null;
+    if (c.agg && (c.agg.total_weight || c.agg.codes && c.agg.codes.length)) {
+      agg = el('span', { class: 'agg' },
+        '⚠ weight=' + (c.agg.total_weight||0).toFixed(1)
+        + ' · ' + (c.agg.codes||[]).join(', '));
+    }
     return el('div', { class: 'cand', 'data-ref': c.obj_ref },
-      el('div', null, c.obj_type + ' · ', el('span', { class: 'meta' }, c.kind + ' · ' + (c.kg_code || '—'))),
+      el('div', null, c.obj_type + ' · ',
+        el('span', { class: 'meta' }, c.kind + ' · ' + (c.kg_code || '—') + aliasNote), agg),
       el('div', { class: 'meta' }, meta.join(' · ') + ' · ' + fmtCoord(c.centroid_lon) + ',' + fmtCoord(c.centroid_lat))
     );
+  }
+
+  function renderPrediction(act, pred) {
+    if (!pred) return null;
+    const lines = [];
+    if (act === 'confirm') {
+      lines.push(el('div', null,
+        'Adds your weight to the prediction (',
+        el('b', null, pred.predicted_type || '?'), '). ',
+        'Current confirms: ', el('b', null, String(pred.current.n_confirms||0)),
+        ' → after submit: ', el('b', null, String(pred.n_confirms_after||1)), '.'));
+      if ((pred.n_confirms_after||0) >= 2) lines.push(el('div', { class: 'verify' },
+        '→ community-verified after this confirm.'));
+    } else if (act === 'reject') {
+      lines.push(el('div', null,
+        'Records rejection. Current rejections: ', el('b', null, String(pred.current.n_rejects||0)),
+        ' → after submit: ', el('b', null, String(pred.n_rejects_after||1)), '.'));
+      if (pred.flips_outcome) lines.push(el('div', { class: 'flip' },
+        '→ enough rejections to flag as low-quality + queue for resampling.'));
+      else lines.push(el('div', null, 'Will not yet flip outcome (need 2+ unless trusted).'));
+    } else if (act === 'correct_type') {
+      const eff = pred.projected_effective_type;
+      lines.push(el('div', null,
+        'Suggests ‘', el('b', null, (pred.kind === 'correct_type' ? (pred.corrected_type || '?') : '?')),
+        '’ instead of ‘', el('b', null, pred.predicted_type || '?'), '’.'));
+      if (eff && eff !== pred.predicted_type) lines.push(el('div', { class: 'flip' },
+        '→ community-effective type would become ', el('b', null, eff), '.'));
+      else lines.push(el('div', null, 'Need 2+ students agreeing OR 1 trusted reviewer to override.'));
+    }
+    if (pred.n_flags) lines.push(el('div', { class: 'meta' },
+      pred.n_flags + ' rule flag(s) already weight ' + (pred.flag_weight||0).toFixed(1) + '.'));
+    const wrap = el('div', { class: 'pred' });
+    lines.forEach(l => wrap.appendChild(l));
+    return wrap;
   }
 
   function renderMatch(res, info) {
@@ -282,9 +332,36 @@
     const cor = el('select');
     TYPES.forEach(t => cor.appendChild(el('option', { value: t }, t)));
     cor.style.display = 'none';
+    const predBox = el('div');
+    function refreshPrediction() {
+      const action = sel.value;
+      // Server-rendered prediction provided pre-bake; for correct_type, also
+      // re-fetch with the chosen target so the projection reflects this user's vote.
+      let pred = (res.action_predictions || {})[action];
+      if (action === 'correct_type') {
+        const ct = cor.value;
+        const ref = (cands.querySelector('.cand.sel') || {}).getAttribute
+          ? cands.querySelector('.cand.sel').getAttribute('data-ref') : null;
+        if (ref) {
+          fetch(API_BASE + '/api/v1/flags/predict?obj_ref=' + encodeURIComponent(ref)
+              + '&kind=correct_type&corrected_type=' + encodeURIComponent(ct))
+            .then(r => r.json()).then(p => {
+              p.kind = 'correct_type'; p.corrected_type = ct;
+              const node = renderPrediction('correct_type', p);
+              predBox.replaceChildren(); if (node) predBox.appendChild(node);
+            }).catch(()=>{});
+          return;
+        }
+      }
+      const node = renderPrediction(action, pred);
+      predBox.replaceChildren();
+      if (node) predBox.appendChild(node);
+    }
     sel.addEventListener('change', () => {
       cor.style.display = (sel.value === 'correct_type') ? 'block' : 'none';
+      refreshPrediction();
     });
+    cor.addEventListener('change', refreshPrediction);
     const notes = el('textarea', { placeholder: 'Notes (optional)' });
     const status = el('div', { class: 'row' });
     const submit = el('button', null, 'Submit');
@@ -322,6 +399,8 @@
     wrap.appendChild(el('div', { class: 'row' },
       el('span', { class: 'lb' }, 'Action:'), sel));
     wrap.appendChild(cor);
+    wrap.appendChild(predBox);
+    refreshPrediction();
     wrap.appendChild(notes);
     wrap.appendChild(el('div', { class: 'btns' }, cancel, submit));
     wrap.appendChild(status);
@@ -350,8 +429,10 @@
               obj_type: j.object.obj_type, centroid_lon: j.object.centroid_lon,
               centroid_lat: j.object.centroid_lat, height_max_m: j.object.height_max_m,
               area_sqm: j.object.area_sqm, rf_confidence: j.object.rf_confidence,
+              agg: j.aggregate,
             }],
             flags: j.flags, hint: {},
+            action_predictions: j.predictions,
           };
           showPop(rect, renderMatch(fakeRes, { selectedText: text, ctx }));
         });

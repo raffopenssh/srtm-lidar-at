@@ -1615,35 +1615,67 @@ function _refForTopItem(kg, kind, idx, otype) {
 }
 function _filterFlagged(arr, kg, kind, flagged) {
   if (!arr || !arr.length) return arr || [];
-  const out = arr.filter((o, i) => {
+  return arr.filter((o, i) => {
     const otype = o.rf_type || o.type || 'tree';
     return !flagged.has(_refForTopItem(kg, kind, i, otype));
   });
-  // Safety: if the filter would empty the list (every entry is flagged,
-  // common for top_10_trees in KGs full of misclassified masts), keep
-  // the original. The user toggle is meant to skip noise, not blank UI.
-  return out.length ? out : arr;
+}
+
+// Tier colors used by flag toggle — keep in sync with TIER_COLOR below.
+const _TIER_COLOR = ['var(--dim)', '#3fb950', '#d29922', '#f85149'];
+const _TIER_BORDER = ['var(--border)', '#3fb95066', '#d2992266', '#f8514966'];
+
+// Decide which tier levels actually change what the user sees.
+// We compare the (top_obj[0], top_tree[0]) survivors at each tier; if
+// they are identical to the previous effective tier, drop that tier.
+function _effectiveTierLevels(js) {
+  if (!js || !_lastKgFlags || !_lastKgFlags.length) return [];
+  const kg = js.kg_code;
+  function sig(level) {
+    const flagged = _flaggedRefSet(level);
+    const t = (_filterFlagged(js.top_10_trees||[], kg, 'top_tree', flagged)[0] || {});
+    const o = (_filterFlagged(js.top_10_objects||[], kg, 'top_obj', flagged)[0] || {});
+    return [t.height_m, o.height_max_m||o.height_m, o.type].join('|');
+  }
+  const base = sig(0);
+  const out = [];
+  let last = base;
+  for (const lvl of [1, 2, 3]) {
+    const s = sig(lvl);
+    if (s !== last) { out.push(lvl); last = s; }
+  }
+  return out;
 }
 function renderLastKg(js) {
   const card = document.getElementById('lastKgCard');
   card.style.display = 'block';
   if (js.kg_code) card.setAttribute('data-srtm-kg', js.kg_code);
-  // Show / update the flag-severity toggle (4-state cycle)
+  // Show / update the flag-severity toggle. Cycle only through levels
+  // that actually change visible content (computed from the current KG).
   const toggleWrap = document.getElementById('lastKgFilterToggle');
   const labelEl = document.getElementById('lastKgFilterLabel');
   if (typeof toggleWrap._level !== 'number') toggleWrap._level = 0;
+  const effective = _effectiveTierLevels(js);
+  toggleWrap._effective = effective;
+  // Snap current level to nearest effective (or 0 if none).
+  if (toggleWrap._level && effective.indexOf(toggleWrap._level) < 0) {
+    toggleWrap._level = 0;
+  }
   const level = toggleWrap._level;
-  if (_lastKgFlags && _lastKgFlags.length) {
+  if (effective.length) {
     toggleWrap.style.display = 'inline-flex';
-    const refs = _flaggedRefSet(level || 1); // count for current or low when off
+    const refs = _flaggedRefSet(level || effective[0]);
     labelEl.textContent = String(refs.size);
-    const names = ['off', 'low', 'medium', 'high'];
-    toggleWrap.title = 'Filter flagged items — ' + names[level] +
-      ' (tap to cycle: off → low → medium → high)';
+    const names = { 0: 'off', 1: 'low', 2: 'medium', 3: 'high' };
+    const tiers = effective.map(l => names[l]).join(' → ');
+    toggleWrap.title = 'Hide flagged items — ' + names[level] +
+      ' (tap to cycle: off → ' + tiers + ' → off)';
   } else {
     toggleWrap.style.display = 'none';
   }
+  let activeColor = null;
   if (level > 0) {
+    activeColor = _TIER_COLOR[level];
     const flagged = _flaggedRefSet(level);
     const kg = js.kg_code;
     js = JSON.parse(JSON.stringify(js)); // shallow clone so we don't mutate cache
@@ -1686,8 +1718,13 @@ function renderLastKg(js) {
   items.push({l: 'New Buildings', v: fmt(newb.count || 0)});
   items.push({l: 'Infrastructure', v: fmt(infra.total || 0)});
   items.push({l: 'Trees', v: fmt(trees.count) + ' / ' + ((trees.total_canopy_sqm||0)/10000).toFixed(2) + 'ha'});
-  items.push({l: 'Tallest', v: top10[0] ? ((top10[0].height_max_m||top10[0].height_m||0).toFixed(1) + 'm ' + (top10[0].type||'')) : '—'});
-  items.push({l: 'Tallest Tree', v: top10t[0] ? ((top10t[0].height_m||0).toFixed(1) + 'm') : '—'});
+  const _tint = activeColor ? ('color:' + activeColor) : '';
+  items.push({l: 'Tallest', v: top10[0]
+    ? ('<span style="' + _tint + '">' + (top10[0].height_max_m||top10[0].height_m||0).toFixed(1) + 'm ' + (top10[0].type||'') + '</span>')
+    : '—'});
+  items.push({l: 'Tallest Tree', v: top10t[0]
+    ? ('<span style="' + _tint + '">' + (top10t[0].height_m||0).toFixed(1) + 'm</span>')
+    : '—'});
   items.push({l: 'Stem Vol', v: (trees.est_stem_volume_m3||0).toFixed(0) + ' m\u00b3'});
   items.push({l: 'Elev', v: (terrain.elevation_min_m||0).toFixed(0) + '\u2013' + (terrain.elevation_max_m||0).toFixed(0) + 'm'});
   items.push({l: 'Slope', v: (terrain.steepness_mean_deg||0).toFixed(1) + '\u00b0 ' + (terrain.aspect_dominant||'')});
@@ -1747,29 +1784,29 @@ function renderLastKg(js) {
     '<span class="ds-tag ' + (s.ok ? 'ds-ok' : 'ds-miss') + '">' +
     (s.ok ? '\u2713 ' : '\u2717 ') + s.name + '</span>'
   ).join('');
-  // Wire toggle once. Each tap cycles 0 → 1 → 2 → 3 → 0.
+  // Wire toggle once. Each tap cycles through effective levels only.
   const tgl = document.getElementById('lastKgFilterToggle');
   if (tgl && !tgl._wired) {
     tgl._wired = true;
     if (typeof tgl._level !== 'number') tgl._level = 0;
     tgl.addEventListener('click', () => {
-      tgl._level = (tgl._level + 1) % 4;
+      const eff = tgl._effective || [];
+      const seq = [0].concat(eff);
+      const i = seq.indexOf(tgl._level);
+      tgl._level = seq[((i < 0 ? 0 : i) + 1) % seq.length];
       tgl.setAttribute('aria-pressed', tgl._level ? 'true' : 'false');
       if (_lastKgJson) renderLastKg(_lastKgJson);
     });
   }
   if (tgl) {
     const lvl = tgl._level || 0;
-    // Tier colours: green-ish for low, amber for medium, red for high
-    const TIER_COLOR = ['var(--dim)', '#3fb950', '#d29922', '#f85149'];
-    const TIER_BORDER = ['var(--border)', '#3fb95066', '#d2992266', '#f8514966'];
-    tgl.style.color = TIER_COLOR[lvl];
-    tgl.style.borderColor = TIER_BORDER[lvl];
+    tgl.style.color = _TIER_COLOR[lvl];
+    tgl.style.borderColor = _TIER_BORDER[lvl];
     const ico = document.getElementById('lastKgFilterIcon');
     if (ico) {
-      // 0: outline flag; 1: 1 filled flag; 2: 2 flags; 3: 3 flags
+      // 0: outline flag; 1–3 filled flags repeated
       ico.textContent = lvl === 0 ? '⚐' : '⚑'.repeat(lvl);
-      ico.style.color = TIER_COLOR[lvl];
+      ico.style.color = _TIER_COLOR[lvl];
     }
   }
 }

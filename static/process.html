@@ -173,6 +173,7 @@
   .log-badge-ok { background: #3fb95022; color: #3fb950; }
   .log-badge-warn { background: #d2992222; color: var(--yellow); }
   .log-badge-err { background: #f8514922; color: var(--red); }
+  .log-peer { display: inline-block; font-size: 8px; padding: 0 4px; border-radius: 3px; background: #30363d; color: #8b949e; margin-right: 6px; vertical-align: baseline; letter-spacing: 0.3px; flex-shrink: 0; }
 
   /* Tables */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -1089,8 +1090,10 @@ function clearKgTimer() {
 // ── Log ─────────────────────────────────────────────────────────
 function updateLog(d) {
   const log = d.recent_log || [];
+  // Determine peer source: proxied → _active_peer_id, local → instance field or 'primary'
+  const logPeer = d._active_peer_id || d.instance || '';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '');
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer;
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -1132,7 +1135,9 @@ function updateLog(d) {
     } else if (lvl === 'info' && e.kg && latestInfoPerKg[e.kg] !== i) {
       badge = '<span class="log-badge log-badge-ok">✔</span>';
     }
+    const peerTag = logPeer ? '<span class="log-peer">' + esc(logPeer) + '</span>' : '';
     h += '<div class="' + cls + '">' +
+      peerTag +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
       (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +
       '<span class="log-msg">' + msg + badge + '</span></div>';

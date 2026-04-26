@@ -1097,6 +1097,7 @@ def processing_status():
             'parcels_total': 0, 'buildings_total': 0, 'started_at': None,
             'git_commit': _GIT_COMMIT,
             'region': _REGION,
+            'instance': os.environ.get('INSTANCE_ID', 'primary'),
         })
     try:
         data = json.loads(progress_file.read_text())
@@ -1189,6 +1190,7 @@ def processing_status():
             pass
         data['throttle'] = Path('data/austria_processor/upload_throttle').exists()
         data['region'] = _REGION
+        data['instance'] = os.environ.get('INSTANCE_ID', 'primary')
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

@@ -377,11 +377,22 @@
     });
     wrap.appendChild(cands);
 
-    // Flags on the top candidate
+    // Flags on the top candidate (dedup by code, keep highest severity + count)
     if (res.flags && res.flags.length) {
-      const fb = el('div', { class: 'row' }, el('span', { class: 'lb' }, 'Flags:'));
+      const SEV_RANK = { error: 3, warning: 2, info: 1 };
+      const byCode = new Map();
       res.flags.forEach(f => {
-        fb.appendChild(el('span', { class: 'flag-badge flag-' + f.severity }, f.flag_code));
+        const cur = byCode.get(f.flag_code);
+        if (!cur || (SEV_RANK[f.severity]||0) > (SEV_RANK[cur.severity]||0)) {
+          byCode.set(f.flag_code, { severity: f.severity, count: (cur ? cur.count : 0) + 1 });
+        } else {
+          cur.count += 1;
+        }
+      });
+      const fb = el('div', { class: 'row' }, el('span', { class: 'lb' }, 'Flags:'));
+      byCode.forEach((v, code) => {
+        const label = v.count > 1 ? code + ' ×' + v.count : code;
+        fb.appendChild(el('span', { class: 'flag-badge flag-' + v.severity }, label));
       });
       wrap.appendChild(fb);
     }

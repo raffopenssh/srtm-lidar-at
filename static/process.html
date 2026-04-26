@@ -339,6 +339,7 @@
   <h1>🇦🇹 Austria Landscape Processor</h1>
   <span class="hdr-links">
     <a href="/">app</a>
+    <a href="/query.html">query</a>
     <a href="/training.html">training</a>
     <a href="/docs">docs</a>
     <a href="/api/v1/docs/llm.txt">llm.txt</a>
@@ -424,14 +425,14 @@
 <div class="last-kg" id="lastKgCard" style="display:none">
   <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <span>Last Completed KG — <span id="lastKgName">—</span></span>
-    <label id="lastKgFilterToggle" title="Hide segments that triggered quality flags"
-      style="font-size:10px;text-transform:none;letter-spacing:0;color:var(--dim);
-      cursor:pointer;display:none;align-items:center;gap:4px;margin-left:auto;
-      padding:2px 6px;border:1px solid var(--border);border-radius:10px;
-      background:transparent;user-select:none">
-      <input type="checkbox" id="lastKgFilterFlagged" style="margin:0;cursor:pointer;accent-color:#d29922">
-      <span id="lastKgFilterLabel">hide flagged</span>
-    </label>
+    <button id="lastKgFilterToggle" type="button"
+      title="Hide segments that triggered quality flags"
+      aria-pressed="false"
+      style="font-size:10px;line-height:1;color:var(--dim);cursor:pointer;display:none;
+      align-items:center;gap:4px;margin-left:auto;padding:2px 7px;border:1px solid var(--border);
+      border-radius:10px;background:transparent;user-select:none;font-family:inherit">
+      <span id="lastKgFilterIcon" style="font-size:11px">⚑</span><span id="lastKgFilterLabel">0</span>
+    </button>
   </div>
   <div class="last-kg-grid" id="lastKgGrid"></div>
   <div class="ds-row" id="lastKgDatasources" style="margin-top:6px"></div>
@@ -1606,18 +1607,18 @@ function renderLastKg(js) {
   const card = document.getElementById('lastKgCard');
   card.style.display = 'block';
   if (js.kg_code) card.setAttribute('data-srtm-kg', js.kg_code);
-  // Show / update the "hide flagged" toggle
+  // Show / update the "hide flagged" toggle (subtle icon button)
   const toggleWrap = document.getElementById('lastKgFilterToggle');
   const labelEl = document.getElementById('lastKgFilterLabel');
-  const cb = document.getElementById('lastKgFilterFlagged');
   if (_lastKgFlags && _lastKgFlags.length) {
     toggleWrap.style.display = 'inline-flex';
     const refs = _flaggedRefSet();
-    labelEl.textContent = 'hide ' + refs.size + ' flagged';
+    labelEl.textContent = String(refs.size);
+    toggleWrap.title = (toggleWrap._on ? 'Showing only ' : 'Hide ') + refs.size + ' flagged item(s)';
   } else {
     toggleWrap.style.display = 'none';
   }
-  const hideFlagged = !!cb.checked;
+  const hideFlagged = !!toggleWrap._on;
   if (hideFlagged) {
     const flagged = _flaggedRefSet();
     const kg = js.kg_code;
@@ -1722,16 +1723,22 @@ function renderLastKg(js) {
     '<span class="ds-tag ' + (s.ok ? 'ds-ok' : 'ds-miss') + '">' +
     (s.ok ? '\u2713 ' : '\u2717 ') + s.name + '</span>'
   ).join('');
-  // Wire "hide flagged" toggle once and update visual state.
-  const cbEl = document.getElementById('lastKgFilterFlagged');
-  if (cbEl && !cbEl._wired) {
-    cbEl._wired = true;
-    cbEl.addEventListener('change', () => { if (_lastKgJson) renderLastKg(_lastKgJson); });
-  }
+  // Wire toggle once and update visual state.
   const tgl = document.getElementById('lastKgFilterToggle');
-  if (tgl && cbEl) {
-    tgl.style.borderColor = cbEl.checked ? '#d29922' : 'var(--border)';
-    tgl.style.color = cbEl.checked ? '#d29922' : 'var(--dim)';
+  if (tgl && !tgl._wired) {
+    tgl._wired = true;
+    tgl._on = false;
+    tgl.addEventListener('click', () => {
+      tgl._on = !tgl._on;
+      tgl.setAttribute('aria-pressed', tgl._on ? 'true' : 'false');
+      if (_lastKgJson) renderLastKg(_lastKgJson);
+    });
+  }
+  if (tgl) {
+    tgl.style.borderColor = tgl._on ? '#d29922' : 'var(--border)';
+    tgl.style.color = tgl._on ? '#d29922' : 'var(--dim)';
+    const ico = document.getElementById('lastKgFilterIcon');
+    if (ico) ico.textContent = tgl._on ? '⚑' : '⚐'; // filled vs outline flag
   }
 }
 

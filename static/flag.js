@@ -63,23 +63,41 @@
         transition: opacity .15s; user-select: none;
         -webkit-user-select: none; -webkit-touch-callout: none;
         -webkit-tap-highlight-color: rgba(0,0,0,0); touch-action: manipulation; }
-      .srtm-chip.srtm-chip-touch { padding: 10px 16px; font-size: 13px;
-        border-radius: 22px; min-height: 40px; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+      /* Mobile chip: dock to bottom-center of viewport so it never fights
+         the OS text-selection toolbar or covers the selected content. */
+      .srtm-chip.srtm-chip-touch { padding: 12px 22px; font-size: 14px;
+        border-radius: 26px; min-height: 44px; box-shadow: 0 6px 20px rgba(0,0,0,.55);
+        bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
+        top: auto !important; left: 50% !important;
+        transform: translateX(-50%); }
       .srtm-chip:hover { background: #388bfd; }
       .srtm-chip:before { content: '🚩'; margin-right: 4px; font-size: 12px; }
       .srtm-pop { position: fixed; z-index: 2147483647; background: #161b22; color: #c9d1d9;
         border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px;
         font: 12px 'SF Mono', monospace; min-width: 320px; max-width: 460px;
-        box-shadow: 0 6px 24px rgba(0,0,0,.5); max-height: 90vh; overflow: auto;
-        -webkit-overflow-scrolling: touch; }
-      @media (max-width: 480px) {
+        box-shadow: 0 6px 24px rgba(0,0,0,.5); max-height: 80vh; overflow-y: auto;
+        overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+      @media (max-width: 600px) {
+        /* Sheet-style popover: full-width, anchored to bottom of viewport,
+           independent scroll, never affected by document scroll position. */
         .srtm-pop { left: 8px !important; right: 8px !important;
           width: auto !important; max-width: none !important;
-          min-width: 0 !important; }
+          min-width: 0 !important;
+          top: auto !important;
+          bottom: calc(env(safe-area-inset-bottom, 0px) + 8px) !important;
+          max-height: 75vh; }
         .srtm-pop select, .srtm-pop input, .srtm-pop textarea,
-        .srtm-pop button { font-size: 14px !important; padding: 8px 10px !important; min-height: 38px; }
-        .srtm-pop .cands { max-height: 30vh; }
+        .srtm-pop button:not(.srtm-pop-close) { font-size: 14px !important;
+          padding: 8px 10px !important; min-height: 38px; }
+        .srtm-pop .cands { max-height: 28vh; }
+        .srtm-pop button.srtm-pop-close { display: inline-flex !important; }
       }
+      .srtm-pop button.srtm-pop-close { display: none; position: absolute;
+        top: 4px; right: 4px; background: transparent; border: 0;
+        color: #8b949e; font-size: 24px; line-height: 1; padding: 6px 10px;
+        cursor: pointer; box-shadow: none; min-height: 0; font-family: inherit; }
+      .srtm-pop button.srtm-pop-close:hover { background: transparent;
+        color: #c9d1d9; filter: none; }
       .srtm-pop h4 { font-size: 12px; color: #58a6ff; margin: 0 0 8px; }
       .srtm-pop .row { display: flex; gap: 6px; margin: 4px 0; align-items: baseline; flex-wrap: wrap; }
       .srtm-pop .lb { color: #8b949e; min-width: 64px; font-size: 10px; text-transform: uppercase; }
@@ -173,22 +191,19 @@
     } else {
       // refresh handler reference (lastSel may have been updated)
     }
-    // Position: desktop = above selection (room there). Touch = below,
-    // because Android/iOS draw their toolbar above the selection.
-    const chipH = IS_TOUCH ? 44 : 28;
-    const chipW = IS_TOUCH ? 130 : 70;
-    let top, left;
+    // Touch: chip is bottom-docked via CSS (safe-area aware). Don't write
+    // top/left here — leave them blank so CSS rules win. Desktop: place
+    // chip just above the selection.
     if (IS_TOUCH) {
-      top = Math.min(window.innerHeight - chipH - 8, rect.bottom + 8);
-      // If the bottom of the screen is too close, place above instead.
-      if (top + chipH > window.innerHeight - 8) top = Math.max(8, rect.top - chipH - 8);
+      chipEl.style.top = ''; chipEl.style.left = '';
     } else {
-      top = Math.max(8, rect.top - chipH - 4);
+      const chipH = 28, chipW = 70;
+      const top = Math.max(8, rect.top - chipH - 4);
+      const left = Math.min(window.innerWidth - chipW - 8,
+                            Math.max(8, rect.left + rect.width/2 - chipW/2));
+      chipEl.style.top = top + 'px';
+      chipEl.style.left = left + 'px';
     }
-    left = Math.min(window.innerWidth - chipW - 8,
-                    Math.max(8, rect.left + rect.width/2 - chipW/2));
-    chipEl.style.top = top + 'px';
-    chipEl.style.left = left + 'px';
     chipEl.style.display = 'block';
     chipEl.style.opacity = '1';
     if (chipTimer) clearTimeout(chipTimer);
@@ -246,20 +261,41 @@
   function showPop(anchorRect, content) {
     closePop();
     popEl = el('div', { class: 'srtm-pop' });
-    popEl.appendChild(content);
+    // Mobile/touch users get a visible close button in addition to
+    // tap-outside / Escape. Desktop hides it via CSS.
+    const closeBtn = el('button', {
+      class: 'srtm-pop-close', type: 'button',
+      title: 'Close', 'aria-label': 'Close',
+    }, '×');
+    const fireClose = (e) => { e.preventDefault(); e.stopPropagation(); closePop(); };
+    closeBtn.addEventListener('click', fireClose);
+    closeBtn.addEventListener('touchend', fireClose, { passive: false });
+    popEl.appendChild(closeBtn);
+    const body = el('div', { class: 'srtm-pop-body' });
+    body.appendChild(content);
+    popEl.appendChild(body);
     document.body.appendChild(popEl);
-    const r = popEl.getBoundingClientRect();
-    const top = Math.min(window.innerHeight - r.height - 8,
-                Math.max(8, anchorRect.bottom + 6));
-    const left = Math.min(window.innerWidth - r.width - 8,
-                 Math.max(8, anchorRect.left));
-    popEl.style.top = top + 'px';
-    popEl.style.left = left + 'px';
+    // On mobile (≤600px) the CSS pins the popover to the viewport bottom
+    // as a sheet — don't override top/left.
+    const isMobile = window.matchMedia('(max-width: 600px)').matches;
+    if (!isMobile) {
+      const r = popEl.getBoundingClientRect();
+      const top = Math.min(window.innerHeight - r.height - 8,
+                  Math.max(8, anchorRect.bottom + 6));
+      const left = Math.min(window.innerWidth - r.width - 8,
+                   Math.max(8, anchorRect.left));
+      popEl.style.top = top + 'px';
+      popEl.style.left = left + 'px';
+    }
     setTimeout(() => {
       document.addEventListener('mousedown', popOutsideHandler, true);
       document.addEventListener('touchstart', popOutsideHandler, true);
       document.addEventListener('keydown', popKeyHandler, true);
     }, 0);
+  }
+
+  function _popBody() {
+    return popEl && popEl.querySelector('.srtm-pop-body');
   }
 
   function openPopForSelection(sel) {
@@ -268,10 +304,11 @@
     const loading = el('div', null, 'Matching “' + text + '”…');
     showPop(rect, loading);
     matchText(text, ctx).then(res => {
-      const body = renderMatch(res, { selectedText: text, ctx });
-      popEl.replaceChild(body, popEl.firstChild);
+      const body = _popBody(); if (!body) return;
+      body.replaceChildren(renderMatch(res, { selectedText: text, ctx }));
     }).catch(e => {
-      popEl.replaceChild(el('div', { class: 'err' }, 'Match failed: ' + e), popEl.firstChild);
+      const body = _popBody(); if (!body) return;
+      body.replaceChildren(el('div', { class: 'err' }, 'Match failed: ' + e));
     });
   }
 
@@ -513,7 +550,8 @@
       const loading = el('div', null, 'Matching…');
       showPop(rect, loading);
       matchText(text, ctx).then(res => {
-        popEl.replaceChild(renderMatch(res, { selectedText: text, ctx }), popEl.firstChild);
+        const body = _popBody(); if (!body) return;
+        body.replaceChildren(renderMatch(res, { selectedText: text, ctx }));
       });
     }
   }

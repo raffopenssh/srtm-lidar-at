@@ -949,9 +949,10 @@ function updateSubtitle(d) {
       dirInfo += ' · on <b>' + esc(d._active_peer_id) + '</b>';
     }
   }
+  const blocksInfo = d.pending_blocks ? ' · <b>' + fmt(d.pending_blocks) + '</b> blocks pending' : '';
   el.innerHTML = '<b>' + fmt(d.completed||0) + '</b>/<b>' + fmt(d.total_kgs||0) + '</b> KGs · <b>' +
     fmt(d.success||0) + '</b> success · <b>' + fmt(d.uploaded||0) + '</b> uploaded' +
-    extra + infra + dirInfo + elapsed + started;
+    extra + infra + blocksInfo + dirInfo + elapsed + started;
 }
 
 // ── Current KG ──────────────────────────────────────────────────

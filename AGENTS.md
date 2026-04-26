@@ -72,6 +72,7 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 | File | Purpose |
 |------|----------|
 | `gpkg_streamed.py` | Strip-streamed full-GPKG writer for large KGs (>100 Mpx). Keeps peak memory ~500 MB regardless of KG size. Called automatically by `build_full_gpkg_tiled()` when pixel count exceeds threshold. |
+| `kg_splitter.py` | Splits large KGs (>28 tiles) into contiguous blocks with directional names. Parcel filtering at runtime. |
 
 ### Deprecated (kept for reference)
 `landscape_classifier.py`, `object_classifier.py`, `scene_adaptive_classifier_patches.py`
@@ -782,6 +783,34 @@ JSON `coverage` section: `n_tiles`, `tile_km`, `parcel_elevation_coverage_pct`, 
 | `static/process.html` | ~2100L | Dashboard UI (status, map, log, Zenodo manifest, peer director cards) |
 | `data/austria_processor/MONITOR.md` | — | Monitoring checklist + expected timelines |
 | `gpkg_streamed.py` | ~500L | Strip-streamed full-GPKG builder for large KGs (auto-used >100 Mpx, skipped >200 Mpx) |
+| `kg_splitter.py` | ~300L | KG block splitter — splits large KGs (>28 tiles) into contiguous blocks with directional names |
+
+### KG Block Splitting
+
+Large KGs (>28 tiles ≈ >42 km²) are automatically split into smaller contiguous
+blocks for processing. Each block is named with a directional suffix:
+
+```
+49006 Innerbreitenau  →  49006-south  (28 tiles)
+                         49006-north  (28 tiles)
+
+80110 Sölden          →  80110-southwest-1, 80110-southeast-1, ... (16 blocks)
+```
+
+**How it works:**
+- `kg_splitter.maybe_split_kg(kg)` checks tile count and splits bbox into grid blocks
+- Splitting happens in `main()` when building the pending list — transparent to `process_one_kg`
+- Each block processes only parcels whose centroid falls within its bbox
+- Blocks are stored on Zenodo as `49006-south.json`, `49006-south_light.gpkg`, etc.
+- The search index aggregates all blocks into one parent KG row (all parcels, all stats)
+- The KG counter counts unique parent codes, not blocks
+- Priority queue: putting `49006` in queue processes all its blocks
+
+**Files affected by splitting:**
+- `kg_splitter.py` — splitting logic, block code utilities
+- `austria_processor.py` — block expansion in `main()`, parcel filtering in `process_one_kg()`
+- `search_index.py` — `_enrich_kg_from_blocks()` aggregates block JSONs into parent row
+- `app.py` — queue API resolves block codes via parent KG
 
 ### Where to Look When Debugging
 

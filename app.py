@@ -1911,9 +1911,13 @@ def processing_queue_get():
             pass
     # Filter out already-completed KGs, BUT keep tombstoned ones (queued for reprocessing)
     completed = _get_completed_kgs()
-    # Extract KG code (leading digits) from tombstone keys like '12362_json', '12362_full_gpkg'
+    # Extract KG code (digits, or digits-label for blocks) from tombstone keys like '12362_json', '49006-north_json'
     import re as _re
-    tombstoned_kgs = {_re.match(r'^(\d+)', key).group(1) for key in _MANIFEST_TOMBSTONES if _re.match(r'^\d+', key)}
+    tombstoned_kgs = set()
+    for key in _MANIFEST_TOMBSTONES:
+        _m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
+        if _m:
+            tombstoned_kgs.add(_m.group(1))
     dirty = len(codes)
     codes = [c for c in codes if c not in completed or c in tombstoned_kgs]
     if len(codes) < dirty:
@@ -1971,13 +1975,19 @@ def processing_queue_get():
             ny = max(1, _math.ceil((max_lat - min_lat) / step_y))
             return nx * ny
         def _resolve(code):
+            from kg_splitter import is_block_code, parent_kg_code as _parent_code, block_label as _block_label
+            _lookup_code = _parent_code(code) if is_block_code(code) else code
             row = conn.execute(
                 'SELECT kg_name, gemeinde_name, district_name, min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?',
-                (code,)
+                (_lookup_code,)
             ).fetchone()
             is_tombstoned = code in tombstoned_kgs
             if row:
-                return {'code': code, 'name': row['kg_name'],
+                _name = row['kg_name']
+                _lbl = _block_label(code)
+                if _lbl:
+                    _name = f"{_name} ({_lbl})"
+                return {'code': code, 'name': _name,
                         'gemeinde': row['gemeinde_name'],
                         'district': row['district_name'],
                         'failures': failure_counts.get(code, 0),

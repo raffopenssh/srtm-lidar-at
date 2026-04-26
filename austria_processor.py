@@ -305,6 +305,7 @@ class ProgressTracker:
         self._state = {
             "state": "idle",
             "total_kgs": 0,
+            "_completed_parent_codes": [],
             "completed": 0,
             "success": 0,
             "failed": 0,
@@ -396,14 +397,30 @@ class ProgressTracker:
                 "step": step, "ts": datetime.now(timezone.utc).isoformat(),
             })
             self._state["failed"] += 1
-            self._state["completed"] += 1
+            # Only increment completed KG count for new parent codes
+            from kg_splitter import is_block_code, parent_kg_code
+            _parent = parent_kg_code(code) if is_block_code(code) else code
+            _pset = set(self._state.get("_completed_parent_codes", []))
+            if _parent not in _pset:
+                _pset.add(_parent)
+                self._state["_completed_parent_codes"] = sorted(_pset)
+                self._state["completed"] += 1
 
     def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0,
                         last_kg_code: str = None, last_kg_seconds: float = 0,
                         n_new_buildings: int = 0, n_infrastructure: int = 0):
         with self._lock:
-            self._state["success"] += 1
-            self._state["completed"] += 1
+            from kg_splitter import is_block_code, parent_kg_code
+            _parent = parent_kg_code(last_kg_code) if last_kg_code and is_block_code(last_kg_code) else last_kg_code
+            _pset = set(self._state.get("_completed_parent_codes", []))
+            _is_new_kg = _parent and _parent not in _pset
+            if _parent:
+                _pset.add(_parent)
+                self._state["_completed_parent_codes"] = sorted(_pset)
+            # completed counts unique parent KGs, not blocks
+            if _is_new_kg:
+                self._state["success"] += 1
+                self._state["completed"] += 1
             self._state["uploaded"] += 1
             self._state["upload_size_bytes"] += upload_bytes
             self._state["parcels_total"] += parcels
@@ -5481,7 +5498,79 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # --- 1. Cadastre ---
         result["step"] = "cadastre"
         _report_step("cadastre")
-        cadastre_data = fetch_cadastre_data(kg_code)
+        # For blocks, fetch cadastre using parent KG code
+        _parent_code = kg.get("_parent_kg_code", kg_code)
+        cadastre_data = fetch_cadastre_data(_parent_code)
+
+        # --- 1a. Block parcel filtering ---
+        # If this is a block (split from a larger KG), filter cadastre
+        # to parcels whose centroid falls within the block's bbox.
+        _is_block = kg.get("_parent_kg_code") is not None
+        if _is_block:
+            from shapely.geometry import box as _shapely_box
+            _block_bb = kg["bbox"]
+            _block_env_wgs = _shapely_box(
+                _block_bb["min_lon"], _block_bb["min_lat"],
+                _block_bb["max_lon"], _block_bb["max_lat"],
+            )
+            # Use WGS84 geometries for bbox test (block bbox is in WGS84)
+            _n_before = len(cadastre_data["parcels"])
+            _kept_parcel_ids = set()
+            _filtered_parcels = []
+            _filtered_parcels_geojson = []
+            for _i, p in enumerate(cadastre_data["parcels"]):
+                _pg = p.get("geometry_wgs") or p.get("geometry")
+                if _pg is None:
+                    continue
+                try:
+                    if _pg.centroid.within(_block_env_wgs):
+                        _filtered_parcels.append(p)
+                        _kept_parcel_ids.add(p.get("parcel_id", ""))
+                        if _i < len(cadastre_data["parcels_geojson"]):
+                            _filtered_parcels_geojson.append(
+                                cadastre_data["parcels_geojson"][_i])
+                except Exception:
+                    pass
+            cadastre_data["parcels"] = _filtered_parcels
+            cadastre_data["parcels_geojson"] = _filtered_parcels_geojson
+
+            # Filter buildings, addresses, landuse to block bbox
+            if _filtered_parcels:
+                from shapely.ops import unary_union as _block_uu
+                from shapely.validation import make_valid as _block_mv
+                _block_geoms = []
+                for p in _filtered_parcels:
+                    try:
+                        g = p["geometry"]
+                        _block_geoms.append(_block_mv(g) if not g.is_valid else g)
+                    except Exception:
+                        _block_geoms.append(p["geometry"].buffer(0))
+                _block_union = _block_uu(_block_geoms).buffer(10)  # 10m buffer
+                cadastre_data["building_footprints"] = [
+                    b for b in cadastre_data["building_footprints"]
+                    if b["geometry"].intersects(_block_union)
+                ]
+                cadastre_data["buildings_geojson"] = [
+                    f for f in cadastre_data["buildings_geojson"]
+                    if True  # keep all — footprint filter above is primary
+                ]
+                cadastre_data["building_addresses"] = [
+                    a for a in cadastre_data["building_addresses"]
+                    if a["geometry_3035"].intersects(_block_union)
+                ]
+                cadastre_data["landuse"] = [
+                    lu for lu in cadastre_data["landuse"]
+                    if lu["geometry"].intersects(_block_union)
+                ]
+            else:
+                cadastre_data["building_footprints"] = []
+                cadastre_data["buildings_geojson"] = []
+                cadastre_data["building_addresses"] = []
+                cadastre_data["landuse"] = []
+            log.info("KG %s: block parcel filter: %d → %d parcels, %d buildings",
+                     kg_code, _n_before, len(cadastre_data["parcels"]),
+                     len(cadastre_data["building_footprints"]))
+
         result["n_parcels"] = len(cadastre_data["parcels"])
         result["n_buildings"] = len(cadastre_data["building_footprints"])
         _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, "
@@ -6943,15 +7032,25 @@ def _read_retry_queue() -> list[str]:
 
 
 def _remove_from_retry_queue(kg_code: str):
-    """Remove a single KG code from the retry queue file (atomic)."""
+    """Remove a KG code (or its parent) from the retry queue file (atomic).
+
+    For block codes like '49006-south', also removes the parent '49006'
+    once all sibling blocks are done.
+    """
     try:
         if not RETRY_QUEUE_FILE.exists():
             return
         codes = json.loads(RETRY_QUEUE_FILE.read_text())
-        if kg_code in codes:
-            codes = [c for c in codes if c != kg_code]
+        from kg_splitter import is_block_code, parent_kg_code
+        to_remove = {kg_code}
+        # Also remove the parent code — blocks are expanded from the parent
+        # at runtime, so the parent in the queue is consumed
+        if is_block_code(kg_code):
+            to_remove.add(parent_kg_code(kg_code))
+        new_codes = [c for c in codes if c not in to_remove]
+        if len(new_codes) < len(codes):
             tmp = RETRY_QUEUE_FILE.with_suffix('.tmp')
-            tmp.write_text(json.dumps(codes))
+            tmp.write_text(json.dumps(new_codes))
             tmp.replace(RETRY_QUEUE_FILE)
     except Exception:
         pass
@@ -6964,7 +7063,13 @@ def _clear_tombstones(kg_code: str):
         if not tombstone_path.exists():
             return
         tombstones = json.loads(tombstone_path.read_text())
-        keys_to_remove = [k for k in tombstones if k.startswith(kg_code + '_')]
+        # Match both exact code and parent code for block completions
+        from kg_splitter import is_block_code, parent_kg_code
+        _prefixes = [kg_code + '_']
+        if is_block_code(kg_code):
+            _prefixes.append(parent_kg_code(kg_code) + '_')
+        keys_to_remove = [k for k in tombstones
+                          if any(k.startswith(p) for p in _prefixes)]
         if not keys_to_remove:
             return
         for k in keys_to_remove:
@@ -7323,6 +7428,44 @@ def main():
                and kg["kg_code"] not in failed_kgs
                and kg["kg_code"] not in peer_claimed]
 
+    # --- Expand large KGs into blocks ---
+    from kg_splitter import (maybe_split_kg, is_block_code, parent_kg_code,
+                             all_block_codes_for_parent, MAX_TILES_PER_BLOCK)
+
+    # Check if parent KGs are fully done (all blocks completed)
+    # Also recognize parent codes that were completed as a whole (no blocks)
+    _parent_codes_with_blocks = set()
+    for c in completed_codes:
+        if is_block_code(c):
+            _parent_codes_with_blocks.add(parent_kg_code(c))
+
+    # A parent KG is effectively completed if its base code is in
+    # completed_codes OR all its blocks are completed.  We can't know
+    # the expected block count without re-splitting, so we check lazily
+    # during expansion below.
+
+    _expanded_pending = []
+    _n_split = 0
+    for kg_item in pending:
+        code = kg_item["kg_code"]
+        blocks = maybe_split_kg(kg_item)
+        if len(blocks) > 1:
+            _n_split += 1
+            # Filter out already-completed or failed blocks
+            for blk in blocks:
+                bc = blk["kg_code"]
+                if bc not in completed_codes and bc not in failed_kgs and bc not in peer_claimed:
+                    _expanded_pending.append(blk)
+                else:
+                    log.debug("  Block %s already done/failed — skipping", bc)
+        else:
+            _expanded_pending.append(kg_item)
+
+    if _n_split:
+        log.info("Expanded %d large KGs into blocks: %d → %d items",
+                 _n_split, len(pending), len(_expanded_pending))
+    pending = _expanded_pending
+
     # --- Load priority queue and prepend to pending ---
     priority_codes = _read_retry_queue()
     # Filter out completed / permanently-failed from the file too
@@ -7334,17 +7477,34 @@ def main():
         log.info("Priority queue: %d KGs to process first: %s",
                  len(priority_codes),
                  priority_codes[:10])
-        # Separate priority KGs from the rest
+        # Build parent-code set for matching blocks to queued parents
+        _priority_parents = set()
+        for pc in priority_codes:
+            _priority_parents.add(pc)
+            if is_block_code(pc):
+                _priority_parents.add(parent_kg_code(pc))
+
+        # Separate priority KGs from the rest.
+        # A block matches if its own code OR its parent code is in queue.
         priority_kgs = []
         non_priority = []
         for kg_item in pending:
-            if kg_item["kg_code"] in priority_set:
+            _code = kg_item["kg_code"]
+            _parent = kg_item.get("_parent_kg_code", _code)
+            if _code in priority_set or _parent in priority_set:
                 priority_kgs.append(kg_item)
             else:
                 non_priority.append(kg_item)
         # Build lookup for ordering priority_kgs to match the file order
         prio_order = {c: idx for idx, c in enumerate(priority_codes)}
-        priority_kgs.sort(key=lambda k: prio_order.get(k["kg_code"], 999999))
+        # Blocks inherit their parent's priority position
+        def _prio_key(k):
+            c = k["kg_code"]
+            p = k.get("_parent_kg_code", c)
+            base = min(prio_order.get(c, 999999), prio_order.get(p, 999999))
+            # Sub-sort blocks by index within parent
+            return (base, k.get("_block_index", 0))
+        priority_kgs.sort(key=_prio_key)
     else:
         priority_kgs = []
         non_priority = pending
@@ -7378,13 +7538,20 @@ def main():
             log.info("  ... and %d more", len(pending) - 20)
         return
 
+    # Count completed KGs — normalize block codes to parent codes
+    _completed_parents = set()
+    for c in completed_codes:
+        _completed_parents.add(parent_kg_code(c) if is_block_code(c) else c)
+    _n_completed = len(_completed_parents)
+
     progress.update(
         state="running",
         total_kgs=len(kgs),
-        completed=len(completed_codes),
-        success=len(completed_codes),
-        _completed_at_start=len(completed_codes),
+        completed=_n_completed,
+        success=_n_completed,
+        _completed_at_start=_n_completed,
         started_at=datetime.now(timezone.utc).isoformat(),
+        pending_blocks=len(pending),
     )
     progress.save()
 

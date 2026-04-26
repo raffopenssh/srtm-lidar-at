@@ -538,16 +538,39 @@ class SearchIndex:
             json_dir_p = Path(json_dir)
             n_processed = 0
             if json_dir_p.exists():
+                # Collect block JSONs grouped by parent KG for aggregation
+                _block_jsons = {}  # parent_code -> [(block_code, data)]
+                _plain_jsons = {}  # code -> data
                 for jf in json_dir_p.glob('*.json'):
                     code = jf.stem
-                    if not code.isdigit():
+                    _base = code.split('-', 1)[0] if '-' in code else code
+                    if not _base.isdigit():
                         continue
                     try:
                         data = json.loads(jf.read_text())
+                        if '-' in code and _base != code:
+                            # Block code — group under parent
+                            _block_jsons.setdefault(_base, []).append((code, data))
+                        else:
+                            _plain_jsons[code] = data
+                    except Exception as e:
+                        log.warning('enrich %s: %s', code, e)
+
+                # Enrich plain (non-block) KGs
+                for code, data in _plain_jsons.items():
+                    try:
                         self._enrich_kg(c, code, data)
                         n_processed += 1
                     except Exception as e:
                         log.warning('enrich %s: %s', code, e)
+
+                # Enrich block KGs — aggregate into parent row
+                for parent_code, block_list in _block_jsons.items():
+                    try:
+                        self._enrich_kg_from_blocks(c, parent_code, block_list)
+                        n_processed += 1
+                    except Exception as e:
+                        log.warning('enrich blocks for %s: %s', parent_code, e)
 
             elapsed = time.time() - t0
             c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
@@ -827,14 +850,357 @@ class SearchIndex:
                     'INSERT INTO kg_parcels VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     prc_rows)
 
+    def _enrich_kg_from_blocks(self, c, parent_code, block_list):
+        """Aggregate multiple block JSONs into the parent KG row.
+
+        Each block_list entry is (block_code, data_dict).
+        Merges ALL data — area summaries, terrain, NDVI, SAR, Hansen,
+        buildings, parcels, classification, phenology, etc. — so the
+        parent row looks exactly as if processed in one pass.
+        """
+        if not block_list:
+            return
+
+        block_list.sort(key=lambda x: x[0])
+
+        # ── helpers ──────────────────────────────────────────────
+        def _wavg(key_path):
+            """Area-weighted average of a nested numeric field."""
+            vals = []
+            for _, d in block_list:
+                v = d
+                for k in key_path:
+                    v = v.get(k) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                area = d.get('total_area_sqm', 1)
+                if v is not None and isinstance(v, (int, float)):
+                    vals.append((v, area))
+            if not vals:
+                return None
+            return round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 4)
+
+        def _sum(key_path):
+            total = 0
+            for _, d in block_list:
+                v = d
+                for k in key_path:
+                    v = v.get(k) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                if v is not None and isinstance(v, (int, float)):
+                    total += v
+            return total
+
+        def _min_val(key_path):
+            vals = [v for v in (_deep(d, key_path) for _, d in block_list)
+                    if v is not None and isinstance(v, (int, float))]
+            return min(vals) if vals else None
+
+        def _max_val(key_path):
+            vals = [v for v in (_deep(d, key_path) for _, d in block_list)
+                    if v is not None and isinstance(v, (int, float))]
+            return max(vals) if vals else None
+
+        def _deep(d, key_path):
+            for k in key_path:
+                d = d.get(k) if isinstance(d, dict) else None
+                if d is None:
+                    return None
+            return d
+
+        def _any_val(key_path):
+            """First non-None value across blocks."""
+            for _, d in block_list:
+                v = _deep(d, key_path)
+                if v is not None:
+                    return v
+            return None
+
+        # ── scaffold from last block ─────────────────────────────
+        _, last_data = block_list[-1]
+        merged = {}  # build from scratch, not shallow copy
+
+        # Top-level
+        total_area = _sum(['total_area_sqm'])
+        merged['total_area_sqm'] = total_area
+        merged['generated_at'] = _any_val(['generated_at'])
+        merged['observation_period'] = _any_val(['observation_period']) or {}
+
+        # ── parcels (concatenate ALL details) ────────────────────
+        all_parcel_details = []
+        for _, d in block_list:
+            all_parcel_details.extend(d.get('parcels', {}).get('details', []))
+        merged['parcels'] = {
+            'count': len(all_parcel_details),
+            'details': all_parcel_details,
+        }
+
+        # ── buildings (concatenate ALL details) ──────────────────
+        all_bf_details = []
+        for _, d in block_list:
+            all_bf_details.extend(d.get('building_footprints', {}).get('details', []))
+        merged['building_footprints'] = {
+            'count': len(all_bf_details),
+            'details': all_bf_details,
+        }
+
+        # ── new buildings (concatenate features) ─────────────────
+        all_nb = []
+        for _, d in block_list:
+            all_nb.extend(d.get('new_buildings', {}).get('features', []))
+        merged['new_buildings'] = {
+            'count': len(all_nb),
+            'features': all_nb,
+        }
+
+        # ── infrastructure ───────────────────────────────────────
+        all_infra = []
+        for _, d in block_list:
+            all_infra.extend(d.get('infrastructure', {}).get('features', []))
+        merged['infrastructure'] = {
+            'total': len(all_infra),
+            'features': all_infra,
+        }
+
+        # ── landscape ────────────────────────────────────────────
+        merged['landscape'] = {
+            'dominant_type': _any_val(['landscape', 'dominant_type']),
+            'vegetated_fraction': _wavg(['landscape', 'vegetated_fraction']),
+            'shannon_diversity': _wavg(['landscape', 'shannon_diversity']),
+            'n_segments': _sum(['landscape', 'n_segments']),
+        }
+
+        # ── area_summary (merge by type) ─────────────────────────
+        merged_area_sum = {}
+        merged_height_dist = {}
+        for _, d in block_list:
+            for otype, info in d.get('area_summary', {}).items():
+                if otype not in merged_area_sum:
+                    merged_area_sum[otype] = {'area_sqm': 0, 'n_objects': 0}
+                merged_area_sum[otype]['area_sqm'] += info.get('area_sqm', 0)
+                merged_area_sum[otype]['n_objects'] += info.get('n_objects', 0)
+            for otype, hd in d.get('height_distribution', {}).items():
+                if otype not in merged_height_dist:
+                    merged_height_dist[otype] = {
+                        'min': None, 'max': None, 'p90': None,
+                        '_means': [], '_p90s': [],
+                    }
+                mhd = merged_height_dist[otype]
+                if hd.get('min') is not None:
+                    mhd['min'] = hd['min'] if mhd['min'] is None else min(mhd['min'], hd['min'])
+                if hd.get('max') is not None:
+                    mhd['max'] = hd['max'] if mhd['max'] is None else max(mhd['max'], hd['max'])
+                if hd.get('mean') is not None:
+                    mhd['_means'].append(hd['mean'])
+                if hd.get('p90') is not None:
+                    mhd['_p90s'].append(hd['p90'])
+        if total_area > 0:
+            for otype in merged_area_sum:
+                merged_area_sum[otype]['fraction'] = round(
+                    merged_area_sum[otype]['area_sqm'] / total_area, 4)
+        merged['area_summary'] = merged_area_sum
+        for otype, hd in merged_height_dist.items():
+            if hd['_means']:
+                hd['mean'] = round(sum(hd['_means']) / len(hd['_means']), 2)
+            if hd['_p90s']:
+                hd['p90'] = round(max(hd['_p90s']), 2)  # conservative
+            del hd['_means']
+            del hd['_p90s']
+        merged['height_distribution'] = merged_height_dist
+
+        # ── terrain (weighted averages + min/max extremes) ───────
+        merged['terrain'] = {
+            'elevation_min_m': _min_val(['terrain', 'elevation_min_m']),
+            'elevation_max_m': _max_val(['terrain', 'elevation_max_m']),
+            'elevation_mean_m': _wavg(['terrain', 'elevation_mean_m']),
+            'elevation_range_m': None,  # computed below
+            'steepness_mean_deg': _wavg(['terrain', 'steepness_mean_deg']),
+            'steepness_max_deg': _max_val(['terrain', 'steepness_max_deg']),
+            'aspect_dominant': _any_val(['terrain', 'aspect_dominant']),
+            'roughness_mean': _wavg(['terrain', 'roughness_mean']),
+            'terrain_class': _any_val(['terrain', 'terrain_class']),
+        }
+        e_min = merged['terrain']['elevation_min_m']
+        e_max = merged['terrain']['elevation_max_m']
+        if e_min is not None and e_max is not None:
+            merged['terrain']['elevation_range_m'] = round(e_max - e_min, 2)
+
+        # ── tree stats ───────────────────────────────────────────
+        merged_ts = {
+            'count': _sum(['tree_stats', 'count']),
+            'total_canopy_sqm': _sum(['tree_stats', 'total_canopy_sqm']),
+            'est_stem_volume_m3': _sum(['tree_stats', 'est_stem_volume_m3']),
+            'mean_height_m': _wavg(['tree_stats', 'mean_height_m']),
+        }
+        merged['tree_stats'] = merged_ts
+
+        # ── NDVI ─────────────────────────────────────────────────
+        merged['ndvi'] = {
+            'copernicus_mean': _wavg(['ndvi', 'copernicus_mean']),
+            'bev_nir_mean': _wavg(['ndvi', 'bev_nir_mean']),
+        }
+
+        # ── SAR ──────────────────────────────────────────────────
+        merged['sar'] = {
+            'vv_mean_db': _wavg(['sar', 'vv_mean_db']),
+            'vh_mean_db': _wavg(['sar', 'vh_mean_db']),
+        }
+
+        # ── NDVI harmonics ───────────────────────────────────────
+        merged['ndvi_harmonics'] = {
+            'mean_mean': _wavg(['ndvi_harmonics', 'mean_mean']),
+            'amplitude_mean': _wavg(['ndvi_harmonics', 'amplitude_mean']),
+            'phase_mean': _wavg(['ndvi_harmonics', 'phase_mean']),
+        }
+
+        # ── temporal change ──────────────────────────────────────
+        merged['temporal_change'] = {
+            'net_volume_change_m3': _sum(['temporal_change', 'net_volume_change_m3']),
+            'mean_stability': _wavg(['temporal_change', 'mean_stability']),
+            'dtm_change_mean_m': _wavg(['temporal_change', 'dtm_change_mean_m']),
+            'n_changed_segments': _sum(['temporal_change', 'n_changed_segments']),
+            'total_disturbed_volume_m3': _sum(['temporal_change', 'total_disturbed_volume_m3']),
+        }
+
+        # ── hansen (merge loss_by_year) ──────────────────────────
+        merged_hansen = {}
+        for _, d in block_list:
+            for yr, val in d.get('hansen', {}).get('loss_by_year', {}).items():
+                px = val.get('pixels', val) if isinstance(val, dict) else val
+                try:
+                    merged_hansen[yr] = merged_hansen.get(yr, 0) + int(px)
+                except (ValueError, TypeError):
+                    pass
+        merged['hansen'] = {'loss_by_year': {yr: {'pixels': px}
+                            for yr, px in merged_hansen.items()}}
+
+        # ── phenology ────────────────────────────────────────────
+        merged_phen = {}
+        for _, d in block_list:
+            for cls_name, frac in d.get('phenology', {}).get('distribution', {}).items():
+                merged_phen[cls_name] = merged_phen.get(cls_name, 0) + (frac or 0)
+        # Re-normalize
+        phen_total = sum(merged_phen.values()) or 1
+        merged['phenology'] = {
+            'distribution': {k: round(v / phen_total, 4) for k, v in merged_phen.items()},
+        }
+
+        # ── classification ───────────────────────────────────────
+        merged_ptc = {}
+        for _, d in block_list:
+            for otype, info in d.get('classification', {}).get('per_type_confidence', {}).items():
+                if otype not in merged_ptc:
+                    merged_ptc[otype] = {'count': 0, 'diverged_count': 0,
+                                         'area_sqm': 0, '_conf_sum': 0,
+                                         '_min': None}
+                m = merged_ptc[otype]
+                cnt = info.get('count', 0)
+                m['count'] += cnt
+                m['diverged_count'] += info.get('diverged_count', 0)
+                m['area_sqm'] += info.get('area_sqm', 0)
+                if info.get('mean') is not None:
+                    m['_conf_sum'] += (info['mean'] or 0) * cnt
+                if info.get('min') is not None:
+                    m['_min'] = info['min'] if m['_min'] is None else min(m['_min'], info['min'])
+        for otype, m in merged_ptc.items():
+            m['mean'] = round(m['_conf_sum'] / m['count'], 4) if m['count'] else None
+            m['min'] = m.pop('_min')
+            del m['_conf_sum']
+
+        # Top divergences: concatenate, sort by count desc, take top 10
+        all_top_div = []
+        for _, d in block_list:
+            all_top_div.extend(d.get('classification', {}).get('top_divergences', []))
+        # Group by (rf_type, final_type) and sum counts
+        div_map = {}
+        for dv in all_top_div:
+            key = (dv.get('rf_type', ''), dv.get('final_type', ''))
+            div_map[key] = div_map.get(key, 0) + dv.get('count', 0)
+        merged_top_div = sorted(
+            [{'rf_type': k[0], 'final_type': k[1], 'count': v}
+             for k, v in div_map.items()],
+            key=lambda x: -x['count'])[:10]
+
+        merged['classification'] = {
+            'mean_confidence': _wavg(['classification', 'mean_confidence']),
+            'rf_classified_pct': _wavg(['classification', 'rf_classified_pct']),
+            'rf_mean_confidence': _wavg(['classification', 'rf_mean_confidence']),
+            'diverged_count': _sum(['classification', 'diverged_count']),
+            'diverged_pct': _wavg(['classification', 'diverged_pct']),
+            'per_type_confidence': merged_ptc,
+            'top_divergences': merged_top_div,
+        }
+
+        # ── top_by_type (concatenate, sort, take top per type) ───
+        merged_top_by_type = {}
+        for _, d in block_list:
+            for otype, entries in d.get('top_by_type', {}).items():
+                merged_top_by_type.setdefault(otype, []).extend(entries)
+        # Sort by area desc, keep top 5 per type
+        for otype in merged_top_by_type:
+            merged_top_by_type[otype] = sorted(
+                merged_top_by_type[otype],
+                key=lambda e: -(e.get('area_sqm') or 0),
+            )[:5]
+        merged['top_by_type'] = merged_top_by_type
+
+        # ── coverage ─────────────────────────────────────────────
+        merged['coverage'] = {
+            'n_tiles': _sum(['coverage', 'n_tiles']),
+            'building_height_coverage_pct': _wavg(['coverage', 'building_height_coverage_pct']),
+        }
+
+        # ── data quality (weighted average) ──────────────────────
+        merged['data_quality'] = {
+            'quality_score': _wavg(['data_quality', 'quality_score']),
+            'quality_grade': _any_val(['data_quality', 'quality_grade']),
+            'available_layers': _any_val(['data_quality', 'available_layers']) or [],
+            'missing_layers': _any_val(['data_quality', 'missing_layers']) or [],
+        }
+
+        # Block metadata for reference
+        merged['_blocks'] = [
+            {'code': bc, 'label': bc.split('-', 1)[1] if '-' in bc else bc}
+            for bc, _ in block_list
+        ]
+
+        # ── enrich the parent row ────────────────────────────────
+        self._enrich_kg(c, parent_code, merged)
+
     def update_kg(self, kg_code, json_path=None, manifest=None):
-        """Incremental update for a single KG after processing."""
+        """Incremental update for a single KG after processing.
+
+        Handles block codes (e.g. '49006-north') by enriching the parent
+        KG row and storing Zenodo URLs under the parent code.
+        """
+        from kg_splitter import is_block_code, parent_kg_code as _parent_code
+        _is_block = is_block_code(kg_code)
+        _target_code = _parent_code(kg_code) if _is_block else kg_code
+
         with self._write_lock:
             c = self._conn()
             if json_path and Path(json_path).exists():
                 data = json.loads(Path(json_path).read_text())
-                self._enrich_kg(c, kg_code, data)
+                if _is_block:
+                    # For blocks, aggregate all available block JSONs
+                    _json_dir = Path(json_path).parent
+                    _prefix = _target_code + '-'
+                    _blocks = []
+                    for jf in _json_dir.glob(f'{_prefix}*.json'):
+                        try:
+                            _blocks.append((jf.stem, json.loads(jf.read_text())))
+                        except Exception:
+                            pass
+                    if _blocks:
+                        self._enrich_kg_from_blocks(c, _target_code, _blocks)
+                    else:
+                        self._enrich_kg(c, _target_code, data)
+                else:
+                    self._enrich_kg(c, _target_code, data)
             if manifest:
+                # For blocks, store Zenodo URLs under parent code
+                # but use the block's manifest keys
                 for suffix, col_url, col_size in [
                     ('_json', 'zenodo_json_url', 'zenodo_json_size'),
                     ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
@@ -844,7 +1210,7 @@ class SearchIndex:
                     if entry:
                         url = _zenodo_url(entry)
                         c.execute(f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
-                                  (url, entry.get('size'), kg_code))
+                                  (url, entry.get('size'), _target_code))
             c.commit()
 
     # ════════════════════════════════════════════════════════════════

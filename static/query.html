@@ -46,6 +46,7 @@ body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overf
 .flag-high{background:#b62324;color:#fff}
 .flag-medium{background:#d29922;color:#000}
 .flag-low{background:#586069;color:#fff}
+.flag-tag{background:#21262d;color:#bc8cff;border:1px solid #30363d;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px;display:inline-block}
 .tabs{display:flex;border-bottom:1px solid var(--border);background:var(--card)}
 .tabs button{background:none;color:var(--dim);border:0;border-bottom:2px solid transparent;padding:6px 12px;cursor:pointer;font:inherit}
 .tabs button.on{color:var(--blue);border-color:var(--blue)}
@@ -202,16 +203,66 @@ function extractItems(j) {
   if (!j) return [];
   const items = [];
   if (Array.isArray(j.flags)) {
-    j.flags.forEach((f, i) => items.push({
-      id: 'flag-' + (f.id != null ? f.id : i),
-      kg: f.kg_code, lon: f.centroid_lon, lat: f.centroid_lat,
-      type: f.obj_type, sev: f.severity, message: f.message,
-      flag_code: f.flag_code, obj_ref: f.obj_ref,
-      height: f.height_max_m, area: f.area_sqm,
-      title: f.flag_code + ' · ' + (f.obj_type||'?') + ' · ' + (f.kg_code||'') + (f.height_max_m!=null ? ' · '+f.height_max_m.toFixed(1)+'m':''),
-      weight: (f.aggregate||{}).total_weight, n_codes: ((f.aggregate||{}).codes||[]).length,
-      raw: f, kind: 'flag',
-    }));
+    // Dedup so each physical object becomes ONE row with all its flag
+    // codes shown as tags. The same segment can appear under several
+    // obj_refs (top_tree / top_obj / top_by_type aliases) and several
+    // rules can fire on each — collapse by (kg, type, rounded coords,
+    // rounded height, rounded area). Keep the highest-severity flag
+    // for the row's primary content + best obj_ref for actions.
+    const SEV_RANK = { critical: 3, high: 2, medium: 1, low: 0 };
+    const KIND_PRIO = { building: 0, parcel: 1, top_tree: 2, top_obj: 3,
+                        top_by_type: 4, new_building: 5, infra: 6 };
+    const r5 = (v) => v == null ? '' : Math.round(v * 1e5) / 1e5;
+    const rh = (v) => v == null ? '' : Math.round(v * 2) / 2;     // 0.5m bucket
+    const ra = (v) => v == null ? '' : Math.round(v / 5) * 5;     // 5m² bucket
+    const buckets = new Map();
+    j.flags.forEach((f, i) => {
+      const key = [f.kg_code||'', f.obj_type||'', r5(f.centroid_lon),
+                   r5(f.centroid_lat), rh(f.height_max_m), ra(f.area_sqm)].join('|');
+      let b = buckets.get(key);
+      if (!b) {
+        b = { flags: [f], primary: f, agg: f.aggregate, refs: new Set() };
+        buckets.set(key, b);
+      } else {
+        b.flags.push(f);
+        if ((SEV_RANK[f.severity]||0) > (SEV_RANK[b.primary.severity]||0)) b.primary = f;
+        if (!b.agg && f.aggregate) b.agg = f.aggregate;
+        // pick the more-informative obj_ref (lowest priority number)
+        const oldP = KIND_PRIO[b.primary.kind] != null ? KIND_PRIO[b.primary.kind] : 99;
+        const newP = KIND_PRIO[f.kind] != null ? KIND_PRIO[f.kind] : 99;
+        if (newP < oldP) b.primary = { ...b.primary, kind: f.kind, obj_ref: f.obj_ref };
+      }
+      if (f.obj_ref) b.refs.add(f.obj_ref);
+    });
+    Array.from(buckets.values()).forEach((b, i) => {
+      const f = b.primary;
+      // Distinct flag codes per object (sorted, severity first).
+      const codeSet = new Map();
+      b.flags.forEach(x => {
+        const cur = codeSet.get(x.flag_code);
+        if (!cur || (SEV_RANK[x.severity]||0) > (SEV_RANK[cur]||0))
+          codeSet.set(x.flag_code, x.severity);
+      });
+      // Codes seen in *this* listing (sev-aware) ...
+      let codes = Array.from(codeSet.entries())
+        .sort((a,bb) => (SEV_RANK[bb[1]]||0) - (SEV_RANK[a[1]]||0))
+        .map(e => e[0]);
+      // ...union with full per-object aggregate so users see every rule
+      // that flagged the object, not just those passing the current filter.
+      const aggCodes = (b.agg && b.agg.codes) ? b.agg.codes : [];
+      aggCodes.forEach(c => { if (!codes.includes(c)) codes.push(c); });
+      const aliasN = b.refs.size > 1 ? b.refs.size - 1 : 0;
+      items.push({
+        id: 'flag-' + (f.obj_ref || i),
+        kg: f.kg_code, lon: f.centroid_lon, lat: f.centroid_lat,
+        type: f.obj_type, sev: f.severity, message: f.message,
+        flag_code: codes[0], flag_codes: codes, obj_ref: f.obj_ref,
+        height: f.height_max_m, area: f.area_sqm,
+        title: (f.obj_type||'?') + ' · ' + (f.kg_code||'') + (f.height_max_m!=null ? ' · '+f.height_max_m.toFixed(1)+'m':'') + (aliasN ? ' · +' + aliasN + ' alias' + (aliasN===1?'':'es') : ''),
+        weight: (b.agg||{}).total_weight, n_codes: codes.length,
+        raw: f, kind: 'flag',
+      });
+    });
   }
   if (Array.isArray(j.candidates)) {
     j.candidates.forEach((c, i) => items.push({
@@ -293,7 +344,10 @@ function render() {
     if (it.lon != null) row.setAttribute('data-srtm-lon', it.lon);
     if (it.lat != null) row.setAttribute('data-srtm-lat', it.lat);
     const sev = it.sev ? '<span class="flag-badge flag-' + it.sev + '">' + it.sev + '</span>' : '';
-    const flagCode = it.flag_code ? ' <code>' + it.flag_code + '</code>' : '';
+    const codeList = it.flag_codes && it.flag_codes.length ? it.flag_codes : (it.flag_code ? [it.flag_code] : []);
+    const flagCode = codeList.length
+      ? ' ' + codeList.map(c => '<code class="flag-tag">' + c + '</code>').join(' ')
+      : '';
     const meta = [];
     if (it.height != null) meta.push('h=' + fmtNum(it.height));
     if (it.area != null) meta.push('A=' + Math.round(it.area) + 'm²');

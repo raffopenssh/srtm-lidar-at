@@ -422,7 +422,17 @@
 
 <!-- Last Completed KG Summary -->
 <div class="last-kg" id="lastKgCard" style="display:none">
-  <div class="lb">Last Completed KG — <span id="lastKgName">—</span></div>
+  <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span>Last Completed KG — <span id="lastKgName">—</span></span>
+    <label id="lastKgFilterToggle" title="Hide segments that triggered quality flags"
+      style="font-size:10px;text-transform:none;letter-spacing:0;color:var(--dim);
+      cursor:pointer;display:none;align-items:center;gap:4px;margin-left:auto;
+      padding:2px 6px;border:1px solid var(--border);border-radius:10px;
+      background:transparent;user-select:none">
+      <input type="checkbox" id="lastKgFilterFlagged" style="margin:0;cursor:pointer;accent-color:#d29922">
+      <span id="lastKgFilterLabel">hide flagged</span>
+    </label>
+  </div>
   <div class="last-kg-grid" id="lastKgGrid"></div>
   <div class="ds-row" id="lastKgDatasources" style="margin-top:6px"></div>
 </div>
@@ -1560,16 +1570,69 @@ function updateLastKg(d) {
 }
 async function fetchKgJson(code) {
   try {
-    const r = await fetch('/api/v1/kg/' + code);
+    const [r, fr] = await Promise.all([
+      fetch('/api/v1/kg/' + code),
+      fetch('/api/v1/flags?kg=' + encodeURIComponent(code) + '&limit=1000')
+        .then(x => x.ok ? x.json() : null).catch(() => null),
+    ]);
     if (!r.ok) return;
     const js = await r.json();
+    _lastKgJson = js;
+    _lastKgFlags = (fr && fr.flags) ? fr.flags : [];
     renderLastKg(js);
   } catch(e) { console.error('fetchKgJson:', e); }
+}
+let _lastKgJson = null, _lastKgFlags = [];
+
+function _flaggedRefSet() {
+  const s = new Set();
+  (_lastKgFlags||[]).forEach(f => { if (f.obj_ref) s.add(f.obj_ref); });
+  return s;
+}
+// Each top item has an implicit obj_ref of '<kg>:<kind>:<index>' — mirror
+// quality_flags.iter_objects so the toggle can match segments.
+function _refForTopItem(kg, kind, idx, otype) {
+  if (kind === 'top_by_type') return kg + ':top_by_type:' + otype + ':' + idx;
+  return kg + ':' + kind + ':' + idx;
+}
+function _filterFlagged(arr, kg, kind, flagged) {
+  if (!arr || !arr.length) return arr || [];
+  return arr.filter((o, i) => {
+    const otype = o.rf_type || o.type || 'tree';
+    return !flagged.has(_refForTopItem(kg, kind, i, otype));
+  });
 }
 function renderLastKg(js) {
   const card = document.getElementById('lastKgCard');
   card.style.display = 'block';
   if (js.kg_code) card.setAttribute('data-srtm-kg', js.kg_code);
+  // Show / update the "hide flagged" toggle
+  const toggleWrap = document.getElementById('lastKgFilterToggle');
+  const labelEl = document.getElementById('lastKgFilterLabel');
+  const cb = document.getElementById('lastKgFilterFlagged');
+  if (_lastKgFlags && _lastKgFlags.length) {
+    toggleWrap.style.display = 'inline-flex';
+    const refs = _flaggedRefSet();
+    labelEl.textContent = 'hide ' + refs.size + ' flagged';
+  } else {
+    toggleWrap.style.display = 'none';
+  }
+  const hideFlagged = !!cb.checked;
+  if (hideFlagged) {
+    const flagged = _flaggedRefSet();
+    const kg = js.kg_code;
+    js = JSON.parse(JSON.stringify(js)); // shallow clone so we don't mutate cache
+    js.top_10_objects = _filterFlagged(js.top_10_objects, kg, 'top_obj', flagged);
+    js.top_10_trees   = _filterFlagged(js.top_10_trees,   kg, 'top_tree', flagged);
+    if (js.top_by_type) {
+      const out = {};
+      Object.keys(js.top_by_type).forEach(t => {
+        out[t] = (js.top_by_type[t]||[]).filter((o,i) =>
+          !flagged.has(_refForTopItem(kg, 'top_by_type', i, t)));
+      });
+      js.top_by_type = out;
+    }
+  }
   document.getElementById('lastKgName').textContent =
     (js.kg_code || '?') + ' ' + (js.kg_name || '') + (js.state_name ? ' (' + js.state_name + ')' : '');
 
@@ -1598,8 +1661,8 @@ function renderLastKg(js) {
   items.push({l: 'New Buildings', v: fmt(newb.count || 0)});
   items.push({l: 'Infrastructure', v: fmt(infra.total || 0)});
   items.push({l: 'Trees', v: fmt(trees.count) + ' / ' + ((trees.total_canopy_sqm||0)/10000).toFixed(2) + 'ha'});
-  items.push({l: 'Tallest', v: (top10[0]?.height_max_m||top10[0]?.height_m||0).toFixed(1) + 'm ' + (top10[0]?.type||'')});
-  items.push({l: 'Tallest Tree', v: (top10t[0]?.height_m||0).toFixed(1) + 'm'});
+  items.push({l: 'Tallest', v: top10[0] ? ((top10[0].height_max_m||top10[0].height_m||0).toFixed(1) + 'm ' + (top10[0].type||'')) : '—'});
+  items.push({l: 'Tallest Tree', v: top10t[0] ? ((top10t[0].height_m||0).toFixed(1) + 'm') : '—'});
   items.push({l: 'Stem Vol', v: (trees.est_stem_volume_m3||0).toFixed(0) + ' m\u00b3'});
   items.push({l: 'Elev', v: (terrain.elevation_min_m||0).toFixed(0) + '\u2013' + (terrain.elevation_max_m||0).toFixed(0) + 'm'});
   items.push({l: 'Slope', v: (terrain.steepness_mean_deg||0).toFixed(1) + '\u00b0 ' + (terrain.aspect_dominant||'')});
@@ -1659,6 +1722,17 @@ function renderLastKg(js) {
     '<span class="ds-tag ' + (s.ok ? 'ds-ok' : 'ds-miss') + '">' +
     (s.ok ? '\u2713 ' : '\u2717 ') + s.name + '</span>'
   ).join('');
+  // Wire "hide flagged" toggle once and update visual state.
+  const cbEl = document.getElementById('lastKgFilterFlagged');
+  if (cbEl && !cbEl._wired) {
+    cbEl._wired = true;
+    cbEl.addEventListener('change', () => { if (_lastKgJson) renderLastKg(_lastKgJson); });
+  }
+  const tgl = document.getElementById('lastKgFilterToggle');
+  if (tgl && cbEl) {
+    tgl.style.borderColor = cbEl.checked ? '#d29922' : 'var(--border)';
+    tgl.style.color = cbEl.checked ? '#d29922' : 'var(--dim)';
+  }
 }
 
 // ── Tile Cache Overlays ─────────────────────────────────────────

@@ -57,16 +57,29 @@
   function ensureStyles() {
     if (document.getElementById('srtm-flag-css')) return;
     const css = `
-      .srtm-chip { position: fixed; z-index: 99999; background: #1f6feb;
-        color: #fff; font: 11px 'SF Mono', monospace; padding: 4px 8px;
-        border-radius: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.3);
-        transition: opacity .15s; user-select: none; }
+      .srtm-chip { position: fixed; z-index: 2147483646; background: #1f6feb;
+        color: #fff; font: 11px 'SF Mono', monospace; padding: 6px 10px;
+        border-radius: 14px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+        transition: opacity .15s; user-select: none;
+        -webkit-user-select: none; -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: rgba(0,0,0,0); touch-action: manipulation; }
+      .srtm-chip.srtm-chip-touch { padding: 10px 16px; font-size: 13px;
+        border-radius: 22px; min-height: 40px; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
       .srtm-chip:hover { background: #388bfd; }
       .srtm-chip:before { content: '🚩'; margin-right: 4px; font-size: 12px; }
-      .srtm-pop { position: fixed; z-index: 99999; background: #161b22; color: #c9d1d9;
+      .srtm-pop { position: fixed; z-index: 2147483647; background: #161b22; color: #c9d1d9;
         border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px;
         font: 12px 'SF Mono', monospace; min-width: 320px; max-width: 460px;
-        box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+        box-shadow: 0 6px 24px rgba(0,0,0,.5); max-height: 90vh; overflow: auto;
+        -webkit-overflow-scrolling: touch; }
+      @media (max-width: 480px) {
+        .srtm-pop { left: 8px !important; right: 8px !important;
+          width: auto !important; max-width: none !important;
+          min-width: 0 !important; }
+        .srtm-pop select, .srtm-pop input, .srtm-pop textarea,
+        .srtm-pop button { font-size: 14px !important; padding: 8px 10px !important; min-height: 38px; }
+        .srtm-pop .cands { max-height: 30vh; }
+      }
       .srtm-pop h4 { font-size: 12px; color: #58a6ff; margin: 0 0 8px; }
       .srtm-pop .row { display: flex; gap: 6px; margin: 4px 0; align-items: baseline; flex-wrap: wrap; }
       .srtm-pop .lb { color: #8b949e; min-width: 64px; font-size: 10px; text-transform: uppercase; }
@@ -132,32 +145,62 @@
 
   // ----- Selection tracking --------------------------------------------
   let chipEl = null, chipTimer = null, lastSel = null;
+  // Touch devices (Android/iOS): the OS text-selection toolbar overlaps
+  // any small in-page chip. We avoid that by (a) only showing the chip
+  // *after* the selection has settled (i.e. the user has finished
+  // dragging the handles), (b) anchoring it well below the selection so
+  // it doesn't fight the native menu, and (c) making it large enough to
+  // tap. We also key off touchend / pointerup rather than mousedown.
+  const IS_TOUCH = (typeof window !== 'undefined') && (
+    (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+    ('ontouchstart' in window));
+  let _touchSettleTimer = null;
 
   function placeChip(rect, sel) {
     if (!chipEl) {
-      chipEl = el('div', { class: 'srtm-chip', title: 'Flag this object',
-        on: { mousedown: (e) => { e.preventDefault(); openPopForSelection(sel); } } }, 'Flag');
+      chipEl = el('div', {
+        class: 'srtm-chip' + (IS_TOUCH ? ' srtm-chip-touch' : ''),
+        title: 'Flag this object',
+      }, IS_TOUCH ? 'Flag selection' : 'Flag');
+      // Use click (and pointerup as fallback) instead of mousedown so we
+      // don't preventDefault'ing the native selection menu. On touch the
+      // first tap dismisses native menu; the second tap on our chip wins.
+      const fire = (e) => { e.preventDefault(); e.stopPropagation();
+                            openPopForSelection(lastSel || sel); };
+      chipEl.addEventListener('click', fire);
+      chipEl.addEventListener('touchend', fire, { passive: false });
       document.body.appendChild(chipEl);
+    } else {
+      // refresh handler reference (lastSel may have been updated)
     }
-    const top = Math.max(8, rect.top - 32);
-    const left = Math.min(window.innerWidth - 80, Math.max(8, rect.left + rect.width/2 - 30));
+    // Position: desktop = above selection (room there). Touch = below,
+    // because Android/iOS draw their toolbar above the selection.
+    const chipH = IS_TOUCH ? 44 : 28;
+    const chipW = IS_TOUCH ? 130 : 70;
+    let top, left;
+    if (IS_TOUCH) {
+      top = Math.min(window.innerHeight - chipH - 8, rect.bottom + 8);
+      // If the bottom of the screen is too close, place above instead.
+      if (top + chipH > window.innerHeight - 8) top = Math.max(8, rect.top - chipH - 8);
+    } else {
+      top = Math.max(8, rect.top - chipH - 4);
+    }
+    left = Math.min(window.innerWidth - chipW - 8,
+                    Math.max(8, rect.left + rect.width/2 - chipW/2));
     chipEl.style.top = top + 'px';
     chipEl.style.left = left + 'px';
     chipEl.style.display = 'block';
     chipEl.style.opacity = '1';
     if (chipTimer) clearTimeout(chipTimer);
-    chipTimer = setTimeout(hideChip, 4500);
+    chipTimer = setTimeout(hideChip, IS_TOUCH ? 12000 : 4500);
   }
   function hideChip() { if (chipEl) chipEl.style.display = 'none'; }
 
-  function onSelectionChange() {
+  function _evaluateSelection() {
     const sel = document.getSelection();
     if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideChip(); return; }
     const text = sel.toString().trim();
     if (text.length < 2 || text.length > 200) { hideChip(); return; }
-    // Heuristic: only show chip if the text looks like it might match an object.
-    // Either contains a unit/number, or contains a known type name, or is
-    // explicitly inside a container with data-srtm-* hints.
     const hasNum = /\d/.test(text);
     const hasType = TYPES.some(t => new RegExp('\\b' + t + '\\b','i').test(text));
     const ctx = findContext(sel.anchorNode);
@@ -169,12 +212,30 @@
     placeChip(rect, lastSel);
   }
 
+  function onSelectionChange() {
+    if (!IS_TOUCH) { _evaluateSelection(); return; }
+    // On touch: hide while the user is actively dragging selection
+    // handles. We re-show only after a short settle period to avoid
+    // flashing under the native menu.
+    hideChip();
+    if (_touchSettleTimer) clearTimeout(_touchSettleTimer);
+    _touchSettleTimer = setTimeout(_evaluateSelection, 700);
+  }
+  function onSelectionSettle() {
+    // Called on touchend / pointerup: re-evaluate after a small delay
+    // so the OS has finalised the selection rectangle.
+    if (!IS_TOUCH) return;
+    if (_touchSettleTimer) clearTimeout(_touchSettleTimer);
+    _touchSettleTimer = setTimeout(_evaluateSelection, 350);
+  }
+
   // ----- Popover -------------------------------------------------------
   let popEl = null;
 
   function closePop() {
     if (popEl) { popEl.remove(); popEl = null; }
     document.removeEventListener('mousedown', popOutsideHandler, true);
+    document.removeEventListener('touchstart', popOutsideHandler, true);
     document.removeEventListener('keydown', popKeyHandler, true);
   }
   function popOutsideHandler(e) {
@@ -196,6 +257,7 @@
     popEl.style.left = left + 'px';
     setTimeout(() => {
       document.addEventListener('mousedown', popOutsideHandler, true);
+      document.addEventListener('touchstart', popOutsideHandler, true);
       document.addEventListener('keydown', popKeyHandler, true);
     }, 0);
   }
@@ -450,12 +512,30 @@
   function install(opts) {
     if (installed) return; installed = true;
     ensureStyles();
+    let _selDebounce = null;
     document.addEventListener('selectionchange', () => {
-      // debounce a touch
-      if (chipTimer && chipTimer._sel) clearTimeout(chipTimer._sel);
-      chipTimer = chipTimer || {};
-      chipTimer._sel = setTimeout(onSelectionChange, 120);
+      if (_selDebounce) clearTimeout(_selDebounce);
+      _selDebounce = setTimeout(onSelectionChange, 120);
     });
+    // Touch finalisation triggers a fresh evaluation after the OS has
+    // settled the selection rectangle (Android sometimes fires
+    // selectionchange while the user is still dragging the handles).
+    ['touchend', 'pointerup'].forEach(ev =>
+      document.addEventListener(ev, onSelectionSettle, { passive: true }));
+    // Hide the chip when the user begins a new touch elsewhere —
+    // avoids the chip ghosting on top of the native menu while the
+    // user is still adjusting the selection.
+    document.addEventListener('touchstart', (e) => {
+      if (chipEl && chipEl.contains(e.target)) return;
+      // Only hide if the touch starts outside any active selection range.
+      hideChip();
+    }, { passive: true });
+    // Visual viewport changes (keyboard, OS toolbar) reposition popover.
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', () => {
+        if (popEl) hideChip();
+      });
+    }
   }
   function uninstall() { hideChip(); closePop(); installed = false; }
 

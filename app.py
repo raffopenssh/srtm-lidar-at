@@ -44,6 +44,8 @@ import temporal_analysis as tca
 import geo_parse
 import search_index as si
 import cadastre_bridge as cb
+import feedback_db
+import quality_flags
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -54,6 +56,16 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 def _init_search_index():
     try:
         idx = si.init_index()
+        feedback_db.ensure_schema()
+        # On startup, ensure quality_flags has been computed for every existing JSON.
+        # Cheap (~6s for 18 KGs); idempotent per (obj_ref, flag_code, rule_version).
+        try:
+            json_dir = Path('data/austria_processor/json')
+            for jp in json_dir.glob('*.json'):
+                try: quality_flags.scan_json(jp)
+                except Exception as e: log.warning('quality_flags initial scan %s: %s', jp.name, e)
+        except Exception as e:
+            log.warning('quality_flags initial sweep: %s', e)
         # Watch for new JSON files every 60s
         json_dir = Path('data/austria_processor/json')
         known = set(f.stem for f in json_dir.glob('*.json')) if json_dir.exists() else set()
@@ -62,11 +74,17 @@ def _init_search_index():
             try:
                 if not json_dir.exists():
                     continue
-                current = set(f.stem for f in json_dir.glob('*.json'))
+                current_files = {f.stem: f for f in json_dir.glob('*.json')}
+                current = set(current_files.keys())
                 new_kgs = current - known
                 if new_kgs:
-                    log.info('🔍 New KGs detected: %s, rebuilding index', new_kgs)
+                    log.info('🔍 New KGs detected: %s, rebuilding index + flags', new_kgs)
                     idx.build()
+                    for kg in new_kgs:
+                        jp = current_files.get(kg)
+                        if jp:
+                            try: quality_flags.scan_json(jp)
+                            except Exception as e: log.warning('quality_flags scan %s: %s', kg, e)
                     known = current
             except Exception as e:
                 log.warning('Search index watch: %s', e)
@@ -3614,10 +3632,17 @@ def api_query():
                 t.start()
                 return jsonify({'task_id': task_id, 'status': 'running',
                                 'poll': f'/api/v1/query?task_id={task_id}'}), 202
-            return jsonify(idx.query_top_features(
+            res = idx.query_top_features(
                 args['top_features'], object_type=otype,
                 min_confidence=mc, bbox=tf_bbox,
-                limit=limit, offset=offset))
+                limit=limit, offset=offset)
+            try:
+                _enrich_top_features_with_flags(res, args['top_features'],
+                    exclude_flagged=args.get('exclude_flagged','').lower() in ('true','1','yes'),
+                    min_severity=args.get('min_flag_severity'))
+            except Exception as e:
+                log.warning('flag enrichment: %s', e)
+            return jsonify(res)
 
         # Cross-KG segment-level power queries
         # e.g. ?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01
@@ -8401,6 +8426,264 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
 
     return _error(f"Unknown format: {fmt}. Use json, gpkg, or kml.", 400)
 
+
+def _enrich_top_features_with_flags(result: dict, feature_type: str,
+                                    exclude_flagged: bool = False,
+                                    min_severity: str = None):
+    """Attach flags + community overrides to top_features rows. Layered
+    on top of frozen JSONs — no rewrite of the source data."""
+    items = result.get('results') or []
+    if not items: return
+    # Recreate the canonical obj_ref to look up flags/overrides
+    refs = []
+    for i, it in enumerate(items):
+        kg = it.get('kg_code')
+        if not kg: refs.append(None); continue
+        if feature_type == 'trees':
+            ref = f'{kg}:top_tree:{i}'  # only valid if items list mirrors top_10_trees order
+        elif feature_type == 'objects':
+            ref = f'{kg}:top_obj:{i}'
+        elif feature_type == 'new_buildings':
+            ref = f'{kg}:new_building:{i}'
+        elif feature_type == 'infrastructure':
+            ref = None  # infra needs (otype, idx); fall through to coord-resolve below
+        else:
+            ref = None
+        refs.append(ref)
+    # For items that don't have an obvious ref (cross-KG sort), resolve by coord.
+    coord_keys = []
+    for i, it in enumerate(items):
+        if refs[i]: continue
+        coord = it.get('coordinate') or {}
+        lon = coord.get('lon') or it.get('centroid_lon')
+        lat = coord.get('lat') or it.get('centroid_lat')
+        if lon is None or lat is None: continue
+        try:
+            r = feedback_db.resolve_point(lon, lat,
+                hint={'predicted_type': it.get('type') or it.get('rf_type'),
+                      'height_max_m': it.get('height_m') or it.get('height_max_m') or it.get('max_height_m'),
+                      'area_sqm': it.get('area_sqm')},
+                kg_code=it.get('kg_code'), radius_m=10)
+            if r.get('obj_ref'): refs[i] = r['obj_ref']
+        except Exception: pass
+    # Bulk fetch flags + overrides
+    valid_refs = [r for r in refs if r]
+    overrides = feedback_db.effective_overrides(valid_refs) if valid_refs else {}
+    flags_by_ref = {}
+    if valid_refs:
+        feedback_db.ensure_schema()
+        import sqlite3 as _s
+        c = _s.connect(feedback_db.DB_PATH); c.row_factory = _s.Row
+        qm = ','.join(['?'] * len(valid_refs))
+        for row in c.execute(f'SELECT obj_ref, flag_code, severity, message FROM flags WHERE obj_ref IN ({qm})',
+                              valid_refs):
+            flags_by_ref.setdefault(row['obj_ref'], []).append({
+                'flag_code': row['flag_code'], 'severity': row['severity'],
+                'message': row['message']})
+        c.close()
+    # Attach + filter
+    sev_rank = {'low': 0, 'medium': 1, 'high': 2, 'critical': 3}
+    min_rank = sev_rank.get((min_severity or '').lower(), 0)
+    out = []
+    for it, ref in zip(items, refs):
+        if ref:
+            it['obj_ref'] = ref
+            fl = flags_by_ref.get(ref) or []
+            if fl: it['flags'] = fl
+            ov = overrides.get(ref)
+            if ov and (ov.get('effective_type') or ov.get('community_verified')):
+                if ov.get('effective_type'):
+                    it['predicted_type'] = it.get('type')
+                    it['type'] = ov['effective_type']
+                    it['effective_type'] = ov['effective_type']
+                it['community_verified'] = bool(ov.get('community_verified'))
+                it['n_confirms'] = ov.get('n_confirms')
+                it['n_rejects'] = ov.get('n_rejects')
+                it['n_corrections'] = ov.get('n_corrections')
+        if exclude_flagged:
+            cur_max = max((sev_rank.get(f['severity'], 0) for f in it.get('flags', [])), default=-1)
+            threshold = sev_rank.get((min_severity or 'medium').lower(), 1)
+            if cur_max >= threshold:
+                continue
+        out.append(it)
+    if exclude_flagged:
+        result['results'] = out
+        result['filtered_count'] = len(out)
+
+
+# === SECTION: Quality flags + feedback ============================
+
+def _bbox_arg(s):
+    if not s: return None
+    try:
+        parts = [float(x) for x in s.split(',')]
+        return parts if len(parts) == 4 else None
+    except Exception: return None
+
+
+@app.route('/api/v1/flags', methods=['GET'])
+def api_flags_list():
+    """List quality flags. Filterable + paginated.
+
+    Params: kg, severity (low|medium|high|critical), code, type, kind,
+            bbox=w,s,e,n, min_value, order=severity|value|recent,
+            limit (default 200, max 1000), offset.
+    """
+    a = request.args
+    try:
+        rows = feedback_db.list_flags(
+            kg_code=a.get('kg'), severity=a.get('severity'),
+            flag_code=a.get('code'), obj_type=a.get('type'),
+            kind=a.get('kind'),
+            bbox=_bbox_arg(a.get('bbox')),
+            min_value=float(a['min_value']) if a.get('min_value') else None,
+            limit=min(int(a.get('limit', 200)), 1000),
+            offset=int(a.get('offset', 0)),
+            order=a.get('order', 'severity'))
+        return jsonify({'count': len(rows), 'flags': rows})
+    except Exception as e:
+        log.exception('flags list')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/flags/stats', methods=['GET'])
+def api_flags_stats():
+    return jsonify(feedback_db.flag_stats())
+
+
+@app.route('/api/v1/flags/match', methods=['GET', 'POST'])
+def api_flags_match():
+    """Match a free-text snippet (e.g. '102.2m tree') and/or coordinates
+    to known objects so the user can flag/correct without an ID.
+
+    Params (GET) or JSON (POST):
+        text=<snippet>     e.g. '102.2m tree'
+        kg=<kg_code>       optional KG scope
+        lon=, lat=         optional coordinate (improves resolution)
+        radius_m=<m>       default 200
+    """
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+    else:
+        body = {}
+    a = request.args
+    text = body.get('text') or a.get('text') or ''
+    kg   = body.get('kg')   or a.get('kg')
+    lon  = body.get('lon')  or a.get('lon')
+    lat  = body.get('lat')  or a.get('lat')
+    radius = body.get('radius_m') or a.get('radius_m') or 200
+    try:
+        lon = float(lon) if lon not in (None, '') else None
+        lat = float(lat) if lat not in (None, '') else None
+        radius = float(radius)
+    except Exception:
+        lon = lat = None
+    try:
+        result = feedback_db.match_text(text, kg_code=kg, lon=lon, lat=lat, radius_m=radius)
+        # If a candidate exists, attach its known flags + nearby flags
+        if result.get('obj_ref'):
+            obj_flags = feedback_db.list_flags(limit=10, kg_code=result.get('kg_code'))
+            obj_flags = [f for f in obj_flags if f['obj_ref'] == result['obj_ref']]
+            result['flags'] = obj_flags
+        return jsonify(result)
+    except Exception as e:
+        log.exception('flags match')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/flags/object/<path:obj_ref>', methods=['GET'])
+def api_flag_object(obj_ref):
+    """Return the object record + all its flags + any feedback."""
+    feedback_db.ensure_schema()
+    import sqlite3
+    c = sqlite3.connect(feedback_db.DB_PATH); c.row_factory = sqlite3.Row
+    obj = c.execute('SELECT * FROM objects WHERE obj_ref=?', (obj_ref,)).fetchone()
+    if not obj:
+        c.close()
+        return jsonify({'error': 'unknown obj_ref'}), 404
+    obj = dict(obj)
+    if obj.get('attrs_json'):
+        try: obj['attrs'] = json.loads(obj.pop('attrs_json'))
+        except Exception: obj.pop('attrs_json', None)
+    flags = feedback_db.list_flags(kg_code=obj['kg_code'], limit=200)
+    flags = [f for f in flags if f['obj_ref'] == obj_ref]
+    fb = feedback_db.list_feedback(obj_ref=obj_ref, limit=50)
+    overrides = feedback_db.effective_overrides([obj_ref])
+    c.close()
+    return jsonify({'object': obj, 'flags': flags, 'feedback': fb,
+                    'override': overrides.get(obj_ref)})
+
+
+@app.route('/api/v1/flags/rebuild', methods=['POST'])
+def api_flags_rebuild():
+    """Re-run quality_flags. ?kg=CODE for one KG, otherwise all local JSONs."""
+    kg = request.args.get('kg')
+    json_dir = Path('data/austria_processor/json')
+    if kg:
+        jp = json_dir / f'{kg}.json'
+        if not jp.exists(): return jsonify({'error': 'no JSON for that KG'}), 404
+        r = quality_flags.scan_json(jp)
+        return jsonify({'kg_code': kg, 'objects': len(r['objects']), 'flags': len(r['flags'])})
+    n_obj = n_flag = 0
+    for jp in json_dir.glob('*.json'):
+        try:
+            r = quality_flags.scan_json(jp)
+            n_obj += len(r['objects']); n_flag += len(r['flags'])
+        except Exception as e:
+            log.warning('rebuild %s: %s', jp.name, e)
+    return jsonify({'objects': n_obj, 'flags': n_flag})
+
+
+def _feedback_user(req):
+    """Resolve user from header/body. Anonymous fallback."""
+    tok = req.headers.get('X-Feedback-Token') or (req.get_json(silent=True) or {}).get('token')
+    user_id = (req.get_json(silent=True) or {}).get('user') or req.args.get('user') or 'anon'
+    role = 'student'
+    # Trivial role mapping; tighten later via data/feedback_users.json if needed
+    return user_id, role
+
+
+@app.route('/api/v1/feedback', methods=['POST'])
+def api_feedback_submit():
+    """Record one feedback item.
+
+    Accepts ANY of:
+      {"obj_ref":"...", "kind":"confirm|reject|correct_type|report_missing", ...}
+      {"point":{"lon":...,"lat":...}, "context_text":"102.2m tree", ...}
+      {"selected_text":"...", "kg_code":"...", ...}    # text-only (for embedded JS widget)
+
+    Returns the resolved obj_ref + status.
+    """
+    payload = request.get_json(silent=True) or {}
+    user, role = _feedback_user(request)
+    src = payload.get('source_app') or 'web'
+    try:
+        result = feedback_db.record_feedback(payload, user_id=user, user_role=role,
+                                              source_app=src)
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        log.exception('feedback submit')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/feedback', methods=['GET'])
+def api_feedback_list():
+    a = request.args
+    rows = feedback_db.list_feedback(
+        kg_code=a.get('kg'), user=a.get('user'),
+        since=a.get('since'), obj_ref=a.get('obj_ref'),
+        limit=min(int(a.get('limit', 200)), 1000),
+        offset=int(a.get('offset', 0)))
+    return jsonify({'count': len(rows), 'feedback': rows})
+
+
+@app.route('/api/v1/feedback/resolve', methods=['GET', 'POST'])
+def api_feedback_resolve():
+    """Preview-only. Same matching logic as /flags/match — doesn't save."""
+    return api_flags_match()
+
+
+# === END SECTION ===================================================
 
 @app.route('/docs')
 def docs_page():

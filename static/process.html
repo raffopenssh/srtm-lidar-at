@@ -1569,6 +1569,7 @@ async function fetchKgJson(code) {
 function renderLastKg(js) {
   const card = document.getElementById('lastKgCard');
   card.style.display = 'block';
+  if (js.kg_code) card.setAttribute('data-srtm-kg', js.kg_code);
   document.getElementById('lastKgName').textContent =
     (js.kg_code || '?') + ' ' + (js.kg_name || '') + (js.state_name ? ' (' + js.state_name + ')' : '');
 
@@ -2452,5 +2453,7 @@ setInterval(() => {
   document.getElementById('pollCd').textContent = cd;
 }, 1000);
 </script>
+<script src="/flag.js" defer></script>
+<script>document.addEventListener('DOMContentLoaded', () => { if (window.SrtmFlag) SrtmFlag.install(); });</script>
 </body>
 </html>

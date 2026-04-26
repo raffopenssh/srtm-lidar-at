@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>srtm-lidar-at — Query Explorer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+:root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#c9d1d9;
+        --dim:#8b949e; --green:#3fb950; --yellow:#d29922; --red:#f85149;
+        --blue:#58a6ff; --purple:#bc8cff; --cyan:#56d4dd; }
+*{box-sizing:border-box;margin:0;padding:0;font-family:'SF Mono','Fira Code','Consolas',monospace}
+body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overflow:hidden}
+.app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+.tb{display:flex;gap:6px;padding:8px 12px;align-items:center;border-bottom:1px solid var(--border);background:var(--card);flex-wrap:wrap}
+.tb h1{font-size:13px;color:var(--blue);margin-right:8px}
+.tb a{color:var(--dim);text-decoration:none;margin:0 4px}
+.tb a:hover{color:var(--text)}
+.tb input,.tb select{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font:inherit}
+.tb input.q{flex:1;min-width:280px}
+.tb button{background:#238636;color:#fff;border:0;border-radius:4px;padding:6px 14px;cursor:pointer;font:inherit}
+.tb button:hover{filter:brightness(1.15)}
+.tb button.alt{background:#30363d}
+.tb .preset{background:#30363d;border:1px solid var(--border);padding:3px 8px;border-radius:3px;cursor:pointer;color:var(--blue);font-size:11px}
+.tb .preset:hover{background:#1f6feb33}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);overflow:hidden}
+.pane{background:var(--bg);overflow:auto;display:flex;flex-direction:column}
+.pane h3{font-size:11px;text-transform:uppercase;color:var(--dim);padding:6px 12px;border-bottom:1px solid var(--border);background:var(--card)}
+.body{flex:1;overflow:auto}
+#map{height:100%;width:100%}
+.txt-body{padding:0}
+.txt-body pre{padding:10px 12px;margin:0;font-size:11.5px;color:var(--text);white-space:pre-wrap;word-break:break-word}
+.endpoint-bar{display:flex;gap:6px;padding:6px 12px;border-bottom:1px solid var(--border);background:var(--card);flex-wrap:wrap}
+.endpoint-bar select{flex:0 0 auto}
+.endpoint-bar code{background:var(--bg);padding:2px 6px;border-radius:3px;color:var(--cyan);font-size:10.5px}
+.kvgrid{display:grid;grid-template-columns:1fr 2fr;gap:4px 12px;padding:8px 12px;font-size:11px}
+.kvgrid .k{color:var(--dim)}
+.kvgrid .v{color:var(--text)}
+.row-result{padding:6px 10px;border-bottom:1px solid var(--border);cursor:pointer}
+.row-result:hover,.row-result.sel{background:#1f6feb22}
+.row-result.hl{background:rgba(212,153,34,.25);outline:1px solid var(--yellow);outline-offset:-1px}
+.r-head{color:var(--blue);font-weight:bold}
+.r-meta{color:var(--dim);font-size:10.5px}
+.flag-badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:4px}
+.flag-critical{background:#da3633;color:#fff}
+.flag-high{background:#b62324;color:#fff}
+.flag-medium{background:#d29922;color:#000}
+.flag-low{background:#586069;color:#fff}
+.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--card)}
+.tabs button{background:none;color:var(--dim);border:0;border-bottom:2px solid transparent;padding:6px 12px;cursor:pointer;font:inherit}
+.tabs button.on{color:var(--blue);border-color:var(--blue)}
+.legend{position:absolute;bottom:12px;right:12px;background:var(--card);border:1px solid var(--border);padding:6px 8px;border-radius:4px;font-size:10.5px;z-index:1000}
+.legend .lg-row{display:flex;align-items:center;gap:6px;margin:2px 0}
+.legend .lg-dot{width:10px;height:10px;border-radius:50%;border:1px solid #fff}
+.url-display{padding:4px 12px;background:var(--bg);font-size:10.5px;color:var(--cyan);border-bottom:1px solid var(--border);overflow-x:auto;white-space:nowrap}
+.url-display a{color:var(--blue);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="tb">
+    <h1>🔍 Query Explorer</h1>
+    <a href="/">Home</a> <a href="/process.html">Processor</a> <a href="/api/v1/docs/llm.txt" target="_blank">API docs</a>
+    <select id="endpoint">
+      <option value="/api/v1/query">/query</option>
+      <option value="/api/v1/query/parcels">/query/parcels</option>
+      <option value="/api/v1/flags">/flags</option>
+      <option value="/api/v1/flags/match">/flags/match</option>
+      <option value="/api/v1/flags/stats">/flags/stats</option>
+      <option value="/api/v1/feedback">/feedback (list)</option>
+      <option value="/api/v1/query/nature">/query/nature</option>
+      <option value="/api/v1/query/compound">/query/compound</option>
+    </select>
+    <input class="q" id="params" placeholder="params: severity=critical&limit=50  — or just text=102.2m+tree">
+    <button id="runBtn">Run</button>
+    <button class="alt" id="clearBtn">Clear</button>
+  </div>
+
+  <div class="split">
+    <div class="pane">
+      <div class="endpoint-bar">
+        <span class="r-meta">Presets:</span>
+        <button class="preset" data-ep="/api/v1/flags" data-p="severity=critical&limit=20">critical flags</button>
+        <button class="preset" data-ep="/api/v1/flags" data-p="code=tree_height_implausible&order=value&limit=20">tallest “trees”</button>
+        <button class="preset" data-ep="/api/v1/flags" data-p="code=mast_likely_misclassified&limit=20">likely masts</button>
+        <button class="preset" data-ep="/api/v1/flags" data-p="code=building_height_too_low&limit=20">tiny buildings</button>
+        <button class="preset" data-ep="/api/v1/flags" data-p="code=flat_type_has_height&order=value&limit=20">ground w/ height</button>
+        <button class="preset" data-ep="/api/v1/flags/match" data-p="text=102.2m+tree">match “102.2m tree”</button>
+        <button class="preset" data-ep="/api/v1/query" data-p="high_confidence_type=mast&limit=20">RF: high-conf masts</button>
+      </div>
+      <div class="url-display" id="urlBar"></div>
+      <div class="tabs">
+        <button class="on" data-tab="results">Results</button>
+        <button data-tab="raw">Raw JSON</button>
+        <button data-tab="stats">Summary</button>
+      </div>
+      <div class="body" id="resultsBody"></div>
+    </div>
+    <div class="pane" style="position:relative">
+      <h3>Map (click marker to highlight) <span class="r-meta" id="mapStatus"></span></h3>
+      <div class="body" style="position:relative"><div id="map"></div></div>
+      <div class="legend" id="legend" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/flag.js" defer></script>
+<script>
+const $ = (s)=>document.querySelector(s);
+const $$ = (s)=>document.querySelectorAll(s);
+let map, markersGroup, lastJson = null, currentTab = 'results';
+let rowEls = [], markerEls = [];
+let selectedId = null;
+
+function initMap() {
+  map = L.map('map', { zoomControl: true }).setView([47.7, 14.5], 7);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: 'OSM' }).addTo(map);
+  markersGroup = L.layerGroup().addTo(map);
+}
+
+function sevColor(s){return ({critical:'#da3633',high:'#b62324',medium:'#d29922',low:'#586069'})[s] || '#58a6ff';}
+function fmtNum(v,d=1){return v==null?'—':(typeof v==='number'?v.toFixed(d):v);}
+
+function buildUrl() {
+  const ep = $('#endpoint').value;
+  const p = $('#params').value.trim();
+  return ep + (p ? '?' + p : '');
+}
+function updateUrl(){
+  const u = buildUrl();
+  $('#urlBar').innerHTML = '<a href="' + u + '" target="_blank">' + u + '</a>';
+}
+$('#endpoint').addEventListener('change', updateUrl);
+$('#params').addEventListener('input', updateUrl);
+
+$$('.preset').forEach(b => b.addEventListener('click', () => {
+  $('#endpoint').value = b.dataset.ep;
+  $('#params').value = b.dataset.p;
+  updateUrl();
+  run();
+}));
+
+$$('.tabs button').forEach(b => b.addEventListener('click', () => {
+  $$('.tabs button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  currentTab = b.dataset.tab;
+  render();
+}));
+
+$('#runBtn').addEventListener('click', run);
+$('#clearBtn').addEventListener('click', () => {
+  $('#params').value = '';
+  lastJson = null; selectedId = null;
+  $('#resultsBody').innerHTML = '';
+  markersGroup.clearLayers();
+  $('#urlBar').innerHTML = '';
+});
+$('#params').addEventListener('keydown', e => { if (e.key==='Enter') run(); });
+
+async function run() {
+  updateUrl();
+  const u = buildUrl();
+  $('#mapStatus').textContent = 'loading…';
+  $('#resultsBody').innerHTML = '<div style="padding:12px;color:var(--dim)">Loading…</div>';
+  try {
+    const r = await fetch(u);
+    const j = await r.json();
+    lastJson = j;
+    render();
+  } catch(e) {
+    $('#resultsBody').innerHTML = '<div style="padding:12px;color:var(--red)">Error: '+e+'</div>';
+  } finally {
+    $('#mapStatus').textContent = '';
+  }
+}
+
+function extractItems(j) {
+  // Normalise different endpoint shapes into a flat array of items with
+  // common fields: { id, kg, type, lon, lat, sev?, message?, raw, kind }.
+  if (!j) return [];
+  const items = [];
+  if (Array.isArray(j.flags)) {
+    j.flags.forEach((f, i) => items.push({
+      id: 'flag-' + (f.id != null ? f.id : i),
+      kg: f.kg_code, lon: f.centroid_lon, lat: f.centroid_lat,
+      type: f.obj_type, sev: f.severity, message: f.message,
+      flag_code: f.flag_code, obj_ref: f.obj_ref,
+      height: f.height_max_m, area: f.area_sqm,
+      title: f.flag_code + ' · ' + (f.obj_type||'?') + ' · ' + (f.kg_code||'') + (f.height_max_m!=null ? ' · '+f.height_max_m.toFixed(1)+'m':''),
+      raw: f, kind: 'flag',
+    }));
+  }
+  if (Array.isArray(j.candidates)) {
+    j.candidates.forEach((c, i) => items.push({
+      id: 'cand-' + i, kg: c.kg_code, lon: c.centroid_lon, lat: c.centroid_lat,
+      type: c.obj_type, obj_ref: c.obj_ref,
+      height: c.height_max_m, area: c.area_sqm,
+      title: c.obj_type + ' · ' + (c.kg_code||'') + (c.height_max_m!=null ? ' · '+c.height_max_m.toFixed(1)+'m':'') + (c.distance_m!=null?' · '+c.distance_m.toFixed(0)+'m':''),
+      raw: c, kind: 'candidate', sev: 'medium',
+    }));
+  }
+  if (Array.isArray(j.kgs)) {
+    j.kgs.forEach((k, i) => items.push({
+      id: 'kg-' + i, kg: k.kg_code,
+      lon: ((k.bbox||{}).min_lon + (k.bbox||{}).max_lon)/2,
+      lat: ((k.bbox||{}).min_lat + (k.bbox||{}).max_lat)/2,
+      title: (k.kg_code||'?') + ' — ' + (k.kg_name||''),
+      raw: k, kind: 'kg', sev: 'low',
+    }));
+  }
+  if (Array.isArray(j.parcels)) {
+    j.parcels.forEach((p, i) => items.push({
+      id: 'par-' + i, kg: p.kg_code, lon: p.centroid_lon, lat: p.centroid_lat,
+      type: p.dominant_type, title: (p.parcel_id||'parcel') + ' · ' + (p.dominant_type||''),
+      raw: p, kind: 'parcel', sev: 'low',
+    }));
+  }
+  if (Array.isArray(j.features)) {
+    j.features.forEach((f, i) => items.push({
+      id: 'feat-' + i, lon: (f.centroid||{}).lon || f.centroid_lon,
+      lat: (f.centroid||{}).lat || f.centroid_lat,
+      title: (f.type||f.obj_type||'?') + (f.height_max_m!=null?' · '+f.height_max_m.toFixed(1)+'m':''),
+      raw: f, kind: 'feature', sev: 'low',
+    }));
+  }
+  if (Array.isArray(j.feedback)) {
+    j.feedback.forEach((fb, i) => items.push({
+      id: 'fb-' + (fb.id||i), kg: fb.resolved_kg_code, lon: fb.point_lon, lat: fb.point_lat,
+      title: fb.kind + ' → ' + (fb.corrected_type||fb.predicted_type||'?'),
+      raw: fb, kind: 'feedback', sev: 'medium',
+    }));
+  }
+  return items;
+}
+
+function render() {
+  const body = $('#resultsBody');
+  body.innerHTML = '';
+  rowEls = []; markerEls = []; selectedId = null;
+  markersGroup.clearLayers();
+  $('#legend').style.display = 'none';
+  if (!lastJson) { body.innerHTML = '<div style="padding:12px;color:var(--dim)">Press Run.</div>'; return; }
+  if (currentTab === 'raw') {
+    body.innerHTML = '<pre>' + escapeHtml(JSON.stringify(lastJson, null, 2)) + '</pre>';
+    return;
+  }
+  if (currentTab === 'stats') {
+    body.innerHTML = renderStats(lastJson);
+    return;
+  }
+  // results tab
+  const items = extractItems(lastJson);
+  if (!items.length) {
+    body.innerHTML = '<div style="padding:12px;color:var(--dim)">No items.</div>'
+      + '<pre style="padding:8px 12px;color:var(--dim);font-size:10.5px">' + escapeHtml(JSON.stringify(lastJson, null, 2).slice(0,4000)) + '</pre>';
+    return;
+  }
+  // bounds for fit
+  const pts = items.filter(it => it.lon != null && it.lat != null);
+  if (pts.length) {
+    const b = L.latLngBounds(pts.map(it => [it.lat, it.lon]));
+    if (b.isValid()) map.fitBounds(b, { padding: [40,40], maxZoom: 14 });
+  }
+  // results list
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'row-result';
+    row.dataset.id = it.id;
+    if (it.kg) row.setAttribute('data-srtm-kg', it.kg);
+    if (it.lon != null) row.setAttribute('data-srtm-lon', it.lon);
+    if (it.lat != null) row.setAttribute('data-srtm-lat', it.lat);
+    const sev = it.sev ? '<span class="flag-badge flag-' + it.sev + '">' + it.sev + '</span>' : '';
+    const flagCode = it.flag_code ? ' <code>' + it.flag_code + '</code>' : '';
+    const meta = [];
+    if (it.height != null) meta.push('h=' + fmtNum(it.height));
+    if (it.area != null) meta.push('A=' + Math.round(it.area) + 'm²');
+    if (it.lon != null && it.lat != null) meta.push(it.lon.toFixed(4)+','+it.lat.toFixed(4));
+    if (it.obj_ref) meta.push('<a href="#" data-act="flag" data-ref="' + it.obj_ref + '">flag</a>');
+    row.innerHTML = '<div class="r-head">' + sev + escapeHtml(it.title || '') + flagCode + '</div>'
+                 + '<div class="r-meta">' + meta.join(' · ') + (it.message ? ' · ' + escapeHtml(it.message) : '') + '</div>';
+    row.addEventListener('click', () => selectId(it.id, true));
+    body.appendChild(row); rowEls.push({ id: it.id, el: row, item: it });
+    // marker
+    if (it.lon != null && it.lat != null) {
+      const m = L.circleMarker([it.lat, it.lon], {
+        radius: 7, weight: 2, color: '#fff', fillColor: sevColor(it.sev), fillOpacity: 0.9,
+      });
+      m.bindTooltip(it.title || '', { direction: 'top' });
+      m.on('click', () => selectId(it.id, false));
+      m.addTo(markersGroup);
+      markerEls.push({ id: it.id, m });
+    }
+  });
+  // delegated flag handler
+  body.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-act="flag"]');
+    if (!a) return;
+    e.preventDefault(); e.stopPropagation();
+    const ref = a.getAttribute('data-ref');
+    const r = a.getBoundingClientRect();
+    if (window.SrtmFlag) SrtmFlag.openFor({ obj_ref: ref, anchorRect: r });
+  });
+  // legend
+  if (items.some(i => i.sev)) {
+    const sevs = ['critical','high','medium','low'];
+    $('#legend').innerHTML = sevs.map(s =>
+      '<div class="lg-row"><span class="lg-dot" style="background:'+sevColor(s)+'"></span>'+s+'</div>'
+    ).join('');
+    $('#legend').style.display = 'block';
+  }
+}
+
+function selectId(id, scrollList) {
+  selectedId = id;
+  rowEls.forEach(r => {
+    r.el.classList.toggle('sel', r.id === id);
+    r.el.classList.toggle('hl', r.id === id);
+  });
+  markerEls.forEach(m => {
+    if (m.id === id) {
+      m.m.setStyle({ radius: 11, weight: 3 });
+      const ll = m.m.getLatLng(); map.panTo(ll);
+    } else {
+      m.m.setStyle({ radius: 7, weight: 2 });
+    }
+  });
+  if (scrollList) {} // selection comes from list itself
+  else {
+    const r = rowEls.find(r => r.id === id);
+    if (r) r.el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function renderStats(j) {
+  const summarise = (o, depth=0) => {
+    if (o == null) return '—';
+    if (Array.isArray(o)) return '<i>list[' + o.length + ']</i>' + (o.length && depth<2 ? ' first: <pre style="font-size:10px;color:var(--dim)">'+escapeHtml(JSON.stringify(o[0], null, 2).slice(0,400))+'</pre>' : '');
+    if (typeof o !== 'object') return escapeHtml(String(o));
+    const rows = Object.entries(o).map(([k,v]) =>
+      '<div class="k">'+k+'</div><div class="v">'+ (typeof v==='object' ? summarise(v, depth+1) : escapeHtml(String(v))) +'</div>'
+    ).join('');
+    return '<div class="kvgrid">'+rows+'</div>';
+  };
+  return summarise(j);
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>"']/g, m=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+
+initMap();
+updateUrl();
+// Auto-run a default query.
+$('#endpoint').value = '/api/v1/flags';
+$('#params').value = 'severity=critical&order=value&limit=30';
+updateUrl();
+run();
+
+document.addEventListener('DOMContentLoaded', () => { if (window.SrtmFlag) SrtmFlag.install(); });
+if (window.SrtmFlag) {
+  window.SrtmFlag.on && window.SrtmFlag.on('reported', () => {
+    setTimeout(run, 500); // refresh
+  });
+}
+</script>
+</body>
+</html>

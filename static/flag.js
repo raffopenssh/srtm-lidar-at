@@ -1,0 +1,391 @@
+/* srtm-lidar-at flag widget
+ *
+ * Embeds anywhere. When the user selects text on the page, a discreet
+ * floating chip appears above the selection. Clicking it calls
+ * /api/v1/flags/match with the selected text (and optional context lon/lat
+ * + kg). If the match is plausible, a small popover opens with details and
+ * a one-click "Report" form that POSTs /api/v1/feedback.
+ *
+ * Usage (minimal):
+ *     <script src="/flag.js" defer></script>
+ *     <script> SrtmFlag.install(); </script>
+ *
+ * Optional contextual hints — sites can scope matching by setting
+ * data-srtm-kg, data-srtm-lon, data-srtm-lat on any ancestor element. The
+ * widget walks up the DOM from the selection anchor to find them.
+ *
+ * Public API:
+ *     SrtmFlag.install(opts?)            — enable selection watcher
+ *     SrtmFlag.uninstall()
+ *     SrtmFlag.openFor({obj_ref, kg_code, point, hint})  — open programmatically
+ *     SrtmFlag.matchText(text, ctx?)      — pure API call, returns Promise
+ *     SrtmFlag.attachClickHandler(el)     — explicit click target (icon)
+ *     SrtmFlag.on('reported', cb)        — fires on successful POST
+ *
+ * Designed to be subtle: never hijacks normal selection. Chip auto-hides
+ * after 4s of no interaction.
+ */
+(function () {
+  'use strict';
+  if (window.SrtmFlag) return;
+
+  const API_BASE = (typeof SRTM_API_BASE !== 'undefined' && SRTM_API_BASE) || '';
+  const TYPES = ['tree','shrub','hedge','grass','crop','road','path','parking',
+    'roof','greenhouse','solar_panel','wall','fence','mast','wind_turbine',
+    'water','orchard','vineyard','garden','bare_soil','rock','excavation',
+    'fill','tree_loss','construction','bridge','substation',
+    'forest','woodland','hedgerow','waterbody','building','not_a_feature'];
+
+  const listeners = {};
+  function emit(name, data){ (listeners[name]||[]).forEach(f => { try { f(data); } catch(e){} }); }
+  function on(name, cb){ (listeners[name]=listeners[name]||[]).push(cb); }
+
+  // ----- DOM helpers ---------------------------------------------------
+  function el(tag, attrs, ...children) {
+    const n = document.createElement(tag);
+    if (attrs) for (const k in attrs) {
+      if (k === 'style') Object.assign(n.style, attrs[k]);
+      else if (k === 'on') for (const ev in attrs.on) n.addEventListener(ev, attrs.on[ev]);
+      else if (k === 'class') n.className = attrs[k];
+      else if (k === 'html') n.innerHTML = attrs[k];
+      else if (attrs[k] != null) n.setAttribute(k, attrs[k]);
+    }
+    for (const c of children) if (c != null) n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    return n;
+  }
+
+  function ensureStyles() {
+    if (document.getElementById('srtm-flag-css')) return;
+    const css = `
+      .srtm-chip { position: fixed; z-index: 99999; background: #1f6feb;
+        color: #fff; font: 11px 'SF Mono', monospace; padding: 4px 8px;
+        border-radius: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        transition: opacity .15s; user-select: none; }
+      .srtm-chip:hover { background: #388bfd; }
+      .srtm-chip:before { content: '🚩'; margin-right: 4px; font-size: 12px; }
+      .srtm-pop { position: fixed; z-index: 99999; background: #161b22; color: #c9d1d9;
+        border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px;
+        font: 12px 'SF Mono', monospace; min-width: 320px; max-width: 460px;
+        box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+      .srtm-pop h4 { font-size: 12px; color: #58a6ff; margin: 0 0 8px; }
+      .srtm-pop .row { display: flex; gap: 6px; margin: 4px 0; align-items: baseline; flex-wrap: wrap; }
+      .srtm-pop .lb { color: #8b949e; min-width: 64px; font-size: 10px; text-transform: uppercase; }
+      .srtm-pop .vl { color: #c9d1d9; }
+      .srtm-pop .cands { max-height: 130px; overflow-y: auto; margin: 6px 0;
+        border: 1px solid #30363d; border-radius: 4px; }
+      .srtm-pop .cand { padding: 4px 8px; cursor: pointer; border-bottom: 1px solid #21262d; }
+      .srtm-pop .cand:hover, .srtm-pop .cand.sel { background: #1f6feb33; }
+      .srtm-pop .cand .meta { color: #8b949e; font-size: 10px; }
+      .srtm-pop select, .srtm-pop input, .srtm-pop textarea {
+        background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+        border-radius: 4px; padding: 4px 6px; font: 11px 'SF Mono', monospace; width: 100%; }
+      .srtm-pop textarea { min-height: 36px; resize: vertical; }
+      .srtm-pop .btns { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
+      .srtm-pop button { background: #238636; color: #fff; border: 0; border-radius: 4px;
+        padding: 5px 12px; font: 11px 'SF Mono', monospace; cursor: pointer; }
+      .srtm-pop button.alt { background: #30363d; }
+      .srtm-pop button.danger { background: #da3633; }
+      .srtm-pop button:hover { filter: brightness(1.15); }
+      .srtm-pop .flag-badge { display: inline-block; padding: 1px 5px; border-radius: 3px;
+        font-size: 10px; margin-right: 4px; }
+      .srtm-pop .flag-critical { background: #da3633; color: #fff; }
+      .srtm-pop .flag-high { background: #b62324; color: #fff; }
+      .srtm-pop .flag-medium { background: #d29922; color: #000; }
+      .srtm-pop .flag-low { background: #586069; color: #fff; }
+      .srtm-pop .err { color: #f85149; font-size: 11px; }
+      .srtm-pop .ok { color: #3fb950; font-size: 11px; }
+      .srtm-hl { background: rgba(212, 153, 34, .35); outline: 1px solid #d29922;
+                 transition: background .3s, outline-color .3s; }`;
+    const s = el('style', { id: 'srtm-flag-css' }); s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  // ----- Context discovery from selection ------------------------------
+  function findContext(node) {
+    const ctx = { kg_code: null, lon: null, lat: null };
+    let n = node;
+    while (n && n.nodeType === 3) n = n.parentNode;
+    while (n && n.getAttribute) {
+      if (!ctx.kg_code) {
+        const k = n.getAttribute('data-srtm-kg');
+        if (k) ctx.kg_code = k;
+      }
+      if (!ctx.lon) {
+        const lo = n.getAttribute('data-srtm-lon');
+        if (lo) ctx.lon = parseFloat(lo);
+      }
+      if (!ctx.lat) {
+        const la = n.getAttribute('data-srtm-lat');
+        if (la) ctx.lat = parseFloat(la);
+      }
+      n = n.parentNode;
+    }
+    return ctx;
+  }
+
+  // ----- Selection tracking --------------------------------------------
+  let chipEl = null, chipTimer = null, lastSel = null;
+
+  function placeChip(rect, sel) {
+    if (!chipEl) {
+      chipEl = el('div', { class: 'srtm-chip', title: 'Flag this object',
+        on: { mousedown: (e) => { e.preventDefault(); openPopForSelection(sel); } } }, 'Flag');
+      document.body.appendChild(chipEl);
+    }
+    const top = Math.max(8, rect.top - 32);
+    const left = Math.min(window.innerWidth - 80, Math.max(8, rect.left + rect.width/2 - 30));
+    chipEl.style.top = top + 'px';
+    chipEl.style.left = left + 'px';
+    chipEl.style.display = 'block';
+    chipEl.style.opacity = '1';
+    if (chipTimer) clearTimeout(chipTimer);
+    chipTimer = setTimeout(hideChip, 4500);
+  }
+  function hideChip() { if (chipEl) chipEl.style.display = 'none'; }
+
+  function onSelectionChange() {
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideChip(); return; }
+    const text = sel.toString().trim();
+    if (text.length < 2 || text.length > 200) { hideChip(); return; }
+    // Heuristic: only show chip if the text looks like it might match an object.
+    // Either contains a unit/number, or contains a known type name, or is
+    // explicitly inside a container with data-srtm-* hints.
+    const hasNum = /\d/.test(text);
+    const hasType = TYPES.some(t => new RegExp('\\b' + t + '\\b','i').test(text));
+    const ctx = findContext(sel.anchorNode);
+    const hasCtx = !!(ctx.kg_code || ctx.lon);
+    if (!hasNum && !hasType && !hasCtx) { hideChip(); return; }
+    let rect; try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch (e) { return; }
+    if (!rect || (rect.width === 0 && rect.height === 0)) return;
+    lastSel = { text, ctx, rect };
+    placeChip(rect, lastSel);
+  }
+
+  // ----- Popover -------------------------------------------------------
+  let popEl = null;
+
+  function closePop() {
+    if (popEl) { popEl.remove(); popEl = null; }
+    document.removeEventListener('mousedown', popOutsideHandler, true);
+    document.removeEventListener('keydown', popKeyHandler, true);
+  }
+  function popOutsideHandler(e) {
+    if (popEl && !popEl.contains(e.target)) closePop();
+  }
+  function popKeyHandler(e) { if (e.key === 'Escape') closePop(); }
+
+  function showPop(anchorRect, content) {
+    closePop();
+    popEl = el('div', { class: 'srtm-pop' });
+    popEl.appendChild(content);
+    document.body.appendChild(popEl);
+    const r = popEl.getBoundingClientRect();
+    const top = Math.min(window.innerHeight - r.height - 8,
+                Math.max(8, anchorRect.bottom + 6));
+    const left = Math.min(window.innerWidth - r.width - 8,
+                 Math.max(8, anchorRect.left));
+    popEl.style.top = top + 'px';
+    popEl.style.left = left + 'px';
+    setTimeout(() => {
+      document.addEventListener('mousedown', popOutsideHandler, true);
+      document.addEventListener('keydown', popKeyHandler, true);
+    }, 0);
+  }
+
+  function openPopForSelection(sel) {
+    hideChip();
+    const { text, ctx, rect } = sel;
+    const loading = el('div', null, 'Matching “' + text + '”…');
+    showPop(rect, loading);
+    matchText(text, ctx).then(res => {
+      const body = renderMatch(res, { selectedText: text, ctx });
+      popEl.replaceChild(body, popEl.firstChild);
+    }).catch(e => {
+      popEl.replaceChild(el('div', { class: 'err' }, 'Match failed: ' + e), popEl.firstChild);
+    });
+  }
+
+  // ----- Match / render ------------------------------------------------
+  function matchText(text, ctx = {}) {
+    const params = new URLSearchParams();
+    params.set('text', text);
+    if (ctx.kg_code) params.set('kg', ctx.kg_code);
+    if (ctx.lon != null) params.set('lon', ctx.lon);
+    if (ctx.lat != null) params.set('lat', ctx.lat);
+    return fetch(API_BASE + '/api/v1/flags/match?' + params).then(r => r.json());
+  }
+
+  function fmtCoord(v) { return v == null ? '—' : (Math.round(v*1e5)/1e5).toFixed(5); }
+
+  function renderCandidate(c) {
+    const meta = [];
+    if (c.height_max_m != null) meta.push(c.height_max_m.toFixed(1) + 'm');
+    if (c.area_sqm != null) meta.push(Math.round(c.area_sqm) + 'm²');
+    if (c.distance_m != null) meta.push(c.distance_m.toFixed(0) + 'm away');
+    if (c.rf_confidence != null) meta.push('rf=' + c.rf_confidence.toFixed(2));
+    return el('div', { class: 'cand', 'data-ref': c.obj_ref },
+      el('div', null, c.obj_type + ' · ', el('span', { class: 'meta' }, c.kind + ' · ' + (c.kg_code || '—'))),
+      el('div', { class: 'meta' }, meta.join(' · ') + ' · ' + fmtCoord(c.centroid_lon) + ',' + fmtCoord(c.centroid_lat))
+    );
+  }
+
+  function renderMatch(res, info) {
+    const wrap = el('div');
+    const title = res.status === 'no_object'
+      ? 'No matching object found'
+      : (res.status === 'ambiguous' ? 'Multiple candidates' : 'Matched object');
+    wrap.appendChild(el('h4', null, title));
+    wrap.appendChild(el('div', { class: 'row' },
+      el('span', { class: 'lb' }, 'Selected:'),
+      el('span', { class: 'vl' }, '“' + (info.selectedText || '') + '”')));
+    if (res.hint && Object.keys(res.hint).length) {
+      const h = res.hint;
+      const parts = [];
+      if (h.predicted_type) parts.push('type=' + h.predicted_type);
+      if (h.height_max_m != null) parts.push('h≈' + h.height_max_m + 'm');
+      if (h.area_sqm != null) parts.push('A≈' + Math.round(h.area_sqm) + 'm²');
+      wrap.appendChild(el('div', { class: 'row' },
+        el('span', { class: 'lb' }, 'Parsed:'),
+        el('span', { class: 'vl' }, parts.join(' · ') || '—')));
+    }
+    if (!res.candidates || !res.candidates.length) {
+      wrap.appendChild(el('div', { class: 'err' }, 'Nothing in our index matches that snippet.'));
+      return wrap;
+    }
+    const cands = el('div', { class: 'cands' });
+    res.candidates.forEach((c, i) => {
+      const node = renderCandidate(c);
+      if (i === 0) node.classList.add('sel');
+      node.addEventListener('click', () => {
+        cands.querySelectorAll('.cand').forEach(n => n.classList.remove('sel'));
+        node.classList.add('sel');
+      });
+      cands.appendChild(node);
+    });
+    wrap.appendChild(cands);
+
+    // Flags on the top candidate
+    if (res.flags && res.flags.length) {
+      const fb = el('div', { class: 'row' }, el('span', { class: 'lb' }, 'Flags:'));
+      res.flags.forEach(f => {
+        fb.appendChild(el('span', { class: 'flag-badge flag-' + f.severity }, f.flag_code));
+      });
+      wrap.appendChild(fb);
+    }
+
+    // Form
+    const sel = el('select');
+    sel.appendChild(el('option', { value: 'reject' }, 'reject prediction'));
+    sel.appendChild(el('option', { value: 'confirm' }, 'confirm prediction'));
+    sel.appendChild(el('option', { value: 'correct_type' }, 'correct type →'));
+    const cor = el('select');
+    TYPES.forEach(t => cor.appendChild(el('option', { value: t }, t)));
+    cor.style.display = 'none';
+    sel.addEventListener('change', () => {
+      cor.style.display = (sel.value === 'correct_type') ? 'block' : 'none';
+    });
+    const notes = el('textarea', { placeholder: 'Notes (optional)' });
+    const status = el('div', { class: 'row' });
+    const submit = el('button', null, 'Submit');
+    const cancel = el('button', { class: 'alt' }, 'Cancel');
+    cancel.addEventListener('click', closePop);
+    submit.addEventListener('click', () => {
+      const chosenRef = (cands.querySelector('.cand.sel') || {}).getAttribute
+        ? cands.querySelector('.cand.sel').getAttribute('data-ref') : null;
+      const payload = {
+        obj_ref: chosenRef,
+        kg_code: res.kg_code,
+        kind: sel.value,
+        corrected_type: sel.value === 'correct_type' ? cor.value : null,
+        notes: notes.value,
+        context_text: info.selectedText,
+        source_app: 'flag.js',
+      };
+      submit.disabled = true; status.textContent = 'Submitting…'; status.className = 'row';
+      fetch(API_BASE + '/api/v1/feedback', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).then(r => r.json()).then(j => {
+        if (j.ok) {
+          status.innerHTML = '<span class="ok">Recorded — thank you. id=' + j.id + '</span>';
+          emit('reported', { payload, response: j });
+          setTimeout(closePop, 1200);
+        } else {
+          status.innerHTML = '<span class="err">' + (j.error || 'Failed') + '</span>';
+          submit.disabled = false;
+        }
+      }).catch(e => {
+        status.innerHTML = '<span class="err">' + e + '</span>'; submit.disabled = false;
+      });
+    });
+    wrap.appendChild(el('div', { class: 'row' },
+      el('span', { class: 'lb' }, 'Action:'), sel));
+    wrap.appendChild(cor);
+    wrap.appendChild(notes);
+    wrap.appendChild(el('div', { class: 'btns' }, cancel, submit));
+    wrap.appendChild(status);
+    return wrap;
+  }
+
+  // ----- Programmatic open ---------------------------------------------
+  function openFor(opts) {
+    ensureStyles();
+    const text = opts.text || '';
+    const ctx = { kg_code: opts.kg_code, lon: (opts.point||{}).lon, lat: (opts.point||{}).lat };
+    const rect = opts.anchorRect || { left: window.innerWidth/2 - 200, top: window.innerHeight/2 - 100,
+                                      bottom: window.innerHeight/2 + 100, right: window.innerWidth/2 + 200,
+                                      width: 400, height: 0 };
+    if (opts.obj_ref) {
+      // Direct: skip matching
+      fetch(API_BASE + '/api/v1/flags/object/' + encodeURIComponent(opts.obj_ref))
+        .then(r => r.json()).then(j => {
+          if (j.error) {
+            showPop(rect, el('div', { class: 'err' }, j.error)); return;
+          }
+          const fakeRes = {
+            status: 'resolved', obj_ref: j.object.obj_ref, kg_code: j.object.kg_code,
+            candidates: [{
+              obj_ref: j.object.obj_ref, kg_code: j.object.kg_code, kind: j.object.kind,
+              obj_type: j.object.obj_type, centroid_lon: j.object.centroid_lon,
+              centroid_lat: j.object.centroid_lat, height_max_m: j.object.height_max_m,
+              area_sqm: j.object.area_sqm, rf_confidence: j.object.rf_confidence,
+            }],
+            flags: j.flags, hint: {},
+          };
+          showPop(rect, renderMatch(fakeRes, { selectedText: text, ctx }));
+        });
+    } else {
+      const loading = el('div', null, 'Matching…');
+      showPop(rect, loading);
+      matchText(text, ctx).then(res => {
+        popEl.replaceChild(renderMatch(res, { selectedText: text, ctx }), popEl.firstChild);
+      });
+    }
+  }
+
+  // ----- Install --------------------------------------------------------
+  let installed = false;
+  function install(opts) {
+    if (installed) return; installed = true;
+    ensureStyles();
+    document.addEventListener('selectionchange', () => {
+      // debounce a touch
+      if (chipTimer && chipTimer._sel) clearTimeout(chipTimer._sel);
+      chipTimer = chipTimer || {};
+      chipTimer._sel = setTimeout(onSelectionChange, 120);
+    });
+  }
+  function uninstall() { hideChip(); closePop(); installed = false; }
+
+  window.SrtmFlag = {
+    install, uninstall, openFor, matchText, on,
+    attachClickHandler(elem, opts={}) {
+      elem.addEventListener('click', (e) => {
+        e.preventDefault();
+        const r = elem.getBoundingClientRect();
+        openFor({ ...opts, anchorRect: r });
+      });
+    },
+  };
+})();

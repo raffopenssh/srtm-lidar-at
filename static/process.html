@@ -423,13 +423,13 @@
 
 <!-- Last Completed KG Summary -->
 <div class="last-kg" id="lastKgCard" style="display:none">
-  <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <span>Last Completed KG — <span id="lastKgName">—</span></span>
+  <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:nowrap">
+    <span style="flex:1;min-width:0">Last Completed KG — <span id="lastKgName">—</span></span>
     <button id="lastKgFilterToggle" type="button"
       title="Tap to cycle severity: off → low → medium → high → off"
       aria-pressed="false"
       style="font-size:11px;line-height:1;color:#8b949e;cursor:pointer;display:none;
-      align-items:center;gap:6px;margin-left:auto;padding:3px 9px;border:1px solid #30363d;
+      align-items:center;gap:6px;flex-shrink:0;padding:3px 9px;border:1px solid #30363d;
       border-radius:11px;background:transparent;user-select:none;font-family:inherit">
       <span id="lastKgFilterIcon" style="font-size:13px;letter-spacing:1px;line-height:1">⚐</span><span id="lastKgFilterLabel">0</span>
     </button>

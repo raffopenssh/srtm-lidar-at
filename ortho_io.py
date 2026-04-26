@@ -26,7 +26,7 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin as transform_from_origin
-from rasterio.windows import Window, from_bounds
+from rasterio.windows import Window, WindowError, from_bounds
 
 import hashlib
 from pathlib import Path
@@ -853,7 +853,10 @@ def _try_read_rgbi_for_bbox(
             # Read a window from the source in its native CRS
             with open_with_retry(rgb_url, caller=f"RGBI {opid} RGB") as ds:
                 win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
-                win = win.intersection(Window(0, 0, ds.width, ds.height))
+                try:
+                    win = win.intersection(Window(0, 0, ds.width, ds.height))
+                except WindowError:
+                    continue  # bbox outside this operate's extent
                 if win.width < 1 or win.height < 1:
                     continue
                 src_data = ds.read([1, 2, 3], window=win)
@@ -877,7 +880,10 @@ def _try_read_rgbi_for_bbox(
             try:
                 with open_with_retry(nir_url, caller=f"RGBI {opid} NIR") as ds:
                     win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
-                    win = win.intersection(Window(0, 0, ds.width, ds.height))
+                    try:
+                        win = win.intersection(Window(0, 0, ds.width, ds.height))
+                    except WindowError:
+                        win = Window(0, 0, 0, 0)  # no overlap
                     if win.width >= 1 and win.height >= 1:
                         src_nir = ds.read(1, window=win)
                         src_nir_tf = ds.window_transform(win)

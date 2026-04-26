@@ -367,7 +367,20 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div id="area-hint" style="display:none;width:100%;font-size:11px;color:#b87700;background:#fff8e1;padding:5px 8px;border-radius:4px"></div>
     </div>
   </div>
-  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span id="train-status" style="font-size:10px;opacity:0.8;margin-left:8px"></span><span class="doc-links"><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8;cursor:pointer" title="Click to view processor details"></span><span id="train-status" style="font-size:10px;opacity:0.8;margin-left:8px"></span><span class="doc-links"><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
+  <!-- Processor status popup -->
+  <div id="proc-popup" style="display:none;position:fixed;bottom:36px;right:10px;width:340px;max-height:440px;overflow-y:auto;background:#1c2128;border:1px solid #30363d;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:9999;padding:10px 12px;font-size:11px;color:#c9d1d9">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-weight:700;font-size:12px;color:#e6edf3">🗺️ Processor Status</span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <a href="/process.html" target="_blank" style="font-size:10px;color:#58a6ff;text-decoration:none" title="Open full dashboard">↗ Dashboard</a>
+        <span onclick="closeProcPopup()" style="cursor:pointer;color:#8b949e;font-size:14px;line-height:1" title="Close">×</span>
+      </span>
+    </div>
+    <div id="proc-popup-subtitle" style="font-size:10px;color:#8b949e;margin-bottom:8px"></div>
+    <div id="proc-popup-kg" style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px;display:none"></div>
+    <div id="proc-popup-peers" style="display:flex;flex-direction:column;gap:6px"></div>
+  </div>
   <div class="sidebar-collapse-bar" id="sidebar-collapse-bar"><span class="collapse-arrow">▲</span></div>
 </div>
 
@@ -1324,33 +1337,124 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
   setInterval(update,10000);
 })();
 
-// ============ PROCESSOR STATUS ============
-(function pollProcessorStatus(){
+// ============ PROCESSOR STATUS + POPUP ============
+(function(){
   const el=document.getElementById('proc-status');
-  async function update(){
-    try{
-      const r=await fetch('/api/v1/processing/status');
-      const d=await r.json();
-      const s=d.state||'idle';
-      if(s==='running'){
-        const kg=d.current_kg?` KG ${d.current_kg.code}`:''; 
-        const step=d.current_kg?` · ${d.current_kg.step}`:'';
-        const pct=d.total_kgs?((d.completed/d.total_kgs)*100).toFixed(1)+'%':'0%';
-        el.innerHTML=`🗺️ Proc: ${d.completed}/${d.total_kgs} (${pct})${kg}${step}`;
-        el.style.color='#3fb950';
-      } else if(s==='paused'){
-        el.innerHTML=`⏸ Proc paused: ${d.completed}/${d.total_kgs}`;
-        el.style.color='#d29922';
-      } else if(d.completed>0){
-        el.innerHTML=`■ Proc done: ${d.success}✓ ${d.failed}✗`;
-        el.style.color='#8b949e';
-      } else {
-        el.textContent='';
-      }
-    }catch(e){}
+  const popup=document.getElementById('proc-popup');
+  let _procData=null,_dirData=null,_popupOpen=false;
+
+  function esc(s){const d=document.createElement('div');d.textContent=String(s||'');return d.innerHTML;}
+  function fmtB(b){
+    if(!b)return'0 B';
+    if(b<1024)return b+' B';
+    if(b<1048576)return(b/1024).toFixed(1)+' KB';
+    if(b<1073741824)return(b/1048576).toFixed(1)+' MB';
+    return(b/1073741824).toFixed(2)+' GB';
   }
-  update();
-  setInterval(update,10000);
+
+  function updateChip(d,dir){
+    if(!d){el.textContent='';return;}
+    const s=d.state||'idle';
+    const totalDone=dir?(dir.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0);
+    const activePeer=dir?dir.active_peer:null;
+    const ap=activePeer&&dir?(dir.peers||[]).find(p=>p.id===activePeer):null;
+    const bwLeft=ap&&ap.bandwidth?ap.bandwidth.remaining_gb:null;
+    if(s==='running'){
+      const pct=d.total_kgs?((d.completed/d.total_kgs)*100).toFixed(1)+'%':'0%';
+      let txt='\u{1F5FA}\uFE0F '+totalDone+'/'+( d.total_kgs||0)+'\u00A0('+pct+')';
+      if(dir&&activePeer)txt+='\u00B7'+activePeer;
+      if(bwLeft!=null)txt+='\u00B7\uD83D\uDCE1'+bwLeft.toFixed(0)+'GB';
+      el.innerHTML=txt;el.style.color='#3fb950';
+    }else if(s==='paused'){
+      el.innerHTML='\u23F8\u00A0'+totalDone+'/'+(d.total_kgs||0);el.style.color='#d29922';
+    }else if(totalDone>0){
+      el.innerHTML='\u25A0\u00A0'+(d.success||0)+'\u2713\u00A0'+(d.failed||0)+'\u2717';el.style.color='#8b949e';
+    }else{el.textContent='';}
+  }
+
+  function renderPopupKg(d){
+    const box=document.getElementById('proc-popup-kg');
+    const kg=d.current_kg;
+    if(!kg||d.state==='idle'||d.state==='stopped'){box.style.display='none';return;}
+    box.style.display='';
+    const step=kg.step||'';
+    const tile=kg.tile_index!=null?' tile\u00A0'+kg.tile_index+'/'+(kg.n_tiles||'?'):'';
+    const pct=kg.tile_index!=null&&kg.n_tiles?Math.round(100*kg.tile_index/kg.n_tiles)+'%':'';
+    const tileBar=kg.tile_index&&kg.n_tiles
+      ?'<div style="height:3px;background:#21262d;border-radius:2px;margin-top:5px"><div style="height:100%;width:'+Math.min(100,Math.round(100*kg.tile_index/kg.n_tiles))+'%;background:#58a6ff;border-radius:2px;transition:width .4s"></div></div>':'';
+    box.innerHTML=
+      '<div style="font-weight:600;font-size:11px;color:#58a6ff">KG\u00A0'+esc(kg.code)+'\u00A0'+esc(kg.name||'')+'</div>'+
+      '<div style="color:#8b949e;margin-top:2px">'+esc(step)+tile+(pct?' ('+pct+')':'')+'</div>'+
+      (kg.detail?'<div style="color:#8b949e;font-size:10px;margin-top:1px">'+esc(kg.detail)+'</div>':'')+
+      tileBar;
+  }
+
+  function renderPopupSubtitle(d,dir){
+    const box=document.getElementById('proc-popup-subtitle');
+    const totalDone=dir?(dir.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0);
+    let txt=totalDone+'/'+(d.total_kgs||0)+'\u00A0KGs\u00A0\u00B7\u00A0'+(d.success||0)+'\u2713\u00A0'+(d.failed||0)+'\u2717';
+    if(dir&&dir.active_peer)txt+='\u00A0\u00B7\u00A0active:\u00A0<b>'+esc(dir.active_peer)+'</b>';
+    if(dir&&dir.mode)txt+='\u00A0\u00B7\u00A0'+dir.mode;
+    box.innerHTML=txt;
+  }
+
+  function renderPopupPeers(dir){
+    const container=document.getElementById('proc-popup-peers');
+    if(!dir||(dir.peers||[]).length===0){container.innerHTML='';return;}
+    const peers=dir.peers||[];
+    const active=dir.active_peer;
+    const budget=dir.budget_gb||95;
+    let html='';
+    for(const p of peers){
+      const isActive=p.id===active;
+      const bw=p.bandwidth||{};
+      const usedGb=bw.used_gb||0;
+      const remainGb=bw.remaining_gb!=null?bw.remaining_gb:(budget-usedGb);
+      const bwPct=Math.min(100,Math.round(100*usedGb/budget));
+      const bwCol=bwPct>90?'#f85149':bwPct>70?'#d29922':'#3fb950';
+      const stCol=!p.online?'#6e7681':p.processor_state==='running'?'#3fb950':p.processor_state==='stopped'?'#6e7681':'#d29922';
+      const stLbl=!p.online?'offline':(p.processor_state||'idle');
+      const bord=isActive?'border-color:#388bfd':'';
+      html+='<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:7px 9px;'+bord+'">';
+      html+='<div style="display:flex;justify-content:space-between;align-items:center">';
+      html+='<span style="font-weight:600;color:'+(isActive?'#58a6ff':'#c9d1d9')+'">'+esc(p.id)+(isActive?'\u00A0\u25C0':'')+'</span>';
+      html+='<span style="color:'+stCol+';font-size:10px">'+stLbl+'</span></div>';
+      if(p.current_kg)html+='<div style="font-size:10px;color:#8b949e;margin-top:1px">KG\u00A0'+esc(p.current_kg)+'\u00A0'+esc(p.current_kg_name||'')+'</div>';
+      html+='<div style="font-size:10px;color:#8b949e;margin-top:1px">'+( p.completed||0)+'\u00A0done\u00A0\u00B7\u00A0\uD83D\uDCE1\u00A0'+usedGb.toFixed(1)+'/'+budget+'\u00A0GB\u00A0('+remainGb.toFixed(1)+'\u00A0left)</div>';
+      html+='<div style="height:3px;background:#21262d;border-radius:2px;margin-top:4px"><div style="height:100%;width:'+bwPct+'%;background:'+bwCol+';border-radius:2px;transition:width .5s"></div></div>';
+      if(!p.enabled)html+='<div style="font-size:9px;color:#d29922;margin-top:2px">\u26A0\u00A0disabled</div>';
+      if(p.scheduled&&p.not_before)html+='<div style="font-size:9px;color:#d29922;margin-top:2px">\u23F3\u00A0until\u00A0'+esc(p.not_before)+'</div>';
+      html+='</div>';
+    }
+    container.innerHTML=html;
+  }
+
+  async function fetchAndRender(){
+    try{const r=await fetch('/api/v1/processing/status');_procData=await r.json();}catch(e){}
+    try{const r=await fetch('/api/v1/director/status');_dirData=await r.json();}catch(e){}
+    updateChip(_procData,_dirData);
+    if(_popupOpen){
+      renderPopupSubtitle(_procData||{},_dirData);
+      renderPopupKg(_procData||{});
+      renderPopupPeers(_dirData);
+    }
+  }
+
+  window.closeProcPopup=function(){_popupOpen=false;popup.style.display='none';};
+
+  el.addEventListener('click',function(e){
+    e.stopPropagation();
+    if(_popupOpen){closeProcPopup();return;}
+    _popupOpen=true;popup.style.display='block';
+    renderPopupSubtitle(_procData||{},_dirData);
+    renderPopupKg(_procData||{});
+    renderPopupPeers(_dirData);
+  });
+  document.addEventListener('click',function(e){
+    if(_popupOpen&&!popup.contains(e.target)&&e.target!==el)closeProcPopup();
+  });
+  fetchAndRender();
+  setInterval(fetchAndRender,10000);
 })();
 
 // ============ SIDEBAR COLLAPSE BAR (MOBILE) ============

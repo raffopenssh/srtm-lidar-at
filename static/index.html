@@ -1329,20 +1329,30 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
   const el=document.getElementById('proc-status');
   async function update(){
     try{
-      const r=await fetch('/api/v1/processing/status');
-      const d=await r.json();
+      const [rs,rd]=await Promise.all([
+        fetch('/api/v1/processing/status').then(r=>r.json()).catch(()=>null),
+        fetch('/api/v1/director/status').then(r=>r.json()).catch(()=>null)
+      ]);
+      const d=rs||{};
       const s=d.state||'idle';
-      if(s==='running'){
-        const kg=d.current_kg?` KG ${d.current_kg.code}`:''; 
-        const step=d.current_kg?` · ${d.current_kg.step}`:'';
-        const pct=d.total_kgs?((d.completed/d.total_kgs)*100).toFixed(1)+'%':'0%';
-        el.innerHTML=`🗺️ Proc: ${d.completed}/${d.total_kgs} (${pct})${kg}${step}`;
+      // Combined count across all peers from director
+      const totalDone=rd?(rd.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0);
+      const activePeer=rd?rd.active_peer:null;
+      const ap=activePeer&&rd?(rd.peers||[]).find(p=>p.id===activePeer):null;
+      const kgName=ap&&ap.current_kg_name?ap.current_kg_name:(d.current_kg?d.current_kg.name||d.current_kg.code:'');
+      const kgCode=ap&&ap.current_kg?ap.current_kg:(d.current_kg?d.current_kg.code:'');
+      if(s==='running'||s==='processing'||(activePeer&&ap&&ap.processor_state==='running')){
+        const pct=d.total_kgs?((totalDone/d.total_kgs)*100).toFixed(1)+'%':'0%';
+        let txt=`🗺️ Proc: ${totalDone}/${d.total_kgs||8440}`;
+        if(kgCode)txt+=` · ${kgCode}`;
+        if(kgName&&kgName!==kgCode)txt+=` ${kgName}`;
+        el.innerHTML=txt;
         el.style.color='#3fb950';
       } else if(s==='paused'){
-        el.innerHTML=`⏸ Proc paused: ${d.completed}/${d.total_kgs}`;
+        el.innerHTML=`⏸ Proc paused: ${totalDone}/${d.total_kgs||0}`;
         el.style.color='#d29922';
-      } else if(d.completed>0){
-        el.innerHTML=`■ Proc done: ${d.success}✓ ${d.failed}✗`;
+      } else if(totalDone>0){
+        el.innerHTML=`■ Proc done: ${d.success||0}✓ ${d.failed||0}✗`;
         el.style.color='#8b949e';
       } else {
         el.textContent='';

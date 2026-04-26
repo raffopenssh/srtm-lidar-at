@@ -811,11 +811,19 @@ class PeerDirector:
         sync_counter = 0
         while self._running:
             try:
-                # Re-read config from disk each tick so cross-worker changes are seen
+                # Re-read config + state from disk each tick so cross-worker
+                # changes (e.g. /director/activate from another gunicorn worker)
+                # are picked up by the worker actually running the loop.
                 try:
                     disk_cfg = load_peers_config()
+                    disk_state = load_director_state()
                     with self._lock:
                         self.cfg = disk_cfg
+                        # Merge: prefer disk values for active_peer/mode/last_switch
+                        # but keep our in-memory bandwidth + unreachable_count.
+                        for key in ('active_peer', 'mode', 'last_switch'):
+                            if key in disk_state:
+                                self.state[key] = disk_state[key]
                 except Exception:
                     pass
                 self._update_bandwidth()

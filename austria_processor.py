@@ -5425,6 +5425,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # bev_retry layer handles cases where GDAL exhausts its
             # retries and raises, so surfacing these here is pure noise.
             "CPLE_AppDefined:Request for ",
+            # ortho_io operate coverage gaps: the tile bbox slightly exceeds
+            # a BEV RGBI operate's raster extent, so Window.intersection()
+            # raises WindowError("Intersection is empty").  ortho_io catches
+            # this in its operate fallback loop and continues to the next
+            # operate — the read is never actually retried despite bev_retry
+            # logging "attempt 1/N read failed" before re-raising.  All tiles
+            # complete successfully; this is expected at operate boundaries.
+            "Intersection is empty Window(",
         )
         # Messages to downgrade from error → warning (non-fatal)
         _DOWNGRADE = (

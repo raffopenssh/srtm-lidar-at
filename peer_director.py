@@ -386,6 +386,50 @@ def stop_peer_processor(peer_url: str | None) -> dict:
         return {'error': str(e)}
 
 
+def safely_stop_peer(peer_url: str | None, peer_id: str = '?',
+                     max_wait: int = 60) -> dict:
+    """Stop a peer's processor and verify it actually stopped.
+
+    CRITICAL for credential safety: returns success only after we've
+    confirmed via /processing/status that the peer is no longer running.
+    On failure, the caller MUST NOT start another peer (would cause
+    parallel processing and 402 rate-limit errors on shared credentials).
+
+    Returns: {'status': 'stopped'}, {'status': 'already_stopped'},
+             or {'error': '...', 'last_state': '...'}.
+    """
+    # 1. Send stop request
+    stop_result = stop_peer_processor(peer_url)
+    if 'error' in stop_result and stop_result.get('status') != 'already_stopped':
+        log.warning('Peer %s stop API failed: %s', peer_id, stop_result['error'])
+        # Don't give up yet — status check below may show it's actually stopped
+
+    # 2. Poll status until processor is stopped (or timeout)
+    deadline = time.time() + max_wait
+    last_state = 'unknown'
+    while time.time() < deadline:
+        status = get_peer_status(peer_url)
+        last_state = status.get('state', 'unknown')
+        if last_state in ('idle', 'stopped'):
+            return {'status': 'stopped', 'verified': True}
+        if last_state == 'unreachable':
+            # Peer's gunicorn is down/overloaded; we can't verify. Wait a bit.
+            time.sleep(3)
+            continue
+        # Still running — give it time, retry stop after a few seconds
+        time.sleep(2)
+        if time.time() < deadline - 5:
+            stop_peer_processor(peer_url)  # retry stop in case first one was lost
+            time.sleep(3)
+
+    # Timeout — could not verify peer is stopped
+    log.error('Peer %s did NOT stop within %ds (last state: %s) — '
+              'refusing to activate another peer (credential safety)',
+              peer_id, max_wait, last_state)
+    return {'error': f'stop_not_verified after {max_wait}s',
+            'last_state': last_state}
+
+
 def trigger_peer_update(peer_url: str) -> dict:
     """Tell a remote peer to git pull and restart its web server.
     The peer kills itself on restart so the connection always drops — treat
@@ -669,8 +713,11 @@ class PeerDirector:
                 log.info('Peer %s is scheduled not before %s, switching', active_id, nb)
                 peer = get_peer_by_id(cfg, active_id)
                 if peer:
-                    stop_peer_processor(peer.get('url'))
-                    time.sleep(SWITCH_COOLDOWN)
+                    res = safely_stop_peer(peer.get('url'), active_id)
+                    if 'error' in res:
+                        log.error('Cannot deactivate %s: %s — holding off switch',
+                                  active_id, res['error'])
+                        return  # leave active_peer as is; retry next tick
                 with self._lock:
                     self.state['active_peer'] = None
                     active_id = None
@@ -686,8 +733,12 @@ class PeerDirector:
                          active_id, remaining_gb)
                 peer = get_peer_by_id(cfg, active_id)
                 if peer:
-                    stop_peer_processor(peer.get('url'))
-                    time.sleep(SWITCH_COOLDOWN)
+                    res = safely_stop_peer(peer.get('url'), active_id)
+                    if 'error' in res:
+                        log.error('Cannot deactivate %s (over-budget): %s — '
+                                  'holding off switch (credential safety)',
+                                  active_id, res['error'])
+                        return  # don't activate next peer until this one is verified stopped
                 with self._lock:
                     self.state['active_peer'] = None
                     active_id = None
@@ -745,7 +796,7 @@ class PeerDirector:
                     if ps.get('state') in ('running', 'processing'):
                         log.warning('Non-active peer %s is running — stopping it '
                                     '(only %s should be active)', p['id'], active_id)
-                        stop_peer_processor(p.get('url'))
+                        safely_stop_peer(p.get('url'), p['id'])
 
         # If no active peer, choose one
         if not active_id:
@@ -754,15 +805,31 @@ class PeerDirector:
             if new_peer:
                 peer = get_peer_by_id(cfg, new_peer)
                 if peer:
-                    log.info('Activating peer %s', new_peer)
-                    # Ensure any other peers are stopped
+                    # CRITICAL: verify ALL other peers are fully stopped
+                    # before activating the new one. If we can't verify a
+                    # peer is stopped, abort — starting a new processor while
+                    # another may be running causes Copernicus 402 errors.
+                    blocked = False
                     for p in cfg.get('peers', []):
-                        if p['id'] != new_peer:
-                            ps = get_peer_status(p.get('url'))
-                            if ps.get('state') in ('running', 'processing'):
-                                log.info('Stopping peer %s before switching', p['id'])
-                                stop_peer_processor(p.get('url'))
+                        if p['id'] == new_peer:
+                            continue
+                        ps = get_peer_status(p.get('url'))
+                        st = ps.get('state', 'unknown')
+                        if st in ('running', 'processing'):
+                            log.info('Stopping peer %s before activating %s',
+                                     p['id'], new_peer)
+                            res = safely_stop_peer(p.get('url'), p['id'])
+                            if 'error' in res:
+                                log.error('Could not verify %s is stopped: %s — '
+                                          'aborting activation of %s '
+                                          '(credential safety)',
+                                          p['id'], res.get('error'), new_peer)
+                                blocked = True
+                                break
+                    if blocked:
+                        return  # try again next tick
 
+                    log.info('Activating peer %s', new_peer)
                     result = start_peer_processor(peer.get('url'))
                     log.info('Start result for %s: %s', new_peer, result)
                     with self._lock:

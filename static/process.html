@@ -426,12 +426,12 @@
   <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <span>Last Completed KG — <span id="lastKgName">—</span></span>
     <button id="lastKgFilterToggle" type="button"
-      title="Hide segments that triggered quality flags"
+      title="Tap to cycle severity: off → low → medium → high → off"
       aria-pressed="false"
       style="font-size:10px;line-height:1;color:var(--dim);cursor:pointer;display:none;
-      align-items:center;gap:4px;margin-left:auto;padding:2px 7px;border:1px solid var(--border);
+      align-items:center;gap:5px;margin-left:auto;padding:2px 7px;border:1px solid var(--border);
       border-radius:10px;background:transparent;user-select:none;font-family:inherit">
-      <span id="lastKgFilterIcon" style="font-size:11px">⚑</span><span id="lastKgFilterLabel">0</span>
+      <span id="lastKgFilterIcon" style="font-size:11px;letter-spacing:1px">⚐</span><span id="lastKgFilterLabel">0</span>
     </button>
   </div>
   <div class="last-kg-grid" id="lastKgGrid"></div>
@@ -1585,9 +1585,26 @@ async function fetchKgJson(code) {
 }
 let _lastKgJson = null, _lastKgFlags = [];
 
-function _flaggedRefSet() {
+// Severity tiers controlled by the flag toggle button. Levels:
+//   0 = off (show all)
+//   1 = low  : hide refs with any flag (weight >= 1)
+//   2 = med  : hide refs whose max severity ≥ medium OR weight ≥ 3
+//   3 = high : hide refs whose max severity ≥ high     OR weight ≥ 6
+const _SEV_RANK = { low: 1, info: 1, medium: 2, warning: 2, high: 3, error: 3, critical: 4 };
+function _flaggedRefSet(level) {
+  if (!level) return new Set();
+  const minRank = level === 1 ? 0 : (level === 2 ? 2 : 3);
+  const minWeight = level === 1 ? 0.5 : (level === 2 ? 3 : 6);
+  const byRef = new Map();
+  (_lastKgFlags||[]).forEach(f => {
+    if (!f.obj_ref) return;
+    const cur = byRef.get(f.obj_ref) || { rank: 0, w: 0 };
+    cur.rank = Math.max(cur.rank, _SEV_RANK[f.severity] || 0);
+    cur.w += +f.weight || 0;
+    byRef.set(f.obj_ref, cur);
+  });
   const s = new Set();
-  (_lastKgFlags||[]).forEach(f => { if (f.obj_ref) s.add(f.obj_ref); });
+  byRef.forEach((v, ref) => { if (v.rank >= minRank && v.w >= minWeight) s.add(ref); });
   return s;
 }
 // Each top item has an implicit obj_ref of '<kg>:<kind>:<index>' — mirror
@@ -1598,29 +1615,36 @@ function _refForTopItem(kg, kind, idx, otype) {
 }
 function _filterFlagged(arr, kg, kind, flagged) {
   if (!arr || !arr.length) return arr || [];
-  return arr.filter((o, i) => {
+  const out = arr.filter((o, i) => {
     const otype = o.rf_type || o.type || 'tree';
     return !flagged.has(_refForTopItem(kg, kind, i, otype));
   });
+  // Safety: if the filter would empty the list (every entry is flagged,
+  // common for top_10_trees in KGs full of misclassified masts), keep
+  // the original. The user toggle is meant to skip noise, not blank UI.
+  return out.length ? out : arr;
 }
 function renderLastKg(js) {
   const card = document.getElementById('lastKgCard');
   card.style.display = 'block';
   if (js.kg_code) card.setAttribute('data-srtm-kg', js.kg_code);
-  // Show / update the "hide flagged" toggle (subtle icon button)
+  // Show / update the flag-severity toggle (4-state cycle)
   const toggleWrap = document.getElementById('lastKgFilterToggle');
   const labelEl = document.getElementById('lastKgFilterLabel');
+  if (typeof toggleWrap._level !== 'number') toggleWrap._level = 0;
+  const level = toggleWrap._level;
   if (_lastKgFlags && _lastKgFlags.length) {
     toggleWrap.style.display = 'inline-flex';
-    const refs = _flaggedRefSet();
+    const refs = _flaggedRefSet(level || 1); // count for current or low when off
     labelEl.textContent = String(refs.size);
-    toggleWrap.title = (toggleWrap._on ? 'Showing only ' : 'Hide ') + refs.size + ' flagged item(s)';
+    const names = ['off', 'low', 'medium', 'high'];
+    toggleWrap.title = 'Filter flagged items — ' + names[level] +
+      ' (tap to cycle: off → low → medium → high)';
   } else {
     toggleWrap.style.display = 'none';
   }
-  const hideFlagged = !!toggleWrap._on;
-  if (hideFlagged) {
-    const flagged = _flaggedRefSet();
+  if (level > 0) {
+    const flagged = _flaggedRefSet(level);
     const kg = js.kg_code;
     js = JSON.parse(JSON.stringify(js)); // shallow clone so we don't mutate cache
     js.top_10_objects = _filterFlagged(js.top_10_objects, kg, 'top_obj', flagged);
@@ -1723,22 +1747,30 @@ function renderLastKg(js) {
     '<span class="ds-tag ' + (s.ok ? 'ds-ok' : 'ds-miss') + '">' +
     (s.ok ? '\u2713 ' : '\u2717 ') + s.name + '</span>'
   ).join('');
-  // Wire toggle once and update visual state.
+  // Wire toggle once. Each tap cycles 0 → 1 → 2 → 3 → 0.
   const tgl = document.getElementById('lastKgFilterToggle');
   if (tgl && !tgl._wired) {
     tgl._wired = true;
-    tgl._on = false;
+    if (typeof tgl._level !== 'number') tgl._level = 0;
     tgl.addEventListener('click', () => {
-      tgl._on = !tgl._on;
-      tgl.setAttribute('aria-pressed', tgl._on ? 'true' : 'false');
+      tgl._level = (tgl._level + 1) % 4;
+      tgl.setAttribute('aria-pressed', tgl._level ? 'true' : 'false');
       if (_lastKgJson) renderLastKg(_lastKgJson);
     });
   }
   if (tgl) {
-    tgl.style.borderColor = tgl._on ? '#d29922' : 'var(--border)';
-    tgl.style.color = tgl._on ? '#d29922' : 'var(--dim)';
+    const lvl = tgl._level || 0;
+    // Tier colours: green-ish for low, amber for medium, red for high
+    const TIER_COLOR = ['var(--dim)', '#3fb950', '#d29922', '#f85149'];
+    const TIER_BORDER = ['var(--border)', '#3fb95066', '#d2992266', '#f8514966'];
+    tgl.style.color = TIER_COLOR[lvl];
+    tgl.style.borderColor = TIER_BORDER[lvl];
     const ico = document.getElementById('lastKgFilterIcon');
-    if (ico) ico.textContent = tgl._on ? '⚑' : '⚐'; // filled vs outline flag
+    if (ico) {
+      // 0: outline flag; 1: 1 filled flag; 2: 2 flags; 3: 3 flags
+      ico.textContent = lvl === 0 ? '⚐' : '⚑'.repeat(lvl);
+      ico.style.color = TIER_COLOR[lvl];
+    }
   }
 }
 

@@ -5415,6 +5415,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             "DeprecationWarning: 'Memory' driver is deprecated",
             "Failed to parse API error response",
             "NaN nodata value cannot be recorded",
+            # GDAL-internal HTTP range-request retry noise.
+            # GDAL retries these internally (GDAL_HTTP_MAX_RETRY=3); each
+            # failed attempt is logged as CPLE_AppDefined even when the
+            # overall read ultimately succeeds.  response_code=0 means a
+            # connection reset; response_code=206 is actually the correct
+            # HTTP Partial Content reply for range reads but gets logged
+            # when an interrupted transfer is retried.  Our outer
+            # bev_retry layer handles cases where GDAL exhausts its
+            # retries and raises, so surfacing these here is pure noise.
+            "CPLE_AppDefined:Request for ",
         )
         # Messages to downgrade from error → warning (non-fatal)
         _DOWNGRADE = (

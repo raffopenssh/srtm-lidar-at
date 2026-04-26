@@ -1940,6 +1940,14 @@ def processing_queue_get():
             pass
     if current_kg:
         codes = [c for c in codes if c != current_kg]
+    # Load deferred KG codes (KGs awaiting retry after transient failure)
+    deferred_codes = set()
+    deferred_path = data_dir / 'deferred_kgs.json'
+    if deferred_path.exists():
+        try:
+            deferred_codes = set(json.loads(deferred_path.read_text()))
+        except Exception:
+            pass
     # Load failure counts
     failure_counts = {}
     fc_path = data_dir / 'failure_counts.json'
@@ -1977,25 +1985,46 @@ def processing_queue_get():
             ny = max(1, _math.ceil((max_lat - min_lat) / step_y))
             return nx * ny
         def _resolve(code):
-            from kg_splitter import is_block_code, parent_kg_code as _parent_code, block_label as _block_label
+            from kg_splitter import (is_block_code, parent_kg_code as _parent_code,
+                                     block_label as _block_label, maybe_split_kg,
+                                     all_block_codes_for_parent)
             _lookup_code = _parent_code(code) if is_block_code(code) else code
             row = conn.execute(
                 'SELECT kg_name, gemeinde_name, district_name, min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?',
                 (_lookup_code,)
             ).fetchone()
             is_tombstoned = code in tombstoned_kgs
+            is_deferred = code in deferred_codes
             if row:
                 _name = row['kg_name']
                 _lbl = _block_label(code)
                 if _lbl:
                     _name = f"{_name} ({_lbl})"
-                return {'code': code, 'name': _name,
+                item = {'code': code, 'name': _name,
                         'gemeinde': row['gemeinde_name'],
                         'district': row['district_name'],
                         'failures': failure_counts.get(code, 0),
                         'est_tiles': _est_tiles(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat']),
-                        'tombstoned': is_tombstoned}
-            return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0), 'tombstoned': is_tombstoned}
+                        'tombstoned': is_tombstoned,
+                        'deferred': is_deferred}
+                # Add block split info for parent KG codes (not already a block)
+                if not is_block_code(code) and row['min_lon'] is not None:
+                    _fake_kg = {
+                        'kg_code': code,
+                        'kg_name': row['kg_name'],
+                        'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
+                                 'max_lon': row['max_lon'], 'max_lat': row['max_lat']},
+                    }
+                    _blocks = maybe_split_kg(_fake_kg)
+                    if len(_blocks) > 1:
+                        _done_codes = all_block_codes_for_parent(code, completed)
+                        _done_labels = [_block_label(c) for c in _done_codes]
+                        _all_labels = [b['_block_label'] for b in _blocks]
+                        item['n_blocks'] = len(_blocks)
+                        item['blocks_done'] = _done_labels
+                        item['blocks_pending'] = [l for l in _all_labels if l not in _done_labels]
+                return item
+            return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0), 'tombstoned': is_tombstoned, 'deferred': is_deferred}
         items = [_resolve(c) for c in codes]
         perm_failed_items = [_resolve(c) for c in perm_failed]
     except Exception:

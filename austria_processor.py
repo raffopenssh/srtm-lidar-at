@@ -63,6 +63,7 @@ TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
 POSTPONE_SIGNAL_FILE = DATA_DIR / "postpone_signal.json"
 THROTTLE_FILE = DATA_DIR / "upload_throttle"
+DEFERRED_FILE = DATA_DIR / "deferred_kgs.json"
 
 MAX_KG_PIXELS = 4_000_000
 KG_TIMEOUT_SECONDS = 12 * 60 * 60       # 12 hours — first attempt
@@ -7095,6 +7096,21 @@ def _append_retry_queue(kg_code: str):
         pass
 
 
+def _save_deferred_kgs(deferred_retries: list):
+    """Persist deferred KG codes to disk so the queue API can read them."""
+    try:
+        codes = [d[1]["kg_code"] for d in deferred_retries]
+        DEFERRED_FILE.write_text(json.dumps(codes))
+    except Exception:
+        pass
+
+
+def _append_deferred(deferred_retries: list, entry: tuple):
+    """Append to deferred list and persist to disk."""
+    deferred_retries.append(entry)
+    _save_deferred_kgs(deferred_retries)
+
+
 def _load_failed_kgs() -> set:
     """Load permanently-failed KG codes from file."""
     try:
@@ -7568,6 +7584,7 @@ def main():
 
     # Deferred retry queue: list of (inject_after_index, kg_dict, attempt_num)
     _deferred_retries: list[tuple[int, dict, int]] = []
+    _save_deferred_kgs(_deferred_retries)  # clear stale deferred state
 
     # Track which retry-queue KG codes we've already injected into pending,
     # so we only pick up *new* additions from the file each iteration.
@@ -7586,6 +7603,8 @@ def main():
             log.info("↻ Deferred retry: KG %s re-inserted at position %d "
                      "(attempt %d)",
                      defer_kg["kg_code"], i + 1, defer_attempt)
+        if ready:
+            _save_deferred_kgs(_deferred_retries)
 
         kg = pending[i]
 
@@ -7843,7 +7862,7 @@ def main():
                             _append_retry_queue(kg_code)
                             _deferred_kg: dict = dict(kg)
                             _deferred_kg["_defer_attempt"] = 0  # reset
-                            _deferred_retries.append(
+                            _append_deferred(_deferred_retries, 
                                 (i + DEFER_GAP, _deferred_kg, 0))
                             progress.add_log(
                                 "info",
@@ -7878,7 +7897,7 @@ def main():
                                 _append_retry_queue(kg_code)
                                 _deferred: dict = dict(kg)
                                 _deferred["_defer_attempt"] = _defer_n + 1
-                                _deferred_retries.append(
+                                _append_deferred(_deferred_retries, 
                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
                                 progress.add_log(
                                     "warning",
@@ -8069,7 +8088,7 @@ def main():
                     if _defer_n < 2:
                         _deferred = dict(kg)
                         _deferred["_defer_attempt"] = _defer_n + 1
-                        _deferred_retries.append(
+                        _append_deferred(_deferred_retries, 
                             (i + DEFER_GAP, _deferred, _defer_n + 1))
                 elif is_credits_issue:
                     log.warning("KG %s: Copernicus credits issue — will retry after credits restored", kg_code)
@@ -8093,7 +8112,7 @@ def main():
                         _append_retry_queue(kg_code)
                         _deferred = dict(kg)
                         _deferred["_defer_attempt"] = _defer_n + 1
-                        _deferred_retries.append(
+                        _append_deferred(_deferred_retries, 
                             (i + DEFER_GAP, _deferred, _defer_n + 1))
                         progress.add_log(
                             "warning",
@@ -8137,7 +8156,7 @@ def main():
                 _append_retry_queue(kg_code)
                 _deferred = dict(kg)
                 _deferred["_defer_attempt"] = _defer_n + 1
-                _deferred_retries.append(
+                _append_deferred(_deferred_retries, 
                     (i + DEFER_GAP, _deferred, _defer_n + 1))
                 progress.add_log(
                     "warning",

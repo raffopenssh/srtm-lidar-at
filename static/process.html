@@ -110,6 +110,12 @@
   .prio-tag.tombstoned { border-color: #7a5c00; background: rgba(210,153,34,0.13); }
   .prio-tag.tombstoned .prio-code { color: var(--yellow); }
   .prio-tag .tombstone-badge { font-size: 9px; color: var(--yellow); opacity: 0.9; margin-left: 2px; }
+  .prio-tag.deferred { opacity: 0.5; border-style: dashed; border-color: var(--border); background: transparent; }
+  .prio-tag.deferred .prio-code { color: var(--dim); }
+  .prio-tag .split-badge { font-size: 9px; margin-left: 2px; opacity: 0.85; }
+  .prio-tag .split-pips { display: inline-flex; gap: 2px; margin-left: 3px; align-items: center; }
+  .prio-tag .split-pip { width: 6px; height: 6px; border-radius: 50%; border: 1.5px solid rgba(139,148,158,0.6); background: transparent; }
+  .prio-tag .split-pip.done { background: var(--green); border-color: var(--green); box-shadow: 0 0 3px rgba(63,185,80,0.5); }
   .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
   .prio-tiles { display: inline-flex; align-items: center; gap: 1px; margin-left: 2px; margin-right: 1px; }
   .prio-tiles .t-block { width: 3px; height: 8px; border-radius: 1px; opacity: 0.7; }
@@ -1828,16 +1834,49 @@ function renderPrioQueue() {
     const tag = document.createElement('span');
     const fc = _failClass(kg.failures);
     const isTomb = !!kg.tombstoned;
-    tag.className = 'prio-tag' + (isTomb ? ' tombstoned' : (fc ? ' ' + fc : ''));
+    const isDeferred = !!kg.deferred;
+    let cls = 'prio-tag';
+    if (isDeferred) cls += ' deferred';
+    else if (isTomb) cls += ' tombstoned';
+    else if (fc) cls += ' ' + fc;
+    tag.className = cls;
     tag.draggable = true;
     tag.dataset.idx = i;
-    tag.title = (kg.gemeinde || '') + (kg.district ? ' · ' + kg.district : '') +
-      (kg.failures ? ' · ' + kg.failures + ' failure(s)' : '') +
-      (kg.est_tiles ? ' · ~' + kg.est_tiles + ' tiles' : '') +
-      (isTomb ? ' · queued for reprocessing (was already processed)' : '');
+    // Build title
+    let titleParts = [];
+    if (kg.gemeinde) titleParts.push(kg.gemeinde);
+    if (kg.district) titleParts.push(kg.district);
+    if (kg.failures) titleParts.push(kg.failures + ' failure(s)');
+    if (kg.est_tiles) titleParts.push('~' + kg.est_tiles + ' tiles');
+    if (isTomb) titleParts.push('queued for reprocessing (was already processed)');
+    if (isDeferred) titleParts.push('deferred — retrying after a few KGs');
+    if (kg.n_blocks) {
+      const done = (kg.blocks_done || []).length;
+      titleParts.push('split into ' + kg.n_blocks + ' blocks (' + done + '/' + kg.n_blocks + ' done)');
+      if (kg.blocks_done && kg.blocks_done.length) titleParts.push('done: ' + kg.blocks_done.join(', '));
+      if (kg.blocks_pending && kg.blocks_pending.length) titleParts.push('pending: ' + kg.blocks_pending.join(', '));
+    }
+    tag.title = titleParts.join(' · ');
+    // Build badges
     const tombBadge = isTomb ? '<span class="tombstone-badge" title="Previously processed — queued for reprocessing">↺</span>' : '';
+    const deferBadge = isDeferred ? '<span class="split-badge" style="color:var(--dim)" title="Deferred — retrying after a few KGs">⏳</span>' : '';
+    let splitHtml = '';
+    if (kg.n_blocks) {
+      const done = (kg.blocks_done || []).length;
+      const total = kg.n_blocks;
+      let pips = '';
+      const pending = kg.blocks_pending || [];
+      const doneSet = new Set(kg.blocks_done || []);
+      // Show small pips: filled = done, hollow = pending
+      const allLabels = [...(kg.blocks_done || []), ...pending];
+      for (const lbl of allLabels) {
+        const isDone = doneSet.has(lbl);
+        pips += '<span class="split-pip' + (isDone ? ' done' : '') + '" title="' + esc(lbl) + (isDone ? ' ✓' : '') + '"></span>';
+      }
+      splitHtml = '<span class="split-pips" title="' + done + '/' + total + ' blocks done">' + pips + '</span>';
+    }
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) + tombBadge + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
+      esc(kg.name) + tombBadge + deferBadge + splitHtml + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
       '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
     // Drag events
     tag.addEventListener('dragstart', e => {

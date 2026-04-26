@@ -5578,30 +5578,35 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                      f"{len(cadastre_data['building_footprints'])} buildings")
 
         # --- 1b. Refine bbox from cadastre geometry union ---
-        all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
-                         + [b["geometry"] for b in cadastre_data["building_footprints"]])
-        if all_cad_geoms:
-            try:
-                from shapely.ops import unary_union as _unary_union
-                from shapely.validation import make_valid
-                valid_geoms = []
-                for g in all_cad_geoms:
-                    try:
-                        valid_geoms.append(make_valid(g) if not g.is_valid else g)
-                    except Exception:
-                        valid_geoms.append(g.buffer(0))
-                cad_union_3035 = _unary_union(valid_geoms)
-                cad_union_wgs = transform_to_wgs(cad_union_3035)
-                cb = cad_union_wgs.bounds
-                full_west = min(full_west, cb[0])
-                full_south = min(full_south, cb[1])
-                full_east = max(full_east, cb[2])
-                full_north = max(full_north, cb[3])
-                log.info("KG %s: full bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
-                         kg_code, full_west, full_south, full_east, full_north)
-            except Exception as e:
-                log.warning("KG %s: cadastre union failed, using API bbox: %s",
-                            kg_code, e)
+        # For blocks, SKIP bbox expansion — the block bbox is fixed by the
+        # splitter and must not grow back to the full KG extent.
+        if not _is_block:
+            all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
+                             + [b["geometry"] for b in cadastre_data["building_footprints"]])
+            if all_cad_geoms:
+                try:
+                    from shapely.ops import unary_union as _unary_union
+                    from shapely.validation import make_valid
+                    valid_geoms = []
+                    for g in all_cad_geoms:
+                        try:
+                            valid_geoms.append(make_valid(g) if not g.is_valid else g)
+                        except Exception:
+                            valid_geoms.append(g.buffer(0))
+                    cad_union_3035 = _unary_union(valid_geoms)
+                    cad_union_wgs = transform_to_wgs(cad_union_3035)
+                    cb = cad_union_wgs.bounds
+                    full_west = min(full_west, cb[0])
+                    full_south = min(full_south, cb[1])
+                    full_east = max(full_east, cb[2])
+                    full_north = max(full_north, cb[3])
+                    log.info("KG %s: full bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
+                             kg_code, full_west, full_south, full_east, full_north)
+                except Exception as e:
+                    log.warning("KG %s: cadastre union failed, using API bbox: %s",
+                                kg_code, e)
+        else:
+            log.info("KG %s: block mode — using fixed bbox (no expansion)", kg_code)
 
         # --- 2. Compute tile grid ---
         tile_km = max_km if max_km is not None else MAX_KG_AREA_KM

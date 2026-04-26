@@ -2363,10 +2363,15 @@ def director_activate_peer():
         if old_peer:
             pd.stop_peer_processor(old_peer.get('url'))
 
+    # CRITICAL: persist new active_peer + mode to disk BEFORE starting the
+    # processor. start_peer_processor can take 10-15s (systemd_fallback);
+    # during that window the director loop in another gunicorn worker would
+    # read stale state, see at3 as 'non-active running', and kill it.
+    d.set_mode('manual')
+    d.set_active_peer(peer_id)
+
     # Start new peer
     result = pd.start_peer_processor(peer.get('url'))
-    d.set_active_peer(peer_id)
-    d.set_mode('manual')
     return jsonify({'status': 'activated', 'peer': peer_id, 'start_result': result})
 
 

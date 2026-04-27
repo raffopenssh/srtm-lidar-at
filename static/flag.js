@@ -338,9 +338,28 @@
         '⚠ weight=' + (c.agg.total_weight||0).toFixed(1)
         + ' · ' + (c.agg.codes||[]).join(', '));
     }
+    // Per-candidate deep-link to Query Explorer (filtered + centred on map).
+    let qLink = null;
+    if (c.obj_ref || (c.centroid_lon != null && c.centroid_lat != null)) {
+      const params = new URLSearchParams();
+      if (c.obj_ref) params.set('obj_ref', c.obj_ref);
+      if (c.kg_code) params.set('kg', c.kg_code);
+      if (c.centroid_lon != null) params.set('lon', c.centroid_lon);
+      if (c.centroid_lat != null) params.set('lat', c.centroid_lat);
+      if (c.obj_type) params.set('type', c.obj_type);
+      qLink = el('a', { href: '/query.html?' + params.toString(),
+        target: '_blank', rel: 'noopener',
+        title: 'Open this object in Query Explorer (filtered, centred + zoomed on map)',
+        style: { color: '#58a6ff', fontSize: '12px', textDecoration: 'none',
+                 marginLeft: '6px', padding: '0 5px', borderRadius: '3px',
+                 border: '1px solid #30363d', background: '#0d1117',
+                 lineHeight: '1.4', display: 'inline-block' } },
+        '↗');
+      qLink.addEventListener('click', (e) => { e.stopPropagation(); });
+    }
     return el('div', { class: 'cand', 'data-ref': c.obj_ref },
       el('div', null, c.obj_type + ' · ',
-        el('span', { class: 'meta' }, c.kind + ' · ' + (c.kg_code || '—') + aliasNote), agg),
+        el('span', { class: 'meta' }, c.kind + ' · ' + (c.kg_code || '—') + aliasNote), agg, qLink),
       el('div', { class: 'meta' }, meta.join(' · ') + ' · ' + fmtCoord(c.centroid_lon) + ',' + fmtCoord(c.centroid_lat))
     );
   }
@@ -384,28 +403,7 @@
     const title = res.status === 'no_object'
       ? 'No matching object found'
       : (res.status === 'ambiguous' ? 'Multiple candidates' : 'Matched object');
-    const titleRow = el('div', { class: 'row',
-      style: { justifyContent: 'space-between', alignItems: 'center', margin: '0 0 6px' } },
-      el('h4', { style: { margin: 0 } }, title));
-    // Build a query-explorer link for the top candidate, if any.
-    const top = (res.candidates && res.candidates[0]) || null;
-    if (top && (top.obj_ref || (top.centroid_lon != null && top.centroid_lat != null))) {
-      const params = new URLSearchParams();
-      if (top.obj_ref) params.set('obj_ref', top.obj_ref);
-      if (top.kg_code) params.set('kg', top.kg_code);
-      if (top.centroid_lon != null) params.set('lon', top.centroid_lon);
-      if (top.centroid_lat != null) params.set('lat', top.centroid_lat);
-      if (top.obj_type) params.set('type', top.obj_type);
-      const href = '/query.html?' + params.toString();
-      const link = el('a', { href: href, target: '_blank', rel: 'noopener',
-        title: 'Open this object in Query Explorer (filtered, centred + zoomed on map)',
-        style: { color: '#58a6ff', fontSize: '14px', textDecoration: 'none',
-                 padding: '2px 6px', borderRadius: '4px',
-                 border: '1px solid #30363d', background: '#0d1117' } },
-        '↗');
-      titleRow.appendChild(link);
-    }
-    wrap.appendChild(titleRow);
+    wrap.appendChild(el('h4', null, title));
     wrap.appendChild(el('div', { class: 'row' },
       el('span', { class: 'lb' }, 'Selected:'),
       el('span', { class: 'vl' }, '“' + (info.selectedText || '') + '”')));

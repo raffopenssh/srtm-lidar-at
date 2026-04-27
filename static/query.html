@@ -316,7 +316,32 @@ function extractItems(j) {
       raw: f, kind: 'feature', sev: 'low',
     }));
   }
-  if (Array.isArray(j.feedback)) {
+  if (j.object && j.object.obj_ref) {
+    // /api/v1/flags/object/<obj_ref> → single canonical object
+    const o = j.object;
+    const a = o.attrs || {};
+    const lon = o.centroid_lon != null ? o.centroid_lon : (a.coordinate||{}).lon;
+    const lat = o.centroid_lat != null ? o.centroid_lat : (a.coordinate||{}).lat;
+    const fcodes = (j.flags||[]).map(f => f.flag_code);
+    const sev = (j.flags||[]).reduce((s,f) => {
+      const R={critical:3,high:2,medium:1,low:0};
+      return (R[f.severity]||0) > (R[s]||0) ? f.severity : s;
+    }, null);
+    items.push({
+      id: 'obj-' + o.obj_ref, kg: o.kg_code, lon, lat,
+      type: o.obj_type, obj_ref: o.obj_ref,
+      height: o.height_max_m, area: o.area_sqm,
+      sev: sev || 'low',
+      flag_code: fcodes[0], flag_codes: fcodes,
+      message: a.classifier_source ? ('source=' + a.classifier_source
+        + (a.confidence!=null ? ' · conf=' + a.confidence.toFixed(2) : '')
+        + (a.phenology_class ? ' · ' + a.phenology_class : '')) : null,
+      title: (o.obj_type||'?') + ' · ' + (o.kg_code||'') + ' · ' + o.kind
+        + (o.height_max_m!=null ? ' · '+o.height_max_m.toFixed(1)+'m':''),
+      raw: o, kind: 'object',
+    });
+  }
+  if (Array.isArray(j.feedback) && !j.object) {
     j.feedback.forEach((fb, i) => items.push({
       id: 'fb-' + (fb.id||i), kg: fb.resolved_kg_code, lon: fb.point_lon, lat: fb.point_lat,
       title: fb.kind + ' → ' + (fb.corrected_type||fb.predicted_type||'?'),
@@ -576,21 +601,31 @@ function handleDeepLink() {
     return true;
   }
   if (objRef || (lat != null && lon != null)) {
-    document.getElementById('endpoint').value = '/api/v1/flags';
-    // /api/v1/flags only returns flagged objects, so a narrow obj_ref or
-    // tight bbox query often returns 0 (e.g. top_tree alias rows are not
-    // themselves flagged). We instead query by kg/type to show all flags
-    // in the same KG as context, drop a target marker at the deep-link
-    // location, and highlight the matching obj_ref row if present.
+    // Prefer the object endpoint — it returns the canonical object
+    // record + its flags + feedback regardless of whether anything
+    // currently flagged it. Falls back to a kg/type listing query.
+    let endpoint = '/api/v1/flags';
     const parts = [];
-    if (kg) parts.push('kg=' + encodeURIComponent(kg));
-    if (type) parts.push('type=' + encodeURIComponent(type));
-    if (!kg && objRef) parts.push('obj_ref=' + encodeURIComponent(objRef));
-    if (!kg && !objRef && lat != null && lon != null) {
-      const d = 0.0008;
-      parts.push('bbox=' + (lon-d) + ',' + (lat-d) + ',' + (lon+d) + ',' + (lat+d));
+    if (objRef) {
+      endpoint = '/api/v1/flags/object/' + encodeURIComponent(objRef);
+    } else {
+      if (kg) parts.push('kg=' + encodeURIComponent(kg));
+      if (type) parts.push('type=' + encodeURIComponent(type));
+      if (lat != null && lon != null) {
+        const d = 0.0008;
+        parts.push('bbox=' + (lon-d) + ',' + (lat-d) + ',' + (lon+d) + ',' + (lat+d));
+      }
+      parts.push('limit=200');
     }
-    parts.push('limit=200');
+    document.getElementById('endpoint').value = endpoint;
+    // If the endpoint isn't already in the dropdown, add it.
+    let opt = Array.from(document.querySelectorAll('#endpoint option')).find(o => o.value === endpoint);
+    if (!opt) {
+      opt = document.createElement('option');
+      opt.value = endpoint; opt.textContent = endpoint;
+      document.getElementById('endpoint').appendChild(opt);
+      document.getElementById('endpoint').value = endpoint;
+    }
     document.getElementById('params').value = parts.join('&');
     if (lat != null && lon != null) map.setView([lat, lon], 18);
     updateUrl();
@@ -609,7 +644,7 @@ function handleDeepLink() {
         // Re-centre + zoom in tight (overrides fitBounds in render()).
         setTimeout(() => map.setView([lat, lon], 18), 250);
       }
-      // Highlight the matching row by obj_ref.
+      // Auto-select the matching row.
       if (objRef) setTimeout(() => {
         const target = rowEls.find(r => (r.item.obj_ref === objRef) || (r.item.id && r.item.id.indexOf(objRef) >= 0));
         if (target) selectId(target.id, false);

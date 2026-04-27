@@ -743,6 +743,49 @@ nearest-neighbor ordering relative to the last completed KG.
 | Stale `progress.json` | Service died without cleanup | Restart clears stale state in `main()` init block |
 | Transient server error (500/503/timeout) | Remote service hiccup | Automatic: deferred retry 5 KGs later (up to 2×), then permanent fail |
 
+### Per-Parcel Compact Layout (`parcels.details[i]`)
+
+Storage at scale (1.6M parcels across 8000 KGs) means every byte counts.
+The processor writes per-parcel object highlights as compact arrays + a
+tiny FRaction Area Vector (frav). See `parcel_compact.py` for the schema.
+
+```
+parcel.frav        = { type_letter: area_sqm_int, ... }   always present when
+                                                          any segments hit
+parcel.top_objs[i] = [type_letter, hmax, hmean, area, lon, lat,
+                       conf, rf_conf, manmade_int]   (5 entries, ~60 B each)
+parcel.top_trees[i] = [hmax, hmean, hp90, area, lon, lat, ndvi_m, ndvi_f,
+                        hchg, phen, conf, rf_conf]    (5 entries, ~95 B each)
+```
+
+Letter mapping (lowercase = natural, uppercase = man-made):
+```
+t=tree s=shrub g=grass h=hedge w=water R=roof G=greenhouse P=solar_panel
+F=fence W=wall M=mast T=wind_turbine X=substation r=road p=path k=parking
+b=bridge c=crop o=orchard v=vineyard a=garden B=bare_soil K=rock
+E=excavation L=fill l=tree_loss C=construction e=earthwork u=unclassified
+```
+
+Legacy verbose forms (`top_10_objects`, `top_10_trees` per parcel) are
+still accepted by readers but no longer emitted. quality_flags emits
+`parcel_top_obj:<pid>:<i>` and `parcel_top_tree:<pid>:<i>` refs for both
+formats. The `frav` is what backfill_parcel_top10.py guarantees on every
+parcel — even tiny parcels with no per-segment top_objs.
+
+Backfill (after a code change that adds new per-parcel info):
+```bash
+# Run on a peer (so the bandwidth comes out of the peer's quota)
+curl -X POST https://srtm-lidar-at2.exe.xyz:8000/api/v1/admin/run_backfill \
+  -H 'Content-Type: application/json' -d '{"force": true}'
+curl https://srtm-lidar-at2.exe.xyz:8000/api/v1/admin/backfill_status
+```
+The script downloads each KG's light GPKG from Zenodo, joins
+`segment_points` to parcel polygons, validates the result, and replaces
+the JSON in place in the existing draft Zenodo deposition. The local
+manifest is updated atomically; primary then re-syncs via the peer-sync
+thread (which now compares uploaded_at vs local mtime to pick up
+rewrites).
+
 ### Per-KG Outputs
 
 1. **Full GPKG** (`{kg}_full.gpkg`): DTM/DSM/nDSM + ortho + segment_type rasters, segment vector polygons

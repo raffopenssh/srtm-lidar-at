@@ -2594,6 +2594,16 @@ def director_proxy_status():
     ps['_director'] = status
     ps['_active_peer_id'] = active_id
     ps['_active_peer_url'] = peer.get('url')
+    # Override DB totals with primary's authoritative DB (synced from all peers)
+    try:
+        _row = si.get_index()._conn().execute(
+            'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'
+        ).fetchone()
+        ps['db_processed'] = _row[0]
+        ps['db_parcels_total'] = int(_row[1] or 0)
+        ps['db_area_km2'] = round(float(_row[2] or 0), 2)
+    except Exception:
+        pass
     # Add bandwidth info
     bw = status.get('peers', [])
     for p in bw:

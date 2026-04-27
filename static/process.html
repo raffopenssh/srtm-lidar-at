@@ -851,7 +851,7 @@ function updateCards(d) {
   const _np = d.db_parcels_total || 0, _na = d.db_area_km2 || 0;
   if (_np || _na) {
     pdet += (pdet ? ' · ' : '') +
-      '<span style="opacity:0.75">' +
+      '<span style="opacity:0.75">TOTAL: ' +
       _np.toLocaleString() + ' parcels · ' +
       _na.toLocaleString(undefined,{maximumFractionDigits:0}) + ' km²</span>';
   }

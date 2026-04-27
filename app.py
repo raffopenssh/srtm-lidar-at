@@ -1926,6 +1926,40 @@ def _get_completed_kgs() -> set:
     return completed
 
 
+@app.route('/api/v1/processing/completed_recent')
+def processing_completed_recent():
+    """Return recently completed KGs in chronological order (most recent last).
+
+    Used by the dashboard to swipe through completed KGs.
+    """
+    data_dir = Path('data/austria_processor')
+    manifest_path = data_dir / 'zenodo_manifest.json'
+    items = []
+    if manifest_path.exists():
+        try:
+            m = json.loads(manifest_path.read_text())
+            entries = m.get('entries', m)
+            for key, val in entries.items():
+                if not key.endswith('_json'):
+                    continue
+                if 'error' in (val.get('status', '') or ''):
+                    continue
+                code = key[:-5]
+                ua = val.get('uploaded_at') or ''
+                items.append((ua, code))
+        except Exception:
+            pass
+    items.sort()
+    codes = [c for _, c in items]
+    try:
+        limit = int(request.args.get('limit', '500'))
+    except Exception:
+        limit = 500
+    if limit > 0 and len(codes) > limit:
+        codes = codes[-limit:]
+    return jsonify({'codes': codes, 'count': len(codes)})
+
+
 @app.route('/api/v1/processing/queue')
 def processing_queue_get():
     """Read the priority queue with KG names and failure counts."""

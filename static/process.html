@@ -425,6 +425,13 @@
 <div class="last-kg" id="lastKgCard" style="display:none">
   <div class="lb" style="display:flex;align-items:center;gap:10px;flex-wrap:nowrap">
     <span style="flex:1;min-width:0">Last Completed KG — <span id="lastKgName">—</span></span>
+    <span id="lastKgNav" style="display:none;align-items:center;gap:4px;font-size:11px;color:#8b949e;flex-shrink:0;user-select:none">
+      <button type="button" onclick="_navKg(-1)" title="Previous KG (← / swipe right)"
+        style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:1px 7px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1">◀</button>
+      <span id="lastKgNavPos" style="min-width:60px;text-align:center;font-variant-numeric:tabular-nums"></span>
+      <button type="button" onclick="_navKg(+1)" title="Next KG (→ / swipe left)"
+        style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:1px 7px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1">▶</button>
+    </span>
     <button id="lastKgFilterToggle" type="button"
       title="Tap to cycle severity: off → low → medium → high → off"
       aria-pressed="false"
@@ -1566,12 +1573,76 @@ async function poll() {
 
 // ── Last Completed KG ───────────────────────────────────────────
 let lastFetchedKg = null;
+let _completedKgs = [];           // chronological, most recent last
+let _viewedKgIdx = -1;            // index into _completedKgs being shown
+let _stickToLatest = true;        // when true, follow new completions
+
+async function _refreshCompletedKgs() {
+  try {
+    const r = await fetch('/api/v1/processing/completed_recent?limit=2000');
+    if (!r.ok) return;
+    const j = await r.json();
+    _completedKgs = j.codes || [];
+  } catch(e) { /* ignore */ }
+}
+
 function updateLastKg(d) {
   const code = d.last_kg_code;
-  if (!code || code === lastFetchedKg) return;
-  lastFetchedKg = code;
-  fetchKgJson(code);
+  if (!code) return;
+  // Keep our completed-list fresh when a new KG finishes.
+  if (code !== lastFetchedKg) {
+    lastFetchedKg = code;
+    _refreshCompletedKgs().then(() => {
+      if (_stickToLatest) {
+        _viewedKgIdx = _completedKgs.length - 1;
+        const c = _completedKgs[_viewedKgIdx] || code;
+        fetchKgJson(c);
+      }
+    });
+  }
 }
+
+function _navKg(delta) {
+  if (!_completedKgs.length) return;
+  if (_viewedKgIdx < 0) _viewedKgIdx = _completedKgs.length - 1;
+  const next = Math.max(0, Math.min(_completedKgs.length - 1, _viewedKgIdx + delta));
+  if (next === _viewedKgIdx) return;
+  _viewedKgIdx = next;
+  _stickToLatest = (_viewedKgIdx === _completedKgs.length - 1);
+  fetchKgJson(_completedKgs[_viewedKgIdx]);
+}
+
+// Swipe + arrow-key navigation on the Last KG card.
+(function wireLastKgNav(){
+  function attach() {
+    const card = document.getElementById('lastKgCard');
+    if (!card || card._navWired) return;
+    card._navWired = true;
+    let sx = 0, sy = 0, tracking = false;
+    card.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true;
+    }, { passive: true });
+    card.addEventListener('touchend', (e) => {
+      if (!tracking) return;
+      tracking = false;
+      const t = (e.changedTouches && e.changedTouches[0]) || null;
+      if (!t) return;
+      const dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+      _navKg(dx < 0 ? +1 : -1);  // swipe left → next, swipe right → previous
+    }, { passive: true });
+    document.addEventListener('keydown', (e) => {
+      if (card.style.display === 'none') return;
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      if (e.key === 'ArrowLeft') { _navKg(-1); }
+      else if (e.key === 'ArrowRight') { _navKg(+1); }
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else { attach(); }
+})();
 async function fetchKgJson(code) {
   try {
     const [r, fr] = await Promise.all([
@@ -1696,6 +1767,22 @@ function renderLastKg(js) {
   }
   document.getElementById('lastKgName').textContent =
     (js.kg_code || '?') + ' ' + (js.kg_name || '') + (js.state_name ? ' (' + js.state_name + ')' : '');
+  // Update swipe nav indicator
+  try {
+    const navEl = document.getElementById('lastKgNav');
+    const posEl = document.getElementById('lastKgNavPos');
+    if (navEl && posEl) {
+      const total = _completedKgs.length;
+      let idx = _viewedKgIdx;
+      if (idx < 0 && js.kg_code) idx = _completedKgs.lastIndexOf(js.kg_code);
+      if (total > 1 && idx >= 0) {
+        navEl.style.display = 'inline-flex';
+        posEl.textContent = (idx + 1) + ' / ' + total;
+      } else {
+        navEl.style.display = 'none';
+      }
+    }
+  } catch(e) { /* ignore */ }
 
   const g = document.getElementById('lastKgGrid');
   const items = [];

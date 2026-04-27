@@ -1201,10 +1201,12 @@ def processing_status():
         data['git_commit'] = _GIT_COMMIT
         # DB-sourced processed count (authoritative: counts all peers via Zenodo manifest sync)
         try:
-            _db_processed = si.get_index()._conn().execute(
-                'SELECT COUNT(*) FROM kg WHERE processed=1'
-            ).fetchone()[0]
-            data['db_processed'] = _db_processed
+            _row = si.get_index()._conn().execute(
+                'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'
+            ).fetchone()
+            data['db_processed'] = _row[0]
+            data['db_parcels_total'] = int(_row[1] or 0)
+            data['db_area_km2'] = round(float(_row[2] or 0), 2)
         except Exception:
             pass
         # Include persisted tile history for all completed/failed KGs

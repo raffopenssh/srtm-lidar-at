@@ -848,6 +848,13 @@ function updateCards(d) {
   if (d.failed > 0) pdet += '<span style="color:var(--red)">' + d.failed + ' failed</span> · ';
   if (d.current_kg) pdet += esc(d.current_kg.code) + ' ' + esc(d.current_kg.name || '');
   else if (d.last_kg_code) pdet += 'last: ' + d.last_kg_code;
+  const _np = d.db_parcels_total || 0, _na = d.db_area_km2 || 0;
+  if (_np || _na) {
+    pdet += (pdet ? ' · ' : '') +
+      '<span style="opacity:0.75">' +
+      _np.toLocaleString() + ' parcels · ' +
+      _na.toLocaleString(undefined,{maximumFractionDigits:0}) + ' km²</span>';
+  }
   document.getElementById('cProgDet').innerHTML = pdet || '—';
 
   // Failed KG tags in progress card

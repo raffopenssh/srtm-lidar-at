@@ -55,7 +55,7 @@ body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overf
 .legend .lg-dot{width:10px;height:10px;border-radius:50%;border:1px solid #fff}
 .url-display{padding:4px 12px;background:var(--bg);font-size:10.5px;color:var(--cyan);border-bottom:1px solid var(--border);overflow-x:auto;white-space:nowrap}
 .url-display a{color:var(--blue);text-decoration:none}
-.examples{display:none;max-height:50vh;overflow-y:auto;border-bottom:1px solid var(--border);background:var(--card)}
+.examples{display:none;max-height:min(50vh,50dvh);overflow-y:auto;border-bottom:1px solid var(--border);background:var(--card);overscroll-behavior:contain}
 .examples.open{display:block}
 .ex-search{position:sticky;top:0;background:var(--card);padding:6px 12px;border-bottom:1px solid var(--border);z-index:1}
 .ex-search input{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font:inherit}
@@ -563,6 +563,40 @@ document.getElementById('exBtn').addEventListener('click', () => {
   if (open && !EXAMPLES.length) loadExamples();
 });
 document.getElementById('exFilter').addEventListener('input', e => renderExamples(e.target.value));
+// On mobile, opening the soft keyboard shrinks the visual viewport and can
+// hide the filter input (body has overflow:hidden, so scrollIntoView is a
+// no-op). Float the examples panel as a fixed overlay anchored to the
+// visual viewport while the input is focused, so the keyboard never
+// covers it.
+(function() {
+  const panel = document.getElementById('examples');
+  const input = document.getElementById('exFilter');
+  const vv = window.visualViewport;
+  let active = false;
+  function applyVV() {
+    if (!active) return;
+    const h = (vv ? vv.height : window.innerHeight);
+    const top = (vv ? vv.offsetTop : 0);
+    panel.style.position = 'fixed';
+    panel.style.left = '0'; panel.style.right = '0';
+    panel.style.top = top + 'px';
+    panel.style.zIndex = '2000';
+    // Leave room for the on-screen keyboard.
+    panel.style.maxHeight = Math.max(160, h - 8) + 'px';
+  }
+  function clearVV() {
+    panel.style.position = '';
+    panel.style.left = panel.style.right = panel.style.top = '';
+    panel.style.zIndex = '';
+    panel.style.maxHeight = '';
+  }
+  input.addEventListener('focus', () => { active = true; applyVV(); });
+  input.addEventListener('blur', () => { active = false; clearVV(); });
+  if (vv) {
+    vv.addEventListener('resize', applyVV);
+    vv.addEventListener('scroll', applyVV);
+  }
+})();
 $('#endpoint').addEventListener('change', renderParamsDatalist);
 
 async function loadExamples() {

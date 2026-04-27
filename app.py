@@ -167,13 +167,38 @@ def _sync_peer_data():
 
                 peer_manifest = peer_data.get('manifest', {})
 
-                # Download KG JSONs we don't have
+                # Download KG JSONs we don't have, OR re-download when the
+                # peer's manifest entry is newer/larger than our local copy
+                # (e.g. after a backfill rewrite on a peer).
                 for key, entry in peer_manifest.items():
                     if not key.endswith('_json'):
                         continue
                     code = key.replace('_json', '')
                     local_path = json_dir / f'{code}.json'
+                    needs_dl = True
                     if local_path.exists():
+                        try:
+                            local_size = local_path.stat().st_size
+                            local_mtime = local_path.stat().st_mtime
+                            remote_size = int(entry.get('size') or 0)
+                            remote_ts = entry.get('uploaded_at') or ''
+                            # Compare mtime vs uploaded_at if both available
+                            from datetime import datetime as _dt2
+                            remote_mtime = 0.0
+                            if remote_ts:
+                                try:
+                                    remote_mtime = _dt2.fromisoformat(
+                                        remote_ts.replace('Z', '+00:00')).timestamp()
+                                except Exception:
+                                    pass
+                            # Skip only if local is up-to-date AND same size
+                            if remote_mtime and local_mtime >= remote_mtime - 5:
+                                needs_dl = False
+                            elif remote_size and abs(remote_size - local_size) < 32:
+                                needs_dl = False
+                        except Exception:
+                            pass
+                    if not needs_dl:
                         continue
 
                     # Construct download URL – prefer explicit link, then draft API, then bucket
@@ -196,8 +221,9 @@ def _sync_peer_data():
                                 f.write(chunk)
                         tmp_path.rename(local_path)
                         new_count += 1
-                        log.info('Peer sync: downloaded %s.json (%s bytes) from peer',
-                                 code, local_path.stat().st_size)
+                        action = 're-downloaded' if local_path.exists() else 'downloaded'
+                        log.info('Peer sync: %s %s.json (%s bytes) from peer',
+                                 action, code, local_path.stat().st_size)
                     except Exception as e:
                         # Clean up partial download
                         local_path.with_suffix('.tmp').unlink(missing_ok=True)

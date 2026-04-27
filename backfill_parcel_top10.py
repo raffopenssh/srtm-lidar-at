@@ -257,34 +257,39 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
         issues.append('0 parcels have top_10_objects after enrichment')
 
     # Parcels with substantial area_summary should have a top object.
+    # Use a generous threshold — segment_points are centroids of segments
+    # which may straddle parcel boundaries, so small parcels with rasterised
+    # area_summary won't always pick up a centroid.
     n_expected_obj = 0
     n_missing_obj = 0
     for p in pdetails:
         as_ = p.get('area_summary') or {}
         total_area = sum(v.get('area_sqm', 0) for v in as_.values())
-        if total_area >= 100:  # at least 100 m² of segments inside
+        if total_area >= 500 and (p.get('area_sqm') or 0) >= 1000:
             n_expected_obj += 1
             if not p.get('top_10_objects'):
                 n_missing_obj += 1
-    if n_expected_obj > 0 and n_missing_obj / n_expected_obj > 0.5:
+    if n_expected_obj > 10 and n_missing_obj / n_expected_obj > 0.5:
         issues.append(
-            f'{n_missing_obj}/{n_expected_obj} parcels with area_summary lack top_10_objects '
-            f'(>50%, likely spatial-join bug)'
+            f'{n_missing_obj}/{n_expected_obj} parcels with substantial area_summary '
+            f'lack top_10_objects (>50%, likely spatial-join bug)'
         )
 
-    # Forested parcels should have top_10_trees.
-    n_forested = 0
-    n_forested_no_trees = 0
+    # Tree-bearing parcels should have top_10_trees. Use area_summary['tree']
+    # specifically (forested_fraction also includes shrub).
+    n_tree_bearing = 0
+    n_tree_bearing_no_trees = 0
     for p in pdetails:
-        ff = p.get('forested_fraction') or 0
-        if ff > 0.2 and (p.get('area_sqm') or 0) > 1000:
-            n_forested += 1
+        as_ = p.get('area_summary') or {}
+        tree_area = (as_.get('tree') or {}).get('area_sqm', 0)
+        if tree_area > 200:  # at least 200 m² of tree segments
+            n_tree_bearing += 1
             if not p.get('top_10_trees'):
-                n_forested_no_trees += 1
-    if n_forested > 5 and n_forested_no_trees / n_forested > 0.3:
+                n_tree_bearing_no_trees += 1
+    if n_tree_bearing > 5 and n_tree_bearing_no_trees / n_tree_bearing > 0.3:
         issues.append(
-            f'{n_forested_no_trees}/{n_forested} forested parcels lack top_10_trees '
-            f'(>30%, suspicious)'
+            f'{n_tree_bearing_no_trees}/{n_tree_bearing} tree-bearing parcels lack top_10_trees '
+            f'(>30%, likely spatial-join bug)'
         )
 
     # Per-entry sanity bounds.

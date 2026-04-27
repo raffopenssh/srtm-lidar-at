@@ -2817,6 +2817,30 @@ def admin_run_backfill():
                     'args': args})
 
 
+@app.route('/api/v1/admin/backfill_kill', methods=['POST'])
+def admin_backfill_kill():
+    """Kill a running backfill subprocess."""
+    pid_path = Path('/tmp/backfill.pid')
+    if not pid_path.exists():
+        return jsonify({'status': 'not_running'})
+    try:
+        pid = int(pid_path.read_text().strip())
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            time.sleep(1)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, 9)  # SIGKILL
+            except OSError:
+                pass
+        except OSError:
+            pass
+        pid_path.unlink(missing_ok=True)
+        return jsonify({'status': 'killed', 'pid': pid})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/admin/backfill_status', methods=['GET'])
 def admin_backfill_status():
     """Return PID + tail of /tmp/backfill.log for the running/last backfill."""

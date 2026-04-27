@@ -577,23 +577,36 @@ function handleDeepLink() {
   }
   if (objRef || (lat != null && lon != null)) {
     document.getElementById('endpoint').value = '/api/v1/flags';
+    // /api/v1/flags only returns flagged objects, so a narrow obj_ref or
+    // tight bbox query often returns 0 (e.g. top_tree alias rows are not
+    // themselves flagged). We instead query by kg/type to show all flags
+    // in the same KG as context, drop a target marker at the deep-link
+    // location, and highlight the matching obj_ref row if present.
     const parts = [];
-    if (objRef) parts.push('obj_ref=' + encodeURIComponent(objRef));
-    else {
-      if (kg) parts.push('kg=' + encodeURIComponent(kg));
-      if (type) parts.push('type=' + encodeURIComponent(type));
-      if (lat != null && lon != null) {
-        const d = 0.0008;
-        parts.push('bbox=' + (lon-d) + ',' + (lat-d) + ',' + (lon+d) + ',' + (lat+d));
-      }
+    if (kg) parts.push('kg=' + encodeURIComponent(kg));
+    if (type) parts.push('type=' + encodeURIComponent(type));
+    if (!kg && objRef) parts.push('obj_ref=' + encodeURIComponent(objRef));
+    if (!kg && !objRef && lat != null && lon != null) {
+      const d = 0.0008;
+      parts.push('bbox=' + (lon-d) + ',' + (lat-d) + ',' + (lon+d) + ',' + (lat+d));
     }
     parts.push('limit=200');
     document.getElementById('params').value = parts.join('&');
     if (lat != null && lon != null) map.setView([lat, lon], 18);
     updateUrl();
     run().then(() => {
+      // Drop a prominent target marker at the deep-link location so the
+      // user always sees the actual object even when no flags match.
       if (lat != null && lon != null) {
-        // Re-centre after map.fitBounds in render(); zoom in tight.
+        const tgt = L.circleMarker([lat, lon], {
+          radius: 12, color: '#d29922', weight: 3,
+          fillColor: '#d29922', fillOpacity: 0.25,
+        }).addTo(markersGroup);
+        const popupHtml = '<b>' + (type || 'object') + '</b>'
+          + (objRef ? '<br><code>' + objRef + '</code>' : '')
+          + '<br>' + lat.toFixed(5) + ', ' + lon.toFixed(5);
+        tgt.bindPopup(popupHtml).openPopup();
+        // Re-centre + zoom in tight (overrides fitBounds in render()).
         setTimeout(() => map.setView([lat, lon], 18), 250);
       }
       // Highlight the matching row by obj_ref.

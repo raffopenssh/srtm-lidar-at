@@ -2763,6 +2763,90 @@ def admin_restart_processor():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/admin/run_backfill', methods=['POST'])
+def admin_run_backfill():
+    """Run the per-parcel top10 backfill in a detached background process.
+
+    POST body (JSON, optional):
+        {"kg": "49006-south"}     # only this KG
+        {"dry_run": true}            # validate without uploading
+        {"no_upload": true}          # write JSON locally but skip Zenodo
+        {"force": true}              # re-run even if parcels already enriched
+        {"allow_warnings": true}     # upload despite validation issues
+
+    Designed to be invoked from the primary against a peer (e.g. at2) so
+    backfill bandwidth doesn't come out of the primary's monthly quota.
+    """
+    import subprocess as sp
+    body = request.get_json(silent=True) or {}
+    args = ['python3', '-u', 'backfill_parcel_top10.py']
+    if body.get('kg'):
+        args += ['--kg', str(body['kg'])]
+    if body.get('dry_run'):
+        args.append('--dry-run')
+    if body.get('no_upload'):
+        args.append('--no-upload')
+    if body.get('force'):
+        args.append('--force')
+    if body.get('allow_warnings'):
+        args.append('--allow-warnings')
+    log_path = Path('/tmp/backfill.log')
+    pid_path = Path('/tmp/backfill.pid')
+    if pid_path.exists():
+        try:
+            old_pid = int(pid_path.read_text().strip())
+            try:
+                os.kill(old_pid, 0)
+                return jsonify({'status': 'already_running', 'pid': old_pid,
+                                'log': str(log_path)}), 409
+            except OSError:
+                pid_path.unlink()  # stale
+        except Exception:
+            pid_path.unlink(missing_ok=True)
+    import datetime as _dt
+    log_fp = open(log_path, 'a')
+    log_fp.write(f'\n=== {_dt.datetime.now(_dt.timezone.utc).isoformat()} starting: {" ".join(args)} ===\n')
+    log_fp.flush()
+    p = sp.Popen(
+        args, cwd=str(Path(__file__).parent),
+        stdout=log_fp, stderr=sp.STDOUT,
+        start_new_session=True,  # detach from gunicorn worker
+    )
+    pid_path.write_text(str(p.pid))
+    return jsonify({'status': 'started', 'pid': p.pid, 'log': str(log_path),
+                    'args': args})
+
+
+@app.route('/api/v1/admin/backfill_status', methods=['GET'])
+def admin_backfill_status():
+    """Return PID + tail of /tmp/backfill.log for the running/last backfill."""
+    pid_path = Path('/tmp/backfill.pid')
+    log_path = Path('/tmp/backfill.log')
+    running = False
+    pid = None
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                running = True
+            except OSError:
+                running = False
+        except Exception:
+            pass
+    tail = ''
+    if log_path.exists():
+        try:
+            with open(log_path, 'rb') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 32_000))
+                tail = f.read().decode('utf-8', errors='replace')
+        except Exception as e:
+            tail = f'(log read failed: {e})'
+    return jsonify({'running': running, 'pid': pid, 'log_tail': tail})
+
+
 @app.route('/api/v1/admin/disable_autostart', methods=['POST'])
 def admin_disable_autostart():
     """Disable austria_processor systemd auto-start.

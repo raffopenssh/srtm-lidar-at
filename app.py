@@ -1199,6 +1199,14 @@ def processing_status():
         except Exception:
             pass
         data['git_commit'] = _GIT_COMMIT
+        # DB-sourced processed count (authoritative: counts all peers via Zenodo manifest sync)
+        try:
+            _db_processed = si.get_index()._conn().execute(
+                'SELECT COUNT(*) FROM kg WHERE processed=1'
+            ).fetchone()[0]
+            data['db_processed'] = _db_processed
+        except Exception:
+            pass
         # Include persisted tile history for all completed/failed KGs
         try:
             th_path = Path('data/austria_processor/tile_history.json')
@@ -1938,8 +1946,36 @@ def processing_queue_get():
         _m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
         if _m:
             tombstoned_kgs.add(_m.group(1))
+    # Build a set of "effectively completed" codes — includes parent codes whose
+    # all blocks are done (e.g. '49006' when '49006-south/center/north' are done).
+    from kg_splitter import is_block_code, maybe_split_kg, all_block_codes_for_parent
+    try:
+        idx = si.get_index()
+        _conn = idx._conn()
+        def _parent_fully_done(code: str) -> bool:
+            if is_block_code(code):
+                return False  # block codes checked directly
+            row = _conn.execute(
+                'SELECT min_lon, min_lat, max_lon, max_lat, kg_name FROM kg WHERE kg_code=?',
+                (code,)
+            ).fetchone()
+            if not row or row['min_lon'] is None:
+                return False
+            fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
+                       'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
+                                'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
+            blocks = maybe_split_kg(fake_kg)
+            if len(blocks) <= 1:
+                return False  # not a split KG
+            done = all_block_codes_for_parent(code, completed)
+            return len(done) >= len(blocks)
+    except Exception:
+        def _parent_fully_done(code: str) -> bool:
+            return False
+
     dirty = len(codes)
-    codes = [c for c in codes if c not in completed or c in tombstoned_kgs]
+    codes = [c for c in codes if
+             (c not in completed and not _parent_fully_done(c)) or c in tombstoned_kgs]
     if len(codes) < dirty:
         # Persist the cleaned list
         try:

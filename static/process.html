@@ -956,7 +956,9 @@ function updateSubtitle(d) {
   let dirInfo = '';
   if (_directorData) {
     const dd = _directorData;
-    const totalDone = (dd.peers||[]).reduce((s,p) => s + (p.completed||0), 0);
+    // Use DB-sourced count (authoritative across all peers) if available, else sum peer counters
+    const dbProcessed = d.db_processed;
+    const totalDone = dbProcessed != null ? dbProcessed : (dd.peers||[]).reduce((s,p) => s + (p.completed||0), 0);
     const activeId = dd.active_peer;
     const activeBw = activeId ? ((dd.peers||[]).find(p=>p.id===activeId)||{}).bandwidth||{} : {};
     dirInfo = ' · <b>' + totalDone + '</b>/8440 combined';
@@ -1536,6 +1538,7 @@ async function poll() {
     const r = await fetch(apiUrl);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    _lastStatus = d;
     updateSubtitle(d);
     updateCards(d);
     updateKgCard(d);
@@ -2254,6 +2257,7 @@ async function savePrioQueue() {
 let _peerData = null;
 let _directorData = null;
 let _localCommit = '';  // local git commit from polling status
+let _lastStatus = null;  // last /api/v1/processing/status response
 
 async function fetchDirectorStatus() {
   try {
@@ -2268,7 +2272,10 @@ function renderDirector(d) {
   const mode = d.mode || 'auto';
   const active = d.active_peer;
   const peers = d.peers || [];
-  const totalCompleted = peers.reduce((s,p) => s + (p.completed||0), 0);
+  // Prefer DB-sourced count (from _lastStatus); fall back to summing peer counters
+  const totalCompleted = (_lastStatus && _lastStatus.db_processed != null)
+    ? _lastStatus.db_processed
+    : peers.reduce((s,p) => s + (p.completed||0), 0);
 
   // Summary line
   const modeIcons = {auto: '\u{1f7e2}', manual: '\u{1f7e0}', paused: '\u{1f534}'};

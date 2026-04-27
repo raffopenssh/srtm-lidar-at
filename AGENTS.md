@@ -26,6 +26,8 @@ ESA WorldCover, Sentinel-1 SAR, Austrian Cadastre). Segments landscape into
 |------|------:|----------|
 | `app.py` | ~5900 | Flask API — all endpoints, async task system, progress tracking, director API |
 | `static/index.html` | ~3100 | Single-file Leaflet UI (all JS/CSS inline) |
+| `static/query.html` | ~600 | Query Explorer — split-pane UI over `/api/v1/flags`, `/query`, `/query/parcels`, `/query/compound`, `/query/nature`, `/feedback`. Examples panel auto-parses `/api/v1/docs/llm.txt` (~90 curl examples) → grouped browseable list + datalist autocomplete. Deep-link `?obj_ref=&kg=&lon=&lat=&type=` (or `?endpoint=&params=`) pre-filters + centres + zooms the map; row auto-highlighted on load. |
+| `static/flag.js` | ~620 | Flag widget — text-selection chip → matches a snippet to an object via `/api/v1/flags/match`, shows candidates + flags + feedback form. The popover header has an ↗ icon linking to `/query.html` with the matched obj_ref pre-filtered. `SrtmFlag.install()` / `SrtmFlag.openFor({obj_ref})`. |
 | `object_segmentation.py` | ~2200 | Main analysis pipeline: Felzenszwalb+RAG → per-object classify |
 | `learned_classifier.py` | ~560 | Random Forest classifier (44 features, cadastre-trained) |
 | `peer_director.py` | ~770 | Peer Director — orchestrates processing across multiple VMs (see section below) |

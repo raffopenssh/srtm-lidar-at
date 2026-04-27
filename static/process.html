@@ -424,16 +424,8 @@
 <!-- Last Completed KG Summary -->
 <div class="last-kg" id="lastKgCard" style="display:none">
   <div class="lb" style="display:flex;flex-direction:column;align-items:stretch;gap:6px">
-    <span style="min-width:0">Last Completed KG — <span id="lastKgName">—</span></span>
-   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-    <span id="lastKgNav" style="display:none;align-items:center;gap:4px;font-size:11px;color:#8b949e;user-select:none">
-      <button type="button" onclick="_navKg(-1)" title="Previous KG (← / swipe right)"
-        style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:1px 9px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.6">◀</button>
-      <span id="lastKgNavPos" style="min-width:60px;text-align:center;font-variant-numeric:tabular-nums"></span>
-      <button type="button" onclick="_navKg(+1)" title="Next KG (→ / swipe left)"
-        style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:1px 9px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.6">▶</button>
-    </span>
-    <span style="flex:1"></span>
+   <div style="display:flex;align-items:center;gap:10px;flex-wrap:nowrap">
+    <span style="flex:1;min-width:0">Last Completed KG — <span id="lastKgName">—</span></span>
     <button id="lastKgFilterToggle" type="button"
       title="Tap to cycle severity: off → low → medium → high → off"
       aria-pressed="false"
@@ -442,6 +434,13 @@
       border-radius:11px;background:transparent;user-select:none;font-family:inherit">
       <span id="lastKgFilterIcon" style="font-size:13px;letter-spacing:1px;line-height:1">⚐</span><span id="lastKgFilterLabel">0</span>
     </button>
+   </div>
+   <div id="lastKgNav" style="display:none;align-items:center;justify-content:center;gap:10px;font-size:11px;color:#8b949e;user-select:none">
+    <button type="button" onclick="_navKg(-1)" title="Previous KG (← / swipe right)"
+      style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:2px 14px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.6">◀</button>
+    <span id="lastKgNavPos" style="min-width:64px;text-align:center;font-variant-numeric:tabular-nums"></span>
+    <button type="button" onclick="_navKg(+1)" title="Next KG (→ / swipe left)"
+      style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:2px 14px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.6">▶</button>
    </div>
   </div>
   <div class="last-kg-grid" id="lastKgGrid"></div>
@@ -1789,7 +1788,7 @@ function renderLastKg(js) {
       let idx = _viewedKgIdx;
       if (idx < 0 && js.kg_code) idx = _completedKgs.lastIndexOf(js.kg_code);
       if (total > 1 && idx >= 0) {
-        navEl.style.display = 'inline-flex';
+        navEl.style.display = 'flex';
         posEl.textContent = (idx + 1) + ' / ' + total;
       } else {
         navEl.style.display = 'none';

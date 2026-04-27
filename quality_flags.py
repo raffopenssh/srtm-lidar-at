@@ -249,7 +249,43 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
             'confidence': cls.get('mean_confidence'),
             'attrs': p,
         }
-        # 7a) Per-parcel top objects/trees — flagged independently of KG-wide top_10
+        # 7a) Per-parcel top objects/trees — flagged independently of KG-wide top_10.
+        # Both compact (`top_objs` array form) and verbose (`top_10_objects`
+        # dict form) layouts are supported for backward compatibility.
+        try:
+            from parcel_compact import decode_top_obj, decode_top_tree
+        except ImportError:
+            decode_top_obj = decode_top_tree = lambda x: x
+        # Compact arrays (preferred, written by austria_processor v2026-04+)
+        for i, raw in enumerate(p.get('top_objs') or []):
+            o = decode_top_obj(raw)
+            yield {
+                'obj_ref': f'{kg}:parcel_top_obj:{pid}:{i}',
+                'kg_code': kg, 'kind': 'parcel_top_obj',
+                'obj_type': o.get('type'),
+                'centroid_lon': o.get('lon'), 'centroid_lat': o.get('lat'),
+                'area_sqm': o.get('area_sqm'),
+                'height_max_m': o.get('height_max_m'),
+                'height_mean_m': o.get('height_mean_m'),
+                'rf_confidence': o.get('rf_confidence'),
+                'confidence': o.get('confidence'),
+                'attrs': o,
+            }
+        for i, raw in enumerate(p.get('top_trees') or []):
+            t = decode_top_tree(raw)
+            yield {
+                'obj_ref': f'{kg}:parcel_top_tree:{pid}:{i}',
+                'kg_code': kg, 'kind': 'parcel_top_tree',
+                'obj_type': 'tree',
+                'centroid_lon': t.get('lon'), 'centroid_lat': t.get('lat'),
+                'area_sqm': t.get('area_sqm'),
+                'height_max_m': t.get('height_m'),
+                'height_mean_m': t.get('canopy_height_m'),
+                'rf_confidence': t.get('rf_confidence'),
+                'confidence': t.get('confidence'),
+                'attrs': t,
+            }
+        # Verbose form (legacy)
         for i, o in enumerate(p.get('top_10_objects') or []):
             coord_o = o.get('coordinate') or {}
             yield {

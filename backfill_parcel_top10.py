@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from zenodo_client import Client, Manifest, DEFAULT_TOKEN, landscape_metadata  # noqa: E402
+from parcel_compact import TYPE_LETTER, TOP_N  # noqa: E402
 
 log = logging.getLogger('backfill')
 logging.basicConfig(
@@ -48,8 +49,7 @@ MANIFEST_PATH = ROOT / 'data' / 'austria_processor' / 'zenodo_manifest.json'
 
 GPKG_CACHE.mkdir(parents=True, exist_ok=True)
 
-# How many top items to emit per parcel (matches KG-level count for symmetry).
-TOP_N = 10
+# Per-parcel top item count is fixed in parcel_compact.TOP_N (5).
 
 
 def _download_light_gpkg(manifest: dict, kg_code: str) -> Path | None:
@@ -130,39 +130,41 @@ def _load_segment_points_and_parcels(gpkg_path: Path):
     return seg_records, parcels
 
 
-def _seg_to_top_obj_entry(s: dict, obs_year: int) -> dict:
-    """Convert a segment_points record to a top_10_objects entry."""
-    return {
-        'type': s.get('type'),
-        'height_max_m': round(float(s.get('height_max_m') or 0), 2),
-        'height_mean_m': round(float(s.get('height_mean_m') or 0), 2),
-        'area_sqm': round(float(s.get('area_sqm') or 0), 1),
-        'coordinate': {'lon': round(float(s['_lon']), 7), 'lat': round(float(s['_lat']), 7)},
-        'confidence': round(float(s.get('confidence') or 0), 3),
-        'rf_type': s.get('rf_type', '') or '',
-        'rf_confidence': round(float(s.get('rf_confidence') or 0), 3),
-        'is_manmade': bool(s.get('is_manmade') or 0),
-        'observation_year': obs_year,
-    }
+def _seg_to_top_obj_compact(s: dict) -> list:
+    """Convert a segment_points record to a compact top_objs array entry.
+
+    Format mirrors parcel_compact.TOP_OBJS_KEYS.
+    """
+    otype = s.get('type') or ''
+    return [
+        TYPE_LETTER.get(otype, '?'),
+        round(float(s.get('height_max_m') or 0), 1),
+        round(float(s.get('height_mean_m') or 0), 1),
+        int(float(s.get('area_sqm') or 0)),
+        round(float(s['_lon']), 7),
+        round(float(s['_lat']), 7),
+        round(float(s.get('confidence') or 0), 2),
+        round(float(s.get('rf_confidence') or 0), 2),
+        1 if s.get('is_manmade') else 0,
+    ]
 
 
-def _seg_to_top_tree_entry(s: dict, obs_year: int) -> dict:
-    """Convert a segment_points record (type='tree') to a top_10_trees entry."""
-    return {
-        'height_m': round(float(s.get('height_max_m') or 0), 2),
-        'canopy_height_m': round(float(s.get('height_mean_m') or 0), 2),
-        'height_p90_m': round(float(s.get('height_p90_m') or 0), 2),
-        'coordinate': {'lon': round(float(s['_lon']), 7), 'lat': round(float(s['_lat']), 7)},
-        'area_sqm': round(float(s.get('area_sqm') or 0), 1),
-        'ndvi_mean': round(float(s.get('ndvi_mean') or 0), 4),
-        'ndvi_fused': round(float(s.get('ndvi_fused') or 0), 4),
-        'height_change_m': round(float(s.get('height_change_m') or 0), 3),
-        'phenology_class': s.get('phenology_class', '') or '',
-        'observation_year': obs_year,
-        'confidence': round(float(s.get('confidence') or 0), 3),
-        'rf_type': s.get('rf_type', '') or '',
-        'rf_confidence': round(float(s.get('rf_confidence') or 0), 3),
-    }
+def _seg_to_top_tree_compact(s: dict) -> list:
+    """Convert a tree segment_points record to a compact top_trees array entry."""
+    return [
+        round(float(s.get('height_max_m') or 0), 1),
+        round(float(s.get('height_mean_m') or 0), 1),
+        round(float(s.get('height_p90_m') or 0), 1),
+        int(float(s.get('area_sqm') or 0)),
+        round(float(s['_lon']), 7),
+        round(float(s['_lat']), 7),
+        round(float(s.get('ndvi_mean') or 0), 3),
+        round(float(s.get('ndvi_fused') or 0), 3),
+        round(float(s.get('height_change_m') or 0), 2),
+        s.get('phenology_class', '') or '',
+        round(float(s.get('confidence') or 0), 2),
+        round(float(s.get('rf_confidence') or 0), 2),
+    ]
 
 
 def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
@@ -201,11 +203,37 @@ def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
             continue
 
     enriched = 0
+    n_frav = 0
     for pd in pdetails:
         pid = pd.get('parcel_id', '')
         segs = by_parcel.get(pid, [])
         if not segs:
+            # No segment-points fell inside the parcel — still try to
+            # synthesise a frav from any pre-existing area_summary so
+            # the parcel becomes queryable.
+            as_ = pd.get('area_summary') or {}
+            if as_:
+                frav = {TYPE_LETTER.get(t, '?'): int(info.get('area_sqm', 0))
+                        for t, info in as_.items() if info.get('area_sqm', 0) > 0}
+                if frav:
+                    pd['frav'] = frav
+                    n_frav += 1
             continue
+        # frav: prefer rasterised area_summary (more accurate); else aggregate segments.
+        as_ = pd.get('area_summary') or {}
+        if as_:
+            frav = {TYPE_LETTER.get(t, '?'): int(info.get('area_sqm', 0))
+                    for t, info in as_.items() if info.get('area_sqm', 0) > 0}
+        else:
+            agg = {}
+            for s in segs:
+                otype = s.get('type') or ''
+                k = TYPE_LETTER.get(otype, '?')
+                agg[k] = agg.get(k, 0) + int(float(s.get('area_sqm') or 0))
+            frav = {k: v for k, v in agg.items() if v > 0}
+        if frav:
+            pd['frav'] = frav
+            n_frav += 1
         # top objects by height_max
         top_objs = sorted(
             segs,
@@ -213,7 +241,7 @@ def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
             reverse=True,
         )[:TOP_N]
         if top_objs:
-            pd['top_10_objects'] = [_seg_to_top_obj_entry(s, obs_year) for s in top_objs]
+            pd['top_objs'] = [_seg_to_top_obj_compact(s) for s in top_objs]
         trees = [s for s in segs if (s.get('type') == 'tree')]
         if trees:
             top_trees = sorted(
@@ -221,8 +249,12 @@ def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
                 key=lambda r: float(r.get('height_max_m') or 0),
                 reverse=True,
             )[:TOP_N]
-            pd['top_10_trees'] = [_seg_to_top_tree_entry(s, obs_year) for s in top_trees]
+            pd['top_trees'] = [_seg_to_top_tree_compact(s) for s in top_trees]
+        # Drop any legacy verbose form from a prior backfill run.
+        pd.pop('top_10_objects', None)
+        pd.pop('top_10_trees', None)
         enriched += 1
+    log.info('  enriched %d parcels with top items, %d with frav', enriched, n_frav)
     return enriched
 
 
@@ -251,10 +283,13 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
         if k not in js:
             issues.append(f'top-level field missing: {k}')
 
-    n_with_obj = sum(1 for p in pdetails if p.get('top_10_objects'))
-    n_with_tree = sum(1 for p in pdetails if p.get('top_10_trees'))
+    n_with_obj = sum(1 for p in pdetails if p.get('top_objs') or p.get('top_10_objects'))
+    n_with_tree = sum(1 for p in pdetails if p.get('top_trees') or p.get('top_10_trees'))
+    n_with_frav = sum(1 for p in pdetails if p.get('frav'))
     if n_with_obj == 0:
-        issues.append('0 parcels have top_10_objects after enrichment')
+        issues.append('0 parcels have top_objs after enrichment')
+    if n_with_frav == 0:
+        issues.append('0 parcels have frav after enrichment')
 
     # Parcels with substantial area_summary should have a top object.
     # Use a generous threshold — segment_points are centroids of segments
@@ -267,7 +302,7 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
         total_area = sum(v.get('area_sqm', 0) for v in as_.values())
         if total_area >= 500 and (p.get('area_sqm') or 0) >= 1000:
             n_expected_obj += 1
-            if not p.get('top_10_objects'):
+            if not (p.get('top_objs') or p.get('top_10_objects')):
                 n_missing_obj += 1
     if n_expected_obj > 10 and n_missing_obj / n_expected_obj > 0.5:
         issues.append(
@@ -284,7 +319,7 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
         tree_area = (as_.get('tree') or {}).get('area_sqm', 0)
         if tree_area > 200:  # at least 200 m² of tree segments
             n_tree_bearing += 1
-            if not p.get('top_10_trees'):
+            if not (p.get('top_trees') or p.get('top_10_trees')):
                 n_tree_bearing_no_trees += 1
     if n_tree_bearing > 5 and n_tree_bearing_no_trees / n_tree_bearing > 0.3:
         issues.append(
@@ -292,12 +327,27 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
             f'(>30%, likely spatial-join bug)'
         )
 
-    # Per-entry sanity bounds.
+    # Per-entry sanity bounds. Compact entries are positional arrays.
     bad_entries = 0
     for p in pdetails:
+        for raw in (p.get('top_objs') or []):
+            if isinstance(raw, list):
+                h = raw[1] if len(raw) > 1 else 0
+                a = raw[3] if len(raw) > 3 else 0
+            else:
+                h = raw.get('height_max_m', 0); a = raw.get('area_sqm', 0)
+            if (h or 0) < 0 or (h or 0) > 200 or (a or 0) < 0:
+                bad_entries += 1
+        for raw in (p.get('top_trees') or []):
+            if isinstance(raw, list):
+                h = raw[0] if raw else 0
+            else:
+                h = raw.get('height_m', 0)
+            if (h or 0) < 0 or (h or 0) > 100:
+                bad_entries += 1
+        # Legacy verbose form
         for o in (p.get('top_10_objects') or []):
-            h = o.get('height_max_m') or 0
-            a = o.get('area_sqm') or 0
+            h = o.get('height_max_m') or 0; a = o.get('area_sqm') or 0
             if h < 0 or h > 200 or a < 0:
                 bad_entries += 1
         for t in (p.get('top_10_trees') or []):
@@ -311,6 +361,10 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
     kg_top_trees = js.get('top_10_trees') or []
     parcel_max_tree = 0.0
     for p in pdetails:
+        for raw in (p.get('top_trees') or []):
+            h = raw[0] if isinstance(raw, list) and raw else (raw.get('height_m', 0) or 0)
+            if h and h > parcel_max_tree:
+                parcel_max_tree = h
         for t in (p.get('top_10_trees') or []):
             h = t.get('height_m') or 0
             if h > parcel_max_tree:
@@ -323,9 +377,9 @@ def _validate_enriched_json(js: dict, kg_code: str) -> tuple[bool, list[str]]:
                 f'parcel tree height {parcel_max_tree:.1f}m exceeds KG max {kg_max:.1f}m'
             )
 
-    log.info('  validation: %d/%d w/objs, %d/%d w/trees, %d expected-obj missing, %d bad entries',
+    log.info('  validation: %d/%d w/objs, %d/%d w/trees, %d/%d w/frav, %d expected-obj missing, %d bad',
              n_with_obj, len(pdetails), n_with_tree, len(pdetails),
-             n_missing_obj, bad_entries)
+             n_with_frav, len(pdetails), n_missing_obj, bad_entries)
 
     # Hard-fail if any issue.
     return (len(issues) == 0), issues
@@ -421,8 +475,8 @@ def main() -> int:
             log.info('%s: no parcels.details — skipping', kg_code)
             n_skipped += 1
             continue
-        if not args.force and any(p.get('top_10_objects') for p in pdetails):
-            log.info('%s: already has per-parcel top_10_objects — skipping (use --force to override)', kg_code)
+        if not args.force and any((p.get('top_objs') or p.get('top_10_objects')) and p.get('frav') for p in pdetails):
+            log.info('%s: already has per-parcel top_objs+frav — skipping (use --force to override)', kg_code)
             n_skipped += 1
             continue
 

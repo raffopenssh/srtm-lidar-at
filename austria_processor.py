@@ -4688,63 +4688,91 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         pd['classification'] = cls
         except Exception as e:
             log.warning("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
-        # --- Per-parcel top_10_objects / top_10_trees ---
+        # --- Per-parcel top objects / top trees + compact fraction vector ---
         # The KG-level top_10 lists only surface 10 entries across the whole KG;
         # for a 4750ha KG with 130+ parcels and 85k trees, that's far too coarse
         # for parcel-scale filtering. Emit per-parcel highlights from the same
         # objects already assigned via STRtree (or via _parcel_segment_stats).
+        #
+        # Storage budget: at scale (8440 KGs × 200-500 parcels each) every
+        # extra byte/parcel matters. Use compact array form, top-5 only,
+        # and a tiny `frav` (FRaction Area Vector keyed by short type letters)
+        # so even parcels with no objects get something queryable.
+        #
+        # Format: top_objs[i] = [type_letter, hmax, hmean, area, lon, lat,
+        #                        conf, rf_conf, manmade_flag]
+        #         top_trees[i] = [hmax, hmean, h_p90, area, lon, lat,
+        #                          ndvi_mean, ndvi_fused, hchg, phen, conf, rf_conf]
+        #         frav = {"t": area_sqm, "c": area_sqm, ...}  (rounded ints)
+        # See _PARCEL_TOP_OBJ_KEYS / _PARCEL_TOP_TREE_KEYS below in app.py
+        # query layer (via static/process.html) for decoding.
+        from parcel_compact import TYPE_LETTER, TOP_N
         try:
             p_idx = _parcel_idx_by_id[id(p)]
             p_objs = _parcel_obj_map.get(p_idx, [])
+            # Compact frav from area_summary (or from p_objs if no raster summary)
+            as_ = pd.get('area_summary') or {}
+            if as_:
+                frav = {}
+                for t, info in as_.items():
+                    letter = TYPE_LETTER.get(t, '?')
+                    frav[letter] = int(info.get('area_sqm', 0))
+                if frav:
+                    pd['frav'] = frav
+            elif p_objs:
+                tc_f = Counter()
+                for obj in p_objs:
+                    tc_f[obj.obj_type] += int(obj.area_sqm)
+                frav = {TYPE_LETTER.get(t, '?'): a for t, a in tc_f.items() if a > 0}
+                if frav:
+                    pd['frav'] = frav
             if p_objs:
                 p_top_obj = []
-                for o in sorted(p_objs, key=lambda o: o.height_max, reverse=True)[:10]:
-                    c = None
+                for o in sorted(p_objs, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
+                    lon = lat = None
                     try:
                         lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
-                        c = {"lon": round(lon,7), "lat": round(lat,7)}
-                    except Exception: pass
-                    p_top_obj.append({
-                        "type": o.obj_type,
-                        "height_max_m": round(o.height_max,2),
-                        "height_mean_m": round(o.height_mean,2),
-                        "area_sqm": round(o.area_sqm,1),
-                        "coordinate": c,
-                        "confidence": round(o.confidence,3),
-                        "rf_type": getattr(o, 'rf_type', ''),
-                        "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
-                        "is_manmade": o.is_manmade,
-                        "observation_year": obs_year,
-                    })
+                        lon, lat = round(lon, 7), round(lat, 7)
+                    except Exception:
+                        pass
+                    p_top_obj.append([
+                        TYPE_LETTER.get(o.obj_type, '?'),
+                        round(o.height_max, 1),
+                        round(o.height_mean, 1),
+                        int(o.area_sqm),
+                        lon, lat,
+                        round(o.confidence, 2),
+                        round(getattr(o, 'rf_confidence', 0.0), 2),
+                        1 if o.is_manmade else 0,
+                    ])
                 if p_top_obj:
-                    pd["top_10_objects"] = p_top_obj
+                    pd['top_objs'] = p_top_obj
                 p_trees = [o for o in p_objs if o.obj_type == 'tree']
                 if p_trees:
                     p_top_tree = []
-                    for t in sorted(p_trees, key=lambda o: o.height_max, reverse=True)[:10]:
-                        c = None
+                    for t in sorted(p_trees, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
+                        lon = lat = None
                         try:
                             lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
-                            c = {"lon": round(lon,7), "lat": round(lat,7)}
-                        except Exception: pass
-                        p_top_tree.append({
-                            "height_m": round(t.height_max,2),
-                            "canopy_height_m": round(t.height_mean,2),
-                            "height_p90_m": round(t.height_p90,2),
-                            "coordinate": c,
-                            "area_sqm": round(t.area_sqm,1),
-                            "ndvi_mean": round(t.ndvi_mean,4),
-                            "ndvi_fused": round(t.ndvi_fused,4),
-                            "height_change_m": round(t.height_change,3),
-                            "phenology_class": t.phenology_class or '',
-                            "observation_year": obs_year,
-                            "confidence": round(t.confidence,3),
-                            "rf_type": getattr(t, 'rf_type', ''),
-                            "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3),
-                        })
-                    pd["top_10_trees"] = p_top_tree
+                            lon, lat = round(lon, 7), round(lat, 7)
+                        except Exception:
+                            pass
+                        p_top_tree.append([
+                            round(t.height_max, 1),
+                            round(t.height_mean, 1),
+                            round(t.height_p90, 1),
+                            int(t.area_sqm),
+                            lon, lat,
+                            round(t.ndvi_mean, 3),
+                            round(t.ndvi_fused, 3),
+                            round(t.height_change, 2),
+                            t.phenology_class or '',
+                            round(t.confidence, 2),
+                            round(getattr(t, 'rf_confidence', 0.0), 2),
+                        ])
+                    pd['top_trees'] = p_top_tree
         except Exception as e:
-            log.debug("JSON: per-parcel top10 failed for %s: %s", p.get("parcel_id"), e)
+            log.debug("JSON: per-parcel top items failed for %s: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
     if n_parcel_no_tile > 0:
         log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",

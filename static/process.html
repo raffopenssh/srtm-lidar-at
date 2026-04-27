@@ -1784,11 +1784,20 @@ function renderLastKg(js) {
       js.top_by_type = out;
     }
     // Per-parcel highlights too (parcel_top_obj/parcel_top_tree refs).
+    // Supports both compact (top_objs/top_trees) and verbose (top_10_*) layouts.
     if (js.parcels && js.parcels.details) {
       js.parcels = Object.assign({}, js.parcels, {
         details: js.parcels.details.map(p => {
           const pid = p.parcel_id || '';
           const np = Object.assign({}, p);
+          if (p.top_objs) {
+            np.top_objs = p.top_objs.filter((o,i) =>
+              !flagged.has(kg + ':parcel_top_obj:' + pid + ':' + i));
+          }
+          if (p.top_trees) {
+            np.top_trees = p.top_trees.filter((o,i) =>
+              !flagged.has(kg + ':parcel_top_tree:' + pid + ':' + i));
+          }
           if (p.top_10_objects) {
             np.top_10_objects = p.top_10_objects.filter((o,i) =>
               !flagged.has(kg + ':parcel_top_obj:' + pid + ':' + i));
@@ -1851,6 +1860,27 @@ function renderLastKg(js) {
   // top_by_type then to per-parcel top_10. The data has plenty of objects
   // to surface — no reason to show '—' just because the 10-deep KG-wide
   // list happens to be flagged.
+  // Compact-format decoders (mirrors parcel_compact.py)
+  // top_objs[i] = [type_letter, hmax, hmean, area, lon, lat, conf, rf_conf, manmade]
+  // top_trees[i] = [hmax, hmean, hp90, area, lon, lat, ndvi_m, ndvi_f, hchg, phen, conf, rf_conf]
+  const _LETTER2TYPE = {t:'tree',s:'shrub',g:'grass',h:'hedge',w:'water',
+    R:'roof',G:'greenhouse',P:'solar_panel',F:'fence',W:'wall',M:'mast',
+    T:'wind_turbine',X:'substation',r:'road',p:'path',k:'parking',b:'bridge',
+    c:'crop',o:'orchard',v:'vineyard',a:'garden',B:'bare_soil',K:'rock',
+    E:'excavation',L:'fill',l:'tree_loss',C:'construction',e:'earthwork',u:'unclassified'};
+  function _decObj(x) {
+    if (!Array.isArray(x)) return x;
+    return {type:_LETTER2TYPE[x[0]]||x[0], height_max_m:x[1], height_mean_m:x[2],
+      area_sqm:x[3], coordinate:{lon:x[4],lat:x[5]}, confidence:x[6],
+      rf_confidence:x[7], is_manmade:!!x[8]};
+  }
+  function _decTree(x) {
+    if (!Array.isArray(x)) return x;
+    return {height_m:x[0], canopy_height_m:x[1], height_p90_m:x[2],
+      area_sqm:x[3], coordinate:{lon:x[4],lat:x[5]}, ndvi_mean:x[6],
+      ndvi_fused:x[7], height_change_m:x[8], phenology_class:x[9],
+      confidence:x[10], rf_confidence:x[11]};
+  }
   function _cascadeTop() {
     if (top10[0]) return top10[0];
     const tbt = js.top_by_type || {};
@@ -1863,8 +1893,8 @@ function renderLastKg(js) {
     });
     if (best) return best;
     for (const p of (parcels.details || [])) {
-      const arr = p.top_10_objects || [];
-      if (arr[0]) return arr[0];
+      const arr = p.top_objs || p.top_10_objects || [];
+      if (arr[0]) return _decObj(arr[0]);
     }
     return null;
   }
@@ -1873,8 +1903,8 @@ function renderLastKg(js) {
     const trees = (js.top_by_type || {}).tree || [];
     if (trees[0]) return Object.assign({height_m: trees[0].height_max_m}, trees[0]);
     for (const p of (parcels.details || [])) {
-      const arr = p.top_10_trees || [];
-      if (arr[0]) return arr[0];
+      const arr = p.top_trees || p.top_10_trees || [];
+      if (arr[0]) return _decTree(arr[0]);
     }
     return null;
   }

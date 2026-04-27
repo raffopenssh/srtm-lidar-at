@@ -55,6 +55,19 @@ body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overf
 .legend .lg-dot{width:10px;height:10px;border-radius:50%;border:1px solid #fff}
 .url-display{padding:4px 12px;background:var(--bg);font-size:10.5px;color:var(--cyan);border-bottom:1px solid var(--border);overflow-x:auto;white-space:nowrap}
 .url-display a{color:var(--blue);text-decoration:none}
+.examples{display:none;max-height:50vh;overflow-y:auto;border-bottom:1px solid var(--border);background:var(--card)}
+.examples.open{display:block}
+.ex-search{position:sticky;top:0;background:var(--card);padding:6px 12px;border-bottom:1px solid var(--border);z-index:1}
+.ex-search input{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font:inherit}
+.ex-group{padding:4px 12px;color:var(--purple);font-size:10.5px;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid var(--border);background:#0d1117a0;position:sticky;top:36px}
+.ex-item{padding:6px 12px;border-bottom:1px solid var(--border);cursor:pointer;display:grid;grid-template-columns:auto 1fr;gap:6px 10px}
+.ex-item:hover{background:#1f6feb22}
+.ex-item .ep{color:var(--cyan);font-size:10.5px;white-space:nowrap}
+.ex-item .desc{color:var(--dim);font-size:10.5px;line-height:1.4}
+.ex-item code{color:var(--blue);font-size:10.5px;word-break:break-all}
+.tb .toggle-ex{background:#30363d;color:var(--blue);border:1px solid var(--border);padding:5px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px}
+.tb .toggle-ex:hover{background:#1f6feb33}
+.tb .toggle-ex.on{background:#1f6feb33;color:var(--blue)}
 </style>
 </head>
 <body>
@@ -74,9 +87,15 @@ body{background:var(--bg);color:var(--text);font-size:12px;line-height:1.5;overf
       <option value="/api/v1/query/nature">/query/nature</option>
       <option value="/api/v1/query/compound">/query/compound</option>
     </select>
-    <input class="q" id="params" placeholder="params: severity=critical&limit=50  — or just text=102.2m+tree">
+    <input class="q" id="params" list="paramsList" placeholder="params: severity=critical&limit=50  — or just text=102.2m+tree">
     <button id="runBtn">Run</button>
     <button class="alt" id="clearBtn">Clear</button>
+    <button class="toggle-ex" id="exBtn" title="Browse all example queries from the API docs">📚 Examples</button>
+  </div>
+  <datalist id="paramsList"></datalist>
+  <div class="examples" id="examples">
+    <div class="ex-search"><input id="exFilter" placeholder="Filter examples (e.g. tree, hansen, parcels, building)…" autocomplete="off"></div>
+    <div id="exList"><div style="padding:12px;color:var(--dim)">Loading examples from /api/v1/docs/llm.txt…</div></div>
   </div>
 
   <div class="split">
@@ -425,13 +444,178 @@ function renderStats(j) {
 function escapeHtml(s){return String(s).replace(/[&<>"']/g, m=>({
   '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 
+// ---- Examples panel + autocomplete (parsed from /api/v1/docs/llm.txt) ----
+const KNOWN_ENDPOINTS = Array.from(document.querySelectorAll('#endpoint option')).map(o=>o.value);
+let EXAMPLES = [];
+
+function parseLlmTxtExamples(txt) {
+  const lines = txt.split(/\r?\n/);
+  const out = [];
+  let lastH2 = '', lastH3 = '', lastDesc = '';
+  const curlRe = /^curl\b(?:\s+-[A-Za-z]+\s+\S+)?\s+(?:'([^']+)'|"([^"]+)"|(\S+))/;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/^##\s+/.test(ln))      { lastH2 = ln.replace(/^##\s+/, '').trim(); lastH3=''; continue; }
+    if (/^###\s+/.test(ln))     { lastH3 = ln.replace(/^###\s+/, '').trim(); continue; }
+    if (/^####\s+/.test(ln))    { lastH3 = ln.replace(/^####\s+/, '').trim(); continue; }
+    if (/^#\s+/.test(ln))       { lastDesc = ln.replace(/^#\s+/, '').trim(); continue; }
+    if (/^\s*$/.test(ln))       { lastDesc = ''; continue; }
+    const m = ln.match(curlRe);
+    if (!m) continue;
+    const url = m[1] || m[2] || m[3] || '';
+    const tail = url.split(/\?|#/)[0];
+    const apiIdx = tail.indexOf('/api/v1/');
+    if (apiIdx < 0) continue;
+    const endpoint = tail.slice(apiIdx);
+    const qIdx = url.indexOf('?');
+    const params = qIdx >= 0 ? url.slice(qIdx + 1) : '';
+    // Pick up trailing inline comment, e.g. `... # page 2`
+    const inlineComment = (ln.match(/#\s*(.+)$/) || [])[1] || '';
+    const desc = (lastDesc || inlineComment || '').trim();
+    out.push({ endpoint, params, desc, group: (lastH3 || lastH2 || 'Examples').trim() });
+    // Don't reset lastDesc — several curl lines under one comment are common.
+  }
+  // Dedup identical (endpoint+params) keeping the first description.
+  const seen = new Set();
+  return out.filter(x => { const k = x.endpoint + '?' + x.params; if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
+function renderExamples(filter) {
+  const root = document.getElementById('exList');
+  if (!EXAMPLES.length) { root.innerHTML = '<div style="padding:12px;color:var(--red)">Failed to load examples.</div>'; return; }
+  const f = (filter || '').toLowerCase().trim();
+  const matches = EXAMPLES.filter(ex => {
+    if (!f) return true;
+    return (ex.endpoint + ' ' + ex.params + ' ' + ex.desc + ' ' + ex.group).toLowerCase().includes(f);
+  });
+  if (!matches.length) { root.innerHTML = '<div style="padding:12px;color:var(--dim)">No examples match “' + escapeHtml(f) + '”.</div>'; return; }
+  let html = '', curGroup = null;
+  matches.forEach((ex, i) => {
+    if (ex.group !== curGroup) { curGroup = ex.group; html += '<div class="ex-group">' + escapeHtml(curGroup) + '</div>'; }
+    html += '<div class="ex-item" data-i="' + EXAMPLES.indexOf(ex) + '">'
+          + '<div><code class="ep">' + escapeHtml(ex.endpoint) + '</code></div>'
+          + '<div>' + (ex.desc ? '<div class="desc">' + escapeHtml(ex.desc) + '</div>' : '')
+          + (ex.params ? '<div><code>' + escapeHtml(ex.params) + '</code></div>' : '<div class="desc" style="font-style:italic">no params</div>')
+          + '</div></div>';
+  });
+  root.innerHTML = html;
+  root.querySelectorAll('.ex-item').forEach(it => it.addEventListener('click', () => {
+    const ex = EXAMPLES[+it.dataset.i];
+    // If endpoint is in our select, pick it; else add it on the fly.
+    let opt = Array.from(document.querySelectorAll('#endpoint option')).find(o => o.value === ex.endpoint);
+    if (!opt) {
+      opt = document.createElement('option'); opt.value = ex.endpoint; opt.textContent = ex.endpoint;
+      document.getElementById('endpoint').appendChild(opt);
+    }
+    document.getElementById('endpoint').value = ex.endpoint;
+    document.getElementById('params').value = ex.params;
+    document.getElementById('examples').classList.remove('open');
+    document.getElementById('exBtn').classList.remove('on');
+    updateUrl();
+    run();
+  }));
+}
+
+function renderParamsDatalist() {
+  const dl = document.getElementById('paramsList');
+  if (!dl) return;
+  const ep = document.getElementById('endpoint').value;
+  const seen = new Set();
+  let html = '';
+  EXAMPLES.forEach(ex => {
+    if (ex.endpoint !== ep || !ex.params || seen.has(ex.params)) return;
+    seen.add(ex.params);
+    html += '<option value="' + ex.params.replace(/"/g, '&quot;') + '">'
+          + (ex.desc ? ex.desc.replace(/"/g, '&quot;') : '') + '</option>';
+  });
+  dl.innerHTML = html;
+}
+
+document.getElementById('exBtn').addEventListener('click', () => {
+  const p = document.getElementById('examples');
+  const open = p.classList.toggle('open');
+  document.getElementById('exBtn').classList.toggle('on', open);
+  if (open && !EXAMPLES.length) loadExamples();
+});
+document.getElementById('exFilter').addEventListener('input', e => renderExamples(e.target.value));
+$('#endpoint').addEventListener('change', renderParamsDatalist);
+
+async function loadExamples() {
+  try {
+    const r = await fetch('/api/v1/docs/llm.txt');
+    const txt = await r.text();
+    EXAMPLES = parseLlmTxtExamples(txt);
+    renderExamples('');
+    renderParamsDatalist();
+  } catch (e) {
+    document.getElementById('exList').innerHTML = '<div style="padding:12px;color:var(--red)">Failed to load examples: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+// Preload examples in the background (silent) so the datalist is ready early.
+loadExamples();
+
+// ---- Deep-link handling: ?obj_ref=...&lon=...&lat=... ----
+function _f(v) { const x = parseFloat(v); return isFinite(x) ? x : null; }
+function handleDeepLink() {
+  const sp = new URLSearchParams(window.location.search);
+  const objRef = sp.get('obj_ref');
+  const kg = sp.get('kg');
+  const lon = _f(sp.get('lon'));
+  const lat = _f(sp.get('lat'));
+  const type = sp.get('type');
+  // Allow forwarding endpoint/params verbatim (e.g. from “Examples” shared links).
+  const ep = sp.get('endpoint');
+  const ps = sp.get('params');
+  if (ep) {
+    let opt = Array.from(document.querySelectorAll('#endpoint option')).find(o => o.value === ep);
+    if (!opt) { opt = document.createElement('option'); opt.value = ep; opt.textContent = ep; document.getElementById('endpoint').appendChild(opt); }
+    document.getElementById('endpoint').value = ep;
+    if (ps != null) document.getElementById('params').value = ps;
+    if (lat != null && lon != null) map.setView([lat, lon], 18);
+    updateUrl(); run();
+    return true;
+  }
+  if (objRef || (lat != null && lon != null)) {
+    document.getElementById('endpoint').value = '/api/v1/flags';
+    const parts = [];
+    if (objRef) parts.push('obj_ref=' + encodeURIComponent(objRef));
+    else {
+      if (kg) parts.push('kg=' + encodeURIComponent(kg));
+      if (type) parts.push('type=' + encodeURIComponent(type));
+      if (lat != null && lon != null) {
+        const d = 0.0008;
+        parts.push('bbox=' + (lon-d) + ',' + (lat-d) + ',' + (lon+d) + ',' + (lat+d));
+      }
+    }
+    parts.push('limit=200');
+    document.getElementById('params').value = parts.join('&');
+    if (lat != null && lon != null) map.setView([lat, lon], 18);
+    updateUrl();
+    run().then(() => {
+      if (lat != null && lon != null) {
+        // Re-centre after map.fitBounds in render(); zoom in tight.
+        setTimeout(() => map.setView([lat, lon], 18), 250);
+      }
+      // Highlight the matching row by obj_ref.
+      if (objRef) setTimeout(() => {
+        const target = rowEls.find(r => (r.item.obj_ref === objRef) || (r.item.id && r.item.id.indexOf(objRef) >= 0));
+        if (target) selectId(target.id, false);
+      }, 350);
+    });
+    return true;
+  }
+  return false;
+}
+
 initMap();
 updateUrl();
-// Auto-run a default query.
-$('#endpoint').value = '/api/v1/flags';
-$('#params').value = 'severity=critical&order=value&limit=30';
-updateUrl();
-run();
+if (!handleDeepLink()) {
+  // Auto-run a default query.
+  $('#endpoint').value = '/api/v1/flags';
+  $('#params').value = 'severity=critical&order=value&limit=30';
+  updateUrl();
+  run();
+}
 
 document.addEventListener('DOMContentLoaded', () => { if (window.SrtmFlag) SrtmFlag.install(); });
 if (window.SrtmFlag) {

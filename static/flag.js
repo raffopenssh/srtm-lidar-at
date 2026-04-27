@@ -384,7 +384,28 @@
     const title = res.status === 'no_object'
       ? 'No matching object found'
       : (res.status === 'ambiguous' ? 'Multiple candidates' : 'Matched object');
-    wrap.appendChild(el('h4', null, title));
+    const titleRow = el('div', { class: 'row',
+      style: { justifyContent: 'space-between', alignItems: 'center', margin: '0 0 6px' } },
+      el('h4', { style: { margin: 0 } }, title));
+    // Build a query-explorer link for the top candidate, if any.
+    const top = (res.candidates && res.candidates[0]) || null;
+    if (top && (top.obj_ref || (top.centroid_lon != null && top.centroid_lat != null))) {
+      const params = new URLSearchParams();
+      if (top.obj_ref) params.set('obj_ref', top.obj_ref);
+      if (top.kg_code) params.set('kg', top.kg_code);
+      if (top.centroid_lon != null) params.set('lon', top.centroid_lon);
+      if (top.centroid_lat != null) params.set('lat', top.centroid_lat);
+      if (top.obj_type) params.set('type', top.obj_type);
+      const href = '/query.html?' + params.toString();
+      const link = el('a', { href: href, target: '_blank', rel: 'noopener',
+        title: 'Open this object in Query Explorer (filtered, centred + zoomed on map)',
+        style: { color: '#58a6ff', fontSize: '14px', textDecoration: 'none',
+                 padding: '2px 6px', borderRadius: '4px',
+                 border: '1px solid #30363d', background: '#0d1117' } },
+        '↗');
+      titleRow.appendChild(link);
+    }
+    wrap.appendChild(titleRow);
     wrap.appendChild(el('div', { class: 'row' },
       el('span', { class: 'lb' }, 'Selected:'),
       el('span', { class: 'vl' }, '“' + (info.selectedText || '') + '”')));

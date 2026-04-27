@@ -264,10 +264,11 @@ def _row_to_dict(r):
 
 
 def list_flags(kg_code=None, severity=None, flag_code=None, obj_type=None,
-               bbox=None, min_value=None, kind=None,
+               bbox=None, min_value=None, kind=None, obj_ref=None,
                limit=200, offset=0, order='severity'):
     ensure_schema()
     where = []; args = []
+    if obj_ref:    where.append('f.obj_ref=?'); args.append(obj_ref)
     if kg_code:    where.append('f.kg_code=?'); args.append(kg_code)
     if severity:   where.append('f.severity=?'); args.append(severity)
     if flag_code:  where.append('f.flag_code=?'); args.append(flag_code)

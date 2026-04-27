@@ -8604,7 +8604,7 @@ def api_flags_list():
         rows = feedback_db.list_flags(
             kg_code=a.get('kg'), severity=a.get('severity'),
             flag_code=a.get('code'), obj_type=a.get('type'),
-            kind=a.get('kind'),
+            kind=a.get('kind'), obj_ref=a.get('obj_ref'),
             bbox=_bbox_arg(a.get('bbox')),
             min_value=float(a['min_value']) if a.get('min_value') else None,
             limit=min(int(a.get('limit', 200)), 1000),

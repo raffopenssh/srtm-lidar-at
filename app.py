@@ -2807,11 +2807,27 @@ def admin_run_backfill():
     log_fp = open(log_path, 'a')
     log_fp.write(f'\n=== {_dt.datetime.now(_dt.timezone.utc).isoformat()} starting: {" ".join(args)} ===\n')
     log_fp.flush()
-    p = sp.Popen(
-        args, cwd=str(Path(__file__).parent),
-        stdout=log_fp, stderr=sp.STDOUT,
-        start_new_session=True,  # detach from gunicorn worker
-    )
+    # Launch via `sudo systemd-run --scope` so the backfill lives in its
+    # own systemd scope and survives gunicorn (`srv.service`) restarts.
+    # Without this, the subprocess inherits srv's cgroup and dies whenever
+    # /api/v1/admin/update bounces srv.
+    unit_name = f'backfill-parcel-top10-{int(time.time())}'
+    full_args = ['sudo', '-n', 'systemd-run', '--scope', '--quiet',
+                 '--unit', unit_name, '--'] + args
+    try:
+        p = sp.Popen(
+            full_args, cwd=str(Path(__file__).parent),
+            stdout=log_fp, stderr=sp.STDOUT,
+            start_new_session=True,
+        )
+        log.info('Backfill launched via systemd-run scope unit=%s', unit_name)
+    except Exception as e:
+        log.warning('systemd-run scope failed (%s); falling back to plain Popen', e)
+        p = sp.Popen(
+            args, cwd=str(Path(__file__).parent),
+            stdout=log_fp, stderr=sp.STDOUT,
+            start_new_session=True,
+        )
     pid_path.write_text(str(p.pid))
     return jsonify({'status': 'started', 'pid': p.pid, 'log': str(log_path),
                     'args': args})

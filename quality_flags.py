@@ -249,6 +249,35 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
             'confidence': cls.get('mean_confidence'),
             'attrs': p,
         }
+        # 7a) Per-parcel top objects/trees — flagged independently of KG-wide top_10
+        for i, o in enumerate(p.get('top_10_objects') or []):
+            coord_o = o.get('coordinate') or {}
+            yield {
+                'obj_ref': f'{kg}:parcel_top_obj:{pid}:{i}',
+                'kg_code': kg, 'kind': 'parcel_top_obj',
+                'obj_type': o.get('rf_type') or o.get('type'),
+                'centroid_lon': coord_o.get('lon'), 'centroid_lat': coord_o.get('lat'),
+                'area_sqm': o.get('area_sqm'),
+                'height_max_m': o.get('height_max_m'),
+                'height_mean_m': o.get('height_mean_m'),
+                'rf_confidence': o.get('rf_confidence'),
+                'confidence': o.get('confidence'),
+                'attrs': o,
+            }
+        for i, t in enumerate(p.get('top_10_trees') or []):
+            coord_t = t.get('coordinate') or {}
+            yield {
+                'obj_ref': f'{kg}:parcel_top_tree:{pid}:{i}',
+                'kg_code': kg, 'kind': 'parcel_top_tree',
+                'obj_type': t.get('rf_type') or 'tree',
+                'centroid_lon': coord_t.get('lon'), 'centroid_lat': coord_t.get('lat'),
+                'area_sqm': t.get('area_sqm'),
+                'height_max_m': t.get('height_m'),
+                'height_mean_m': t.get('canopy_height_m'),
+                'rf_confidence': t.get('rf_confidence'),
+                'confidence': t.get('confidence'),
+                'attrs': t,
+            }
 
 
 # ----------------------------------------------------------------------

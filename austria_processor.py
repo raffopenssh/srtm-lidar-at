@@ -4688,6 +4688,63 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                         pd['classification'] = cls
         except Exception as e:
             log.warning("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
+        # --- Per-parcel top_10_objects / top_10_trees ---
+        # The KG-level top_10 lists only surface 10 entries across the whole KG;
+        # for a 4750ha KG with 130+ parcels and 85k trees, that's far too coarse
+        # for parcel-scale filtering. Emit per-parcel highlights from the same
+        # objects already assigned via STRtree (or via _parcel_segment_stats).
+        try:
+            p_idx = _parcel_idx_by_id[id(p)]
+            p_objs = _parcel_obj_map.get(p_idx, [])
+            if p_objs:
+                p_top_obj = []
+                for o in sorted(p_objs, key=lambda o: o.height_max, reverse=True)[:10]:
+                    c = None
+                    try:
+                        lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                        c = {"lon": round(lon,7), "lat": round(lat,7)}
+                    except Exception: pass
+                    p_top_obj.append({
+                        "type": o.obj_type,
+                        "height_max_m": round(o.height_max,2),
+                        "height_mean_m": round(o.height_mean,2),
+                        "area_sqm": round(o.area_sqm,1),
+                        "coordinate": c,
+                        "confidence": round(o.confidence,3),
+                        "rf_type": getattr(o, 'rf_type', ''),
+                        "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
+                        "is_manmade": o.is_manmade,
+                        "observation_year": obs_year,
+                    })
+                if p_top_obj:
+                    pd["top_10_objects"] = p_top_obj
+                p_trees = [o for o in p_objs if o.obj_type == 'tree']
+                if p_trees:
+                    p_top_tree = []
+                    for t in sorted(p_trees, key=lambda o: o.height_max, reverse=True)[:10]:
+                        c = None
+                        try:
+                            lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
+                            c = {"lon": round(lon,7), "lat": round(lat,7)}
+                        except Exception: pass
+                        p_top_tree.append({
+                            "height_m": round(t.height_max,2),
+                            "canopy_height_m": round(t.height_mean,2),
+                            "height_p90_m": round(t.height_p90,2),
+                            "coordinate": c,
+                            "area_sqm": round(t.area_sqm,1),
+                            "ndvi_mean": round(t.ndvi_mean,4),
+                            "ndvi_fused": round(t.ndvi_fused,4),
+                            "height_change_m": round(t.height_change,3),
+                            "phenology_class": t.phenology_class or '',
+                            "observation_year": obs_year,
+                            "confidence": round(t.confidence,3),
+                            "rf_type": getattr(t, 'rf_type', ''),
+                            "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3),
+                        })
+                    pd["top_10_trees"] = p_top_tree
+        except Exception as e:
+            log.debug("JSON: per-parcel top10 failed for %s: %s", p.get("parcel_id"), e)
         parcel_details.append(pd)
     if n_parcel_no_tile > 0:
         log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",

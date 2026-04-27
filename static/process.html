@@ -1783,6 +1783,24 @@ function renderLastKg(js) {
       });
       js.top_by_type = out;
     }
+    // Per-parcel highlights too (parcel_top_obj/parcel_top_tree refs).
+    if (js.parcels && js.parcels.details) {
+      js.parcels = Object.assign({}, js.parcels, {
+        details: js.parcels.details.map(p => {
+          const pid = p.parcel_id || '';
+          const np = Object.assign({}, p);
+          if (p.top_10_objects) {
+            np.top_10_objects = p.top_10_objects.filter((o,i) =>
+              !flagged.has(kg + ':parcel_top_obj:' + pid + ':' + i));
+          }
+          if (p.top_10_trees) {
+            np.top_10_trees = p.top_10_trees.filter((o,i) =>
+              !flagged.has(kg + ':parcel_top_tree:' + pid + ':' + i));
+          }
+          return np;
+        })
+      });
+    }
   }
   document.getElementById('lastKgName').textContent =
     (js.kg_code || '?') + ' ' + (js.kg_name || '') + (js.state_name ? ' (' + js.state_name + ')' : '');
@@ -1829,11 +1847,44 @@ function renderLastKg(js) {
   items.push({l: 'Infrastructure', v: fmt(infra.total || 0)});
   items.push({l: 'Trees', v: fmt(trees.count) + ' / ' + ((trees.total_canopy_sqm||0)/10000).toFixed(2) + 'ha'});
   const _tint = activeColor ? ('color:' + activeColor) : '';
-  items.push({l: 'Tallest', v: top10[0]
-    ? ('<span style="' + _tint + '">' + (top10[0].height_max_m||top10[0].height_m||0).toFixed(1) + 'm ' + (top10[0].type||'') + '</span>')
+  // Cascade: when top_10 is empty (eg fully flagged), fall through to
+  // top_by_type then to per-parcel top_10. The data has plenty of objects
+  // to surface — no reason to show '—' just because the 10-deep KG-wide
+  // list happens to be flagged.
+  function _cascadeTop() {
+    if (top10[0]) return top10[0];
+    const tbt = js.top_by_type || {};
+    let best = null, bestH = -1;
+    Object.keys(tbt).forEach(typ => {
+      (tbt[typ]||[]).forEach(o => {
+        const h = o.height_max_m || o.height_m || 0;
+        if (h > bestH) { bestH = h; best = o; }
+      });
+    });
+    if (best) return best;
+    for (const p of (parcels.details || [])) {
+      const arr = p.top_10_objects || [];
+      if (arr[0]) return arr[0];
+    }
+    return null;
+  }
+  function _cascadeTopTree() {
+    if (top10t[0]) return top10t[0];
+    const trees = (js.top_by_type || {}).tree || [];
+    if (trees[0]) return Object.assign({height_m: trees[0].height_max_m}, trees[0]);
+    for (const p of (parcels.details || [])) {
+      const arr = p.top_10_trees || [];
+      if (arr[0]) return arr[0];
+    }
+    return null;
+  }
+  const _cTop = _cascadeTop();
+  const _cTree = _cascadeTopTree();
+  items.push({l: 'Tallest', v: _cTop
+    ? ('<span style="' + _tint + '">' + (_cTop.height_max_m||_cTop.height_m||0).toFixed(1) + 'm ' + (_cTop.type||_cTop.rf_type||'') + '</span>')
     : '—'});
-  items.push({l: 'Tallest Tree', v: top10t[0]
-    ? ('<span style="' + _tint + '">' + (top10t[0].height_m||0).toFixed(1) + 'm</span>')
+  items.push({l: 'Tallest Tree', v: _cTree
+    ? ('<span style="' + _tint + '">' + (_cTree.height_m||_cTree.height_max_m||0).toFixed(1) + 'm</span>')
     : '—'});
   items.push({l: 'Stem Vol', v: (trees.est_stem_volume_m3||0).toFixed(0) + ' m\u00b3'});
   items.push({l: 'Elev', v: (terrain.elevation_min_m||0).toFixed(0) + '\u2013' + (terrain.elevation_max_m||0).toFixed(0) + 'm'});

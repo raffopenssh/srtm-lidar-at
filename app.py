@@ -1623,7 +1623,14 @@ def processing_stop():
     get stuck in long I/O (e.g. SSL uploads).  We kill the entire
     process group so nothing survives.
 
-    Strategy:
+    Query/JSON params:
+      graceful=1 → send SIGTERM only, don't escalate to SIGKILL. The
+        processor sets _shutdown_requested and exits cleanly *after* the
+        current KG finishes (can take an hour or more). Used by the
+        director when pre-empting between KGs.
+      after_kg=1 → alias for graceful, returns immediately.
+
+    Strategy (default = hard stop):
     1. If we have the Popen handle → kill the whole process group
        (parent started with start_new_session=True so its PID == PGID).
     2. Else systemctl stop (sends SIGTERM to the cgroup).
@@ -1634,6 +1641,36 @@ def processing_stop():
     import subprocess as _sp
     import signal as _sig
     method = None
+
+    # Parse graceful flag from query string OR JSON body
+    body = request.get_json(silent=True) or {}
+    graceful = (request.args.get('graceful') in ('1', 'true', 'yes')
+                or request.args.get('after_kg') in ('1', 'true', 'yes')
+                or body.get('graceful') is True
+                or body.get('after_kg') is True)
+    if graceful:
+        # Send SIGTERM to the process group; the processor's signal
+        # handler sets _shutdown_requested and the loop exits at the next
+        # KG boundary. We do NOT escalate to SIGKILL.
+        sent = False
+        if _processor_process is not None and _processor_process.poll() is None:
+            try:
+                os.killpg(os.getpgid(_processor_process.pid), _sig.SIGTERM)
+                sent = True
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if not sent:
+            try:
+                _sp.run(['pkill', '-TERM', '-f', 'austria_processor.py'],
+                        capture_output=True, text=True, timeout=5)
+                sent = True
+            except Exception:
+                pass
+        return jsonify({
+            'status': 'graceful_stop_requested' if sent else 'no_process',
+            'method': 'sigterm_no_escalate',
+            'note': 'processor will exit after current KG finishes',
+        })
 
     def _proc_alive():
         try:

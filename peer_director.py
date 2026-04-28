@@ -802,11 +802,27 @@ class PeerDirector:
                     log.info('Reservation ready on %s — pre-empting %s (between KGs)',
                              holder, active_id)
                     with self._lock:
+                        # Clear graceful-stop flag before nilling active_id
+                        self.state.get('graceful_stop_sent', {}).pop(active_id, None)
                         self.state['active_peer'] = None
                         active_id = None
                 else:
-                    log.info('Reservation ready on %s but %s is mid-KG (%s) — waiting for KG boundary',
-                             holder, active_id, proc_state)
+                    # Mid-KG: send graceful stop once. The flag prevents
+                    # us from re-sending it on every tick.
+                    sent = self.state.get('graceful_stop_sent', {})
+                    if sent.get(active_id) != holder:
+                        log.info('Reservation ready on %s; sending graceful stop to %s (will exit after current KG)',
+                                 holder, active_id)
+                        try:
+                            stop_peer_processor(active_peer_cfg.get('url'), graceful=True)
+                            with self._lock:
+                                sent[active_id] = holder
+                                self.state['graceful_stop_sent'] = sent
+                        except Exception as e:
+                            log.warning('Graceful stop on %s failed: %s', active_id, e)
+                    else:
+                        log.info('Reservation ready on %s; %s still finishing current KG (graceful stop pending)',
+                                 holder, active_id)
 
         # Check if active peer is scheduled (not_before in the future)
         if active_id:

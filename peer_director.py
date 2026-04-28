@@ -1338,10 +1338,6 @@ class PeerDirector:
                             log.warning('Graceful stop cache-only %s failed: %s', pid, e)
             return
 
-        # Spread the whitelist across peers — each peer gets a slice so
-        # they don't all race for the same KG.  We assume the queue head
-        # wins; KGs already taken by another peer are silently skipped
-        # by the processor's peer_claimed filter.
         if max_add <= 0 and not running_cache_only:
             # No room to add and none running — nothing to do.
             return
@@ -1356,32 +1352,80 @@ class PeerDirector:
                 break
             to_start.append(c['peer'])
 
-        # Slice whitelist across (running_cache_only + to_start) so each
-        # peer has a distinct chunk.  We don't truly partition (peers may
-        # finish at different rates) but it gives them different starts.
-        all_workers = list(running_cache_only) + [p['id'] for p in to_start]
+        # --- Build claimed-KG set so no two cache-only peers (and not
+        # the frontier) target the same KG.  We pull each peer's current
+        # KG from the status snapshot we already gathered above, plus
+        # the active frontier's current_kg.
+        in_progress: set[str] = set()
+        for c in candidates:
+            ps_pid = c['peer']['id']
+            try:
+                ps2 = get_peer_status(c['peer'].get('url'))
+            except Exception:
+                ps2 = {}
+            ckg = (ps2.get('current_kg') or {})
+            code = ckg.get('code') if isinstance(ckg, dict) else None
+            if code:
+                in_progress.add(str(code))
+            # Also consider in_progress_kg.txt-style hint
+            ip = ps2.get('in_progress')
+            if ip:
+                in_progress.add(str(ip))
+            del ps_pid  # silence linter
+        # Frontier's KG
+        if active_frontier:
+            fp = get_peer_by_id(cfg, active_frontier)
+            if fp:
+                try:
+                    fps = get_peer_status(fp.get('url'))
+                    fkg = (fps.get('current_kg') or {})
+                    fcode = fkg.get('code') if isinstance(fkg, dict) else None
+                    if fcode:
+                        in_progress.add(str(fcode))
+                except Exception:
+                    pass
+        # Filter the whitelist before partitioning.
+        whitelist = [k for k in whitelist if k not in in_progress]
+        if not whitelist:
+            log.info('Cache-only orchestrate: whitelist drained after excluding '
+                     '%d in-progress KGs', len(in_progress))
+            return
+
+        # --- Stable, non-overlapping partition by sorted peer id.
+        # Stride assignment guarantees disjoint chunks and is stable
+        # across whitelist size changes (peer X always gets the same
+        # relative position).  Each peer gets every Nth KG starting at
+        # its sorted index.
+        all_workers = sorted(set(running_cache_only) |
+                             {p['id'] for p in to_start})
         if not all_workers:
             return
-        slice_size = max(8, len(whitelist) // len(all_workers) + 4)
-        for i, p in enumerate(to_start):
-            start = (i + len(running_cache_only)) * slice_size
-            chunk = whitelist[start:start + slice_size] or whitelist[:slice_size]
-            log.info('Starting cache-only peer %s with %d KGs (slice %d:%d of %d ready)',
-                     p['id'], len(chunk), start, start + slice_size, len(whitelist))
+        n = len(all_workers)
+        slices = {pid: whitelist[i::n] for i, pid in enumerate(all_workers)}
+
+        # Start new peers with their slice.
+        for p in to_start:
+            chunk = slices.get(p['id'], [])
+            if not chunk:
+                continue
+            log.info('Starting cache-only peer %s with %d KGs (stride %d/%d, '
+                     '%d total ready)', p['id'], len(chunk),
+                     all_workers.index(p['id']) + 1, n, len(whitelist))
             try:
                 start_peer_processor(p.get('url'), cache_only=True,
                                      queue_whitelist=chunk)
             except Exception as e:
                 log.warning('Start cache-only on %s failed: %s', p['id'], e)
 
-        # Re-sync whitelist to running cache-only peers periodically (in
-        # case they've drained their slice).  Cheap PUT.
-        for i, pid in enumerate(running_cache_only):
+        # Re-sync slices to already-running peers (whitelist may have
+        # grown/shrunk since they started).  Cheap PUT.
+        for pid in running_cache_only:
             p = get_peer_by_id(cfg, pid)
             if not p:
                 continue
-            start = i * slice_size
-            chunk = whitelist[start:start + slice_size] or whitelist[:slice_size]
+            chunk = slices.get(pid, [])
+            if not chunk:
+                continue
             try:
                 _push_queue_to_peer(p['url'], chunk)
             except Exception as e:

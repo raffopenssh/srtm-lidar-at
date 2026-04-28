@@ -148,9 +148,10 @@ else
     echo "  ⚠ Peer unreachable — processor will run independently"
 fi
 
-# Enable throttle mode by default on new instances (save bandwidth)
-touch data/austria_processor/upload_throttle
-echo "  ✓ Throttle mode enabled (GPKG uploads skipped — saves ~700 MB/KG)"
+# Throttle OFF by default — with many peers, every peer must upload its
+# own GPKGs (the primary is on cooldown and can't pick up the slack).
+rm -f data/austria_processor/upload_throttle
+echo "  ✓ Throttle mode disabled (full + light GPKGs uploaded to Zenodo)"
 
 # Install the processor service but do NOT enable/start it.
 # The director on the primary instance will start it via the API when needed.

@@ -1162,7 +1162,7 @@ bash deploy.sh
 1. Clones repo, installs deps, decompresses RF model
 2. Installs `srv.service` (gunicorn) and `austria_processor.service`
 3. Starts the web server (`srv`) but does **NOT** enable/start the processor
-4. Enables throttle mode by default
+4. Throttle mode is OFF by default (every peer uploads full + light GPKGs)
 5. Auto-registers with the director via `POST /api/v1/director/peers/add`
 6. The director will start the processor when it’s this peer’s turn
 

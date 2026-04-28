@@ -37,7 +37,7 @@ from typing import Iterable, Iterator, Optional
 
 log = logging.getLogger(__name__)
 
-RULE_VERSION = 'v1.2026-04'
+RULE_VERSION = 'v1.2026-04b'
 JSON_DIR = Path('data/austria_processor/json')
 
 # ----------------------------------------------------------------------
@@ -62,9 +62,15 @@ JSON_DIR = Path('data/austria_processor/json')
 
 THRESHOLDS = {
     # ---- Vegetation height ----
+    # Distributions across 36k indexed parcels (top_objs) Apr-2026:
+    #   tree   p95=37.7  p99=43.1  max=84.3   (real Austria max ~57m)
+    #   shrub  p95=13.3  p99=18.5  max=51.7   → raised warn 4→8
+    #   hedge  p95=17.0  p99=21.3  max=41.1
+    #   solar  p99=3.0  max=3.5
+    #   roof   p95=15.5  p99=22.7  max=50.1
     'tree_max_height_m':           {'warn': 50, 'high': 60, 'critical': 80},
-    'shrub_max_height_m':          {'warn': 4,  'high': 6,  'critical': 15},
-    'hedge_max_height_m':          {'warn': 5,  'high': 8,  'critical': 15},
+    'shrub_max_height_m':          {'warn': 8,  'high': 12, 'critical': 20},
+    'hedge_max_height_m':          {'warn': 8,  'high': 15, 'critical': 25},
     'orchard_max_height_m':        {'warn': 10, 'high': 13, 'critical': 20},
     'vineyard_max_height_m':       {'warn': 3,  'high': 5,  'critical': 10},
     # ---- Buildings ----
@@ -373,8 +379,14 @@ def apply_rules(obj: dict) -> list[dict]:
         sev = _h_severity(h, T['warn'], T['high'], T['critical'])
         if sev:
             out.append(_flag('hedge_height_implausible', sev,
-                f'hedge height_max={h:.1f}m exceeds 5m (likely a tree row or forest segment)',
+                f'hedge height_max={h:.1f}m exceeds 8m (likely a tree row or forest segment)',
                 value=h, threshold=T['high']))
+        # Hedge confidence in our model is always rule-fallback (~0.55).
+        # When a 'hedge' is also clearly tree-tall (>10m), the rule is wrong.
+        if h >= 10 and rf is not None and 0.45 <= rf <= 0.6:
+            out.append(_flag('hedge_likely_tree_row', 'medium',
+                f'hedge {h:.1f}m tall + RF conf={rf:.2f} (rule fallback) — likely tree row',
+                value=h, rf=rf))
 
     # ---- Orchard / vineyard ----
     if t == 'orchard' and h is not None:

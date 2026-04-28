@@ -216,6 +216,28 @@ Parcel filters: `min_vegetated_fraction`, `max_vegetated_fraction`, `min_foreste
 `cadastre_has_buildings`, `cadastre_landuse`, `cadastre_min_area`, `roof_type`,
 `min_stories`, `max_stories`, `sort`, `sort_dir`
 
+**Per-parcel auto-classification** (`parcel_compact.classify_parcel`):
+Every parcel gets an `auto_class` + `auto_subclass` + confidence at index
+build. Reads frav, terrain (slope/tri/elev), top_trees mean height,
+buildings (count/stories/footprint, attributed via PIP against
+`vertex_heights`), and Hansen recent-5yr loss. 15-class taxonomy:
+  forest (tall_forest|recently_thinned), young_forest (regenerating),
+  wooded (open_woodland), meadow (rugged|orchard_meadow), alpine_meadow
+  (pasture|high_alpine), cropland (fallow), vineyard, orchard, shrubland,
+  built_up (apartments|multi_storey|house|dense), farmstead (with_house),
+  infrastructure (road|mixed), water_body, disturbance (recent_clearfell|
+  tree_loss|construction|earthwork), bare, mixed.
+Query via `auto_class=`, `auto_subclass=`, `min_auto_class_confidence=`
+on `/api/v1/query/parcels`.
+
+**Per-parcel building rollup**: `kg_parcels` carries `building_count`,
+`building_max_height_m`, `building_max_stories`,
+`building_total_footprint_sqm` — spatially attributed at index build via
+point-in-polygon (parcel `vertex_heights` → ray casting), with
+nearest-centroid fallback. Filterable via `has_buildings=`,
+`min_buildings/max_buildings`, `min_building_height/max_building_height`,
+`min_building_stories/max_building_stories`.
+
 Index: `data/search_index.db` (~5MB). SQLite FTS5 + R-tree. All queries <25ms.
 Auto-rebuilt on startup and when new KG JSONs appear (60s poll).
 Manual rebuild: `POST /api/v1/index/rebuild`.
@@ -771,6 +793,14 @@ still accepted by readers but no longer emitted. quality_flags emits
 `parcel_top_obj:<pid>:<i>` and `parcel_top_tree:<pid>:<i>` refs for both
 formats. The `frav` is what backfill_parcel_top10.py guarantees on every
 parcel — even tiny parcels with no per-segment top_objs.
+
+**Auto-classification at index build**: every parcel JSON written to
+`data/austria_processor/json/` is consumed by `search_index.py` on the next
+`SearchIndex.build()`/`update()`. The kg_parcels schema includes the new
+columns and `parcel_compact.classify_parcel(p)` runs once per parcel.
+If you change the classifier, run
+`python3 -c "from search_index import SearchIndex; SearchIndex().build()"`
+to repopulate (~10s for ~30 KGs locally; ~30s once Austria is fully indexed).
 
 Backfill (after a code change that adds new per-parcel info):
 ```bash

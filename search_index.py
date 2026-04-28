@@ -2701,6 +2701,14 @@ class SearchIndex:
                              # building join filters
                              building_roof_type=None,
                              building_min_stories=None, building_max_stories=None,
+                             # parcel-level building filters (from PIP attribution)
+                             min_buildings=None, max_buildings=None,
+                             min_building_height=None, max_building_height=None,
+                             min_building_stories=None, max_building_stories=None,
+                             has_buildings=None,
+                             # auto-classification filters
+                             auto_class=None, auto_subclass=None,
+                             min_auto_class_confidence=None,
                              # spatial
                              state=None, district=None, gemeinde=None,
                              bbox=None,
@@ -2746,6 +2754,13 @@ class SearchIndex:
             ('max_area', 'p.area_sqm', '<='),
             ('min_elevation', 'p.elevation_m', '>='),
             ('max_elevation', 'p.elevation_m', '<='),
+            ('min_buildings', 'p.building_count', '>='),
+            ('max_buildings', 'p.building_count', '<='),
+            ('min_building_height', 'p.building_max_height_m', '>='),
+            ('max_building_height', 'p.building_max_height_m', '<='),
+            ('min_building_stories', 'p.building_max_stories', '>='),
+            ('max_building_stories', 'p.building_max_stories', '<='),
+            ('min_auto_class_confidence', 'p.auto_class_confidence', '>='),
             ('min_slope', 'p.slope_mean_deg', '>='),
             ('max_slope', 'p.slope_mean_deg', '<='),
             ('min_tri', 'p.tri_mean', '>='),
@@ -2776,6 +2791,20 @@ class SearchIndex:
         if dominant_type:
             where.append('p.dominant_type = ?')
             params.append(dominant_type)
+        if auto_class:
+            ac_list = [s.strip() for s in auto_class.split(',')] \
+                if isinstance(auto_class, str) else list(auto_class)
+            ph = ','.join('?' * len(ac_list))
+            where.append(f'p.auto_class IN ({ph})')
+            params.extend(ac_list)
+        if auto_subclass:
+            where.append('p.auto_subclass = ?')
+            params.append(auto_subclass)
+        if has_buildings is not None:
+            if has_buildings:
+                where.append('p.building_count > 0')
+            else:
+                where.append('(p.building_count IS NULL OR p.building_count = 0)')
         if aspect:
             aspects = [a.strip() for a in aspect.split(',')] if isinstance(aspect, str) else aspect
             placeholders = ','.join('?' * len(aspects))
@@ -2821,6 +2850,9 @@ class SearchIndex:
             'vegetated_fraction', 'forested_fraction', 'ndsm_max_m',
             'hansen_recent_5yr_pixels', 'hansen_total_pixels',
             'mean_confidence', 'rf_mean_confidence',
+            'building_count', 'building_max_height_m',
+            'building_max_stories', 'building_total_footprint_sqm',
+            'auto_class_confidence',
         }
         if sort not in _valid_sorts:
             sort = 'elevation_m'

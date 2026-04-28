@@ -425,6 +425,58 @@ RF model status: trained, n_samples, oob_score, feature_importances.
 #### GET /api/v1/training/status
 Background RF training job progress (4000-KG run).
 
+### Quality Flags & Feedback
+
+Every KG JSON is scanned post-build. Rules in `quality_flags.py` flag
+implausible heights, mismatched NDVI, edge artefacts, low-confidence
+classifications, and tree-vs-mast/hedge-vs-tree mistakes. Flags carry a
+`severity` (low|medium|high|critical) and a numeric `weight` so multiple
+rules firing on the same object accumulate ("agreement").
+
+Empirical thresholds (re-tuned Apr-2026 against ~36k indexed parcels with
+top_objs/top_trees data):
+  tree height        warn 50m  high 60m  critical 80m   (real Austria max ~57m)
+  shrub height       warn  8m  high 12m  critical 20m   (was 4/6/15 — too noisy)
+  hedge height       warn  8m  high 15m  critical 25m
+  + new rule: hedge ≥10m AND rf_conf 0.45–0.6 → likely_tree_row (medium)
+
+#### GET /api/v1/flags
+List flags. Filterable + paginated.
+Params: kg, severity, code, type, kind, obj_ref, bbox, min_value,
+        order=severity|value|recent, limit, offset.
+Returns: {count, flags: [{obj_ref, kg_code, kind, obj_type, flag_code,
+          severity, weight, message, attrs, aggregate}, ...]}.
+
+#### GET /api/v1/flags/object/<obj_ref>
+All flags + aggregates for one object. obj_ref examples:
+  KGCODE:top_tree:N           top_10_trees rank N
+  KGCODE:top_obj:N            top_10_objects rank N
+  KGCODE:top_by_type:tree:0   per-type top entry
+  KGCODE:building:<id>        cadastre-matched building
+  KGCODE:new_building:N       vectorised unmatched roof
+  KGCODE:infra:road:N         vectorised infrastructure feature
+  KGCODE:parcel:PID           parcel
+  KGCODE:parcel_top_obj:PID:i per-parcel top object
+  KGCODE:parcel_top_tree:PID:i per-parcel top tree
+
+#### GET|POST /api/v1/flags/match
+Match free text + optional coords to a known object so users can flag
+without knowing the obj_ref. Used by static/flag.js.
+Params: text="102.2m tree", kg=, lon=, lat=, radius_m=200.
+Returns: {obj_ref, candidates: [{obj_ref, distance_m, score, agg, ...}],
+          flags: [...], action_predictions: {confirm, reject, correct_type}}.
+
+#### GET /api/v1/flags/stats
+Totals by code/severity/type. Useful for QA dashboards.
+
+#### POST /api/v1/feedback
+User confirms/rejects/corrects an object. Body:
+  {obj_ref, kind: confirm|reject|correct_type, value: <new_type>?,
+   note?, user?}. Resolves matching flags atomically.
+
+#### GET /api/v1/feedback/events
+Recent feedback actions (live activity feed).
+
 ### Search Index (fast pre-built SQLite FTS5 + R-tree over all 8440 Austrian KGs)
 
 #### GET /api/v1/index/status
@@ -708,7 +760,18 @@ Response for single KG (kg= or query_kg):
     elevation_min_m, elevation_max_m, elevation_range_m,
     slope_mean_deg, aspect_mean_deg, aspect_dominant,
     tri_mean, tpi_mean, terrain_class,
-    vertex_heights: [{lat, lon, dtm_m}, ...] (AMS anchor points at every boundary vertex).
+    vertex_heights: [{lat, lon, dtm_m}, ...] (AMS anchor points at every boundary vertex),
+    frav: {type_letter: area_sqm_int, ...} (Fraction-Area Vector — every parcel),
+    top_objs: [[type_letter, hmax, hmean, area, lon, lat, conf, rf_conf, manmade], ...]
+              (compact, 5 entries, ~60B each — see TYPE_LETTER table below),
+    top_trees: [[hmax, hmean, hp90, area, lon, lat, ndvi_mean, ndvi_fused,
+                 height_change_m, phenology_class, conf, rf_conf], ...] (5 entries).
+
+  TYPE_LETTER (single-char): t=tree s=shrub g=grass h=hedge w=water R=roof
+    G=greenhouse P=solar_panel F=fence W=wall M=mast T=wind_turbine X=substation
+    r=road p=path k=parking b=bridge c=crop o=orchard v=vineyard a=garden
+    B=bare_soil K=rock E=excavation L=fill l=tree_loss C=construction
+    e=earthwork u=unclassified.  Lowercase = natural, uppercase = man-made.
   Per-building details (building_footprints.details[]): building_id, footprint_area_sqm,
     centroid, centroid_dtm_m, max_height_m, mean_height_m, dsm_std,
     roof_type_hint, stories_est, segment_types,
@@ -1372,8 +1435,28 @@ Parcel attribute filters:
   max_hansen_recent_5yr / min_hansen_recent_5yr   Hansen loss pixels (2020–2024)
   max_hansen_total / min_hansen_total             Hansen loss pixels (all years)
   building_roof_type=pitched/flat   Parcel must contain a building with this roof type
-  building_min_stories / building_max_stories      Building stories filter
-  sort=<col>                        Sort: elevation_m|area_sqm|slope_mean_deg|tri_mean|vegetated_fraction|forested_fraction|ndsm_max_m|hansen_recent_5yr_pixels|hansen_total_pixels|mean_confidence|rf_mean_confidence
+  building_min_stories / building_max_stories      Building stories filter (any building in parcel)
+
+  --- Per-parcel building rollup (computed via PIP at index build) ---
+  has_buildings=true/false          Parcel contains ≥1 building
+  min_buildings / max_buildings     Number of buildings on parcel
+  min_building_height / max_building_height       Tallest building height (m)
+  min_building_stories / max_building_stories     Tallest building stories
+
+  --- Auto-classification (per-parcel landscape label, from frav + terrain + buildings + hansen) ---
+  auto_class=<class>                Comma-separated allowed. Classes:
+                                    forest, young_forest, wooded, meadow,
+                                    alpine_meadow, cropland, vineyard, orchard,
+                                    shrubland, built_up, farmstead,
+                                    infrastructure, water_body, disturbance,
+                                    bare, mixed
+  auto_subclass=<sub>               multi_storey | apartments | with_house |
+                                    recently_thinned | regenerating | pasture |
+                                    rugged | dense | recent_clearfell | tall_forest |
+                                    open_woodland | tree_loss | construction |
+                                    earthwork | orchard_meadow | high_alpine | ...
+  min_auto_class_confidence=0..1    Minimum classifier confidence (0.5–1.0)
+  sort=<col>                        Sort: elevation_m|area_sqm|slope_mean_deg|tri_mean|vegetated_fraction|forested_fraction|ndsm_max_m|hansen_recent_5yr_pixels|hansen_total_pixels|mean_confidence|rf_mean_confidence|building_count|building_max_height_m|building_max_stories|auto_class_confidence
   sort_dir=asc/desc                 Default: desc
   limit / offset                    Pagination (default 100, max 1000)
 
@@ -1389,7 +1472,71 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?min_forested_fract
 
 # Large grassy parcels in Vorarlberg
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Vorarlberg&dominant_type=grass&min_area=10000&sort=area_sqm&sort_dir=desc'
+
+# === Auto-classification queries (Apr-2026) ===
+# All recently-thinned forests (Hansen 2020+ loss inside an otherwise tree-dominated parcel)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=forest&auto_subclass=recently_thinned&sort=hansen_recent_5yr_pixels&sort_dir=desc&limit=50'
+
+# Apartment blocks (auto-classed built_up with tallest building ≥5 stories)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_subclass=apartments&min_building_stories=5&sort=building_max_height_m&sort_dir=desc'
+
+# Working farmsteads (with house + agricultural surroundings)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=farmstead&auto_subclass=with_house&min_area=2000&limit=100'
+
+# Single-house parcels above 900m on south-facing slopes >17° (alpine chalets)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?has_buildings=true&max_buildings=1&max_building_stories=2&aspect=S,SE,SW&min_slope=17&min_elevation=900&sort=elevation_m&sort_dir=desc'
+
+# Recent clearfells (≥20% of parcel cleared in last 5 years, no longer tree-dominated)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_subclass=recent_clearfell&sort=hansen_recent_5yr_pixels&sort_dir=desc'
+
+# Young / regenerating forest above 1000m (mean tree height <8m)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=young_forest&min_elevation=1000&sort=elevation_m&sort_dir=desc'
+
+# Mixed-use parcels in Vienna (auto_class=mixed, where the dominant signal isn't decisive)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?state=Wien&auto_class=mixed&min_auto_class_confidence=0.4'
+
+# Cropland / orchard / vineyard combined ("productive agriculture")
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=cropland,vineyard,orchard&min_area=1000&sort=area_sqm&sort_dir=desc'
+
+# Disturbance map: any parcel currently flagged as construction/earthwork/clearfell
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=disturbance&sort=area_sqm&sort_dir=desc&limit=200'
+
+# Rugged alpine meadows above 1500m, south-facing (potential pasture sites)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_class=alpine_meadow&min_elevation=1500&aspect=S,SE,SW&sort=area_sqm&sort_dir=desc'
+
+# Dense urban building blocks (auto_subclass=dense, ≥3 buildings, all tall)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/query/parcels?auto_subclass=dense&min_buildings=3&min_building_stories=4&sort=building_max_height_m&sort_dir=desc'
 ```
+
+### Auto-class decision logic (parcel_compact.classify_parcel)
+Priority-ordered ladder. First match wins.
+  1. water_body            water frac ≥ 0.40
+  2. disturbance           recent Hansen ≥ 20% area  OR  tree_loss/excavation/fill/construction ≥ 25% by frav
+  3. built_up              ≥ 35% built footprint  OR  ≥ 5 buildings
+                           subclasses: apartments (≥5 stories), multi_storey (≥3),
+                                       house (≥2), dense (≥60% built), —
+  4. infrastructure        ≥ 35% road+path+parking+bridge
+  5. farmstead             5–35% built + ≥1 building + ≥30% farmland/grass
+                           subclass with_house when buildings have stories
+  6. vineyard / orchard    ≥5% of frav (low threshold — specialty cultivation)
+  7. forest                ≥ 60% trees;   subclass recently_thinned (recent Hansen ≥5%),
+                                          tall_forest (mean tree h ≥ 25m), regenerating (<8m)
+  8. wooded                30–60% trees   (open_woodland subclass)
+  9. shrubland             ≥ 40% shrub, <30% tree
+ 10. cropland              ≥ 50% crop+bare; fallow when bare > crop
+ 11. meadow                ≥ 60% grass; subclasses pasture/rugged/orchard_meadow
+ 12. alpine_meadow         meadow + slope ≥20°  OR  elev ≥1500m  OR  alpine terrain class
+ 13. bare                  ≥ 50% bare_soil/rock
+ 14. mixed                 fallback; subclass = strongest sub-signal name
+
+`auto_class_confidence` reflects how decisively a parcel falls inside its class
+(1.0 unambiguous; 0.4 narrowly past threshold; 0.1 = mixed fallback).
+
+The classifier consumes (defensively): `frav` (preferred), `area_summary`,
+`top_trees[*].canopy_height_m`, `slope_mean_deg`, `tri_mean`, `elevation_m`,
+`elevation_range_m`, `terrain_class`, `hansen_loss.recent_5yr_pixels`,
+`building_count`, `building_max_height_m`, `building_max_stories`,
+`building_total_footprint_sqm` (the last four spatially attributed at index build).
 
 ### GET|POST /api/v1/parcels/batch ← BATCH PARCEL ENRICHMENT
 Accepts GET (query params) or POST (JSON body). Three modes:

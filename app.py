@@ -3379,8 +3379,22 @@ def api_query_parcels():
       max_hansen_total            Max total forest loss pixels
       min_hansen_total            Min total forest loss pixels
       building_roof_type=pitched/flat  Parcel must contain matching building
-      building_min_stories=<N>    Building stories filter
+      building_min_stories=<N>    Building stories filter (any building in parcel)
       building_max_stories=<N>    Building stories filter
+      min_buildings / max_buildings   Number of buildings on parcel (PIP)
+      has_buildings=true/false        Parcel contains ≥1 building
+      min_building_height / max_building_height   Tallest building height (m)
+      min_building_stories / max_building_stories Tallest building stories
+      auto_class=<class>          Auto-class filter (comma-separated allowed):
+                                  forest, young_forest, wooded, meadow,
+                                  alpine_meadow, cropland, vineyard, orchard,
+                                  shrubland, built_up, farmstead,
+                                  infrastructure, water_body, disturbance,
+                                  bare, mixed
+      auto_subclass=<sub>         multi_storey, apartments, with_house,
+                                  recently_thinned, regenerating, pasture,
+                                  rugged, dense, recent_clearfell, ...
+      min_auto_class_confidence   0-1 minimum classifier confidence
       sort=<col>                  Sort column (default: elevation_m)
       sort_dir=asc/desc           Sort direction (default: desc)
       limit=<N>                   Max results (default 100, max 1000)
@@ -3412,6 +3426,10 @@ def api_query_parcels():
             'max_hansen_recent_5yr': int, 'min_hansen_recent_5yr': int,
             'max_hansen_total': int, 'min_hansen_total': int,
             'building_min_stories': int, 'building_max_stories': int,
+            'min_buildings': int, 'max_buildings': int,
+            'min_building_height': float, 'max_building_height': float,
+            'min_building_stories': int, 'max_building_stories': int,
+            'min_auto_class_confidence': float,
         }
         kwargs = {}
         for k, conv in _num.items():
@@ -3421,12 +3439,19 @@ def api_query_parcels():
                 except ValueError:
                     pass
 
+        has_buildings = None
+        if 'has_buildings' in args:
+            has_buildings = args.get('has_buildings', '').lower() in ('true', '1', 'yes')
+
         result = idx.query_parcels_index(
             kg_code=args.get('kg'),
             terrain_class=args.get('terrain_class'),
             aspect=args.get('aspect'),
             dominant_type=args.get('dominant_type'),
             building_roof_type=args.get('building_roof_type'),
+            auto_class=args.get('auto_class'),
+            auto_subclass=args.get('auto_subclass'),
+            has_buildings=has_buildings,
             is_vegetated=args.get('is_vegetated', '').lower() in ('true', '1') if 'is_vegetated' in args else None,
             state=args.get('state'),
             district=args.get('district'),

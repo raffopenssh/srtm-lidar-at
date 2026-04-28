@@ -674,8 +674,8 @@ function initMap() {
   L.control.layers(null, {
     'Tile dots': tileDotsLayer,
     'History dots': historyDotsLayer,
-    'Local Copernicus tiles': copLayer,
-    'Local Hansen tiles': hanLayer,
+    'Zenodo Copernicus cache': copLayer,
+    'Zenodo Hansen cache': hanLayer,
   }, {collapsed: true, position: 'topright'}).addTo(map);
   fetchTileOverlays();
 }

@@ -2346,6 +2346,58 @@ def processing_log():
         return jsonify({'error': str(e)}), 500
 
 
+_zenodo_warm_lock = threading.Lock()
+_zenodo_warm_started: set = set()
+
+
+def _warm_zenodo_zip_indices_async():
+    """Fetch ZIP central directories for every file in cache_manifest.json.
+
+    Runs once per (process, zip_name). Each fetched index is written to
+    ``data/austria_processor/zenodo_zip_index/<md5>.json`` by ``ZipIndex``,
+    where the ``processing/tiles`` endpoint picks it up on subsequent calls.
+    """
+    try:
+        manifest_path = Path('data/austria_processor/cache_manifest.json')
+        if not manifest_path.exists():
+            return
+        manifest = json.loads(manifest_path.read_text())
+    except Exception:
+        return
+
+    files = (manifest.get('files') or {})
+    to_warm = []
+    with _zenodo_warm_lock:
+        for zip_name in files:
+            if zip_name in _zenodo_warm_started:
+                continue
+            _zenodo_warm_started.add(zip_name)
+            to_warm.append(zip_name)
+    if not to_warm:
+        return
+
+    def _worker(names):
+        try:
+            from zenodo_cache import ZenodoCache
+        except Exception:
+            return
+        try:
+            cache = ZenodoCache()
+        except Exception:
+            return
+        for name in names:
+            try:
+                idx = cache._get_zip_index(name)
+                if idx is not None:
+                    # Trigger fetch + on-disk caching
+                    idx.list_entries()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, args=(to_warm,), daemon=True)
+    t.start()
+
+
 @app.route('/api/v1/processing/tiles')
 def processing_tiles():
     """Return Zenodo cache tile bboxes for map overlay in process.html.
@@ -2358,6 +2410,11 @@ def processing_tiles():
     han_seen: set = set()
     cop_tiles: list = []
     han_tiles: list = []
+
+    # Kick off a background warm-up of the Zenodo ZIP central-directory cache
+    # so subsequent calls can include peer-uploaded tiles. Idempotent: each
+    # ZIP is fetched at most once per process and cached on disk.
+    _warm_zenodo_zip_indices_async()
 
     def _add(product: str, w: float, s: float, e: float, n: float):
         key = (round(w, 4), round(s, 4), round(e, 4), round(n, 4))
@@ -2398,12 +2455,8 @@ def processing_tiles():
                     s, w, n, e = floats[0], floats[1], floats[2], floats[3]
                     _add(product, w, s, e, n)
 
-        # Source 2: locally-present tile .meta.json sidecars. Each sidecar
-        # is written next to a real .npz file, so this only includes tiles
-        # that are actually on this disk right now (LRU-evicted tiles are
-        # already gone). tile_bbox_index.json is intentionally NOT used
-        # because it can list tiles that have been evicted but never
-        # uploaded to Zenodo.
+        # Source 2: locally-present tile .meta.json sidecars (tiles physically
+        # on this disk right now — useful when ZIP indices are stale or absent).
         for sub, default_product in (
             ('copernicus_tiles', 'copernicus'),
             ('hansen_tiles', 'hansen'),

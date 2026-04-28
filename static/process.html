@@ -82,6 +82,9 @@
   /* Map */
   #kgMap { height: 200px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px; }
   .leaflet-container { background: var(--bg) !important; }
+  /* Match layer-control toggle size to zoom buttons (30x30) */
+  .leaflet-control-layers-toggle { width: 30px !important; height: 30px !important;
+    background-size: 18px 18px !important; }
   .leaflet-container.crosshair-cursor { cursor: crosshair !important; }
   .priority-drawing #btnDrawPriority { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.1); }
 
@@ -666,16 +669,16 @@ function initMap() {
   map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
-  // Zenodo cache overlays — created but hidden by default (toggle via layer control).
+  // Combined groups: tile dots = current + history; zenodo cache = cop + hansen.
   copLayer = L.layerGroup();
   hanLayer = L.layerGroup();
-  historyDotsLayer = L.layerGroup().addTo(map);
-  tileDotsLayer = L.layerGroup().addTo(map);
+  historyDotsLayer = L.layerGroup();
+  tileDotsLayer = L.layerGroup();
+  const tileDotsGroup = L.layerGroup([tileDotsLayer, historyDotsLayer]).addTo(map);
+  const zenodoGroup = L.layerGroup([copLayer, hanLayer]);
   L.control.layers(null, {
-    'Tile dots': tileDotsLayer,
-    'History dots': historyDotsLayer,
-    'Zenodo Copernicus cache': copLayer,
-    'Zenodo Hansen cache': hanLayer,
+    'Tile dots': tileDotsGroup,
+    'Zenodo cache': zenodoGroup,
   }, {collapsed: true, position: 'topright'}).addTo(map);
   fetchTileOverlays();
 }

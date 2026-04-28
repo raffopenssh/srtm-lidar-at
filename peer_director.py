@@ -323,14 +323,52 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
         queue = [c for c in queue if c not in exclude]
     if not queue:
         return {'status': 'empty_queue', 'synced': 0}
+
+    # Identify tombstoned codes (force-requeued KGs that are locally
+    # "completed" but the operator wants re-processed). The peer's
+    # /processing/queue endpoint filters out already-completed KGs when
+    # skip_processed=True — so tombstoned codes would be silently dropped.
+    # Push them in a second request with skip_processed=False so the peer
+    # accepts them at the front of its queue.
+    tombstoned = set()
     try:
-        r = requests.post(
-            peer_url.rstrip('/') + '/api/v1/processing/queue',
-            json={'kgs': queue, 'position': 0, 'skip_processed': True},
-            timeout=PEER_TIMEOUT,
-        )
-        result = r.json()
-        log.info('Queue sync to %s: pushed %d KGs — %s%s', peer_url, len(queue),
+        import re as _re
+        tpath = DATA_DIR / 'manifest_tombstones.json'
+        if tpath.exists():
+            tdata = json.loads(tpath.read_text())
+            if isinstance(tdata, dict):
+                for key in tdata:
+                    m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
+                    if m:
+                        tombstoned.add(m.group(1))
+    except Exception:
+        tombstoned = set()
+
+    tombstoned_in_queue = [c for c in queue if c in tombstoned]
+    normal_queue = [c for c in queue if c not in tombstoned]
+
+    try:
+        # Push normal codes first (they go to position 0).
+        result = {'status': 'empty_queue'}
+        if normal_queue:
+            r = requests.post(
+                peer_url.rstrip('/') + '/api/v1/processing/queue',
+                json={'kgs': normal_queue, 'position': 0, 'skip_processed': True},
+                timeout=PEER_TIMEOUT,
+            )
+            result = r.json()
+        # Then push tombstoned codes at position 0 — ends up in front,
+        # ahead of the normal codes, preserving the original ordering.
+        if tombstoned_in_queue:
+            r2 = requests.post(
+                peer_url.rstrip('/') + '/api/v1/processing/queue',
+                json={'kgs': tombstoned_in_queue, 'position': 0,
+                      'skip_processed': False},
+                timeout=PEER_TIMEOUT,
+            )
+            result = r2.json()
+        log.info('Queue sync to %s: pushed %d KGs (%d tombstoned) — %s%s',
+                 peer_url, len(queue), len(tombstoned_in_queue),
                  result.get('status', '?'),
                  (' (excluded ' + ','.join(sorted(exclude)) + ')') if exclude else '')
         return result

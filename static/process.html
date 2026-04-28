@@ -1931,6 +1931,7 @@ function renderLastKg(js) {
     if (bare >= 0.50) return 'bare';
     return 'mixed';
   }
+  let _parcelTypesEntry = null;
   if ((parcels.details||[]).length > 0) {
     const tally = {};
     for (const p of parcels.details) {
@@ -1941,10 +1942,7 @@ function renderLastKg(js) {
     if (ranked.length > 0) {
       const top = ranked.slice(0, 6).map(([k,v]) => k + ' ' + v).join(', ');
       const more = ranked.length > 6 ? ' … +' + (ranked.length-6) : '';
-      // Insert right after Parcels item
-      const pIdx = items.findIndex(it => it.l === 'Parcels');
-      const entry = {l: 'Parcel Types', v: '<span style="font-size:0.82em">'+top+more+'</span>'};
-      if (pIdx >= 0) items.splice(pIdx+1, 0, entry); else items.push(entry);
+      _parcelTypesEntry = {l: 'Parcel Types', v: '<span style="font-size:0.82em">'+top+more+'</span>'};
     }
   }
   function _cascadeTop() {
@@ -2015,6 +2013,7 @@ function renderLastKg(js) {
     // Show top divergence pairs
     const topDiv = cls.top_divergences || [];
     if (topDiv.length > 0) {
+      if (_parcelTypesEntry) { items.push(_parcelTypesEntry); _parcelTypesEntry = null; }
       const pairs = topDiv.slice(0, 5).map(d => d.rf_type + '\u2192' + d.final_type + ' (' + d.count + ')').join(', ');
       items.push({l: 'Top Mismatches', v: '<span style="font-size:0.82em">' + pairs + '</span>'});
     }

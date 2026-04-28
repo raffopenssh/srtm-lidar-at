@@ -453,12 +453,20 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         return {'error': str(e2), 'queue_sync': queue_result, 'method': 'both_failed'}
 
 
-def stop_peer_processor(peer_url: str | None) -> dict:
-    """Stop the processor on a peer."""
+def stop_peer_processor(peer_url: str | None, graceful: bool = False) -> dict:
+    """Stop the processor on a peer.
+
+    If ``graceful`` is True, asks the peer to exit cleanly after the
+    current KG instead of SIGTERM'ing mid-KG. Used for cache-only peers
+    where mid-KG kills waste pure CPU work without any credential-safety
+    benefit.
+    """
     url = peer_url if peer_url else 'http://127.0.0.1:8000'
     try:
+        params = {'graceful': '1'} if graceful else None
         r = requests.post(
             url.rstrip('/') + '/api/v1/processing/stop',
+            params=params,
             timeout=30  # stop can take a moment
         )
         if r.ok:
@@ -1311,16 +1319,23 @@ class PeerDirector:
         if not whitelist:
             # Nothing to do for cache-only peers.  Stop any that are
             # running (they'd otherwise idle-loop a fresh subprocess).
+            # Use a graceful stop so the peer finishes its current KG
+            # before exiting — cache-only work is pure CPU + Zenodo
+            # upload, no Copernicus credentials at risk, so there's no
+            # reason to kill mid-KG and waste the work.  If the
+            # whitelist refills before the peer drains, the next tick
+            # will see it still running and let it carry on.
             if running_cache_only:
-                log.info('No cache-ready KGs — stopping %d running cache-only peers',
+                log.info('No cache-ready KGs — gracefully stopping %d running '
+                         'cache-only peers (will exit after current KG)',
                          len(running_cache_only))
                 for pid in running_cache_only:
                     p = get_peer_by_id(cfg, pid)
                     if p:
                         try:
-                            stop_peer_processor(p.get('url'))
+                            stop_peer_processor(p.get('url'), graceful=True)
                         except Exception as e:
-                            log.warning('Stop cache-only %s failed: %s', pid, e)
+                            log.warning('Graceful stop cache-only %s failed: %s', pid, e)
             return
 
         # Spread the whitelist across peers — each peer gets a slice so

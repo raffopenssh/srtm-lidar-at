@@ -801,7 +801,15 @@ class PeerDirector:
                     bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
                     used = bw.get('used_bytes', 0)
                     remaining_gb = (budget_bytes - used) / (1024 ** 3)
-                    if remaining_gb >= 2:
+                    # Honour not_before cooldown — if scheduled, demote
+                    # the active peer so a different one can be picked.
+                    if _peer_is_scheduled(peer):
+                        log.info('Active peer %s is scheduled (not_before=%s) \u2014 letting director pick another',
+                                 active_id, peer.get('not_before'))
+                        with self._lock:
+                            self.state['active_peer'] = None
+                            active_id = None
+                    elif remaining_gb >= 2:
                         log.info('Restarting processor on %s (%.1f GB remaining)',
                                  active_id, remaining_gb)
                         start_peer_processor(peer.get('url'))

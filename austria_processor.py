@@ -126,8 +126,10 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
 
     try:
         from zenodo_cache import ZenodoCache
+        from zenodo_lock import zenodo_upload_lock
         cache = ZenodoCache()
-        stats = cache.upload_all()
+        with zenodo_upload_lock(purpose='cache_flush'):
+            stats = cache.upload_all()
         n_tiles = stats.get("tiles_total", 0)
         n_zips = stats.get("zips_uploaded", 0)
         if n_tiles > 0:
@@ -6017,6 +6019,17 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             break  # abort tile loop — defer KG for retry
                     except Exception as e:
                         from copernicus import CreditsExhaustedError, IPThrottledError, ip_throttled as _cop_throttled
+                        from tile_cache import CacheMissError as _CacheMissError
+                        if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
+                            # Cache-only peer hit a missing tile — abort KG
+                            # so the director re-queues it for the primary.
+                            log.warning("KG %s: cache-only mode hit a miss — aborting (%s)",
+                                        kg_code, e)
+                            result["cache_incomplete"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"cache_miss_tile_{tile_idx+1}"
+                            break
                         if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
                            isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
                             log.error("KG %s: Copernicus throttled/exhausted — aborting KG for retry", kg_code)
@@ -6277,6 +6290,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _report_step(f"tile_{tile_idx+1}",
                          f"done: {len(core_objects)} objects")
 
+        # --- Abort early if cache-only peer hit a miss ---
+        if result.get("cache_incomplete") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to cache miss — "
+                        "will be re-queued for the frontier (primary) peer",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_cache_incomplete"
+            return result
         # --- Abort early if Copernicus throttled or failed mid-KG ---
         if result.get("copernicus_exhausted") and result.get("success") is False:
             log.warning("KG %s: aborting after tile %d/%d due to Copernicus throttle — "
@@ -6971,6 +6991,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
     large GPKGs (multi-GB) on a disk-constrained VM.
     """
     from zenodo_client import Client, landscape_metadata
+    from zenodo_lock import zenodo_upload_lock
 
     client = Client(token=ZENODO_TOKEN)
     upload_stats = {"uploaded": [], "errors": [], "total_bytes": 0}
@@ -6978,7 +6999,12 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
     _avail = available_layers or []
     _miss = missing_layers or []
 
-    for file_key, local_path in files.items():
+    # Acquire fleet-wide Zenodo upload lease.  Single token + sometimes
+    # a shared draft deposition mean concurrent peers must serialise.
+    _lock_ctx = zenodo_upload_lock(purpose='kg_upload', kg=kg_code)
+    _lock_ctx.__enter__()
+    try:
+      for file_key, local_path in files.items():
         if not local_path or not os.path.exists(local_path):
             continue
         if os.path.getsize(local_path) == 0:
@@ -7037,6 +7063,8 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             })
             log.error("KG %s: Zenodo upload failed for %s: %s",
                       kg_code, file_key, e)
+    finally:
+        _lock_ctx.__exit__(None, None, None)
 
     return upload_stats
 
@@ -7468,6 +7496,11 @@ def main():
                         help="List KGs without processing")
     parser.add_argument("--mark-uncertain", action="store_true",
                         help="Label low-confidence RF segments as 'unclassified' instead of rule-based fallback")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="Refuse remote Copernicus/Hansen fetches; only "
+                             "process KGs whose tiles are fully present in the "
+                             "local + Zenodo cache.  Cache misses re-queue the "
+                             "KG for the frontier (primary) peer.")
     parser.add_argument("--peers", nargs='*', default=[],
                         help="Peer instance URLs for coordination (e.g. https://srtm-lidar-at.exe.xyz:8000)")
     parser.add_argument("--instance-id", default=None,
@@ -7503,6 +7536,12 @@ def main():
     import socket as _socket
     _instance_id = args.instance_id or _socket.gethostname()
     os.environ['INSTANCE_ID'] = _instance_id
+    # Cache-only mode propagates to subprocesses via env var.
+    if args.cache_only:
+        os.environ['COPERNICUS_FORBIDDEN'] = '1'
+        import tile_cache as _tc
+        _tc.set_forbid_remote(True)
+        log.info("🔒 Cache-only mode: will refuse Copernicus/Hansen API fetches")
     peer_urls = args.peers or []
 
     log.info("=" * 70)
@@ -7758,6 +7797,7 @@ def main():
         _completed_at_start=_n_completed,
         started_at=datetime.now(timezone.utc).isoformat(),
         pending_blocks=len(pending),
+        cache_only=bool(args.cache_only),
     )
     progress.save()
 
@@ -8316,7 +8356,20 @@ def main():
                                     or '402' in str(result.get("error", ""))
                                     or 'PaymentRequired' in str(result.get("error", "")))
                 is_cop_batch_failure = result.get("copernicus_failed", False)
-                if is_cop_batch_failure:
+                is_cache_incomplete = result.get("cache_incomplete", False)
+                if is_cache_incomplete:
+                    # Cache-only peer hit a missing tile.  The KG must be
+                    # processed by the frontier (primary) peer, which has
+                    # Copernicus credentials.  Re-queue without marking
+                    # as failed; do NOT defer locally — the director will
+                    # exclude this KG from cache-only peers.
+                    log.info("KG %s: cache miss in cache-only mode — "
+                             "re-queueing for the frontier peer", kg_code)
+                    progress.add_log("info",
+                                     f"KG {kg_code}: cache miss — deferred to frontier",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                elif is_cop_batch_failure:
                     log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
                     progress.add_log("warning",
                                      f"KG {kg_code}: Copernicus batch failure — deferred retry",

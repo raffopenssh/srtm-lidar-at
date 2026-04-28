@@ -1561,6 +1561,11 @@ def processing_start():
     state = request.args.get('state') or request.json.get('state', '') if request.is_json else ''
     kg = request.args.get('kg') or (request.json.get('kg', '') if request.is_json else '')
     no_cop = request.args.get('no_copernicus', 'false').lower() in ('true', '1')
+    body = request.get_json(silent=True) or {}
+    cache_only = (
+        request.args.get('cache_only', '').lower() in ('1', 'true', 'yes')
+        or bool(body.get('cache_only'))
+    )
 
     if kg:
         args.extend(['--kg', kg])
@@ -1568,15 +1573,30 @@ def processing_start():
         args.extend(['--state', state])
     if no_cop:
         args.append('--no-copernicus')
+    if cache_only:
+        args.append('--cache-only')
 
     log_file = Path('data/austria_processor/logs/processor.log')
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(log_file, 'a')
 
+    # Inject Zenodo upload mutex broker URL.  Primary serves the broker
+    # on its own gunicorn; peers point at the primary.  Reads from
+    # data/austria_processor/zenodo_lock_url.txt if present, else
+    # localhost when this instance is the director, else unset (no-op).
+    proc_env = os.environ.copy()
+    if 'ZENODO_LOCK_URL' not in proc_env:
+        lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
+        is_director = Path('data/austria_processor/is_director').exists()
+        if lock_file.exists():
+            proc_env['ZENODO_LOCK_URL'] = lock_file.read_text().strip()
+        elif is_director:
+            proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+
     import subprocess
     _processor_process = subprocess.Popen(
         args, stdout=log_fd, stderr=subprocess.STDOUT,
-        start_new_session=True,
+        start_new_session=True, env=proc_env,
     )
     log.info('Austria processor started: PID %d, args=%s', _processor_process.pid, args)
     return jsonify({'status': 'started', 'pid': _processor_process.pid})
@@ -2981,6 +3001,128 @@ def director_restart_peer():
         'stop': stop_result,
         'start': start_result,
     })
+
+
+# === SECTION: Zenodo upload mutex ===
+#
+# Serialise Zenodo write operations across peers — the API token is
+# shared, and concurrent PUTs to the same draft deposition fail.  All
+# peers acquire a lease before uploading and renew it via heartbeat.
+# Stale leases (no heartbeat for >120s) are auto-released.
+
+_ZENODO_LOCK = {
+    'holder': None,        # peer id (str) or None
+    'token': None,         # uuid string returned to the holder
+    'acquired_at': 0.0,    # epoch s
+    'last_heartbeat': 0.0, # epoch s
+    'purpose': None,       # 'kg_upload' | 'cache_flush' | ...
+    'kg': None,            # optional KG code for diagnostics
+}
+_ZENODO_LOCK_LOCK = threading.Lock()
+_ZENODO_LOCK_TTL = 120.0  # seconds without heartbeat → stale
+
+
+def _zenodo_lock_is_stale(now: float) -> bool:
+    if _ZENODO_LOCK['holder'] is None:
+        return False
+    return (now - _ZENODO_LOCK['last_heartbeat']) > _ZENODO_LOCK_TTL
+
+
+@app.route('/api/v1/zenodo/lock', methods=['POST'])
+def zenodo_lock_acquire():
+    """Acquire the global Zenodo upload lease.
+
+    Body: {peer: <id>, purpose: 'kg_upload'|'cache_flush'|..., kg?: <code>}
+    Returns 200 + {token, ttl_s} on success, 423 + {holder, age_s} on conflict.
+    The caller must POST /api/v1/zenodo/lock/heartbeat at least every TTL/2 s.
+    """
+    import uuid as _uuid
+    body = request.get_json(silent=True) or {}
+    peer = str(body.get('peer') or 'anon')
+    purpose = str(body.get('purpose') or 'unknown')
+    kg = body.get('kg')
+    now = time.time()
+    with _ZENODO_LOCK_LOCK:
+        if _ZENODO_LOCK['holder'] is not None and not _zenodo_lock_is_stale(now):
+            # Same peer asking again — reuse the lease (idempotent acquire)
+            if _ZENODO_LOCK['holder'] == peer:
+                _ZENODO_LOCK['last_heartbeat'] = now
+                return jsonify({
+                    'token': _ZENODO_LOCK['token'],
+                    'ttl_s': _ZENODO_LOCK_TTL,
+                    'reacquired': True,
+                })
+            return jsonify({
+                'error': 'locked',
+                'holder': _ZENODO_LOCK['holder'],
+                'purpose': _ZENODO_LOCK['purpose'],
+                'kg': _ZENODO_LOCK['kg'],
+                'age_s': round(now - _ZENODO_LOCK['acquired_at'], 1),
+                'idle_s': round(now - _ZENODO_LOCK['last_heartbeat'], 1),
+            }), 423
+        # Free or stale — grant the lease
+        if _ZENODO_LOCK['holder'] is not None:
+            log.warning('Zenodo lock: stale holder=%s reclaimed by %s',
+                        _ZENODO_LOCK['holder'], peer)
+        token = _uuid.uuid4().hex
+        _ZENODO_LOCK.update({
+            'holder': peer, 'token': token,
+            'acquired_at': now, 'last_heartbeat': now,
+            'purpose': purpose, 'kg': kg,
+        })
+        return jsonify({'token': token, 'ttl_s': _ZENODO_LOCK_TTL})
+
+
+@app.route('/api/v1/zenodo/lock/heartbeat', methods=['POST'])
+def zenodo_lock_heartbeat():
+    """Renew an active lease.  Body: {token: <uuid>}."""
+    body = request.get_json(silent=True) or {}
+    token = body.get('token')
+    now = time.time()
+    with _ZENODO_LOCK_LOCK:
+        if _ZENODO_LOCK['holder'] is None or _ZENODO_LOCK['token'] != token:
+            return jsonify({'error': 'no_lease'}), 410
+        _ZENODO_LOCK['last_heartbeat'] = now
+        return jsonify({'ok': True, 'ttl_s': _ZENODO_LOCK_TTL,
+                        'age_s': round(now - _ZENODO_LOCK['acquired_at'], 1)})
+
+
+@app.route('/api/v1/zenodo/lock', methods=['DELETE'])
+def zenodo_lock_release():
+    """Release the lease.  Body: {token: <uuid>}."""
+    body = request.get_json(silent=True) or {}
+    token = body.get('token')
+    with _ZENODO_LOCK_LOCK:
+        if _ZENODO_LOCK['holder'] is None or _ZENODO_LOCK['token'] != token:
+            return jsonify({'error': 'no_lease'}), 410
+        log.info('Zenodo lock: released by %s (purpose=%s, held %.1fs)',
+                 _ZENODO_LOCK['holder'], _ZENODO_LOCK['purpose'],
+                 time.time() - _ZENODO_LOCK['acquired_at'])
+        _ZENODO_LOCK.update({
+            'holder': None, 'token': None,
+            'acquired_at': 0.0, 'last_heartbeat': 0.0,
+            'purpose': None, 'kg': None,
+        })
+        return jsonify({'ok': True})
+
+
+@app.route('/api/v1/zenodo/lock', methods=['GET'])
+def zenodo_lock_status():
+    """Inspect current lease (no auth)."""
+    now = time.time()
+    with _ZENODO_LOCK_LOCK:
+        if _ZENODO_LOCK['holder'] is None:
+            return jsonify({'free': True})
+        return jsonify({
+            'free': False,
+            'holder': _ZENODO_LOCK['holder'],
+            'purpose': _ZENODO_LOCK['purpose'],
+            'kg': _ZENODO_LOCK['kg'],
+            'age_s': round(now - _ZENODO_LOCK['acquired_at'], 1),
+            'idle_s': round(now - _ZENODO_LOCK['last_heartbeat'], 1),
+            'stale': _zenodo_lock_is_stale(now),
+            'ttl_s': _ZENODO_LOCK_TTL,
+        })
 
 
 @app.route('/api/v1/admin/restart_processor', methods=['POST'])

@@ -97,6 +97,11 @@ mkdir -p /tmp/copernicus_cache /tmp/hansen_cache
 echo "${PEER_URL}" > data/austria_processor/peer_urls.txt
 echo "  ✓ Peer URL written to data/austria_processor/peer_urls.txt"
 
+# Point this peer's processor at the primary's Zenodo upload-lock broker.
+# All peers serialise their Zenodo writes (single API token) via this URL.
+echo "${PEER_URL}" > data/austria_processor/zenodo_lock_url.txt
+echo "  ✓ Zenodo lock URL written to data/austria_processor/zenodo_lock_url.txt"
+
 # ── 6. Install systemd services ──────────────────────────
 echo "\n[6/7] Installing systemd services..."
 

@@ -35,6 +35,29 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+class CacheMissError(RuntimeError):
+    """Raised by tile caches in *forbid_remote* mode when a tile is
+    missing both locally and from the Zenodo persistent cache.
+
+    Used by *cache-only* peers to refuse processing KGs that would
+    require Copernicus or Hansen API calls.  The caller (austria_processor)
+    catches this and re-queues the KG for the frontier (primary) peer.
+    """
+
+
+# Process-global flag — when True, all tile caches refuse remote fetches
+# and raise CacheMissError on any miss.  Set via env COPERNICUS_FORBIDDEN=1
+# or by austria_processor.main() when started with --cache-only.
+FORBID_REMOTE: bool = os.environ.get("COPERNICUS_FORBIDDEN", "").lower() in ("1", "true", "yes")
+
+
+def set_forbid_remote(enabled: bool) -> None:
+    """Toggle cache-only mode globally for this process."""
+    global FORBID_REMOTE
+    FORBID_REMOTE = bool(enabled)
+    log.info("tile_cache: forbid_remote=%s (cache-only mode)", FORBID_REMOTE)
+
+
 def _write_tile_meta(npz_path: Path, product: str,
                      w: float, s: float, e: float, n: float,
                      **extra):
@@ -526,6 +549,9 @@ class CopernicusTileCache:
 
     def _fetch_ndvi_cell(self, cw, cs, ce, cn, year, cred_index):
         """Fetch a single 0.1° NDVI cell from the API and cache it."""
+        if FORBID_REMOTE:
+            raise CacheMissError(
+                f"NDVI cell {cw:.2f},{cs:.2f} (year={year}) not cached (forbid_remote)")
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("ndvi", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -627,6 +653,9 @@ class CopernicusTileCache:
 
     def _fetch_worldcover_cell(self, cw, cs, ce, cn, cred_index):
         """Fetch a single 0.1° WorldCover cell from the API and cache it."""
+        if FORBID_REMOTE:
+            raise CacheMissError(
+                f"WorldCover cell {cw:.2f},{cs:.2f} not cached (forbid_remote)")
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("worldcover", cw, cs, ce, cn)
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -728,6 +757,9 @@ class CopernicusTileCache:
 
     def _fetch_sar_cell(self, cw, cs, ce, cn, year, cred_index):
         """Fetch a single 0.1° SAR cell from the API and cache it."""
+        if FORBID_REMOTE:
+            raise CacheMissError(
+                f"SAR cell {cw:.2f},{cs:.2f} (year={year}) not cached (forbid_remote)")
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("sar", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -840,6 +872,9 @@ class CopernicusTileCache:
 
     def _fetch_harmonics_cell(self, cw, cs, ce, cn, year, progress_fn):
         """Fetch a single 0.1° harmonics cell from the API and cache it."""
+        if FORBID_REMOTE:
+            raise CacheMissError(
+                f"Harmonics cell {cw:.2f},{cs:.2f} (year={year}) not cached (forbid_remote)")
         cell_bbox = {"west": cw, "south": cs, "east": ce, "north": cn}
         path = self._tile_path("harmonics", cw, cs, ce, cn, year=year)
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -991,6 +1026,51 @@ class HansenTileCache:
         w, s, e, n = bbox_wgs
         return snap_bbox_to_grid(w, s, e, n, self.GRID_STEP)
 
+    def has_cached(self, bbox_wgs: tuple) -> bool:
+        """Check if Hansen tile is cached (local or Zenodo).  No downloads.
+
+        Iterates 0.5° cells covering *bbox_wgs* and verifies each is on
+        local disk or recorded in the Zenodo cache manifest's ZIP index.
+        """
+        try:
+            if self._zenodo_cache is None and not self._zenodo_tried:
+                self._zenodo_tried = True
+                from zenodo_cache import ZenodoCache, CacheManifest
+                manifest = CacheManifest()
+                if manifest.depo_id or manifest.all_files():
+                    self._zenodo_cache = ZenodoCache()
+        except Exception:
+            pass
+        tw, ts, te, tn = self._snap(bbox_wgs)
+        step = self.GRID_STEP
+        cw = tw
+        while cw < te - 1e-9:
+            cs = ts
+            while cs < tn - 1e-9:
+                ce = round(cw + step, 5)
+                cn = round(cs + step, 5)
+                path = self._tile_path(cw, cs, ce, cn)
+                if path.exists():
+                    cs += step
+                    continue
+                if self._zenodo_cache is None:
+                    return False
+                try:
+                    from zenodo_cache import _strip_for_lat, _zip_filename, _npz_entry_name
+                    strip_s, strip_n = _strip_for_lat(cs)
+                    zip_name = _zip_filename("hansen", strip_s, strip_n)
+                    idx = self._zenodo_cache._get_zip_index(zip_name)
+                    if idx is None:
+                        return False
+                    entry_name = _npz_entry_name("hansen", cw, cs, ce, cn)
+                    if not idx.has_entry(entry_name):
+                        return False
+                except Exception:
+                    return False
+                cs += step
+            cw += step
+        return True
+
     def get_raw(self, bbox_wgs: tuple) -> Optional[dict]:
         """Get raw Hansen layers for a snapped tile bbox."""
         tw, ts, te, tn = self._snap(bbox_wgs)
@@ -1047,6 +1127,10 @@ class HansenTileCache:
                     return result
             except Exception as e:
                 log.debug("Zenodo Hansen fetch failed: %s", e)
+
+        if FORBID_REMOTE:
+            raise CacheMissError(
+                f"Hansen tile {tw:.2f},{ts:.2f} not cached (forbid_remote)")
 
         try:
             import hansen
@@ -1345,3 +1429,31 @@ def cache_summary() -> dict:
         else:
             result[name] = {"files": 0, "size_mb": 0}
     return result
+
+
+# === SECTION: KG cache coverage predicate ===
+
+def is_kg_fully_cached(bbox_wgs: dict, year: int = 2024,
+                      check_hansen: bool = True,
+                      cop_cache: "CopernicusTileCache | None" = None,
+                      hansen_cache: "HansenTileCache | None" = None) -> bool:
+    """True iff all Copernicus + Hansen tiles for *bbox_wgs* are cached.
+
+    Used by the Peer Director to identify KGs a *cache-only* peer can
+    process without burning Copernicus credentials.  Checks local disk
+    and the Zenodo persistent cache index — never downloads anything.
+    """
+    cop = cop_cache or CopernicusTileCache()
+    if not cop.has_cached(bbox_wgs, ndvi=True, landcover=True,
+                          sar=True, harmonics=True, year=year):
+        return False
+    if check_hansen:
+        hc = hansen_cache or HansenTileCache()
+        try:
+            tup = (bbox_wgs["west"], bbox_wgs["south"],
+                   bbox_wgs["east"], bbox_wgs["north"])
+        except Exception:
+            return False
+        if not hc.has_cached(tup):
+            return False
+    return True

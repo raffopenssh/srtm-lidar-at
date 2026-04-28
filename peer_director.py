@@ -44,6 +44,16 @@ BANDWIDTH_BUDGET_GB = 95  # conservative — leave 5 GB headroom out of 100
 BANDWIDTH_BUDGET_BYTES = BANDWIDTH_BUDGET_GB * (1024 ** 3)
 BANDWIDTH_RENEW_DAY = 17  # day of month when exe.dev bandwidth resets
 
+# Number of enabled peers to keep idle as reserve (never started by
+# the director).  Operational headroom for ad-hoc work, RF training,
+# and bandwidth/credential burst capacity.
+MIN_RESERVE_PEERS = 5
+# How many cache-only peers may run concurrently with the frontier peer.
+# Each cache-only peer only does BEV reads + CPU + Zenodo upload — no
+# Copernicus credentials — so we can run several in parallel.  The
+# limit exists to avoid hammering the (single-token) Zenodo upload mutex.
+MAX_CACHE_ONLY_PEERS = 8
+
 # How often the director checks state (seconds)
 DIRECTOR_POLL_INTERVAL = 30
 # Grace period after stopping a peer before starting another (seconds)
@@ -327,6 +337,38 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
         return {'error': str(e)}
 
 
+def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
+    """Push an explicit list of KG codes as the peer's priority queue.
+
+    Used when sending a *cache-only* peer a whitelist of fully-cached KGs.
+    Replaces the peer's priority queue with the given codes.
+    """
+    if not codes:
+        return {'status': 'empty_whitelist', 'synced': 0}
+    try:
+        # Replace the queue (PUT) so previous frontier work doesn't leak in.
+        r = requests.put(
+            peer_url.rstrip('/') + '/api/v1/processing/queue',
+            json={'queue': codes},
+            timeout=PEER_TIMEOUT,
+        )
+        if r.ok:
+            log.info('Whitelist queue PUT to %s: %d KGs', peer_url, len(codes))
+            return r.json()
+        # Fallback: POST at front
+        r2 = requests.post(
+            peer_url.rstrip('/') + '/api/v1/processing/queue',
+            json={'kgs': codes, 'position': 0, 'skip_processed': True},
+            timeout=PEER_TIMEOUT,
+        )
+        log.info('Whitelist queue POST to %s: %d KGs (PUT was %d)',
+                 peer_url, len(codes), r.status_code)
+        return r2.json() if r2.ok else {'error': f'http {r2.status_code}'}
+    except Exception as e:
+        log.warning('Whitelist queue push to %s failed: %s', peer_url, e)
+        return {'error': str(e)}
+
+
 def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
     """Collect KGs reserved by other peers (not `exclude_peer_id`).
 
@@ -345,29 +387,39 @@ def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
     return out
 
 
-def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None) -> dict:
+def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
+                         *, cache_only: bool = False,
+                         queue_whitelist: list | None = None) -> dict:
     """Start the processor on a peer.
 
     For remote peers, syncs the local priority queue first so the peer
     processes the same KGs in priority order. `exclude_kgs` lets callers
     suppress KGs reserved for other (cooled-down) peers.
+
+    If *cache_only* is True, the peer is started with the ``--cache-only``
+    flag so it refuses any Copernicus/Hansen API call.  Use *queue_whitelist*
+    to send only KGs known to be fully cached.
     """
+    payload = {'cache_only': True} if cache_only else {}
     if peer_url is None:
         # Local start — use the local API so _processor_process is tracked
         try:
             r = requests.post('http://127.0.0.1:8000/api/v1/processing/start',
-                              json={}, timeout=PEER_TIMEOUT)
+                              json=payload, timeout=PEER_TIMEOUT)
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
     # Remote peer — sync cache manifest + priority queue before starting
     _sync_cache_manifest_to_peer(peer_url)
-    queue_result = sync_queue_to_peer(peer_url, exclude=exclude_kgs)
+    if queue_whitelist is not None:
+        queue_result = _push_queue_to_peer(peer_url, list(queue_whitelist))
+    else:
+        queue_result = sync_queue_to_peer(peer_url, exclude=exclude_kgs)
     # Try API start first, fall back to systemd restart via admin endpoint
     try:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/processing/start',
-            json={},
+            json=payload,
             timeout=PEER_TIMEOUT,
         )
         if r.ok:
@@ -643,6 +695,8 @@ class PeerDirector:
                 'not_before': peer.get('not_before'),
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
+                'role': self._peer_role(peer),
+                'cache_only_run': bool(ps.get('cache_only')),
                 'is_active': pid == state.get('active_peer'),
                 'processor_state': proc_status,
                 'current_kg': (ps.get('current_kg') or {}).get('code'),
@@ -654,12 +708,19 @@ class PeerDirector:
                 'region': ps.get('region', ''),
             })
 
+        cache_ready = state.get('_cache_ready_cache') or {}
+        cache_only_running = sum(1 for p in peers_status if p['cache_only_run'])
         return {
             'mode': state.get('mode', 'auto'),
             'active_peer': state.get('active_peer'),
             'last_switch': state.get('last_switch'),
             'budget_gb': cfg.get('budget_gb', BANDWIDTH_BUDGET_GB),
             'renew_day': cfg.get('renew_day', BANDWIDTH_RENEW_DAY),
+            'min_reserve_peers': cfg.get('min_reserve_peers', MIN_RESERVE_PEERS),
+            'max_cache_only_peers': cfg.get('max_cache_only_peers', MAX_CACHE_ONLY_PEERS),
+            'cache_only_running': cache_only_running,
+            'cache_ready_kgs': len(cache_ready.get('codes') or []),
+            'cache_ready_at': cache_ready.get('at'),
             'cycle_start': get_billing_cycle_start().isoformat(),
             'peers': peers_status,
         }
@@ -964,15 +1025,20 @@ class PeerDirector:
                     with self._lock:
                         self.state.get('unreachable_count', {}).pop(active_id, None)
 
-        # Enforce single-active: stop any non-active peers that are running
-        # (they may have been started independently or before director took over)
+        # Enforce single-active for the FRONTIER role: stop any non-active
+        # peers that are running a non-cache-only processor.  Cache-only
+        # peers (no Copernicus credentials) may run in parallel — they're
+        # managed by ``_orchestrate_cache_only``.
         if active_id:
             for p in cfg.get('peers', []):
                 if p['id'] != active_id and p.get('url') is not None:
                     ps = get_peer_status(p.get('url'))
                     if ps.get('state') in ('running', 'processing'):
-                        log.warning('Non-active peer %s is running — stopping it '
-                                    '(only %s should be active)', p['id'], active_id)
+                        if ps.get('cache_only'):
+                            continue  # benign — doesn't touch credentials
+                        log.warning('Non-active peer %s is running frontier work — '
+                                    'stopping it (only %s may run frontier)',
+                                    p['id'], active_id)
                         safely_stop_peer(p.get('url'), p['id'])
 
         # If no active peer, choose one
@@ -982,18 +1048,18 @@ class PeerDirector:
             if new_peer:
                 peer = get_peer_by_id(cfg, new_peer)
                 if peer:
-                    # CRITICAL: verify ALL other peers are fully stopped
-                    # before activating the new one. If we can't verify a
-                    # peer is stopped, abort — starting a new processor while
-                    # another may be running causes Copernicus 402 errors.
+                    # CRITICAL: verify no other peer is running FRONTIER
+                    # work before activating the new one.  Cache-only
+                    # peers don't touch Copernicus credentials and may
+                    # remain running in parallel.
                     blocked = False
                     for p in cfg.get('peers', []):
                         if p['id'] == new_peer:
                             continue
                         ps = get_peer_status(p.get('url'))
                         st = ps.get('state', 'unknown')
-                        if st in ('running', 'processing'):
-                            log.info('Stopping peer %s before activating %s',
+                        if st in ('running', 'processing') and not ps.get('cache_only'):
+                            log.info('Stopping frontier peer %s before activating %s',
                                      p['id'], new_peer)
                             res = safely_stop_peer(p.get('url'), p['id'])
                             if 'error' in res:
@@ -1019,6 +1085,296 @@ class PeerDirector:
                         save_director_state(self.state)
             else:
                 log.info('No peers with sufficient bandwidth available')
+
+    # ---- cache-only peer orchestration -----------------------------
+
+    def _peer_role(self, peer: dict) -> str:
+        """Return the peer's role: 'frontier' (default) or 'cache_only'."""
+        role = (peer.get('role') or '').strip().lower()
+        if role in ('cache_only', 'cache-only', 'cacheonly'):
+            return 'cache_only'
+        return 'frontier'
+
+    def _cached_lat_ranges(self) -> list[tuple[float, float]]:
+        """Lat strips covered by ALL required products in the Zenodo cache.
+
+        Reads ``cache_manifest.json`` and intersects strip availability
+        across ndvi, sar, harmonics, worldcover, hansen.  Returns
+        list of (south, north) lat pairs.  Cheap; lets the predicate
+        skip the >90 %% of KGs that fall outside any covered strip.
+        """
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        if not manifest_path.exists():
+            return []
+        try:
+            d = json.loads(manifest_path.read_text())
+        except Exception:
+            return []
+        files = d.get('files') or {}
+        # parse 'copernicus_<product>_strip_<S>_<N>.zip' / 'hansen_strip_<S>_<N>.zip'
+        per_product: dict[str, set[tuple[float, float]]] = {}
+        for name in files:
+            try:
+                base = name.replace('.zip', '')
+                parts = base.split('_strip_')
+                if len(parts) != 2:
+                    continue
+                product = parts[0]
+                if product.startswith('copernicus_'):
+                    product = product[len('copernicus_'):]
+                south, north = parts[1].split('_')
+                pair = (float(south), float(north))
+                per_product.setdefault(product, set()).add(pair)
+            except Exception:
+                continue
+        required = ['ndvi', 'sar', 'harmonics', 'worldcover', 'hansen']
+        if not all(p in per_product for p in required):
+            return []
+        common = set.intersection(*[per_product[p] for p in required])
+        return sorted(common)
+
+    def _compute_cache_ready_kgs(self, max_kgs: int = 200) -> list[str]:
+        """Return KG codes that are fully present in the local+Zenodo cache.
+
+        Two-stage: cheap lat-strip filter (intersects covered strips
+        across all products) followed by per-cell check via
+        ``tile_cache.is_kg_fully_cached(bbox)``.  Result is cached for
+        5 minutes — the cache extends as the frontier peer fetches new
+        tiles.
+        """
+        now = time.time()
+        cached = self.state.get('_cache_ready_cache') or {}
+        if cached.get('codes') is not None and (now - cached.get('at', 0)) < 300:
+            return cached['codes']
+
+        codes: list[str] = []
+        try:
+            from tile_cache import (CopernicusTileCache, HansenTileCache,
+                                     is_kg_fully_cached)
+            cop_cache = CopernicusTileCache()
+            hansen_cache = HansenTileCache()
+
+            lat_ranges = self._cached_lat_ranges()
+            if not lat_ranges:
+                log.info('Cache-ready scan: no fully-cached lat strip yet')
+                with self._lock:
+                    self.state['_cache_ready_cache'] = {'codes': [], 'at': now}
+                return []
+
+            kg_list_path = DATA_DIR / 'kg_list.json'
+            kgs = []
+            if kg_list_path.exists():
+                kgs = json.loads(kg_list_path.read_text())
+
+            try:
+                from app import _get_completed_kgs
+                completed = _get_completed_kgs()
+            except Exception:
+                completed = set()
+            failed = set()
+            failed_path = DATA_DIR / 'failed_kgs.json'
+            if failed_path.exists():
+                try:
+                    failed = set(json.loads(failed_path.read_text()))
+                except Exception:
+                    pass
+
+            try:
+                import tile_index as ti
+                year = ti.dataset_to_year(ti.DEFAULT_DATASET)
+            except Exception:
+                year = 2024
+
+            def _within_strips(s: float, n: float) -> bool:
+                for ls, ln in lat_ranges:
+                    if s >= ls - 1e-9 and n <= ln + 1e-9:
+                        return True
+                return False
+
+            scanned = 0
+            prefiltered = 0
+            for kg in kgs:
+                code = kg.get('kg_code')
+                if not code or code in completed or code in failed:
+                    continue
+                bb = kg.get('bbox') or {}
+                w, s = bb.get('min_lon'), bb.get('min_lat')
+                e, n = bb.get('max_lon'), bb.get('max_lat')
+                if None in (w, s, e, n):
+                    continue
+                if not _within_strips(s, n):
+                    continue
+                prefiltered += 1
+                bbox = {'west': w, 'south': s, 'east': e, 'north': n}
+                scanned += 1
+                try:
+                    if is_kg_fully_cached(bbox, year=year,
+                                          cop_cache=cop_cache,
+                                          hansen_cache=hansen_cache):
+                        codes.append(code)
+                        if len(codes) >= max_kgs:
+                            break
+                except Exception:
+                    continue
+            log.info('Cache-ready scan: %d/%d KGs in covered strips, %d fully cached (max %d)',
+                     prefiltered, len(kgs), len(codes), max_kgs)
+        except Exception as e:
+            log.warning('Cache-ready scan failed: %s', e)
+
+        with self._lock:
+            self.state['_cache_ready_cache'] = {'codes': codes, 'at': now}
+        return codes
+
+    def _orchestrate_cache_only(self):
+        """Start/stop cache-only peers around the frontier peer.
+
+        Rules:
+          * keep at least ``min_reserve`` enabled peers idle (never started).
+          * only enabled, non-scheduled peers with role=='cache_only' are
+            considered.  If no peers are explicitly tagged cache_only,
+            pick from idle frontier peers (their primary role is still
+            frontier; we just borrow them for cache-only work).
+          * never touch the active frontier peer.
+          * cap concurrent cache-only peers at MAX_CACHE_ONLY_PEERS.
+          * each cache-only peer gets a whitelist of fully-cached KGs.
+          * cache-only peers without enough whitelist work are stopped
+            so they free their slot.
+        """
+        with self._lock:
+            mode = self.state.get('mode', 'auto')
+            cfg = self.cfg.copy()
+            state_copy = self.state.copy()
+        if mode == 'paused':
+            return
+
+        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
+        min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
+        max_cache_only = int(cfg.get('max_cache_only_peers', MAX_CACHE_ONLY_PEERS))
+
+        active_frontier = state_copy.get('active_peer')
+        peers = list(cfg.get('peers', []))
+
+        # Currently running cache-only peers (by id).
+        running_cache_only: list[str] = []
+        # Eligible candidate peers (enabled, not scheduled, not the
+        # active frontier, has bandwidth, online).
+        candidates: list[dict] = []
+        unreachable = 0
+        for p in peers:
+            pid = p['id']
+            if not p.get('enabled', True):
+                continue
+            if _peer_is_scheduled(p):
+                continue
+            if pid == active_frontier:
+                continue
+            if p.get('reserved_kg'):
+                # Holds a frontier-only reservation — leave alone.
+                continue
+            bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
+            used = bw.get('used_bytes', 0)
+            if (budget_bytes - used) < 2 * (1024 ** 3):
+                continue
+            ps = get_peer_status(p.get('url'))
+            st = ps.get('state', 'unknown')
+            if st == 'unreachable':
+                unreachable += 1
+                continue
+            role = self._peer_role(p)
+            running = st in ('running', 'processing')
+            is_cache_only_run = bool(ps.get('cache_only'))
+            if running and is_cache_only_run:
+                running_cache_only.append(pid)
+            candidates.append({'peer': p, 'role': role, 'state': st,
+                               'is_cache_only_run': is_cache_only_run})
+
+        # Compute reserve target.  Reserve peers must be enabled+online
+        # but idle.  Count idle-eligible peers in `candidates`.
+        idle_eligible = [c for c in candidates
+                         if c['state'] in ('idle', 'stopped', 'unknown')]
+
+        # Total enabled peers (excluding active frontier).
+        total_enabled = sum(1 for p in peers if p.get('enabled', True))
+        # We must keep `min_reserve` peers idle.  Subtract running peers
+        # (frontier active + already-running cache-only) from total.
+        running_count = (1 if active_frontier else 0) + len(running_cache_only)
+        # Maximum we may add such that idle remaining ≥ min_reserve.
+        # idle_after_add = total_enabled - running_count - add
+        # We want idle_after_add ≥ min_reserve.
+        slack = max(0, total_enabled - running_count - min_reserve)
+        max_add = min(slack, max_cache_only - len(running_cache_only))
+
+        # Compute cache-ready whitelist (cheap due to caching).
+        whitelist = self._compute_cache_ready_kgs()
+        if not whitelist:
+            # Nothing to do for cache-only peers.  Stop any that are
+            # running (they'd otherwise idle-loop a fresh subprocess).
+            if running_cache_only:
+                log.info('No cache-ready KGs — stopping %d running cache-only peers',
+                         len(running_cache_only))
+                for pid in running_cache_only:
+                    p = get_peer_by_id(cfg, pid)
+                    if p:
+                        try:
+                            stop_peer_processor(p.get('url'))
+                        except Exception as e:
+                            log.warning('Stop cache-only %s failed: %s', pid, e)
+            return
+
+        # Spread the whitelist across peers — each peer gets a slice so
+        # they don't all race for the same KG.  We assume the queue head
+        # wins; KGs already taken by another peer are silently skipped
+        # by the processor's peer_claimed filter.
+        if max_add <= 0 and not running_cache_only:
+            # No room to add and none running — nothing to do.
+            return
+
+        # Choose new peers to start.  Prefer peers explicitly tagged
+        # role=='cache_only'; fall back to idle frontier peers.
+        idle_cache_only = [c for c in idle_eligible if c['role'] == 'cache_only']
+        idle_frontier = [c for c in idle_eligible if c['role'] != 'cache_only']
+        to_start = []
+        for c in idle_cache_only + idle_frontier:
+            if len(to_start) >= max_add:
+                break
+            to_start.append(c['peer'])
+
+        # Slice whitelist across (running_cache_only + to_start) so each
+        # peer has a distinct chunk.  We don't truly partition (peers may
+        # finish at different rates) but it gives them different starts.
+        all_workers = list(running_cache_only) + [p['id'] for p in to_start]
+        if not all_workers:
+            return
+        slice_size = max(8, len(whitelist) // len(all_workers) + 4)
+        for i, p in enumerate(to_start):
+            start = (i + len(running_cache_only)) * slice_size
+            chunk = whitelist[start:start + slice_size] or whitelist[:slice_size]
+            log.info('Starting cache-only peer %s with %d KGs (slice %d:%d of %d ready)',
+                     p['id'], len(chunk), start, start + slice_size, len(whitelist))
+            try:
+                start_peer_processor(p.get('url'), cache_only=True,
+                                     queue_whitelist=chunk)
+            except Exception as e:
+                log.warning('Start cache-only on %s failed: %s', p['id'], e)
+
+        # Re-sync whitelist to running cache-only peers periodically (in
+        # case they've drained their slice).  Cheap PUT.
+        for i, pid in enumerate(running_cache_only):
+            p = get_peer_by_id(cfg, pid)
+            if not p:
+                continue
+            start = i * slice_size
+            chunk = whitelist[start:start + slice_size] or whitelist[:slice_size]
+            try:
+                _push_queue_to_peer(p['url'], chunk)
+            except Exception as e:
+                log.debug('Resync queue to %s failed: %s', pid, e)
+
+        # Status accounting
+        with self._lock:
+            self.state['cache_only_active'] = list(set(
+                running_cache_only + [p['id'] for p in to_start]))
+            save_director_state(self.state)
 
     def _sync_queue_to_active(self):
         """Push the director's local priority queue to the active remote peer.
@@ -1082,6 +1438,13 @@ class PeerDirector:
                     if _clear_completed_reservations(self.cfg):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
+                # Cache-only orchestration runs alongside the frontier
+                # peer.  It only ever starts/stops peers that are NOT the
+                # active frontier and that have no reservation.
+                try:
+                    self._orchestrate_cache_only()
+                except Exception:
+                    log.exception('Cache-only orchestration error')
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)
                 sync_counter += 1
                 if sync_counter >= 5:

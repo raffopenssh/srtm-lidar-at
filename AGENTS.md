@@ -1086,13 +1086,29 @@ grep 'Authenticated successfully\|Rotated to credential\|IP-throttled\|transient
 
 **Read this section before touching peer_director.py, deploy.sh, or any director API endpoint.**
 
-#### Architecture: One Director, Many Workers
+#### Architecture: One Frontier + Many Cache-Only Peers
 
 The system uses a **single director** (the primary instance, `srtm-lidar-at`) to
 orchestrate processing across multiple exe.dev VMs. Each VM has 100 GB/month
-bandwidth. **Only one peer processes at a time** because all instances share the
-same 4 Copernicus credentials — parallel processing would cause 402 rate-limit
-errors.
+bandwidth.
+
+**Two roles**:
+- **Frontier** (one at a time): runs full processing including Copernicus + Hansen
+  fetches.  Touches the shared Copernicus credentials, so only one frontier
+  may run.  All credential rotation happens here.
+- **Cache-only** (many in parallel): processor started with `--cache-only` /
+  `COPERNICUS_FORBIDDEN=1`.  Refuses any Copernicus/Hansen API call — if a
+  tile isn't in the local + Zenodo cache, it raises `CacheMissError` and
+  the KG is re-queued for the frontier.  Peer is fed an explicit whitelist
+  of fully-cached KGs computed by the director.
+
+**Key invariants**:
+- exactly one frontier peer running at any time (credential safety)
+- up to `max_cache_only_peers` (default 8) cache-only peers running in parallel
+- at least `min_reserve_peers` (default 5) enabled peers stay idle (operational
+  headroom for ad-hoc work, RF training, bandwidth bursts)
+- all Zenodo writes (KG uploads + tile-cache flushes) serialise through a
+  single mutex broker on the primary (`/api/v1/zenodo/lock`)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1121,6 +1137,52 @@ errors.
 passive workers. If a peer were to run its own director loop, it would
 start/stop processors in conflict with the primary. This is enforced by the
 `data/austria_processor/is_director` flag file (only exists on the primary).
+
+#### Cache-only peers (parallel processing)
+
+A peer started with `--cache-only` activates `tile_cache.FORBID_REMOTE`.
+All `_fetch_*_cell` methods on `CopernicusTileCache` and `HansenTileCache.get_raw`
+raise `CacheMissError` instead of calling the API.  The processor's tile loop
+catches it, sets `result['cache_incomplete']=True`, and aborts the KG.  The
+parent (`main()`) then re-queues the KG via `_append_retry_queue()` without
+marking it failed — the frontier peer will pick it up later.
+
+The director computes the cache-ready whitelist via `_compute_cache_ready_kgs()`:
+1. Read `cache_manifest.json` and intersect lat-strip availability across
+   `ndvi`, `sar`, `harmonics`, `worldcover`, `hansen` (cheap dict lookup).
+2. For each candidate KG (bbox falls inside a covered strip), call
+   `tile_cache.is_kg_fully_cached(bbox)` — walks per-cell index, no downloads.
+3. Cache result for 5 minutes; the cache extends as the frontier fetches more.
+
+When starting a cache-only peer, the director PUTs a slice of the whitelist
+as the peer's priority queue and starts the processor with `cache_only=True`.
+Different cache-only peers get different slices to reduce overlap.
+
+#### Zenodo upload mutex
+
+All Zenodo writes serialise through `/api/v1/zenodo/lock` on the primary:
+- `upload_kg_to_zenodo()` wraps the entire upload in `zenodo_upload_lock()`
+- `flush_tile_cache_to_zenodo()` wraps `ZenodoCache.upload_all()` similarly
+- Lease has TTL 120s; a daemon thread renews via `/heartbeat` every 30s
+- Stale leases (no heartbeat for >TTL) are auto-released
+- Peers point at the broker via env `ZENODO_LOCK_URL`, set from
+  `data/austria_processor/zenodo_lock_url.txt` (`deploy.sh` writes the
+  primary's URL there)
+- Primary uses `http://127.0.0.1:8000` automatically (set by app.py when
+  spawning the processor on a host with the `is_director` flag)
+- If the broker is unreachable, peers fail open (proceed without lease)
+  to avoid deadlocking the fleet on a network blip
+
+#### Per-peer config (`peers.json`)
+
+New/relevant fields:
+- `role: "frontier" | "cache_only"` — hint to the director.  If absent,
+  treated as frontier (the director may still borrow it for cache-only work
+  when the frontier is elsewhere).
+- `min_reserve_peers` (top-level) — default 5.  Director never starts a
+  cache-only peer if it would push the idle count below this.
+- `max_cache_only_peers` (top-level) — default 8.  Cap on concurrent
+  cache-only peers.
 
 #### How the Director Works
 

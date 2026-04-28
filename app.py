@@ -2354,47 +2354,71 @@ def processing_tiles():
     ``zenodo_cache.ZipIndex``.  Each entry name encodes the grid bbox as
     ``{product}_{s}_{w}_{n}_{e}[_{year}].npz``.
     """
+    cop_seen: set = set()
+    han_seen: set = set()
+    cop_tiles: list = []
+    han_tiles: list = []
+
+    def _add(product: str, w: float, s: float, e: float, n: float):
+        key = (round(w, 4), round(s, 4), round(e, 4), round(n, 4))
+        if product == 'hansen':
+            if key in han_seen:
+                return
+            han_seen.add(key)
+            han_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
+        else:
+            if key in cop_seen:
+                return
+            cop_seen.add(key)
+            cop_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
+
     try:
+        # Source 1: cached central-directory indices of remote Zenodo ZIPs.
         idx_dir = Path('data/austria_processor/zenodo_zip_index')
-        if not idx_dir.exists():
-            return jsonify({'copernicus': [], 'hansen': []})
-        cop_seen: set = set()
-        han_seen: set = set()
-        cop_tiles: list = []
-        han_tiles: list = []
-        for fp in idx_dir.iterdir():
-            if not fp.suffix == '.json':
-                continue
-            try:
-                raw = json.loads(fp.read_text())
-            except Exception:
-                continue
-            for name in raw:
-                base = name.replace('.npz', '')
-                parts = base.split('_')
-                product = parts[0]
-                floats = []
-                for p in parts[1:]:
-                    try:
-                        floats.append(float(p))
-                    except ValueError:
-                        break
-                if len(floats) < 4:
+        if idx_dir.exists():
+            for fp in idx_dir.iterdir():
+                if fp.suffix != '.json':
                     continue
-                s, w, n, e = floats[0], floats[1], floats[2], floats[3]
-                if product == 'hansen':
-                    key = (w, s, e, n)
-                    if key not in han_seen:
-                        han_seen.add(key)
-                        han_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
-                else:
-                    key = (w, s, e, n)
-                    if key not in cop_seen:
-                        cop_seen.add(key)
-                        cop_tiles.append({'w': w, 's': s, 'e': e, 'n': n})
+                try:
+                    raw = json.loads(fp.read_text())
+                except Exception:
+                    continue
+                for name in raw:
+                    base = name.replace('.npz', '')
+                    parts = base.split('_')
+                    product = parts[0]
+                    floats = []
+                    for p in parts[1:]:
+                        try:
+                            floats.append(float(p))
+                        except ValueError:
+                            break
+                    if len(floats) < 4:
+                        continue
+                    s, w, n, e = floats[0], floats[1], floats[2], floats[3]
+                    _add(product, w, s, e, n)
+
+        # Source 2: local tile_bbox_index (every tile this VM has cached or
+        # uploaded). Covers the case where the remote ZIP central-directory
+        # indices haven't been fetched yet.
+        bbox_idx = Path('data/austria_processor/tile_bbox_index.json')
+        if bbox_idx.exists():
+            try:
+                data = json.loads(bbox_idx.read_text())
+            except Exception:
+                data = {}
+            for entry in data.values():
+                src = entry.get('source')
+                try:
+                    w = float(entry['w']); s = float(entry['s'])
+                    e = float(entry['e']); n = float(entry['n'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                _add(src or 'copernicus', w, s, e, n)
+
         return jsonify({'copernicus': cop_tiles, 'hansen': han_tiles})
     except Exception as e:
-        return jsonify({'error': str(e), 'copernicus': [], 'hansen': []})
+        return jsonify({'error': str(e), 'copernicus': cop_tiles, 'hansen': han_tiles})
 
 
 @app.route('/api/v1/processing/manifest')

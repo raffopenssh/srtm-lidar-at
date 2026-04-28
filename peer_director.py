@@ -231,7 +231,9 @@ def get_peer_status(peer_url: str | None) -> dict:
                 except Exception:
                     if d.get('state') in ('running', 'processing'):
                         d['state'] = 'stopped'
-                d.setdefault('git_commit', _LOCAL_GIT_COMMIT)
+                # Always reflect the live srv's commit, not whatever
+                # value an old processor left in progress.json.
+                d['git_commit'] = _LOCAL_GIT_COMMIT
                 return d
             except Exception:
                 pass

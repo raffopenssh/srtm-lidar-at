@@ -2821,19 +2821,55 @@ def director_proxy_status():
 
 @app.route('/api/v1/director/proxy/log')
 def director_proxy_log():
-    """Proxy the active peer's processor log."""
+    """Proxy a peer's processor log. Defaults to the active (frontier)
+    peer; pass ?peer_id=<id> to fetch a specific peer (e.g. a cache-only
+    worker)."""
     d = pd.get_director()
     state = d.state
-    active_id = state.get('active_peer')
     lines = int(request.args.get('lines', 80))
-    if not active_id:
+    target_id = request.args.get('peer_id') or state.get('active_peer')
+    if not target_id:
         return jsonify({'lines': [], 'peer': None})
     cfg = pd.load_peers_config()
-    peer = pd.get_peer_by_id(cfg, active_id)
+    peer = pd.get_peer_by_id(cfg, target_id)
     if not peer:
-        return jsonify({'lines': [], 'peer': active_id})
+        return jsonify({'lines': [], 'peer': target_id})
     log_lines = pd.get_peer_log(peer.get('url'), lines)
-    return jsonify({'lines': log_lines, 'peer': active_id})
+    return jsonify({'lines': log_lines, 'peer': target_id})
+
+
+@app.route('/api/v1/director/proxy/combined_log')
+def director_proxy_combined_log():
+    """Return a merged ``recent_log`` from the active frontier peer plus
+    all running cache-only peers, tagged with the source peer id. Used
+    by process.html so the Live Log shows what every running peer is
+    doing — not just the frontier."""
+    d = pd.get_director()
+    status = d.get_status()
+    cfg = pd.load_peers_config()
+    merged: list[dict] = []
+    seen_ids: list[str] = []
+    for p in status.get('peers', []):
+        pid = p.get('id')
+        if not pid:
+            continue
+        is_active = p.get('is_active') or pid == status.get('active_peer')
+        is_cache_only = bool(p.get('cache_only_run'))
+        running = p.get('processor_state') in ('running', 'processing')
+        if not (is_active or (is_cache_only and running)):
+            continue
+        peer_cfg = pd.get_peer_by_id(cfg, pid)
+        if not peer_cfg:
+            continue
+        ps = pd.get_peer_status(peer_cfg.get('url'))
+        for entry in ps.get('recent_log', []) or []:
+            e = dict(entry)
+            e['peer'] = pid
+            merged.append(e)
+        seen_ids.append(pid)
+    # Newest first
+    merged.sort(key=lambda e: e.get('ts', ''), reverse=True)
+    return jsonify({'log': merged[:300], 'peers': seen_ids})
 
 
 @app.route('/api/v1/director/update_peers', methods=['POST'])

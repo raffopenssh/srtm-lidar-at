@@ -1144,10 +1144,11 @@ function clearKgTimer() {
 // ── Log ─────────────────────────────────────────────────────────
 function updateLog(d) {
   const log = d.recent_log || [];
+  const multi = !!d._multi_peer;
   // Determine peer source: proxied → _active_peer_id, local → instance field or 'primary'
   const logPeer = d._active_peer_id || d.instance || '';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer;
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '');
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -1163,8 +1164,9 @@ function updateLog(d) {
   // the latest per-KG are "completed" steps and get a ✔ badge.
   const latestInfoPerKg = {};  // kg -> index of newest info entry
   sorted.forEach((e, i) => {
-    if ((e.level || 'info') === 'info' && e.kg && !(e.kg in latestInfoPerKg)) {
-      latestInfoPerKg[e.kg] = i;
+    if ((e.level || 'info') === 'info' && e.kg) {
+      const k = (multi ? ((e.peer || '') + ':') : '') + e.kg;
+      if (!(k in latestInfoPerKg)) latestInfoPerKg[k] = i;
     }
   });
   let h = '';
@@ -1186,10 +1188,11 @@ function updateLog(d) {
       badge = '<span class="log-badge log-badge-err">✗</span>';
     } else if (lvl === 'success') {
       badge = '<span class="log-badge log-badge-ok">✔</span>';
-    } else if (lvl === 'info' && e.kg && latestInfoPerKg[e.kg] !== i) {
+    } else if (lvl === 'info' && e.kg && latestInfoPerKg[(multi ? ((e.peer || '') + ':') : '') + e.kg] !== i) {
       badge = '<span class="log-badge log-badge-ok">✔</span>';
     }
-    const peerTag = logPeer ? '<span class="log-peer">' + esc(logPeer) + '</span>' : '';
+    const entryPeer = multi ? (e.peer || '') : logPeer;
+    const peerTag = entryPeer ? '<span class="log-peer">' + esc(entryPeer) + '</span>' : '';
     h += '<div class="' + cls + '">' +
       peerTag +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
@@ -1577,7 +1580,22 @@ async function poll() {
     updateSubtitle(d);
     updateCards(d);
     updateKgCard(d);
-    updateLog(d);
+    // If we have a director with multiple running peers (active +
+    // cache-only), pull a combined log so the Live Log shows what
+    // every running peer is doing. Otherwise fall back to the
+    // single-peer recent_log embedded in the status response.
+    let usedCombined = false;
+    if (_directorData && (_directorData.peers || []).some(p => p.cache_only_run && (p.processor_state === 'running' || p.processor_state === 'processing'))) {
+      try {
+        const lr = await fetch('/api/v1/director/proxy/combined_log');
+        if (lr.ok) {
+          const lj = await lr.json();
+          updateLog({recent_log: lj.log || [], _multi_peer: true});
+          usedCombined = true;
+        }
+      } catch(_) {}
+    }
+    if (!usedCombined) updateLog(d);
     updateFailed(d);
     updateControls(d);
     updateMap(d);
@@ -2639,10 +2657,12 @@ function renderDirector(d) {
       html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;' + border + '">';
     }
 
+    const isCacheOnly = !!p.cache_only_run;
     if (!isInactive) {
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       let badge = '';
       if (isActive) badge = ' ◀ active';
+      else if (isCacheOnly && isRunning) badge = ' · <span style="color:var(--blue);font-weight:500" title="cache-only peer (no Copernicus/Hansen fetches)">cache-only</span>';
       else if (isReady) badge = ' ⏯ holds KG ' + esc(p.reserved_kg);
       else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + badge + '</span>';

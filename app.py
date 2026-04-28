@@ -2398,23 +2398,32 @@ def processing_tiles():
                     s, w, n, e = floats[0], floats[1], floats[2], floats[3]
                     _add(product, w, s, e, n)
 
-        # Source 2: local tile_bbox_index (every tile this VM has cached or
-        # uploaded). Covers the case where the remote ZIP central-directory
-        # indices haven't been fetched yet.
-        bbox_idx = Path('data/austria_processor/tile_bbox_index.json')
-        if bbox_idx.exists():
-            try:
-                data = json.loads(bbox_idx.read_text())
-            except Exception:
-                data = {}
-            for entry in data.values():
-                src = entry.get('source')
-                try:
-                    w = float(entry['w']); s = float(entry['s'])
-                    e = float(entry['e']); n = float(entry['n'])
-                except (KeyError, TypeError, ValueError):
+        # Source 2: locally-present tile .meta.json sidecars. Each sidecar
+        # is written next to a real .npz file, so this only includes tiles
+        # that are actually on this disk right now (LRU-evicted tiles are
+        # already gone). tile_bbox_index.json is intentionally NOT used
+        # because it can list tiles that have been evicted but never
+        # uploaded to Zenodo.
+        for sub, default_product in (
+            ('copernicus_tiles', 'copernicus'),
+            ('hansen_tiles', 'hansen'),
+        ):
+            d = Path('data/austria_processor') / sub
+            if not d.exists():
+                continue
+            for fp in d.glob('*.meta.json'):
+                npz = fp.with_suffix('').with_suffix('.npz')
+                if not npz.exists():
                     continue
-                _add(src or 'copernicus', w, s, e, n)
+                try:
+                    meta = json.loads(fp.read_text())
+                    w = float(meta['w']); s = float(meta['s'])
+                    e = float(meta['e']); n = float(meta['n'])
+                except Exception:
+                    continue
+                product = meta.get('product') or default_product
+                bucket = 'hansen' if (default_product == 'hansen' or product == 'hansen') else 'copernicus'
+                _add(bucket, w, s, e, n)
 
         return jsonify({'copernicus': cop_tiles, 'hansen': han_tiles})
     except Exception as e:

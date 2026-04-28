@@ -2001,6 +2001,15 @@ def processing_queue_get():
             pass
     # Filter out already-completed KGs, BUT keep tombstoned ones (queued for reprocessing)
     completed = _get_completed_kgs()
+    # Re-read tombstone file from disk — gunicorn workers don't share memory,
+    # so a POST that adds tombstones in worker A must be visible to GET in worker B.
+    if _tombstone_path.exists():
+        try:
+            _disk_tombstones = json.loads(_tombstone_path.read_text())
+            if isinstance(_disk_tombstones, dict):
+                _MANIFEST_TOMBSTONES.update(_disk_tombstones)
+        except Exception:
+            pass
     # Extract KG code (digits, or digits-label for blocks) from tombstone keys like '12362_json', '49006-north_json'
     import re as _re
     tombstoned_kgs = set()
@@ -2194,35 +2203,51 @@ def processing_queue_add():
                 kept.append(c)
         new_codes = kept
     else:
-        # Force re-process: tombstone existing manifest entries so sync doesn't re-import them
+        # Force re-process: tombstone existing manifest entries so sync doesn't re-import them.
+        # ALSO add a synthetic '_requeue' tombstone for any completed KG so the GET handler
+        # (which filters out completed codes unless tombstoned) keeps it in the queue.
         import datetime as _dt
+        ts = _dt.datetime.utcnow().isoformat()
         manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+        mentries = None
+        mdata = None
         if manifest_path.exists():
             try:
                 mdata = json.loads(manifest_path.read_text())
                 mentries = mdata.get('entries', mdata)
-                ts = _dt.datetime.utcnow().isoformat()
-                changed = False
-                for c in new_codes:
-                    if c in completed:
-                        for suffix in ('_full_gpkg', '_light_gpkg', '_json'):
-                            key = c + suffix
-                            if key in mentries:
-                                del mentries[key]
-                                _MANIFEST_TOMBSTONES[key] = ts
-                                tombstoned.append(key)
-                                changed = True
-                if changed:
-                    import tempfile as _tf
-                    fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
-                    try:
-                        with os.fdopen(fd, 'w') as f:
-                            json.dump({'entries': mentries}, f, indent=2, sort_keys=True)
-                        os.replace(tmp, manifest_path)
-                    except BaseException:
-                        try: os.unlink(tmp)
-                        except OSError: pass
-                    _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+            except Exception:
+                mentries = None
+        changed = False
+        for c in new_codes:
+            if c not in completed:
+                continue
+            # Always mark as force-requeued so GET keeps it visible.
+            _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
+            tombstoned.append(c + '_requeue')
+            if mentries is not None:
+                for suffix in ('_full_gpkg', '_light_gpkg', '_json'):
+                    key = c + suffix
+                    if key in mentries:
+                        del mentries[key]
+                        _MANIFEST_TOMBSTONES[key] = ts
+                        tombstoned.append(key)
+                        changed = True
+        if changed and mentries is not None:
+            try:
+                import tempfile as _tf
+                fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        json.dump({'entries': mentries}, f, indent=2, sort_keys=True)
+                    os.replace(tmp, manifest_path)
+                except BaseException:
+                    try: os.unlink(tmp)
+                    except OSError: pass
+            except Exception:
+                pass
+        if tombstoned:
+            try:
+                _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
             except Exception:
                 pass
 

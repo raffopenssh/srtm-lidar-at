@@ -277,6 +277,15 @@ class SearchIndex:
                 -- hansen
                 hansen_total_pixels INTEGER DEFAULT 0,
                 hansen_recent_5yr_pixels INTEGER DEFAULT 0,
+                -- buildings (spatial join during indexing)
+                building_count INTEGER DEFAULT 0,
+                building_max_height_m REAL,
+                building_max_stories INTEGER,
+                building_total_footprint_sqm REAL DEFAULT 0,
+                -- auto-classification (from parcel_compact.classify_parcel)
+                auto_class TEXT,
+                auto_subclass TEXT,
+                auto_class_confidence REAL,
                 PRIMARY KEY (kg_code, parcel_id)
             )''',
             'CREATE INDEX IF NOT EXISTS idx_prc_kg ON kg_parcels(kg_code)',
@@ -292,6 +301,10 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_prc_hansen ON kg_parcels(hansen_recent_5yr_pixels)',
             'CREATE INDEX IF NOT EXISTS idx_prc_rf_conf ON kg_parcels(rf_mean_confidence)',
             'CREATE INDEX IF NOT EXISTS idx_prc_is_veg ON kg_parcels(is_vegetated)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_auto_class ON kg_parcels(auto_class)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_bld_count ON kg_parcels(building_count)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_bld_stories ON kg_parcels(building_max_stories)',
+            'CREATE INDEX IF NOT EXISTS idx_prc_bld_height ON kg_parcels(building_max_height_m)',
             # === Index metadata ===
             '''CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
@@ -444,7 +457,7 @@ class SearchIndex:
         with self._write_lock:
             c = self._conn()
             # Drop and recreate — ensures schema changes are picked up
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'index_meta'):
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'kg_parcels', 'index_meta'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
             for t in ('kg_rtree', 'fts_kg'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
@@ -811,11 +824,114 @@ class SearchIndex:
         p_details = parcels.get('details', [])
         if p_details:
             c.execute('DELETE FROM kg_parcels WHERE kg_code=?', (code,))
-            prc_rows = []
+            # Spatial join (building → parcel) via point-in-polygon.
+            # The parcel JSON includes `vertex_heights` (boundary vertices in
+            # WGS84). We test each building's centroid against parcel polygons
+            # using a bbox prefilter, then ray-casting PIP. Falls back to
+            # nearest-centroid-within-radius for parcels whose polygon is
+            # unavailable (sparse cases).
+            try:
+                from parcel_compact import classify_parcel  # local import
+            except Exception:
+                classify_parcel = None
+            buildings = (data.get('building_footprints') or {}).get('details') or []
+            import math
+
+            def _polygon_from_vertices(vh):
+                pts = []
+                for v in (vh or []):
+                    lon, lat = v.get('lon'), v.get('lat')
+                    if lon is not None and lat is not None:
+                        pts.append((float(lon), float(lat)))
+                return pts if len(pts) >= 3 else None
+
+            def _bbox(pts):
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                return min(xs), min(ys), max(xs), max(ys)
+
+            def _point_in_poly(x, y, poly):
+                # ray casting; poly is list of (x,y), closed or not
+                inside = False
+                n = len(poly)
+                j = n - 1
+                for i in range(n):
+                    xi, yi = poly[i]; xj, yj = poly[j]
+                    if ((yi > y) != (yj > y)) and \
+                       (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi):
+                        inside = not inside
+                    j = i
+                return inside
+
+            parcel_geom = []  # (poly_or_None, bbox_or_None, centroid_lon, centroid_lat, area_sqm)
             for p in p_details:
+                cc = p.get('centroid') or {}
+                poly = _polygon_from_vertices(p.get('vertex_heights'))
+                bb = _bbox(poly) if poly else None
+                parcel_geom.append((poly, bb,
+                                    cc.get('lon'), cc.get('lat'),
+                                    float(p.get('area_sqm') or 0)))
+
+            bld_per_parcel = [{'count': 0, 'max_h': 0.0, 'max_st': 0,
+                                'foot': 0.0} for _ in p_details]
+            for b in buildings:
+                bc = b.get('centroid') or {}
+                blon, blat = bc.get('lon'), bc.get('lat')
+                if blon is None or blat is None:
+                    continue
+                # 1) PIP against parcels with polygon (bbox prefilter)
+                hit = -1
+                for i, (poly, bb, _, _, _) in enumerate(parcel_geom):
+                    if poly is None or bb is None:
+                        continue
+                    if blon < bb[0] or blon > bb[2] or blat < bb[1] or blat > bb[3]:
+                        continue
+                    if _point_in_poly(blon, blat, poly):
+                        hit = i
+                        break
+                # 2) fallback: nearest-centroid within √area radius (handles
+                #    parcels with malformed vertex_heights)
+                if hit < 0:
+                    best_i, best_d = -1, 1e9
+                    for i, (poly, bb, plon, plat, parea) in enumerate(parcel_geom):
+                        if poly is not None or plon is None or plat is None:
+                            continue
+                        d = (plon - blon) ** 2 + (plat - blat) ** 2
+                        if d < best_d:
+                            best_d = d; best_i = i
+                    if best_i >= 0:
+                        parea = parcel_geom[best_i][4]
+                        if parea > 0:
+                            r_deg2 = (math.sqrt(parea) * 1.5 / 111000.0) ** 2
+                            if best_d <= r_deg2:
+                                hit = best_i
+                if hit < 0:
+                    continue
+                rec = bld_per_parcel[hit]
+                rec['count'] += 1
+                h = float(b.get('max_height_m') or 0)
+                if h > rec['max_h']: rec['max_h'] = h
+                st = int(b.get('stories_est') or 0)
+                if st > rec['max_st']: rec['max_st'] = st
+                rec['foot'] += float(b.get('footprint_area_sqm') or 0)
+
+            prc_rows = []
+            for p, bagg in zip(p_details, bld_per_parcel):
                 centroid = p.get('centroid', {})
                 cls = p.get('classification', {})
                 hansen = p.get('hansen_loss', {})
+                # Inject building rollup so classify_parcel can use it.
+                p_for_class = dict(p)
+                p_for_class['building_count'] = bagg['count']
+                p_for_class['building_max_height_m'] = bagg['max_h'] or None
+                p_for_class['building_max_stories'] = bagg['max_st'] or None
+                p_for_class['building_total_footprint_sqm'] = bagg['foot']
+                if classify_parcel is not None:
+                    try:
+                        ac = classify_parcel(p_for_class)
+                    except Exception:
+                        ac = {}
+                else:
+                    ac = {}
                 prc_rows.append((
                     code,
                     p.get('parcel_id', ''),
@@ -844,10 +960,17 @@ class SearchIndex:
                     cls.get('rf_mean_confidence'),
                     hansen.get('total_pixels', 0),
                     hansen.get('recent_5yr_pixels', 0),
+                    bagg['count'],
+                    bagg['max_h'] or None,
+                    bagg['max_st'] or None,
+                    bagg['foot'],
+                    ac.get('class'),
+                    ac.get('subclass'),
+                    ac.get('confidence'),
                 ))
             if prc_rows:
                 c.executemany(
-                    'INSERT INTO kg_parcels VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'INSERT INTO kg_parcels VALUES (' + ','.join(['?'] * 34) + ')',
                     prc_rows)
 
     def _enrich_kg_from_blocks(self, c, parent_code, block_list):

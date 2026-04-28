@@ -61,6 +61,7 @@ IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
 TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
 COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
+ZENODO_PAUSE_FILE = DATA_DIR / "zenodo_paused"
 POSTPONE_SIGNAL_FILE = DATA_DIR / "postpone_signal.json"
 THROTTLE_FILE = DATA_DIR / "upload_throttle"
 DEFERRED_FILE = DATA_DIR / "deferred_kgs.json"
@@ -6417,6 +6418,26 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     result["_full_gpkg_uploaded"] = True
                 except Exception as _ue:
                     log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
+                    # Signal Zenodo problem to the parent process so it can
+                    # pause + switch peers.  Keep the local full GPKG on
+                    # disk so the parent can re-upload later.  We still
+                    # let light GPKG + JSON build complete so we don't
+                    # waste an hour of compute; if Zenodo recovers in the
+                    # meantime the parent uploads everything together.
+                    _reason = _classify_zenodo_error(_ue)
+                    try:
+                        ZENODO_PAUSE_FILE.write_text(json.dumps({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "kg": kg_code,
+                            "step": "upload_full_gpkg",
+                            "reason": _reason,
+                            "error": str(_ue),
+                        }))
+                    except Exception:
+                        pass
+                    result["zenodo_failed"] = True
+                    result["zenodo_error"] = str(_ue)
+                    result["zenodo_reason"] = _reason
         gc.collect()
 
         # --- 5c. Free tile checkpoints now that full GPKG is written ---
@@ -7009,7 +7030,11 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
         except Exception as e:
             upload_stats["errors"].append({
-                "key": zenodo_key, "error": str(e)})
+                "key": zenodo_key,
+                "error": str(e),
+                "status_code": int(getattr(e, "status_code", 0) or 0),
+                "reason": _classify_zenodo_error(e),
+            })
             log.error("KG %s: Zenodo upload failed for %s: %s",
                       kg_code, file_key, e)
 
@@ -7121,6 +7146,63 @@ def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool
 
 
 RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.json"
+
+
+def _classify_zenodo_error(exc_or_msg) -> str:
+    """Classify a Zenodo failure as 'rate_limit', 'auth', 'server', or 'network'.
+
+    'rate_limit' / 'auth' / 'server' are GLOBAL (token-wide) \u2014 every peer
+    using the same token will hit the same problem.  The director should
+    keep ALL peers paused until Zenodo recovers.
+
+    'network' is LOCAL (peer-side connectivity) \u2014 only that peer is
+    affected, so the director should switch to another peer.
+    """
+    status = 0
+    try:
+        status = int(getattr(exc_or_msg, "status_code", 0) or 0)
+    except Exception:
+        status = 0
+    msg = str(exc_or_msg).lower() if exc_or_msg else ""
+    if status == 429 or "429" in msg or "too many requests" in msg or "rate limit" in msg:
+        return "rate_limit"
+    if status in (401, 403) or "401" in msg or "403" in msg or "unauthorized" in msg or "forbidden" in msg:
+        return "auth"
+    if status in (500, 502, 503, 504) or "500" in msg or "502" in msg or "503" in msg or "504" in msg or "server error" in msg or "bad gateway" in msg or "service unavailable" in msg:
+        return "server"
+    # Connection / timeout / SSL = peer-local network
+    return "network"
+
+
+def _zenodo_pause_is_global(reason: str) -> bool:
+    """Token-wide problem? All peers are blocked, no point switching."""
+    return reason in ("rate_limit", "auth")
+
+
+def _zenodo_probe(token: str = None) -> tuple[bool, str]:
+    """Cheap GET to Zenodo to check whether our token is usable.
+
+    Returns (ok, reason).  reason is one of: 'ok', 'rate_limit', 'auth',
+    'server', 'network'.
+    """
+    import requests as _requests
+    tok = token or ZENODO_TOKEN
+    try:
+        r = _requests.get("https://zenodo.org/api/deposit/depositions",
+                          params={"access_token": tok, "size": 1},
+                          timeout=20)
+        if r.status_code < 300:
+            return True, "ok"
+        if r.status_code == 429:
+            return False, "rate_limit"
+        if r.status_code in (401, 403):
+            return False, "auth"
+        if r.status_code >= 500:
+            return False, "server"
+        return False, f"http_{r.status_code}"
+    except Exception as e:
+        return False, _classify_zenodo_error(e)
+
 
 
 def _read_retry_queue() -> list[str]:
@@ -8137,42 +8219,97 @@ def main():
                     for err in upload_stats["errors"]:
                         log.warning("KG %s upload error: %s", kg_code, err)
 
-                progress.record_success(
-                    parcels=result.get("n_parcels", 0),
-                    buildings=result.get("n_buildings", 0),
-                    upload_bytes=upload_stats["total_bytes"],
-                    last_kg_code=kg_code,
-                    last_kg_seconds=elapsed_kg,
-                    n_new_buildings=result.get("n_new_buildings", 0),
-                    n_infrastructure=result.get("n_infrastructure", 0),
-                )
-                _qg = result.get('quality_grade', '')
-                _qs = result.get('quality_score', 0)
-                progress.add_log(
-                    "success",
-                    f"KG {kg_code} done in {elapsed_kg:.0f}s "
-                    f"({result.get('n_segments', 0)} segs, "
-                    f"{result.get('n_parcels', 0)} par, "
-                    f"{result.get('n_buildings', 0)} bldg, "
-                    f"quality={_qs:.0%} {_qg})",
-                    kg_code,
-                )
-                # Persist tile dots for completed KG
-                with progress._lock:
-                    _ckg = progress._state.get("current_kg") or {}
-                    _ts = _ckg.get("tile_statuses", [])
-                _save_tile_history(kg_code, _ts, "completed")
+                # --- Detect transient Zenodo failures and re-queue ---
+                _zenodo_transient = False
+                _zenodo_reason = result.get("zenodo_reason", "")
+                for _err in upload_stats["errors"]:
+                    _r = _err.get("reason") or _classify_zenodo_error(_err.get("error", ""))
+                    if _is_transient_error(str(_err.get("error", "")), "upload") or _r in ("rate_limit", "auth", "server", "network"):
+                        _zenodo_transient = True
+                        # Prefer the most-global reason
+                        if _zenodo_reason != "rate_limit" and _r in ("rate_limit", "auth"):
+                            _zenodo_reason = _r
+                        elif not _zenodo_reason:
+                            _zenodo_reason = _r
+                if result.get("zenodo_failed") and not _zenodo_transient:
+                    _zenodo_transient = True
+                    if not _zenodo_reason:
+                        _zenodo_reason = "network"
 
-                # Remove from priority queue file now that it's done
-                _remove_from_retry_queue(kg_code)
+                if _zenodo_transient:
+                    _global = _zenodo_pause_is_global(_zenodo_reason)
+                    log.warning("KG %s: Zenodo upload failure (reason=%s, global=%s) \u2014 re-queuing",
+                                kg_code, _zenodo_reason, _global)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: Zenodo {_zenodo_reason} \u2014 re-queued",
+                                     kg_code)
+                    try:
+                        ZENODO_PAUSE_FILE.write_text(json.dumps({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "kg": kg_code,
+                            "step": "upload",
+                            "reason": _zenodo_reason,
+                            "global": _global,
+                            "error": "; ".join(str(e.get('error', '')) for e in upload_stats["errors"]) or result.get("zenodo_error", ""),
+                        }))
+                    except Exception:
+                        pass
+                    _append_retry_queue(kg_code)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    kg_succeeded = False
+                    # Skip record_success path; fall through so the
+                    # post-iteration pause check picks up the flag file.
 
-                # Clear any tombstone entries so the dashboard stops showing
-                # this KG as pending reprocessing.
-                _clear_tombstones(kg_code)
+                # Subprocess flagged early-upload failure but parent succeeded:
+                # clear the pause file (Zenodo recovered).
+                if result.get("zenodo_failed") and not upload_stats["errors"]:
+                    try:
+                        if ZENODO_PAUSE_FILE.exists():
+                            ZENODO_PAUSE_FILE.unlink()
+                            log.info("Zenodo upload recovered \u2014 cleared pause file")
+                    except Exception:
+                        pass
 
-                # Proactively flush tile cache to Zenodo so tiles
-                # survive disk cleanup between KGs.
-                flush_tile_cache_to_zenodo()
+                if not _zenodo_transient:
+                    progress.record_success(
+                        parcels=result.get("n_parcels", 0),
+                        buildings=result.get("n_buildings", 0),
+                        upload_bytes=upload_stats["total_bytes"],
+                        last_kg_code=kg_code,
+                        last_kg_seconds=elapsed_kg,
+                        n_new_buildings=result.get("n_new_buildings", 0),
+                        n_infrastructure=result.get("n_infrastructure", 0),
+                    )
+                    _qg = result.get('quality_grade', '')
+                    _qs = result.get('quality_score', 0)
+                    progress.add_log(
+                        "success",
+                        f"KG {kg_code} done in {elapsed_kg:.0f}s "
+                        f"({result.get('n_segments', 0)} segs, "
+                        f"{result.get('n_parcels', 0)} par, "
+                        f"{result.get('n_buildings', 0)} bldg, "
+                        f"quality={_qs:.0%} {_qg})",
+                        kg_code,
+                    )
+                    # Persist tile dots for completed KG
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "completed")
+
+                    # Remove from priority queue file now that it's done
+                    _remove_from_retry_queue(kg_code)
+
+                    # Clear any tombstone entries so the dashboard stops showing
+                    # this KG as pending reprocessing.
+                    _clear_tombstones(kg_code)
+
+                    # Proactively flush tile cache to Zenodo so tiles
+                    # survive disk cleanup between KGs.
+                    flush_tile_cache_to_zenodo()
             else:
                 # --- Copernicus credits exhausted? Don't mark as permanently failed ---
                 is_credits_issue = (result.get("copernicus_exhausted")
@@ -8349,6 +8486,60 @@ def main():
             log.info("▶ Copernicus resumed.")
             progress.update(state="running")
             progress.add_log("info", "Resumed after Copernicus pause", "")
+            progress.save()
+
+        # --- Zenodo pause: probe periodically, switch peers if local-only ---
+        if ZENODO_PAUSE_FILE.exists():
+            try:
+                _zinfo = json.loads(ZENODO_PAUSE_FILE.read_text())
+            except Exception:
+                _zinfo = {"reason": "network"}
+            _reason = _zinfo.get("reason", "network")
+            _is_global = bool(_zinfo.get("global")) or _zenodo_pause_is_global(_reason)
+            log.warning("⏸  Zenodo pause active (reason=%s, global=%s)",
+                        _reason, _is_global)
+            progress.update(state="paused_zenodo")
+            progress.add_log("warning",
+                             f"Paused: Zenodo {_reason}. "
+                             + ("Token-wide \u2014 all peers blocked."
+                                if _is_global else
+                                "Local network \u2014 director should switch peer."),
+                             "")
+            progress.save()
+
+            probe_count = 0
+            while ZENODO_PAUSE_FILE.exists():
+                probe_count += 1
+                # Network = peer-side issue: probe more often (2 min)
+                # so the director can switch faster.
+                # Rate-limit / auth = global: probe every 10 min.
+                _wait = 600 if _is_global else 120
+                time.sleep(_wait)
+                if _shutdown_requested:
+                    break
+                ok, why = _zenodo_probe()
+                log.info("Zenodo paused \u2014 probe #%d: %s (%s)",
+                         probe_count, "OK" if ok else "failed", why)
+                if ok:
+                    log.info("▶ Zenodo recovered. Removing pause file.")
+                    try:
+                        ZENODO_PAUSE_FILE.unlink()
+                    except Exception:
+                        pass
+                    break
+                # Update reason if it changed (e.g. network → rate_limit)
+                if why and why != _reason:
+                    _reason = why
+                    _is_global = _zenodo_pause_is_global(_reason)
+                    try:
+                        _zinfo["reason"] = _reason
+                        _zinfo["global"] = _is_global
+                        _zinfo["last_probe"] = datetime.now(timezone.utc).isoformat()
+                        ZENODO_PAUSE_FILE.write_text(json.dumps(_zinfo))
+                    except Exception:
+                        pass
+            progress.update(state="running")
+            progress.add_log("info", "Resumed after Zenodo pause", "")
             progress.save()
 
         if (i + 1) % 10 == 0:

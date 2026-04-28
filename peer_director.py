@@ -19,7 +19,7 @@ import os
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -53,6 +53,10 @@ PEER_TIMEOUT = 30
 # Number of consecutive unreachable polls before failover (avoids killing
 # peers during heavy GPKG builds that briefly starve gunicorn).
 UNREACHABLE_FAILOVER_THRESHOLD = 3
+# How long to keep a peer out of rotation after a local Zenodo network
+# failure (the same peer hitting the same network problem on retry would
+# loop forever).  Cleared automatically when not_before passes.
+ZENODO_NETWORK_COOLDOWN_MIN = 30
 
 
 def _default_peers_config() -> dict:
@@ -749,7 +753,49 @@ class PeerDirector:
             if peer:
                 status = get_peer_status(peer.get('url'))
                 proc_state = status.get('state', 'unknown')
-                if proc_state in ('idle', 'stopped'):
+
+                # --- Zenodo pause detection ----------------------------
+                # paused_zenodo with global=true (rate_limit/auth on the
+                # token) blocks every peer using the same token, so we
+                # leave the peer paused (probing itself) and don't switch.
+                # Non-global (network) is a peer-local issue; cool that
+                # peer down for a bit and switch to another peer.
+                zinfo = status.get('zenodo_pause') or {}
+                # Only act when the parent loop has truly entered the
+                # paused_zenodo state (writes that state to progress.json).
+                # Mid-KG the subprocess may have written the pause file
+                # but the parent is still building light GPKG / JSON; we
+                # don't want to abort that work.
+                if proc_state == 'paused_zenodo':
+                    is_global = bool(zinfo.get('global'))
+                    reason = zinfo.get('reason', 'network')
+                    if is_global:
+                        log.info('Active peer %s: Zenodo paused globally (reason=%s) \u2014 holding all peers',
+                                 active_id, reason)
+                        # Don't switch \u2014 every peer would hit the same
+                        # token-wide issue.  The peer probes Zenodo itself.
+                        return
+                    log.warning('Active peer %s: Zenodo network failure \u2014 cooling down %d min and switching',
+                                active_id, ZENODO_NETWORK_COOLDOWN_MIN)
+                    # Apply not_before cooldown so choose_active_peer skips this peer
+                    cd_until = (datetime.now(timezone.utc)
+                                + timedelta(minutes=ZENODO_NETWORK_COOLDOWN_MIN))
+                    for p in self.cfg.get('peers', []):
+                        if p['id'] == active_id:
+                            p['not_before'] = cd_until.isoformat()
+                            break
+                    save_peers_config(self.cfg)
+                    # Stop processor on this peer (still uploading retries)
+                    res = safely_stop_peer(peer.get('url'), active_id)
+                    if 'error' in res:
+                        log.error('Cannot stop %s during Zenodo failover: %s',
+                                  active_id, res['error'])
+                        return
+                    with self._lock:
+                        self.state['active_peer'] = None
+                        active_id = None
+                # ------------------------------------------------------
+                if active_id and proc_state in ('idle', 'stopped'):
                     # Processor stopped (finished a KG or was stopped externally)
                     # Check if it should continue
                     bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})

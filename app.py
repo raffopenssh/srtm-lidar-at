@@ -1213,6 +1213,18 @@ def processing_status():
                 data['system']['zenodo_cache'] = ZenodoCache().status()
             except Exception:
                 pass
+            # Zenodo / Copernicus pause flags
+            for _flag, _key in (('zenodo_paused', 'zenodo_pause'),
+                                ('copernicus_paused', 'copernicus_pause')):
+                _fp = _pl.Path(f'data/austria_processor/{_flag}')
+                if _fp.exists():
+                    try:
+                        data[_key] = json.loads(_fp.read_text())
+                    except Exception:
+                        try:
+                            data[_key] = {'raw': _fp.read_text()[:500]}
+                        except Exception:
+                            data[_key] = {'present': True}
             # Manifest summary
             mf = _pl.Path('data/austria_processor/zenodo_manifest.json')
             if mf.exists():

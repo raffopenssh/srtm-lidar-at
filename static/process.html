@@ -1881,6 +1881,72 @@ function renderLastKg(js) {
       ndvi_fused:x[7], height_change_m:x[8], phenology_class:x[9],
       confidence:x[10], rf_confidence:x[11]};
   }
+  // Parcel auto-class tally (mirrors parcel_compact.classify_parcel; uses
+  // frav + top_trees + terrain only, no building rollup). Lightweight.
+  function _classifyParcelLite(p) {
+    const frav = p.frav || {};
+    const a = {};
+    let total = 0;
+    for (const k of Object.keys(frav)) { a[_LETTER2TYPE[k]||k] = frav[k]; total += frav[k]; }
+    if (total === 0) {
+      const s = p.area_summary || {};
+      for (const t of Object.keys(s)) { a[t] = s[t].area_sqm||0; total += a[t]; }
+    }
+    if (total === 0) return null;
+    const F = (t) => (a[t]||0)/total;
+    const sumF = (arr) => arr.reduce((s,t)=>s+F(t), 0);
+    const tree = F('tree'), shrub = F('shrub'), grass = F('grass');
+    const built = sumF(['roof','greenhouse','solar_panel','construction']);
+    const infra = sumF(['road','path','parking','bridge']);
+    const water = F('water'), bare = sumF(['bare_soil','rock']);
+    const disturb = sumF(['tree_loss','excavation','fill','construction','earthwork']);
+    const farmland = F('crop')+F('orchard')+F('vineyard')+bare;
+    const slope = p.slope_mean_deg||0, elev = p.elevation_m||0;
+    const hRecent = ((p.hansen_loss||{}).recent_5yr_pixels||0)*900/(p.area_sqm||1);
+    let mTreeH = null, n = 0;
+    for (const r of (p.top_trees||[])) {
+      const h = Array.isArray(r) ? r[1] : (r.canopy_height_m||r.height_m);
+      if (h != null) { mTreeH = (mTreeH||0)+h; n++; }
+    }
+    if (n) mTreeH /= n;
+    if (water >= 0.40) return 'water_body';
+    if (disturb >= 0.25 || hRecent >= 0.20) return 'disturbance';
+    if (built >= 0.35) return 'built_up';
+    if (infra >= 0.35) return 'infrastructure';
+    if (built >= 0.10 && (farmland+grass) >= 0.30) return 'farmstead';
+    if (F('vineyard') >= 0.05) return 'vineyard';
+    if (F('orchard') >= 0.05) return 'orchard';
+    if (tree >= 0.60) {
+      if (hRecent >= 0.05) return 'forest (thinned)';
+      if (mTreeH != null && mTreeH < 8) return 'young_forest';
+      return 'forest';
+    }
+    if (tree >= 0.30) return 'wooded';
+    if (shrub >= 0.40 && tree < 0.30) return 'shrubland';
+    if ((F('crop')+bare) >= 0.50) return 'cropland';
+    if (grass >= 0.60) {
+      if (slope >= 20 || elev >= 1500) return 'alpine_meadow';
+      return 'meadow';
+    }
+    if (bare >= 0.50) return 'bare';
+    return 'mixed';
+  }
+  if ((parcels.details||[]).length > 0) {
+    const tally = {};
+    for (const p of parcels.details) {
+      const c = _classifyParcelLite(p);
+      if (c) tally[c] = (tally[c]||0) + 1;
+    }
+    const ranked = Object.entries(tally).sort((a,b)=>b[1]-a[1]);
+    if (ranked.length > 0) {
+      const top = ranked.slice(0, 6).map(([k,v]) => k + ' ' + v).join(', ');
+      const more = ranked.length > 6 ? ' … +' + (ranked.length-6) : '';
+      // Insert right after Parcels item
+      const pIdx = items.findIndex(it => it.l === 'Parcels');
+      const entry = {l: 'Parcel Types', v: '<span style="font-size:0.82em">'+top+more+'</span>'};
+      if (pIdx >= 0) items.splice(pIdx+1, 0, entry); else items.push(entry);
+    }
+  }
   function _cascadeTop() {
     if (top10[0]) return top10[0];
     const tbt = js.top_by_type || {};

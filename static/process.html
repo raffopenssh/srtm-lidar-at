@@ -2601,10 +2601,11 @@ function renderDirector(d) {
     // Determine if this peer is "inactive" (not active, not running)
     const isRunning = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
     const isScheduled = p.scheduled;
-    // "Owner" = cooled-down peer that holds a reserved KG and will
-    // resume from tile checkpoints once cooldown lifts. Show it expanded
-    // (with relative resume time) even though it is not the current active.
-    const isOwner = !!p.reserved_kg && isScheduled;
+    // "Owner" = peer that holds a reserved KG. Either still in cooldown
+    // (will resume after not_before) or already past cooldown and
+    // waiting for the substitute to finish its current KG.
+    const isOwner = !!p.reserved_kg;
+    const isReady = isOwner && !isScheduled;
     const isInactive = !isActive && !isRunning && !isOwner;
 
     const border = isActive ? 'border-color:var(--blue);'
@@ -2642,6 +2643,7 @@ function renderDirector(d) {
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       let badge = '';
       if (isActive) badge = ' ◀ active';
+      else if (isReady) badge = ' ⏯ holds KG ' + esc(p.reserved_kg);
       else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + badge + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
@@ -2692,7 +2694,9 @@ function renderDirector(d) {
       html += '<div style="font-size:10px;color:var(--yellow);margin-top:2px" title="' + esc(p.not_before) + '">⏳ ' + esc(note) + '</div>';
     }
     if (isOwner && active && active !== p.id) {
-      html += '<div style="font-size:10px;color:var(--dim);margin-top:2px">↪ substitute: <b>' + esc(active) + '</b></div>';
+      const note = isReady ? 'waiting for <b>' + esc(active) + '</b> to finish KG'
+                            : 'substitute: <b>' + esc(active) + '</b>';
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:2px">↪ ' + note + '</div>';
     }
 
     if (isInactive) html += '</div>'; // close .peer-detail

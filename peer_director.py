@@ -328,30 +328,20 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
 
 
 def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
-    """Collect KGs reserved by cooled-down peers (other than `exclude_peer_id`).
+    """Collect KGs reserved by other peers (not `exclude_peer_id`).
 
-    A reservation only counts if `not_before` is in the future — stale
-    reservations (cooldown already passed) are ignored.
+    Reservations persist past `not_before` so that the holding peer can
+    actually pick the KG back up once cooldown lifts. Stale reservations
+    are pruned separately by `_clear_completed_reservations` once the KG
+    appears in the local `_get_completed_kgs()` set.
     """
     out = set()
-    now = datetime.now(timezone.utc)
     for p in cfg.get('peers', []):
         if exclude_peer_id and p.get('id') == exclude_peer_id:
             continue
         kg = p.get('reserved_kg')
-        if not kg:
-            continue
-        nb = p.get('not_before')
-        if not nb:
-            continue
-        try:
-            nbdt = datetime.fromisoformat(nb)
-            if nbdt.tzinfo is None:
-                nbdt = nbdt.replace(tzinfo=timezone.utc)
-            if nbdt > now:
-                out.add(str(kg))
-        except (ValueError, TypeError):
-            pass
+        if kg:
+            out.add(str(kg))
     return out
 
 
@@ -506,25 +496,60 @@ def _peer_is_scheduled(peer: dict) -> bool:
         return False
 
 
-def _clear_stale_reservations(cfg: dict) -> bool:
-    """Drop reserved_kg for peers whose cooldown has already passed.
+def _clear_completed_reservations(cfg: dict) -> bool:
+    """Drop reserved_kg for peers whose held KG is already completed.
 
+    A reservation otherwise persists past `not_before` so the holding
+    peer can pick its held KG back up after the cooldown lifts.
     Returns True if the config was modified.
     """
+    completed = set()
+    try:
+        # Imported lazily — app.py imports peer_director at startup.
+        from app import _get_completed_kgs
+        completed = _get_completed_kgs()
+    except Exception:
+        pass
     changed = False
     for p in cfg.get('peers', []):
-        if p.get('reserved_kg') and not _peer_is_scheduled(p):
+        kg = p.get('reserved_kg')
+        if kg and str(kg) in completed:
             p.pop('reserved_kg', None)
             changed = True
     return changed
 
 
+def _ready_reservation_holder(cfg: dict) -> str | None:
+    """Return peer_id of an enabled, non-scheduled peer that holds a
+    reserved KG ready to be resumed. Returns None if no such peer.
+    """
+    for p in cfg.get('peers', []):
+        if not p.get('enabled', True):
+            continue
+        if not p.get('reserved_kg'):
+            continue
+        if _peer_is_scheduled(p):
+            continue
+        return p['id']
+    return None
+
+
 def choose_active_peer(cfg: dict, state: dict) -> str | None:
     """Pick the best peer to run the processor on.
 
-    Returns peer_id with most remaining bandwidth, or None if all exhausted.
-    Skips peers that are disabled or have a not_before date in the future.
+    Reservation holders win first — if an enabled, non-scheduled peer
+    still holds a reserved KG, give it priority so it can resume the
+    held KG from its tile checkpoints. Otherwise pick the peer with the
+    most remaining bandwidth.
+    Returns None if all candidates have <2 GB remaining.
     """
+    holder = _ready_reservation_holder(cfg)
+    if holder:
+        bw = state.get('peer_bandwidth', {}).get(holder, {})
+        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
+        used = bw.get('used_bytes', 0)
+        if (budget_bytes - used) >= 2 * (1024 ** 3):
+            return holder
     budget_gb = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB)
     budget_bytes = budget_gb * (1024 ** 3)
     best_id = None
@@ -761,6 +786,27 @@ class PeerDirector:
             state_copy = self.state.copy()
 
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
+
+        # Pre-empt the active peer when a different peer's reservation
+        # becomes ready (cooldown lifted, KG still pending). The held KG
+        # has tile checkpoints on the holder, so it finishes much faster
+        # there than starting fresh on the substitute. We only pre-empt
+        # between KGs (never mid-KG) by waiting for idle/stopped state.
+        if active_id:
+            holder = _ready_reservation_holder(cfg)
+            if holder and holder != active_id:
+                active_peer_cfg = get_peer_by_id(cfg, active_id)
+                ps = get_peer_status(active_peer_cfg.get('url')) if active_peer_cfg else {}
+                proc_state = ps.get('state', 'unknown')
+                if proc_state in ('idle', 'stopped'):
+                    log.info('Reservation ready on %s — pre-empting %s (between KGs)',
+                             holder, active_id)
+                    with self._lock:
+                        self.state['active_peer'] = None
+                        active_id = None
+                else:
+                    log.info('Reservation ready on %s but %s is mid-KG (%s) — waiting for KG boundary',
+                             holder, active_id, proc_state)
 
         # Check if active peer is scheduled (not_before in the future)
         if active_id:
@@ -1017,7 +1063,7 @@ class PeerDirector:
                     pass
                 self._update_bandwidth()
                 with self._lock:
-                    if _clear_stale_reservations(self.cfg):
+                    if _clear_completed_reservations(self.cfg):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)

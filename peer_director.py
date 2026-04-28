@@ -291,18 +291,24 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
         log.warning('Cache manifest sync to %s failed: %s', peer_url, e)
 
 
-def sync_queue_to_peer(peer_url: str) -> dict:
+def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     """Push the local priority queue to a remote peer.
 
     Reads the local retry_queue.json and POSTs it to the peer's
     /api/v1/processing/queue endpoint (position=0 = front of queue).
     Skips if queue is empty.
+
+    `exclude` is a set of KG codes that must NOT be sent to this peer
+    (typically KGs reserved for cooled-down peers so they can resume
+    them from tile checkpoints when their cooldown lifts).
     """
     queue_path = DATA_DIR / 'retry_queue.json'
     try:
         queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
     except Exception:
         queue = []
+    if exclude:
+        queue = [c for c in queue if c not in exclude]
     if not queue:
         return {'status': 'empty_queue', 'synced': 0}
     try:
@@ -312,18 +318,49 @@ def sync_queue_to_peer(peer_url: str) -> dict:
             timeout=PEER_TIMEOUT,
         )
         result = r.json()
-        log.info('Queue sync to %s: pushed %d KGs — %s', peer_url, len(queue), result.get('status', '?'))
+        log.info('Queue sync to %s: pushed %d KGs — %s%s', peer_url, len(queue),
+                 result.get('status', '?'),
+                 (' (excluded ' + ','.join(sorted(exclude)) + ')') if exclude else '')
         return result
     except Exception as e:
         log.warning('Queue sync to %s failed: %s', peer_url, e)
         return {'error': str(e)}
 
 
-def start_peer_processor(peer_url: str | None) -> dict:
+def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
+    """Collect KGs reserved by cooled-down peers (other than `exclude_peer_id`).
+
+    A reservation only counts if `not_before` is in the future — stale
+    reservations (cooldown already passed) are ignored.
+    """
+    out = set()
+    now = datetime.now(timezone.utc)
+    for p in cfg.get('peers', []):
+        if exclude_peer_id and p.get('id') == exclude_peer_id:
+            continue
+        kg = p.get('reserved_kg')
+        if not kg:
+            continue
+        nb = p.get('not_before')
+        if not nb:
+            continue
+        try:
+            nbdt = datetime.fromisoformat(nb)
+            if nbdt.tzinfo is None:
+                nbdt = nbdt.replace(tzinfo=timezone.utc)
+            if nbdt > now:
+                out.add(str(kg))
+        except (ValueError, TypeError):
+            pass
+    return out
+
+
+def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None) -> dict:
     """Start the processor on a peer.
 
     For remote peers, syncs the local priority queue first so the peer
-    processes the same KGs in priority order.
+    processes the same KGs in priority order. `exclude_kgs` lets callers
+    suppress KGs reserved for other (cooled-down) peers.
     """
     if peer_url is None:
         # Local start — use the local API so _processor_process is tracked
@@ -335,7 +372,7 @@ def start_peer_processor(peer_url: str | None) -> dict:
             return {'error': str(e)}
     # Remote peer — sync cache manifest + priority queue before starting
     _sync_cache_manifest_to_peer(peer_url)
-    queue_result = sync_queue_to_peer(peer_url)
+    queue_result = sync_queue_to_peer(peer_url, exclude=exclude_kgs)
     # Try API start first, fall back to systemd restart via admin endpoint
     try:
         r = requests.post(
@@ -469,6 +506,19 @@ def _peer_is_scheduled(peer: dict) -> bool:
         return False
 
 
+def _clear_stale_reservations(cfg: dict) -> bool:
+    """Drop reserved_kg for peers whose cooldown has already passed.
+
+    Returns True if the config was modified.
+    """
+    changed = False
+    for p in cfg.get('peers', []):
+        if p.get('reserved_kg') and not _peer_is_scheduled(p):
+            p.pop('reserved_kg', None)
+            changed = True
+    return changed
+
+
 def choose_active_peer(cfg: dict, state: dict) -> str | None:
     """Pick the best peer to run the processor on.
 
@@ -567,6 +617,7 @@ class PeerDirector:
                 'enabled': peer.get('enabled', True),
                 'not_before': peer.get('not_before'),
                 'scheduled': _peer_is_scheduled(peer),
+                'reserved_kg': peer.get('reserved_kg'),
                 'is_active': pid == state.get('active_peer'),
                 'processor_state': proc_status,
                 'current_kg': (ps.get('current_kg') or {}).get('code'),
@@ -698,8 +749,10 @@ class PeerDirector:
                     if peer:
                         status = get_peer_status(peer.get('url'))
                         if status.get('state') in ('idle', 'stopped', 'unknown'):
-                            log.info('Manual mode: starting processor on %s', active_id)
-                            start_peer_processor(peer.get('url'))
+                            excl = _reserved_kgs(self.cfg, exclude_peer_id=active_id)
+                            log.info('Manual mode: starting processor on %s%s', active_id,
+                                     (' — excluding ' + ','.join(sorted(excl))) if excl else '')
+                            start_peer_processor(peer.get('url'), exclude_kgs=excl)
                 return
 
             # Auto mode — check bandwidth and switch if needed
@@ -777,12 +830,18 @@ class PeerDirector:
                         return
                     log.warning('Active peer %s: Zenodo network failure \u2014 cooling down %d min and switching',
                                 active_id, ZENODO_NETWORK_COOLDOWN_MIN)
-                    # Apply not_before cooldown so choose_active_peer skips this peer
+                    # Apply not_before cooldown so choose_active_peer skips this peer.
+                    # Also reserve the in-progress KG so substitute peers skip
+                    # it — the cooled peer keeps its tile checkpoints and
+                    # will finish quickly when the cooldown lifts.
                     cd_until = (datetime.now(timezone.utc)
                                 + timedelta(minutes=ZENODO_NETWORK_COOLDOWN_MIN))
+                    cur_kg = (status.get('current_kg') or {}).get('code')
                     for p in self.cfg.get('peers', []):
                         if p['id'] == active_id:
                             p['not_before'] = cd_until.isoformat()
+                            if cur_kg:
+                                p['reserved_kg'] = str(cur_kg)
                             break
                     save_peers_config(self.cfg)
                     # Stop processor on this peer (still uploading retries)
@@ -810,9 +869,11 @@ class PeerDirector:
                             self.state['active_peer'] = None
                             active_id = None
                     elif remaining_gb >= 2:
-                        log.info('Restarting processor on %s (%.1f GB remaining)',
-                                 active_id, remaining_gb)
-                        start_peer_processor(peer.get('url'))
+                        excl = _reserved_kgs(cfg, exclude_peer_id=active_id)
+                        log.info('Restarting processor on %s (%.1f GB remaining)%s',
+                                 active_id, remaining_gb,
+                                 (' — excluding ' + ','.join(sorted(excl))) if excl else '')
+                        start_peer_processor(peer.get('url'), exclude_kgs=excl)
                     else:
                         log.info('Peer %s depleted, finding next peer', active_id)
                         with self._lock:
@@ -883,8 +944,12 @@ class PeerDirector:
                     if blocked:
                         return  # try again next tick
 
-                    log.info('Activating peer %s', new_peer)
-                    result = start_peer_processor(peer.get('url'))
+                    # Exclude KGs reserved for other cooled-down peers,
+                    # so a substitute does useful work on a different KG.
+                    excl = _reserved_kgs(cfg, exclude_peer_id=new_peer)
+                    log.info('Activating peer %s%s', new_peer,
+                             (' (excluding reserved KGs: ' + ','.join(sorted(excl)) + ')') if excl else '')
+                    result = start_peer_processor(peer.get('url'), exclude_kgs=excl)
                     log.info('Start result for %s: %s', new_peer, result)
                     with self._lock:
                         self.state['active_peer'] = new_peer
@@ -920,8 +985,11 @@ class PeerDirector:
             if self.state.get('_last_queue_hash') == q_hash:
                 return
 
-        # Push to peer
-        result = sync_queue_to_peer(peer['url'])
+        # Push to peer (excluding KGs reserved for cooled-down peers)
+        with self._lock:
+            cfg = self.cfg.copy()
+        excl = _reserved_kgs(cfg, exclude_peer_id=active_id)
+        result = sync_queue_to_peer(peer['url'], exclude=excl)
         if 'error' not in result:
             with self._lock:
                 self.state['_last_queue_hash'] = q_hash
@@ -948,6 +1016,9 @@ class PeerDirector:
                 except Exception:
                     pass
                 self._update_bandwidth()
+                with self._lock:
+                    if _clear_stale_reservations(self.cfg):
+                        save_peers_config(self.cfg)
                 self._check_and_switch()
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)
                 sync_counter += 1

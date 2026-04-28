@@ -656,6 +656,21 @@ function fmtT(iso) {
   try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
 }
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtRelFuture(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return iso;
+  const ms = t - Date.now();
+  if (ms <= 0) return 'now';
+  const s = Math.round(ms/1000);
+  if (s < 60) return 'in ' + s + 's';
+  const m = Math.round(s/60);
+  if (m < 60) return 'in ' + m + 'm';
+  const h = Math.floor(m/60), mm = m % 60;
+  if (h < 24) return 'in ' + h + 'h' + (mm ? ' ' + mm + 'm' : '');
+  const d = Math.floor(h/24);
+  return 'in ' + d + 'd';
+}
 
 // Step pipeline
 const STEPS = ['cadastre','lidar','terrain','ortho','copernicus','hansen','segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
@@ -2586,9 +2601,14 @@ function renderDirector(d) {
     // Determine if this peer is "inactive" (not active, not running)
     const isRunning = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
     const isScheduled = p.scheduled;
-    const isInactive = !isActive && !isRunning;
+    // "Owner" = cooled-down peer that holds a reserved KG and will
+    // resume from tile checkpoints once cooldown lifts. Show it expanded
+    // (with relative resume time) even though it is not the current active.
+    const isOwner = !!p.reserved_kg && isScheduled;
+    const isInactive = !isActive && !isRunning && !isOwner;
 
-    const border = isActive ? 'border-color:var(--blue);' : '';
+    const border = isActive ? 'border-color:var(--blue);'
+      : (isOwner ? 'border-color:var(--yellow);' : '');
 
     if (isInactive) {
       // Collapsed card — single line with expand toggle
@@ -2597,7 +2617,10 @@ function renderDirector(d) {
       html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id);
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
       html += ' · ' + (p.completed||0) + ' done';
-      if (isScheduled && p.not_before) html += ' · <span style="color:var(--yellow)">⏳ until ' + esc(p.not_before) + '</span>';
+      if (isScheduled && p.not_before) {
+        const rel = fmtRelFuture(p.not_before);
+        html += ' · <span style="color:var(--yellow)" title="' + esc(p.not_before) + '">⏳ ' + esc(rel) + '</span>';
+      }
       const rtInline = regionTag(p);
       if (rtInline) html += ' · ' + rtInline;
       const vtInline = versionTag(p);
@@ -2617,7 +2640,10 @@ function renderDirector(d) {
 
     if (!isInactive) {
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + (isActive ? ' ◀ active' : '') + '</span>';
+      let badge = '';
+      if (isActive) badge = ' ◀ active';
+      else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
+      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + badge + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
       if (p.online && p.processor_state === 'running') {
         html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px;color:var(--yellow)" onclick="restartPeer(\'' + esc(p.id) + '\')" title="Force-restart processor (kills stuck subprocesses)">⟳ Restart</button>';
@@ -2660,7 +2686,14 @@ function renderDirector(d) {
     html += '<div style="height:100%;width:' + bwPct + '%;background:' + bwColor + ';border-radius:2px;transition:width 0.5s"></div>';
     html += '</div>';
     if (!p.enabled) html += '<div style="font-size:10px;color:var(--yellow);margin-top:2px">⚠ disabled</div>';
-    if (isScheduled && p.not_before) html += '<div style="font-size:10px;color:var(--yellow);margin-top:2px">⏳ Scheduled: not before ' + esc(p.not_before) + '</div>';
+    if (isScheduled && p.not_before) {
+      const rel = fmtRelFuture(p.not_before);
+      const note = isOwner ? 'Resumes ' + rel : ('Scheduled: ' + rel);
+      html += '<div style="font-size:10px;color:var(--yellow);margin-top:2px" title="' + esc(p.not_before) + '">⏳ ' + esc(note) + '</div>';
+    }
+    if (isOwner && active && active !== p.id) {
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:2px">↪ substitute: <b>' + esc(active) + '</b></div>';
+    }
 
     if (isInactive) html += '</div>'; // close .peer-detail
     html += '</div>'; // close card

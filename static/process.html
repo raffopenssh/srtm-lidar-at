@@ -2724,8 +2724,27 @@ async function updatePeers() {
   btn.textContent = '\u23f3 Updating\u2026';
   btn.disabled = true;
   try {
-    const r = await fetch('/api/v1/director/update_peers', {method:'POST'});
-    const d = await r.json();
+    let r = await fetch('/api/v1/director/update_peers', {method:'POST'});
+    let d = await r.json();
+    if (r.status === 409 && d.push) {
+      // Local commits couldn't be pushed (e.g. non-fast-forward).
+      const out = (d.push.push_out || d.push.error || 'unknown error');
+      const ahead = d.push.ahead || '?';
+      if (confirm(`Push to origin failed (${ahead} local commits).\n\n${out}\n\nUpdate peers anyway from the current origin?`)) {
+        r = await fetch('/api/v1/director/update_peers', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({skip_push: true})
+        });
+        d = await r.json();
+      } else {
+        btn.textContent = '\u274c Push failed';
+        setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
+        return;
+      }
+    }
+    if (d.push && d.push.attempted && d.push.ahead && Number(d.push.ahead) > 0 && d.push.push_rc === 0) {
+      console.log(`Pushed ${d.push.ahead} commits before updating peers.`);
+    }
     btn.textContent = '\u2705 Done';
     setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; fetchDirectorStatus(); }, 3000);
   } catch(e) {

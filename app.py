@@ -2774,14 +2774,66 @@ def director_update_peers():
     """
     body = request.get_json(silent=True) or {}
     target_id = body.get('peer_id')
+    skip_push = bool(body.get('skip_push'))
     cfg = pd.load_peers_config()
+
+    # Ensure local commits are on origin before peers pull. Otherwise peers
+    # report 'Already up to date.' against a stale remote and silently stay
+    # behind the primary.
+    push_info = {'attempted': False}
+    if not skip_push:
+        try:
+            import subprocess as sp
+            repo = str(Path(__file__).parent)
+            branch = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                            capture_output=True, text=True, timeout=5,
+                            cwd=repo).stdout.strip() or 'main'
+            local = sp.run(['git', 'rev-parse', branch],
+                           capture_output=True, text=True, timeout=5,
+                           cwd=repo).stdout.strip()
+            sp.run(['git', 'fetch', 'origin', branch],
+                   capture_output=True, text=True, timeout=20, cwd=repo)
+            remote = sp.run(['git', 'rev-parse', f'origin/{branch}'],
+                            capture_output=True, text=True, timeout=5,
+                            cwd=repo).stdout.strip()
+            push_info = {'attempted': True, 'branch': branch,
+                         'local': local[:7], 'remote_before': remote[:7]}
+            if local and remote and local != remote:
+                # Check whether local is ahead (fast-forwardable on remote)
+                ahead = sp.run(['git', 'rev-list', '--count',
+                                f'origin/{branch}..{branch}'],
+                               capture_output=True, text=True, timeout=5,
+                               cwd=repo).stdout.strip()
+                push_info['ahead'] = ahead
+                push = sp.run(['git', 'push', 'origin', branch],
+                              capture_output=True, text=True, timeout=60,
+                              cwd=repo)
+                push_info['push_rc'] = push.returncode
+                push_info['push_out'] = (push.stdout + push.stderr).strip()[-500:]
+                if push.returncode != 0:
+                    return jsonify({
+                        'error': 'git push failed; aborting peer update',
+                        'push': push_info,
+                        'hint': 'Resolve manually or pass {"skip_push": true} to force.',
+                    }), 409
+            else:
+                push_info['push_rc'] = 0
+                push_info['note'] = 'origin already up to date'
+        except Exception as e:
+            push_info['error'] = str(e)
+            return jsonify({
+                'error': f'pre-push check failed: {e}',
+                'push': push_info,
+                'hint': 'Pass {"skip_push": true} to update peers anyway.',
+            }), 500
+
     results = {}
     for peer in cfg.get('peers', []):
         if peer.get('url'):  # skip local
             if target_id and peer['id'] != target_id:
                 continue
             results[peer['id']] = pd.trigger_peer_update(peer['url'])
-    return jsonify({'results': results})
+    return jsonify({'results': results, 'push': push_info})
 
 
 @app.route('/api/v1/admin/update', methods=['POST'])

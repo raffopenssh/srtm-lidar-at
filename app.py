@@ -136,8 +136,18 @@ _PROTECTED_PREFIXES = (
 _AUTH_SELF_HANDLED = ('/api/v1/admin/install_token',)
 
 
+# Paths where GET is read-only inspection (let through) but POST/PUT/DELETE
+# still require the admin token. The dashboard polls these without a token.
+_PROTECTED_GET_OPEN = (
+    '/api/v1/processing/queue',
+    '/api/v1/processing/cache_manifest',
+)
+
+
 def _is_protected_path(path: str, method: str) -> bool:
     if path in _AUTH_SELF_HANDLED:
+        return False
+    if method == 'GET' and any(path.startswith(p) for p in _PROTECTED_GET_OPEN):
         return False
     return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
 

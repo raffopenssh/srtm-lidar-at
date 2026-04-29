@@ -311,6 +311,13 @@ class HTTPRangeFile:
         return result
 
 
+class _StaleOffsetError(Exception):
+    """Raised when a ZIP entry's cached header_offset points at the
+    wrong byte in the remote ZIP — typically because another peer
+    rewrote the ZIP after this peer cached the central directory."""
+    pass
+
+
 # === SECTION: ZIP index (central directory cache) ===
 
 class ZipIndex:
@@ -389,37 +396,48 @@ class ZipIndex:
     def entry_info(self, name: str) -> Optional[zipfile.ZipInfo]:
         return self._load_or_fetch().get(name)
 
-    def read_entry(self, name: str) -> Optional[bytes]:
-        """Read a single entry from the remote ZIP via HTTP range request."""
-        entries = self._load_or_fetch()
+    def invalidate(self):
+        """Drop in-memory + on-disk cached central directory.
+
+        Forces the next call to _load_or_fetch() to re-read the ZIP
+        central directory from Zenodo.  Used when a stale offset is
+        detected (the remote ZIP was rewritten by another peer with
+        more tiles merged in).
+        """
+        self._entries = None
+        try:
+            self._index_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _try_read_with_entries(self, name: str,
+                                entries: Dict[str, zipfile.ZipInfo]) -> Optional[bytes]:
+        """Attempt to read a single entry using the supplied entry table.
+
+        Returns the decompressed bytes on success, None if the entry is
+        missing, or raises _StaleOffsetError when the local file header
+        signature is wrong (indicating the central directory is stale).
+        """
         zi = entries.get(name)
         if zi is None:
             return None
 
-        # Read the local file header + compressed data
-        # Local header is 30 bytes + filename_len + extra_len,
-        # followed by compressed data of compress_size bytes.
         hrf = HTTPRangeFile(self.url, session=self._session)
         hrf.seek(zi.header_offset)
 
-        # Read local file header (30 bytes minimum)
         local_header = hrf.read(30)
         if len(local_header) < 30:
             return None
 
-        # Parse local header to get filename_len and extra_len
         sig = struct.unpack("<I", local_header[:4])[0]
         if sig != 0x04034b50:  # PK\x03\x04
-            log.warning("Bad local header signature at offset %d", zi.header_offset)
-            return None
+            raise _StaleOffsetError(
+                f"Bad local header signature at offset {zi.header_offset}"
+            )
 
         fname_len = struct.unpack("<H", local_header[26:28])[0]
         extra_len = struct.unpack("<H", local_header[28:30])[0]
-
-        # Skip filename + extra fields
         hrf.read(fname_len + extra_len)
-
-        # Read compressed data
         compressed = hrf.read(zi.compress_size)
 
         if zi.compress_type == zipfile.ZIP_STORED:
@@ -428,10 +446,43 @@ class ZipIndex:
             import zlib
             return zlib.decompress(compressed, -15)
         else:
-            # Fallback: download via zipfile (slower, full central dir parse)
             hrf2 = HTTPRangeFile(self.url, session=self._session)
             with zipfile.ZipFile(hrf2) as zf:
                 return zf.read(name)
+
+    def read_entry(self, name: str) -> Optional[bytes]:
+        """Read a single entry from the remote ZIP via HTTP range request.
+
+        On a bad local-header signature (stale cached central directory
+        because another peer rewrote this ZIP with more tiles merged in),
+        invalidate the cached index, re-fetch it from Zenodo, and retry
+        the read once.  This recovers transparently from the
+        "Bad local header signature at offset N" warning that used to
+        cause cache-only peers to abort the KG.
+        """
+        entries = self._load_or_fetch()
+        try:
+            return self._try_read_with_entries(name, entries)
+        except _StaleOffsetError as e:
+            log.warning(
+                "%s for %s in %s — invalidating index and retrying",
+                e, name, self.url,
+            )
+            self.invalidate()
+            try:
+                fresh = self._load_or_fetch()
+            except Exception as exc:
+                log.warning("ZIP index re-fetch failed: %s", exc)
+                return None
+            try:
+                return self._try_read_with_entries(name, fresh)
+            except _StaleOffsetError as e2:
+                # Still bad after a fresh fetch — the ZIP itself is
+                # corrupt at this offset, not our cache.  Give up.
+                log.warning(
+                    "Stale offset persists after re-fetch: %s. Giving up.", e2,
+                )
+                return None
 
 
 # === SECTION: Inventory (what's in local cache) ===

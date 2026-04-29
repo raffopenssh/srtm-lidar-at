@@ -10668,6 +10668,40 @@ def share_rename(old_id):
         return _error(str(e))
 
 
+@app.route('/process.html')
+def process_html():
+    """Serve the processor dashboard with the admin token pre-injected.
+
+    The dashboard exercises every cluster admin endpoint (queue add/delete,
+    tombstones, bbox add, reshuffle, peers add/update, throttle, ...).  We
+    inject the current admin token as an inline script before the page's own
+    fetch interceptor so all those calls succeed without prompting the
+    operator. Anyone who can load /process.html therefore obtains the token;
+    that's by design — the dashboard is the admin UI.
+    """
+    try:
+        html = (Path('static') / 'process.html').read_text(encoding='utf-8')
+    except Exception as e:
+        return _error(f'process.html missing: {e}', 500)
+    tok = _current_admin_token() or ''
+    # JSON-encode so quotes/backslashes survive embedding.
+    inject = (
+        '<script>(function(){try{'
+        f'var t={json.dumps(tok)};'
+        'if(t){localStorage.setItem("srtm_admin_token",t);}'
+        '}catch(e){}})();</script>\n'
+    )
+    # Insert right after <head> so it runs before the existing interceptor.
+    lower = html.lower()
+    idx = lower.find('<head>')
+    if idx >= 0:
+        cut = idx + len('<head>')
+        html = html[:cut] + '\n' + inject + html[cut:]
+    else:
+        html = inject + html
+    return Response(html, mimetype='text/html; charset=utf-8')
+
+
 @app.route('/')
 def index():
     # ?share=X&dl=gpkg → redirect to GPKG download

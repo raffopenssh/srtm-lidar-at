@@ -3165,6 +3165,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             del ndvi_full
         del ndvi_sum, ndvi_wsum
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("FULL_GPKG: NDVI layer failed: %s", e)
 
     # ------------------------------------------------------------------
@@ -3213,6 +3216,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             log.info("  FULL_GPKG: WorldCover written")
         del wc_full
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("FULL_GPKG: WorldCover layer failed: %s", e)
 
     # ------------------------------------------------------------------
@@ -3267,6 +3273,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             log.info("  FULL_GPKG: SAR_VV + SAR_VH written")
         del vv_full, vh_full
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("FULL_GPKG: SAR layer failed: %s", e)
 
     # ------------------------------------------------------------------
@@ -3312,6 +3321,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             log.info("  FULL_GPKG: Hansen (treecover + lossyear) written")
         del tc_full, ly_full
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("FULL_GPKG: Hansen layer failed: %s", e)
 
     # ------------------------------------------------------------------
@@ -6395,8 +6407,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
-        full_gpkg, _boundary_remap = build_full_gpkg_tiled(
-            kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+        try:
+            full_gpkg, _boundary_remap = build_full_gpkg_tiled(
+                kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+        except Exception as _bge:
+            from tile_cache import CacheMissError as _CacheMissError
+            if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
+                # Cache-only peer hit a missing tile while building the full
+                # GPKG (e.g. tiles restored from checkpoint did not re-fetch
+                # Copernicus/Hansen, and those layers were not in the local
+                # or Zenodo cache).  Abort so the director re-queues the KG
+                # for the frontier (primary) peer.
+                log.warning("KG %s: cache-only mode hit a miss during gpkg_full \u2014 aborting (%s)",
+                            kg_code, _bge)
+                result["cache_incomplete"] = True
+                result["success"] = False
+                result["error"] = str(_bge)
+                result["step"] = "aborted_cache_incomplete_gpkg_full"
+                return result
+            raise
         result["files"]["full_gpkg"] = full_gpkg
 
         # --- 5b. Validate full GPKG, then stream to Zenodo ---

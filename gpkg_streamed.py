@@ -617,6 +617,9 @@ def build_full_gpkg_streamed(
             dtype='float32', blend='feather')
         log.info("  STREAMED GPKG: NDVI written")
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("STREAMED GPKG: NDVI layer failed: %s", e)
 
     # --- B7: ESA WorldCover ---
@@ -654,6 +657,9 @@ def build_full_gpkg_streamed(
             dtype='uint8', blend='overwrite')
         log.info("  STREAMED GPKG: WorldCover written")
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("STREAMED GPKG: WorldCover layer failed: %s", e)
 
     # --- B8: Sentinel-1 SAR (VV + VH) ---
@@ -702,6 +708,9 @@ def build_full_gpkg_streamed(
             dtype='float32', blend='overwrite')
         log.info("  STREAMED GPKG: SAR_VV + SAR_VH written")
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("STREAMED GPKG: SAR layer failed: %s", e)
 
     # --- B9: Hansen Global Forest Change ---
@@ -747,6 +756,9 @@ def build_full_gpkg_streamed(
             dtype='uint8', blend='overwrite')
         log.info("  STREAMED GPKG: Hansen (treecover + lossyear) written")
     except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
         log.warning("STREAMED GPKG: Hansen layer failed: %s", e)
 
     # ===================================================================

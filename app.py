@@ -1899,20 +1899,52 @@ def processing_start():
     #   * subprocess survives srv.service restarts (start_new_session)
     #   * single source of truth: only the director starts processors
     unit_name = f'austria-processor-{int(time.time())}'
-    scope_args = [
-        'sudo', '-n', 'systemd-run', '--scope', '--quiet',
-        '--unit', unit_name,
-        '-p', 'MemoryMax=8G',
-        '-p', 'MemoryHigh=7G',
-        '-p', 'OOMScoreAdjust=100',
-        '--',
-    ] + args
+    # Probe which -p properties this systemd accepts. systemd 255 (Ubuntu
+    # 24.04) rejects OOMScoreAdjust as a transient property and aborts
+    # systemd-run with rc=1 — which silently kills the processor at start.
+    # Probe each property with a tiny /bin/true and only keep the ones
+    # that are accepted.
+    def _probe_prop(prop):
+        try:
+            r = subprocess.run(
+                ['sudo', '-n', 'systemd-run', '--scope', '--quiet',
+                 '--unit', f'srtm-probe-{int(time.time()*1000)}',
+                 '-p', prop, '--', '/bin/true'],
+                capture_output=True, timeout=5,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+    cgroup_props = []
+    for p in ('MemoryMax=8G', 'MemoryHigh=7G', 'OOMScoreAdjust=100'):
+        if _probe_prop(p):
+            cgroup_props += ['-p', p]
+        else:
+            log.warning('systemd-run does not accept %s on this host — dropping', p)
+    scope_args = (
+        ['sudo', '-n', 'systemd-run', '--scope', '--quiet',
+         '--unit', unit_name]
+        + cgroup_props
+        + ['--']
+        + args
+    )
+    # Verify the scope can actually start by waiting briefly. If systemd-run
+    # exits with non-zero (rejected property, sudo failure, ...), fall back
+    # to plain Popen instead of letting the processor silently die.
     use_scope = True
     try:
         _processor_process = subprocess.Popen(
             scope_args, stdout=log_fd, stderr=subprocess.STDOUT,
             start_new_session=True, env=proc_env,
         )
+        # Brief liveness check: systemd-run --scope keeps the parent alive
+        # for the lifetime of the child. If it dies within 2s, the child
+        # is gone.
+        time.sleep(2)
+        if _processor_process.poll() is not None:
+            log.warning('systemd-run scope died with rc=%s — falling back to plain Popen',
+                        _processor_process.returncode)
+            raise RuntimeError(f'scope rc={_processor_process.returncode}')
         log.info('Austria processor started in scope %s: PID %d, args=%s',
                  unit_name, _processor_process.pid, args)
     except Exception as e:

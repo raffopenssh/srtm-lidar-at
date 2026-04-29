@@ -2949,8 +2949,13 @@ function updateDeployCmd() {
   const vm = document.getElementById('addPeerVmName').value.trim() || '<vm-name>';
   const selfUrl = vm === '<vm-name>' ? 'https://<vm-name>.exe.xyz:8000' : `https://${vm}.exe.xyz:8000`;
   const peerUrl = _directorPublicUrl();
+  // Bake the cluster admin token into the setup script so the new VM can
+  // join without a manual second step. Pulled from localStorage where the
+  // dashboard stashed it after first 401-prompt.
+  const adminTok = localStorage.getItem('srtm_admin_token') || '';
+  const tokEnv = adminTok ? `ADMIN_TOKEN=${adminTok} ` : '';
   // Build the setup script that deploy.sh runs on first boot
-  const deployScript = `curl -sL https://${_GH_TOKEN}@raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
+  const deployScript = `curl -sL https://${_GH_TOKEN}@raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ${tokEnv}SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
   // exe.dev new --setup-script supports \n for newlines
   const cmd = `new --name=${vm} --setup-script='${deployScript}'`;
   document.getElementById('addPeerCmd').textContent = cmd;

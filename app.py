@@ -166,6 +166,29 @@ def _sync_peer_data():
                     continue
 
                 peer_manifest = peer_data.get('manifest', {})
+                peer_tombstones = peer_data.get('tombstones', {}) or {}
+
+                # Merge peer tombstones into ours (newest timestamp wins).
+                # Propagates force-requeue requests across the fleet so
+                # peers with stale local JSONs don't silently skip a
+                # re-queued KG.
+                if isinstance(peer_tombstones, dict) and peer_tombstones:
+                    changed_tomb = False
+                    for tk, tv in peer_tombstones.items():
+                        if not isinstance(tv, str):
+                            continue
+                        cur = _MANIFEST_TOMBSTONES.get(tk, '')
+                        if tv > cur:
+                            _MANIFEST_TOMBSTONES[tk] = tv
+                            changed_tomb = True
+                    if changed_tomb:
+                        try:
+                            _tombstone_path.write_text(
+                                json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+                            log.info('Peer sync: merged tombstones from peer (now %d entries)',
+                                     len(_MANIFEST_TOMBSTONES))
+                        except Exception:
+                            pass
 
                 # Download KG JSONs we don't have, OR re-download when the
                 # peer's manifest entry is newer/larger than our local copy
@@ -1350,6 +1373,18 @@ def processing_peers_status():
     else:
         result['manifest'] = {}
 
+    # Tombstones: KG keys that have been force-requeued.  Peers must
+    # honor these when computing completed_codes so they don't skip a
+    # re-queued KG just because they have an old local JSON.
+    tomb_path = data_dir / 'manifest_tombstones.json'
+    if tomb_path.exists():
+        try:
+            result['tombstones'] = json.loads(tomb_path.read_text())
+        except Exception:
+            result['tombstones'] = {}
+    else:
+        result['tombstones'] = {}
+
     return jsonify(result)
 
 
@@ -1601,22 +1636,64 @@ def processing_start():
             proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
 
     import subprocess
-    _processor_process = subprocess.Popen(
-        args, stdout=log_fd, stderr=subprocess.STDOUT,
-        start_new_session=True, env=proc_env,
-    )
-    log.info('Austria processor started: PID %d, args=%s', _processor_process.pid, args)
-    return jsonify({'status': 'started', 'pid': _processor_process.pid})
+    # Launch inside a transient systemd scope so the processor lives in its
+    # own cgroup with proper memory limits (8G/7G), instead of inheriting
+    # srv.service's 5G/4G limits.  Without this, heavy KGs trigger memory
+    # throttling (mem_cgroup_handle_over_high — observed 3-hour Felzenszwalb
+    # stalls on at2).  We use --scope (not --service) so:
+    #   * lifecycle stays with the director (no Restart=, no autostart)
+    #   * _processor_process Popen handle still works for stop/pause/resume
+    #   * subprocess survives srv.service restarts (start_new_session)
+    #   * single source of truth: only the director starts processors
+    unit_name = f'austria-processor-{int(time.time())}'
+    scope_args = [
+        'sudo', '-n', 'systemd-run', '--scope', '--quiet',
+        '--unit', unit_name,
+        '-p', 'MemoryMax=8G',
+        '-p', 'MemoryHigh=7G',
+        '-p', 'OOMScoreAdjust=100',
+        '--',
+    ] + args
+    use_scope = True
+    try:
+        _processor_process = subprocess.Popen(
+            scope_args, stdout=log_fd, stderr=subprocess.STDOUT,
+            start_new_session=True, env=proc_env,
+        )
+        log.info('Austria processor started in scope %s: PID %d, args=%s',
+                 unit_name, _processor_process.pid, args)
+    except Exception as e:
+        log.warning('systemd-run scope failed (%s); falling back to plain Popen', e)
+        use_scope = False
+        _processor_process = subprocess.Popen(
+            args, stdout=log_fd, stderr=subprocess.STDOUT,
+            start_new_session=True, env=proc_env,
+        )
+        log.info('Austria processor started (no cgroup): PID %d, args=%s',
+                 _processor_process.pid, args)
+    return jsonify({
+        'status': 'started',
+        'pid': _processor_process.pid,
+        'method': 'systemd_scope' if use_scope else 'subprocess',
+        'scope': unit_name if use_scope else None,
+    })
 
 
 @app.route('/api/v1/processing/pause', methods=['POST'])
 def processing_pause():
-    """Pause the processor (sends SIGSTOP)."""
+    """Pause the processor (sends SIGSTOP to its process group)."""
     global _processor_process
     if _processor_process is None or _processor_process.poll() is not None:
         return jsonify({'error': 'Processor not running'}), 404
     import signal as _sig
-    os.kill(_processor_process.pid, _sig.SIGSTOP)
+    # Use killpg: when launched via `sudo systemd-run --scope`, the Popen
+    # PID is sudo's, and sudo doesn't forward SIGSTOP to its child.  The
+    # whole chain (sudo → systemd-run → python) shares one process group
+    # because we set start_new_session=True, so killpg reaches python.
+    try:
+        os.killpg(os.getpgid(_processor_process.pid), _sig.SIGSTOP)
+    except (ProcessLookupError, PermissionError, OSError):
+        os.kill(_processor_process.pid, _sig.SIGSTOP)
     # Update progress file
     pf = Path('data/austria_processor/progress.json')
     if pf.exists():
@@ -1628,12 +1705,15 @@ def processing_pause():
 
 @app.route('/api/v1/processing/resume', methods=['POST'])
 def processing_resume():
-    """Resume the processor (sends SIGCONT)."""
+    """Resume the processor (sends SIGCONT to its process group)."""
     global _processor_process
     if _processor_process is None or _processor_process.poll() is not None:
         return jsonify({'error': 'Processor not running'}), 404
     import signal as _sig
-    os.kill(_processor_process.pid, _sig.SIGCONT)
+    try:
+        os.killpg(os.getpgid(_processor_process.pid), _sig.SIGCONT)
+    except (ProcessLookupError, PermissionError, OSError):
+        os.kill(_processor_process.pid, _sig.SIGCONT)
     pf = Path('data/austria_processor/progress.json')
     if pf.exists():
         d = json.loads(pf.read_text())
@@ -2010,7 +2090,12 @@ def processing_prioritize():
 
 
 def _get_completed_kgs() -> set:
-    """Return set of KG codes that have been successfully processed."""
+    """Return set of KG codes that have been successfully processed.
+
+    Tombstoned KGs (force-requeued by an operator) are excluded so they
+    aren't silently filtered out of the priority queue or advertised
+    as completed to peers.
+    """
     data_dir = Path('data/austria_processor')
     completed = set()
     manifest_path = data_dir / 'zenodo_manifest.json'
@@ -2027,6 +2112,18 @@ def _get_completed_kgs() -> set:
     if json_dir.exists():
         for jf in json_dir.glob('*.json'):
             completed.add(jf.stem)
+    # Drop tombstoned KGs (force-requeued by operator).
+    try:
+        if _tombstone_path.exists():
+            tdata = json.loads(_tombstone_path.read_text())
+            if isinstance(tdata, dict):
+                import re as _re_c
+                for tk in tdata.keys():
+                    _m = _re_c.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', tk)
+                    if _m:
+                        completed.discard(_m.group(1))
+    except Exception:
+        pass
     return completed
 
 

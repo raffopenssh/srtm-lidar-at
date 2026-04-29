@@ -2957,6 +2957,26 @@ def admin_update():
         if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
             sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
                    capture_output=True, timeout=60)
+        # Install / refresh systemd watchdog units (idempotent).  These
+        # restart srv if /api/v1/ping stops answering — protects against
+        # the wedged-gunicorn failure mode.
+        try:
+            from pathlib import Path as _P
+            ws = _P(repo) / 'srv-watchdog.service'
+            wt = _P(repo) / 'srv-watchdog.timer'
+            wsh = _P(repo) / 'srv_watchdog.sh'
+            if ws.exists() and wt.exists() and wsh.exists():
+                sp.run(['chmod', '+x', str(wsh)], capture_output=True, timeout=5)
+                sp.run(['sudo', 'cp', str(ws), '/etc/systemd/system/srv-watchdog.service'],
+                       capture_output=True, timeout=10)
+                sp.run(['sudo', 'cp', str(wt), '/etc/systemd/system/srv-watchdog.timer'],
+                       capture_output=True, timeout=10)
+                sp.run(['sudo', 'systemctl', 'daemon-reload'],
+                       capture_output=True, timeout=10)
+                sp.run(['sudo', 'systemctl', 'enable', '--now', 'srv-watchdog.timer'],
+                       capture_output=True, timeout=10)
+        except Exception as _e:
+            log.warning('srv-watchdog install failed: %s', _e)
         # Defer restart if processor is mid-upload (avoid broken manifest entries)
         current_step = ''
         try:

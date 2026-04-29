@@ -135,7 +135,12 @@ EOSVC
 
 sudo cp srv.service /etc/systemd/system/srv.service
 sudo cp /tmp/austria_processor.service /etc/systemd/system/austria_processor.service
+sudo cp srv-watchdog.service /etc/systemd/system/srv-watchdog.service
+sudo cp srv-watchdog.timer   /etc/systemd/system/srv-watchdog.timer
+chmod +x srv_watchdog.sh
 sudo systemctl daemon-reload
+sudo systemctl enable --now srv-watchdog.timer
+echo "  ✓ srv liveness watchdog installed"
 
 # ── 7. Start services ────────────────────────────────────
 echo "\n[7/7] Starting services..."

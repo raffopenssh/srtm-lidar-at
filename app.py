@@ -2082,10 +2082,42 @@ def processing_queue_get():
     # Extract KG code (digits, or digits-label for blocks) from tombstone keys like '12362_json', '49006-north_json'
     import re as _re
     tombstoned_kgs = set()
-    for key in _MANIFEST_TOMBSTONES:
+    # Resolve tombstones that have already been satisfied: if the KG has a
+    # _json manifest entry uploaded AFTER the tombstone timestamp, the peer
+    # has reprocessed it — drop the stale tombstone.  This handles the case
+    # where a peer ran the KG (cleared its own tombstone, but the primary's
+    # _requeue tombstone is invisible to peers).
+    _stale_tombstones = []
+    try:
+        _mf_path = Path('data/austria_processor/zenodo_manifest.json')
+        _mf_entries = {}
+        if _mf_path.exists():
+            _mf_data = json.loads(_mf_path.read_text())
+            _mf_entries = _mf_data.get('entries', _mf_data) or {}
+    except Exception:
+        _mf_entries = {}
+    for key, ts_val in list(_MANIFEST_TOMBSTONES.items()):
         _m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
-        if _m:
-            tombstoned_kgs.add(_m.group(1))
+        if not _m:
+            continue
+        _kg = _m.group(1)
+        # Check if this KG has a fresh _json upload after the tombstone
+        _json_entry = _mf_entries.get(_kg + '_json')
+        if _json_entry:
+            _uploaded_at = _json_entry.get('uploaded_at', '')
+            if _uploaded_at and _uploaded_at > str(ts_val):
+                _stale_tombstones.append(key)
+                continue
+        tombstoned_kgs.add(_kg)
+    if _stale_tombstones:
+        for k in _stale_tombstones:
+            _MANIFEST_TOMBSTONES.pop(k, None)
+        try:
+            _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+            log.info('Cleared %d stale tombstone(s) (KG reprocessed by peer): %s',
+                     len(_stale_tombstones), _stale_tombstones[:5])
+        except Exception:
+            pass
     # Build a set of "effectively completed" codes — includes parent codes whose
     # all blocks are done (e.g. '49006' when '49006-south/center/north' are done).
     from kg_splitter import is_block_code, maybe_split_kg, all_block_codes_for_parent
@@ -2880,6 +2912,9 @@ def director_update_peers():
     body = request.get_json(silent=True) or {}
     target_id = body.get('peer_id')
     skip_push = bool(body.get('skip_push'))
+    # Default: graceful update (let peers finish current KG first).
+    # Pass {"graceful": false} to force immediate restart.
+    graceful = body.get('graceful', True) is not False
     cfg = pd.load_peers_config()
 
     # Ensure local commits are on origin before peers pull. Otherwise peers
@@ -2937,16 +2972,73 @@ def director_update_peers():
         if peer.get('url'):  # skip local
             if target_id and peer['id'] != target_id:
                 continue
-            results[peer['id']] = pd.trigger_peer_update(peer['url'])
-    return jsonify({'results': results, 'push': push_info})
+            results[peer['id']] = pd.trigger_peer_update(peer['url'], graceful=graceful)
+    return jsonify({'results': results, 'push': push_info, 'graceful': graceful})
 
 
 @app.route('/api/v1/admin/update', methods=['POST'])
 def admin_update():
-    """Git pull and restart the web server (called by director on peers)."""
+    """Git pull and restart the web server (called by director on peers).
+
+    Optional body/query: graceful=1 → if a processor is running mid-KG,
+    send a graceful stop (SIGTERM, no escalation) and defer the actual
+    git-pull + srv restart until the processor has exited at the next KG
+    boundary. Director will start it again on the next tick.
+    """
+    body = request.get_json(silent=True) or {}
+    graceful = (request.args.get('graceful') in ('1', 'true', 'yes')
+                or body.get('graceful') is True
+                or body.get('after_kg') is True)
     try:
         import subprocess as sp
         repo = str(Path(__file__).parent)
+        if graceful:
+            # Are we mid-KG?  If so, send graceful stop and defer the
+            # actual update to a background thread that polls until the
+            # processor exits, then runs the same code path as below.
+            try:
+                proc_running = sp.run(
+                    ['pgrep', '-f', 'austria_processor.py'],
+                    capture_output=True, timeout=3,
+                ).returncode == 0
+            except Exception:
+                proc_running = False
+            if proc_running:
+                # Ask the processor to stop after the current KG.
+                try:
+                    sp.run(['pkill', '-TERM', '-f', 'austria_processor.py'],
+                           capture_output=True, text=True, timeout=5)
+                except Exception:
+                    pass
+                import threading as _th, time as _t
+                def _deferred_update():
+                    deadline = _t.time() + 4 * 3600  # 4 h cap
+                    while _t.time() < deadline:
+                        try:
+                            still = sp.run(
+                                ['pgrep', '-f', 'austria_processor.py'],
+                                capture_output=True, timeout=3,
+                            ).returncode == 0
+                        except Exception:
+                            still = False
+                        if not still:
+                            break
+                        _t.sleep(15)
+                    # Now run the actual update + restart sequence.
+                    try:
+                        sp.run(['git', 'checkout', '--', '.'],
+                               capture_output=True, text=True, timeout=10, cwd=repo)
+                        sp.run(['git', 'pull', '--ff-only'],
+                               capture_output=True, text=True, timeout=60, cwd=repo)
+                    except Exception:
+                        pass
+                    sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
+                _th.Thread(target=_deferred_update, daemon=True).start()
+                return jsonify({
+                    'status': 'graceful_update_scheduled',
+                    'note': 'will git-pull + restart srv once processor exits at next KG boundary',
+                })
+            # No processor running → fall through to immediate path.
         # Reset any tracked files that have local modifications (e.g. manifest)
         sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
                timeout=10, cwd=repo)

@@ -855,8 +855,9 @@ function updateCards(d) {
   }
   document.getElementById('cServiceDet').innerHTML = sdet || '—';
 
-  // Progress
-  const done = d.completed || 0;
+  // Progress (prefer DB-sourced count which aggregates all peers via
+  // Zenodo manifest sync; falls back to local manifest count otherwise)
+  const done = (d.db_processed != null ? d.db_processed : (d.completed || 0));
   const total = d.total_kgs || 0;
   const pct = total > 0 ? (done / total * 100) : 0;
   document.getElementById('cProgVal').textContent = done + '/' + total;

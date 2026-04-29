@@ -576,14 +576,18 @@ def safely_stop_peer(peer_url: str | None, peer_id: str = '?',
             'last_state': last_state}
 
 
-def trigger_peer_update(peer_url: str) -> dict:
+def trigger_peer_update(peer_url: str, graceful: bool = False) -> dict:
     """Tell a remote peer to git pull and restart its web server.
     The peer kills itself on restart so the connection always drops — treat
     any ConnectionError/ReadTimeout after the request was sent as success.
+
+    If ``graceful`` is True, the peer will defer git-pull + restart until
+    the current KG finishes (no mid-KG kills).
     """
     try:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/admin/update',
+            params={'graceful': '1'} if graceful else None,
             timeout=15
         )
         return r.json()

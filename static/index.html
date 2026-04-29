@@ -1335,8 +1335,10 @@ function hideFullscreenLoading(){document.getElementById('loading-overlay').clas
       ]);
       const d=rs||{};
       const s=d.state||'idle';
-      // Combined count across all peers from director
-      const totalDone=rd?(rd.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0);
+      // Prefer DB-sourced count (aggregates all peers via Zenodo manifest sync,
+      // matches the "TOTAL" parcel/area numbers).  Fall back to peer sum or local.
+      const totalDone=(d.db_processed!=null)?d.db_processed
+        :(rd?(rd.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0));
       const activePeer=rd?rd.active_peer:null;
       const ap=activePeer&&rd?(rd.peers||[]).find(p=>p.id===activePeer):null;
       const kgName=ap&&ap.current_kg_name?ap.current_kg_name:(d.current_kg?d.current_kg.name||d.current_kg.code:'');

@@ -5196,8 +5196,14 @@ def _fetch_copernicus_for_tile(
             return result
     except Exception as e:
         from copernicus import CreditsExhaustedError, IPThrottledError
+        from tile_cache import CacheMissError as _CacheMissError
         if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
            isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+            raise
+        # Cache-only mode: don't waste time on quadrant fallback (sub-tiles
+        # will also miss the cache).  Re-raise so the outer tile loop can
+        # mark the KG cache_incomplete and re-queue for the frontier.
+        if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
             raise
         log.warning("Copernicus full-tile fetch failed for %s: %s — trying sub-tiles",
                     tile_label, e)
@@ -5220,8 +5226,11 @@ def _fetch_copernicus_for_tile(
                 sub_results.append((sb, sr))
             except Exception as e:
                 from copernicus import CreditsExhaustedError, IPThrottledError
+                from tile_cache import CacheMissError as _CacheMissError
                 if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
                    isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+                    raise
+                if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
                     raise
                 log.warning("Copernicus quadrant %d/%d failed: %s",
                             si+1, n_pieces, e)

@@ -7603,6 +7603,15 @@ def main():
     # Count completed KGs from local JSON files on disk
     _local_jsons = list(JSON_DIR.glob("*.json")) if JSON_DIR.is_dir() else []
     _completed = len(_local_jsons)
+    # Restore last_kg_code from most recent JSON so the dashboard's
+    # "Last Completed KG" card shows after a restart, before the next
+    # KG finishes in the current session.
+    _last_kg_code = None
+    if _local_jsons:
+        try:
+            _last_kg_code = max(_local_jsons, key=lambda p: p.stat().st_mtime).stem
+        except Exception:
+            _last_kg_code = None
     log.info(
         "Resuming state: %d uploaded KGs, %d bytes, %d local JSONs",
         _uploaded_kgs, _upload_bytes, _completed,
@@ -7617,7 +7626,7 @@ def main():
         success=_completed,
         uploaded=_uploaded_kgs,
         upload_size_bytes=_upload_bytes,
-        last_kg_code=None,
+        last_kg_code=_last_kg_code,
         last_kg_seconds=0,
         n_new_buildings_total=0,
         n_infrastructure_total=0,

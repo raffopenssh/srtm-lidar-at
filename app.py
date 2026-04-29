@@ -8511,6 +8511,18 @@ def _dominant_cadastre_code(feat, parcels):
 
 # === SECTION: /api/v1/docs + share endpoints ===
 
+@app.route('/api/v1/ping', methods=['GET'])
+def ping():
+    """Cheap liveness probe — NEVER blocks on disk/network.
+
+    Used by the local watchdog (`srv_watchdog.sh`) and the director to
+    distinguish 'gunicorn is alive' from 'gunicorn is wedged'.  Must stay
+    fast (no FS I/O, no subprocess, no requests).
+    """
+    import time as _t
+    return jsonify({'pong': True, 'ts': _t.time()})
+
+
 @app.route('/api/v1/info', methods=['GET'])
 def info():
     return jsonify({

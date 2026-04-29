@@ -1,0 +1,8 @@
+[Unit]
+Description=srv liveness watchdog (restarts gunicorn if /api/v1/ping is unresponsive)
+After=srv.service
+
+[Service]
+Type=oneshot
+User=exedev
+ExecStart=/home/exedev/srtm-lidar/srv_watchdog.sh

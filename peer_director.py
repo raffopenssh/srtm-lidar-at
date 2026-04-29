@@ -58,8 +58,22 @@ MAX_CACHE_ONLY_PEERS = 8
 DIRECTOR_POLL_INTERVAL = 30
 # Grace period after stopping a peer before starting another (seconds)
 SWITCH_COOLDOWN = 10
-# HTTP timeout for peer API calls
-PEER_TIMEOUT = 30
+# HTTP timeout for peer API calls.  Tuple = (connect_timeout, read_timeout).
+# A 3 s connect catches DNS / TLS-handshake hangs without waiting forever.
+# Read timeout is short for cheap probes (bandwidth/status) and longer for
+# operations that legitimately take time (start/stop, cache_manifest sync).
+PEER_TIMEOUT = (3, 8)
+PEER_TIMEOUT_PROBE = (3, 8)         # bandwidth, status, log
+PEER_TIMEOUT_CONTROL = (5, 25)      # start/stop/cache-manifest/queue PUT
+# Bandwidth poll concurrency — keep small to avoid ephemeral-port exhaustion
+# but enough that the loop finishes well within DIRECTOR_POLL_INTERVAL even
+# when most peers are wedged.
+BANDWIDTH_POLL_CONCURRENCY = 10
+# After this many consecutive bandwidth-poll failures, back off polling
+# the peer for BANDWIDTH_BACKOFF_SECONDS so a single dead peer can't drag
+# out the loop on every tick.
+BANDWIDTH_BACKOFF_THRESHOLD = 3
+BANDWIDTH_BACKOFF_SECONDS = 300     # 5 min
 # Number of consecutive unreachable polls before failover (avoids killing
 # peers during heavy GPKG builds that briefly starve gunicorn).
 UNREACHABLE_FAILOVER_THRESHOLD = 3
@@ -198,17 +212,18 @@ def get_local_bandwidth() -> dict:
 
 
 def get_peer_bandwidth(peer_url: str) -> dict:
-    """Get bandwidth from a remote peer."""
+    """Get bandwidth from a remote peer.  Short timeout — must not block the loop."""
     try:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/bandwidth',
-            timeout=PEER_TIMEOUT
+            timeout=PEER_TIMEOUT_PROBE
         )
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        log.warning('Failed to get bandwidth from %s: %s', peer_url, e)
-        # On error, assume peer has budget remaining (don't penalize for missing endpoint)
+        # Don't log here — the caller (_update_bandwidth) decides whether to
+        # warn based on the consecutive-failure count.  Avoids log spam when
+        # a peer is wedged.
         return {'error': str(e), 'used_bytes': 0, 'used_gb': 0,
                 'remaining_gb': BANDWIDTH_BUDGET_GB, 'pct_used': 0,
                 'estimated': True}
@@ -241,7 +256,7 @@ def get_peer_status(peer_url: str | None) -> dict:
     try:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/processing/status',
-            timeout=PEER_TIMEOUT
+            timeout=PEER_TIMEOUT_PROBE
         )
         r.raise_for_status()
         return r.json()
@@ -267,7 +282,7 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/processing/log',
             params={'lines': lines},
-            timeout=PEER_TIMEOUT
+            timeout=PEER_TIMEOUT_PROBE
         )
         r.raise_for_status()
         d = r.json()
@@ -291,7 +306,7 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
             return
         r = requests.put(
             peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-            json=local_cm, timeout=PEER_TIMEOUT,
+            json=local_cm, timeout=PEER_TIMEOUT_CONTROL,
         )
         if r.ok:
             result = r.json()
@@ -354,7 +369,7 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
             r = requests.post(
                 peer_url.rstrip('/') + '/api/v1/processing/queue',
                 json={'kgs': normal_queue, 'position': 0, 'skip_processed': True},
-                timeout=PEER_TIMEOUT,
+                timeout=PEER_TIMEOUT_CONTROL,
             )
             result = r.json()
         # Then push tombstoned codes at position 0 — ends up in front,
@@ -364,7 +379,7 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
                 peer_url.rstrip('/') + '/api/v1/processing/queue',
                 json={'kgs': tombstoned_in_queue, 'position': 0,
                       'skip_processed': False},
-                timeout=PEER_TIMEOUT,
+                timeout=PEER_TIMEOUT_CONTROL,
             )
             result = r2.json()
         log.info('Queue sync to %s: pushed %d KGs (%d tombstoned) — %s%s',
@@ -390,7 +405,7 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
         r = requests.put(
             peer_url.rstrip('/') + '/api/v1/processing/queue',
             json={'queue': codes},
-            timeout=PEER_TIMEOUT,
+            timeout=PEER_TIMEOUT_CONTROL,
         )
         if r.ok:
             log.info('Whitelist queue PUT to %s: %d KGs', peer_url, len(codes))
@@ -399,7 +414,7 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
         r2 = requests.post(
             peer_url.rstrip('/') + '/api/v1/processing/queue',
             json={'kgs': codes, 'position': 0, 'skip_processed': True},
-            timeout=PEER_TIMEOUT,
+            timeout=PEER_TIMEOUT_CONTROL,
         )
         log.info('Whitelist queue POST to %s: %d KGs (PUT was %d)',
                  peer_url, len(codes), r.status_code)
@@ -445,7 +460,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         # Local start — use the local API so _processor_process is tracked
         try:
             r = requests.post('http://127.0.0.1:8000/api/v1/processing/start',
-                              json=payload, timeout=PEER_TIMEOUT)
+                              json=payload, timeout=PEER_TIMEOUT_CONTROL)
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
@@ -460,7 +475,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/processing/start',
             json=payload,
-            timeout=PEER_TIMEOUT,
+            timeout=PEER_TIMEOUT_CONTROL,
         )
         if r.ok:
             result = r.json()
@@ -728,11 +743,29 @@ class PeerDirector:
             cfg = self.cfg.copy()
             state = self.state.copy()
 
+        # Poll all peer statuses in parallel — a single wedged peer
+        # must never wedge the dashboard request.
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FTimeout
+        statuses: dict[str, dict] = {}
+        peers_list = list(cfg.get('peers', []))
+        with ThreadPoolExecutor(max_workers=BANDWIDTH_POLL_CONCURRENCY,
+                                thread_name_prefix='dir-st') as ex:
+            futs = {ex.submit(get_peer_status, p.get('url')): p for p in peers_list}
+            import time as _t
+            deadline = _t.time() + 15
+            for fut, p in list(futs.items()):
+                try:
+                    statuses[p['id']] = fut.result(
+                        timeout=max(0.1, deadline - _t.time())
+                    )
+                except (FTimeout, Exception) as e:
+                    statuses[p['id']] = {'state': 'unreachable', 'error': str(e)}
+
         peers_status = []
-        for peer in cfg.get('peers', []):
+        for peer in peers_list:
             pid = peer['id']
             url = peer.get('url')
-            ps = get_peer_status(url)
+            ps = statuses.get(pid, {'state': 'unreachable'})
             bw = state.get('peer_bandwidth', {}).get(pid, {})
             proc_status = ps.get('state', 'unknown')
 
@@ -801,14 +834,14 @@ class PeerDirector:
             try:
                 # First check current state
                 r = requests.get(url.rstrip('/') + '/api/v1/processing/throttle',
-                                 timeout=PEER_TIMEOUT)
+                                 timeout=PEER_TIMEOUT_PROBE)
                 current = r.json().get('throttle', False) if r.ok else None
                 if current == enabled:
                     results[peer['id']] = 'already_' + ('on' if enabled else 'off')
                     continue
                 # Toggle to match desired state
                 r2 = requests.post(url.rstrip('/') + '/api/v1/processing/throttle',
-                                   timeout=PEER_TIMEOUT)
+                                   timeout=PEER_TIMEOUT_CONTROL)
                 if r2.ok:
                     results[peer['id']] = 'set_' + ('on' if enabled else 'off')
                 else:
@@ -855,19 +888,103 @@ class PeerDirector:
         return {'status': 'removed', 'peer_id': peer_id}
 
     def _update_bandwidth(self):
-        """Refresh bandwidth data for all peers."""
-        for peer in self.cfg.get('peers', []):
-            pid = peer['id']
-            url = peer.get('url')
-            if url is None:
-                bw = get_local_bandwidth()
-            else:
-                bw = get_peer_bandwidth(url)
+        """Refresh bandwidth data for all peers in parallel.
 
-            with self._lock:
-                if 'peer_bandwidth' not in self.state:
-                    self.state['peer_bandwidth'] = {}
-                self.state['peer_bandwidth'][pid] = bw
+        A single wedged peer must never delay the loop.  Each remote peer
+        is polled in a worker thread with short tuple-timeouts (connect=3,
+        read=8).  After BANDWIDTH_BACKOFF_THRESHOLD consecutive failures
+        we skip polling that peer for BANDWIDTH_BACKOFF_SECONDS so the
+        loop stays fast even when half the fleet is dead.
+        """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FTimeout
+        import time as _t
+
+        peers = list(self.cfg.get('peers', []))
+        # Local first — cheap, in-process.
+        for peer in peers:
+            if peer.get('url') is None:
+                bw = get_local_bandwidth()
+                with self._lock:
+                    self.state.setdefault('peer_bandwidth', {})[peer['id']] = bw
+
+        remote = [p for p in peers if p.get('url')]
+        if not remote:
+            return
+
+        with self._lock:
+            backoff = self.state.setdefault('_bandwidth_backoff', {})
+            misses = self.state.setdefault('_bandwidth_misses', {})
+        now = _t.time()
+
+        # Filter peers currently in backoff so the loop stays fast.
+        to_poll = []
+        for p in remote:
+            pid = p['id']
+            until = backoff.get(pid, 0)
+            if until > now:
+                continue
+            to_poll.append(p)
+
+        results: dict[str, dict] = {}
+        if to_poll:
+            poll_started = _t.time()
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=BANDWIDTH_POLL_CONCURRENCY,
+                    thread_name_prefix='dir-bw'
+                ) as ex:
+                    futs = {ex.submit(get_peer_bandwidth, p['url']): p for p in to_poll}
+                    # Hard wall-clock budget: even if a worker hangs we
+                    # don't wait more than this for the whole batch.
+                    deadline = poll_started + 15
+                    for fut, p in list(futs.items()):
+                        try:
+                            results[p['id']] = fut.result(
+                                timeout=max(0.1, deadline - _t.time())
+                            )
+                        except FTimeout:
+                            results[p['id']] = {
+                                'error': 'bandwidth poll exceeded 15 s budget',
+                                'used_bytes': 0, 'used_gb': 0,
+                                'remaining_gb': BANDWIDTH_BUDGET_GB,
+                                'pct_used': 0, 'estimated': True,
+                            }
+                        except Exception as e:
+                            results[p['id']] = {
+                                'error': str(e),
+                                'used_bytes': 0, 'used_gb': 0,
+                                'remaining_gb': BANDWIDTH_BUDGET_GB,
+                                'pct_used': 0, 'estimated': True,
+                            }
+            except Exception:
+                log.exception('bandwidth pool error')
+            log.debug('bandwidth poll: %d peers in %.1fs',
+                     len(to_poll), _t.time() - poll_started)
+
+        # Apply results + maintain backoff bookkeeping.
+        with self._lock:
+            self.state.setdefault('peer_bandwidth', {})
+            for p in remote:
+                pid = p['id']
+                if pid in results:
+                    bw = results[pid]
+                    self.state['peer_bandwidth'][pid] = bw
+                    if bw.get('error'):
+                        misses[pid] = misses.get(pid, 0) + 1
+                        if misses[pid] >= BANDWIDTH_BACKOFF_THRESHOLD:
+                            backoff[pid] = now + BANDWIDTH_BACKOFF_SECONDS
+                            log.warning(
+                                'Backing off bandwidth poll for %s for %ds '
+                                'after %d failures (last err: %s)',
+                                pid, BANDWIDTH_BACKOFF_SECONDS,
+                                misses[pid], str(bw.get('error'))[:80]
+                            )
+                    else:
+                        misses.pop(pid, None)
+                        backoff.pop(pid, None)
+                # else: still in backoff, keep last known value
+            self.state['_bandwidth_backoff'] = backoff
+            self.state['_bandwidth_misses'] = misses
 
     def _check_and_switch(self):
         """Check if we need to switch the active peer."""

@@ -3048,6 +3048,22 @@ fetchDirectorStatus();
 setInterval(poll, POLL * 1000);
 setInterval(fetchPrioQueue, 15000);
 setInterval(fetchDirectorStatus, 15000);
+// Refresh completed-KG list periodically so the Last KG card advances
+// when cache-only peers finish work (their completions don't bump the
+// active peer's last_kg_code, but they do show up in the local merged
+// manifest after peer-sync).
+setInterval(() => {
+  _refreshCompletedKgs().then(() => {
+    if (_stickToLatest && _completedKgs.length) {
+      const latest = _completedKgs[_completedKgs.length - 1];
+      if (latest && latest !== lastFetchedKg) {
+        lastFetchedKg = latest;
+        _viewedKgIdx = _completedKgs.length - 1;
+        fetchKgJson(latest);
+      }
+    }
+  });
+}, 30000);
 setInterval(() => {
   cd--;
   if (cd <= 0) cd = POLL;

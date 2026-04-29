@@ -561,6 +561,25 @@ def _sync_peer_data():
                     idx.build()
                 except Exception as e:
                     log.warning('Peer sync: index rebuild failed: %s', e)
+                # Bump last_kg_code in our local progress.json to the most
+                # recently arrived JSON so the dashboard's "Last Completed
+                # KG" card updates as cache-only peers complete work.
+                try:
+                    pf = Path('data/austria_processor/progress.json')
+                    if pf.exists():
+                        pdata = json.loads(pf.read_text())
+                        latest = max(json_dir.glob('*.json'),
+                                     key=lambda p: p.stat().st_mtime, default=None)
+                        if latest is not None:
+                            new_code = latest.stem
+                            if pdata.get('last_kg_code') != new_code:
+                                pdata['last_kg_code'] = new_code
+                                tmp = pf.with_suffix('.tmp')
+                                tmp.write_text(json.dumps(pdata, indent=2, default=str))
+                                tmp.replace(pf)
+                                log.info('Peer sync: bumped last_kg_code to %s', new_code)
+                except Exception as e:
+                    log.debug('Peer sync: last_kg_code bump failed: %s', e)
 
             # --- Sync Zenodo tile-cache manifest across peers ---
             # Read our local cache_manifest, push to each peer, pull theirs.

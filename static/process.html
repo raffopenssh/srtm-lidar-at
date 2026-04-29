@@ -638,7 +638,9 @@
   // pollers (status, log, peers) hit several protected endpoints in
   // parallel; without dedupe the operator gets one prompt per request.
   let _promptInFlight = null;
-  let _dismissed = false;
+  // Prompts disabled by default — dashboard is used in live presentations.
+  // Re-enable in the JS console with `srtmResetAdminToken()` if needed.
+  let _dismissed = true;
   function promptToken(reason){
     if (_dismissed) return Promise.resolve(null);
     if (_promptInFlight) return _promptInFlight;

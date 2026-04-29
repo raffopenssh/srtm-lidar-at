@@ -89,6 +89,24 @@ def _load_or_create_admin_token() -> str:
 
 ADMIN_TOKEN = _load_or_create_admin_token()
 
+
+def _current_admin_token() -> str:
+    """Read the admin token fresh each time.
+
+    Lets `/api/v1/admin/install_token` rotate the cluster secret without
+    a srv restart — the next request picks up the new value.
+    """
+    global ADMIN_TOKEN
+    try:
+        if ADMIN_TOKEN_PATH.exists():
+            tok = ADMIN_TOKEN_PATH.read_text().strip()
+            if tok:
+                ADMIN_TOKEN = tok
+                return tok
+    except Exception:
+        pass
+    return ADMIN_TOKEN
+
 # URL prefixes that require the admin token. GET-only inspection endpoints
 # (/director/status, /processing/queue, /processing/peers, /bandwidth, ...)
 # stay open so the dashboard remains usable from anywhere.
@@ -114,7 +132,13 @@ _PROTECTED_PREFIXES = (
 )
 
 
+# Endpoints that handle their own auth (before_request must let them through).
+_AUTH_SELF_HANDLED = ('/api/v1/admin/install_token',)
+
+
 def _is_protected_path(path: str, method: str) -> bool:
+    if path in _AUTH_SELF_HANDLED:
+        return False
     return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
 
 
@@ -145,7 +169,7 @@ def _enforce_admin_token():
     tok = (request.headers.get('X-Admin-Token')
            or request.args.get('admin_token')
            or request.cookies.get('admin_token'))
-    if tok and tok == ADMIN_TOKEN:
+    if tok and tok == _current_admin_token():
         return None
     return jsonify({'error': 'admin token required',
                     'hint': 'set X-Admin-Token header'}), 401
@@ -159,7 +183,57 @@ def admin_token_bootstrap():
     protected endpoints. Public callers get 401 from the before_request hook
     (this route is under /api/v1/admin/ so it is protected).
     """
-    return jsonify({'token': ADMIN_TOKEN})
+    return jsonify({'token': _current_admin_token()})
+
+
+@app.route('/api/v1/admin/install_token', methods=['POST'])
+def admin_install_token():
+    """Install/rotate the cluster admin token.
+
+    Authentication rules (the before_request hook lets this route through;
+    we authenticate here ourselves):
+      * If this peer currently has NO token (data/admin_token missing or
+        empty), accept any non-empty new token — first-write-wins
+        bootstrap. Used by the director to seed peers running pre-auth
+        code that have just been updated.
+      * Otherwise the request must present a valid X-Admin-Token (the
+        peer's current token) OR pass current_token in the body.
+
+    Body JSON: {"new_token": "...", "current_token": "<optional>"}
+    """
+    global ADMIN_TOKEN
+    body = request.get_json(silent=True) or {}
+    new_tok = (body.get('new_token') or '').strip()
+    if not new_tok or len(new_tok) < 16:
+        return jsonify({'error': 'new_token must be a non-empty string >=16 chars'}), 400
+
+    # Loopback always allowed (on-box CLI / in-process callers).
+    if not _request_is_loopback():
+        existing = ''
+        try:
+            if ADMIN_TOKEN_PATH.exists():
+                existing = ADMIN_TOKEN_PATH.read_text().strip()
+        except Exception:
+            existing = ''
+        if existing:
+            presented = (request.headers.get('X-Admin-Token')
+                         or request.args.get('admin_token')
+                         or body.get('current_token') or '')
+            if presented != existing:
+                return jsonify({
+                    'error': 'token already installed; current X-Admin-Token required to rotate',
+                }), 401
+        # else: bootstrap, allow.
+
+    try:
+        ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ADMIN_TOKEN_PATH.write_text(new_tok)
+        ADMIN_TOKEN_PATH.chmod(0o600)
+    except Exception as e:
+        return jsonify({'error': f'failed to write token: {e}'}), 500
+    ADMIN_TOKEN = new_tok
+    log.info('admin_install_token: token installed/rotated (len=%d)', len(new_tok))
+    return jsonify({'status': 'installed'})
 
 
 # Initialize search index + watch for new KG JSON files
@@ -3257,13 +3331,48 @@ def director_update_peers():
                 'hint': 'Pass {"skip_push": true} to update peers anyway.',
             }), 500
 
-    results = {}
+    # Push the cluster admin token to every peer first. Idempotent: if
+    # the peer already has it, install_token is a no-op (current_token
+    # check passes). If the peer has none (fresh deploy or pre-auth code
+    # that just pulled), bootstrap-allowed first install seeds it. This
+    # makes the dashboard "Update Peers" button self-bootstrapping for
+    # the cluster auth rollout, even if the peer's web server has not
+    # yet picked up the new auth code (the install_token endpoint is
+    # part of the same release; peers running pre-release code simply
+    # skip this step harmlessly with a 404).
+    cluster_tok = _current_admin_token()
+    token_results = {}
     for peer in cfg.get('peers', []):
-        if peer.get('url'):  # skip local
-            if target_id and peer['id'] != target_id:
-                continue
-            results[peer['id']] = pd.trigger_peer_update(peer['url'], graceful=graceful)
-    return jsonify({'results': results, 'push': push_info, 'graceful': graceful})
+        if not peer.get('url'):
+            continue
+        if target_id and peer['id'] != target_id:
+            continue
+        token_results[peer['id']] = pd.install_token_on_peer(
+            peer['url'], cluster_tok)
+
+    results = {}
+    # Update peers in parallel with bounded concurrency. Sequential loops
+    # don't scale to 150 peers; trigger_peer_update returns quickly
+    # because the peer drops the connection on srv restart.
+    targets = [p for p in cfg.get('peers', [])
+               if p.get('url') and (not target_id or p['id'] == target_id)]
+    if targets:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(20, len(targets))) as ex:
+            futs = {ex.submit(pd.trigger_peer_update, p['url'], graceful): p['id']
+                    for p in targets}
+            for f in as_completed(futs):
+                pid = futs[f]
+                try:
+                    results[pid] = f.result(timeout=60)
+                except Exception as e:
+                    results[pid] = {'error': str(e)}
+    return jsonify({
+        'results': results,
+        'token_install': token_results,
+        'push': push_info,
+        'graceful': graceful,
+    })
 
 
 @app.route('/api/v1/admin/update', methods=['POST'])

@@ -596,6 +596,40 @@ def safely_stop_peer(peer_url: str | None, peer_id: str = '?',
             'last_state': last_state}
 
 
+def install_token_on_peer(peer_url: str, new_token: str) -> dict:
+    """Push the cluster admin token to a peer.
+
+    Used by /api/v1/director/update_peers to keep the cluster secret in
+    sync without manual scp. The peer's /api/v1/admin/install_token
+    endpoint accepts the new token if (a) the peer has none yet
+    (bootstrap), or (b) the request presents the peer's current token
+    via X-Admin-Token. We send our local token in the header, which
+    matches case (b) when peers are already in sync and is harmless
+    (ignored) under case (a).
+
+    Peers running pre-auth code return 404 — reported as 'not_installed';
+    after they pull the new code their next /admin/update will pick up
+    the seeded token from data/admin_token.
+    """
+    if not new_token:
+        return {'status': 'skipped_empty_token'}
+    try:
+        r = requests.post(
+            peer_url.rstrip('/') + '/api/v1/admin/install_token',
+            json={'new_token': new_token, 'current_token': new_token},
+            headers=_admin_headers(),
+            timeout=PEER_TIMEOUT_CONTROL,
+        )
+        if r.status_code == 404:
+            return {'status': 'endpoint_missing',
+                    'note': 'peer running pre-auth code; will be ok after update'}
+        if r.ok:
+            return {'status': 'installed'}
+        return {'status': f'http_{r.status_code}', 'body': r.text[:200]}
+    except Exception as e:
+        return {'error': str(e)}
+
+
 def trigger_peer_update(peer_url: str, graceful: bool = False) -> dict:
     """Tell a remote peer to git pull and restart its web server.
     The peer kills itself on restart so the connection always drops — treat

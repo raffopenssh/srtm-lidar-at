@@ -983,32 +983,67 @@ function updateCards(d) {
 }
 
 // ── Subtitle ────────────────────────────────────────────────────
+// Compact number: 1234567 → 1.2M, 12345 → 12K
+function fmtC(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return (n/1e9).toFixed(1).replace(/\.0$/,'') + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'') + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1).replace(/\.0$/,'') + 'K';
+  return String(n);
+}
+
+let _indexStats = null;
+async function refreshIndexStats() {
+  try {
+    const r = await fetch('/api/v1/index/status');
+    if (r.ok) _indexStats = await r.json();
+  } catch (e) {}
+}
+refreshIndexStats();
+setInterval(refreshIndexStats, 60000);
+
 function updateSubtitle(d) {
   const el = document.getElementById('subtitle');
-  const elapsed = d.elapsed_seconds ? ' · elapsed <b>' + fmtD(d.elapsed_seconds) + '</b>' : '';
-  const started = d.started_at ? ' · since ' + fmtT(d.started_at) : '';
-  const extra = d.n_new_buildings_total ? ' · <b>' + fmt(d.n_new_buildings_total) + '</b> new buildings' : '';
-  const infra = d.n_infrastructure_total ? ' · <b>' + fmt(d.n_infrastructure_total) + '</b> infrastructure' : '';
-  let dirInfo = '';
+  const parts = [];
+  // ── Live progress ──
+  const totKg = d.total_kgs || 0;
+  const done = d.completed || 0;
+  const pct = totKg ? ((done/totKg)*100).toFixed(1) : '0';
+  parts.push('<b>' + fmt(done) + '</b>/' + fmt(totKg) + ' KGs (' + pct + '%)');
+  if (d.success) parts.push('<b>' + fmt(d.success) + '</b> ✓');
+  if (d.uploaded) parts.push('<b>' + fmt(d.uploaded) + '</b> ⬆');
+  if (d.pending_blocks) parts.push('<b>' + fmt(d.pending_blocks) + '</b> blocks pending');
   if (_directorData) {
     const dd = _directorData;
-    // Use DB-sourced count (authoritative across all peers) if available, else sum peer counters
     const dbProcessed = d.db_processed;
     const totalDone = dbProcessed != null ? dbProcessed : (dd.peers||[]).reduce((s,p) => s + (p.completed||0), 0);
     const activeId = dd.active_peer;
     const activeBw = activeId ? ((dd.peers||[]).find(p=>p.id===activeId)||{}).bandwidth||{} : {};
-    dirInfo = ' · <b>' + totalDone + '</b>/8440 combined';
-    if (activeBw.remaining_gb != null) {
-      dirInfo += ' · 📡 ' + activeBw.remaining_gb.toFixed(0) + ' GB left';
-    }
-    if (activeId && d._active_peer_id) {
-      dirInfo += ' · on <b>' + esc(d._active_peer_id) + '</b>';
-    }
+    parts.push('<b>' + totalDone + '</b>/8440 combined');
+    if (activeBw.remaining_gb != null) parts.push('📡 ' + activeBw.remaining_gb.toFixed(0) + ' GB');
+    if (activeId && d._active_peer_id) parts.push('on <b>' + esc(d._active_peer_id) + '</b>');
   }
-  const blocksInfo = d.pending_blocks ? ' · <b>' + fmt(d.pending_blocks) + '</b> blocks pending' : '';
-  el.innerHTML = '<b>' + fmt(d.completed||0) + '</b>/<b>' + fmt(d.total_kgs||0) + '</b> KGs · <b>' +
-    fmt(d.success||0) + '</b> success · <b>' + fmt(d.uploaded||0) + '</b> uploaded' +
-    extra + infra + blocksInfo + dirInfo + elapsed + started;
+  if (d.elapsed_seconds) parts.push('⏱ <b>' + fmtD(d.elapsed_seconds) + '</b>');
+
+  // ── DB cumulative (interesting facts about everything processed so far) ──
+  let line2 = '';
+  const s = _indexStats;
+  if (s && s.processed_count) {
+    const dbParts = [];
+    if (s.processed_area_km2) dbParts.push('<b>' + fmt(Math.round(s.processed_area_km2)) + '</b> km²');
+    if (s.total_parcels) dbParts.push('<b>' + fmtC(s.total_parcels) + '</b> parcels');
+    if (s.total_buildings) {
+      let b = '<b>' + fmtC(s.total_buildings) + '</b> buildings';
+      if (s.total_new_buildings) b += ' (+<b>' + fmtC(s.total_new_buildings) + '</b> new)';
+      dbParts.push(b);
+    }
+    if (s.total_tree_count) dbParts.push('<b>' + fmtC(s.total_tree_count) + '</b> trees');
+    if (s.indexed_segments) dbParts.push('<b>' + fmtC(s.indexed_segments) + '</b> segments');
+    if (s.states_covered) dbParts.push('<b>' + s.states_covered + '</b>/9 states · <b>' + s.districts_covered + '</b> districts');
+    if (s.avg_confidence) dbParts.push('avg conf <b>' + s.avg_confidence.toFixed(2) + '</b>');
+    if (dbParts.length) line2 = '<div style="opacity:0.85">📊 ' + dbParts.join(' · ') + '</div>';
+  }
+  el.innerHTML = parts.join(' · ') + line2;
 }
 
 // ── Current KG ──────────────────────────────────────────────────

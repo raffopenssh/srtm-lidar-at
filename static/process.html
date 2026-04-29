@@ -550,9 +550,17 @@
 <div class="sec">
   <div class="sec-t">
     <span>Live Log</span>
-    <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
-      <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
-    </label>
+    <span style="display:flex;gap:10px;align-items:center">
+      <span id="logFilter" title="Click to show only warnings and errors"
+            style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
+                   padding:2px 7px;border:1px solid var(--border);border-radius:10px;
+                   user-select:none">
+        <span id="logFilterCount">0 warn / 0 err</span>
+      </span>
+      <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
+        <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
+      </label>
+    </span>
   </div>
   <div class="log-wrap" id="logArea">
     <div class="log-row log-info"><span class="log-msg">Waiting for data…</span></div>
@@ -992,58 +1000,40 @@ function fmtC(n) {
   return String(n);
 }
 
-let _indexStats = null;
-async function refreshIndexStats() {
-  try {
-    const r = await fetch('/api/v1/index/status');
-    if (r.ok) _indexStats = await r.json();
-  } catch (e) {}
-}
-refreshIndexStats();
-setInterval(refreshIndexStats, 60000);
-
 function updateSubtitle(d) {
   const el = document.getElementById('subtitle');
   const parts = [];
-  // ── Live progress ──
   const totKg = d.total_kgs || 0;
-  const done = d.completed || 0;
-  const pct = totKg ? ((done/totKg)*100).toFixed(1) : '0';
-  parts.push('<b>' + fmt(done) + '</b>/' + fmt(totKg) + ' KGs (' + pct + '%)');
-  if (d.success) parts.push('<b>' + fmt(d.success) + '</b> ✓');
-  if (d.uploaded) parts.push('<b>' + fmt(d.uploaded) + '</b> ⬆');
-  if (d.pending_blocks) parts.push('<b>' + fmt(d.pending_blocks) + '</b> blocks pending');
+  const doneDb = d.db_processed != null ? d.db_processed : (d.completed || 0);
+  const pct = totKg ? ((doneDb/totKg)*100).toFixed(1) : '0';
+  // ── Processed (authoritative DB totals across all peers) ──
+  parts.push('<b>' + fmt(doneDb) + '</b>/' + fmt(totKg) + ' KGs (' + pct + '%)');
+  if (d.db_area_km2) parts.push('<b>' + fmt(Math.round(d.db_area_km2)) + '</b> km²');
+  if (d.db_parcels_total) parts.push('<b>' + fmtC(d.db_parcels_total) + '</b> parcels');
+  if (d.db_buildings_total) {
+    let b = '<b>' + fmtC(d.db_buildings_total) + '</b> buildings';
+    if (d.db_new_buildings_total) b += ' (+<b>' + fmtC(d.db_new_buildings_total) + '</b> new)';
+    parts.push(b);
+  }
+  if (d.db_trees_total) parts.push('<b>' + fmtC(d.db_trees_total) + '</b> trees');
+  if (d.db_infrastructure_total) parts.push('<b>' + fmtC(d.db_infrastructure_total) + '</b> infra');
+  // ── Currently processing ──
+  const k = d.current_kg;
+  if (k && k.code) {
+    let cur = 'now <b>' + esc(k.code) + (k.name ? ' ' + esc(k.name) : '') + '</b>';
+    if (k.step) cur += ' (' + esc(k.step) + (k.n_tiles ? ' ' + (k.current_tile||1) + '/' + k.n_tiles : '') + ')';
+    parts.push(cur);
+  }
+  // ── Active peer + bandwidth ──
   if (_directorData) {
     const dd = _directorData;
-    const dbProcessed = d.db_processed;
-    const totalDone = dbProcessed != null ? dbProcessed : (dd.peers||[]).reduce((s,p) => s + (p.completed||0), 0);
     const activeId = dd.active_peer;
-    const activeBw = activeId ? ((dd.peers||[]).find(p=>p.id===activeId)||{}).bandwidth||{} : {};
-    parts.push('<b>' + totalDone + '</b>/8440 combined');
-    if (activeBw.remaining_gb != null) parts.push('📡 ' + activeBw.remaining_gb.toFixed(0) + ' GB');
     if (activeId && d._active_peer_id) parts.push('on <b>' + esc(d._active_peer_id) + '</b>');
+    const activeBw = activeId ? ((dd.peers||[]).find(p=>p.id===activeId)||{}).bandwidth||{} : {};
+    if (activeBw.remaining_gb != null) parts.push('<b>' + activeBw.remaining_gb.toFixed(0) + ' GB</b> left');
   }
-  if (d.elapsed_seconds) parts.push('⏱ <b>' + fmtD(d.elapsed_seconds) + '</b>');
-
-  // ── DB cumulative (interesting facts about everything processed so far) ──
-  let line2 = '';
-  const s = _indexStats;
-  if (s && s.processed_count) {
-    const dbParts = [];
-    if (s.processed_area_km2) dbParts.push('<b>' + fmt(Math.round(s.processed_area_km2)) + '</b> km²');
-    if (s.total_parcels) dbParts.push('<b>' + fmtC(s.total_parcels) + '</b> parcels');
-    if (s.total_buildings) {
-      let b = '<b>' + fmtC(s.total_buildings) + '</b> buildings';
-      if (s.total_new_buildings) b += ' (+<b>' + fmtC(s.total_new_buildings) + '</b> new)';
-      dbParts.push(b);
-    }
-    if (s.total_tree_count) dbParts.push('<b>' + fmtC(s.total_tree_count) + '</b> trees');
-    if (s.indexed_segments) dbParts.push('<b>' + fmtC(s.indexed_segments) + '</b> segments');
-    if (s.states_covered) dbParts.push('<b>' + s.states_covered + '</b>/9 states · <b>' + s.districts_covered + '</b> districts');
-    if (s.avg_confidence) dbParts.push('avg conf <b>' + s.avg_confidence.toFixed(2) + '</b>');
-    if (dbParts.length) line2 = '<div style="opacity:0.85">📊 ' + dbParts.join(' · ') + '</div>';
-  }
-  el.innerHTML = parts.join(' · ') + line2;
+  if (d.elapsed_seconds) parts.push(fmtD(d.elapsed_seconds));
+  el.innerHTML = parts.join(' · ');
 }
 
 // ── Current KG ──────────────────────────────────────────────────
@@ -1178,13 +1168,31 @@ function clearKgTimer() {
 }
 
 // ── Log ─────────────────────────────────────────────────────────
+let _logFilterIssues = false;
+(function(){
+  const f = document.getElementById('logFilter');
+  if (f) f.addEventListener('click', () => {
+    _logFilterIssues = !_logFilterIssues;
+    f.style.background = _logFilterIssues ? 'rgba(210,153,34,0.13)' : '';
+    f.style.borderColor = _logFilterIssues ? 'var(--yellow)' : 'var(--border)';
+    f.style.color = _logFilterIssues ? 'var(--yellow)' : 'var(--dim)';
+    prevLogHash = ''; // force re-render
+  });
+})();
+
 function updateLog(d) {
   const log = d.recent_log || [];
   const multi = !!d._multi_peer;
   // Determine peer source: proxied → _active_peer_id, local → instance field or 'primary'
   const logPeer = d._active_peer_id || d.instance || '';
+  // Update warn/err counter chip
+  const nWarn = log.filter(e => (e.level||'') === 'warning').length;
+  const nErr  = log.filter(e => (e.level||'') === 'error').length;
+  const cnt = document.getElementById('logFilterCount');
+  if (cnt) cnt.innerHTML = '<span style="color:' + (nWarn?'var(--yellow)':'var(--dim)') + '">' + nWarn + ' warn</span> / ' +
+                           '<span style="color:' + (nErr?'var(--red)':'var(--dim)') + '">' + nErr + ' err</span>';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '');
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '');
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -1194,8 +1202,13 @@ function updateLog(d) {
     return;
   }
 
-  // Newest first
-  const sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  // Newest first; optionally filter to warnings + errors
+  let sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  if (_logFilterIssues) sorted = sorted.filter(e => (e.level||'') === 'warning' || (e.level||'') === 'error');
+  if (sorted.length === 0) {
+    area.innerHTML = '<div class="log-row log-info"><span class="log-msg" style="color:var(--dim)">No warnings or errors ✓</span></div>';
+    return;
+  }
   // Build set of KGs that have step transitions — all info entries except
   // the latest per-KG are "completed" steps and get a ✔ badge.
   const latestInfoPerKg = {};  // kg -> index of newest info entry

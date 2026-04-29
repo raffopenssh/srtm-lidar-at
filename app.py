@@ -1240,11 +1240,18 @@ def processing_status():
         # DB-sourced processed count (authoritative: counts all peers via Zenodo manifest sync)
         try:
             _row = si.get_index()._conn().execute(
-                'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'
+                'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6, '
+                'COALESCE(SUM(building_count),0), COALESCE(SUM(new_building_count),0), '
+                'COALESCE(SUM(tree_count),0), COALESCE(SUM(infrastructure_count),0) '
+                'FROM kg WHERE processed=1'
             ).fetchone()
             data['db_processed'] = _row[0]
             data['db_parcels_total'] = int(_row[1] or 0)
             data['db_area_km2'] = round(float(_row[2] or 0), 2)
+            data['db_buildings_total'] = int(_row[3] or 0)
+            data['db_new_buildings_total'] = int(_row[4] or 0)
+            data['db_trees_total'] = int(_row[5] or 0)
+            data['db_infrastructure_total'] = int(_row[6] or 0)
         except Exception:
             pass
         # Include persisted tile history for all completed/failed KGs
@@ -2835,11 +2842,18 @@ def director_proxy_status():
     # Override DB totals with primary's authoritative DB (synced from all peers)
     try:
         _row = si.get_index()._conn().execute(
-            'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'
+            'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6, '
+            'COALESCE(SUM(building_count),0), COALESCE(SUM(new_building_count),0), '
+            'COALESCE(SUM(tree_count),0), COALESCE(SUM(infrastructure_count),0) '
+            'FROM kg WHERE processed=1'
         ).fetchone()
         ps['db_processed'] = _row[0]
         ps['db_parcels_total'] = int(_row[1] or 0)
         ps['db_area_km2'] = round(float(_row[2] or 0), 2)
+        ps['db_buildings_total'] = int(_row[3] or 0)
+        ps['db_new_buildings_total'] = int(_row[4] or 0)
+        ps['db_trees_total'] = int(_row[5] or 0)
+        ps['db_infrastructure_total'] = int(_row[6] or 0)
     except Exception:
         pass
     # Add bandwidth info

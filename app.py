@@ -166,6 +166,29 @@ def _sync_peer_data():
                     continue
 
                 peer_manifest = peer_data.get('manifest', {})
+                peer_tombstones = peer_data.get('tombstones', {}) or {}
+
+                # Merge peer tombstones into ours (newest timestamp wins).
+                # This propagates force-requeue requests across the fleet so
+                # peers that have an old local JSON of a re-queued KG won't
+                # silently skip it.
+                if isinstance(peer_tombstones, dict) and peer_tombstones:
+                    changed_tomb = False
+                    for tk, tv in peer_tombstones.items():
+                        if not isinstance(tv, str):
+                            continue
+                        cur = _MANIFEST_TOMBSTONES.get(tk, '')
+                        if tv > cur:
+                            _MANIFEST_TOMBSTONES[tk] = tv
+                            changed_tomb = True
+                    if changed_tomb:
+                        try:
+                            _tombstone_path.write_text(
+                                json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+                            log.info('Peer sync: merged tombstones from peer (now %d entries)',
+                                     len(_MANIFEST_TOMBSTONES))
+                        except Exception:
+                            pass
 
                 # Download KG JSONs we don't have, OR re-download when the
                 # peer's manifest entry is newer/larger than our local copy
@@ -1350,6 +1373,18 @@ def processing_peers_status():
     else:
         result['manifest'] = {}
 
+    # Tombstones: KG keys that have been force-requeued.  Peers must
+    # honor these when computing 'completed_codes' so they don't skip
+    # a re-queued KG just because they have an old local JSON.
+    tomb_path = data_dir / 'manifest_tombstones.json'
+    if tomb_path.exists():
+        try:
+            result['tombstones'] = json.loads(tomb_path.read_text())
+        except Exception:
+            result['tombstones'] = {}
+    else:
+        result['tombstones'] = {}
+
     return jsonify(result)
 
 
@@ -1574,39 +1609,89 @@ def processing_start():
         or bool(body.get('cache_only'))
     )
 
+    extra_args = []
     if kg:
-        args.extend(['--kg', kg])
+        extra_args.extend(['--kg', kg])
     elif state:
-        args.extend(['--state', state])
+        extra_args.extend(['--state', state])
     if no_cop:
-        args.append('--no-copernicus')
+        extra_args.append('--no-copernicus')
     if cache_only:
-        args.append('--cache-only')
+        extra_args.append('--cache-only')
 
     log_file = Path('data/austria_processor/logs/processor.log')
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    log_fd = open(log_file, 'a')
 
-    # Inject Zenodo upload mutex broker URL.  Primary serves the broker
-    # on its own gunicorn; peers point at the primary.  Reads from
-    # data/austria_processor/zenodo_lock_url.txt if present, else
-    # localhost when this instance is the director, else unset (no-op).
-    proc_env = os.environ.copy()
-    if 'ZENODO_LOCK_URL' not in proc_env:
+    # Determine Zenodo lock URL (passed to processor via env)
+    zlock = ''
+    if 'ZENODO_LOCK_URL' in os.environ:
+        zlock = os.environ['ZENODO_LOCK_URL']
+    else:
         lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
         is_director = Path('data/austria_processor/is_director').exists()
         if lock_file.exists():
-            proc_env['ZENODO_LOCK_URL'] = lock_file.read_text().strip()
+            zlock = lock_file.read_text().strip()
         elif is_director:
-            proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+            zlock = 'http://127.0.0.1:8000'
 
+    # --- Preferred path: launch via systemd (austria_processor.service) ---
+    # The service has an 8G cgroup; gunicorn (srv.service) is capped at 5G.
+    # Running as a child of gunicorn squeezes the processor into srv's cgroup
+    # and triggers memory throttling on heavy KGs.
+    import subprocess as _sp
+    args_env = ' '.join(_sp.list2cmdline([a]) for a in extra_args)
+    env_path = Path('data/austria_processor/proc_args.env')
+    try:
+        env_path.write_text(
+            'PROCESSOR_ARGS=' + args_env + '\n' +
+            ('ZENODO_LOCK_URL=' + zlock + '\n' if zlock else '')
+        )
+    except Exception as e:
+        log.warning('Could not write proc_args.env: %s', e)
+
+    use_systemd = True
+    try:
+        # Reset failed state from previous run, then start.
+        _sp.run(['sudo', '-n', 'systemctl', 'reset-failed', 'austria_processor'],
+                capture_output=True, text=True, timeout=5)
+        r = _sp.run(['sudo', '-n', 'systemctl', 'start', 'austria_processor'],
+                    capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            log.warning('systemctl start austria_processor failed: %s',
+                        r.stderr.strip() or r.stdout.strip())
+            use_systemd = False
+    except Exception as e:
+        log.warning('systemctl start austria_processor exception: %s', e)
+        use_systemd = False
+
+    if use_systemd:
+        # Capture MainPID so /processing/stop can target the cgroup
+        try:
+            r = _sp.run(['systemctl', 'show', 'austria_processor', '-p', 'MainPID', '--value'],
+                        capture_output=True, text=True, timeout=5)
+            mpid = int((r.stdout or '0').strip() or '0')
+        except Exception:
+            mpid = 0
+        _processor_process = None  # not a Popen — managed by systemd
+        log.info('Austria processor started via systemd: MainPID=%d, args=%s',
+                 mpid, extra_args)
+        return jsonify({'status': 'started', 'pid': mpid, 'method': 'systemd'})
+
+    # --- Fallback: spawn directly (legacy path, used if systemd is unavailable) ---
+    log.warning('Falling back to direct subprocess spawn (no cgroup isolation)')
+    args = [sys.executable, 'austria_processor.py', '--mark-uncertain'] + extra_args
+    proc_env = os.environ.copy()
+    if zlock and 'ZENODO_LOCK_URL' not in proc_env:
+        proc_env['ZENODO_LOCK_URL'] = zlock
+    log_fd = open(log_file, 'a')
     import subprocess
     _processor_process = subprocess.Popen(
         args, stdout=log_fd, stderr=subprocess.STDOUT,
         start_new_session=True, env=proc_env,
     )
-    log.info('Austria processor started: PID %d, args=%s', _processor_process.pid, args)
-    return jsonify({'status': 'started', 'pid': _processor_process.pid})
+    log.info('Austria processor started (fallback): PID %d, args=%s',
+             _processor_process.pid, args)
+    return jsonify({'status': 'started', 'pid': _processor_process.pid, 'method': 'subprocess'})
 
 
 @app.route('/api/v1/processing/pause', methods=['POST'])
@@ -2010,7 +2095,12 @@ def processing_prioritize():
 
 
 def _get_completed_kgs() -> set:
-    """Return set of KG codes that have been successfully processed."""
+    """Return set of KG codes that have been successfully processed.
+
+    KGs with an active tombstone (force-requeued) are excluded so they
+    won't be silently filtered out of the priority queue or advertised
+    as completed to peers.
+    """
     data_dir = Path('data/austria_processor')
     completed = set()
     manifest_path = data_dir / 'zenodo_manifest.json'
@@ -2027,6 +2117,18 @@ def _get_completed_kgs() -> set:
     if json_dir.exists():
         for jf in json_dir.glob('*.json'):
             completed.add(jf.stem)
+    # Drop tombstoned KGs (force-requeued by operator)
+    try:
+        if _tombstone_path.exists():
+            tdata = json.loads(_tombstone_path.read_text())
+            if isinstance(tdata, dict):
+                import re as _re_c
+                for tk in tdata.keys():
+                    _m = _re_c.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', tk)
+                    if _m:
+                        completed.discard(_m.group(1))
+    except Exception:
+        pass
     return completed
 
 

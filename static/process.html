@@ -633,19 +633,33 @@
   const KEY = 'srtm_admin_token';
   function getTok(){ return localStorage.getItem(KEY) || ''; }
   function setTok(v){ if(v) localStorage.setItem(KEY, v); else localStorage.removeItem(KEY); }
-  async function promptToken(reason){
-    const cur = getTok();
-    const v = prompt('Admin token required' + (reason ? ' (' + reason + ')' : '') +
-                     '.\nGet it from `cat data/admin_token` on the primary VM.', cur);
-    if (v === null) return null;
-    setTok(v.trim());
-    return v.trim();
+  // Dedupe prompts: one in-flight at a time, and once dismissed we stop
+  // pestering the operator for the rest of the page lifetime. Background
+  // pollers (status, log, peers) hit several protected endpoints in
+  // parallel; without dedupe the operator gets one prompt per request.
+  let _promptInFlight = null;
+  let _dismissed = false;
+  function promptToken(reason){
+    if (_dismissed) return Promise.resolve(null);
+    if (_promptInFlight) return _promptInFlight;
+    _promptInFlight = new Promise(resolve => {
+      setTimeout(() => {
+        const cur = getTok();
+        const v = prompt('Admin token required' + (reason ? ' (' + reason + ')' : '') +
+                         '.\nGet it from `cat data/admin_token` on the primary VM.', cur);
+        _promptInFlight = null;
+        if (v === null) { _dismissed = true; resolve(null); return; }
+        const t = v.trim();
+        setTok(t);
+        resolve(t);
+      }, 0);
+    });
+    return _promptInFlight;
   }
   const _origFetch = window.fetch.bind(window);
   window.fetch = async function(input, init){
     init = init || {};
     const url = (typeof input === 'string') ? input : (input && input.url) || '';
-    // Only attach token to our own API.
     if (url.startsWith('/api/v1/') || url.startsWith(location.origin + '/api/v1/')) {
       const tok = getTok();
       if (tok) {
@@ -654,7 +668,7 @@
       }
     }
     let r = await _origFetch(input, init);
-    if (r.status === 401 && (url.includes('/api/v1/'))) {
+    if (r.status === 401 && url.includes('/api/v1/') && !_dismissed) {
       const t = await promptToken('current token rejected');
       if (t) {
         init.headers = new Headers(init.headers || {});
@@ -664,8 +678,7 @@
     }
     return r;
   };
-  // Expose a quick reset for operators.
-  window.srtmResetAdminToken = () => { setTok(''); location.reload(); };
+  window.srtmResetAdminToken = () => { setTok(''); _dismissed = false; location.reload(); };
 })();
 const API = '/api/v1/processing/status';
 const POLL = 5;

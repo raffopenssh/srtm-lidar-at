@@ -7659,23 +7659,6 @@ def main():
         log.info("Retry mode: %d failed KGs to reprocess", len(kgs))
 
     # --- Determine already-completed KGs (Zenodo manifest + local JSON) ---
-    # Honor manifest_tombstones.json: a KG with a fresh '_requeue' tombstone
-    # was force-requeued by an operator and must be reprocessed even if we
-    # have a local JSON or manifest entry for it.
-    tombstoned_kgs: set[str] = set()
-    tombstone_path = DATA_DIR / "manifest_tombstones.json"
-    if tombstone_path.exists():
-        try:
-            _tdata = json.loads(tombstone_path.read_text())
-            if isinstance(_tdata, dict):
-                import re as _re_t
-                for _tk in _tdata.keys():
-                    _m = _re_t.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', _tk)
-                    if _m:
-                        tombstoned_kgs.add(_m.group(1))
-        except Exception as e:
-            log.warning("Could not read tombstones: %s", e)
-
     completed_codes = set()
     for key in manifest.keys():
         if key.endswith("_json"):
@@ -7683,14 +7666,7 @@ def main():
     # Also count local JSONs not yet uploaded (e.g. upload failed but JSON exists)
     for jf in JSON_DIR.glob("*.json"):
         completed_codes.add(jf.stem)
-    if tombstoned_kgs:
-        re_count = len(completed_codes & tombstoned_kgs)
-        completed_codes -= tombstoned_kgs
-        if re_count:
-            log.info("Tombstones force-requeue %d KG(s): %s",
-                     re_count, sorted(tombstoned_kgs & {jf.stem for jf in JSON_DIR.glob('*.json')})[:10])
-    log.info("Already completed: %d (manifest + local JSON, %d tombstoned)",
-             len(completed_codes), len(tombstoned_kgs))
+    log.info("Already completed: %d (manifest + local JSON)", len(completed_codes))
 
     # --- Load failed KGs + handle crash recovery ---
     failed_kgs = _load_failed_kgs()

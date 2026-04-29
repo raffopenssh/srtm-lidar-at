@@ -625,6 +625,48 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+// === Admin token interceptor ===
+// Cluster admin endpoints require X-Admin-Token. Token lives in
+// localStorage; on 401 we prompt once and retry. Operator gets the
+// token from `cat data/admin_token` on the primary.
+(function(){
+  const KEY = 'srtm_admin_token';
+  function getTok(){ return localStorage.getItem(KEY) || ''; }
+  function setTok(v){ if(v) localStorage.setItem(KEY, v); else localStorage.removeItem(KEY); }
+  async function promptToken(reason){
+    const cur = getTok();
+    const v = prompt('Admin token required' + (reason ? ' (' + reason + ')' : '') +
+                     '.\nGet it from `cat data/admin_token` on the primary VM.', cur);
+    if (v === null) return null;
+    setTok(v.trim());
+    return v.trim();
+  }
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = async function(input, init){
+    init = init || {};
+    const url = (typeof input === 'string') ? input : (input && input.url) || '';
+    // Only attach token to our own API.
+    if (url.startsWith('/api/v1/') || url.startsWith(location.origin + '/api/v1/')) {
+      const tok = getTok();
+      if (tok) {
+        init.headers = new Headers(init.headers || {});
+        init.headers.set('X-Admin-Token', tok);
+      }
+    }
+    let r = await _origFetch(input, init);
+    if (r.status === 401 && (url.includes('/api/v1/'))) {
+      const t = await promptToken('current token rejected');
+      if (t) {
+        init.headers = new Headers(init.headers || {});
+        init.headers.set('X-Admin-Token', t);
+        r = await _origFetch(input, init);
+      }
+    }
+    return r;
+  };
+  // Expose a quick reset for operators.
+  window.srtmResetAdminToken = () => { setTok(''); location.reload(); };
+})();
 const API = '/api/v1/processing/status';
 const POLL = 5;
 let cd = POLL;

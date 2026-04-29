@@ -1211,12 +1211,45 @@ on `data/austria_processor/director.lock`). The other worker skips it.
 - When ALL peers are exhausted → director logs "no peers available" and waits
 - After bandwidth reset (17th) → vnstat reports drop, peers become eligible again
 
+#### Admin Token (cluster auth)
+
+All mutating admin/director/processing/zenodo endpoints require
+`X-Admin-Token: <token>`. Loopback (127.0.0.1, no XFF) is exempt so
+the in-process director and on-box CLI work without plumbing it.
+
+- Token lives in `data/admin_token` (gitignored, mode 0600). Auto-generated
+  on first start of the primary.
+- Peers must have the **same** token. `deploy.sh` accepts `ADMIN_TOKEN=...`
+  to install it. Without it, peer registration and director-driven
+  start/stop will 401.
+- Dashboard prompts for the token on first 401 and stores it in
+  `localStorage` (key `srtm_admin_token`). Reset with
+  `srtmResetAdminToken()` in the JS console.
+- The director re-reads `data/admin_token` on every outbound peer call
+  (`peer_director._admin_headers()`), so token rotations propagate
+  without a director restart.
+- Rotate by writing a new value to `data/admin_token` on every peer +
+  primary (e.g. via `for p in peers; do scp ...; done`); no service
+  restart required.
+
+```bash
+# Get the token (on primary)
+cat data/admin_token
+
+# Use it from CLI
+curl -H "X-Admin-Token: $(cat data/admin_token)" \
+  -X POST https://srtm-lidar-at3.exe.xyz:8000/api/v1/admin/update
+```
+
 #### Deploying a New Peer
 
 ```bash
 # On the new exe.dev VM:
+#   ADMIN_TOKEN required so the peer can register with the director.
+#   Get it via `cat data/admin_token` on the primary.
 SELF_URL=https://srtm-lidar-at4.exe.xyz:8000 \
 PEER_URL=https://srtm-lidar-at.exe.xyz:8000 \
+ADMIN_TOKEN=<paste from primary> \
 bash deploy.sh
 ```
 

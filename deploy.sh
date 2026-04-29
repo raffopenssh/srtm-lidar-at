@@ -24,6 +24,10 @@ PEER_URL="${PEER_URL:-https://srtm-lidar-at.exe.xyz:8000}"
 SELF_URL="${SELF_URL:-}"
 GITHUB_TOKEN="<REDACTED_GITHUB_PAT>"
 GIT_REPO="${GIT_REPO:-https://${GITHUB_TOKEN}@github.com/raffopenssh/srtm-lidar-at.git}"
+# Admin token for director coordination — fetch from primary if not provided.
+# Required to call protected admin endpoints (e.g. peer registration). Without
+# it the VM can run a web server but cannot join the cluster.
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 
 # Derive INSTANCE_ID from SELF_URL if not set
 # e.g. https://srtm-lidar-at3.exe.xyz:8000 -> srtm-lidar-at3
@@ -92,6 +96,19 @@ mkdir -p /tmp/copernicus_cache /tmp/hansen_cache
 # Initialize empty files if missing
 [ -f data/austria_processor/retry_queue.json ] || echo '[]' > data/austria_processor/retry_queue.json
 [ -f data/austria_processor/failed_kgs.json ]  || echo '[]' > data/austria_processor/failed_kgs.json
+
+# Install shared admin token (cluster-wide secret). Required for the director
+# to make protected calls into this peer (start/stop processor, queue, etc.).
+if [ -n "${ADMIN_TOKEN}" ]; then
+    echo "${ADMIN_TOKEN}" > data/admin_token
+    chmod 600 data/admin_token
+    echo "  ✓ Admin token installed (provided via env)"
+elif [ ! -f data/admin_token ]; then
+    echo "  ⚠ ADMIN_TOKEN not provided and data/admin_token missing."
+    echo "    On the primary, run: cat data/admin_token"
+    echo "    Then re-run with ADMIN_TOKEN=<value> bash deploy.sh"
+    echo "    (Cluster registration will fail without it.)"
+fi
 
 # Write peer URLs for the web API's peer sync thread
 echo "${PEER_URL}" > data/austria_processor/peer_urls.txt
@@ -187,8 +204,13 @@ else
         echo "  Registering as '${PEER_ID}' at ${SELF_URL} with director ${PEER_URL}..."
         # Wait for web server to be ready
         sleep 3
+        TOK="${ADMIN_TOKEN}"
+        if [ -z "${TOK}" ] && [ -f data/admin_token ]; then
+            TOK=$(cat data/admin_token)
+        fi
         REG_RESP=$(curl -sf -X POST \
           -H "Content-Type: application/json" \
+          -H "X-Admin-Token: ${TOK}" \
           -d "{\"id\": \"${PEER_ID}\", \"url\": \"${SELF_URL}\"}" \
           "${PEER_URL}/api/v1/director/peers/add" 2>&1) && \
           echo "  ✓ Registered with director: ${REG_RESP}" || \

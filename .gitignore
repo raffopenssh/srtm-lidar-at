@@ -20,3 +20,4 @@ rf_training_data/in_progress_kg.txt
 rf_training_data/openeo_circuit.json
 data/austria_processor/is_director
 data/austria_processor/zenodo_manifest.json
+data/admin_token

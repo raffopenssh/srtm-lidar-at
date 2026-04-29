@@ -39,6 +39,25 @@ DATA_DIR = Path('data/austria_processor')
 PEERS_CONFIG = DATA_DIR / 'peers.json'
 DIRECTOR_STATE = DATA_DIR / 'director_state.json'
 
+# Cluster-wide admin token (shared with app.py via data/admin_token).
+# Must be the same on every peer or the director's outbound calls 401.
+_ADMIN_TOKEN_PATH = Path('data/admin_token')
+
+
+def _admin_headers() -> dict:
+    """Return headers for outbound peer admin calls.
+
+    Re-reads the token on every call so that token rotations propagate
+    without a director restart.
+    """
+    try:
+        tok = _ADMIN_TOKEN_PATH.read_text().strip()
+        if tok:
+            return {'X-Admin-Token': tok}
+    except Exception:
+        pass
+    return {}
+
 # Bandwidth budget per peer per billing cycle (bytes)
 BANDWIDTH_BUDGET_GB = 95  # conservative — leave 5 GB headroom out of 100
 BANDWIDTH_BUDGET_BYTES = BANDWIDTH_BUDGET_GB * (1024 ** 3)
@@ -216,8 +235,8 @@ def get_peer_bandwidth(peer_url: str) -> dict:
     try:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/bandwidth',
-            timeout=PEER_TIMEOUT_PROBE
-        )
+            timeout=PEER_TIMEOUT_PROBE,
+        headers=_admin_headers())
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -256,8 +275,8 @@ def get_peer_status(peer_url: str | None) -> dict:
     try:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/processing/status',
-            timeout=PEER_TIMEOUT_PROBE
-        )
+            timeout=PEER_TIMEOUT_PROBE,
+        headers=_admin_headers())
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -282,8 +301,8 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         r = requests.get(
             peer_url.rstrip('/') + '/api/v1/processing/log',
             params={'lines': lines},
-            timeout=PEER_TIMEOUT_PROBE
-        )
+            timeout=PEER_TIMEOUT_PROBE,
+        headers=_admin_headers())
         r.raise_for_status()
         d = r.json()
         return d.get('lines', d.get('log', []))
@@ -307,7 +326,7 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
         r = requests.put(
             peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
             json=local_cm, timeout=PEER_TIMEOUT_CONTROL,
-        )
+        headers=_admin_headers())
         if r.ok:
             result = r.json()
             log.info('Cache manifest sync to %s: %d entries updated',
@@ -370,7 +389,7 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
                 peer_url.rstrip('/') + '/api/v1/processing/queue',
                 json={'kgs': normal_queue, 'position': 0, 'skip_processed': True},
                 timeout=PEER_TIMEOUT_CONTROL,
-            )
+            headers=_admin_headers())
             result = r.json()
         # Then push tombstoned codes at position 0 — ends up in front,
         # ahead of the normal codes, preserving the original ordering.
@@ -380,7 +399,7 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
                 json={'kgs': tombstoned_in_queue, 'position': 0,
                       'skip_processed': False},
                 timeout=PEER_TIMEOUT_CONTROL,
-            )
+            headers=_admin_headers())
             result = r2.json()
         log.info('Queue sync to %s: pushed %d KGs (%d tombstoned) — %s%s',
                  peer_url, len(queue), len(tombstoned_in_queue),
@@ -406,7 +425,7 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
             peer_url.rstrip('/') + '/api/v1/processing/queue',
             json={'queue': codes},
             timeout=PEER_TIMEOUT_CONTROL,
-        )
+        headers=_admin_headers())
         if r.ok:
             log.info('Whitelist queue PUT to %s: %d KGs', peer_url, len(codes))
             return r.json()
@@ -415,7 +434,7 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
             peer_url.rstrip('/') + '/api/v1/processing/queue',
             json={'kgs': codes, 'position': 0, 'skip_processed': True},
             timeout=PEER_TIMEOUT_CONTROL,
-        )
+        headers=_admin_headers())
         log.info('Whitelist queue POST to %s: %d KGs (PUT was %d)',
                  peer_url, len(codes), r.status_code)
         return r2.json() if r2.ok else {'error': f'http {r2.status_code}'}
@@ -460,7 +479,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         # Local start — use the local API so _processor_process is tracked
         try:
             r = requests.post('http://127.0.0.1:8000/api/v1/processing/start',
-                              json=payload, timeout=PEER_TIMEOUT_CONTROL)
+                              json=payload, timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
@@ -476,7 +495,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
             peer_url.rstrip('/') + '/api/v1/processing/start',
             json=payload,
             timeout=PEER_TIMEOUT_CONTROL,
-        )
+        headers=_admin_headers())
         if r.ok:
             result = r.json()
             result['queue_sync'] = queue_result
@@ -497,7 +516,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
             peer_url.rstrip('/') + '/api/v1/admin/restart_processor',
             json={},
             timeout=30,
-        )
+        headers=_admin_headers())
         result = r2.json() if r2.ok else {'error': f'systemd fallback: {r2.status_code}'}
         result['queue_sync'] = queue_result
         result['method'] = 'systemd_fallback'
@@ -520,7 +539,8 @@ def stop_peer_processor(peer_url: str | None, graceful: bool = False) -> dict:
         r = requests.post(
             url.rstrip('/') + '/api/v1/processing/stop',
             params=params,
-            timeout=30  # stop can take a moment
+            timeout=30,  # stop can take a moment
+            headers=_admin_headers(),
         )
         if r.ok:
             return r.json()
@@ -588,8 +608,8 @@ def trigger_peer_update(peer_url: str, graceful: bool = False) -> dict:
         r = requests.post(
             peer_url.rstrip('/') + '/api/v1/admin/update',
             params={'graceful': '1'} if graceful else None,
-            timeout=15
-        )
+            timeout=15,
+        headers=_admin_headers())
         return r.json()
     except requests.exceptions.ConnectionError:
         # Expected: peer restarted and dropped the connection
@@ -838,14 +858,16 @@ class PeerDirector:
             try:
                 # First check current state
                 r = requests.get(url.rstrip('/') + '/api/v1/processing/throttle',
-                                 timeout=PEER_TIMEOUT_PROBE)
+                                 timeout=PEER_TIMEOUT_PROBE,
+                                 headers=_admin_headers())
                 current = r.json().get('throttle', False) if r.ok else None
                 if current == enabled:
                     results[peer['id']] = 'already_' + ('on' if enabled else 'off')
                     continue
                 # Toggle to match desired state
                 r2 = requests.post(url.rstrip('/') + '/api/v1/processing/throttle',
-                                   timeout=PEER_TIMEOUT_CONTROL)
+                                   timeout=PEER_TIMEOUT_CONTROL,
+                                   headers=_admin_headers())
                 if r2.ok:
                     results[peer['id']] = 'set_' + ('on' if enabled else 'off')
                 else:

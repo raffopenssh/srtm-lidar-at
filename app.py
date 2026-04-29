@@ -52,7 +52,186 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
+# === Admin auth ===
+# Shared cluster-wide secret stored in data/admin_token. Required header
+# X-Admin-Token (or ?admin_token=) on every mutating admin/director/processing
+# /zenodo endpoint. Loopback requests (127.0.0.1) are exempt so the in-process
+# director and dashboard fetches via /admin/token bootstrap work without
+# plumbing the secret everywhere. The token is auto-generated on first start
+# and is replicated by deploy.sh + peer-sync to every peer.
+
+ADMIN_TOKEN_PATH = Path('data/admin_token')
+
+
+def _load_or_create_admin_token() -> str:
+    """Load shared admin token, creating one if missing.
+
+    Lives in data/admin_token (gitignored). deploy.sh copies the primary's
+    token to peers; the data sync thread keeps it consistent.
+    """
+    try:
+        if ADMIN_TOKEN_PATH.exists():
+            tok = ADMIN_TOKEN_PATH.read_text().strip()
+            if tok:
+                return tok
+    except Exception:
+        pass
+    import secrets
+    tok = secrets.token_urlsafe(32)
+    try:
+        ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ADMIN_TOKEN_PATH.write_text(tok)
+        ADMIN_TOKEN_PATH.chmod(0o600)
+    except Exception as e:
+        log.warning('admin_token: could not persist token: %s', e)
+    return tok
+
+
+ADMIN_TOKEN = _load_or_create_admin_token()
+
+# URL prefixes that require the admin token. GET-only inspection endpoints
+# (/director/status, /processing/queue, /processing/peers, /bandwidth, ...)
+# stay open so the dashboard remains usable from anywhere.
+_PROTECTED_PREFIXES = (
+    '/api/v1/admin/',
+    '/api/v1/director/mode',
+    '/api/v1/director/activate',
+    '/api/v1/director/stop',
+    '/api/v1/director/peers',  # POST/PUT/DELETE; GET also requires token (contains URLs)
+    '/api/v1/director/throttle',
+    '/api/v1/director/update_peers',
+    '/api/v1/director/restart_peer',
+    '/api/v1/processing/start',
+    '/api/v1/processing/stop',
+    '/api/v1/processing/pause',
+    '/api/v1/processing/resume',
+    '/api/v1/processing/single',
+    '/api/v1/processing/retry',
+    '/api/v1/processing/throttle',
+    '/api/v1/processing/queue',
+    '/api/v1/processing/cache_manifest',
+    '/api/v1/zenodo/lock',
+)
+
+
+def _is_protected_path(path: str, method: str) -> bool:
+    return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
+
+
+def _request_is_loopback() -> bool:
+    """True for requests originating on this host.
+
+    gunicorn behind exe.dev's proxy: remote_addr is 127.0.0.1 for proxied
+    traffic too, so we also require X-Forwarded-For to be absent for the
+    loopback bypass to apply.
+    """
+    try:
+        if request.remote_addr not in ('127.0.0.1', '::1'):
+            return False
+        if request.headers.get('X-Forwarded-For'):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+@app.before_request
+def _enforce_admin_token():
+    path = request.path or ''
+    if not _is_protected_path(path, request.method):
+        return None
+    if _request_is_loopback():
+        return None
+    tok = (request.headers.get('X-Admin-Token')
+           or request.args.get('admin_token')
+           or request.cookies.get('admin_token'))
+    if tok and tok == ADMIN_TOKEN:
+        return None
+    return jsonify({'error': 'admin token required',
+                    'hint': 'set X-Admin-Token header'}), 401
+
+
+@app.route('/api/v1/admin/token', methods=['GET'])
+def admin_token_bootstrap():
+    """Loopback-only endpoint: returns the admin token.
+
+    The dashboard fetches this on load so the operator's browser can call
+    protected endpoints. Public callers get 401 from the before_request hook
+    (this route is under /api/v1/admin/ so it is protected).
+    """
+    return jsonify({'token': ADMIN_TOKEN})
+
+
 # Initialize search index + watch for new KG JSON files
+class _GitBusy(RuntimeError):
+    """Raised when another git sync is already running on this VM."""
+    pass
+
+
+_GIT_SYNC_LOCK_PATH = '/tmp/srtm_git_sync.lock'
+
+
+def _safe_git_sync(repo: str, sp):
+    """Robust git pull for `/admin/update` and the deferred-update path.
+
+    Failure modes seen in production rollouts (15+ peers, observed 2026-04-29):
+      * Stale .git/index.lock from crashed/concurrent git ops -> every
+        subsequent update fails until manual cleanup.
+      * Concurrent /admin/update calls racing on the same repo.
+      * `git pull` 30s timeout too tight on cold-cache / slow-network VMs.
+      * `git checkout -- .` 10s timeout too tight when the working tree is
+        large (data/* dir mtimes get stat-walked).
+
+    This helper:
+      1. Takes an exclusive non-blocking flock on /tmp/srtm_git_sync.lock
+         so concurrent calls fail fast (409) instead of corrupting state.
+      2. Removes any .git/index.lock older than 60s (left by crashed git).
+      3. Bumps timeouts: checkout 30s, fetch 60s, pull 120s.
+      4. Uses `git fetch` then `git reset --hard origin/<branch>` instead of
+         `pull --ff-only` -- robust against local commits/divergence and
+         deterministic across 150 peers.
+    Returns the CompletedProcess of the final reset (with stdout/stderr that
+    callers stuff into the JSON response).
+    """
+    import fcntl, os as _os, time as _t
+    from pathlib import Path as _P
+    lock_fd = _os.open(_GIT_SYNC_LOCK_PATH, _os.O_CREAT | _os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise _GitBusy('git sync already in progress on this VM')
+        # Stale .git/index.lock cleanup (60s grace).
+        idx_lock = _P(repo) / '.git' / 'index.lock'
+        try:
+            if idx_lock.exists() and (_t.time() - idx_lock.stat().st_mtime) > 60:
+                idx_lock.unlink()
+        except Exception:
+            pass
+        # Determine current branch (default main).
+        branch = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                        capture_output=True, text=True, timeout=10,
+                        cwd=repo).stdout.strip() or 'main'
+        # Reset any tracked file modifications.
+        sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
+               timeout=30, cwd=repo)
+        # Fetch + hard-reset (robust against divergence; deterministic).
+        fetch = sp.run(['git', 'fetch', 'origin', branch],
+                       capture_output=True, text=True, timeout=60, cwd=repo)
+        reset = sp.run(['git', 'reset', '--hard', f'origin/{branch}'],
+                       capture_output=True, text=True, timeout=30, cwd=repo)
+        # Synthesize a pull-like CompletedProcess for the response.
+        reset.stdout = (fetch.stdout + reset.stdout).strip()
+        reset.stderr = (fetch.stderr + reset.stderr).strip()
+        return reset
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        _os.close(lock_fd)
+
+
 def _init_search_index():
     try:
         idx = si.init_index()
@@ -3137,10 +3316,7 @@ def admin_update():
                         _t.sleep(15)
                     # Now run the actual update + restart sequence.
                     try:
-                        sp.run(['git', 'checkout', '--', '.'],
-                               capture_output=True, text=True, timeout=10, cwd=repo)
-                        sp.run(['git', 'pull', '--ff-only'],
-                               capture_output=True, text=True, timeout=60, cwd=repo)
+                        _safe_git_sync(repo, sp)
                     except Exception:
                         pass
                     sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
@@ -3150,12 +3326,15 @@ def admin_update():
                     'note': 'will git-pull + restart srv once processor exits at next KG boundary',
                 })
             # No processor running → fall through to immediate path.
-        # Reset any tracked files that have local modifications (e.g. manifest)
-        sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
-               timeout=10, cwd=repo)
-        # Git pull
-        pull = sp.run(['git', 'pull', '--ff-only'], capture_output=True, text=True,
-                      timeout=30, cwd=repo)
+        # Reset any tracked files that have local modifications + pull, with
+        # stale-lock cleanup, serialization, and bumped timeouts. See
+        # _safe_git_sync() docstring.
+        try:
+            pull = _safe_git_sync(repo, sp)
+        except _GitBusy as _gb:
+            return jsonify({'error': 'another update in progress', 'detail': str(_gb)}), 409
+        except Exception as _ge:
+            return jsonify({'error': f'git sync failed: {_ge}'}), 500
         # Ensure traceroute is available (needed for region detection)
         if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
             sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],

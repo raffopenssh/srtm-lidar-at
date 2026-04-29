@@ -3185,6 +3185,25 @@ def admin_update():
                        capture_output=True, timeout=10)
         except Exception as _e:
             log.warning('srv-watchdog install failed: %s', _e)
+        # Refresh austria_processor.service unit (idempotent).  The new
+        # unit reads PROCESSOR_ARGS from a generated env file so /processing/start
+        # can launch via systemctl with full cgroup isolation.  This must
+        # run on every peer or the new app.py will fall back to the legacy
+        # subprocess.Popen path.
+        try:
+            from pathlib import Path as _P
+            ap_unit = _P(repo) / 'austria_processor.service'
+            if ap_unit.exists():
+                sp.run(['sudo', 'cp', str(ap_unit),
+                        '/etc/systemd/system/austria_processor.service'],
+                       capture_output=True, timeout=10)
+                sp.run(['sudo', 'systemctl', 'daemon-reload'],
+                       capture_output=True, timeout=10)
+                # Do NOT enable — we still don't want autostart on peers.
+                sp.run(['sudo', 'systemctl', 'reset-failed', 'austria_processor'],
+                       capture_output=True, timeout=5)
+        except Exception as _e:
+            log.warning('austria_processor.service refresh failed: %s', _e)
         # Defer restart if processor is mid-upload (avoid broken manifest entries)
         current_step = ''
         try:

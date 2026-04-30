@@ -3179,9 +3179,28 @@ function renderDirector(d) {
     const strips = (d.cached_lat_strips || []).length;
     const parActive = (d.parallel_frontiers_active || []).length;
     const cmCount = d.cache_miss_count || 0;
+    // Server-friendliness throttle pill
+    let capHtml = '';
+    if (typeof d.capacity_factor === 'number') {
+      const f = d.capacity_factor;
+      const pct = Math.round(f * 100);
+      const comp = d.capacity_components || {};
+      const r = comp.rates || {};
+      let color = 'var(--green)';
+      if (f < 0.55) color = 'var(--red)';
+      else if (f < 0.85) color = 'var(--yellow)';
+      const tip = 'Server-friendliness throttle. Scales peer counts down when ' +
+        'BEV / Zenodo / Copernicus emit warnings.\n' +
+        'BEV warnings/min (5m): ' + (r.bev || 0) + '\n' +
+        'Zenodo warnings/min (5m): ' + (r.zenodo || 0) + '\n' +
+        'Copernicus warnings/min (5m): ' + (r.copernicus || 0) + '\n' +
+        'EMA: ' + (comp.ema || f) + ' · drift: ' + (comp.drift || 0);
+      capHtml = ' · 🌿 <span title="' + tip + '" style="color:' + color + ';cursor:help"><b>' + pct + '%</b> capacity</span>';
+    }
     cap.innerHTML = '🔑 <b>' + valid + '/' + total + '</b> valid creds · ⚡ max parallel frontiers: <b>' + maxPar + '</b> (need ' + per + ' each)' +
       ' · 🗺️ cached strips: <b>' + strips + '</b>' +
       (parActive ? ' · → running parallel: <b>' + parActive + '</b>' : '') +
+      capHtml +
       (cmCount ? ' · ⚠️ <span style="color:var(--yellow)" title="KGs excluded from cache-only whitelist until their Zenodo strip updates">' + cmCount + ' cache-miss KGs</span>' : '');
   }
   // --- Credentials list ---

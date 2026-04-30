@@ -1409,6 +1409,45 @@ push the latest manifest.
 | `data/austria_processor/director.lock` | fcntl lock — ensures single director loop across workers |
 | `data/austria_processor/peer_urls.txt` | Peer URLs for the data sync thread |
 
+#### Server-Friendliness Throttle
+
+When BEV (`data.bev.gv.at`), Zenodo, or Copernicus servers start emitting
+warnings (HTTP 0 range-read drops, 429 / 503, openEO 402s) the director
+automatically reduces the number of concurrent peers so we don't hammer
+them. The mechanism:
+
+1. `ProgressTracker.add_log()` (in `austria_processor.py`) classifies every
+   warning/error into `bev` / `zenodo` / `copernicus` based on substring
+   tokens, and keeps a 10-min sliding window. Per-minute rates are
+   exposed in `progress.json → warning_rates` and propagate to the
+   director via `/api/v1/processing/status`.
+2. Each director tick (~30 s) `_capacity_factor()` takes the **max**
+   per-kind 5-minute rate across all peers and maps it linearly to a
+   sub-factor: 1.0 at zero warnings, `THROTTLE_MIN_FACTOR` (0.30) at
+   `THROTTLE_SATURATION_RATE` warnings/min. The minimum sub-factor wins.
+3. An EMA (`THROTTLE_EMA_ALPHA = 0.25`, half-life ~3 ticks) smooths the
+   raw value, then a slow sinusoidal drift (±10 % over a 2-hour period,
+   phase derived from the hostname) overlays an organic wobble.
+4. `_orchestrate_parallel_frontiers()` and `_orchestrate_cache_only()`
+   multiply their caps (`max_parallel_frontiers` and
+   `max_cache_only_peers`) by the factor each tick. Frontiers always
+   keep at least one slot — the active frontier is never pre-empted by
+   the throttle. Cache-only count *can* drop to zero on sustained
+   pressure.
+5. Status payload exposes `capacity_factor` and `capacity_components`;
+   dashboard shows a 🌿 pill (green/yellow/red) with the rates as
+   tooltip.
+
+Saturation thresholds (warnings per minute) live in
+`peer_director.py → THROTTLE_SATURATION_RATE`:
+- bev: 6.0  (a few range-read retries are normal noise)
+- zenodo: 1.5  (Zenodo rate-limits aggressively)
+- copernicus: 0.5  (402s should be near zero in steady state)
+
+Tuning knobs: `THROTTLE_MIN_FACTOR`, `THROTTLE_EMA_ALPHA`,
+`THROTTLE_DRIFT_PERIOD_S`, `THROTTLE_DRIFT_AMPLITUDE` at the top of
+`peer_director.py`.
+
 #### Director Modes
 
 | Mode | Behaviour |

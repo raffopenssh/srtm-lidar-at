@@ -306,6 +306,11 @@ class ProgressTracker:
     def __init__(self, path: Path):
         self.path = path
         self._lock = __import__('threading').Lock()
+        # Sliding-window of (ts, kind) entries for warning-rate computation.
+        # In-memory only: a restart wipes it, which is the right behaviour
+        # — a fresh process should not inherit historical alarm state.
+        from collections import deque as _deque
+        self._warning_history = _deque()
         self._state = {
             "state": "idle",
             "total_kgs": 0,
@@ -350,7 +355,13 @@ class ProgressTracker:
 
     def get(self) -> dict:
         with self._lock:
-            return dict(self._state)
+            snap = dict(self._state)
+        # Attach live warning rates (cheap; ~ms even with thousands of entries).
+        try:
+            snap["warning_rates"] = self.warning_rates()
+        except Exception:
+            snap["warning_rates"] = {}
+        return snap
 
     def update(self, **kwargs):
         with self._lock:
@@ -387,12 +398,86 @@ class ProgressTracker:
                 else:
                     self._state["current_kg"].pop("step_detail", None)
 
+    # --- Warning classification (for fleet-wide throttle in peer director).
+    # Patterns are case-insensitive substring tests; first match wins. The
+    # buckets are intentionally coarse: we only need to know whether the BEV
+    # GeoTIFF servers or Zenodo are getting hammered, not why.
+    _WARN_BEV_TOKENS = (
+        "data.bev.gv.at", "rasterio._err", "cple_appdefined", "bev_retry",
+        "als_dtm", "als_dsm", "http error code: 0",
+    )
+    _WARN_ZENODO_TOKENS = (
+        "zenodo.org", "zenodo ", "deposit", "sandbox.zenodo",
+    )
+    _WARN_COPERNICUS_TOKENS = (
+        "openeo", "copernicus", "sentinel", "402", "ip-throttled",
+        "creditsexhausted",
+    )
+
+    @classmethod
+    def _classify_warning(cls, level: str, msg: str) -> str | None:
+        if level not in ("warning", "error"):
+            return None
+        m = (msg or "").lower()
+        for tok in cls._WARN_BEV_TOKENS:
+            if tok in m:
+                return "bev"
+        for tok in cls._WARN_ZENODO_TOKENS:
+            if tok in m:
+                return "zenodo"
+        for tok in cls._WARN_COPERNICUS_TOKENS:
+            if tok in m:
+                return "copernicus"
+        return None
+
+    def _tally_warning(self, kind: str):
+        """Append a (ts, kind) entry to the in-memory sliding window.
+
+        Lives only in process memory — rebuilds after a restart, which is
+        what we want (a restarted peer should start with a clean slate).
+        """
+        now = time.time()
+        hist = self._warning_history
+        hist.append((now, kind))
+        # Trim entries older than 10 min — keeps the deque small.
+        cutoff = now - 600
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+    def warning_rates(self) -> dict:
+        """Per-minute warning rates over the last 1, 5, and 10 min windows.
+
+        Returns ``{bev: {1m, 5m, 10m}, zenodo: {...}, copernicus: {...}}``.
+        Read by the dashboard and the peer director to drive throttle.
+        """
+        now = time.time()
+        windows = (60, 300, 600)
+        out = {k: {"1m": 0.0, "5m": 0.0, "10m": 0.0}
+               for k in ("bev", "zenodo", "copernicus")}
+        # Snapshot the deque under the lock to avoid races with appenders.
+        with self._lock:
+            snap = list(self._warning_history)
+        for ts, kind in snap:
+            for w, label in zip(windows, ("1m", "5m", "10m")):
+                if now - ts <= w:
+                    out.setdefault(kind, {"1m": 0.0, "5m": 0.0, "10m": 0.0})[label] += 1
+        # Convert raw counts → per-minute rates.
+        for kind, d in out.items():
+            d["1m"]  = round(d["1m"] / 1.0,  3)
+            d["5m"]  = round(d["5m"] / 5.0,  3)
+            d["10m"] = round(d["10m"] / 10.0, 3)
+        return out
+
     def add_log(self, level: str, msg: str, kg: str = ""):
         with self._lock:
             entry = {"ts": datetime.now(timezone.utc).isoformat(),
                      "level": level, "msg": msg, "kg": kg}
             self._state["recent_log"].append(entry)
             self._state["recent_log"] = self._state["recent_log"][-200:]
+        # Classify + tally outside the lock — _tally_warning takes its own.
+        kind = self._classify_warning(level, msg)
+        if kind:
+            self._tally_warning(kind)
 
     def add_failure(self, code: str, name: str, error: str, step: str):
         with self._lock:

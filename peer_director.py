@@ -104,6 +104,35 @@ UNREACHABLE_FAILOVER_THRESHOLD = 3
 # loop forever).  Cleared automatically when not_before passes.
 ZENODO_NETWORK_COOLDOWN_MIN = 30
 
+# --- Server-friendliness throttle ----------------------------------------
+#
+# When BEV / Zenodo / Copernicus servers start emitting warnings (HTTP 0
+# range-read drops, 429s, 503s, openEO 402s) we voluntarily reduce the
+# number of concurrent peers so we don't hammer them. The capacity factor
+# is recomputed on every director tick from the fleet-wide warning rate.
+#
+# We never go below ``THROTTLE_MIN_FACTOR`` (so a single noisy peer can't
+# drop the fleet to zero) and we never run more than 100% of the
+# configured max. We also overlay a slow sinusoidal drift (period
+# ~2 hours) so the activity pattern looks organic rather than
+# bang‑on‑max all the time. Phase per peer comes from a stable hash so
+# different VMs take their breaks at different times.
+THROTTLE_MIN_FACTOR = 0.30
+THROTTLE_MAX_FACTOR = 1.00
+# warnings/min (per kind) at which the factor reaches its minimum.
+# A few stray retries are normal; sustained > ~6/min is real pressure.
+THROTTLE_SATURATION_RATE = {
+    'bev': 6.0,
+    'zenodo': 1.5,        # Zenodo rate-limits aggressively
+    'copernicus': 0.5,    # 402s should be near-zero in steady state
+}
+# EMA smoothing factor for the capacity decision (per tick, ~30 s).
+# Smaller = slower to react / recover. 0.25 gives a half‑life of ~3 ticks.
+THROTTLE_EMA_ALPHA = 0.25
+# Sinusoidal drift: period and amplitude (fraction of total range).
+THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
+THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value
+
 
 def _default_peers_config() -> dict:
     """Return default peers.json structure."""
@@ -780,6 +809,82 @@ class PeerDirector:
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
+        # EMA capacity factor (0..1). Survives ticks but not restarts —
+        # which is fine: a fresh director starts optimistic and lets the
+        # warning rate pull it down within a few minutes if needed.
+        self._capacity_ema: float = THROTTLE_MAX_FACTOR
+        self._capacity_components: dict = {}
+
+    # --- Server-friendliness throttle ------------------------------------
+    def _fleet_warning_rates(self, statuses: dict) -> dict:
+        """Aggregate per-peer ``warning_rates`` into a fleet-wide max.
+
+        We use the maximum (not the sum) per kind because a single peer
+        seeing 6 BEV warnings/min is already a strong signal: it means
+        the BEV servers are pushing back, and adding more peers would
+        make it worse no matter how many quiet peers we have.
+        """
+        agg = {'bev': 0.0, 'zenodo': 0.0, 'copernicus': 0.0}
+        peer_count = 0
+        for ps in (statuses or {}).values():
+            wr = (ps or {}).get('warning_rates') or {}
+            if not wr:
+                continue
+            peer_count += 1
+            for kind in agg:
+                # 5-min window is the sweet spot: long enough to ignore
+                # one-off retries, short enough to react within ~5 min.
+                rate = float(((wr.get(kind) or {}).get('5m')) or 0.0)
+                if rate > agg[kind]:
+                    agg[kind] = rate
+        agg['_peers_reporting'] = peer_count
+        return agg
+
+    def _capacity_factor(self, statuses: dict) -> float:
+        """Combined capacity factor in [THROTTLE_MIN_FACTOR, 1.0].
+
+        Per-kind sub-factors decay linearly from 1.0 (no warnings) down to
+        THROTTLE_MIN_FACTOR at the saturation rate. The minimum sub-factor
+        wins (i.e. whichever upstream is angriest dominates). An EMA
+        smooths it across ticks; a slow sinusoidal drift adds a natural
+        wobble so we don't sit pinned at the cap.
+        """
+        rates = self._fleet_warning_rates(statuses)
+        sub = {}
+        for kind, sat in THROTTLE_SATURATION_RATE.items():
+            r = float(rates.get(kind, 0.0))
+            if sat <= 0:
+                sub[kind] = 1.0
+                continue
+            # 1.0 at r=0, MIN_FACTOR at r>=sat, linear in between.
+            frac = max(0.0, min(1.0, r / sat))
+            sub[kind] = THROTTLE_MAX_FACTOR - frac * (
+                THROTTLE_MAX_FACTOR - THROTTLE_MIN_FACTOR)
+        raw = min(sub.values()) if sub else THROTTLE_MAX_FACTOR
+        # EMA smoothing.
+        a = THROTTLE_EMA_ALPHA
+        self._capacity_ema = a * raw + (1.0 - a) * self._capacity_ema
+        # Slow sinusoidal drift to mimic an organic activity pattern.
+        # Phase derived from local hostname so different primaries (and
+        # the future-self of the same primary post‑restart) stay roughly
+        # in sync but not identical.
+        import math, socket
+        phase = (abs(hash(socket.gethostname())) % 1000) / 1000.0
+        t = time.time() / THROTTLE_DRIFT_PERIOD_S + phase
+        drift = THROTTLE_DRIFT_AMPLITUDE * math.sin(2 * math.pi * t)
+        final = max(THROTTLE_MIN_FACTOR,
+                    min(THROTTLE_MAX_FACTOR, self._capacity_ema + drift))
+        self._capacity_components = {
+            'rates': {k: rates.get(k, 0.0)
+                       for k in ('bev', 'zenodo', 'copernicus')},
+            'sub_factors': {k: round(v, 3) for k, v in sub.items()},
+            'raw': round(raw, 3),
+            'ema': round(self._capacity_ema, 3),
+            'drift': round(drift, 3),
+            'factor': round(final, 3),
+            'peers_reporting': rates.get('_peers_reporting', 0),
+        }
+        return final
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -951,6 +1056,10 @@ class PeerDirector:
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
+            'capacity_factor': state.get(
+                'capacity_factor', self._capacity_ema),
+            'capacity_components': state.get(
+                'capacity_components', self._capacity_components),
             'peers': peers_status,
         }
 
@@ -1941,6 +2050,19 @@ class PeerDirector:
         # creds as a fleet-wide spare so a 402 can rotate without
         # colliding with another peer's slice.
         max_par = self._max_parallel_frontiers(cfg)
+        # Server-friendliness throttle: scale down when BEV / Zenodo /
+        # Copernicus are getting hammered. Round, but never below 1 if
+        # max_par was already ≥ 1 — we always allow the active frontier.
+        _factor = float(state_copy.get('capacity_factor',
+                                        self._capacity_ema))
+        if max_par > 0:
+            max_par_throttled = max(1, int(round(max_par * _factor)))
+            if max_par_throttled < max_par:
+                log.info(
+                    'capacity factor %.2f → max_parallel_frontiers %d → %d',
+                    _factor, max_par, max_par_throttled,
+                )
+            max_par = max_par_throttled
 
         # Frontier peers each pin to a disjoint Austria-wide 0.5° lat
         # strip so they never collide on a Zenodo cache ZIP write — even
@@ -2171,6 +2293,20 @@ class PeerDirector:
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
         min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
         max_cache_only = int(cfg.get('max_cache_only_peers', MAX_CACHE_ONLY_PEERS))
+        # Server-friendliness throttle (see _capacity_factor docstring).
+        # Cache-only peers hit BEV + Zenodo, so this is exactly the knob
+        # to turn down when those servers complain. We *do* allow zero
+        # here — when servers are really angry, idling cache-only peers
+        # is the right move (the active frontier still makes progress).
+        _factor = float(state_copy.get('capacity_factor',
+                                        self._capacity_ema))
+        _max_cache_only_full = max_cache_only
+        max_cache_only = max(0, int(round(max_cache_only * _factor)))
+        if max_cache_only < _max_cache_only_full:
+            log.info(
+                'capacity factor %.2f → max_cache_only_peers %d → %d',
+                _factor, _max_cache_only_full, max_cache_only,
+            )
 
         active_frontier = state_copy.get('active_peer')
         peers = list(cfg.get('peers', []))
@@ -2411,6 +2547,38 @@ class PeerDirector:
                 except Exception:
                     pass
                 self._update_bandwidth()
+                # Capacity factor: poll each peer's processing status once
+                # per tick (cheap; we already do it implicitly inside the
+                # orchestrators) and use the warning_rates field to derive
+                # how aggressively we should run. We stash both the factor
+                # and the components on self.state so the dashboard can
+                # show the user *why* we slowed down.
+                try:
+                    from concurrent.futures import (
+                        ThreadPoolExecutor as _Tpe,
+                        TimeoutError as _Fto,
+                    )
+                    _peers = list(self.cfg.get('peers', []))
+                    _statuses: dict[str, dict] = {}
+                    with _Tpe(max_workers=BANDWIDTH_POLL_CONCURRENCY,
+                                thread_name_prefix='dir-cap') as _ex:
+                        _futs = {_ex.submit(get_peer_status, p.get('url')): p
+                                 for p in _peers}
+                        _deadline = time.time() + 12
+                        for _f, _p in list(_futs.items()):
+                            try:
+                                _statuses[_p['id']] = _f.result(
+                                    timeout=max(0.1, _deadline - time.time())
+                                )
+                            except (_Fto, Exception):
+                                _statuses[_p['id']] = {'state': 'unreachable'}
+                    factor = self._capacity_factor(_statuses)
+                    with self._lock:
+                        self.state['capacity_factor'] = round(factor, 3)
+                        self.state['capacity_components'] = (
+                            self._capacity_components)
+                except Exception:
+                    log.exception('capacity factor computation failed')
                 with self._lock:
                     if _clear_completed_reservations(self.cfg):
                         save_peers_config(self.cfg)

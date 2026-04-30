@@ -1656,36 +1656,46 @@ function peerActionsMenu(p, opts) {
          `<div class="pmenu-pop">${items.join('')}</div></span>`;
 }
 
+function _pmenuClose() {
+  document.querySelectorAll('.pmenu-pop.open').forEach(el => {
+    el.classList.remove('open');
+    // Move back into its origin wrapper so subsequent toggles find it
+    const origin = el._pmenuOrigin;
+    if (origin && origin.isConnected && el.parentElement !== origin) {
+      origin.appendChild(el);
+    }
+  });
+}
 function _pmenuToggle(ev, btn) {
   ev.stopPropagation();
-  const pop = btn.nextElementSibling;
+  // Find the popup — either next sibling (closed state in wrapper) or already in body keyed by btn
+  let pop = btn._pmenuPop || btn.nextElementSibling;
+  if (!pop || !pop.classList || !pop.classList.contains('pmenu-pop')) return;
+  btn._pmenuPop = pop;
+  if (!pop._pmenuOrigin) pop._pmenuOrigin = btn.parentElement;
   const wasOpen = pop.classList.contains('open');
-  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
-  if (!wasOpen) {
-    // Position relative to the button (fixed-positioned, so use viewport coords)
-    const r = btn.getBoundingClientRect();
-    pop.classList.add('open');
-    // Default: drop down, right-align with the button
-    const popW = pop.offsetWidth || 170;
-    const popH = pop.offsetHeight || 0;
-    let left = r.right - popW;
-    if (left < 4) left = 4;
-    let top = r.bottom + 4;
-    // Flip up if it would overflow the viewport bottom
-    if (top + popH > window.innerHeight - 4 && r.top - 4 - popH > 4) {
-      top = r.top - 4 - popH;
-    }
-    pop.style.left = left + 'px';
-    pop.style.top = top + 'px';
+  _pmenuClose();
+  if (wasOpen) return;
+  // Portal to <body> so ancestor opacity/transform stacking contexts can't dim or cover it
+  document.body.appendChild(pop);
+  pop.classList.add('open');
+  const r = btn.getBoundingClientRect();
+  const popW = pop.offsetWidth || 170;
+  const popH = pop.offsetHeight || 0;
+  let left = r.right - popW;
+  if (left < 4) left = 4;
+  let top = r.bottom + 4;
+  if (top + popH > window.innerHeight - 4 && r.top - 4 - popH > 4) {
+    top = r.top - 4 - popH;
   }
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
 }
 function _pmenuRun(btn, fn) {
-  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
+  _pmenuClose();
   try { fn(); } catch(e) { console.error(e); }
 }
-document.addEventListener('click', () => {
-  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
-});
+document.addEventListener('click', _pmenuClose);
 
 async function peerCmd(peerId, action) {
   // Send pause/resume/stop to a specific peer (proxies via primary if remote).

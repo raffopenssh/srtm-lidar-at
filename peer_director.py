@@ -1308,10 +1308,28 @@ class PeerDirector:
                             active_id = None
                     elif remaining_gb >= 2:
                         excl = _reserved_kgs(cfg, exclude_peer_id=active_id)
-                        log.info('Restarting processor on %s (%.1f GB remaining)%s',
-                                 active_id, remaining_gb,
-                                 (' — excluding ' + ','.join(sorted(excl))) if excl else '')
-                        start_peer_processor(peer.get('url'), exclude_kgs=excl)
+                        # Re-issue with the current cred/strip plan so
+                        # the active peer stays pinned to its slice.
+                        plan_cred = (self.state.get('frontier_cred_plan') or {}).get(active_id)
+                        plan_strip = (self.state.get('frontier_strip_plan') or {}).get(active_id)
+                        if not plan_cred:
+                            self._refresh_peer_caps(peer)
+                            plan_cred = (self._assign_cred_indices([active_id], cfg)
+                                          .get(active_id))
+                        if not plan_strip:
+                            strips = self._austria_lat_strips()
+                            plan_strip = [list(strips[0])] if strips else None
+                        log.info(
+                            'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
+                            active_id, remaining_gb,
+                            (' — excluding ' + ','.join(sorted(excl))) if excl else '',
+                            plan_cred, plan_strip,
+                        )
+                        start_peer_processor(
+                            peer.get('url'), exclude_kgs=excl,
+                            cred_indices=plan_cred,
+                            lat_strips=plan_strip,
+                        )
                     else:
                         log.info('Peer %s depleted, finding next peer', active_id)
                         with self._lock:

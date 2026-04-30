@@ -874,7 +874,17 @@ class PeerDirector:
             valid_creds = []
         per = max(1, int(cfg.get('min_creds_per_frontier',
                                   self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
-        max_par = (len(valid_creds) // per) if valid_creds else 0
+        # Account for legacy active peer locking its full local pool.
+        active_id_now = state.get('active_peer')
+        peer_caps_cache = state.get('_peer_caps') or {}
+        active_caps_now = set((peer_caps_cache.get(active_id_now) or {}).get('caps') or [])
+        reserved_by_active_now: set[int] = set()
+        if active_id_now and 'cred_subset_env' not in active_caps_now:
+            n_local = int((peer_caps_cache.get(active_id_now) or {}).get('cred_count') or 4)
+            reserved_by_active_now = set(i for i in valid_creds if i < n_local)
+        available_creds = [i for i in valid_creds if i not in reserved_by_active_now]
+        max_par_extra = (len(available_creds) // per) if available_creds else 0
+        max_par = (1 if active_id_now else 0) + max_par_extra
         cred_plan = state.get('frontier_cred_plan') or {}
         strip_plan = state.get('frontier_strip_plan') or {}
         cached_strips = self._cached_lat_ranges() if hasattr(self, '_cached_lat_ranges') else []
@@ -1584,6 +1594,12 @@ class PeerDirector:
 
         Each peer gets a disjoint slice of length ``min_creds_per_frontier``.
         Returns {peer_id: [cred_idx, ...]}.
+
+        Legacy peers (no ``cred_subset_env`` capability) ignore the env
+        var and use their full LOCAL credential pool. To avoid double-
+        booking creds we reserve range(cred_count_local) exclusively for
+        each legacy peer in the input list and hand the remaining valid
+        creds to peers that respect the env var.
         """
         valid = sorted(self._valid_credentials())
         per = max(1, int(cfg.get('min_creds_per_frontier',
@@ -1591,10 +1607,37 @@ class PeerDirector:
         out = {}
         if not valid or not frontier_ids:
             return out
-        # Stable assignment by sorted peer id
+
+        peer_caps_cache = self.state.get('_peer_caps') or {}
+
+        def _is_legacy(pid):
+            entry = peer_caps_cache.get(pid) or {}
+            return 'cred_subset_env' not in set(entry.get('caps') or [])
+
+        def _local_pool_size(pid):
+            entry = peer_caps_cache.get(pid) or {}
+            return int(entry.get('cred_count') or 4)
+
+        # Reserve creds locked by legacy peers FIRST.
+        reserved: set[int] = set()
         peers_sorted = sorted(frontier_ids)
-        for i, pid in enumerate(peers_sorted):
-            slice_ = valid[i * per:(i + 1) * per]
+        for pid in peers_sorted:
+            if _is_legacy(pid):
+                # Legacy peer holds first N indices of its local pool.
+                # That maps to indices [0..N-1] in the canonical pool because
+                # builtins are stable-ordered and prepended.
+                n = _local_pool_size(pid)
+                slice_ = list(range(min(n, len(valid))))
+                # Only count actually-valid indices.
+                slice_ = [i for i in slice_ if i in valid]
+                out[pid] = slice_
+                reserved.update(slice_)
+
+        # Remaining valid creds go to upgraded peers, sliced by `per`.
+        remaining = [i for i in valid if i not in reserved]
+        upgraded = [pid for pid in peers_sorted if not _is_legacy(pid)]
+        for i, pid in enumerate(upgraded):
+            slice_ = remaining[i * per:(i + 1) * per]
             if not slice_:
                 break
             out[pid] = slice_
@@ -1896,9 +1939,25 @@ class PeerDirector:
         valid = self._valid_credentials()
         per = max(1, int(cfg.get('min_creds_per_frontier',
                                   self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
-        max_par = len(valid) // per
-        if max_par <= 1:
-            # Not enough creds for a second frontier.
+
+        # If the active peer is a LEGACY peer (no cred_subset_env), it
+        # locks its full local pool (range(cred_count_local)). Subtract
+        # those from the pool available to parallel frontiers, otherwise
+        # we'd double-book the same credentials.
+        peer_caps_cache = state_copy.get('_peer_caps') or {}
+        active_caps = set((peer_caps_cache.get(active_id) or {}).get('caps') or [])
+        active_legacy = 'cred_subset_env' not in active_caps
+        reserved_by_active: set[int] = set()
+        if active_legacy:
+            n = int((peer_caps_cache.get(active_id) or {}).get('cred_count') or 4)
+            reserved_by_active = set(i for i in valid if i < n)
+        available = [i for i in valid if i not in reserved_by_active]
+        max_par_total = len(valid) // per
+        max_par_extra = len(available) // per  # peers we can ADD beyond active
+        # Total cap accounts for the active peer (1 slot, even if legacy)
+        max_par = (1 if active_id else 0) + max_par_extra
+        if max_par_extra < 1:
+            # No headroom for an additional parallel frontier.
             with self._lock:
                 self.state['parallel_frontiers_active'] = []
             return

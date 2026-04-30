@@ -911,9 +911,11 @@ class PeerDirector:
         for row in peers_status:
             pid = row['id']
             proc_st = row.get('processor_state')
-            # Treat any non-terminal state as 'holding' — e.g. paused_zenodo
-            # peers are mid-KG awaiting the upload lock and still own creds.
-            if proc_st in ('stopped', 'unreachable', 'unknown', 'failed', None):
+            # Only actively-running peers hold credentials. Paused peers
+            # (paused_zenodo, paused_copernicus, etc.) release their creds
+            # so other peers can use them — the director re-assigns when
+            # the paused peer resumes (next start_peer_processor call).
+            if proc_st not in ('running', 'processing'):
                 continue
             if row.get('cache_only_run'):
                 continue

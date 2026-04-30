@@ -2012,6 +2012,27 @@ class PeerDirector:
                     'needs_stop_cache_only': is_running and is_cache_only_run,
                 })
 
+        # If the active peer is legacy and reserves creds that overlap
+        # with an already-running parallel frontier's stale plan, stop
+        # the parallel frontier so the next tick re-issues a non-
+        # conflicting plan. Without this, at2 keeps using [0,1] (env
+        # set at startup) while legacy at5 also uses [0,1] from its
+        # full local pool — same creds in flight on two peers.
+        old_plan = state_copy.get('frontier_cred_plan') or {}
+        for pid in list(running):
+            old_slice = set(old_plan.get(pid) or [])
+            if old_slice & reserved_by_active:
+                log.warning('Parallel frontier %s plan %s overlaps creds '
+                            'reserved by legacy active %s — stopping for '
+                            're-assignment', pid, sorted(old_slice), active_id)
+                peer = get_peer_by_id(cfg, pid)
+                if peer:
+                    try:
+                        stop_peer_processor(peer.get('url'), graceful=True)
+                    except Exception as e:
+                        log.warning('Stop %s failed: %s', pid, e)
+                running.remove(pid)
+
         # Slot budget = max_par - 1 (subtract primary). Also keep reserve.
         slack = max(0, total_enabled - (1 if active_id else 0)
                     - len(running) - min_reserve)

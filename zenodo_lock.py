@@ -34,6 +34,14 @@ _DEFAULT_TTL = 120.0  # must match _ZENODO_LOCK_TTL on the server
 _HEARTBEAT_INTERVAL = 30.0  # seconds; well under TTL/2
 _ACQUIRE_RETRY_INTERVAL = 5.0  # seconds between retries when locked
 _ACQUIRE_TIMEOUT = 1800.0  # max wait for the lease (30 min)
+# HTTP timeout for the broker POST. Primary's gunicorn workers can stall
+# briefly under load (heavy GPKG building, search-index rebuild, etc.) so
+# 15 s was too tight — a slow tick produced spurious "proceeding without
+# lease" warnings on every cache-only peer simultaneously.
+_BROKER_HTTP_TIMEOUT = (5, 60)  # (connect, read)
+# Number of consecutive transport failures we tolerate quietly before
+# escalating to a warning. The broker is best‑effort — a single blip is
+# normal, but sustained failures should be loud.
 
 
 def _broker_url() -> Optional[str]:
@@ -104,17 +112,32 @@ def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
     deadline = time.monotonic() + max_wait_s
     lease: Optional[ZenodoLease] = None
     backoff = _ACQUIRE_RETRY_INTERVAL
+    transport_failures = 0
     while True:
         try:
             r = requests.post(
                 f"{broker}/api/v1/zenodo/lock",
                 json={'peer': peer, 'purpose': purpose, 'kg': kg},
-                timeout=15,
+                timeout=_BROKER_HTTP_TIMEOUT,
             )
         except Exception as e:
-            # Broker unreachable — fail open after one warning.  We'd rather
-            # process than deadlock the fleet on a network blip.
-            log.warning('Zenodo lock broker unreachable (%s) — proceeding without lease', e)
+            # Broker unreachable. We retry a couple of times on transport
+            # failures before giving up — the primary's gunicorn workers
+            # can briefly stall under load and we'd rather wait 5–10 s for
+            # the lease than fan out into uncoordinated uploads.
+            transport_failures += 1
+            if transport_failures <= 2 and time.monotonic() < deadline:
+                log.info('Zenodo lock broker transport error (%s) — retry %d',
+                         str(e)[:120], transport_failures)
+                time.sleep(min(backoff, max(1.0, deadline - time.monotonic())))
+                backoff = min(backoff * 1.5, 30.0)
+                continue
+            # Sustained failure — fail open. We'd rather process than
+            # deadlock the fleet on a network outage; the director's
+            # single‑active rule already keeps Zenodo writes mostly serial.
+            log.warning(
+                'Zenodo lock broker unreachable after %d attempts (%s) — '
+                'proceeding without lease', transport_failures, str(e)[:160])
             yield None
             return
         if r.status_code == 200:

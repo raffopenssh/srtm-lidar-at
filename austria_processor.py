@@ -347,7 +347,17 @@ class ProgressTracker:
             pass
 
     def save(self):
+        # Snapshot warning rates BEFORE taking the lock (warning_rates()
+        # acquires it itself) so they land in the persisted JSON. Without
+        # this the field is only visible inside this process via get();
+        # the dashboard reads progress.json off disk and would never see
+        # it, which means the director throttle never engages on peers.
+        try:
+            wr = self.warning_rates()
+        except Exception:
+            wr = {}
         with self._lock:
+            self._state["warning_rates"] = wr
             tmp = str(self.path) + ".tmp"
             with open(tmp, 'w') as f:
                 json.dump(self._state, f, indent=2, default=str)

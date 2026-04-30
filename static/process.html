@@ -3130,6 +3130,10 @@ function renderDirector(d) {
         '</select></div>';
     }
 
+    if (!p.online) {
+      const cmd = 'cd ~/srtm-lidar && git pull --ff-only && sudo systemctl restart srv';
+      html += '<div style="margin-top:4px;display:flex;gap:4px;align-items:center"><code style="flex:1;font-size:9px;background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:2px 4px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Run on peer (offline — cannot push from director)">' + esc(cmd) + '</code><button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="event.stopPropagation();navigator.clipboard.writeText(\'' + cmd + '\');this.textContent=\'✓\';setTimeout(()=>this.textContent=\'⧉\',1000)" title="Copy manual update command">⧉</button></div>';
+    }
     if (isInactive) html += '</div>'; // close .peer-detail
     html += '</div>'; // close card
   }

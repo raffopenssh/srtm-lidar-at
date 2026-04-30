@@ -1025,10 +1025,12 @@ class PeerDirector:
                 'online': proc_status != 'unreachable',
                 'git_commit': ps.get('git_commit', ''),
                 'region': ps.get('region', ''),
-                # Authoritative cred_indices from the peer's own progress.json
-                # — what the running processor subprocess actually has in env.
-                # Used as fallback when frontier_cred_plan is stale/empty.
+                # Authoritative cred_indices/lat_strips from the peer's own
+                # progress.json — what the running processor subprocess
+                # actually has in env. Used as fallback when the director's
+                # frontier_cred_plan / frontier_strip_plan is stale/empty.
                 '_reported_cred_indices': ps.get('cred_indices'),
+                '_reported_lat_strips': ps.get('lat_strip_filter'),
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
@@ -1070,10 +1072,14 @@ class PeerDirector:
                     row['cred_indices'] = list(reported)
                 elif pid in cred_plan:
                     row['cred_indices'] = cred_plan[pid]
-                if pid in strip_plan:
+                reported_strips = row.pop('_reported_lat_strips', None)
+                if reported_strips:
+                    row['lat_strips'] = list(reported_strips)
+                elif pid in strip_plan:
                     row['lat_strips'] = strip_plan[pid]
             else:
                 row.pop('_reported_cred_indices', None)
+                row.pop('_reported_lat_strips', None)
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
                       if p['id'] == pid), None)

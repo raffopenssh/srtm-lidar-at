@@ -69,9 +69,12 @@ BANDWIDTH_RENEW_DAY = 17  # day of month when exe.dev bandwidth resets
 MIN_RESERVE_PEERS = 5
 # How many cache-only peers may run concurrently with the frontier peer.
 # Each cache-only peer only does BEV reads + CPU + Zenodo upload — no
-# Copernicus credentials — so we can run several in parallel.  The
-# limit exists to avoid hammering the (single-token) Zenodo upload mutex.
-MAX_CACHE_ONLY_PEERS = 8
+# Copernicus credentials — so we can run as many as the whitelist and
+# the reserve policy permit. The Zenodo upload mutex serialises writes
+# so peers wait their turn rather than fighting. 64 is a soft ceiling
+# well above the current fleet size; it just prevents the orchestrator
+# from spinning up an absurd number of peers if min_reserve is misset.
+MAX_CACHE_ONLY_PEERS = 64
 
 # How often the director checks state (seconds)
 DIRECTOR_POLL_INTERVAL = 30
@@ -1974,7 +1977,9 @@ class PeerDirector:
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
         min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
         peers = list(cfg.get('peers', []))
-        total_enabled = sum(1 for p in peers if p.get('enabled', True))
+        total_enabled = sum(1 for p in peers
+                            if p.get('enabled', True)
+                            and not _peer_is_scheduled(p))
 
         # Already running parallel frontiers (excluding active_peer).
         running: list[str] = []
@@ -2044,6 +2049,11 @@ class PeerDirector:
 
         # Stable assignment: primary + sorted(running+candidates) -> ids in
         # order define which cred slice and lat strip they get.
+        # Prefer idle/stopped candidates over cache-only-running ones so
+        # we don't kill in-progress cache-only work when there's a free
+        # peer available.
+        candidates.sort(key=lambda c: (1 if c.get('needs_stop_cache_only') else 0,
+                                       c['peer']['id']))
         ordered = [active_id] + sorted(running) + sorted(
             c['peer']['id'] for c in candidates[:max_add])
         ordered = ordered[:max_par]  # cap to credential capacity
@@ -2072,14 +2082,24 @@ class PeerDirector:
             # we can re-start it as a frontier with the assigned creds /
             # lat-strip env. Otherwise the start API returns 409 and the
             # peer keeps doing cache-only work, leaving creds idle.
+            #
+            # IMPORTANT: must be a HARD stop (graceful=False). A graceful
+            # stop only flips the after-KG shutdown flag (~hours away).
+            # The subsequent start API would 409 and we'd ping-pong every
+            # tick, with the peer never actually entering frontier mode.
+            # Tile checkpoints survive the kill so the partial KG resumes
+            # cheaply on the next run.
             if cand.get('needs_stop_cache_only'):
-                log.info('Parallel frontier: stopping cache-only run on %s '
-                         'before promoting to frontier', pid)
+                log.info('Parallel frontier: hard-stopping cache-only run on '
+                         '%s before promoting to frontier', pid)
                 try:
-                    stop_peer_processor(peer.get('url'), graceful=True)
+                    stop_peer_processor(peer.get('url'), graceful=False)
                 except Exception as e:
                     log.warning('Stop cache-only on %s failed: %s', pid, e)
                     continue
+                # Brief settle so the peer's processor_state flips to
+                # stopped before we POST /start (avoid 409 race).
+                import time as _t; _t.sleep(2)
             log.info('Parallel frontier: starting %s with creds=%s strips=%s',
                      pid, creds, strips_for)
             try:
@@ -2164,8 +2184,13 @@ class PeerDirector:
         idle_eligible = [c for c in candidates
                          if c['state'] in ('idle', 'stopped', 'unknown')]
 
-        # Total enabled peers (excluding active frontier).
-        total_enabled = sum(1 for p in peers if p.get('enabled', True))
+        # Total enabled peers excluding scheduled-out (e.g. not_before in
+        # the future, like a primary that's been parked until the next
+        # bandwidth cycle). Without this, the reserve math wastes slots
+        # on peers we can't ever activate.
+        total_enabled = sum(1 for p in peers
+                            if p.get('enabled', True)
+                            and not _peer_is_scheduled(p))
         # We must keep `min_reserve` peers idle.  Subtract running peers
         # (frontier active + already-running cache-only) from total.
         running_count = (1 if active_frontier else 0) + len(running_cache_only)

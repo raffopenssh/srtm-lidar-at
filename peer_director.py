@@ -107,10 +107,13 @@ ZENODO_NETWORK_COOLDOWN_MIN = 30
 # Each cooldown applied within HOLD_TENDENCY_WINDOW_HOURS is counted; the next
 # cooldown is multiplied by 2**(count-1), capped at HOLD_TENDENCY_MAX_MIN.
 # Short window so we react quickly to targeted rate-limits: a peer that
-# trips twice within ~2 h is almost certainly being throttled by name/IP
+# trips twice within ~3 h is almost certainly being throttled by name/IP
 # and should sit out aggressively rather than thrash in/out every 30 min.
-HOLD_TENDENCY_WINDOW_HOURS = 2
-HOLD_TENDENCY_MAX_MIN = 8 * 60    # 8 h ceiling
+# Aggressive escalation factor: each repeat multiplies the cooldown by
+# HOLD_TENDENCY_FACTOR (cubic-ish growth instead of doubling).
+HOLD_TENDENCY_WINDOW_HOURS = 3
+HOLD_TENDENCY_FACTOR = 3
+HOLD_TENDENCY_MAX_MIN = 12 * 60   # 12 h ceiling
 
 # --- Server-friendliness throttle ----------------------------------------
 #
@@ -1486,7 +1489,7 @@ class PeerDirector:
                             break
                     repeat_count = len(history) + 1  # this incident
                     cd_min = min(
-                        ZENODO_NETWORK_COOLDOWN_MIN * (2 ** (repeat_count - 1)),
+                        ZENODO_NETWORK_COOLDOWN_MIN * (HOLD_TENDENCY_FACTOR ** (repeat_count - 1)),
                         HOLD_TENDENCY_MAX_MIN,
                     )
                     if repeat_count > 1:

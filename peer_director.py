@@ -1507,10 +1507,22 @@ class PeerDirector:
                     # will finish quickly when the cooldown lifts.
                     cd_until = now + timedelta(minutes=cd_min)
                     cur_kg = (status.get('current_kg') or {}).get('code')
+                    # On escalation (repeat #2+) release the held KG so
+                    # another peer can pick it up — the offender clearly
+                    # can't reach Zenodo and shouldn't block progress.
+                    # First trip: keep the reservation so the peer can
+                    # resume from its own tile checkpoints when cooldown
+                    # lifts.
+                    release_hold = repeat_count > 1
                     for p in self.cfg.get('peers', []):
                         if p['id'] == active_id:
                             p['not_before'] = cd_until.isoformat()
-                            if cur_kg:
+                            if release_hold:
+                                released = p.pop('reserved_kg', None)
+                                if released or cur_kg:
+                                    log.warning('Releasing held KG %s from %s (escalated cooldown)',
+                                                released or cur_kg, active_id)
+                            elif cur_kg:
                                 p['reserved_kg'] = str(cur_kg)
                             # Record this incident; prune older than window.
                             history.append(now)

@@ -308,6 +308,32 @@ function extractItems(j) {
       raw: p, kind: 'parcel', sev: 'low',
     }));
   }
+  if (Array.isArray(j.results)) {
+    // Generic results array (e.g. /query/parcels, /query/nature). Anything
+    // with a centroid is map-encodable.
+    j.results.forEach((r, i) => {
+      const lon = r.centroid_lon != null ? r.centroid_lon
+                : (r.centroid||{}).lon;
+      const lat = r.centroid_lat != null ? r.centroid_lat
+                : (r.centroid||{}).lat;
+      if (lon == null || lat == null) return;
+      const label = r.parcel_id || r.kg_code || r.obj_ref || ('row '+i);
+      const sub = r.auto_class || r.dominant_type || r.obj_type || r.type || '';
+      const extras = [];
+      if (r.elevation_m != null) extras.push(r.elevation_m.toFixed(0)+'m');
+      if (r.slope_mean_deg != null) extras.push(r.slope_mean_deg.toFixed(0)+'°');
+      if (r.aspect_dominant) extras.push(r.aspect_dominant);
+      if (r.area_sqm != null) extras.push((r.area_sqm/10000).toFixed(2)+'ha');
+      items.push({
+        id: 'res-' + i, kg: r.kg_code, lon, lat,
+        type: sub,
+        obj_ref: r.obj_ref,
+        title: label + (sub ? ' · ' + sub : '')
+             + (extras.length ? ' · ' + extras.join(' · ') : ''),
+        raw: r, kind: 'result', sev: 'low',
+      });
+    });
+  }
   if (Array.isArray(j.features)) {
     j.features.forEach((f, i) => items.push({
       id: 'feat-' + i, lon: (f.centroid||{}).lon || f.centroid_lon,

@@ -103,6 +103,14 @@ UNREACHABLE_FAILOVER_THRESHOLD = 3
 # failure (the same peer hitting the same network problem on retry would
 # loop forever).  Cleared automatically when not_before passes.
 ZENODO_NETWORK_COOLDOWN_MIN = 30
+# Escalating cooldown for peers with a 'hold tendency' (repeat offenders).
+# Each cooldown applied within HOLD_TENDENCY_WINDOW_HOURS is counted; the next
+# cooldown is multiplied by 2**(count-1), capped at HOLD_TENDENCY_MAX_MIN.
+# Short window so we react quickly to targeted rate-limits: a peer that
+# trips twice within ~2 h is almost certainly being throttled by name/IP
+# and should sit out aggressively rather than thrash in/out every 30 min.
+HOLD_TENDENCY_WINDOW_HOURS = 2
+HOLD_TENDENCY_MAX_MIN = 8 * 60    # 8 h ceiling
 
 # --- Server-friendliness throttle ----------------------------------------
 #
@@ -1014,6 +1022,7 @@ class PeerDirector:
                 'not_before': peer.get('not_before'),
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
+                'zenodo_cooldown_history': peer.get('zenodo_cooldown_history') or [],
                 'role': self._peer_role(peer),
                 'cache_only_run': bool(ps.get('cache_only')),
                 'is_active': pid == state.get('active_peer'),
@@ -1454,20 +1463,57 @@ class PeerDirector:
                         # Don't switch \u2014 every peer would hit the same
                         # token-wide issue.  The peer probes Zenodo itself.
                         return
-                    log.warning('Active peer %s: Zenodo network failure \u2014 cooling down %d min and switching',
-                                active_id, ZENODO_NETWORK_COOLDOWN_MIN)
+                    # Hold-tendency escalation: peers that repeatedly trip
+                    # the Zenodo network cooldown are likely on a flaky
+                    # route. Track recent cooldown timestamps and double
+                    # the duration on each repeat within the window so we
+                    # don't burn the whole day cycling them in/out.
+                    now = datetime.now(timezone.utc)
+                    cutoff = now - timedelta(hours=HOLD_TENDENCY_WINDOW_HOURS)
+                    history = []
+                    for p in self.cfg.get('peers', []):
+                        if p['id'] == active_id:
+                            raw = p.get('zenodo_cooldown_history') or []
+                            for ts in raw:
+                                try:
+                                    t = datetime.fromisoformat(ts)
+                                    if t.tzinfo is None:
+                                        t = t.replace(tzinfo=timezone.utc)
+                                except Exception:
+                                    continue
+                                if t >= cutoff:
+                                    history.append(t)
+                            break
+                    repeat_count = len(history) + 1  # this incident
+                    cd_min = min(
+                        ZENODO_NETWORK_COOLDOWN_MIN * (2 ** (repeat_count - 1)),
+                        HOLD_TENDENCY_MAX_MIN,
+                    )
+                    if repeat_count > 1:
+                        log.warning('Active peer %s: Zenodo network failure '
+                                    '(repeat #%d in %dh) \u2014 cooling down '
+                                    '%d min (escalated) and switching',
+                                    active_id, repeat_count,
+                                    HOLD_TENDENCY_WINDOW_HOURS, cd_min)
+                    else:
+                        log.warning('Active peer %s: Zenodo network failure \u2014 cooling down %d min and switching',
+                                    active_id, cd_min)
                     # Apply not_before cooldown so choose_active_peer skips this peer.
                     # Also reserve the in-progress KG so substitute peers skip
                     # it — the cooled peer keeps its tile checkpoints and
                     # will finish quickly when the cooldown lifts.
-                    cd_until = (datetime.now(timezone.utc)
-                                + timedelta(minutes=ZENODO_NETWORK_COOLDOWN_MIN))
+                    cd_until = now + timedelta(minutes=cd_min)
                     cur_kg = (status.get('current_kg') or {}).get('code')
                     for p in self.cfg.get('peers', []):
                         if p['id'] == active_id:
                             p['not_before'] = cd_until.isoformat()
                             if cur_kg:
                                 p['reserved_kg'] = str(cur_kg)
+                            # Record this incident; prune older than window.
+                            history.append(now)
+                            p['zenodo_cooldown_history'] = [
+                                t.isoformat() for t in history
+                            ]
                             break
                     save_peers_config(self.cfg)
                     # Stop processor on this peer (still uploading retries)

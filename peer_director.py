@@ -1318,7 +1318,9 @@ class PeerDirector:
                                           .get(active_id))
                         if not plan_strip:
                             strips = self._austria_lat_strips()
-                            plan_strip = [list(strips[0])] if strips else None
+                            # No prior plan: give all strips to this
+                            # lone frontier; orchestrator will trim later.
+                            plan_strip = [list(s) for s in strips] if strips else None
                         log.info(
                             'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
                             active_id, remaining_gb,
@@ -1424,7 +1426,10 @@ class PeerDirector:
                     plan = self._assign_cred_indices([new_peer], cfg)
                     creds_for_peer = plan.get(new_peer)
                     strips = self._austria_lat_strips()
-                    strip_for_peer = [list(strips[0])] if strips else None
+                    # Lone frontier on activation: own all strips.
+                    # The parallel orchestrator will redistribute later
+                    # when more frontiers come online.
+                    strip_for_peer = [list(s) for s in strips] if strips else None
                     log.info(
                         'Activating peer %s%s creds=%s strip=%s',
                         new_peer,
@@ -2009,18 +2014,34 @@ class PeerDirector:
         ordered = ordered[:max_par]  # cap to credential capacity
         cred_plan = self._assign_cred_indices(ordered, cfg)
 
-        # Lat strips: each frontier gets ONE disjoint Austria-wide strip
-        # so peers open new regions independently. Extra strips beyond
-        # the frontier count are unassigned for now (they'll be picked
-        # up as frontier slots open). If there are fewer strips than
-        # frontiers (rare), tail peers get nothing — we then trim
-        # ``ordered`` so we don't start an unfiltered peer.
+        # Lat strips: distribute ALL Austria strips contiguously across
+        # the frontier peers. With 7 strips and 3 frontiers each peer
+        # gets ~2-3 contiguous strips. This matters for straddler KGs
+        # (the ~6% whose bbox crosses a 0.5° strip boundary): the owning
+        # frontier (by centroid) reads/writes neighbour-strip cache tiles
+        # for the overlap. If the neighbour strip is owned by the same
+        # peer (contiguous range), there's no contention. Cross-peer
+        # contention only happens at the inter-peer boundary — at most
+        # N-1 such boundaries instead of one boundary per strip.
+        # When fewer strips than frontiers (very rare with 7 strips),
+        # tail peers get nothing — we then trim ``ordered``.
         strip_plan: dict[str, list] = {}
-        for i, pid in enumerate(ordered):
-            if i < len(strips):
-                s, n = strips[i]
-                strip_plan[pid] = [[s, n]]
-            else:
+        n_peers = len(ordered)
+        n_strips = len(strips)
+        if n_peers > 0 and n_strips > 0:
+            base = n_strips // n_peers
+            extra = n_strips % n_peers  # first `extra` peers get one more strip
+            offset = 0
+            for i, pid in enumerate(ordered):
+                size = base + (1 if i < extra else 0)
+                if size <= 0:
+                    strip_plan[pid] = []
+                    continue
+                slice_ = strips[offset:offset + size]
+                strip_plan[pid] = [[s, n] for s, n in slice_]
+                offset += size
+        else:
+            for pid in ordered:
                 strip_plan[pid] = []
         # Trim peers that ended up without a strip (no cap collision).
         ordered = [pid for pid in ordered if strip_plan.get(pid)]

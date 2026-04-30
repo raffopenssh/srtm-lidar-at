@@ -889,6 +889,57 @@ class PeerDirector:
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
                       if p['id'] == pid), None)
             )
+
+        # Refresh capability cache for all peers (cheap when cached).
+        for peer in peers_list:
+            try:
+                self._refresh_peer_caps(peer)
+            except Exception:
+                pass
+
+        # --- Credential holders: which peer currently holds each cred ---
+        # A peer 'holds' a credential if it's running frontier work using it.
+        # * Cache-only peers hold no credentials (no Copernicus calls).
+        # * Frontier peers with cred_subset_env capability hold only the
+        #   cred indices assigned in cred_plan.
+        # * Frontier peers WITHOUT cred_subset_env (legacy/un-upgraded)
+        #   fall back to using the full pool — they hold ALL cred indices.
+        cred_holders: dict[int, list[str]] = {i: [] for i in range(len(cred_pool))}
+        active_id = state.get('active_peer')
+        parallel_active = set(state.get('parallel_frontiers_active') or [])
+        all_indices = list(range(len(cred_pool)))
+        for row in peers_status:
+            pid = row['id']
+            proc_st = row.get('processor_state')
+            if proc_st not in ('running', 'processing'):
+                continue
+            if row.get('cache_only_run'):
+                continue
+            is_frontier = (pid == active_id) or (pid in parallel_active)
+            if not is_frontier:
+                # Other running peer (frontier) — be conservative: assume
+                # legacy holding full pool unless proven otherwise.
+                pass
+            peer_cfg = next((p for p in cfg.get('peers', []) if p['id'] == pid), None)
+            caps = set()
+            if peer_cfg is not None:
+                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
+                caps = set(cache_entry.get('caps') or [])
+            assigned = cred_plan.get(pid)
+            if assigned and 'cred_subset_env' in caps:
+                indices = assigned
+            else:
+                # Legacy peer — uses its OWN local pool (first N indices
+                # of ours, since builtins are stable-ordered).
+                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
+                n = int(cache_entry.get('cred_count') or 4)
+                indices = all_indices[:n]
+            for idx in indices:
+                if 0 <= idx < len(cred_pool):
+                    cred_holders[idx].append(pid)
+        # Annotate cred_pool entries with holders
+        for i, c in enumerate(cred_pool):
+            c['holders'] = cred_holders.get(i, [])
         return {
             'mode': state.get('mode', 'auto'),
             'active_peer': state.get('active_peer'),
@@ -1451,7 +1502,12 @@ class PeerDirector:
         return caps
 
     def _refresh_peer_caps(self, peer: dict) -> set[str]:
-        """Fetch /api/v1/info from a peer and cache its capabilities."""
+        """Fetch /api/v1/info from a peer and cache its capabilities.
+
+        Also opportunistically probes /api/v1/credentials to learn how
+        many creds the peer's local pool has (used to scope holder
+        annotations for legacy peers that use the full local pool).
+        """
         url = peer.get('url')
         pid = peer['id']
         cache = self.state.setdefault('_peer_caps', {})
@@ -1464,6 +1520,7 @@ class PeerDirector:
                 import copernicus as _cop  # noqa: F401
                 caps = {'cred_subset_env', 'lat_strip_filter',
                         'cred_api_v1', 'parallel_frontiers'}
+                cred_count = len(_cop.list_credentials())
             else:
                 r = requests.get(url.rstrip('/') + '/api/v1/info',
                                  timeout=PEER_TIMEOUT_PROBE,
@@ -1472,10 +1529,21 @@ class PeerDirector:
                     return set(entry.get('caps') or [])
                 d = r.json()
                 caps = set(d.get('capabilities') or [])
+                cred_count = entry.get('cred_count') or 4
+                # Probe /api/v1/credentials (works on both upgraded and
+                # legacy peers that expose it). 4 is the legacy default.
+                try:
+                    cr = requests.get(url.rstrip('/') + '/api/v1/credentials',
+                                      timeout=PEER_TIMEOUT_PROBE)
+                    if cr.ok:
+                        cred_count = len((cr.json() or {}).get('credentials') or [])
+                except Exception:
+                    pass
         except Exception as e:
             log.debug('cap probe %s failed: %s', pid, e)
             return set(entry.get('caps') or [])
-        cache[pid] = {'caps': sorted(caps), 'at': time.time()}
+        cache[pid] = {'caps': sorted(caps), 'at': time.time(),
+                      'cred_count': cred_count}
         return caps
 
     def _max_parallel_frontiers(self, cfg: dict) -> int:

@@ -2954,20 +2954,40 @@ function renderCredentials(creds) {
   }
   let html = '<table style="width:100%;border-collapse:collapse;font-size:11px">' +
     '<thead><tr style="color:var(--dim);text-align:left;border-bottom:1px solid var(--border)">' +
-    '<th>#</th><th>client_id</th><th>source</th><th>status</th><th>label</th><th></th></tr></thead><tbody>';
+    '<th>#</th><th>client_id</th><th>source</th><th>status</th><th>held by</th><th>label</th><th></th></tr></thead><tbody>';
   for (const c of creds) {
     const exhausted = !!c.exhausted;
     const st = (c.last_status || 'unchecked').toLowerCase();
-    const stColor = exhausted || st==='exhausted' ? 'var(--red)' :
-                    st==='valid' ? 'var(--green)' :
-                    st==='invalid' ? 'var(--red)' :
-                    st==='error' ? 'var(--yellow)' :
-                    'var(--dim)';
+    // Status cell: combine exhausted + last_status into one badge
+    let stLabel = st;
+    let stColor;
+    if (exhausted) {
+      stLabel = 'exhausted';
+      stColor = 'var(--red)';
+    } else if (st === 'valid') {
+      stColor = 'var(--green)';
+    } else if (st === 'invalid' || st === 'exhausted') {
+      stColor = 'var(--red)';
+    } else if (st === 'error') {
+      stColor = 'var(--yellow)';
+    } else {
+      stColor = 'var(--dim)';
+    }
+    const stIcon = exhausted ? '🚫 ' : (st === 'valid' ? '✓ ' : '');
+    // Holders: peer id(s) currently using this credential
+    const holders = c.holders || [];
+    let holdersHtml;
+    if (holders.length === 0) {
+      holdersHtml = '<span style="color:var(--dim)">—</span>';
+    } else {
+      holdersHtml = holders.map(h => '<span style="font-family:monospace;color:var(--green);background:rgba(80,200,120,0.12);padding:0 4px;border-radius:3px" title="Currently held by ' + esc(h) + '">' + esc(h) + '</span>').join(' ');
+    }
     html += '<tr style="border-bottom:1px solid var(--border)">' +
       '<td style="color:var(--dim)">' + (c.index+1) + '</td>' +
       '<td style="font-family:monospace;color:var(--text)" title="' + esc(c.client_id||'') + '">' + esc((c.client_id_short || c.client_id || '').slice(0,18)) + '</td>' +
       '<td style="color:var(--dim)">' + esc(c.source||'') + '</td>' +
-      '<td style="color:' + stColor + '">' + esc(st) + (exhausted ? ' (🚫)' : '') + '</td>' +
+      '<td style="color:' + stColor + '">' + stIcon + esc(stLabel) + '</td>' +
+      '<td>' + holdersHtml + '</td>' +
       '<td style="color:var(--dim)">' + esc(c.label||'') + '</td>' +
       '<td style="text-align:right">' +
         (c.source==='builtin' ? '' :

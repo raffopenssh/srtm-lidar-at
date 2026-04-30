@@ -340,6 +340,32 @@
     .zen-url-full { display: none; }
     .zen-url-icon { display: inline; }
   }
+/* Peer action overflow menu */
+.pmenu-wrap { position: relative; display: inline-block; }
+.pmenu-btn {
+  font-family: inherit; font-size: 13px; line-height: 16px;
+  padding: 0 6px; border: 1px solid var(--border); border-radius: 3px;
+  background: transparent; color: var(--dim); cursor: pointer;
+  letter-spacing: 1px;
+}
+.pmenu-btn:hover { color: var(--fg); border-color: var(--dim); }
+.pmenu-pop {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 100;
+  min-width: 170px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 5px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  padding: 3px 0; display: none;
+}
+.pmenu-pop.open { display: block; }
+.pmenu-item {
+  display: block; width: 100%; text-align: left; background: transparent;
+  border: 0; color: var(--fg); padding: 5px 10px; font-size: 11px;
+  font-family: inherit; cursor: pointer; white-space: nowrap;
+}
+.pmenu-item:hover { background: var(--border); }
+.pmenu-item.danger { color: var(--red); }
+.pmenu-item.warn { color: var(--yellow); }
+.pmenu-sep { height: 1px; background: var(--border); margin: 3px 0; }
+.pmenu-empty { padding: 5px 10px; font-size: 11px; color: var(--dim); }
 </style>
 </head>
 <body>
@@ -433,12 +459,7 @@
     <span id="kgPeerTag" title="" style="display:none;font-size:10px;font-family:monospace;padding:1px 6px;border:1px solid var(--border);border-radius:10px;color:var(--dim);white-space:nowrap;cursor:help;flex-shrink:0"></span>
     <span class="kg-title" id="kgTitle" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
     <span class="kg-sub" id="kgTimer" style="flex-shrink:0"></span>
-    <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
-      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
-    >postpone</button>
-    <button id="btnCooldown" onclick="cooldownPeer()" title="Stop this peer and skip it for 24h"
-      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
-    >24h cooldown</button>
+    <span id="kgPeerActions" style="flex-shrink:0"></span>
   </div>
   <div id="kgPeerNav" style="display:none;align-items:center;justify-content:center;gap:10px;font-size:11px;color:#8b949e;user-select:none;margin-top:4px">
     <button type="button" onclick="_navKgPeer(-1)" title="Previous peer (← / swipe right)"
@@ -1296,12 +1317,25 @@ function updateKgCard(d, peerMeta) {
   }
 
   document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
-  // Postpone + 24h cooldown apply to whichever peer's card is on screen.
-  // Buttons proxy to the peer via peer_id; show whenever the peer is running.
-  const _peerRunning = (d.state === 'running' || d.state === 'processing');
-  document.getElementById('btnPostpone').style.display = _peerRunning ? '' : 'none';
-  document.getElementById('btnCooldown').style.display =
-    (_peerRunning && peerMeta && peerMeta.id && peerMeta.url !== null) ? '' : 'none';
+  // Unified action menu for whichever peer's card is on screen.
+  const _kgActions = document.getElementById('kgPeerActions');
+  if (peerMeta && peerMeta.id) {
+    // Pull director-side fields (reserved_kg, scheduled, enabled) when
+    // available so the menu can show Release / Clear cooldown items.
+    const dpeer = ((_directorData && _directorData.peers) || []).find(x => x.id === peerMeta.id) || {};
+    const merged = Object.assign({
+      enabled: true, online: true,
+    }, dpeer, peerMeta, {
+      processor_state: d.state || dpeer.processor_state || 'running',
+      online: true,
+      reserved_kg: dpeer.reserved_kg,
+      scheduled: !!dpeer.scheduled,
+    });
+    _kgActions.innerHTML = peerActionsMenu(merged,
+      {isActive: !!peerMeta.is_active, hideRemove: true});
+  } else {
+    _kgActions.innerHTML = '';
+  }
 
   // Tile progress bar
   const ct = kg.current_tile || 0;
@@ -1566,6 +1600,117 @@ async function sendCmd(action) {
 function _currentPeerCardMeta() {
   if (_peerCards && _peerCards.length && _peerCards[_peerCardIdx]) return _peerCards[_peerCardIdx];
   return null;
+}
+
+// ── Per-peer overflow menu ──────────────────────────────────────
+// Renders a ⋯ button + popover with all per-peer actions. Pass a
+// peer-status-shaped object (id, url, processor_state, online, enabled,
+// scheduled, reserved_kg, cache_only_run, current_kg) plus optional
+// flags (isActive, hideRemove).
+function peerActionsMenu(p, opts) {
+  opts = opts || {};
+  const id = p.id || '';
+  const idJ = JSON.stringify(id);
+  const isPrimary = (p.url == null);
+  const isRunning = !!(p.online && (p.processor_state === 'running' || p.processor_state === 'processing'));
+  const isPaused = !!(p.online && p.processor_state === 'paused');
+  const isStopped = !!(p.online && (p.processor_state === 'stopped' || p.processor_state === 'idle'));
+  const isScheduled = !!p.scheduled;
+  const hasReserved = !!p.reserved_kg;
+  const isActive = !!opts.isActive;
+  const items = [];
+
+  if (!isActive && p.enabled && p.online && !isScheduled) {
+    items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => activatePeer(${idJ}))">▶ Activate</button>`);
+  }
+  if (isRunning) {
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => peerCmd(${idJ}, 'pause'))">‖ Pause</button>`);
+  } else if (isPaused) {
+    items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => peerCmd(${idJ}, 'resume'))">▶ Resume</button>`);
+  }
+  if (isRunning || isPaused) {
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => postponeKGFor(${idJ}))">⏭ Postpone KG</button>`);
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => peerCmd(${idJ}, 'stop'))">■ Stop</button>`);
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => restartPeer(${idJ}))">⟳ Restart</button>`);
+  }
+  if (!isPrimary && (isRunning || isPaused || isStopped)) {
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => cooldownPeerById(${idJ}, 24))">⏳ 24h cooldown</button>`);
+  }
+  if (isScheduled) {
+    items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => cooldownPeerById(${idJ}, 0))">✕ Clear cooldown</button>`);
+  }
+  if (hasReserved) {
+    items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => releaseHold(${idJ}))">⤓ Release hold (KG ${esc(p.reserved_kg)})</button>`);
+  }
+  if (!opts.hideRemove && !isPrimary && p.url != null) {
+    if (items.length) items.push('<div class="pmenu-sep"></div>');
+    items.push(`<button class="pmenu-item danger" onclick="_pmenuRun(this, () => deletePeer(${idJ}))">✕ Remove peer</button>`);
+  }
+  if (!items.length) items.push('<div class="pmenu-empty">No actions</div>');
+  return `<span class="pmenu-wrap"><button class="pmenu-btn" title="Actions" onclick="_pmenuToggle(event, this)">⋯</button>` +
+         `<div class="pmenu-pop">${items.join('')}</div></span>`;
+}
+
+function _pmenuToggle(ev, btn) {
+  ev.stopPropagation();
+  const pop = btn.nextElementSibling;
+  const wasOpen = pop.classList.contains('open');
+  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
+  if (!wasOpen) pop.classList.add('open');
+}
+function _pmenuRun(btn, fn) {
+  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
+  try { fn(); } catch(e) { console.error(e); }
+}
+document.addEventListener('click', () => {
+  document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
+});
+
+async function peerCmd(peerId, action) {
+  // Send pause/resume/stop to a specific peer (proxies via primary if remote).
+  try {
+    const meta = (_peerCards||[]).find(p => p.id === peerId);
+    let url = '/api/v1/processing/' + action;
+    if (meta && meta.url) {
+      // Remote peer: proxy directly to peer
+      url = meta.url.replace(/\/$/, '') + '/api/v1/processing/' + action;
+    }
+    const r = await fetch(url, {method: 'POST'});
+    if (!r.ok) alert(action + ' failed: ' + await r.text());
+    setTimeout(() => { poll(); fetchDirectorStatus(); fetchAllPeerStatuses(); }, 600);
+  } catch(e) { console.error(action, e); }
+}
+async function postponeKGFor(peerId) {
+  if (!confirm('Postpone current KG on ' + peerId + '? It will be re-queued 5 KGs later.')) return;
+  try {
+    const r = await fetch('/api/v1/processing/postpone?peer_id=' + encodeURIComponent(peerId), {method:'POST'});
+    if (!r.ok) { alert('Postpone failed: ' + await r.text()); return; }
+    setTimeout(() => { poll(); fetchPrioQueue(); fetchAllPeerStatuses(); }, 1500);
+  } catch(e) { console.error(e); }
+}
+async function cooldownPeerById(peerId, hours) {
+  if (hours > 0) {
+    if (!confirm('Stop ' + peerId + ' and skip it for ' + hours + 'h?\n(Any held KG will be released.)')) return;
+  } else {
+    if (!confirm('Clear cooldown on ' + peerId + '?')) return;
+  }
+  try {
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId) + '/cooldown',
+      {method:'POST', headers: {'Content-Type':'application/json'},
+       body: JSON.stringify({hours: hours})});
+    if (!r.ok) { alert('Cooldown failed: ' + await r.text()); return; }
+    setTimeout(() => { poll(); fetchDirectorStatus(); fetchAllPeerStatuses(); }, 1500);
+  } catch(e) { console.error(e); }
+}
+async function releaseHold(peerId) {
+  if (!confirm('Release reserved KG on ' + peerId + '?\nThis also clears any pending cooldown so the KG is freed for any peer.')) return;
+  try {
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId) + '/release_hold',
+      {method:'POST', headers: {'Content-Type':'application/json'},
+       body: JSON.stringify({clear_cooldown: true})});
+    if (!r.ok) { alert('Release failed: ' + await r.text()); return; }
+    setTimeout(() => { poll(); fetchDirectorStatus(); fetchAllPeerStatuses(); }, 1500);
+  } catch(e) { console.error(e); }
 }
 async function postponeKG() {
   const meta = _currentPeerCardMeta();
@@ -3133,13 +3278,7 @@ function renderDirector(d) {
       else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + badge + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
-      if (p.online && p.processor_state === 'running') {
-        html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px;color:var(--yellow)" onclick="restartPeer(\'' + esc(p.id) + '\')" title="Force-restart processor (kills stuck subprocesses)">⟳ Restart</button>';
-      }
-      if (!isActive && p.enabled && p.online && !isScheduled) {
-        html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="activatePeer(\'' + esc(p.id) + '\')">Activate</button>';
-      }
-      if (p.url !== null) html += '<span style="font-size:11px;color:var(--dim);cursor:pointer;opacity:0.5;transition:opacity 0.15s" onmouseover="this.style.opacity=1;this.style.color=\'var(--red)\'" onmouseout="this.style.opacity=0.5;this.style.color=\'var(--dim)\'" onclick="deletePeer(\'' + esc(p.id) + '\')" title="Remove peer">✕</span>';
+      html += peerActionsMenu(p, {isActive: isActive});
       html += '</span>';
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
@@ -3158,9 +3297,7 @@ function renderDirector(d) {
       // Show inside hidden detail
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + '</span>';
-      if (!isActive && p.enabled && p.online && !isScheduled) {
-        html += '<button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="activatePeer(\'' + esc(p.id) + '\')">Activate</button>';
-      }
+      html += peerActionsMenu(p, {isActive: isActive});
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');

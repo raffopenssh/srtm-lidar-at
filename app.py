@@ -3539,6 +3539,8 @@ def director_cooldown_peer(peer_id):
     else:
         nb_iso = (_dt.now(_tz.utc) + _td(hours=hours)).isoformat()
         peer['not_before'] = nb_iso
+    # Cooldown always releases any KG hold so the substitute can pick it up.
+    released_kg = peer.pop('reserved_kg', None)
     pd.save_peers_config(cfg)
     # Stop the peer's processor so the cooldown takes immediate effect.
     stopped = False
@@ -3551,7 +3553,37 @@ def director_cooldown_peer(peer_id):
     d = pd.get_director()
     d.reload_config()
     return jsonify({'status': 'ok', 'peer_id': peer_id,
-                    'not_before': nb_iso, 'stopped': stopped, 'hours': hours})
+                    'not_before': nb_iso, 'stopped': stopped, 'hours': hours,
+                    'released_kg': released_kg})
+
+
+@app.route('/api/v1/director/peers/<peer_id>/release_hold', methods=['POST'])
+def director_release_hold(peer_id):
+    """Release a peer's reserved KG hold.
+
+    Peers acquire a ``reserved_kg`` when they cool down mid-KG so the
+    substitute does not steal it. This endpoint clears that reservation
+    and (optionally) the associated ``not_before`` cooldown so the KG
+    re-enters the normal queue.
+
+    Body JSON: {"clear_cooldown": true}
+    """
+    body = request.get_json(silent=True) or {}
+    clear_cd = bool(body.get('clear_cooldown', True))
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return jsonify({'error': f'Peer {peer_id} not found'}), 404
+    released_kg = peer.pop('reserved_kg', None)
+    cleared = False
+    if clear_cd and peer.get('not_before'):
+        peer.pop('not_before', None)
+        cleared = True
+    pd.save_peers_config(cfg)
+    pd.get_director().reload_config()
+    return jsonify({'status': 'ok', 'peer_id': peer_id,
+                    'released_kg': released_kg,
+                    'cooldown_cleared': cleared})
 
 
 @app.route('/api/v1/director/peers/<peer_id>/pin', methods=['POST'])

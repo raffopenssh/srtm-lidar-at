@@ -878,12 +878,19 @@ class PeerDirector:
         cred_plan = state.get('frontier_cred_plan') or {}
         strip_plan = state.get('frontier_strip_plan') or {}
         cached_strips = self._cached_lat_ranges() if hasattr(self, '_cached_lat_ranges') else []
-        # Annotate peer rows with their assignments.
+        # Annotate peer rows with their assignments — but only when
+        # the peer is actually doing frontier work. A stale frontier_cred_plan
+        # for a peer currently running cache-only would otherwise mislead
+        # the dashboard into thinking those creds are locked.
         for row in peers_status:
             pid = row['id']
-            if pid in cred_plan:
+            proc_st = row.get('processor_state')
+            cache_only_run = bool(row.get('cache_only_run'))
+            is_running = proc_st in ('running', 'processing')
+            holds_creds = is_running and not cache_only_run
+            if holds_creds and pid in cred_plan:
                 row['cred_indices'] = cred_plan[pid]
-            if pid in strip_plan:
+            if holds_creds and pid in strip_plan:
                 row['lat_strips'] = strip_plan[pid]
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])

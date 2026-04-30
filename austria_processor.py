@@ -7759,14 +7759,23 @@ def main():
             log.warning("Bad KG_LAT_STRIP_FILTER=%r: %s", _strip_raw, e)
             _strips = []
         if _strips:
+            # Assign each KG to exactly one strip via its bbox centroid
+            # latitude. Using full bbox containment would exclude KGs
+            # that straddle a 0.5° boundary (~6% of Austria) from every
+            # peer. Centroid ownership is unambiguous: every KG goes to
+            # exactly one strip's owner, and that peer fetches a few
+            # overlap tiles from the neighbouring strip's cache. Zenodo
+            # strip ZIPs are independent and writes are serialised by
+            # the upload mutex, so this is safe.
             def _kg_in_strips(kg):
                 bb = kg.get("bbox") or {}
                 s = bb.get("min_lat")
                 n = bb.get("max_lat")
                 if s is None or n is None:
                     return False
+                mid = 0.5 * (s + n)
                 for ls, ln in _strips:
-                    if s >= ls - 1e-9 and n <= ln + 1e-9:
+                    if ls - 1e-9 <= mid < ln - 1e-9:
                         return True
                 return False
             before = len(pending)

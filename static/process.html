@@ -350,7 +350,7 @@
 }
 .pmenu-btn:hover { color: var(--fg); border-color: var(--dim); }
 .pmenu-pop {
-  position: absolute; right: 0; top: calc(100% + 4px); z-index: 100;
+  position: fixed; z-index: 9999;
   min-width: 170px; background: var(--bg); border: 1px solid var(--border);
   border-radius: 5px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
   padding: 3px 0; display: none;
@@ -1661,7 +1661,23 @@ function _pmenuToggle(ev, btn) {
   const pop = btn.nextElementSibling;
   const wasOpen = pop.classList.contains('open');
   document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));
-  if (!wasOpen) pop.classList.add('open');
+  if (!wasOpen) {
+    // Position relative to the button (fixed-positioned, so use viewport coords)
+    const r = btn.getBoundingClientRect();
+    pop.classList.add('open');
+    // Default: drop down, right-align with the button
+    const popW = pop.offsetWidth || 170;
+    const popH = pop.offsetHeight || 0;
+    let left = r.right - popW;
+    if (left < 4) left = 4;
+    let top = r.bottom + 4;
+    // Flip up if it would overflow the viewport bottom
+    if (top + popH > window.innerHeight - 4 && r.top - 4 - popH > 4) {
+      top = r.top - 4 - popH;
+    }
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+  }
 }
 function _pmenuRun(btn, fn) {
   document.querySelectorAll('.pmenu-pop.open').forEach(el => el.classList.remove('open'));

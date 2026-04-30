@@ -1926,14 +1926,16 @@ class PeerDirector:
             caps = self._refresh_peer_caps(p)
             if 'cred_subset_env' not in caps:
                 continue  # graceful upgrade gate
-            is_running_frontier = (
-                ps.get('state') in ('running', 'processing')
-                and not ps.get('cache_only')
-            )
-            if is_running_frontier:
+            is_running = ps.get('state') in ('running', 'processing')
+            is_cache_only_run = bool(ps.get('cache_only'))
+            if is_running and not is_cache_only_run:
                 running.append(pid)
             else:
-                candidates.append({'peer': p, 'state': ps.get('state', 'unknown')})
+                candidates.append({
+                    'peer': p,
+                    'state': ps.get('state', 'unknown'),
+                    'needs_stop_cache_only': is_running and is_cache_only_run,
+                })
 
         # Slot budget = max_par - 1 (subtract primary). Also keep reserve.
         slack = max(0, total_enabled - (1 if active_id else 0)
@@ -1959,6 +1961,7 @@ class PeerDirector:
         # Start new candidates with their plan.
         to_start_ids = [pid for pid in ordered
                         if pid != active_id and pid not in running]
+        cand_by_id = {c['peer']['id']: c for c in candidates}
         started = []
         for pid in to_start_ids:
             peer = get_peer_by_id(cfg, pid)
@@ -1968,6 +1971,19 @@ class PeerDirector:
             strips_for = strip_plan.get(pid)
             if not creds:
                 continue
+            cand = cand_by_id.get(pid) or {}
+            # If the peer is currently running cache-only, stop it first so
+            # we can re-start it as a frontier with the assigned creds /
+            # lat-strip env. Otherwise the start API returns 409 and the
+            # peer keeps doing cache-only work, leaving creds idle.
+            if cand.get('needs_stop_cache_only'):
+                log.info('Parallel frontier: stopping cache-only run on %s '
+                         'before promoting to frontier', pid)
+                try:
+                    stop_peer_processor(peer.get('url'), graceful=True)
+                except Exception as e:
+                    log.warning('Stop cache-only on %s failed: %s', pid, e)
+                    continue
             log.info('Parallel frontier: starting %s with creds=%s strips=%s',
                      pid, creds, strips_for)
             try:

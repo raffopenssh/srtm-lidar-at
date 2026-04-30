@@ -911,7 +911,9 @@ class PeerDirector:
         for row in peers_status:
             pid = row['id']
             proc_st = row.get('processor_state')
-            if proc_st not in ('running', 'processing'):
+            # Treat any non-terminal state as 'holding' — e.g. paused_zenodo
+            # peers are mid-KG awaiting the upload lock and still own creds.
+            if proc_st in ('stopped', 'unreachable', 'unknown', 'failed', None):
                 continue
             if row.get('cache_only_run'):
                 continue

@@ -1708,25 +1708,50 @@ class PeerDirector:
         cap_strips = len(self._austria_lat_strips())
         return max(1, min(cap_creds, cap_strips))
 
-    def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict) -> dict:
+    def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
+                              prior: dict | None = None) -> dict:
         """Distribute valid credential indices across frontier peers.
 
         Each peer gets a disjoint slice of length ``min_creds_per_frontier``
         (1 active + (per-1) hot-standby spares for in-peer rotation).
         Returns {peer_id: [cred_idx, ...]}.
+
+        ``prior`` is the previous plan ({peer_id: [idx,...]}). When
+        provided, peers in ``prior`` keep their slice if it is still
+        valid (all indices still in the valid pool, length == per, no
+        overlap with another peer's slice). New peers get fresh slices
+        from whatever credentials remain. This avoids restarts caused
+        by membership churn re-sorting the assignment.
         """
         valid = sorted(self._valid_credentials())
         per = max(1, int(cfg.get('min_creds_per_frontier',
                                   self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
-        out = {}
+        out: dict[str, list[int]] = {}
         if not valid or not frontier_ids:
             return out
-        peers_sorted = sorted(frontier_ids)
-        for i, pid in enumerate(peers_sorted):
-            slice_ = valid[i * per:(i + 1) * per]
+        valid_set = set(valid)
+        used: set[int] = set()
+        prior = prior or {}
+        # Keep existing assignments where possible.
+        for pid in frontier_ids:
+            slice_ = prior.get(pid)
             if not slice_:
+                continue
+            slice_ = sorted(int(i) for i in slice_)
+            if (len(slice_) == per
+                    and all(i in valid_set for i in slice_)
+                    and not (set(slice_) & used)):
+                out[pid] = slice_
+                used.update(slice_)
+        # Assign fresh slices from leftover creds for newcomers, sorted
+        # by id for determinism.
+        leftovers = [i for i in valid if i not in used]
+        for pid in sorted(p for p in frontier_ids if p not in out):
+            slice_ = leftovers[:per]
+            if len(slice_) < per:
                 break
             out[pid] = slice_
+            leftovers = leftovers[per:]
         return out
 
     def _austria_lat_strips(self) -> list[tuple[float, float]]:
@@ -2139,7 +2164,13 @@ class PeerDirector:
         if max_add > 0:
             ordered += sorted(c['peer']['id'] for c in candidates[:max_add])
         ordered = ordered[:max_par]  # cap to credential capacity
-        cred_plan = self._assign_cred_indices(ordered, cfg)
+        # Preserve existing peer→creds mapping where valid; only newly
+        # promoted peers get fresh slices. Without this, a peer entering
+        # or leaving the running set would shuffle every other peer's
+        # cred slice, triggering plan-drift restart loops.
+        prior_cred_plan = state_copy.get('frontier_cred_plan') or {}
+        cred_plan = self._assign_cred_indices(
+            ordered, cfg, prior=prior_cred_plan)
 
         # Lat strips: distribute ALL Austria strips contiguously across
         # the frontier peers. With 7 strips and 3 frontiers each peer
@@ -2155,18 +2186,40 @@ class PeerDirector:
         strip_plan: dict[str, list] = {}
         n_peers = len(ordered)
         n_strips = len(strips)
+        prior_strip_plan = state_copy.get('frontier_strip_plan') or {}
         if n_peers > 0 and n_strips > 0:
-            base = n_strips // n_peers
-            extra = n_strips % n_peers  # first `extra` peers get one more strip
-            offset = 0
-            for i, pid in enumerate(ordered):
-                size = base + (1 if i < extra else 0)
-                if size <= 0:
-                    strip_plan[pid] = []
-                    continue
-                slice_ = strips[offset:offset + size]
-                strip_plan[pid] = [[s, n] for s, n in slice_]
-                offset += size
+            # Preserve existing peer→strip assignments where the prior
+            # slice still fits within the canonical strip set; only fill
+            # gaps for new peers from whatever strips remain. Without
+            # this, churn in `ordered` re-shuffles every peer's strip
+            # range each tick, triggering plan-drift restarts.
+            strip_set = {tuple(s) for s in strips}
+            used: set[tuple[float, float]] = set()
+            for pid in ordered:
+                old = prior_strip_plan.get(pid) or []
+                old_t = [tuple(s) for s in old]
+                if old and all(s in strip_set and s not in used
+                               for s in old_t):
+                    strip_plan[pid] = [list(s) for s in old_t]
+                    used.update(old_t)
+            leftover = [s for s in strips if tuple(s) not in used]
+            unassigned = [pid for pid in ordered if pid not in strip_plan]
+            if unassigned and leftover:
+                base = len(leftover) // len(unassigned)
+                extra = len(leftover) % len(unassigned)
+                # Tail-extra: existing peers may already hold extra
+                # strips, so give the bonus to new peers in id order.
+                offset = 0
+                for i, pid in enumerate(unassigned):
+                    size = base + (1 if i < extra else 0)
+                    if size <= 0:
+                        strip_plan[pid] = []
+                        continue
+                    slice_ = leftover[offset:offset + size]
+                    strip_plan[pid] = [[s, n] for s, n in slice_]
+                    offset += size
+            for pid in ordered:
+                strip_plan.setdefault(pid, [])
         else:
             for pid in ordered:
                 strip_plan[pid] = []
@@ -2257,10 +2310,18 @@ class PeerDirector:
                 # Brief settle so the peer's processor_state flips to
                 # stopped before we POST /start (avoid 409 race).
                 import time as _t; _t.sleep(2)
-            log.info('Parallel frontier: starting %s with creds=%s strips=%s',
-                     pid, creds, strips_for)
+            # Exclude KGs reserved for OTHER peers from this peer's
+            # priority queue, so we don't double-process a reservation
+            # holder's KG on a parallel frontier that happens to share
+            # the same lat strip.
+            par_excl = _reserved_kgs(cfg, exclude_peer_id=pid)
+            log.info('Parallel frontier: starting %s with creds=%s strips=%s%s',
+                     pid, creds, strips_for,
+                     (' (excluding ' + ','.join(sorted(par_excl)) + ')')
+                     if par_excl else '')
             try:
                 start_peer_processor(peer.get('url'),
+                                     exclude_kgs=par_excl,
                                      cred_indices=creds,
                                      lat_strips=strips_for)
                 started.append(pid)

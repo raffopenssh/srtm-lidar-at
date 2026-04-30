@@ -877,20 +877,12 @@ class PeerDirector:
             valid_creds = []
         per = max(1, int(cfg.get('min_creds_per_frontier',
                                   self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
-        # Account for legacy active peer locking its full local pool.
         active_id_now = state.get('active_peer')
-        peer_caps_cache = state.get('_peer_caps') or {}
-        active_caps_now = set((peer_caps_cache.get(active_id_now) or {}).get('caps') or [])
-        reserved_by_active_now: set[int] = set()
-        if active_id_now and 'cred_subset_env' not in active_caps_now:
-            n_local = int((peer_caps_cache.get(active_id_now) or {}).get('cred_count') or 4)
-            reserved_by_active_now = set(i for i in valid_creds if i < n_local)
-        available_creds = [i for i in valid_creds if i not in reserved_by_active_now]
-        max_par_extra = (len(available_creds) // per) if available_creds else 0
-        max_par = (1 if active_id_now else 0) + max_par_extra
+        max_par = self._max_parallel_frontiers(cfg)
         cred_plan = state.get('frontier_cred_plan') or {}
         strip_plan = state.get('frontier_strip_plan') or {}
         cached_strips = self._cached_lat_ranges() if hasattr(self, '_cached_lat_ranges') else []
+        austria_strips = self._austria_lat_strips()
         # Annotate peer rows with their assignments — but only when
         # the peer is actually doing frontier work. A stale frontier_cred_plan
         # for a peer currently running cache-only would otherwise mislead
@@ -902,17 +894,9 @@ class PeerDirector:
             is_running = proc_st in ('running', 'processing')
             holds_creds = is_running and not cache_only_run
             if holds_creds:
-                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
-                caps_for_pid = set(cache_entry.get('caps') or [])
-                if pid in cred_plan and 'cred_subset_env' in caps_for_pid:
+                if pid in cred_plan:
                     row['cred_indices'] = cred_plan[pid]
-                elif row['id'] == state.get('active_peer') or pid in (state.get('parallel_frontiers_active') or []):
-                    # Legacy peer running frontier work — uses its full
-                    # local pool. Show the indices it actually holds so the
-                    # dashboard matches the holders column.
-                    n = int(cache_entry.get('cred_count') or 4)
-                    row['cred_indices'] = list(range(n))
-                if pid in strip_plan and 'lat_strip_filter' in caps_for_pid:
+                if pid in strip_plan:
                     row['lat_strips'] = strip_plan[pid]
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
@@ -928,45 +912,19 @@ class PeerDirector:
 
         # --- Credential holders: which peer currently holds each cred ---
         # A peer 'holds' a credential if it's running frontier work using it.
-        # * Cache-only peers hold no credentials (no Copernicus calls).
-        # * Frontier peers with cred_subset_env capability hold only the
-        #   cred indices assigned in cred_plan.
-        # * Frontier peers WITHOUT cred_subset_env (legacy/un-upgraded)
-        #   fall back to using the full pool — they hold ALL cred indices.
+        # All peers expose cred_subset_env now — they only hold the cred
+        # indices in cred_plan. Cache-only peers hold no credentials.
         cred_holders: dict[int, list[str]] = {i: [] for i in range(len(cred_pool))}
-        active_id = state.get('active_peer')
-        parallel_active = set(state.get('parallel_frontiers_active') or [])
-        all_indices = list(range(len(cred_pool)))
         for row in peers_status:
             pid = row['id']
             proc_st = row.get('processor_state')
             # Only actively-running peers hold credentials. Paused peers
-            # (paused_zenodo, paused_copernicus, etc.) release their creds
-            # so other peers can use them — the director re-assigns when
-            # the paused peer resumes (next start_peer_processor call).
+            # release their creds so other peers can use them.
             if proc_st not in ('running', 'processing'):
                 continue
             if row.get('cache_only_run'):
                 continue
-            is_frontier = (pid == active_id) or (pid in parallel_active)
-            if not is_frontier:
-                # Other running peer (frontier) — be conservative: assume
-                # legacy holding full pool unless proven otherwise.
-                pass
-            peer_cfg = next((p for p in cfg.get('peers', []) if p['id'] == pid), None)
-            caps = set()
-            if peer_cfg is not None:
-                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
-                caps = set(cache_entry.get('caps') or [])
-            assigned = cred_plan.get(pid)
-            if assigned and 'cred_subset_env' in caps:
-                indices = assigned
-            else:
-                # Legacy peer — uses its OWN local pool (first N indices
-                # of ours, since builtins are stable-ordered).
-                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
-                n = int(cache_entry.get('cred_count') or 4)
-                indices = all_indices[:n]
+            indices = cred_plan.get(pid) or []
             for idx in indices:
                 if 0 <= idx < len(cred_pool):
                     cred_holders[idx].append(pid)
@@ -989,6 +947,7 @@ class PeerDirector:
             'min_creds_per_frontier': per,
             'max_parallel_frontiers': max_par,
             'cached_lat_strips': [[s, n] for s, n in cached_strips],
+            'austria_lat_strips': [[s, n] for s, n in austria_strips],
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
@@ -1439,23 +1398,40 @@ class PeerDirector:
                     # Exclude KGs reserved for other cooled-down peers,
                     # so a substitute does useful work on a different KG.
                     excl = _reserved_kgs(cfg, exclude_peer_id=new_peer)
-                    # Build credential plan: primary peer gets the first
-                    # min_creds_per_frontier valid creds; remaining go to
-                    # parallel-frontier peers (orchestrated separately).
+                    # Build credential + lat-strip plan. The active peer
+                    # always gets the FIRST slice of creds and the FIRST
+                    # Austria-wide lat strip; parallel-frontier peers
+                    # (orchestrated separately) get the remaining slices.
+                    self._refresh_peer_caps(peer)
                     plan = self._assign_cred_indices([new_peer], cfg)
                     creds_for_peer = plan.get(new_peer)
-                    # Capability-gated: only set if peer supports it.
-                    caps = self._refresh_peer_caps(peer)
-                    cred_kw = creds_for_peer if 'cred_subset_env' in caps else None
-                    log.info('Activating peer %s%s%s', new_peer,
-                             (' (excluding reserved KGs: ' + ','.join(sorted(excl)) + ')') if excl else '',
-                             (' creds=%s' % creds_for_peer) if cred_kw else '')
-                    result = start_peer_processor(peer.get('url'), exclude_kgs=excl,
-                                                  cred_indices=cred_kw)
+                    strips = self._austria_lat_strips()
+                    strip_for_peer = [list(strips[0])] if strips else None
+                    log.info(
+                        'Activating peer %s%s creds=%s strip=%s',
+                        new_peer,
+                        (' (excluding reserved KGs: ' + ','.join(sorted(excl)) + ')') if excl else '',
+                        creds_for_peer, strip_for_peer,
+                    )
+                    result = start_peer_processor(
+                        peer.get('url'), exclude_kgs=excl,
+                        cred_indices=creds_for_peer,
+                        lat_strips=strip_for_peer,
+                    )
                     log.info('Start result for %s: %s', new_peer, result)
                     with self._lock:
                         self.state['active_peer'] = new_peer
                         self.state['last_switch'] = datetime.now(timezone.utc).isoformat()
+                        # Seed the strip plan so the parallel-frontier
+                        # orchestrator knows the active peer's strip.
+                        sp = dict(self.state.get('frontier_strip_plan') or {})
+                        if strip_for_peer:
+                            sp[new_peer] = strip_for_peer
+                            self.state['frontier_strip_plan'] = sp
+                        cp = dict(self.state.get('frontier_cred_plan') or {})
+                        if creds_for_peer:
+                            cp[new_peer] = list(creds_for_peer)
+                            self.state['frontier_cred_plan'] = cp
                         save_director_state(self.state)
             else:
                 log.info('No peers with sufficient bandwidth available')
@@ -1582,27 +1558,30 @@ class PeerDirector:
     def _max_parallel_frontiers(self, cfg: dict) -> int:
         """How many frontier peers we may run concurrently.
 
-        floor(valid_creds / min_creds_per_frontier). Clamped to 1+.
+        Each frontier holds ``min_creds_per_frontier`` credentials — one
+        active + one (or more) hot-standby spares for in-peer rotation
+        on 402. With per=2 and 8 valid creds, we get 4 frontiers, each
+        with its own pair (1 working + 1 spare).
+
+        Also bounded by the number of 0.5° lat strips covering Austria
+        (so each frontier can take a disjoint strip). With 7 strips this
+        rarely binds.
         """
         valid = self._valid_credentials()
-        per = int(cfg.get('min_creds_per_frontier',
-                          self.MIN_CREDS_PER_FRONTIER_DEFAULT))
-        per = max(1, per)
+        per = max(1, int(cfg.get('min_creds_per_frontier',
+                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
         if not valid:
             return 0
-        return max(1, len(valid) // per)
+        cap_creds = max(1, len(valid) // per)
+        cap_strips = len(self._austria_lat_strips())
+        return max(1, min(cap_creds, cap_strips))
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict) -> dict:
         """Distribute valid credential indices across frontier peers.
 
-        Each peer gets a disjoint slice of length ``min_creds_per_frontier``.
+        Each peer gets a disjoint slice of length ``min_creds_per_frontier``
+        (1 active + (per-1) hot-standby spares for in-peer rotation).
         Returns {peer_id: [cred_idx, ...]}.
-
-        Legacy peers (no ``cred_subset_env`` capability) ignore the env
-        var and use their full LOCAL credential pool. To avoid double-
-        booking creds we reserve range(cred_count_local) exclusively for
-        each legacy peer in the input list and hand the remaining valid
-        creds to peers that respect the env var.
         """
         valid = sorted(self._valid_credentials())
         per = max(1, int(cfg.get('min_creds_per_frontier',
@@ -1610,41 +1589,32 @@ class PeerDirector:
         out = {}
         if not valid or not frontier_ids:
             return out
-
-        peer_caps_cache = self.state.get('_peer_caps') or {}
-
-        def _is_legacy(pid):
-            entry = peer_caps_cache.get(pid) or {}
-            return 'cred_subset_env' not in set(entry.get('caps') or [])
-
-        def _local_pool_size(pid):
-            entry = peer_caps_cache.get(pid) or {}
-            return int(entry.get('cred_count') or 4)
-
-        # Reserve creds locked by legacy peers FIRST.
-        reserved: set[int] = set()
         peers_sorted = sorted(frontier_ids)
-        for pid in peers_sorted:
-            if _is_legacy(pid):
-                # Legacy peer holds first N indices of its local pool.
-                # That maps to indices [0..N-1] in the canonical pool because
-                # builtins are stable-ordered and prepended.
-                n = _local_pool_size(pid)
-                slice_ = list(range(min(n, len(valid))))
-                # Only count actually-valid indices.
-                slice_ = [i for i in slice_ if i in valid]
-                out[pid] = slice_
-                reserved.update(slice_)
-
-        # Remaining valid creds go to upgraded peers, sliced by `per`.
-        remaining = [i for i in valid if i not in reserved]
-        upgraded = [pid for pid in peers_sorted if not _is_legacy(pid)]
-        for i, pid in enumerate(upgraded):
-            slice_ = remaining[i * per:(i + 1) * per]
+        for i, pid in enumerate(peers_sorted):
+            slice_ = valid[i * per:(i + 1) * per]
             if not slice_:
                 break
             out[pid] = slice_
         return out
+
+    def _austria_lat_strips(self) -> list[tuple[float, float]]:
+        """Return the 0.5° lat strips that cover Austria.
+
+        Independent of cache state — these are the canonical strips that
+        the Zenodo cache + tile_cache use, so frontier peers pinned to a
+        strip will never collide on a Zenodo ZIP write.
+        """
+        try:
+            from zenodo_cache import _lat_strips
+            return [tuple(s) for s in _lat_strips()]
+        except Exception:
+            # Fallback: Austria spans 46.0–49.5°N, snapped to 0.5°.
+            strips = []
+            s = 46.0
+            while s < 49.5:
+                strips.append((round(s, 4), round(s + 0.5, 4)))
+                s += 0.5
+            return strips
 
     def _strip_fingerprint(self, lat_south: float, lat_north: float) -> str:
         """Return a cheap fingerprint of the cache manifest for one lat strip.
@@ -1943,33 +1913,19 @@ class PeerDirector:
         per = max(1, int(cfg.get('min_creds_per_frontier',
                                   self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
 
-        # If the active peer is a LEGACY peer (no cred_subset_env), it
-        # locks its full local pool (range(cred_count_local)). Subtract
-        # those from the pool available to parallel frontiers, otherwise
-        # we'd double-book the same credentials.
-        peer_caps_cache = state_copy.get('_peer_caps') or {}
-        active_caps = set((peer_caps_cache.get(active_id) or {}).get('caps') or [])
-        active_legacy = 'cred_subset_env' not in active_caps
-        reserved_by_active: set[int] = set()
-        if active_legacy:
-            n = int((peer_caps_cache.get(active_id) or {}).get('cred_count') or 4)
-            reserved_by_active = set(i for i in valid if i < n)
-        available = [i for i in valid if i not in reserved_by_active]
-        max_par_total = len(valid) // per
-        max_par_extra = len(available) // per  # peers we can ADD beyond active
-        # Total cap accounts for the active peer (1 slot, even if legacy)
-        max_par = (1 if active_id else 0) + max_par_extra
-        if max_par_extra < 1:
-            # No headroom for an additional parallel frontier.
-            with self._lock:
-                self.state['parallel_frontiers_active'] = []
-            return
+        # Cap on total concurrent frontiers (incl. active). With 8 valid
+        # creds and per=2 this is min(3, 7) = 3 — we always reserve `per`
+        # creds as a fleet-wide spare so a 402 can rotate without
+        # colliding with another peer's slice.
+        max_par = self._max_parallel_frontiers(cfg)
 
-        # Get covered lat strips (intersection of all required products)
-        strips = self._cached_lat_ranges()
-        if len(strips) < 2:
-            # Without at least 2 disjoint cache strips, parallel frontiers
-            # would conflict on tile_cache writes. Hold off.
+        # Frontier peers each pin to a disjoint Austria-wide 0.5° lat
+        # strip so they never collide on a Zenodo cache ZIP write — even
+        # when opening regions that aren't yet cached. Cached vs uncached
+        # strips are equivalent here: tile uploads are scoped to one
+        # strip per ZIP.
+        strips = self._austria_lat_strips()
+        if not strips:
             with self._lock:
                 self.state['parallel_frontiers_active'] = []
             return
@@ -2003,9 +1959,9 @@ class PeerDirector:
             ps = get_peer_status(p.get('url'))
             if ps.get('state') == 'unreachable':
                 continue
-            caps = self._refresh_peer_caps(p)
-            if 'cred_subset_env' not in caps:
-                continue  # graceful upgrade gate
+            # Refresh caps opportunistically; all current peers expose
+            # cred_subset_env so we no longer gate on it.
+            self._refresh_peer_caps(p)
             is_running = ps.get('state') in ('running', 'processing')
             is_cache_only_run = bool(ps.get('cache_only'))
             if is_running and not is_cache_only_run:
@@ -2017,52 +1973,87 @@ class PeerDirector:
                     'needs_stop_cache_only': is_running and is_cache_only_run,
                 })
 
-        # If the active peer is legacy and reserves creds that overlap
-        # with an already-running parallel frontier's stale plan, stop
-        # the parallel frontier so the next tick re-issues a non-
-        # conflicting plan. Without this, at2 keeps using [0,1] (env
-        # set at startup) while legacy at5 also uses [0,1] from its
-        # full local pool — same creds in flight on two peers.
-        old_plan = state_copy.get('frontier_cred_plan') or {}
-        for pid in list(running):
-            old_slice = set(old_plan.get(pid) or [])
-            if old_slice & reserved_by_active:
-                log.warning('Parallel frontier %s plan %s overlaps creds '
-                            'reserved by legacy active %s — stopping for '
-                            're-assignment', pid, sorted(old_slice), active_id)
-                peer = get_peer_by_id(cfg, pid)
-                if peer:
-                    try:
-                        stop_peer_processor(peer.get('url'), graceful=True)
-                    except Exception as e:
-                        log.warning('Stop %s failed: %s', pid, e)
-                running.remove(pid)
-
-        # Slot budget = max_par - 1 (subtract primary). Also keep reserve.
+        # Slot budget = max_par - 1 (subtract active). Also keep reserve.
         slack = max(0, total_enabled - (1 if active_id else 0)
                     - len(running) - min_reserve)
         max_add = min(slack, max_par - 1 - len(running))
-        if max_add <= 0 and not running:
-            with self._lock:
-                self.state['parallel_frontiers_active'] = list(running)
-            return
 
-        # Stable assignment: primary + sorted(running+candidates) -> ids in
+        # Stable assignment: active + sorted(running+candidates) -> ids in
         # order define which cred slice and lat strip they get.
         # Prefer idle/stopped candidates over cache-only-running ones so
         # we don't kill in-progress cache-only work when there's a free
         # peer available.
         candidates.sort(key=lambda c: (1 if c.get('needs_stop_cache_only') else 0,
                                        c['peer']['id']))
-        ordered = [active_id] + sorted(running) + sorted(
-            c['peer']['id'] for c in candidates[:max_add])
+        ordered = [active_id] + sorted(running)
+        if max_add > 0:
+            ordered += sorted(c['peer']['id'] for c in candidates[:max_add])
         ordered = ordered[:max_par]  # cap to credential capacity
         cred_plan = self._assign_cred_indices(ordered, cfg)
-        # Lat strips: round-robin disjoint assignment
-        strip_plan: dict[str, list] = {pid: [] for pid in ordered}
-        for i, st in enumerate(strips):
-            pid = ordered[i % len(ordered)]
-            strip_plan[pid].append([st[0], st[1]])
+
+        # Lat strips: each frontier gets ONE disjoint Austria-wide strip
+        # so peers open new regions independently. Extra strips beyond
+        # the frontier count are unassigned for now (they'll be picked
+        # up as frontier slots open). If there are fewer strips than
+        # frontiers (rare), tail peers get nothing — we then trim
+        # ``ordered`` so we don't start an unfiltered peer.
+        strip_plan: dict[str, list] = {}
+        for i, pid in enumerate(ordered):
+            if i < len(strips):
+                s, n = strips[i]
+                strip_plan[pid] = [[s, n]]
+            else:
+                strip_plan[pid] = []
+        # Trim peers that ended up without a strip (no cap collision).
+        ordered = [pid for pid in ordered if strip_plan.get(pid)]
+        cred_plan = {pid: cred_plan[pid] for pid in ordered if pid in cred_plan}
+
+        # Detect peers running with a stale plan (creds OR strips don't
+        # match). Hard-stop them so the next tick re-issues with the
+        # correct env. This is what catches the case where the active
+        # peer was started without a lat_strips env (e.g. via the
+        # legacy choose_active_peer path).
+        old_cred_plan = state_copy.get('frontier_cred_plan') or {}
+        old_strip_plan = state_copy.get('frontier_strip_plan') or {}
+        peers_to_restart: list[str] = []
+        for pid in [active_id] + list(running):
+            want_creds = sorted(cred_plan.get(pid) or [])
+            want_strips = sorted(
+                tuple(s) for s in (strip_plan.get(pid) or [])
+            )
+            have_creds = sorted(old_cred_plan.get(pid) or [])
+            have_strips = sorted(
+                tuple(s) for s in (old_strip_plan.get(pid) or [])
+            )
+            if want_creds and want_strips and (
+                want_creds != have_creds or want_strips != have_strips
+            ):
+                log.warning(
+                    'Frontier %s plan drift: have creds=%s strips=%s, '
+                    'want creds=%s strips=%s — restarting',
+                    pid, have_creds, have_strips, want_creds, want_strips,
+                )
+                peers_to_restart.append(pid)
+
+        for pid in peers_to_restart:
+            peer = get_peer_by_id(cfg, pid)
+            if not peer:
+                continue
+            try:
+                stop_peer_processor(peer.get('url'), graceful=False)
+            except Exception as e:
+                log.warning('Restart-stop %s failed: %s', pid, e)
+        # If we hard-stopped any peers, return early; the next tick will
+        # see them as candidates with the correct plan.
+        if peers_to_restart:
+            with self._lock:
+                self.state['frontier_cred_plan'] = cred_plan
+                self.state['frontier_strip_plan'] = strip_plan
+                self.state['parallel_frontiers_active'] = [
+                    pid for pid in running if pid not in peers_to_restart
+                ]
+                save_director_state(self.state)
+            return
 
         # Start new candidates with their plan.
         to_start_ids = [pid for pid in ordered
@@ -2075,7 +2066,7 @@ class PeerDirector:
                 continue
             creds = cred_plan.get(pid)
             strips_for = strip_plan.get(pid)
-            if not creds:
+            if not creds or not strips_for:
                 continue
             cand = cand_by_id.get(pid) or {}
             # If the peer is currently running cache-only, stop it first so

@@ -390,8 +390,8 @@
     <div class="val st-idle" id="cServiceVal">○ Idle</div>
     <div class="det" id="cServiceDet">—</div>
     <svg id="cCapSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
-         style="width:100%;height:28px;margin-top:6px;visibility:hidden"></svg>
-    <div class="det" id="cCapDet" style="font-size:10px;opacity:0.85;margin-top:2px;min-height:14px;visibility:hidden"></div>
+         style="width:100%;height:28px;margin-top:6px;display:block;visibility:hidden"></svg>
+    <div class="det" id="cCapDet" style="font-size:10px;opacity:0.85;margin-top:2px;min-height:14px;visibility:hidden">&nbsp;</div>
   </div>
   <div class="card" id="cProgress">
     <div class="lb">Progress</div>
@@ -406,7 +406,7 @@
     <div class="det" id="cRateDet">—</div>
     <div class="det" id="cRateArea" style="opacity:0.7;margin-top:2px"></div>
     <svg id="cRateSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
-         style="width:100%;height:28px;margin-top:6px;visibility:hidden"></svg>
+         style="width:100%;height:28px;margin-top:6px;display:block;visibility:hidden"></svg>
   </div>
   <div class="card" id="cSystem">
     <div class="lb">System</div>
@@ -1004,11 +1004,30 @@ function updateCards(d) {
   const sys = d.system || {};
   const mf = d.manifest || {};
 
-  // Service
-  const dots = {running:'●',idle:'○',paused:'◉',stopped:'○',complete:'✓'};
+  // Service. The status payload alternates between the primary's local
+  // state ('stopped' — nothing running on this box) and the director
+  // proxy's view of the active peer ('running' — the actual frontier).
+  // Both are correct but flapping the Service card between them every
+  // 2 s is just visual noise. Sticky-prefer the most informative state
+  // ('running' beats 'stopped'/'unreachable') for a short window.
+  const dots = {running:'●',idle:'○',paused:'◉',stopped:'○',complete:'✓',unreachable:'○'};
   const sEl = document.getElementById('cServiceVal');
-  sEl.textContent = (dots[s]||'○') + ' ' + s.charAt(0).toUpperCase() + s.slice(1);
-  sEl.className = 'val st-' + s;
+  const now = Date.now();
+  if (!window._serviceState) window._serviceState = {label: s, ts: 0};
+  const prev = window._serviceState;
+  // Promote running/processing immediately. Demote to stopped/unreachable
+  // only if we haven't seen running for >8 s.
+  let shown = s;
+  if (s === 'running' || s === 'processing') {
+    prev.label = 'running'; prev.ts = now; shown = 'running';
+  } else if ((s === 'stopped' || s === 'unreachable' || s === 'idle') &&
+             prev.label === 'running' && (now - prev.ts) < 8000) {
+    shown = 'running';
+  } else {
+    prev.label = s; prev.ts = now;
+  }
+  sEl.textContent = (dots[shown]||'○') + ' ' + shown.charAt(0).toUpperCase() + shown.slice(1);
+  sEl.className = 'val st-' + shown;
   let sdet = '';
   if (sys.proc_pid) sdet += 'PID ' + sys.proc_pid;
   if (sys.proc_ram_mb) sdet += ' · ' + sys.proc_ram_mb + 'MB';

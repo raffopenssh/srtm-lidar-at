@@ -1025,6 +1025,10 @@ class PeerDirector:
                 'online': proc_status != 'unreachable',
                 'git_commit': ps.get('git_commit', ''),
                 'region': ps.get('region', ''),
+                # Authoritative cred_indices from the peer's own progress.json
+                # — what the running processor subprocess actually has in env.
+                # Used as fallback when frontier_cred_plan is stale/empty.
+                '_reported_cred_indices': ps.get('cred_indices'),
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
@@ -1058,10 +1062,18 @@ class PeerDirector:
             is_running = proc_st in ('running', 'processing')
             holds_creds = is_running and not cache_only_run
             if holds_creds:
-                if pid in cred_plan:
+                # Prefer the peer's own reported cred_indices (ground truth
+                # from its env) over the director's plan, which can be
+                # stale across worker restarts or director state resets.
+                reported = row.pop('_reported_cred_indices', None)
+                if reported:
+                    row['cred_indices'] = list(reported)
+                elif pid in cred_plan:
                     row['cred_indices'] = cred_plan[pid]
                 if pid in strip_plan:
                     row['lat_strips'] = strip_plan[pid]
+            else:
+                row.pop('_reported_cred_indices', None)
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
                       if p['id'] == pid), None)
@@ -1088,7 +1100,9 @@ class PeerDirector:
                 continue
             if row.get('cache_only_run'):
                 continue
-            indices = cred_plan.get(pid) or []
+            # Use the row's annotated cred_indices, which already prefers
+            # the peer-reported ground truth over a possibly-stale plan.
+            indices = row.get('cred_indices') or cred_plan.get(pid) or []
             for idx in indices:
                 if 0 <= idx < len(cred_pool):
                     cred_holders[idx].append(pid)

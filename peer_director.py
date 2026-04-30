@@ -884,6 +884,11 @@ class PeerDirector:
         # warning rate pull it down within a few minutes if needed.
         self._capacity_ema: float = THROTTLE_MAX_FACTOR
         self._capacity_components: dict = {}
+        # Sliding history of (ts, factor, bev, zenodo, copernicus) tuples.
+        # Sized for ~2h of 30s ticks (240 entries). Survives ticks but not
+        # restarts; that's fine for a UI sparkline.
+        from collections import deque as _dq
+        self._capacity_history = _dq(maxlen=240)
 
     # --- Server-friendliness throttle ------------------------------------
     def _fleet_warning_rates(self, statuses: dict) -> dict:
@@ -954,6 +959,15 @@ class PeerDirector:
             'factor': round(final, 3),
             'peers_reporting': rates.get('_peers_reporting', 0),
         }
+        # Append to ring buffer. Compact tuple (no dict) to keep the
+        # JSON payload small even when serialised in get_status().
+        self._capacity_history.append((
+            int(time.time()),
+            round(final, 3),
+            round(float(rates.get('bev', 0.0)), 3),
+            round(float(rates.get('zenodo', 0.0)), 3),
+            round(float(rates.get('copernicus', 0.0)), 3),
+        ))
         return final
 
     def start(self):
@@ -1151,6 +1165,10 @@ class PeerDirector:
                 'capacity_factor', self._capacity_ema),
             'capacity_components': state.get(
                 'capacity_components', self._capacity_components),
+            'capacity_history': [
+                {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+                for (t, f, b, z, c) in list(self._capacity_history)
+            ],
             'peers': peers_status,
         }
 

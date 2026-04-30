@@ -389,6 +389,9 @@
     <div class="lb">Service</div>
     <div class="val st-idle" id="cServiceVal">○ Idle</div>
     <div class="det" id="cServiceDet">—</div>
+    <svg id="cCapSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
+         style="width:100%;height:28px;margin-top:6px;display:none"></svg>
+    <div class="det" id="cCapDet" style="display:none;font-size:10px;opacity:0.85;margin-top:2px"></div>
   </div>
   <div class="card" id="cProgress">
     <div class="lb">Progress</div>
@@ -1014,6 +1017,7 @@ function updateCards(d) {
     sdet += ' <span class="badge badge-' + cc + '">cop ' + cc + '</span>';
   }
   document.getElementById('cServiceDet').innerHTML = sdet || '—';
+  renderCapacityHistory();
 
   // Progress (prefer DB-sourced count which aggregates all peers via
   // Zenodo manifest sync; falls back to local manifest count otherwise)
@@ -3208,6 +3212,114 @@ async function fetchDirectorStatus() {
     _directorData = await r.json();
     renderDirector(_directorData);
   } catch(e) { console.error('director:', e); }
+}
+
+// Render the rolling capacity-factor sparkline + tooltip in the Service
+// card. Reads from _directorData populated by fetchDirectorStatus().
+function renderCapacityHistory() {
+  const svg = document.getElementById('cCapSpark');
+  const det = document.getElementById('cCapDet');
+  if (!svg || !det) return;
+  const d = _directorData;
+  const hist = (d && d.capacity_history) || [];
+  if (!d || hist.length < 2) {
+    svg.style.display = 'none';
+    det.style.display = 'none';
+    return;
+  }
+  const factor = (typeof d.capacity_factor === 'number') ? d.capacity_factor : 1;
+  const pct = Math.round(factor * 100);
+  const comp = (d && d.capacity_components) || {};
+  const r = comp.rates || {};
+  let color = '#3fc26b';
+  if (factor < 0.55) color = '#e05656';
+  else if (factor < 0.85) color = '#d6b94b';
+  // Adaptive y-axis: zoom into the observed factor range so a flat-30%
+  // line doesn't degenerate to a single pixel at the bottom. We snap
+  // the floor to THROTTLE_MIN_FACTOR (0.30) — that's the floor the
+  // backend can ever produce — so the chart reads as "distance above
+  // the throttle floor" when pinned, and as "full 0..1" when free.
+  const W = 120, H = 28;
+  const n = hist.length;
+  const t0 = hist[0].t, tN = hist[n-1].t;
+  const span = Math.max(1, tN - t0);
+  // Saturation rates from peer_director.THROTTLE_SATURATION_RATE.
+  const sat = {bev: 6.0, zen: 1.5, cop: 0.5};
+  // Determine y-range. Factor stays in [0.30, 1.00]; rates are
+  // normalised by saturation so they share the same axis as factor.
+  let dataMin = 1.0, dataMax = 0.30;
+  for (const e of hist) {
+    dataMin = Math.min(dataMin, e.f);
+    dataMax = Math.max(dataMax, e.f);
+    dataMax = Math.max(dataMax, (e.bev || 0) / sat.bev,
+                                 (e.zen || 0) / sat.zen,
+                                 (e.cop || 0) / sat.cop);
+  }
+  // Pad and snap. Floor at 0.30 (THROTTLE_MIN_FACTOR) when factor never
+  // climbed above ~0.5; otherwise floor at 0.
+  const yLo = (dataMax < 0.5 && dataMin >= 0.29) ? 0.30 : 0;
+  const yHi = Math.min(1.0, Math.max(dataMax + 0.05, yLo + 0.2));
+  const yRange = yHi - yLo;
+  function ny(v) {
+    const t = (Math.max(yLo, Math.min(yHi, v)) - yLo) / yRange;
+    return H - t * H;
+  }
+  function pathFor(key) {
+    let p = '';
+    for (let i=0; i<n; i++) {
+      const e = hist[i];
+      const x = ((e.t - t0) / span) * W;
+      const y = ny(e[key]);
+      p += (i===0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    }
+    return p;
+  }
+  function normPath(key, satKey) {
+    let p = '';
+    for (let i=0; i<n; i++) {
+      const e = hist[i];
+      const x = ((e.t - t0) / span) * W;
+      const v = (e[key] || 0) / sat[satKey];
+      const y = ny(v);
+      p += (i===0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    }
+    return p;
+  }
+  // Reference gridlines drawn only if they fall inside the visible range.
+  const grids = [];
+  for (const ref of [0.30, 0.50, 0.85, 1.00]) {
+    if (ref >= yLo && ref <= yHi) {
+      const y = ny(ref).toFixed(1);
+      grids.push('<line x1="0" y1="' + y + '" x2="' + W + '" y2="' + y +
+        '" stroke="#444" stroke-width="0.5" stroke-dasharray="2,2"/>');
+    }
+  }
+  // Build tooltip from current rates.
+  const elapsedMin = Math.round((tN - t0) / 60);
+  const tip = 'Capacity factor over last ' + elapsedMin + 'm.\n' +
+    'Pulls peer parallelism down when upstreams emit warnings.\n' +
+    'Now: BEV ' + (r.bev||0) + '/min · Zen ' + (r.zenodo||0) + '/min · Cop ' + (r.copernicus||0) + '/min';
+  // y-range label so a zoomed view doesn't lie about absolute values.
+  const rangeLbl = '<text x="1" y="7" font-size="7" fill="#888">' +
+    Math.round(yHi*100) + '%</text>' +
+    '<text x="1" y="' + (H-1) + '" font-size="7" fill="#888">' +
+    Math.round(yLo*100) + '%</text>';
+  svg.innerHTML =
+    '<title>' + tip + '</title>' +
+    grids.join('') +
+    // warning-rate context (thin lines, normalised to saturation)
+    '<path d="' + normPath('bev','bev') + '" fill="none" stroke="#e05656" stroke-width="0.8" opacity="0.55"/>' +
+    '<path d="' + normPath('zen','zen') + '" fill="none" stroke="#d6b94b" stroke-width="0.8" opacity="0.55"/>' +
+    '<path d="' + normPath('cop','cop') + '" fill="none" stroke="#9b6df0" stroke-width="0.8" opacity="0.55"/>' +
+    // capacity factor (bold)
+    '<path d="' + pathFor('f') + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' +
+    rangeLbl;
+  svg.style.display = 'block';
+  det.style.display = 'block';
+  det.innerHTML = '<span style="color:' + color + '"><b>' + pct + '%</b></span> capacity · ' +
+    '<span style="color:#e05656" title="BEV warnings/min (5m)">B ' + (r.bev||0).toFixed(1) + '</span> · ' +
+    '<span style="color:#d6b94b" title="Zenodo warnings/min (5m)">Z ' + (r.zenodo||0).toFixed(1) + '</span> · ' +
+    '<span style="color:#9b6df0" title="Copernicus warnings/min (5m)">C ' + (r.copernicus||0).toFixed(1) + '</span>';
 }
 
 function renderDirector(d) {

@@ -390,8 +390,8 @@
     <div class="val st-idle" id="cServiceVal">○ Idle</div>
     <div class="det" id="cServiceDet">—</div>
     <svg id="cCapSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
-         style="width:100%;height:28px;margin-top:6px;display:none"></svg>
-    <div class="det" id="cCapDet" style="display:none;font-size:10px;opacity:0.85;margin-top:2px"></div>
+         style="width:100%;height:28px;margin-top:6px;visibility:hidden"></svg>
+    <div class="det" id="cCapDet" style="font-size:10px;opacity:0.85;margin-top:2px;min-height:14px;visibility:hidden"></div>
   </div>
   <div class="card" id="cProgress">
     <div class="lb">Progress</div>
@@ -406,7 +406,7 @@
     <div class="det" id="cRateDet">—</div>
     <div class="det" id="cRateArea" style="opacity:0.7;margin-top:2px"></div>
     <svg id="cRateSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
-         style="width:100%;height:28px;margin-top:6px;display:block"></svg>
+         style="width:100%;height:28px;margin-top:6px;visibility:hidden"></svg>
   </div>
   <div class="card" id="cSystem">
     <div class="lb">System</div>
@@ -1017,7 +1017,11 @@ function updateCards(d) {
     sdet += ' <span class="badge badge-' + cc + '">cop ' + cc + '</span>';
   }
   document.getElementById('cServiceDet').innerHTML = sdet || '—';
-  renderCapacityHistory();
+  // NOTE: renderCapacityHistory() is intentionally NOT called here —
+  // it depends on _directorData (from /api/v1/director/status) which
+  // polls on its own cadence. Calling it here would race the director
+  // fetch and flicker the sparkline.
+
 
   // Progress (prefer DB-sourced count which aggregates all peers via
   // Zenodo manifest sync; falls back to local manifest count otherwise)
@@ -1120,10 +1124,11 @@ function updateCards(d) {
               (n - 1 - i) + 'd ago)</title></rect>';
     }
     spark.innerHTML = bars;
-    spark.style.display = 'block';
+    spark.style.visibility = 'visible';
   } else if (spark) {
-    spark.innerHTML = '';
-    spark.style.display = 'none';
+    // Keep the SVG mounted so the card height is stable even when the
+    // series is briefly empty (status poll race after a deploy).
+    spark.style.visibility = 'hidden';
   }
 
   // System
@@ -3224,8 +3229,10 @@ function renderCapacityHistory() {
   const d = _directorData;
   const hist = (d && d.capacity_history) || [];
   if (!d || hist.length < 2) {
-    svg.style.display = 'none';
-    det.style.display = 'none';
+    // Hide via visibility (not display) to preserve reserved layout
+    // height — prevents layout shift when data arrives.
+    svg.style.visibility = 'hidden';
+    det.style.visibility = 'hidden';
     return;
   }
   const factor = (typeof d.capacity_factor === 'number') ? d.capacity_factor : 1;
@@ -3315,8 +3322,8 @@ function renderCapacityHistory() {
     // capacity factor (bold)
     '<path d="' + pathFor('f') + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' +
     rangeLbl;
-  svg.style.display = 'block';
-  det.style.display = 'block';
+  svg.style.visibility = 'visible';
+  det.style.visibility = 'visible';
   det.innerHTML = '<span style="color:' + color + '"><b>' + pct + '%</b></span> capacity · ' +
     '<span style="color:#e05656" title="BEV warnings/min (5m)">B ' + (r.bev||0).toFixed(1) + '</span> · ' +
     '<span style="color:#d6b94b" title="Zenodo warnings/min (5m)">Z ' + (r.zenodo||0).toFixed(1) + '</span> · ' +

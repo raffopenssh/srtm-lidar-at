@@ -7745,6 +7745,35 @@ def main():
                and kg["kg_code"] not in failed_kgs
                and kg["kg_code"] not in peer_claimed]
 
+    # --- Optional latitude-strip filter (per-peer dedication) ---
+    # KG_LAT_STRIP_FILTER=[[s1,n1],[s2,n2],...] limits this peer to KGs
+    # whose bbox falls inside any allowed strip. Set by the director on
+    # cache-only / strip-pinned peers to avoid two peers touching the
+    # same Zenodo cache strip simultaneously.
+    _strip_raw = os.environ.get("KG_LAT_STRIP_FILTER", "").strip()
+    if _strip_raw:
+        try:
+            _strips = json.loads(_strip_raw)
+            _strips = [(float(s), float(n)) for s, n in _strips]
+        except Exception as e:
+            log.warning("Bad KG_LAT_STRIP_FILTER=%r: %s", _strip_raw, e)
+            _strips = []
+        if _strips:
+            def _kg_in_strips(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat")
+                n = bb.get("max_lat")
+                if s is None or n is None:
+                    return False
+                for ls, ln in _strips:
+                    if s >= ls - 1e-9 and n <= ln + 1e-9:
+                        return True
+                return False
+            before = len(pending)
+            pending = [kg for kg in pending if _kg_in_strips(kg)]
+            log.info("KG_LAT_STRIP_FILTER active (%d strips): %d -> %d KGs",
+                     len(_strips), before, len(pending))
+
     # --- Expand large KGs into blocks ---
     from kg_splitter import (maybe_split_kg, is_block_code, parent_kg_code,
                              all_block_codes_for_parent, MAX_TILES_PER_BLOCK)
@@ -8441,6 +8470,39 @@ def main():
                                      f"KG {kg_code}: cache miss — deferred to frontier",
                                      kg_code)
                     _append_retry_queue(kg_code)
+                    # Tell the director (primary) to exclude this KG
+                    # from cache-only whitelists until the relevant
+                    # Zenodo cache strip updates. Avoids hammering the
+                    # APIs by re-running KGs we already know we can't
+                    # complete in cache-only mode.
+                    try:
+                        import pathlib as _pl
+                        import socket as _sock
+                        _director_url = (os.environ.get('ZENODO_LOCK_URL', '').strip()
+                                         or 'http://127.0.0.1:8000')
+                        _admin_tok = ''
+                        try:
+                            _admin_tok = _pl.Path('data/admin_token').read_text().strip()
+                        except Exception:
+                            pass
+                        _payload = {
+                            'kg_code': str(kg_code),
+                            'peer_id': os.environ.get('INSTANCE_ID', _sock.gethostname()),
+                            'bbox': kg.get('bbox'),
+                            'tile_info': str(result.get('step', '')),
+                        }
+                        _headers = {'Content-Type': 'application/json'}
+                        if _admin_tok:
+                            _headers['X-Admin-Token'] = _admin_tok
+                        _r = requests.post(
+                            _director_url.rstrip('/') + '/api/v1/processing/cache_misses',
+                            json=_payload, headers=_headers, timeout=10,
+                        )
+                        if not _r.ok:
+                            log.debug('cache_miss POST status=%s body=%s',
+                                      _r.status_code, _r.text[:200])
+                    except Exception as _e:
+                        log.debug('cache_miss POST failed: %s', _e)
                 elif is_cop_batch_failure:
                     log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
                     progress.add_log("warning",

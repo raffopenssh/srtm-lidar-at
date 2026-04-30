@@ -422,11 +422,51 @@ These are the dangerous changes — they touch many files and are easy to break.
 3. Retrain the model: existing `.joblib` files become incompatible if feature count changes
 
 **Changing the Copernicus credential set:**
-1. `copernicus.py` → `_CREDENTIALS` list (line ~48, 4 tuples of `(client_id, client_secret)`)
-2. `rm -f data/austria_processor/copernicus_paused` (removes throttle pause)
-3. `rm -f data/austria_processor/openeo_circuit.json` (resets circuit breaker)
-4. Restart processor: `sudo systemctl restart austria_processor`
-5. **Important**: the `@_retry_on_rotation` decorator tries `len(_CREDENTIALS)+1` attempts. Adding/removing credentials changes retry behaviour automatically.
+1. Preferred: use the dashboard → 🔑 Credentials panel → “+ Add”, or
+   `POST /api/v1/credentials {client_id, client_secret, label?, validate}`.
+   New creds are validated (OIDC client-credentials probe), persisted to
+   `data/austria_processor/copernicus_credentials.json`, and visible to
+   the director on the next tick (no restart needed for new KGs).
+2. The built-in seed list is `_BUILTIN_CREDENTIALS` in `copernicus.py`
+   (~line 48). The runtime pool is the union of built-ins + the persisted
+   store; user-added creds can be removed via the API, built-ins cannot.
+3. `rm -f data/austria_processor/copernicus_paused` (removes throttle pause)
+4. `rm -f data/austria_processor/openeo_circuit.json` (resets circuit breaker)
+5. **Persistence**: `_exhausted_cred_indices` is mirrored to the credentials
+   JSON (`exhausted=true`) so a fresh subprocess inherits the exhaustion
+   state. The director treats `exhausted=true` and `last_status` in
+   {`exhausted`,`invalid`} as “not valid” when computing
+   `max_parallel_frontiers`. Call `POST /api/v1/credentials/validate`
+   (no body) to re-probe everything, e.g. on the 1st of the month after
+   credit renewals.
+6. **Important**: the `@_retry_on_rotation` decorator tries `len(_CREDENTIALS)+1` attempts. Adding/removing credentials changes retry behaviour automatically.
+
+**Per-peer credential & lat-strip dedication (parallel frontiers):**
+The director assigns disjoint slices of valid credentials and disjoint
+cached lat strips to peers running frontier work in parallel.
+* `min_creds_per_frontier` (default 2) in `peers.json` sets the minimum
+  cred count per frontier peer. `max_parallel_frontiers = floor(valid /
+  per)`.
+* Capability-gated: only peers exposing `cred_subset_env` in
+  `/api/v1/info→capabilities` get parallel work. Pre-upgrade peers run
+  single-frontier as before (graceful upgrade).
+* Pinning: each peer has an optional `pinned_role` in `peers.json`
+  (`frontier`, `cache_only`, `idle`). Set via dashboard dropdown or
+  `POST /api/v1/director/peers/<id>/pin {pinned_role}`.
+* The processor honors `COPERNICUS_CRED_INDICES="0,2"` and
+  `KG_LAT_STRIP_FILTER="[[47.0,47.5],[48.0,48.5]]"` env vars set by the
+  director when starting the subprocess.
+
+**Cache-only cache-miss avoidance:**
+When a cache-only peer hits a missing tile, the processor records the KG
+in `data/austria_processor/cache_miss_kgs.json` (on the primary, via
+`POST /api/v1/processing/cache_misses`). The entry stores a fingerprint
+of the relevant Zenodo cache strip; the director excludes the KG from
+cache-only whitelists until the strip's manifest changes (i.e. new tiles
+uploaded). Prevents re-hammering the API for KGs we already know are
+incomplete in cache-only mode. Fingerprints are computed from
+`updated_at` of the strip's `copernicus_*_strip_<S>_<N>.zip` and
+`hansen_strip_<S>_<N>.zip` entries in `cache_manifest.json`.
 
 **Changing tile grid / overlap:**
 1. `austria_processor.py` → `_compute_tile_grid()` (tile_km, overlap_km params)

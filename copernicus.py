@@ -45,12 +45,97 @@ logger = logging.getLogger(__name__)
 # OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
 # OLD (account 1, out of credits): CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
 # OLD (account 1, out of credits): CLIENT_SECRET = "<REDACTED_SECRET>"
-_CREDENTIALS = [
+# Built-in credentials (always loaded). Additional credentials can be
+# added at runtime via /api/v1/credentials and are persisted to
+# data/austria_processor/copernicus_credentials.json. The file is the
+# single source of truth at runtime; this list is the seed/fallback.
+_BUILTIN_CREDENTIALS = [
     ("sh-f36653c6-5d8c-48a1-b86d-476c50eb389c", "<REDACTED_SECRET>"),  # fresh 2026-04
     ("sh-8d8c685f-df36-4536-b949-666532d08414", "<REDACTED_SECRET>"),  # renews 2026-05-01
     ("sh-2ed25dbb-857d-4e99-b070-e1954a99a980", "<REDACTED_SECRET>"),  # renews 2026-05-01
     ("sh-07af1740-88e5-49d1-93c8-e9fca0fe2d49", "<REDACTED_SECRET>"),  # 30k credits
+    ("sh-6db28e03-8090-4194-81b1-4d7db557b5aa", "<REDACTED_SECRET>"),  # added 2026-04 (slot 5)
+    ("sh-9c10ed71-86af-4c72-b6f5-50c0e160128f", "<REDACTED_SECRET>"),  # added 2026-04 (slot 6)
 ]
+
+# Credentials store path (instance-local; not in git)
+_CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")
+# Per-credential metadata: label, added_at, last_validated_at, last_status,
+# notes. Indexed by client_id.
+_cred_meta: Dict[str, Dict[str, Any]] = {}
+# Forward-declared so _load_credentials_from_disk can rehydrate it; the
+# canonical declaration (with comment) appears below.
+_exhausted_cred_indices: set = set()
+
+def _load_credentials_from_disk() -> list:
+    """Merge built-ins with persisted credentials. Built-ins always come first.
+
+    Also rehydrates ``_exhausted_cred_indices`` from any ``exhausted=True``
+    flags persisted in the meta, so a fresh subprocess starts with the
+    same exhaustion state the parent already discovered.
+    """
+    global _cred_meta
+    creds = list(_BUILTIN_CREDENTIALS)
+    seen = {c[0] for c in creds}
+    _cred_meta = {}
+    for cid, _csec in _BUILTIN_CREDENTIALS:
+        _cred_meta[cid] = {"source": "builtin"}
+    if _CRED_STORE.exists():
+        try:
+            data = json.loads(_CRED_STORE.read_text())
+            for entry in data.get("credentials", []):
+                cid = entry.get("client_id")
+                csec = entry.get("client_secret")
+                if not cid or not csec or cid in seen:
+                    # Update metadata even for builtins so we keep last_validated_at etc.
+                    if cid in _cred_meta:
+                        for k, v in entry.items():
+                            if k not in ("client_secret",):
+                                _cred_meta[cid][k] = v
+                    continue
+                creds.append((cid, csec))
+                seen.add(cid)
+                _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
+        except Exception as e:
+            logger.warning("Failed to load credentials store %s: %s", _CRED_STORE, e)
+    # Apply persisted exhaustion to in-memory set.
+    for i, (cid, _) in enumerate(creds):
+        meta = _cred_meta.get(cid) or {}
+        if meta.get("exhausted"):
+            _exhausted_cred_indices.add(i)
+    return creds
+
+def _save_credentials_to_disk():
+    """Persist non-builtin credentials + meta for all creds to disk.
+
+    Also persists per-credential ``exhausted`` + ``exhausted_at`` so a
+    fresh subprocess (and the director) inherits the state.
+    """
+    builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
+    out = {"credentials": []}
+    now_iso = __import__('datetime').datetime.utcnow().isoformat() + "Z"
+    for i, (cid, csec) in enumerate(_CREDENTIALS):
+        meta = dict(_cred_meta.get(cid, {}))
+        meta["client_id"] = cid
+        meta["client_secret"] = csec
+        meta.setdefault("source", "builtin" if cid in builtin_ids else "user")
+        was_exh = bool(meta.get("exhausted"))
+        is_exh = i in _exhausted_cred_indices
+        meta["exhausted"] = is_exh
+        if is_exh and not was_exh:
+            meta["exhausted_at"] = now_iso
+        if not is_exh:
+            meta.pop("exhausted_at", None)
+        out["credentials"].append(meta)
+    try:
+        _CRED_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CRED_STORE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=2))
+        os.replace(tmp, _CRED_STORE)
+    except Exception as e:
+        logger.warning("Failed to save credentials store: %s", e)
+
+_CREDENTIALS = _load_credentials_from_disk()
 _credential_index = 0  # current credential pair
 CLIENT_ID = _CREDENTIALS[0][0]
 CLIENT_SECRET = _CREDENTIALS[0][1]
@@ -98,7 +183,7 @@ _connections: Dict[int, Any] = {}
 # Callers (e.g. rf_train) can check this to pause gracefully.
 credits_exhausted: bool = False
 _credits_exhausted_at: Optional[str] = None  # ISO timestamp
-_exhausted_cred_indices: set = set()  # tracks which credential indices got 402
+# tracks which credential indices got 402 (rehydrated from disk on import)
 
 # IP-level throttle: all credentials return 402 but probes pass.
 # Unlike credits_exhausted (monthly cap), this recovers in ~2 hours.
@@ -119,10 +204,198 @@ _FAILED_MONTH_402_COOLDOWN_SECS = 1800  # 30 minutes — 402 is IP-level, recove
 _cred_lock = threading.Lock()
 
 
+# Per-process credential whitelist. Set via COPERNICUS_CRED_INDICES env
+# (e.g. "0,2,3") to restrict the workers in this process to a subset of
+# the credential pool. The director uses this so different peers use
+# disjoint credential pairs and don't collide on rate limits.
+_ALLOWED_CRED_INDICES: Optional[set] = None
+
+
+def _init_allowed_cred_indices():
+    global _ALLOWED_CRED_INDICES, _credential_index, CLIENT_ID, CLIENT_SECRET
+    raw = os.environ.get("COPERNICUS_CRED_INDICES", "").strip()
+    if not raw:
+        return
+    try:
+        idxs = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            i = int(part)
+            if 0 <= i < len(_CREDENTIALS):
+                idxs.append(i)
+        if idxs:
+            _ALLOWED_CRED_INDICES = set(idxs)
+            with _cred_lock:
+                _credential_index = idxs[0]
+                CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+            logger.info("COPERNICUS_CRED_INDICES=%s -> using credentials %s (start=%d)",
+                        raw, sorted(_ALLOWED_CRED_INDICES), idxs[0])
+    except Exception as e:
+        logger.warning("Bad COPERNICUS_CRED_INDICES=%r: %s", raw, e)
+
+_init_allowed_cred_indices()
+
+
 def FUNCTIONING_CREDENTIALS() -> list:
-    """Return the list of credential indices that haven't been exhausted (402)."""
+    """Return the list of credential indices that haven't been exhausted (402).
+
+    If COPERNICUS_CRED_INDICES is set, the result is intersected with the
+    whitelist so this process only ever uses its assigned credentials.
+    """
     with _cred_lock:
-        return [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
+        idxs = [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
+    if _ALLOWED_CRED_INDICES is not None:
+        idxs = [i for i in idxs if i in _ALLOWED_CRED_INDICES]
+    return idxs
+
+
+def list_credentials() -> list:
+    """Return public credential metadata (client_id, source, last_validated_at,
+    last_status, exhausted, label). Never returns secrets."""
+    with _cred_lock:
+        exhausted = set(_exhausted_cred_indices)
+        creds = list(_CREDENTIALS)
+    out = []
+    for i, (cid, _csec) in enumerate(creds):
+        meta = dict(_cred_meta.get(cid, {}))
+        meta.pop("client_secret", None)
+        meta["index"] = i
+        meta["client_id"] = cid
+        meta["client_id_short"] = cid[:16] + "..."
+        meta["exhausted"] = i in exhausted
+        if _ALLOWED_CRED_INDICES is not None:
+            meta["allowed_in_process"] = i in _ALLOWED_CRED_INDICES
+        out.append(meta)
+    return out
+
+
+def validate_credential(client_id: str, client_secret: str) -> dict:
+    """Probe a (client_id, client_secret) pair. Returns dict with ok, status,
+    error. Performs an OIDC client-credentials auth — same shape as
+    _probe_credential() but for arbitrary creds (used before adding)."""
+    if openeo is None:
+        return {"ok": False, "status": "openeo_missing",
+                "error": "openeo package not installed"}
+    try:
+        conn = openeo.connect(OPENEO_URL)
+        conn.authenticate_oidc_client_credentials(
+            client_id=client_id, client_secret=client_secret)
+        return {"ok": True, "status": "valid"}
+    except Exception as e:
+        msg = str(e)
+        if '402' in msg and 'PaymentRequired' in msg:
+            return {"ok": False, "status": "exhausted", "error": msg[:300]}
+        if '401' in msg or 'invalid_client' in msg:
+            return {"ok": False, "status": "invalid", "error": msg[:300]}
+        return {"ok": False, "status": "error", "error": msg[:300]}
+
+
+def add_credential(client_id: str, client_secret: str, label: str = "",
+                   notes: str = "", validate: bool = True) -> dict:
+    """Add a new credential to the runtime pool and persist to disk.
+
+    If *validate* is True, probe before adding. Returns the new index +
+    validation result. Idempotent: re-adding an existing client_id
+    updates label/notes only.
+    """
+    global _CREDENTIALS
+    client_id = (client_id or "").strip()
+    client_secret = (client_secret or "").strip()
+    if not client_id or not client_secret:
+        return {"ok": False, "error": "client_id and client_secret required"}
+
+    val = {"ok": True, "status": "unchecked"}
+    if validate:
+        val = validate_credential(client_id, client_secret)
+
+    now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
+    with _cred_lock:
+        # If the credential is already known, just update meta
+        existing_idx = None
+        for i, (cid, _) in enumerate(_CREDENTIALS):
+            if cid == client_id:
+                existing_idx = i
+                break
+        if existing_idx is None:
+            _CREDENTIALS.append((client_id, client_secret))
+            existing_idx = len(_CREDENTIALS) - 1
+        meta = _cred_meta.setdefault(client_id, {})
+        if label:
+            meta["label"] = label
+        if notes:
+            meta["notes"] = notes
+        meta.setdefault("source", "user")
+        meta.setdefault("added_at", now)
+        meta["last_validated_at"] = now
+        meta["last_status"] = val.get("status", "unchecked")
+        if not val.get("ok"):
+            meta["last_error"] = val.get("error", "")
+        else:
+            meta.pop("last_error", None)
+        _save_credentials_to_disk()
+    return {"ok": True, "index": existing_idx, "client_id": client_id,
+            "validation": val}
+
+
+def remove_credential(client_id: str) -> dict:
+    """Remove a credential by client_id. Built-ins cannot be removed via API
+    (would reappear on restart) — but we still drop the in-memory entry so
+    the running process stops using them."""
+    global _CREDENTIALS, _credential_index, CLIENT_ID, CLIENT_SECRET
+    with _cred_lock:
+        idx = None
+        for i, (cid, _) in enumerate(_CREDENTIALS):
+            if cid == client_id:
+                idx = i
+                break
+        if idx is None:
+            return {"ok": False, "error": "not found"}
+        _CREDENTIALS.pop(idx)
+        _exhausted_cred_indices.discard(idx)
+        # Reindex exhausted set to account for shift
+        _exhausted_cred_indices_old = set(_exhausted_cred_indices)
+        _exhausted_cred_indices.clear()
+        for j in _exhausted_cred_indices_old:
+            if j > idx:
+                _exhausted_cred_indices.add(j - 1)
+            elif j < idx:
+                _exhausted_cred_indices.add(j)
+        if _credential_index >= len(_CREDENTIALS):
+            _credential_index = 0
+        if _CREDENTIALS:
+            CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+        _cred_meta.pop(client_id, None)
+        _save_credentials_to_disk()
+    return {"ok": True, "removed": client_id}
+
+
+def revalidate_all_credentials() -> list:
+    """Probe every credential, update meta. Returns a list parallel to
+    list_credentials() but with fresh probe results."""
+    out = []
+    now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
+    with _cred_lock:
+        creds = list(_CREDENTIALS)
+    for i, (cid, csec) in enumerate(creds):
+        val = validate_credential(cid, csec)
+        with _cred_lock:
+            meta = _cred_meta.setdefault(cid, {})
+            meta["last_validated_at"] = now
+            meta["last_status"] = val.get("status", "unchecked")
+            if val.get("ok"):
+                meta.pop("last_error", None)
+                # If we previously thought it was exhausted, reset.
+                _exhausted_cred_indices.discard(i)
+            else:
+                meta["last_error"] = val.get("error", "")
+                if val.get("status") == "exhausted":
+                    _exhausted_cred_indices.add(i)
+        out.append({"index": i, "client_id": cid, **val})
+    with _cred_lock:
+        _save_credentials_to_disk()
+    return out
 
 
 class CreditsExhaustedError(Exception):
@@ -221,6 +494,14 @@ def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
         logger.warning("Credential %d/%d confirmed exhausted (402 PaymentRequired, client_id=%s)",
                        idx + 1, len(_CREDENTIALS),
                        _CREDENTIALS[idx][0][:16] + "...")
+        # Persist so the director and other workers see it.
+        meta = _cred_meta.setdefault(_CREDENTIALS[idx][0], {})
+        meta["last_status"] = "exhausted"
+        meta["last_error"] = msg[:300]
+        try:
+            _save_credentials_to_disk()
+        except Exception as _se:
+            logger.debug("persist exhaustion failed: %s", _se)
 
         if len(_exhausted_cred_indices) >= len(_CREDENTIALS):
             # ALL credentials exhausted
@@ -253,6 +534,17 @@ def reset_exhausted_credentials():
         _exhausted_cred_indices.clear()
         credits_exhausted = False
         _credits_exhausted_at = None
+        # Clear persisted exhaustion flags too.
+        for cid, meta in _cred_meta.items():
+            if meta.get("exhausted"):
+                meta["exhausted"] = False
+                meta.pop("exhausted_at", None)
+                if meta.get("last_status") == "exhausted":
+                    meta["last_status"] = "unchecked"
+        try:
+            _save_credentials_to_disk()
+        except Exception:
+            pass
     logger.info("Reset exhausted-credential tracking for %d credentials",
                 len(_CREDENTIALS))
 

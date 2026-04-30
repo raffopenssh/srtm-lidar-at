@@ -463,7 +463,9 @@ def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
 
 def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                          *, cache_only: bool = False,
-                         queue_whitelist: list | None = None) -> dict:
+                         queue_whitelist: list | None = None,
+                         cred_indices: list | None = None,
+                         lat_strips: list | None = None) -> dict:
     """Start the processor on a peer.
 
     For remote peers, syncs the local priority queue first so the peer
@@ -474,7 +476,13 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
     flag so it refuses any Copernicus/Hansen API call.  Use *queue_whitelist*
     to send only KGs known to be fully cached.
     """
-    payload = {'cache_only': True} if cache_only else {}
+    payload = {}
+    if cache_only:
+        payload['cache_only'] = True
+    if cred_indices is not None:
+        payload['cred_indices'] = list(cred_indices)
+    if lat_strips is not None:
+        payload['lat_strips'] = list(lat_strips)
     if peer_url is None:
         # Local start — use the local API so _processor_process is tracked
         try:
@@ -733,6 +741,11 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
             continue
         if _peer_is_scheduled(peer):
             continue
+        pinned = (peer.get('pinned_role') or '').strip().lower()
+        if pinned in ('idle', 'off', 'pause', 'paused', 'parked'):
+            continue  # user-pinned idle
+        if pinned in ('cache_only', 'cache-only', 'cacheonly'):
+            continue  # user-pinned cache_only — not eligible as primary frontier
         pid = peer['id']
         bw = state.get('peer_bandwidth', {}).get(pid, {})
         used = bw.get('used_bytes', 0)
@@ -849,6 +862,33 @@ class PeerDirector:
 
         cache_ready = state.get('_cache_ready_cache') or {}
         cache_only_running = sum(1 for p in peers_status if p['cache_only_run'])
+
+        # --- Credential pool & assignment plan ----------------------
+        try:
+            cred_pool = self._credential_pool()
+        except Exception:
+            cred_pool = []
+        try:
+            valid_creds = self._valid_credentials()
+        except Exception:
+            valid_creds = []
+        per = max(1, int(cfg.get('min_creds_per_frontier',
+                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        max_par = (len(valid_creds) // per) if valid_creds else 0
+        cred_plan = state.get('frontier_cred_plan') or {}
+        strip_plan = state.get('frontier_strip_plan') or {}
+        cached_strips = self._cached_lat_ranges() if hasattr(self, '_cached_lat_ranges') else []
+        # Annotate peer rows with their assignments.
+        for row in peers_status:
+            pid = row['id']
+            if pid in cred_plan:
+                row['cred_indices'] = cred_plan[pid]
+            if pid in strip_plan:
+                row['lat_strips'] = strip_plan[pid]
+            row['pinned_role'] = (
+                next((p.get('pinned_role') for p in cfg.get('peers', [])
+                      if p['id'] == pid), None)
+            )
         return {
             'mode': state.get('mode', 'auto'),
             'active_peer': state.get('active_peer'),
@@ -860,6 +900,13 @@ class PeerDirector:
             'cache_only_running': cache_only_running,
             'cache_ready_kgs': len(cache_ready.get('codes') or []),
             'cache_ready_at': cache_ready.get('at'),
+            'credentials': cred_pool,
+            'valid_credentials': valid_creds,
+            'min_creds_per_frontier': per,
+            'max_parallel_frontiers': max_par,
+            'cached_lat_strips': [[s, n] for s, n in cached_strips],
+            'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
+            'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
             'peers': peers_status,
         }
@@ -1251,9 +1298,12 @@ class PeerDirector:
                         self.state.get('unreachable_count', {}).pop(active_id, None)
 
         # Enforce single-active for the FRONTIER role: stop any non-active
-        # peers that are running a non-cache-only processor.  Cache-only
-        # peers (no Copernicus credentials) may run in parallel — they're
-        # managed by ``_orchestrate_cache_only``.
+        # peers that are running a non-cache-only processor UNLESS the
+        # director has authorised them as a parallel frontier (in
+        # ``parallel_frontiers_active``) AND the cred pool supports it.
+        # Cache-only peers (no Copernicus credentials) may run in parallel —
+        # they're managed by ``_orchestrate_cache_only``.
+        parallel_ok = set(self.state.get('parallel_frontiers_active') or [])
         if active_id:
             for p in cfg.get('peers', []):
                 if p['id'] != active_id and p.get('url') is not None:
@@ -1261,6 +1311,8 @@ class PeerDirector:
                     if ps.get('state') in ('running', 'processing'):
                         if ps.get('cache_only'):
                             continue  # benign — doesn't touch credentials
+                        if p['id'] in parallel_ok:
+                            continue  # authorised parallel frontier
                         log.warning('Non-active peer %s is running frontier work — '
                                     'stopping it (only %s may run frontier)',
                                     p['id'], active_id)
@@ -1278,12 +1330,15 @@ class PeerDirector:
                     # peers don't touch Copernicus credentials and may
                     # remain running in parallel.
                     blocked = False
+                    parallel_ok = set(self.state.get('parallel_frontiers_active') or [])
                     for p in cfg.get('peers', []):
                         if p['id'] == new_peer:
                             continue
                         ps = get_peer_status(p.get('url'))
                         st = ps.get('state', 'unknown')
                         if st in ('running', 'processing') and not ps.get('cache_only'):
+                            if p['id'] in parallel_ok:
+                                continue
                             log.info('Stopping frontier peer %s before activating %s',
                                      p['id'], new_peer)
                             res = safely_stop_peer(p.get('url'), p['id'])
@@ -1300,9 +1355,19 @@ class PeerDirector:
                     # Exclude KGs reserved for other cooled-down peers,
                     # so a substitute does useful work on a different KG.
                     excl = _reserved_kgs(cfg, exclude_peer_id=new_peer)
-                    log.info('Activating peer %s%s', new_peer,
-                             (' (excluding reserved KGs: ' + ','.join(sorted(excl)) + ')') if excl else '')
-                    result = start_peer_processor(peer.get('url'), exclude_kgs=excl)
+                    # Build credential plan: primary peer gets the first
+                    # min_creds_per_frontier valid creds; remaining go to
+                    # parallel-frontier peers (orchestrated separately).
+                    plan = self._assign_cred_indices([new_peer], cfg)
+                    creds_for_peer = plan.get(new_peer)
+                    # Capability-gated: only set if peer supports it.
+                    caps = self._refresh_peer_caps(peer)
+                    cred_kw = creds_for_peer if 'cred_subset_env' in caps else None
+                    log.info('Activating peer %s%s%s', new_peer,
+                             (' (excluding reserved KGs: ' + ','.join(sorted(excl)) + ')') if excl else '',
+                             (' creds=%s' % creds_for_peer) if cred_kw else '')
+                    result = start_peer_processor(peer.get('url'), exclude_kgs=excl,
+                                                  cred_indices=cred_kw)
                     log.info('Start result for %s: %s', new_peer, result)
                     with self._lock:
                         self.state['active_peer'] = new_peer
@@ -1314,11 +1379,270 @@ class PeerDirector:
     # ---- cache-only peer orchestration -----------------------------
 
     def _peer_role(self, peer: dict) -> str:
-        """Return the peer's role: 'frontier' (default) or 'cache_only'."""
+        """Return the peer's effective role.
+
+        ``pinned_role`` (set by user via UI) overrides ``role``.
+        Values: ``frontier`` (default), ``cache_only``, ``idle``
+        (never started by the director, regardless of bandwidth/whitelist).
+        """
+        pinned = (peer.get('pinned_role') or '').strip().lower()
+        if pinned in ('idle', 'off', 'pause', 'paused', 'parked'):
+            return 'idle'
+        if pinned in ('cache_only', 'cache-only', 'cacheonly'):
+            return 'cache_only'
+        if pinned in ('frontier', 'active'):
+            return 'frontier'
         role = (peer.get('role') or '').strip().lower()
         if role in ('cache_only', 'cache-only', 'cacheonly'):
             return 'cache_only'
         return 'frontier'
+
+    # --- Credential pool & capability tracking -----------------------
+
+    # Minimum credentials required to start a new frontier KG. Set by the
+    # user as 'min_creds_per_frontier' in peers.json (default 2).
+    MIN_CREDS_PER_FRONTIER_DEFAULT = 2
+
+    def _credential_pool(self) -> list[dict]:
+        """Return the local credential list (no secrets)."""
+        try:
+            import copernicus as _cop
+            return _cop.list_credentials()
+        except Exception as e:
+            log.warning('credential_pool: %s', e)
+            return []
+
+    def _valid_credentials(self) -> list[int]:
+        """Return indices of credentials that are not exhausted.
+
+        Re-runs cheap probes at most every 10 minutes; uses cached
+        ``last_status`` from copernicus.list_credentials() in between.
+        """
+        creds = self._credential_pool()
+        # Force-revalidate every 10 min
+        last = self.state.get('_creds_revalidated_at') or 0
+        now = time.time()
+        if now - last > 600:
+            try:
+                import copernicus as _cop
+                _cop.revalidate_all_credentials()
+                creds = _cop.list_credentials()
+                self.state['_creds_revalidated_at'] = now
+            except Exception as e:
+                log.debug('revalidate_all_credentials failed: %s', e)
+        valid = []
+        for c in creds:
+            if c.get('exhausted'):
+                continue
+            st = (c.get('last_status') or '').lower()
+            if st in ('exhausted', 'invalid'):
+                continue
+            valid.append(int(c.get('index')))
+        return valid
+
+    def _peer_capabilities(self, ps: dict) -> set[str]:
+        """Read capability flags from a peer's /api/v1/info response.
+
+        ps is a dict that may have come from get_peer_status() (which
+        already contains 'git_commit') OR from a cached /info call.
+        We refresh capabilities lazily and cache them in director state.
+        """
+        caps = set(ps.get('capabilities') or [])
+        return caps
+
+    def _refresh_peer_caps(self, peer: dict) -> set[str]:
+        """Fetch /api/v1/info from a peer and cache its capabilities."""
+        url = peer.get('url')
+        pid = peer['id']
+        cache = self.state.setdefault('_peer_caps', {})
+        entry = cache.get(pid) or {}
+        if entry and (time.time() - entry.get('at', 0)) < 300:
+            return set(entry.get('caps') or [])
+        try:
+            if url is None:
+                # Local peer: import is fastest
+                import copernicus as _cop  # noqa: F401
+                caps = {'cred_subset_env', 'lat_strip_filter',
+                        'cred_api_v1', 'parallel_frontiers'}
+            else:
+                r = requests.get(url.rstrip('/') + '/api/v1/info',
+                                 timeout=PEER_TIMEOUT_PROBE,
+                                 headers=_admin_headers())
+                if not r.ok:
+                    return set(entry.get('caps') or [])
+                d = r.json()
+                caps = set(d.get('capabilities') or [])
+        except Exception as e:
+            log.debug('cap probe %s failed: %s', pid, e)
+            return set(entry.get('caps') or [])
+        cache[pid] = {'caps': sorted(caps), 'at': time.time()}
+        return caps
+
+    def _max_parallel_frontiers(self, cfg: dict) -> int:
+        """How many frontier peers we may run concurrently.
+
+        floor(valid_creds / min_creds_per_frontier). Clamped to 1+.
+        """
+        valid = self._valid_credentials()
+        per = int(cfg.get('min_creds_per_frontier',
+                          self.MIN_CREDS_PER_FRONTIER_DEFAULT))
+        per = max(1, per)
+        if not valid:
+            return 0
+        return max(1, len(valid) // per)
+
+    def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict) -> dict:
+        """Distribute valid credential indices across frontier peers.
+
+        Each peer gets a disjoint slice of length ``min_creds_per_frontier``.
+        Returns {peer_id: [cred_idx, ...]}.
+        """
+        valid = sorted(self._valid_credentials())
+        per = max(1, int(cfg.get('min_creds_per_frontier',
+                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        out = {}
+        if not valid or not frontier_ids:
+            return out
+        # Stable assignment by sorted peer id
+        peers_sorted = sorted(frontier_ids)
+        for i, pid in enumerate(peers_sorted):
+            slice_ = valid[i * per:(i + 1) * per]
+            if not slice_:
+                break
+            out[pid] = slice_
+        return out
+
+    def _strip_fingerprint(self, lat_south: float, lat_north: float) -> str:
+        """Return a cheap fingerprint of the cache manifest for one lat strip.
+
+        Concatenates the ``updated_at`` of every relevant ZIP for that
+        strip across all required products. When ANY ZIP is rewritten
+        (a new tile uploaded), the fingerprint changes and any
+        cache-miss entries pinned to the old fingerprint expire.
+        """
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        if not manifest_path.exists():
+            return ''
+        try:
+            d = json.loads(manifest_path.read_text())
+        except Exception:
+            return ''
+        files = d.get('files') or {}
+        parts = []
+        for product in ('ndvi', 'sar', 'harmonics', 'worldcover', 'hansen'):
+            if product == 'hansen':
+                name = f'hansen_strip_{lat_south:.1f}_{lat_north:.1f}.zip'
+            else:
+                name = f'copernicus_{product}_strip_{lat_south:.1f}_{lat_north:.1f}.zip'
+            ent = files.get(name) or {}
+            parts.append(name + '@' + str(ent.get('updated_at') or '-'))
+        import hashlib
+        return hashlib.md5('|'.join(parts).encode()).hexdigest()[:12]
+
+    def _strip_for_bbox(self, bb: dict) -> tuple[float, float] | None:
+        s = bb.get('min_lat') or bb.get('south')
+        n = bb.get('max_lat') or bb.get('north')
+        if s is None or n is None:
+            return None
+        for ls, ln in self._cached_lat_ranges():
+            if s >= ls - 1e-9 and n <= ln + 1e-9:
+                return (ls, ln)
+        return None
+
+    def _load_cache_misses(self) -> dict:
+        """Return {kg_code: {fingerprint, recorded_at, peer_id, strip}}."""
+        p = DATA_DIR / 'cache_miss_kgs.json'
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text()) or {}
+        except Exception:
+            return {}
+
+    def _save_cache_misses(self, misses: dict):
+        p = DATA_DIR / 'cache_miss_kgs.json'
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix('.tmp')
+            tmp.write_text(json.dumps(misses, indent=2))
+            os.replace(tmp, p)
+        except Exception as e:
+            log.warning('save cache_misses failed: %s', e)
+
+    def record_cache_miss(self, kg_code: str, peer_id: str = '?',
+                          bbox: dict | None = None,
+                          tile_info: str = '') -> dict:
+        """Mark a KG as cache-miss. Future cache-only orchestration skips
+        it until its strip fingerprint changes (i.e. new tiles uploaded).
+        """
+        kg_code = str(kg_code)
+        misses = self._load_cache_misses()
+        strip = None
+        if bbox:
+            strip = self._strip_for_bbox(bbox)
+        fp = self._strip_fingerprint(*strip) if strip else ''
+        entry = {
+            'fingerprint': fp,
+            'strip': list(strip) if strip else None,
+            'recorded_at': datetime.now(timezone.utc).isoformat(),
+            'peer_id': peer_id,
+            'tile_info': tile_info,
+        }
+        misses[kg_code] = entry
+        self._save_cache_misses(misses)
+        log.info('cache_miss recorded: KG %s (strip=%s fp=%s peer=%s)',
+                 kg_code, strip, fp, peer_id)
+        # Invalidate the cache-ready KG cache so next tick excludes this KG
+        with self._lock:
+            self.state.pop('_cache_ready_cache', None)
+        return entry
+
+    def _cache_miss_excluded(self) -> set:
+        """Return the set of KG codes that should currently be excluded
+        from cache-only whitelist because of an unresolved cache miss.
+        Entries whose fingerprint differs from the current manifest are
+        cleared (cache has updated since the miss).
+        """
+        misses = self._load_cache_misses()
+        if not misses:
+            return set()
+        # Compute current fingerprint per strip lazily.
+        fp_cache: dict[tuple, str] = {}
+        excluded = set()
+        changed = False
+        for kg, ent in list(misses.items()):
+            strip = ent.get('strip')
+            old_fp = ent.get('fingerprint') or ''
+            if not strip:
+                # Unknown strip — keep excluded for 24 h, then drop.
+                age = 0
+                try:
+                    age = (datetime.now(timezone.utc) -
+                           datetime.fromisoformat(ent['recorded_at'])).total_seconds()
+                except Exception:
+                    pass
+                if age > 86400:
+                    misses.pop(kg, None)
+                    changed = True
+                    continue
+                excluded.add(kg)
+                continue
+            key = (round(strip[0], 1), round(strip[1], 1))
+            cur_fp = fp_cache.get(key)
+            if cur_fp is None:
+                cur_fp = self._strip_fingerprint(strip[0], strip[1])
+                fp_cache[key] = cur_fp
+            if cur_fp and cur_fp != old_fp:
+                # Strip updated since miss — clear.
+                misses.pop(kg, None)
+                changed = True
+                log.info('cache_miss cleared: KG %s (strip %s fp %s→%s)',
+                         kg, key, old_fp, cur_fp)
+            else:
+                excluded.add(kg)
+        if changed:
+            self._save_cache_misses(misses)
+        return excluded
 
     def _cached_lat_ranges(self) -> list[tuple[float, float]]:
         """Lat strips covered by ALL required products in the Zenodo cache.
@@ -1416,11 +1740,17 @@ class PeerDirector:
                         return True
                 return False
 
+            cache_miss_excluded = self._cache_miss_excluded()
+            if cache_miss_excluded:
+                log.info('Cache-ready scan: excluding %d KGs with unresolved cache misses',
+                         len(cache_miss_excluded))
             scanned = 0
             prefiltered = 0
             for kg in kgs:
                 code = kg.get('kg_code')
                 if not code or code in completed or code in failed:
+                    continue
+                if code in cache_miss_excluded:
                     continue
                 bb = kg.get('bbox') or {}
                 w, s = bb.get('min_lon'), bb.get('min_lat')
@@ -1449,6 +1779,138 @@ class PeerDirector:
         with self._lock:
             self.state['_cache_ready_cache'] = {'codes': codes, 'at': now}
         return codes
+
+    def _orchestrate_parallel_frontiers(self):
+        """Start additional frontier peers when credential capacity permits.
+
+        Each new frontier gets:
+          * a disjoint slice of valid Copernicus credentials
+          * a disjoint slice of fully-cached lat strips
+        Both come from the same cache_manifest used by cache-only peers.
+
+        Skipped silently when:
+          * primary active_peer is not running yet
+          * fewer than 2*min_creds_per_frontier valid creds (can't fit a
+            second peer)
+          * peer lacks the ``cred_subset_env`` capability (graceful upgrade)
+        """
+        with self._lock:
+            mode = self.state.get('mode', 'auto')
+            cfg = self.cfg.copy()
+            state_copy = self.state.copy()
+        if mode == 'paused':
+            return
+
+        active_id = state_copy.get('active_peer')
+        if not active_id:
+            return
+
+        valid = self._valid_credentials()
+        per = max(1, int(cfg.get('min_creds_per_frontier',
+                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        max_par = len(valid) // per
+        if max_par <= 1:
+            # Not enough creds for a second frontier.
+            with self._lock:
+                self.state['parallel_frontiers_active'] = []
+            return
+
+        # Get covered lat strips (intersection of all required products)
+        strips = self._cached_lat_ranges()
+        if len(strips) < 2:
+            # Without at least 2 disjoint cache strips, parallel frontiers
+            # would conflict on tile_cache writes. Hold off.
+            with self._lock:
+                self.state['parallel_frontiers_active'] = []
+            return
+
+        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
+        min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
+        peers = list(cfg.get('peers', []))
+        total_enabled = sum(1 for p in peers if p.get('enabled', True))
+
+        # Already running parallel frontiers (excluding active_peer).
+        running: list[str] = []
+        candidates: list[dict] = []
+        for p in peers:
+            pid = p['id']
+            if pid == active_id:
+                continue
+            if not p.get('enabled', True):
+                continue
+            if _peer_is_scheduled(p):
+                continue
+            role = self._peer_role(p)
+            if role in ('idle', 'cache_only'):
+                continue
+            if p.get('reserved_kg'):
+                continue
+            bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
+            if (budget_bytes - bw.get('used_bytes', 0)) < 2 * (1024 ** 3):
+                continue
+            ps = get_peer_status(p.get('url'))
+            if ps.get('state') == 'unreachable':
+                continue
+            caps = self._refresh_peer_caps(p)
+            if 'cred_subset_env' not in caps:
+                continue  # graceful upgrade gate
+            is_running_frontier = (
+                ps.get('state') in ('running', 'processing')
+                and not ps.get('cache_only')
+            )
+            if is_running_frontier:
+                running.append(pid)
+            else:
+                candidates.append({'peer': p, 'state': ps.get('state', 'unknown')})
+
+        # Slot budget = max_par - 1 (subtract primary). Also keep reserve.
+        slack = max(0, total_enabled - (1 if active_id else 0)
+                    - len(running) - min_reserve)
+        max_add = min(slack, max_par - 1 - len(running))
+        if max_add <= 0 and not running:
+            with self._lock:
+                self.state['parallel_frontiers_active'] = list(running)
+            return
+
+        # Stable assignment: primary + sorted(running+candidates) -> ids in
+        # order define which cred slice and lat strip they get.
+        ordered = [active_id] + sorted(running) + sorted(
+            c['peer']['id'] for c in candidates[:max_add])
+        ordered = ordered[:max_par]  # cap to credential capacity
+        cred_plan = self._assign_cred_indices(ordered, cfg)
+        # Lat strips: round-robin disjoint assignment
+        strip_plan: dict[str, list] = {pid: [] for pid in ordered}
+        for i, st in enumerate(strips):
+            pid = ordered[i % len(ordered)]
+            strip_plan[pid].append([st[0], st[1]])
+
+        # Start new candidates with their plan.
+        to_start_ids = [pid for pid in ordered
+                        if pid != active_id and pid not in running]
+        started = []
+        for pid in to_start_ids:
+            peer = get_peer_by_id(cfg, pid)
+            if not peer:
+                continue
+            creds = cred_plan.get(pid)
+            strips_for = strip_plan.get(pid)
+            if not creds:
+                continue
+            log.info('Parallel frontier: starting %s with creds=%s strips=%s',
+                     pid, creds, strips_for)
+            try:
+                start_peer_processor(peer.get('url'),
+                                     cred_indices=creds,
+                                     lat_strips=strips_for)
+                started.append(pid)
+            except Exception as e:
+                log.warning('Start parallel frontier on %s failed: %s', pid, e)
+
+        with self._lock:
+            self.state['parallel_frontiers_active'] = list(set(running) | set(started))
+            self.state['frontier_cred_plan'] = cred_plan
+            self.state['frontier_strip_plan'] = strip_plan
+            save_director_state(self.state)
 
     def _orchestrate_cache_only(self):
         """Start/stop cache-only peers around the frontier peer.
@@ -1714,6 +2176,12 @@ class PeerDirector:
                     if _clear_completed_reservations(self.cfg):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
+                # Parallel-frontier orchestration: start additional
+                # frontier peers when credential capacity permits.
+                try:
+                    self._orchestrate_parallel_frontiers()
+                except Exception:
+                    log.exception('Parallel-frontier orchestration error')
                 # Cache-only orchestration runs alongside the frontier
                 # peer.  It only ever starts/stops peers that are NOT the
                 # active frontier and that have no reservation.

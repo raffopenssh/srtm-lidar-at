@@ -21,3 +21,5 @@ rf_training_data/openeo_circuit.json
 data/austria_processor/is_director
 data/austria_processor/zenodo_manifest.json
 data/admin_token
+data/austria_processor/copernicus_credentials.json
+data/austria_processor/cache_miss_kgs.json

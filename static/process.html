@@ -404,7 +404,18 @@
       </span>
     </div>
     <div id="directorBody" class="coll-b" style="margin-top:6px;">
+      <div id="directorCapacity" style="font-size:11px;color:var(--dim);margin-bottom:6px;"></div>
       <div id="directorPeers" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;"></div>
+      <div id="directorCredsBox" style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;font-weight:600">🔑 Copernicus credentials <span id="credsCount" style="color:var(--dim);font-weight:400"></span></span>
+          <span style="display:flex;gap:4px">
+            <button class="btn" onclick="revalidateCreds()" style="font-size:10px;padding:1px 6px">↻ Revalidate</button>
+            <button class="btn" onclick="showAddCredModal()" style="font-size:10px;padding:1px 6px">+ Add</button>
+          </span>
+        </div>
+        <div id="credsList" style="margin-top:6px;font-size:11px;"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2887,10 +2898,154 @@ function renderDirector(d) {
       html += '<div style="font-size:10px;color:var(--dim);margin-top:2px">↪ ' + note + '</div>';
     }
 
+    // --- Assignments (cred indices + lat strips) ---
+    if (p.cred_indices && p.cred_indices.length) {
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:2px" title="Credential indices reserved for this peer">🔑 creds: ' +
+        p.cred_indices.map(i => '#' + (i+1)).join(', ') + '</div>';
+    }
+    if (p.lat_strips && p.lat_strips.length) {
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:2px" title="Cache lat strips dedicated to this peer">🗺️ strips: ' +
+        p.lat_strips.map(s => s[0].toFixed(1) + '–' + s[1].toFixed(1) + '°').join(', ') + '</div>';
+    }
+    // --- Pin selector ---
+    {
+      const pinned = p.pinned_role || '';
+      const pinId = 'pin-' + esc(p.id);
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:4px;display:flex;align-items:center;gap:4px">📌 <select id="' + pinId + '" onchange="setPeerPin(\'' + esc(p.id) + '\', this.value)" style="font-size:10px;padding:0 2px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px">' +
+        '<option value=""' + (pinned===''?' selected':'') + '>auto</option>' +
+        '<option value="frontier"' + (pinned==='frontier'?' selected':'') + '>frontier</option>' +
+        '<option value="cache_only"' + (pinned==='cache_only'?' selected':'') + '>cache-only</option>' +
+        '<option value="idle"' + (pinned==='idle'?' selected':'') + '>idle</option>' +
+        '</select></div>';
+    }
+
     if (isInactive) html += '</div>'; // close .peer-detail
     html += '</div>'; // close card
   }
   container.innerHTML = html;
+
+  // --- Capacity line (above peer cards) ---
+  const cap = document.getElementById('directorCapacity');
+  if (cap) {
+    const valid = (d.valid_credentials || []).length;
+    const total = (d.credentials || []).length;
+    const per = d.min_creds_per_frontier || 2;
+    const maxPar = d.max_parallel_frontiers || 0;
+    const strips = (d.cached_lat_strips || []).length;
+    const parActive = (d.parallel_frontiers_active || []).length;
+    const cmCount = d.cache_miss_count || 0;
+    cap.innerHTML = '🔑 <b>' + valid + '/' + total + '</b> valid creds · ⚡ max parallel frontiers: <b>' + maxPar + '</b> (need ' + per + ' each)' +
+      ' · 🗺️ cached strips: <b>' + strips + '</b>' +
+      (parActive ? ' · → running parallel: <b>' + parActive + '</b>' : '') +
+      (cmCount ? ' · ⚠️ <span style="color:var(--yellow)" title="KGs excluded from cache-only whitelist until their Zenodo strip updates">' + cmCount + ' cache-miss KGs</span>' : '');
+  }
+  // --- Credentials list ---
+  renderCredentials(d.credentials || []);
+}
+
+function renderCredentials(creds) {
+  const list = document.getElementById('credsList');
+  const cnt = document.getElementById('credsCount');
+  if (cnt) cnt.textContent = '(' + creds.length + ')';
+  if (!list) return;
+  if (!creds.length) {
+    list.innerHTML = '<span style="color:var(--dim)">No credentials — add one above.</span>';
+    return;
+  }
+  let html = '<table style="width:100%;border-collapse:collapse;font-size:11px">' +
+    '<thead><tr style="color:var(--dim);text-align:left;border-bottom:1px solid var(--border)">' +
+    '<th>#</th><th>client_id</th><th>source</th><th>status</th><th>label</th><th></th></tr></thead><tbody>';
+  for (const c of creds) {
+    const exhausted = !!c.exhausted;
+    const st = (c.last_status || 'unchecked').toLowerCase();
+    const stColor = exhausted || st==='exhausted' ? 'var(--red)' :
+                    st==='valid' ? 'var(--green)' :
+                    st==='invalid' ? 'var(--red)' :
+                    st==='error' ? 'var(--yellow)' :
+                    'var(--dim)';
+    html += '<tr style="border-bottom:1px solid var(--border)">' +
+      '<td style="color:var(--dim)">' + (c.index+1) + '</td>' +
+      '<td style="font-family:monospace;color:var(--text)" title="' + esc(c.client_id||'') + '">' + esc((c.client_id_short || c.client_id || '').slice(0,18)) + '</td>' +
+      '<td style="color:var(--dim)">' + esc(c.source||'') + '</td>' +
+      '<td style="color:' + stColor + '">' + esc(st) + (exhausted ? ' (🚫)' : '') + '</td>' +
+      '<td style="color:var(--dim)">' + esc(c.label||'') + '</td>' +
+      '<td style="text-align:right">' +
+        (c.source==='builtin' ? '' :
+          '<button class="btn" style="font-size:10px;padding:0 4px" onclick="removeCred(\'' + esc(c.client_id) + '\')" title="Remove credential">✕</button>') +
+      '</td></tr>';
+  }
+  html += '</tbody></table>';
+  list.innerHTML = html;
+}
+
+async function setPeerPin(peerId, role) {
+  try {
+    const body = role ? {pinned_role: role} : {pinned_role: null};
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId) + '/pin', {
+      method:'POST', headers:{'Content-Type':'application/json',
+                              /* token added by interceptor */},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert('Pin failed: ' + (e.error || r.status));
+    }
+    fetchDirectorStatus();
+  } catch(e) { alert('Pin error: ' + e); }
+}
+
+async function showAddCredModal() {
+  const cid = prompt('Copernicus client_id (sh-...)?');
+  if (!cid) return;
+  const csec = prompt('Copernicus client_secret?');
+  if (!csec) return;
+  const label = prompt('Label/notes (optional)?', '') || '';
+  try {
+    const r = await fetch('/api/v1/credentials', {
+      method:'POST', headers:{'Content-Type':'application/json',
+                              /* token added by interceptor */},
+      body: JSON.stringify({client_id: cid.trim(), client_secret: csec.trim(),
+                            label: label.trim(), validate: true}),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      alert('Add failed: ' + (j.error || r.status));
+      return;
+    }
+    const v = j.validation || {};
+    alert('Added. Validation: ' + (v.status || 'unchecked') +
+          (v.error ? '\n' + v.error : ''));
+    fetchDirectorStatus();
+  } catch(e) { alert('Add error: ' + e); }
+}
+
+async function removeCred(clientId) {
+  if (!confirm('Remove credential ' + clientId + '?')) return;
+  try {
+    const r = await fetch('/api/v1/credentials/' + encodeURIComponent(clientId), {
+      method:'DELETE', headers:{/* token added by interceptor */},
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert('Remove failed: ' + (e.error || r.status));
+    }
+    fetchDirectorStatus();
+  } catch(e) { alert('Remove error: ' + e); }
+}
+
+async function revalidateCreds() {
+  try {
+    const r = await fetch('/api/v1/credentials/validate', {
+      method:'POST', headers:{'Content-Type':'application/json',
+                              /* token added by interceptor */},
+      body: '{}',
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert('Revalidate failed: ' + (e.error || r.status));
+    }
+    fetchDirectorStatus();
+  } catch(e) { alert('Revalidate error: ' + e); }
 }
 
 async function setDirectorMode(mode) {

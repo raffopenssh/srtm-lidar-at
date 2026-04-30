@@ -129,6 +129,8 @@ _PROTECTED_PREFIXES = (
     '/api/v1/processing/queue',
     '/api/v1/processing/cache_manifest',
     '/api/v1/zenodo/lock',
+    '/api/v1/credentials',
+    '/api/v1/processing/cache_misses',
 )
 
 
@@ -244,6 +246,69 @@ def admin_install_token():
     ADMIN_TOKEN = new_tok
     log.info('admin_install_token: token installed/rotated (len=%d)', len(new_tok))
     return jsonify({'status': 'installed'})
+
+
+# === SECTION: Copernicus credentials API ===
+
+@app.route('/api/v1/credentials', methods=['GET'])
+def credentials_list():
+    """List Copernicus credentials known to this peer (no secrets).
+
+    GET is allowed without admin token to support read-only dashboards;
+    the response never includes client_secret.
+    """
+    try:
+        import copernicus as _cop
+        return jsonify({'credentials': _cop.list_credentials()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/credentials', methods=['POST'])
+def credentials_add():
+    """Add a Copernicus credential pair, validate, and persist.
+
+    Body JSON: {"client_id":"sh-...","client_secret":"...",
+                "label":"optional","notes":"optional",
+                "validate": true|false}
+    """
+    data = request.get_json(silent=True) or {}
+    cid = (data.get('client_id') or '').strip()
+    csec = (data.get('client_secret') or '').strip()
+    if not cid or not csec:
+        return jsonify({'error': 'client_id and client_secret required'}), 400
+    import copernicus as _cop
+    res = _cop.add_credential(
+        cid, csec,
+        label=(data.get('label') or '').strip(),
+        notes=(data.get('notes') or '').strip(),
+        validate=bool(data.get('validate', True)),
+    )
+    if not res.get('ok'):
+        return jsonify(res), 400
+    return jsonify(res)
+
+
+@app.route('/api/v1/credentials/<client_id>', methods=['DELETE'])
+def credentials_remove(client_id):
+    import copernicus as _cop
+    res = _cop.remove_credential(client_id)
+    if not res.get('ok'):
+        return jsonify(res), 404
+    return jsonify(res)
+
+
+@app.route('/api/v1/credentials/validate', methods=['POST'])
+def credentials_validate():
+    """Probe one credential pair without storing. Body: client_id, client_secret.
+    Or POST with no body to revalidate all known credentials."""
+    data = request.get_json(silent=True) or {}
+    import copernicus as _cop
+    if data.get('client_id') and data.get('client_secret'):
+        return jsonify(_cop.validate_credential(
+            data['client_id'], data['client_secret']))
+    # No body — revalidate all
+    return jsonify({'results': _cop.revalidate_all_credentials()})
 
 
 # Initialize search index + watch for new KG JSON files
@@ -1587,6 +1652,31 @@ def processing_status():
         except Exception:
             pass
         data['git_commit'] = _GIT_COMMIT
+        # Surface assignment env so the director/dashboard see what this
+        # processor is dedicated to.
+        try:
+            _ci = os.environ.get('COPERNICUS_CRED_INDICES', '').strip()
+            if not _ci:
+                # Read from running processor's environ if possible.
+                if data.get('system', {}).get('proc_pid'):
+                    try:
+                        with open(f"/proc/{data['system']['proc_pid']}/environ", 'rb') as _f:
+                            envs = _f.read().split(b'\0')
+                        for kv in envs:
+                            if kv.startswith(b'COPERNICUS_CRED_INDICES='):
+                                _ci = kv.split(b'=', 1)[1].decode('utf-8', 'ignore')
+                            elif kv.startswith(b'KG_LAT_STRIP_FILTER='):
+                                try:
+                                    data['lat_strip_filter'] = json.loads(
+                                        kv.split(b'=', 1)[1].decode('utf-8', 'ignore'))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            if _ci:
+                data['cred_indices'] = [int(x) for x in _ci.split(',') if x.strip()]
+        except Exception:
+            pass
         # DB-sourced processed count (authoritative: counts all peers via Zenodo manifest sync)
         try:
             _row = si.get_index()._conn().execute(
@@ -1971,6 +2061,12 @@ def processing_start():
         request.args.get('cache_only', '').lower() in ('1', 'true', 'yes')
         or bool(body.get('cache_only'))
     )
+    # Per-peer assignments from the director:
+    #   cred_indices: list[int] of credentials this process may use
+    #   lat_strips:   list[[south,north]] of lat strips this peer is
+    #                 dedicated to (cache-only orchestration)
+    cred_indices = body.get('cred_indices')
+    lat_strips = body.get('lat_strips')
 
     if kg:
         args.extend(['--kg', kg])
@@ -1990,6 +2086,19 @@ def processing_start():
     # data/austria_processor/zenodo_lock_url.txt if present, else
     # localhost when this instance is the director, else unset (no-op).
     proc_env = os.environ.copy()
+    if cred_indices:
+        try:
+            cs = ','.join(str(int(i)) for i in cred_indices if int(i) >= 0)
+            if cs:
+                proc_env['COPERNICUS_CRED_INDICES'] = cs
+        except Exception:
+            pass
+    if lat_strips:
+        try:
+            # Encode as JSON list of [south, north] pairs.
+            proc_env['KG_LAT_STRIP_FILTER'] = json.dumps(lat_strips)
+        except Exception:
+            pass
     if 'ZENODO_LOCK_URL' not in proc_env:
         lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
         is_director = Path('data/austria_processor/is_director').exists()
@@ -3286,6 +3395,92 @@ def director_add_peer():
         'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
         'total_peers': len(cfg['peers']),
     })
+
+
+@app.route('/api/v1/processing/cache_misses', methods=['GET'])
+def processing_cache_misses_get():
+    """Return the recorded cache-miss KG list (director-side store)."""
+    p = Path('data/austria_processor/cache_miss_kgs.json')
+    if not p.exists():
+        return jsonify({})
+    try:
+        return jsonify(json.loads(p.read_text()))
+    except Exception:
+        return jsonify({})
+
+
+@app.route('/api/v1/processing/cache_misses', methods=['POST'])
+def processing_cache_misses_post():
+    """Record a cache-miss KG.
+
+    Body JSON: {kg_code, peer_id?, bbox?, tile_info?}
+    Stored in data/austria_processor/cache_miss_kgs.json keyed by KG code.
+    Future cache-only orchestration skips it until the strip's manifest
+    fingerprint changes (i.e. new tiles uploaded).
+    """
+    data = request.get_json(silent=True) or {}
+    kg = (data.get('kg_code') or '').strip()
+    if not kg:
+        return jsonify({'error': 'kg_code required'}), 400
+    d = pd.get_director()
+    entry = d.record_cache_miss(
+        kg, peer_id=data.get('peer_id', '?'),
+        bbox=data.get('bbox'), tile_info=data.get('tile_info', ''),
+    )
+    return jsonify({'status': 'recorded', 'kg_code': kg, 'entry': entry})
+
+
+@app.route('/api/v1/processing/cache_misses/<kg>', methods=['DELETE'])
+def processing_cache_misses_delete(kg):
+    """Clear a cache-miss entry (e.g. after manual cache push)."""
+    p = Path('data/austria_processor/cache_miss_kgs.json')
+    if not p.exists():
+        return jsonify({'status': 'not_found'}), 404
+    try:
+        misses = json.loads(p.read_text())
+    except Exception:
+        return jsonify({'error': 'corrupt store'}), 500
+    if kg in misses:
+        del misses[kg]
+        p.write_text(json.dumps(misses, indent=2))
+        # Drop director cache so next tick refreshes
+        d = pd.get_director()
+        with d._lock:
+            d.state.pop('_cache_ready_cache', None)
+        return jsonify({'status': 'cleared', 'kg_code': kg})
+    return jsonify({'status': 'not_found'}), 404
+
+
+@app.route('/api/v1/director/peers/<peer_id>/pin', methods=['POST'])
+def director_pin_peer(peer_id):
+    """Set or clear a peer's pinned_role.
+
+    Body JSON: {"pinned_role": "frontier"|"cache_only"|"idle"|null}
+    Pinning overrides automatic role selection. Setting null clears it.
+    """
+    data = request.get_json(silent=True) or {}
+    role = data.get('pinned_role')
+    if role is not None:
+        role = str(role).strip().lower() or None
+        if role and role not in ('frontier', 'cache_only', 'idle'):
+            return jsonify({'error': 'pinned_role must be one of frontier, cache_only, idle, or null'}), 400
+    cfg = pd.load_peers_config()
+    found = None
+    for p in cfg.get('peers', []):
+        if p['id'] == peer_id:
+            found = p
+            break
+    if not found:
+        return jsonify({'error': f'Peer {peer_id} not found'}), 404
+    if role is None:
+        found.pop('pinned_role', None)
+    else:
+        found['pinned_role'] = role
+    pd.save_peers_config(cfg)
+    d = pd.get_director()
+    d.reload_config()
+    return jsonify({'status': 'updated', 'peer_id': peer_id,
+                    'pinned_role': found.get('pinned_role')})
 
 
 @app.route('/api/v1/director/peers/<peer_id>', methods=['DELETE'])
@@ -9212,6 +9407,15 @@ def info():
         },
         "max_area_sqkm": MAX_AREA_SQM / 1e6,
         "proxy_pool": __import__('bev_proxy').status(),
+        # Capability flags. The director uses these to decide whether to
+        # send features the peer supports (graceful upgrade path).
+        "capabilities": [
+            'cred_subset_env',     # honors COPERNICUS_CRED_INDICES
+            'lat_strip_filter',    # honors KG_LAT_STRIP_FILTER
+            'cred_api_v1',         # /api/v1/credentials available
+            'parallel_frontiers',  # safe to run alongside other frontiers
+        ],
+        "capability_version": 1,
     })
 
 

@@ -475,6 +475,59 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
         return {'error': str(e)}
 
 
+def _in_progress_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
+    """Return the set of KG codes currently being processed by *other* peers.
+
+    Probes each peer's `/api/v1/processing/status` and pulls `current_kg.code`.
+    Used to exclude an active KG from the priority queue we push to a peer
+    we're about to (re)start, so two peers don't race the same KG.
+
+    Without this, the retry-queue sync happily re-issues a KG to a fresh
+    frontier even though another peer is mid-tile on it. Tile checkpoints
+    are per-peer, so the duplicate work is wasted.
+    """
+    import re as _re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = [p for p in cfg.get('peers', [])
+               if p.get('url') and (not exclude_peer_id
+                                    or p.get('id') != exclude_peer_id)]
+    out: set = set()
+    if not targets:
+        return out
+    with ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
+        futs = {pool.submit(get_peer_status, p['url']): p for p in targets}
+        for f in as_completed(futs, timeout=PEER_TIMEOUT_PROBE * 2 + 2):
+            try:
+                ps = f.result()
+            except Exception:
+                continue
+            if ps.get('state') not in ('running', 'processing'):
+                continue
+            ck = ps.get('current_kg') or {}
+            code = ck.get('code') if isinstance(ck, dict) else None
+            if code:
+                out.add(str(code))
+                # Also block the parent KG code so a sibling block of an
+                # already-being-split KG isn't issued to another peer.
+                m = _re.match(r'^(\d+)(?:-[a-z][-a-z0-9]*)?$', str(code))
+                if m:
+                    out.add(m.group(1))
+    return out
+
+
+def _excluded_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
+    """Union of reservations and in-progress KGs across other peers.
+
+    The single source of truth for "don't issue these KGs to *exclude_peer_id*".
+    Combines:
+      * `_reserved_kgs` — KGs held for cooled-down peers (resume from
+        tile checkpoints once their not_before expires).
+      * `_in_progress_kgs` — KGs another peer is currently processing.
+    """
+    return (_reserved_kgs(cfg, exclude_peer_id=exclude_peer_id)
+            | _in_progress_kgs(cfg, exclude_peer_id=exclude_peer_id))
+
+
 def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
     """Collect KGs reserved by other peers (not `exclude_peer_id`).
 
@@ -1259,7 +1312,7 @@ class PeerDirector:
                     if peer:
                         status = get_peer_status(peer.get('url'))
                         if status.get('state') in ('idle', 'stopped', 'unknown'):
-                            excl = _reserved_kgs(self.cfg, exclude_peer_id=active_id)
+                            excl = _excluded_kgs(self.cfg, exclude_peer_id=active_id)
                             log.info('Manual mode: starting processor on %s%s', active_id,
                                      (' — excluding ' + ','.join(sorted(excl))) if excl else '')
                             start_peer_processor(peer.get('url'), exclude_kgs=excl)
@@ -1416,7 +1469,7 @@ class PeerDirector:
                             self.state['active_peer'] = None
                             active_id = None
                     elif remaining_gb >= 2:
-                        excl = _reserved_kgs(cfg, exclude_peer_id=active_id)
+                        excl = _excluded_kgs(cfg, exclude_peer_id=active_id)
                         # Re-issue with the current cred/strip plan so
                         # the active peer stays pinned to its slice.
                         plan_cred = (self.state.get('frontier_cred_plan') or {}).get(active_id)
@@ -1526,7 +1579,7 @@ class PeerDirector:
 
                     # Exclude KGs reserved for other cooled-down peers,
                     # so a substitute does useful work on a different KG.
-                    excl = _reserved_kgs(cfg, exclude_peer_id=new_peer)
+                    excl = _excluded_kgs(cfg, exclude_peer_id=new_peer)
                     # Build credential + lat-strip plan. The active peer
                     # always gets the FIRST slice of creds and the FIRST
                     # Austria-wide lat strip; parallel-frontier peers
@@ -2314,7 +2367,7 @@ class PeerDirector:
             # priority queue, so we don't double-process a reservation
             # holder's KG on a parallel frontier that happens to share
             # the same lat strip.
-            par_excl = _reserved_kgs(cfg, exclude_peer_id=pid)
+            par_excl = _excluded_kgs(cfg, exclude_peer_id=pid)
             log.info('Parallel frontier: starting %s with creds=%s strips=%s%s',
                      pid, creds, strips_for,
                      (' (excluding ' + ','.join(sorted(par_excl)) + ')')
@@ -2585,7 +2638,7 @@ class PeerDirector:
         # Push to peer (excluding KGs reserved for cooled-down peers)
         with self._lock:
             cfg = self.cfg.copy()
-        excl = _reserved_kgs(cfg, exclude_peer_id=active_id)
+        excl = _excluded_kgs(cfg, exclude_peer_id=active_id)
         result = sync_queue_to_peer(peer['url'], exclude=excl)
         if 'error' not in result:
             with self._lock:

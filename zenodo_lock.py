@@ -24,9 +24,25 @@ import os
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
+
+_ADMIN_TOKEN_PATH = Path('data/admin_token')
+
+
+def _admin_headers() -> dict:
+    """Cluster auth header for the broker. Re-read each call so token
+    rotations on disk propagate without restarts. Empty dict if missing
+    (single-host dev or loopback)."""
+    try:
+        tok = _ADMIN_TOKEN_PATH.read_text().strip()
+        if tok:
+            return {'X-Admin-Token': tok}
+    except Exception:
+        pass
+    return {}
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +93,7 @@ class ZenodoLease:
                 r = requests.post(
                     f"{self.broker}/api/v1/zenodo/lock/heartbeat",
                     json={'token': self.token}, timeout=15,
+                    headers=_admin_headers(),
                 )
                 if r.status_code == 410:
                     log.warning('Zenodo lease lost (410) — broker reclaimed it')
@@ -92,6 +109,7 @@ class ZenodoLease:
             requests.delete(
                 f"{self.broker}/api/v1/zenodo/lock",
                 json={'token': self.token}, timeout=15,
+                headers=_admin_headers(),
             )
         except Exception as e:
             log.warning('Zenodo lease release failed: %s', e)
@@ -119,6 +137,7 @@ def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
                 f"{broker}/api/v1/zenodo/lock",
                 json={'peer': peer, 'purpose': purpose, 'kg': kg},
                 timeout=_BROKER_HTTP_TIMEOUT,
+                headers=_admin_headers(),
             )
         except Exception as e:
             # Broker unreachable. We retry a couple of times on transport

@@ -381,39 +381,80 @@ def _safe_git_sync(repo: str, sp):
         _os.close(lock_fd)
 
 
+_INDEX_WATCH_LOCK_PATH = '/tmp/srtm_index_watch.lock'
+
+
 def _init_search_index():
+    import fcntl as _fcntl, os as _os
     try:
-        idx = si.init_index()
+        idx = si.get_index()
         feedback_db.ensure_schema()
-        # On startup, ensure quality_flags has been computed for every existing JSON.
-        # Cheap (~6s for 18 KGs); idempotent per (obj_ref, flag_code, rule_version).
+        json_dir = Path('data/austria_processor/json')
+
+        # Acquire single-worker lock for the watcher loop. The other gunicorn
+        # worker exits this function early so we don't double-build.
+        lock_fd = _os.open(_INDEX_WATCH_LOCK_PATH,
+                           _os.O_CREAT | _os.O_RDWR, 0o644)
         try:
-            json_dir = Path('data/austria_processor/json')
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info('🔍 Search index watcher already running in another worker; skipping')
+            try: _os.close(lock_fd)
+            except Exception: pass
+            return
+
+        # Initial build (only the lock-holder does this)
+        idx.build()
+
+        # Initial quality_flags sweep
+        try:
             for jp in json_dir.glob('*.json'):
                 try: quality_flags.scan_json(jp)
                 except Exception as e: log.warning('quality_flags initial scan %s: %s', jp.name, e)
         except Exception as e:
             log.warning('quality_flags initial sweep: %s', e)
-        # Watch for new JSON files every 60s
-        json_dir = Path('data/austria_processor/json')
-        known = set(f.stem for f in json_dir.glob('*.json')) if json_dir.exists() else set()
+
+        # Watch for new/updated JSON files every 60s. Use mtime tracking so
+        # that re-uploaded JSONs (e.g. after backfill) get re-enriched.
+        def _snapshot():
+            if not json_dir.exists():
+                return {}
+            out = {}
+            for f in json_dir.glob('*.json'):
+                try: out[f.stem] = f.stat().st_mtime
+                except OSError: pass
+            return out
+
+        known = _snapshot()
         while True:
             time.sleep(60)
             try:
-                if not json_dir.exists():
+                current = _snapshot()
+                changed = [code for code, mt in current.items()
+                           if known.get(code) != mt]
+                if not changed:
                     continue
-                current_files = {f.stem: f for f in json_dir.glob('*.json')}
-                current = set(current_files.keys())
-                new_kgs = current - known
-                if new_kgs:
-                    log.info('🔍 New KGs detected: %s, rebuilding index + flags', new_kgs)
-                    idx.build()
-                    for kg in new_kgs:
-                        jp = current_files.get(kg)
-                        if jp:
-                            try: quality_flags.scan_json(jp)
-                            except Exception as e: log.warning('quality_flags scan %s: %s', kg, e)
-                    known = current
+                preview = changed[:10] + (['...'] if len(changed) > 10 else [])
+                log.info('🔍 %d new/updated KG JSON(s): %s',
+                         len(changed), preview)
+                # Incremental update -- no full rebuild
+                manifest = {}
+                mp = Path('data/austria_processor/zenodo_manifest.json')
+                if mp.exists():
+                    try:
+                        md = json.loads(mp.read_text())
+                        manifest = md.get('entries', md)
+                    except Exception:
+                        pass
+                for code in changed:
+                    jp = json_dir / f'{code}.json'
+                    try:
+                        idx.update_kg(code, json_path=str(jp), manifest=manifest)
+                    except Exception as e:
+                        log.warning('index update %s: %s', code, e)
+                    try: quality_flags.scan_json(jp)
+                    except Exception as e: log.warning('quality_flags scan %s: %s', code, e)
+                known = current
             except Exception as e:
                 log.warning('Search index watch: %s', e)
     except Exception as e:
@@ -630,12 +671,12 @@ def _sync_peer_data():
                     log.warning('Peer sync: manifest merge failed: %s', e)
 
             if new_count > 0:
-                log.info('Peer sync: %d new KG JSONs downloaded, triggering index rebuild', new_count)
-                try:
-                    idx = si.get_index()
-                    idx.build()
-                except Exception as e:
-                    log.warning('Peer sync: index rebuild failed: %s', e)
+                log.info('Peer sync: %d new KG JSONs downloaded; the index watcher will pick them up incrementally', new_count)
+                # No build()/update_kg() here -- the _init_search_index
+                # watcher (single-worker, fcntl-locked) detects mtime
+                # changes within ~60s and incrementally updates each
+                # changed KG row. Calling build() on every peer sync
+                # caused thrashing (14-30s rebuild every minute).
                 # Bump last_kg_code in our local progress.json to the most
                 # recently arrived JSON so the dashboard's "Last Completed
                 # KG" card updates as cache-only peers complete work.

@@ -3512,44 +3512,52 @@ def director_throttle():
 
 @app.route('/api/v1/director/proxy/status')
 def director_proxy_status():
-    """Proxy the active peer's processing status to the dashboard."""
+    """Return the active peer's *live* processing state on top of the
+    primary's locally-computed enrichment (manifest_* rate / ETA,
+    tile_history, db_* totals, kgs_completed_per_day, total_kgs, ...).
+    Without this overlay we lose all the cross-peer aggregates as soon
+    as a remote peer becomes active."""
     d = pd.get_director()
     status = d.get_status()
     active_id = status.get('active_peer')
+    # Start from the primary's enriched status so the dashboard keeps
+    # its rate / ETA / DB totals / sparkline / tile history even when
+    # a remote peer is the frontier.
+    base = processing_status().get_json() or {}
     if not active_id:
-        return jsonify({'state': 'no_active_peer', 'director': status})
+        base['_director'] = status
+        if not base.get('state'):
+            base['state'] = 'no_active_peer'
+        return jsonify(base)
     cfg = pd.load_peers_config()
     peer = pd.get_peer_by_id(cfg, active_id)
     if not peer:
-        return jsonify({'state': 'peer_not_found', 'director': status})
-    ps = pd.get_peer_status(peer.get('url'))
-    ps['_director'] = status
-    ps['_active_peer_id'] = active_id
-    ps['_active_peer_url'] = peer.get('url')
-    # Override DB totals with primary's authoritative DB (synced from all peers)
-    try:
-        _row = si.get_index()._conn().execute(
-            'SELECT COUNT(*), COALESCE(SUM(parcel_count),0), COALESCE(SUM(total_area_sqm),0)/1e6, '
-            'COALESCE(SUM(building_count),0), COALESCE(SUM(new_building_count),0), '
-            'COALESCE(SUM(tree_count),0), COALESCE(SUM(infrastructure_count),0) '
-            'FROM kg WHERE processed=1'
-        ).fetchone()
-        ps['db_processed'] = _row[0]
-        ps['db_parcels_total'] = int(_row[1] or 0)
-        ps['db_area_km2'] = round(float(_row[2] or 0), 2)
-        ps['db_buildings_total'] = int(_row[3] or 0)
-        ps['db_new_buildings_total'] = int(_row[4] or 0)
-        ps['db_trees_total'] = int(_row[5] or 0)
-        ps['db_infrastructure_total'] = int(_row[6] or 0)
-    except Exception:
-        pass
-    # Add bandwidth info
-    bw = status.get('peers', [])
-    for p in bw:
-        if p['id'] == active_id:
-            ps['_bandwidth'] = p.get('bandwidth', {})
+        base['_director'] = status
+        base['state'] = 'peer_not_found'
+        return jsonify(base)
+    ps = pd.get_peer_status(peer.get('url')) or {}
+    # Overlay only the fields that describe the peer's live work.
+    # Everything else (manifest_*, db_*, total_kgs, tile_history,
+    # kgs_completed_per_day, system, manifest, ...) stays from the
+    # primary's view.
+    LIVE_KEYS = (
+        'state', 'current_kg', 'current_step', 'step', 'step_detail',
+        'step_started_at', 'step_detail_ts', 'step_times', 'step_issues',
+        'started_at', 'last_kg_code', 'last_kg_seconds',
+        'recent_log', 'failed_kgs', 'subtile',
+        'instance', 'region', 'git_commit',
+    )
+    for k in LIVE_KEYS:
+        if k in ps and ps[k] is not None:
+            base[k] = ps[k]
+    base['_director'] = status
+    base['_active_peer_id'] = active_id
+    base['_active_peer_url'] = peer.get('url')
+    for p in status.get('peers', []):
+        if p.get('id') == active_id:
+            base['_bandwidth'] = p.get('bandwidth', {})
             break
-    return jsonify(ps)
+    return jsonify(base)
 
 
 @app.route('/api/v1/director/proxy/log')
@@ -3569,6 +3577,133 @@ def director_proxy_log():
         return jsonify({'lines': [], 'peer': target_id})
     log_lines = pd.get_peer_log(peer.get('url'), lines)
     return jsonify({'lines': log_lines, 'peer': target_id})
+
+
+_ALL_STATUS_CACHE = {'ts': 0.0, 'data': None, 'refreshing': False}
+_ALL_STATUS_TTL = 8.0       # serve cached if newer
+_ALL_STATUS_STALE = 60.0    # serve stale + bg refresh if newer
+_ALL_STATUS_CACHE_FILE = Path('/tmp/srtm_all_status_cache.json')
+
+def _all_status_load_disk():
+    try:
+        if _ALL_STATUS_CACHE_FILE.exists():
+            d = json.loads(_ALL_STATUS_CACHE_FILE.read_text())
+            _ALL_STATUS_CACHE['ts'] = float(d.get('cached_at', 0))
+            _ALL_STATUS_CACHE['data'] = d
+    except Exception:
+        pass
+
+def _all_status_save_disk(payload):
+    try:
+        tmp = _ALL_STATUS_CACHE_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(_ALL_STATUS_CACHE_FILE)
+    except Exception:
+        pass
+
+def _all_status_compute():
+    """Probe every running peer in parallel and return the payload.
+    Extracted from the route so background refresh can call it."""
+    from concurrent.futures import ThreadPoolExecutor
+    import time as _time
+    d = pd.get_director()
+    status = d.get_status()
+    cfg = pd.load_peers_config()
+    targets = []
+    for p in status.get('peers', []):
+        pid = p.get('id')
+        if not pid:
+            continue
+        is_active = p.get('is_active') or pid == status.get('active_peer')
+        is_cache_only = bool(p.get('cache_only_run'))
+        running = p.get('processor_state') in ('running', 'processing')
+        if not (is_active or (is_cache_only and running)):
+            continue
+        # Skip peers that the director already knows are offline
+        # (they hang the response while we wait for connect timeout).
+        if not p.get('online', True):
+            continue
+        peer_cfg = pd.get_peer_by_id(cfg, pid)
+        if not peer_cfg:
+            continue
+        targets.append((pid, peer_cfg.get('url'), bool(is_active), bool(is_cache_only)))
+    out: list[dict] = []
+    if targets:
+        def _probe(t):
+            pid, url, is_active, is_cache_only = t
+            # Local primary: read directly, no HTTP round-trip.
+            if not url:
+                try:
+                    ps = processing_status().get_json() or {}
+                except Exception as e:
+                    ps = {'state': 'unreachable', 'error': str(e)}
+            else:
+                try:
+                    # Tight timeout: this endpoint feeds a fast carousel,
+                    # slow/hung peers should drop out rather than block.
+                    import requests as _req
+                    r = _req.get(
+                        url.rstrip('/') + '/api/v1/processing/status',
+                        timeout=(2, 4),
+                        headers=pd._admin_headers(),
+                    )
+                    r.raise_for_status()
+                    ps = r.json() or {}
+                except Exception as e:
+                    ps = {'state': 'unreachable', 'error': str(e)}
+            ps['_peer_id'] = pid
+            ps['_peer_url'] = url
+            ps['_is_active'] = is_active
+            ps['_cache_only'] = is_cache_only
+            return ps
+        with ThreadPoolExecutor(max_workers=min(20, len(targets))) as pool:
+            out = list(pool.map(_probe, targets))
+    now = _time.time()
+    payload = {'peers': out, 'active_peer': status.get('active_peer'),
+               'cached_at': now}
+    _ALL_STATUS_CACHE['ts'] = now
+    _ALL_STATUS_CACHE['data'] = payload
+    _all_status_save_disk(payload)
+    return payload
+
+
+@app.route('/api/v1/director/proxy/all_status')
+def director_proxy_all_status():
+    """Return processing status for *every* running peer (active frontier
+    + all cache-only running peers). Used by process.html so the user
+    can swipe through current-KG cards across the fleet. Peers are
+    probed in parallel so the response stays under ~3s even with 20
+    peers. Stale-while-refresh keeps it snappy."""
+    import time as _time
+    import threading as _th
+    # In-memory cache may be cold (each gunicorn worker has its own);
+    # fall back to a tiny on-disk cache so workers share results.
+    if _ALL_STATUS_CACHE.get('data') is None:
+        _all_status_load_disk()
+    now = _time.time()
+    cached = _ALL_STATUS_CACHE.get('data')
+    age = now - _ALL_STATUS_CACHE.get('ts', 0)
+    if cached is not None and age < _ALL_STATUS_TTL:
+        return jsonify(cached)
+    # Re-read from disk in case another worker just refreshed.
+    _all_status_load_disk()
+    cached = _ALL_STATUS_CACHE.get('data')
+    age = now - _ALL_STATUS_CACHE.get('ts', 0)
+    if cached is not None and age < _ALL_STATUS_TTL:
+        return jsonify(cached)
+    if cached is not None and age < _ALL_STATUS_STALE and \
+       not _ALL_STATUS_CACHE.get('refreshing'):
+        def _bg_refresh():
+            try:
+                _all_status_compute()
+            except Exception:
+                pass
+            finally:
+                _ALL_STATUS_CACHE['refreshing'] = False
+        _ALL_STATUS_CACHE['refreshing'] = True
+        _th.Thread(target=_bg_refresh, daemon=True).start()
+        return jsonify(cached)
+    return jsonify(_all_status_compute())
 
 
 @app.route('/api/v1/director/proxy/combined_log')
@@ -4192,6 +4327,30 @@ def index_status():
     try:
         idx = si.get_index()
         return jsonify(idx.stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/processing/kg_outlines')
+def api_kg_outlines():
+    """Return processed-KG bboxes for the dashboard map. Cheap (one
+    SQL query against the search index).
+
+    Query params:
+      processed=1     only KGs marked processed (default)
+      processed=0     all KGs (warning: large response)
+    """
+    only_processed = request.args.get('processed', '1') != '0'
+    try:
+        conn = si.get_index()._conn()
+        sql = ('SELECT kg_code, kg_name, min_lon, min_lat, max_lon, max_lat '
+               'FROM kg WHERE min_lon IS NOT NULL')
+        if only_processed:
+            sql += ' AND processed=1'
+        rows = conn.execute(sql).fetchall()
+        out = [{'code': r[0], 'name': r[1] or '',
+                'bbox': [r[2], r[3], r[4], r[5]]} for r in rows]
+        return jsonify({'kgs': out, 'count': len(out)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

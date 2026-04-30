@@ -422,20 +422,31 @@
 
 <!-- Current KG -->
 <div class="kg-card" id="kgCard" style="display:none">
-  <div style="display:flex;align-items:baseline;gap:6px">
-    <span class="kg-title" id="kgTitle">—</span>
-    <span class="kg-sub" id="kgTimer"></span>
+  <div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap">
+    <span id="kgPeerTag" title="" style="display:none;font-size:10px;font-family:monospace;padding:1px 6px;border:1px solid var(--border);border-radius:10px;color:var(--dim);white-space:nowrap;cursor:help;flex-shrink:0"></span>
+    <span class="kg-title" id="kgTitle" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
+    <span class="kg-sub" id="kgTimer" style="flex-shrink:0"></span>
     <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
-      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;margin-left:auto;flex-shrink:0"
+      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
     >postpone</button>
   </div>
-  <div class="kg-sub" id="kgSub" style="min-height:1.3em"></div>
-  <div class="tile-bar" id="tileBar" style="display:none">
-    <span class="tile-lbl" id="tileLbl">tile 0/0</span>
-    <div class="tile-track"><div class="tile-fill" id="tileFill" style="width:0%"></div></div>
-    <span id="tilePct" style="min-width:32px;text-align:right">0%</span>
+  <div id="kgPeerNav" style="display:none;align-items:center;justify-content:center;gap:10px;font-size:11px;color:#8b949e;user-select:none;margin-top:4px">
+    <button type="button" onclick="_navKgPeer(-1)" title="Previous peer (← / swipe right)"
+      style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:2px 12px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.4">◀</button>
+    <span id="kgPeerNavPos" style="min-width:80px;text-align:center;font-variant-numeric:tabular-nums"></span>
+    <button type="button" onclick="_navKgPeer(+1)" title="Next peer (→ / swipe left)"
+      style="background:transparent;border:1px solid #30363d;border-radius:4px;color:inherit;padding:2px 12px;cursor:pointer;font-family:inherit;font-size:12px;line-height:1.4">▶</button>
   </div>
-  <div class="steps" id="kgSteps"></div>
+  <div id="kgBody">
+    <div class="kg-sub" id="kgSub" style="min-height:1.3em"></div>
+    <div class="tile-bar" id="tileBar" style="display:none">
+      <span class="tile-lbl" id="tileLbl">tile 0/0</span>
+      <div class="tile-track"><div class="tile-fill" id="tileFill" style="width:0%"></div></div>
+      <span id="tilePct" style="min-width:32px;text-align:right">0%</span>
+    </div>
+    <div class="steps" id="kgSteps"></div>
+  </div>
+  <div id="kgIdle" style="display:none"></div>
 </div>
 
 <!-- Last Completed KG Summary -->
@@ -703,6 +714,8 @@ let map, mapMarkers;
 let tileDotsLayer;       // current KG tile dots (redrawn each poll)
 let historyDotsLayer;    // accumulated past-KG tile dots (persistent)
 let copLayer, hanLayer;
+let outlinesLayer;       // bbox outlines of every processed KG (from search index)
+let _lastOutlinesCount = -1;
 let pulseMarker = null;
 let _lastPulseKey = null;
 let _tilesFitted = false;
@@ -768,18 +781,55 @@ function initMap() {
   hanLayer = L.layerGroup();
   historyDotsLayer = L.layerGroup();
   tileDotsLayer = L.layerGroup();
+  outlinesLayer = L.layerGroup();
   const tileDotsGroup = L.layerGroup([tileDotsLayer, historyDotsLayer]).addTo(map);
+  outlinesLayer.addTo(map);
   const zenodoGroup = L.layerGroup([copLayer, hanLayer]);
   L.control.layers(null, {
+    'Completed KGs': outlinesLayer,
     'Tile dots': tileDotsGroup,
     'Zenodo cache': zenodoGroup,
   }, {collapsed: true, position: 'topright'}).addTo(map);
   fetchTileOverlays();
+  fetchKgOutlines();
+  setInterval(fetchKgOutlines, 60000);
 }
 
 function updateMap(d) {
   // KG-level centroids removed — tile dots handle current KG.
   // Completed/failed KGs still get a marker via tile_statuses.
+}
+
+// Render KG bbox outlines for every processed KG. Cheap server-side
+// query against the search index, refreshed every 60s. Replaces the
+// per-tile dots that were lost when tile_history.json got truncated
+// to ~20 entries.
+async function fetchKgOutlines() {
+  if (!map || !outlinesLayer) return;
+  try {
+    const r = await fetch('/api/v1/processing/kg_outlines?processed=1');
+    if (!r.ok) return;
+    const j = await r.json();
+    const kgs = j.kgs || [];
+    if (kgs.length === _lastOutlinesCount) return;  // no change
+    _lastOutlinesCount = kgs.length;
+    outlinesLayer.clearLayers();
+    kgs.forEach(k => {
+      const bb = k.bbox || [];
+      if (bb.length !== 4) return;
+      const [w,s,e,n] = bb;
+      if (!w || !s || !e || !n) return;
+      const rect = L.rectangle([[s,w],[n,e]], {
+        color: '#3fb950', weight: 1, opacity: 0.55,
+        fillColor: '#3fb950', fillOpacity: 0.10,
+        className: 'kg-outline',
+        interactive: true,
+      });
+      rect.bindTooltip(k.code + ' ' + (k.name || ''),
+        {className: 'dark-tooltip', sticky: true});
+      outlinesLayer.addLayer(rect);
+    });
+  } catch (e) { /* ignore */ }
 }
 
 // Render accumulated history dots (completed & failed KGs)
@@ -1167,27 +1217,54 @@ function updateSubtitle(d) {
 }
 
 // ── Current KG ──────────────────────────────────────────────────
-function updateKgCard(d) {
+function updateKgCard(d, peerMeta) {
   const card = document.getElementById('kgCard');
+  const body = document.getElementById('kgBody');
+  const idleEl = document.getElementById('kgIdle');
+  const peerTag = document.getElementById('kgPeerTag');
+  // Peer tag (always reflects context if provided)
+  if (peerMeta && peerMeta.id) {
+    peerTag.style.display = '';
+    let label = peerMeta.id;
+    if (peerMeta.is_active) label += ' · frontier';
+    else if (peerMeta.cache_only) label += ' · cache-only';
+    peerTag.textContent = label;
+    let tip = peerMeta.id;
+    if (peerMeta.url) tip += '\n' + peerMeta.url;
+    if (peerMeta.is_active) tip += '\nrole: frontier (full processing)';
+    else if (peerMeta.cache_only) tip += '\nrole: cache-only (Zenodo cache only)';
+    peerTag.title = tip;
+    peerTag.style.borderColor = peerMeta.is_active ? 'var(--green)' : 'var(--blue)';
+    peerTag.style.color = peerMeta.is_active ? 'var(--green)' : 'var(--blue)';
+  } else {
+    peerTag.style.display = 'none';
+  }
   const kg = d.current_kg;
   if (!kg) {
     // Show idle state info
+    body.style.display = 'none';
+    idleEl.style.display = '';
     if (d.state === 'idle' || d.state === 'stopped') {
       card.style.display = 'block';
       card.style.borderColor = 'var(--border)';
       const last = d.last_kg_code ? 'Last completed: ' + d.last_kg_code : '';
       const t = d.last_kg_seconds ? ' in ' + fmtD(d.last_kg_seconds) : '';
-      card.innerHTML = '<div style="color:var(--dim);font-size:12px">' +
+      idleEl.innerHTML = '<div style="color:var(--dim);font-size:12px">' +
         (d.state === 'idle' ? '○ Idle' : '■ Stopped') + (last ? ' · ' + last + t : '') +
         '</div>';
     } else if (d.state === 'complete') {
       card.style.display = 'block';
       card.style.borderColor = '#23492e';
-      card.innerHTML = '<div style="color:var(--green);font-size:13px">✓ Processing complete</div>';
+      idleEl.innerHTML = '<div style="color:var(--green);font-size:13px">✓ Processing complete</div>';
     } else if (d.state === 'paused') {
       card.style.display = 'block';
       card.style.borderColor = '#3d3019';
-      card.innerHTML = '<div style="color:var(--yellow);font-size:12px">◉ Paused</div>';
+      idleEl.innerHTML = '<div style="color:var(--yellow);font-size:12px">◉ Paused</div>';
+    } else if (peerMeta) {
+      // Peer card: always visible during peer-swipe even when not running
+      card.style.display = 'block';
+      card.style.borderColor = 'var(--border)';
+      idleEl.innerHTML = '<div style="color:var(--dim);font-size:12px">○ ' + esc(d.state || 'idle') + '</div>';
     } else {
       card.style.display = 'none';
     }
@@ -1195,6 +1272,8 @@ function updateKgCard(d) {
     return;
   }
 
+  body.style.display = '';
+  idleEl.style.display = 'none';
   card.style.display = 'block';
   card.style.borderColor = 'rgba(88,166,255,0.3)';
 
@@ -1207,7 +1286,11 @@ function updateKgCard(d) {
   }
 
   document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
-  document.getElementById('btnPostpone').style.display = (d.state === 'running') ? '' : 'none';
+  // Only let user postpone the active frontier (the one a button click
+  // here actually controls). For other peers in the carousel hide it.
+  const _canPostpone = (d.state === 'running') &&
+    (!peerMeta || peerMeta.is_active || !peerMeta.id);
+  document.getElementById('btnPostpone').style.display = _canPostpone ? '' : 'none';
 
   // Tile progress bar
   const ct = kg.current_tile || 0;
@@ -1758,7 +1841,16 @@ async function poll() {
     _lastStatus = d;
     updateSubtitle(d);
     updateCards(d);
-    updateKgCard(d);
+    // Render the current-KG card; if the peer-swipe is showing a
+    // specific peer, defer to that view, otherwise show the active
+    // (primary or proxied frontier) status.
+    if (_peerCards && _peerCards.length > 0) {
+      _renderPeerCard();
+    } else {
+      updateKgCard(d);
+    }
+    // Refresh the per-peer carousel.
+    fetchAllPeerStatuses();
     // If we have a director with multiple running peers (active +
     // cache-only), pull a combined log so the Live Log shows what
     // every running peer is doing. Otherwise fall back to the
@@ -1802,6 +1894,101 @@ let _completedKgs = [];           // chronological, most recent last
 let _viewedKgIdx = -1;            // index into _completedKgs being shown
 let _stickToLatest = true;        // when true, follow new completions
 
+// Peer carousel for the Current KG card.
+let _peerCards = [];              // [{id,url,is_active,cache_only,status}]
+let _peerCardIdx = 0;             // index into _peerCards
+let _peerCardPinned = false;      // user navigated -> stop auto-resort
+let _peerFetchInflight = false;
+let _peerFetchLast = 0;
+
+function _peerProgressKey(p) {
+  // Lower = closer to completion. We score 0..1 where 1 = step `done`.
+  const STEPS_LOCAL = ['cadastre','lidar','terrain','ortho','copernicus','hansen',
+    'segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
+  const s = p.status || {};
+  const kg = s.current_kg || {};
+  let step = kg.step || s.current_step || s.step;
+  // Map tile_N -> segment for ordering purposes
+  if (step && /^tile_\d+$/.test(step)) step = 'segment';
+  // Map upload_*  -> upload (final phase before done)
+  if (step && step.startsWith('upload')) step = 'upload';
+  if (step === 'json_summary') step = 'json';
+  let stepIdx = step ? STEPS_LOCAL.indexOf(step) : -1;
+  if (stepIdx < 0) stepIdx = 0;
+  const stepFrac = stepIdx / Math.max(1, STEPS_LOCAL.length - 1);
+  // Tile fraction within the segment phase
+  const ct = kg.current_tile || 0, nt = kg.n_tiles || 0;
+  const tileFrac = (nt > 0) ? Math.min(1, Math.max(0, (ct - 1) / nt)) : 0;
+  // Combine: step weight dominates, tiles refine within segment phase
+  const score = stepFrac + (tileFrac * 0.5 / Math.max(1, STEPS_LOCAL.length - 1));
+  // Sort descending by score => smaller key first
+  return -score;
+}
+function _sortPeerCards(arr) {
+  return arr.slice().sort((a, b) => {
+    const ka = _peerProgressKey(a), kb = _peerProgressKey(b);
+    if (ka !== kb) return ka - kb;
+    // Active peer first as tiebreaker, then by id
+    if (a.is_active !== b.is_active) return a.is_active ? -1 : 1;
+    return String(a.id).localeCompare(String(b.id));
+  });
+}
+async function fetchAllPeerStatuses() {
+  if (_peerFetchInflight) return;
+  // Throttle to once every 8s (poll cadence is faster).
+  if (Date.now() - _peerFetchLast < 8000) return;
+  _peerFetchInflight = true;
+  try {
+    const r = await fetch('/api/v1/director/proxy/all_status');
+    if (!r.ok) return;
+    const j = await r.json();
+    const peers = (j.peers || []).map(s => ({
+      id: s._peer_id, url: s._peer_url,
+      is_active: !!s._is_active, cache_only: !!s._cache_only,
+      status: s,
+    }));
+    _peerCards = _sortPeerCards(peers);
+    _peerFetchLast = Date.now();
+    if (_peerCards.length === 0) return;
+    // Keep the same peer in view if user pinned, otherwise snap to the
+    // sorted-first card (closest to completion).
+    if (_peerCardPinned) {
+      const cur = _peerCards.findIndex(p => p.id === (_peerCards[_peerCardIdx]?.id));
+      _peerCardIdx = cur >= 0 ? cur : 0;
+    } else {
+      _peerCardIdx = 0;
+    }
+    _renderPeerCard();
+  } catch (e) {
+    // ignore
+  } finally {
+    _peerFetchInflight = false;
+  }
+}
+function _renderPeerCard() {
+  if (!_peerCards.length) return;
+  if (_peerCardIdx < 0) _peerCardIdx = 0;
+  if (_peerCardIdx >= _peerCards.length) _peerCardIdx = _peerCards.length - 1;
+  const p = _peerCards[_peerCardIdx];
+  updateKgCard(p.status, p);
+  // Nav indicator
+  const nav = document.getElementById('kgPeerNav');
+  const pos = document.getElementById('kgPeerNavPos');
+  if (_peerCards.length > 1) {
+    nav.style.display = 'flex';
+    pos.textContent = (_peerCardIdx + 1) + ' / ' + _peerCards.length +
+      ' · ' + p.id;
+  } else {
+    nav.style.display = 'none';
+  }
+}
+function _navKgPeer(delta) {
+  if (!_peerCards.length) return;
+  _peerCardPinned = true;
+  _peerCardIdx = Math.max(0, Math.min(_peerCards.length - 1, _peerCardIdx + delta));
+  _renderPeerCard();
+}
+
 async function _refreshCompletedKgs() {
   try {
     const r = await fetch('/api/v1/processing/completed_recent?limit=2000');
@@ -1836,6 +2023,30 @@ function _navKg(delta) {
   _stickToLatest = (_viewedKgIdx === _completedKgs.length - 1);
   fetchKgJson(_completedKgs[_viewedKgIdx]);
 }
+
+// Swipe + arrow-key navigation on the Current KG card (peer carousel).
+(function wireKgPeerNav(){
+  function attach() {
+    const card = document.getElementById('kgCard');
+    if (!card || card._peerNavWired) return;
+    card._peerNavWired = true;
+    let sx = 0, sy = 0, tracking = false;
+    card.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true;
+    }, { passive: true });
+    card.addEventListener('touchend', (e) => {
+      if (!tracking) return; tracking = false;
+      const t = (e.changedTouches && e.changedTouches[0]) || null;
+      if (!t) return;
+      const dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+      _navKgPeer(dx < 0 ? +1 : -1);
+    }, { passive: true });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach);
+  else attach();
+})();
 
 // Swipe + arrow-key navigation on the Last KG card.
 (function wireLastKgNav(){

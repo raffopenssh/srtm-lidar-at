@@ -129,11 +129,24 @@ def _read_single_tile(
         if nodata is not None:
             data[data == nodata] = np.nan
 
-        # --- Save to disk cache ---
+        # --- Save to disk cache (atomic: write to tmp + rename) ---
+        # Direct np.savez_compressed to the final path is not atomic — a
+        # SIGKILL/OOM/restart mid-write leaves a truncated .npz that
+        # surfaces later as "Corrupt BEV cache: No data left in file".
         try:
             tf_arr = np.array([transform.a, transform.b, transform.c,
                                transform.d, transform.e, transform.f])
-            np.savez_compressed(str(cp), data=data, transform=tf_arr)
+            import os as _os, tempfile as _tf
+            fd, tmp_path = _tf.mkstemp(
+                prefix=cp.stem + ".", suffix=".tmp.npz", dir=str(cp.parent))
+            _os.close(fd)
+            try:
+                np.savez_compressed(tmp_path, data=data, transform=tf_arr)
+                _os.replace(tmp_path, str(cp))
+            finally:
+                if _os.path.exists(tmp_path):
+                    try: _os.unlink(tmp_path)
+                    except Exception: pass
         except Exception as e:
             log.warning("Failed to cache %s: %s", label, e)
 

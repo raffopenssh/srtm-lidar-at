@@ -1539,6 +1539,51 @@ def processing_status():
                     'count': len(ents),
                     'total_size_bytes': sum(e.get('size', 0) for e in ents.values()),
                 }
+                # Completion rate / ETA based on actual Zenodo upload timestamps.
+                # One KG "completed" = max(uploaded_at) across its entries
+                # (full_gpkg / light_gpkg / json) — i.e. when the last
+                # product landed on Zenodo.
+                try:
+                    from datetime import datetime as _dt
+                    kg_done_at = {}
+                    for key, e in ents.items():
+                        ts = e.get('uploaded_at')
+                        if not ts:
+                            continue
+                        kg = key.split('_', 1)[0]
+                        try:
+                            t = _dt.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                        except Exception:
+                            continue
+                        if kg not in kg_done_at or t > kg_done_at[kg]:
+                            kg_done_at[kg] = t
+                    if kg_done_at:
+                        now_ts = time.time()
+                        times = sorted(kg_done_at.values())
+                        # Prefer last 24h; fall back to the last 50 KGs if
+                        # the window is sparse (e.g. peers idle overnight).
+                        WIN = 24 * 3600
+                        recent = [t for t in times if now_ts - t <= WIN]
+                        if len(recent) >= 5:
+                            window_s = max(now_ts - recent[0], 1.0)
+                            n_recent = len(recent)
+                        elif len(times) >= 5:
+                            tail = times[-50:]
+                            window_s = max(now_ts - tail[0], 1.0)
+                            n_recent = len(tail)
+                        else:
+                            window_s = max(now_ts - times[0], 1.0)
+                            n_recent = len(times)
+                        rate_per_h = n_recent / (window_s / 3600.0)
+                        avg_s = window_s / n_recent
+                        data['manifest_rate_kgs_per_hour'] = round(rate_per_h, 2)
+                        data['manifest_avg_seconds_per_kg'] = round(avg_s, 1)
+                        data['manifest_completion_count'] = len(kg_done_at)
+                        data['manifest_last_completion_ts'] = max(times)
+                        data['manifest_window_kgs'] = n_recent
+                        data['manifest_window_seconds'] = int(window_s)
+                except Exception as _ex:
+                    log.debug('manifest rate calc failed: %s', _ex)
         except Exception:
             pass
         data['git_commit'] = _GIT_COMMIT
@@ -1557,6 +1602,42 @@ def processing_status():
             data['db_new_buildings_total'] = int(_row[4] or 0)
             data['db_trees_total'] = int(_row[5] or 0)
             data['db_infrastructure_total'] = int(_row[6] or 0)
+            # Total Austria area for area-based progress (denominator).
+            _row2 = si.get_index()._conn().execute(
+                'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg'
+            ).fetchone()
+            data['db_area_km2_total'] = round(float(_row2[0] or 0), 2)
+        except Exception:
+            pass
+        # Sparkline series: KGs completed per day (last 30 days, by Zenodo upload).
+        try:
+            mf2 = _pl.Path('data/austria_processor/zenodo_manifest.json')
+            if mf2.exists():
+                from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+                md2 = json.loads(mf2.read_text())
+                ents2 = md2.get('entries', {})
+                kg_done_at2 = {}
+                for key, e in ents2.items():
+                    ts = e.get('uploaded_at')
+                    if not ts:
+                        continue
+                    kg = key.split('_', 1)[0]
+                    try:
+                        t = _dt2.fromisoformat(ts.replace('Z', '+00:00'))
+                    except Exception:
+                        continue
+                    if kg not in kg_done_at2 or t > kg_done_at2[kg]:
+                        kg_done_at2[kg] = t
+                if kg_done_at2:
+                    now_dt = _dt2.now(_tz2.utc)
+                    today = now_dt.date()
+                    DAYS = 30
+                    buckets = [0] * DAYS
+                    for t in kg_done_at2.values():
+                        d_ago = (today - t.date()).days
+                        if 0 <= d_ago < DAYS:
+                            buckets[DAYS - 1 - d_ago] += 1
+                    data['manifest_daily_completions'] = buckets
         except Exception:
             pass
         # Include persisted tile history for all completed/failed KGs

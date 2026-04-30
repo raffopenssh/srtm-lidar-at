@@ -368,6 +368,9 @@
     <div class="lb">Rate</div>
     <div class="val" id="cRateVal">—</div>
     <div class="det" id="cRateDet">—</div>
+    <div class="det" id="cRateArea" style="opacity:0.7;margin-top:2px"></div>
+    <svg id="cRateSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
+         style="width:100%;height:28px;margin-top:6px;display:block"></svg>
   </div>
   <div class="card" id="cSystem">
     <div class="lb">System</div>
@@ -959,14 +962,73 @@ function updateCards(d) {
     fContainer.innerHTML = '';
   }
 
-  // Rate
-  const rate = d.rate_kgs_per_hour;
+  // Rate — prefer Zenodo-upload-derived rate (counts ALL peers,
+  // resilient across processor restarts). Falls back to live
+  // session rate from the local processor if no manifest yet.
+  const mRate = d.manifest_rate_kgs_per_hour;
+  const mAvg = d.manifest_avg_seconds_per_kg;
+  const rate = (mRate != null) ? mRate : d.rate_kgs_per_hour;
+  const avgS = (mAvg != null) ? mAvg : d.avg_seconds_per_kg;
   document.getElementById('cRateVal').textContent = rate != null ? rate.toFixed(1) + ' KG/h' : '—';
   let rdet = '';
-  if (d.avg_seconds_per_kg) rdet += 'avg ' + fmtD(d.avg_seconds_per_kg) + '/KG';
-  if (d.eta_seconds) rdet += ' · ETA ' + fmtD(d.eta_seconds);
+  if (avgS) rdet += 'avg ' + fmtD(avgS) + '/KG';
+  // ETA from manifest rate if available; else processor-reported eta_seconds
+  let etaS = d.eta_seconds;
+  if (mRate && mRate > 0) {
+    const total = d.total_kgs || 0;
+    const done = (d.db_processed != null ? d.db_processed : (d.completed || 0));
+    const remaining = Math.max(total - done, 0);
+    etaS = (remaining / mRate) * 3600;
+  }
+  if (etaS) rdet += ' · ETA ' + fmtD(etaS);
   if (d.last_kg_seconds) rdet += ' · last ' + fmtD(d.last_kg_seconds);
+  if (mRate != null && d.manifest_window_kgs) {
+    rdet += ' · <span style="opacity:0.6">last ' + d.manifest_window_kgs + ' uploads</span>';
+  }
   document.getElementById('cRateDet').innerHTML = rdet || '—';
+
+  // Area-based progress subtitle
+  const aDone = d.db_area_km2 || 0;
+  const aTot = d.db_area_km2_total || 0;
+  const aEl = document.getElementById('cRateArea');
+  if (aTot > 0) {
+    const aPct = (aDone / aTot * 100);
+    aEl.textContent = aDone.toLocaleString(undefined,{maximumFractionDigits:0}) +
+                      ' / ' + aTot.toLocaleString(undefined,{maximumFractionDigits:0}) +
+                      ' km² · ' + aPct.toFixed(1) + '% by area';
+  } else {
+    aEl.textContent = '';
+  }
+
+  // Sparkline: KGs/day over last 30 days
+  const spark = document.getElementById('cRateSpark');
+  const series = d.manifest_daily_completions || [];
+  if (spark && series.length) {
+    const W = 120, H = 28;
+    const max = Math.max(1, ...series);
+    const n = series.length;
+    const bw = W / n;
+    const today = series[n - 1];
+    let bars = '';
+    for (let i = 0; i < n; i++) {
+      const v = series[i];
+      const h = (v / max) * (H - 2);
+      const x = i * bw;
+      const y = H - h;
+      const isToday = (i === n - 1);
+      const fill = isToday ? 'var(--green)' : 'rgba(46,160,67,0.45)';
+      bars += '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
+              '" width="' + Math.max(bw - 0.5, 0.5).toFixed(2) +
+              '" height="' + Math.max(h, 0.5).toFixed(2) +
+              '" fill="' + fill + '"><title>' + v + ' KG (' +
+              (n - 1 - i) + 'd ago)</title></rect>';
+    }
+    spark.innerHTML = bars;
+    spark.style.display = 'block';
+  } else if (spark) {
+    spark.innerHTML = '';
+    spark.style.display = 'none';
+  }
 
   // System
   let zc = {};

@@ -496,7 +496,13 @@ def _in_progress_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
         return out
     with ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
         futs = {pool.submit(get_peer_status, p['url']): p for p in targets}
-        for f in as_completed(futs, timeout=PEER_TIMEOUT_PROBE * 2 + 2):
+        # PEER_TIMEOUT_PROBE is a (connect, read) tuple; cap the wall-clock
+        # wait at read*2 + a small buffer so a single hung peer doesn't
+        # stall the director loop.
+        _read_to = (PEER_TIMEOUT_PROBE[1]
+                    if isinstance(PEER_TIMEOUT_PROBE, tuple)
+                    else PEER_TIMEOUT_PROBE)
+        for f in as_completed(futs, timeout=_read_to * 2 + 2):
             try:
                 ps = f.result()
             except Exception:

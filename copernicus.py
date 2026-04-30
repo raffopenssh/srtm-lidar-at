@@ -105,12 +105,48 @@ def _load_credentials_from_disk() -> list:
             _exhausted_cred_indices.add(i)
     return creds
 
+def _reload_credentials_from_disk():
+    """Re-read on-disk store and merge any user creds we don't know about
+    into the in-memory pool. Necessary because gunicorn runs multiple
+    workers, each with its own ``_CREDENTIALS`` list — without this,
+    worker B will save its stale view and overwrite worker A's additions.
+    """
+    global _CREDENTIALS
+    if not _CRED_STORE.exists():
+        return
+    try:
+        data = json.loads(_CRED_STORE.read_text())
+    except Exception as e:
+        logger.warning("Failed to re-read credentials store: %s", e)
+        return
+    seen = {c[0] for c in _CREDENTIALS}
+    for entry in data.get("credentials", []):
+        cid = entry.get("client_id")
+        csec = entry.get("client_secret")
+        if not cid or not csec:
+            continue
+        # Always pull latest meta (last_status, exhausted, label, etc.)
+        if cid in _cred_meta:
+            for k, v in entry.items():
+                if k != "client_secret":
+                    _cred_meta[cid][k] = v
+        else:
+            _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
+        if cid not in seen:
+            _CREDENTIALS.append((cid, csec))
+            seen.add(cid)
+            # Honor persisted exhaustion
+            if entry.get("exhausted"):
+                _exhausted_cred_indices.add(len(_CREDENTIALS) - 1)
+
 def _save_credentials_to_disk():
     """Persist non-builtin credentials + meta for all creds to disk.
 
     Also persists per-credential ``exhausted`` + ``exhausted_at`` so a
     fresh subprocess (and the director) inherits the state.
     """
+    # Refresh from disk first so we don't drop creds another worker added.
+    _reload_credentials_from_disk()
     builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
     out = {"credentials": []}
     now_iso = __import__('datetime').datetime.utcnow().isoformat() + "Z"
@@ -255,6 +291,8 @@ def list_credentials() -> list:
     """Return public credential metadata (client_id, source, last_validated_at,
     last_status, exhausted, label). Never returns secrets."""
     with _cred_lock:
+        # Pick up creds added by sibling gunicorn workers.
+        _reload_credentials_from_disk()
         exhausted = set(_exhausted_cred_indices)
         creds = list(_CREDENTIALS)
     out = []

@@ -324,6 +324,13 @@
   #zenTbl .zen-th-date { width: 21%; }
   #zenTbl .zen-th-url  { width: 12%; }
   .zen-url-icon { display: none; }
+  /* Pulsing glow on rows whose KG is currently being processed */
+  @keyframes kgGlow {
+    0%,100% { box-shadow: inset 0 0 0 0 rgba(88,166,255,0); background: rgba(88,166,255,0.06); }
+    50%     { box-shadow: inset 0 0 14px 0 rgba(88,166,255,0.55); background: rgba(88,166,255,0.18); }
+  }
+  #zenTbl tr.kg-active td { animation: kgGlow 2.2s ease-in-out infinite; }
+  #zenTbl tr.kg-active td:first-child { box-shadow: inset 3px 0 0 0 var(--blue); }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
     #zenTbl .zen-th-name { width: 46%; }
@@ -1658,6 +1665,32 @@ async function fetchManifestSummary() {
 }
 
 let _zenFilterCode = '';  // active KG code filter for manifest
+let _activeProcessingKgs = new Set();  // KG codes currently being processed across all peers
+
+// Update the kg-active class on existing manifest rows without re-rendering.
+function _applyActiveKgGlow() {
+  const tbody = document.querySelector('#zenTbl tbody');
+  if (!tbody) return;
+  tbody.querySelectorAll('tr[data-kg]').forEach(tr => {
+    const code = tr.getAttribute('data-kg');
+    if (code && _activeProcessingKgs.has(code)) tr.classList.add('kg-active');
+    else tr.classList.remove('kg-active');
+  });
+}
+
+function _updateActiveProcessingKgs(peers) {
+  const next = new Set();
+  (peers || []).forEach(p => {
+    const cur = (p.status && p.status.current_kg) || null;
+    if (cur && cur.code) next.add(String(cur.code));
+  });
+  // Cheap diff
+  let same = next.size === _activeProcessingKgs.size;
+  if (same) for (const c of next) if (!_activeProcessingKgs.has(c)) { same = false; break; }
+  if (same) return;
+  _activeProcessingKgs = next;
+  _applyActiveKgGlow();
+}
 let _zenFilterLabel = ''; // display label for active filter
 
 function _zenManifestRow(e) {
@@ -1674,7 +1707,11 @@ function _zenManifestRow(e) {
     const min = String(dt.getMinutes()).padStart(2,'0');
     return dd+'/'+mm+' '+hh+':'+min;
   })() : '—';
-  return '<tr>' +
+  // Extract KG code from filename (e.g. '12017_full.gpkg', '49006-south.json')
+  const kgMatch = (e.filename || '').match(/^([0-9]+(?:-[a-z]+(?:-\d+)?)?)/i);
+  const kgCode = kgMatch ? kgMatch[1] : '';
+  const activeCls = (kgCode && _activeProcessingKgs && _activeProcessingKgs.has(kgCode)) ? ' class="kg-active"' : '';
+  return '<tr' + activeCls + (kgCode ? ' data-kg="' + esc(kgCode) + '"' : '') + '>' +
     '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
     '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
     '<td title="' + fname + '">' + fname + '</td>' +
@@ -1871,6 +1908,16 @@ async function poll() {
     _lastStatus = d;
     updateSubtitle(d);
     updateCards(d);
+    // Fallback (single-instance / before peer fetch returns): seed active set
+    // from the current status payload too.
+    if (!_peerCards || _peerCards.length === 0) {
+      const next = new Set();
+      const cur = d && d.current_kg;
+      if (cur && cur.code) next.add(String(cur.code));
+      let same = next.size === _activeProcessingKgs.size;
+      if (same) for (const c of next) if (!_activeProcessingKgs.has(c)) { same = false; break; }
+      if (!same) { _activeProcessingKgs = next; _applyActiveKgGlow(); }
+    }
     // Render the current-KG card; if the peer-swipe is showing a
     // specific peer, defer to that view, otherwise show the active
     // (primary or proxied frontier) status.
@@ -1979,6 +2026,7 @@ async function fetchAllPeerStatuses() {
     }));
     _peerCards = _sortPeerCards(peers);
     _peerFetchLast = Date.now();
+    _updateActiveProcessingKgs(peers);
     if (_peerCards.length === 0) return;
     // Keep the same peer in view if user pinned, otherwise snap to the
     // sorted-first card (closest to completion).

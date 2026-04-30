@@ -2096,8 +2096,13 @@ class PeerDirector:
             role = self._peer_role(p)
             if role in ('idle', 'cache_only'):
                 continue
-            if p.get('reserved_kg'):
-                continue
+            # Reservation holders are eligible as parallel frontiers —
+            # they just process their reserved KG first (priority queue
+            # ensures it is at the head, _reserved_kgs excludes other
+            # peers from racing them on it). Without this, a reservation
+            # holder whose pre-emption is pending (active peer mid‑KG)
+            # would sit idle indefinitely instead of running parallel
+            # frontier work in the meantime.
             bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
             if (budget_bytes - bw.get('used_bytes', 0)) < 2 * (1024 ** 3):
                 continue

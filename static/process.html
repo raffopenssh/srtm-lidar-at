@@ -1642,6 +1642,11 @@ function peerActionsMenu(p, opts) {
   if (hasReserved) {
     items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => releaseHold(${idJ}))">⤓ Release hold (KG ${esc(p.reserved_kg)})</button>`);
   }
+  if (p.online && p.url != null) {
+    if (items.length) items.push('<div class="pmenu-sep"></div>');
+    items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => updatePeerById(${idJ}, true))" title="git pull + restart after current KG finishes">⬆ Update (graceful)</button>`);
+    items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => updatePeerById(${idJ}, false))" title="git pull + restart immediately, killing mid-KG work">⬆ Force update</button>`);
+  }
   if (!opts.hideRemove && !isPrimary && p.url != null) {
     if (items.length) items.push('<div class="pmenu-sep"></div>');
     items.push(`<button class="pmenu-item danger" onclick="_pmenuRun(this, () => deletePeer(${idJ}))">✕ Remove peer</button>`);
@@ -1700,6 +1705,17 @@ async function cooldownPeerById(peerId, hours) {
        body: JSON.stringify({hours: hours})});
     if (!r.ok) { alert('Cooldown failed: ' + await r.text()); return; }
     setTimeout(() => { poll(); fetchDirectorStatus(); fetchAllPeerStatuses(); }, 1500);
+  } catch(e) { console.error(e); }
+}
+async function updatePeerById(peerId, graceful) {
+  const label = graceful ? 'graceful update (after current KG)' : 'force update (kills mid-KG work)';
+  if (!confirm('Run ' + label + ' on ' + peerId + '?')) return;
+  try {
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId) + '/update',
+      {method:'POST', headers: {'Content-Type':'application/json'},
+       body: JSON.stringify({graceful: !!graceful})});
+    if (!r.ok) { alert('Update failed: ' + await r.text()); return; }
+    setTimeout(() => { fetchDirectorStatus(); fetchAllPeerStatuses(); }, 3000);
   } catch(e) { console.error(e); }
 }
 async function releaseHold(peerId) {
@@ -3256,9 +3272,9 @@ function renderDirector(d) {
       const vtInline = versionTag(p);
       if (vtInline) html += ' · ' + vtInline;
       html += '</span>';
-      html += '<span style="display:flex;align-items:center;gap:4px">';
-      if (p.url !== null) html += '<span style="font-size:11px;color:var(--dim);cursor:pointer;opacity:0.5;transition:opacity 0.15s" onmouseover="this.style.opacity=1;this.style.color=\'var(--red)\'" onmouseout="this.style.opacity=0.5;this.style.color=\'var(--dim)\'" onclick="event.stopPropagation();deletePeer(\'' + esc(p.id) + '\')" title="Remove peer">✕</span>';
-      html += '<span style="font-size:10px;color:var(--dim)">▼</span>';
+      html += '<span style="display:flex;align-items:center;gap:4px" onclick="event.stopPropagation()">';
+      html += peerActionsMenu(p, {isActive: isActive});
+      html += '<span style="font-size:10px;color:var(--dim);cursor:pointer" onclick="this.closest(\'div[onclick]\').parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">▼</span>';
       html += '</span>';
       html += '</div>';
       // Hidden detail section
@@ -3297,7 +3313,6 @@ function renderDirector(d) {
       // Show inside hidden detail
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
       html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + '</span>';
-      html += peerActionsMenu(p, {isActive: isActive});
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');

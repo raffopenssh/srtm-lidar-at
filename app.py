@@ -3557,6 +3557,29 @@ def director_cooldown_peer(peer_id):
                     'released_kg': released_kg})
 
 
+@app.route('/api/v1/director/peers/<peer_id>/update', methods=['POST'])
+def director_update_peer(peer_id):
+    """Trigger git pull + restart on a single peer.
+
+    Body JSON: {"graceful": true|false}. ``graceful=true`` (default)
+    defers the restart until the peer finishes the current KG.
+    ``graceful=false`` restarts immediately, killing any mid-KG work.
+    """
+    body = request.get_json(silent=True) or {}
+    graceful = body.get('graceful', True) is not False
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return jsonify({'error': f'Peer {peer_id} not found'}), 404
+    url = peer.get('url')
+    if not url:
+        # Primary updates locally via /api/v1/admin/update — proxy in-process.
+        return admin_update()  # type: ignore[name-defined]
+    res = pd.trigger_peer_update(url, graceful=graceful)
+    return jsonify({'status': 'ok', 'peer_id': peer_id,
+                    'graceful': graceful, 'result': res})
+
+
 @app.route('/api/v1/director/peers/<peer_id>/release_hold', methods=['POST'])
 def director_release_hold(peer_id):
     """Release a peer's reserved KG hold.

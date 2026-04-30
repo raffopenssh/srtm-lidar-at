@@ -2404,7 +2404,30 @@ def processing_stop():
 
 @app.route('/api/v1/processing/postpone', methods=['POST'])
 def processing_postpone():
-    """Postpone current KG — kill subprocess, re-queue 5 KGs later, no fail count bump."""
+    """Postpone current KG — kill subprocess, re-queue 5 KGs later, no fail count bump.
+
+    Optional ``peer_id`` (query or JSON body) proxies the request to that
+    peer so the dashboard can postpone whichever peer's KG card is on
+    screen, not just the local primary.
+    """
+    peer_id = request.args.get('peer_id') or (
+        (request.get_json(silent=True) or {}).get('peer_id'))
+    if peer_id:
+        cfg = pd.load_peers_config()
+        peer_cfg = pd.get_peer_by_id(cfg, peer_id)
+        if not peer_cfg:
+            return jsonify({'error': f'Peer {peer_id} not found'}), 404
+        url = peer_cfg.get('url')
+        if url:
+            try:
+                import requests as _req
+                r = _req.post(url.rstrip('/') + '/api/v1/processing/postpone',
+                              timeout=(3, 8), headers=pd._admin_headers())
+                return (r.text, r.status_code,
+                        {'Content-Type': r.headers.get('Content-Type', 'application/json')})
+            except Exception as e:
+                return jsonify({'error': f'Proxy to {peer_id} failed: {e}'}), 502
+        # else: peer is the local primary, fall through
     postpone_file = Path('data/austria_processor/postpone_signal.json')
     # Read current KG from progress
     pf = Path('data/austria_processor/progress.json')
@@ -3492,6 +3515,45 @@ def processing_cache_misses_delete(kg):
     return jsonify({'status': 'not_found'}), 404
 
 
+@app.route('/api/v1/director/peers/<peer_id>/cooldown', methods=['POST'])
+def director_cooldown_peer(peer_id):
+    """Set a manual cooldown on a peer.
+
+    Body JSON: {"hours": 24} (default 24). Sets ``not_before`` to now+hours
+    and stops the peer's processor. The director will skip it until the
+    cooldown lifts. Pass ``hours=0`` to clear an existing cooldown.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        hours = float(body.get('hours', 24))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'hours must be a number'}), 400
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return jsonify({'error': f'Peer {peer_id} not found'}), 404
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    if hours <= 0:
+        peer.pop('not_before', None)
+        nb_iso = None
+    else:
+        nb_iso = (_dt.now(_tz.utc) + _td(hours=hours)).isoformat()
+        peer['not_before'] = nb_iso
+    pd.save_peers_config(cfg)
+    # Stop the peer's processor so the cooldown takes immediate effect.
+    stopped = False
+    if hours > 0:
+        try:
+            pd.safely_stop_peer(peer.get('url'), peer_id)
+            stopped = True
+        except Exception as e:
+            log.warning('cooldown: stop %s failed: %s', peer_id, e)
+    d = pd.get_director()
+    d.reload_config()
+    return jsonify({'status': 'ok', 'peer_id': peer_id,
+                    'not_before': nb_iso, 'stopped': stopped, 'hours': hours})
+
+
 @app.route('/api/v1/director/peers/<peer_id>/pin', methods=['POST'])
 def director_pin_peer(peer_id):
     """Set or clear a peer's pinned_role.
@@ -3658,7 +3720,9 @@ def _all_status_compute():
         is_active = p.get('is_active') or pid == status.get('active_peer')
         is_cache_only = bool(p.get('cache_only_run'))
         running = p.get('processor_state') in ('running', 'processing')
-        if not (is_active or (is_cache_only and running)):
+        # Include the active frontier, any other running frontier peers
+        # (parallel-frontier mode), and all running cache-only peers.
+        if not (is_active or running):
             continue
         # Skip peers that the director already knows are offline
         # (they hang the response while we wait for connect timeout).

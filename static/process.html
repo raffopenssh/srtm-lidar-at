@@ -429,6 +429,9 @@
     <button id="btnPostpone" onclick="postponeKG()" title="Skip this KG, retry in 5 KGs"
       style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
     >postpone</button>
+    <button id="btnCooldown" onclick="cooldownPeer()" title="Stop this peer and skip it for 24h"
+      style="font-family:inherit;font-size:10px;padding:0 5px;border:1px solid var(--yellow);background:transparent;color:var(--yellow);border-radius:3px;cursor:pointer;display:none;line-height:18px;white-space:nowrap;flex-shrink:0"
+    >24h cooldown</button>
   </div>
   <div id="kgPeerNav" style="display:none;align-items:center;justify-content:center;gap:10px;font-size:11px;color:#8b949e;user-select:none;margin-top:4px">
     <button type="button" onclick="_navKgPeer(-1)" title="Previous peer (← / swipe right)"
@@ -1286,11 +1289,12 @@ function updateKgCard(d, peerMeta) {
   }
 
   document.getElementById('kgTitle').textContent = kg.code + ' ' + (kg.name || '');
-  // Only let user postpone the active frontier (the one a button click
-  // here actually controls). For other peers in the carousel hide it.
-  const _canPostpone = (d.state === 'running') &&
-    (!peerMeta || peerMeta.is_active || !peerMeta.id);
-  document.getElementById('btnPostpone').style.display = _canPostpone ? '' : 'none';
+  // Postpone + 24h cooldown apply to whichever peer's card is on screen.
+  // Buttons proxy to the peer via peer_id; show whenever the peer is running.
+  const _peerRunning = (d.state === 'running' || d.state === 'processing');
+  document.getElementById('btnPostpone').style.display = _peerRunning ? '' : 'none';
+  document.getElementById('btnCooldown').style.display =
+    (_peerRunning && peerMeta && peerMeta.id && peerMeta.url !== null) ? '' : 'none';
 
   // Tile progress bar
   const ct = kg.current_tile || 0;
@@ -1550,16 +1554,40 @@ async function sendCmd(action) {
     setTimeout(() => { poll(); fetchDirectorStatus(); }, 400);
   } catch(e) { console.error(action, e); }
 }
+function _currentPeerCardMeta() {
+  if (_peerCards && _peerCards.length && _peerCards[_peerCardIdx]) return _peerCards[_peerCardIdx];
+  return null;
+}
 async function postponeKG() {
-  if (!confirm('Postpone current KG? It will be re-queued 5 KGs later.')) return;
+  const meta = _currentPeerCardMeta();
+  const peerLabel = meta && meta.id ? meta.id : 'primary';
+  if (!confirm('Postpone current KG on ' + peerLabel + '? It will be re-queued 5 KGs later.')) return;
+  const btn = document.getElementById('btnPostpone');
   try {
-    const btn = document.getElementById('btnPostpone');
     btn.disabled = true; btn.textContent = 'postponing…';
-    const r = await fetch('/api/v1/processing/postpone', {method:'POST'});
+    let url = '/api/v1/processing/postpone';
+    if (meta && meta.id && meta.url) url += '?peer_id=' + encodeURIComponent(meta.id);
+    const r = await fetch(url, {method:'POST'});
     if (!r.ok) { alert('Postpone failed: ' + await r.text()); btn.disabled = false; btn.textContent = 'postpone'; return; }
-    // Refresh queue + status after a short delay for processor to react
-    setTimeout(() => { poll(); fetchPrioQueue(); }, 2000);
-  } catch(e) { console.error(e); }
+    btn.disabled = false; btn.textContent = 'postpone';
+    setTimeout(() => { poll(); fetchPrioQueue(); fetchAllPeerStatuses(); }, 2000);
+  } catch(e) { console.error(e); btn.disabled = false; btn.textContent = 'postpone'; }
+}
+async function cooldownPeer() {
+  const meta = _currentPeerCardMeta();
+  if (!meta || !meta.id) { alert('No peer selected'); return; }
+  if (!meta.url) { alert('Cannot cooldown the primary'); return; }
+  if (!confirm('Stop ' + meta.id + ' and skip it for 24h?')) return;
+  const btn = document.getElementById('btnCooldown');
+  try {
+    btn.disabled = true; btn.textContent = 'cooling…';
+    const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(meta.id) + '/cooldown',
+      {method:'POST', headers: {'Content-Type':'application/json'},
+       body: JSON.stringify({hours: 24})});
+    if (!r.ok) { alert('Cooldown failed: ' + await r.text()); btn.disabled = false; btn.textContent = '24h cooldown'; return; }
+    btn.disabled = false; btn.textContent = '24h cooldown';
+    setTimeout(() => { poll(); fetchDirectorStatus(); fetchAllPeerStatuses(); }, 1500);
+  } catch(e) { console.error(e); btn.disabled = false; btn.textContent = '24h cooldown'; }
 }
 async function retryKg(code) {
   try {

@@ -888,10 +888,19 @@ class PeerDirector:
             cache_only_run = bool(row.get('cache_only_run'))
             is_running = proc_st in ('running', 'processing')
             holds_creds = is_running and not cache_only_run
-            if holds_creds and pid in cred_plan:
-                row['cred_indices'] = cred_plan[pid]
-            if holds_creds and pid in strip_plan:
-                row['lat_strips'] = strip_plan[pid]
+            if holds_creds:
+                cache_entry = (state.get('_peer_caps') or {}).get(pid) or {}
+                caps_for_pid = set(cache_entry.get('caps') or [])
+                if pid in cred_plan and 'cred_subset_env' in caps_for_pid:
+                    row['cred_indices'] = cred_plan[pid]
+                elif row['id'] == state.get('active_peer') or pid in (state.get('parallel_frontiers_active') or []):
+                    # Legacy peer running frontier work — uses its full
+                    # local pool. Show the indices it actually holds so the
+                    # dashboard matches the holders column.
+                    n = int(cache_entry.get('cred_count') or 4)
+                    row['cred_indices'] = list(range(n))
+                if pid in strip_plan and 'lat_strip_filter' in caps_for_pid:
+                    row['lat_strips'] = strip_plan[pid]
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
                       if p['id'] == pid), None)

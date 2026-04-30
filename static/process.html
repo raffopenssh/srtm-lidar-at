@@ -1343,8 +1343,10 @@ function updateKgCard(d, peerMeta) {
       elapsedStr = ' (' + secs + 's)';
     }
   }
+  const _kgFull = (kg.code || '') + (kg.name ? ' ' + kg.name : '');
+  const _statePart = kg.state ? ' (' + kg.state + ')' : '';
   document.getElementById('kgSub').innerHTML =
-    esc((kg.state ? '(' + kg.state + ')' : '') + ' · step: ' + pipelineStep + stepDetail + elapsedStr)
+    esc(_kgFull + _statePart + ' · step: ' + pipelineStep + stepDetail + elapsedStr)
     + (isActive ? '<span class="anim-dots"></span>' : '');
 
   // Steps pipeline with elapsed time per step

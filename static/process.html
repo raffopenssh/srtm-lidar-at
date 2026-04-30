@@ -324,13 +324,13 @@
   #zenTbl .zen-th-date { width: 21%; }
   #zenTbl .zen-th-url  { width: 12%; }
   .zen-url-icon { display: none; }
-  /* Pulsing glow on rows whose KG is currently being processed */
-  @keyframes kgGlow {
-    0%,100% { box-shadow: inset 0 0 0 0 rgba(88,166,255,0); background: rgba(88,166,255,0.06); }
-    50%     { box-shadow: inset 0 0 14px 0 rgba(88,166,255,0.55); background: rgba(88,166,255,0.18); }
+  /* Pulsing glow on priority-queue tags whose KG is currently being processed */
+  @keyframes prioKgGlow {
+    0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,0.0), inset 0 0 0 0 rgba(88,166,255,0); border-color: var(--blue); }
+    50%     { box-shadow: 0 0 10px 1px rgba(88,166,255,0.65), inset 0 0 6px 0 rgba(88,166,255,0.35); border-color: #79b8ff; }
   }
-  #zenTbl tr.kg-active td { animation: kgGlow 2.2s ease-in-out infinite; }
-  #zenTbl tr.kg-active td:first-child { box-shadow: inset 3px 0 0 0 var(--blue); }
+  .prio-tag.kg-active { animation: prioKgGlow 1.8s ease-in-out infinite; }
+  .prio-tag.kg-active .prio-code { color: var(--blue); }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
     #zenTbl .zen-th-name { width: 46%; }
@@ -1667,14 +1667,14 @@ async function fetchManifestSummary() {
 let _zenFilterCode = '';  // active KG code filter for manifest
 let _activeProcessingKgs = new Set();  // KG codes currently being processed across all peers
 
-// Update the kg-active class on existing manifest rows without re-rendering.
+// Update the kg-active class on existing priority-queue tags without re-rendering.
 function _applyActiveKgGlow() {
-  const tbody = document.querySelector('#zenTbl tbody');
-  if (!tbody) return;
-  tbody.querySelectorAll('tr[data-kg]').forEach(tr => {
-    const code = tr.getAttribute('data-kg');
-    if (code && _activeProcessingKgs.has(code)) tr.classList.add('kg-active');
-    else tr.classList.remove('kg-active');
+  const container = document.getElementById('prioQueueTags');
+  if (!container) return;
+  container.querySelectorAll('.prio-tag').forEach(tag => {
+    const code = tag.getAttribute('data-kg');
+    if (code && _activeProcessingKgs.has(code)) tag.classList.add('kg-active');
+    else tag.classList.remove('kg-active');
   });
 }
 
@@ -1707,11 +1707,7 @@ function _zenManifestRow(e) {
     const min = String(dt.getMinutes()).padStart(2,'0');
     return dd+'/'+mm+' '+hh+':'+min;
   })() : '—';
-  // Extract KG code from filename (e.g. '12017_full.gpkg', '49006-south.json')
-  const kgMatch = (e.filename || '').match(/^([0-9]+(?:-[a-z]+(?:-\d+)?)?)/i);
-  const kgCode = kgMatch ? kgMatch[1] : '';
-  const activeCls = (kgCode && _activeProcessingKgs && _activeProcessingKgs.has(kgCode)) ? ' class="kg-active"' : '';
-  return '<tr' + activeCls + (kgCode ? ' data-kg="' + esc(kgCode) + '"' : '') + '>' +
+  return '<tr>' +
     '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
     '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
     '<td title="' + fname + '">' + fname + '</td>' +
@@ -2751,9 +2747,11 @@ function renderPrioQueue() {
     if (isDeferred) cls += ' deferred';
     else if (isTomb) cls += ' tombstoned';
     else if (fc) cls += ' ' + fc;
+    if (kg.code && _activeProcessingKgs && _activeProcessingKgs.has(String(kg.code))) cls += ' kg-active';
     tag.className = cls;
     tag.draggable = true;
     tag.dataset.idx = i;
+    if (kg.code) tag.setAttribute('data-kg', String(kg.code));
     // Build title
     let titleParts = [];
     if (kg.gemeinde) titleParts.push(kg.gemeinde);

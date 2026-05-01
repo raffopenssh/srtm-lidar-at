@@ -66,7 +66,13 @@ BANDWIDTH_RENEW_DAY = 17  # day of month when exe.dev bandwidth resets
 # Number of enabled peers to keep idle as reserve (never started by
 # the director).  Operational headroom for ad-hoc work, RF training,
 # and bandwidth/credential burst capacity.
-MIN_RESERVE_PEERS = 5
+#
+# Now that spinning up new peers is cheap and unlimited, the default
+# reserve is 0 — use every enabled peer.  The capacity factor + Zenodo
+# upload mutex + per-peer cooldowns are sufficient to keep us tender
+# towards upstream servers.  Set ``min_reserve_peers`` in peers.json if
+# you really want some peers idle (e.g. during ad-hoc development).
+MIN_RESERVE_PEERS = 0
 # How many cache-only peers may run concurrently with the frontier peer.
 # Each cache-only peer only does BEV reads + CPU + Zenodo upload — no
 # Copernicus credentials — so we can run as many as the whitelist and
@@ -95,14 +101,16 @@ BANDWIDTH_POLL_CONCURRENCY = 10
 # the peer for BANDWIDTH_BACKOFF_SECONDS so a single dead peer can't drag
 # out the loop on every tick.
 BANDWIDTH_BACKOFF_THRESHOLD = 3
-BANDWIDTH_BACKOFF_SECONDS = 300     # 5 min
+BANDWIDTH_BACKOFF_SECONDS = 900     # 15 min — be tender with flaky peers
 # Number of consecutive unreachable polls before failover (avoids killing
 # peers during heavy GPKG builds that briefly starve gunicorn).
 UNREACHABLE_FAILOVER_THRESHOLD = 3
 # How long to keep a peer out of rotation after a local Zenodo network
 # failure (the same peer hitting the same network problem on retry would
 # loop forever).  Cleared automatically when not_before passes.
-ZENODO_NETWORK_COOLDOWN_MIN = 30
+# 60 min base — Zenodo's targeted rate-limits are slow to clear and we'd
+# rather a peer sit out longer than thrash in/out.
+ZENODO_NETWORK_COOLDOWN_MIN = 60
 # Escalating cooldown for peers with a 'hold tendency' (repeat offenders).
 # Each cooldown applied within HOLD_TENDENCY_WINDOW_HOURS is counted; the next
 # cooldown is multiplied by 2**(count-1), capped at HOLD_TENDENCY_MAX_MIN.
@@ -111,9 +119,11 @@ ZENODO_NETWORK_COOLDOWN_MIN = 30
 # and should sit out aggressively rather than thrash in/out every 30 min.
 # Aggressive escalation factor: each repeat multiplies the cooldown by
 # HOLD_TENDENCY_FACTOR (cubic-ish growth instead of doubling).
-HOLD_TENDENCY_WINDOW_HOURS = 3
+# Wider window so we count repeats over a longer baseline; with cheap
+# peers we can afford to keep an offender out for the rest of the day.
+HOLD_TENDENCY_WINDOW_HOURS = 6
 HOLD_TENDENCY_FACTOR = 3
-HOLD_TENDENCY_MAX_MIN = 12 * 60   # 12 h ceiling
+HOLD_TENDENCY_MAX_MIN = 24 * 60   # 24 h ceiling
 
 # --- Server-friendliness throttle ----------------------------------------
 #
@@ -128,18 +138,26 @@ HOLD_TENDENCY_MAX_MIN = 12 * 60   # 12 h ceiling
 # ~2 hours) so the activity pattern looks organic rather than
 # bang‑on‑max all the time. Phase per peer comes from a stable hash so
 # different VMs take their breaks at different times.
-THROTTLE_MIN_FACTOR = 0.30
+THROTTLE_MIN_FACTOR = 0.20
 THROTTLE_MAX_FACTOR = 1.00
 # warnings/min (per kind) at which the factor reaches its minimum.
 # A few stray retries are normal; sustained > ~6/min is real pressure.
+# Tightened down 2026-04-30: with a 20+ peer fleet a small per-peer
+# warning rate aggregates into real fleet-wide pressure on upstream
+# servers. Lower saturation rates ⇒ throttle bites earlier, peers back
+# off sooner. We'd rather lose ~30 % of cache-only slots for an hour
+# than get the whole token banned.
 THROTTLE_SATURATION_RATE = {
-    'bev': 6.0,
-    'zenodo': 1.5,        # Zenodo rate-limits aggressively
-    'copernicus': 0.5,    # 402s should be near-zero in steady state
+    'bev': 3.0,
+    'zenodo': 0.8,        # Zenodo rate-limits aggressively
+    'copernicus': 0.3,    # 402s should be near-zero in steady state
 }
 # EMA smoothing factor for the capacity decision (per tick, ~30 s).
 # Smaller = slower to react / recover. 0.25 gives a half‑life of ~3 ticks.
-THROTTLE_EMA_ALPHA = 0.25
+# Smaller alpha → slower reaction up *and* down. Recovery is slow on
+# purpose: once we've upset Zenodo/BEV, easing back gradually is far
+# safer than snapping back to full throttle the moment warnings stop.
+THROTTLE_EMA_ALPHA = 0.15
 # Sinusoidal drift: period and amplitude (fraction of total range).
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
 THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value

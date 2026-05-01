@@ -1145,8 +1145,8 @@ bandwidth.
 **Key invariants**:
 - exactly one frontier peer running at any time (credential safety)
 - up to `max_cache_only_peers` (default 8) cache-only peers running in parallel
-- at least `min_reserve_peers` (default 5) enabled peers stay idle (operational
-  headroom for ad-hoc work, RF training, bandwidth bursts)
+- at least `min_reserve_peers` (default 0 — was 5; with cheap unlimited
+  peers we no longer keep a reserve) enabled peers stay idle
 - all Zenodo writes (KG uploads + tile-cache flushes) serialise through a
   single mutex broker on the primary (`/api/v1/zenodo/lock`)
 
@@ -1439,10 +1439,19 @@ them. The mechanism:
    tooltip.
 
 Saturation thresholds (warnings per minute) live in
-`peer_director.py → THROTTLE_SATURATION_RATE`:
-- bev: 6.0  (a few range-read retries are normal noise)
-- zenodo: 1.5  (Zenodo rate-limits aggressively)
-- copernicus: 0.5  (402s should be near zero in steady state)
+`peer_director.py → THROTTLE_SATURATION_RATE` (tightened 2026-04-30 for
+the 20+ peer fleet — small per-peer rates aggregate fast):
+- bev: 3.0  (a few range-read retries are normal noise)
+- zenodo: 0.8  (Zenodo rate-limits aggressively)
+- copernicus: 0.3  (402s should be near zero in steady state)
+
+Backoff timings are also more tender:
+- `BANDWIDTH_BACKOFF_SECONDS = 900` (15 min after 3 failed bandwidth polls)
+- `ZENODO_NETWORK_COOLDOWN_MIN = 60` (was 30)
+- `HOLD_TENDENCY_WINDOW_HOURS = 6` (was 3) — longer memory for repeat offenders
+- `HOLD_TENDENCY_MAX_MIN = 24 * 60` (was 12 h) — a bad peer can sit out a full day
+- `THROTTLE_EMA_ALPHA = 0.15` (was 0.25) — slower recovery, kinder to upstreams
+- `THROTTLE_MIN_FACTOR = 0.20` (was 0.30) — deeper cuts under heavy pressure
 
 Tuning knobs: `THROTTLE_MIN_FACTOR`, `THROTTLE_EMA_ALPHA`,
 `THROTTLE_DRIFT_PERIOD_S`, `THROTTLE_DRIFT_AMPLITUDE` at the top of

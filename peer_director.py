@@ -706,14 +706,31 @@ def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
     actually pick the KG back up once cooldown lifts. Stale reservations
     are pruned separately by `_clear_completed_reservations` once the KG
     appears in the local `_get_completed_kgs()` set.
+
+    Split-KG awareness: a reservation on a block code (``60336-northwest``)
+    also blocks the parent code (``60336``), and a reservation on a
+    parent blocks the parent itself (block siblings are still OK to run
+    in parallel — adding parent → all-blocks would over-block legitimate
+    parallel block work). The asymmetric expansion is correct because
+    a peer that holds a *block* still leaves other blocks free for
+    parallel processing.
     """
+    import re as _re
     out = set()
     for p in cfg.get('peers', []):
         if exclude_peer_id and p.get('id') == exclude_peer_id:
             continue
         kg = p.get('reserved_kg')
-        if kg:
-            out.add(str(kg))
+        if not kg:
+            continue
+        s = str(kg)
+        out.add(s)
+        # Block parent code too: an old (pre-splitter) peer would
+        # otherwise treat ``60336`` as free while another peer holds
+        # ``60336-northwest`` mid-tile.
+        m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
+        if m:
+            out.add(m.group(1))
     return out
 
 
@@ -2897,7 +2914,26 @@ class PeerDirector:
             rec['commit'] = commit
             rec['last_state'] = proc_state
             if not idle:
+                # Mid-KG. Send a graceful update to the peer so it
+                # schedules ``git pull + restart srv`` after the
+                # current KG finishes. Throttle: only resend every
+                # 30 min (peer already has the deferred-update thread
+                # running once asked). Without this, a long-running
+                # KG would mean the peer never updates — even though
+                # ``/admin/update?graceful=1`` does exactly the right
+                # thing on its own.
                 rec['waiting_for_idle'] = True
+                last_graceful = float(rec.get('last_graceful_attempt') or 0)
+                if (now - last_graceful) >= 1800:
+                    log.info('Stale peer %s mid-KG (%s on %s); sending '
+                             'graceful update to schedule restart at KG boundary',
+                             pid, proc_state, commit)
+                    try:
+                        gres = trigger_peer_update(url, graceful=True)
+                    except Exception as e:
+                        gres = {'error': str(e)}
+                    rec['last_graceful_attempt'] = now
+                    rec['last_graceful_result'] = gres
                 tracked[pid] = rec
                 continue
             rec.pop('waiting_for_idle', None)

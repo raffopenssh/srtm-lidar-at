@@ -7611,17 +7611,34 @@ def _fetch_peer_state(peer_url: str) -> dict | None:
 
 
 def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
-    """Return set of KG codes claimed by any peer (completed + current + priority)."""
-    claimed = set()
+    """Return set of KG codes claimed by any peer (completed + current + priority).
+
+    Split-KG awareness: a peer that reports it's currently processing
+    block ``60336-northwest`` also claims the parent code ``60336`` so
+    a *different* peer (especially an older one running pre-splitter
+    code) doesn't simultaneously start the un-split parent KG. Without
+    this, two peers race the same area: at17 on ``60336-northwest`` and
+    at19 on ``60336`` was the failure mode this guards against.
+    """
+    import re as _re
+    claimed: set[str] = set()
+    def _add(c):
+        if not c:
+            return
+        s = str(c)
+        claimed.add(s)
+        m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
+        if m:
+            claimed.add(m.group(1))
     for url in peer_urls:
         state = _fetch_peer_state(url)
         if state is None:
             continue
-        claimed.update(state.get('completed', []))
-        if state.get('current'):
-            claimed.add(state['current'])
-        if state.get('in_progress'):
-            claimed.add(state['in_progress'])
+        for c in state.get('completed', []) or []:
+            _add(c)
+        _add(state.get('current'))
+        _add(state.get('current_parent'))   # explicit parent hint from peer
+        _add(state.get('in_progress'))
     return claimed
 
 

@@ -1726,13 +1726,19 @@ function _pmenuRun(btn, fn) {
 document.addEventListener('click', _pmenuClose);
 
 async function peerCmd(peerId, action) {
-  // Send pause/resume/stop to a specific peer (proxies via primary if remote).
+  // Send pause/resume/stop to a specific peer. Always go through the
+  // primary's /director/peers/<id>/cmd/<action> proxy so the cluster
+  // admin token is forwarded server-side; cross-origin POSTs from the
+  // browser drop the X-Admin-Token (the JS fetch wrapper only injects
+  // it for same-origin URLs) and return 401 — which is what made
+  // the per-peer Stop button appear to do nothing.
   try {
     const meta = (_peerCards||[]).find(p => p.id === peerId);
-    let url = '/api/v1/processing/' + action;
+    let url;
     if (meta && meta.url) {
-      // Remote peer: proxy directly to peer
-      url = meta.url.replace(/\/$/, '') + '/api/v1/processing/' + action;
+      url = '/api/v1/director/peers/' + encodeURIComponent(peerId) + '/cmd/' + encodeURIComponent(action);
+    } else {
+      url = '/api/v1/processing/' + action;
     }
     const r = await fetch(url, {method: 'POST'});
     if (!r.ok) alert(action + ' failed: ' + await r.text());

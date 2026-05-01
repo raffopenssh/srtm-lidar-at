@@ -1827,6 +1827,15 @@ def processing_peers_status():
         except Exception:
             pass
     result['current'] = current
+    # Parent code for split-KG awareness. Older peers (pre-kg_splitter)
+    # don't know that ``60336-northwest`` is a sub-block of ``60336``;
+    # exposing the parent code lets them de-dupe correctly.
+    try:
+        from kg_splitter import is_block_code, parent_kg_code
+        if current and is_block_code(current):
+            result['current_parent'] = parent_kg_code(current)
+    except Exception:
+        pass
 
     # In-progress marker (crash recovery file)
     ipf = data_dir / 'in_progress_kg.txt'
@@ -3693,6 +3702,58 @@ def director_pin_peer(peer_id):
     d.reload_config()
     return jsonify({'status': 'updated', 'peer_id': peer_id,
                     'pinned_role': found.get('pinned_role')})
+
+
+@app.route('/api/v1/director/peers/<peer_id>/cmd/<action>', methods=['POST'])
+def director_peer_cmd(peer_id, action):
+    """Proxy pause/resume/stop/start to a remote peer's processor.
+
+    The dashboard talks to *this* primary (so X-Admin-Token + cookies
+    work normally); we forward the request to the peer with the
+    cluster admin token. Without this proxy, the dashboard's
+    cross-origin POST to ``https://srtm-lidar-atN.exe.xyz:8000/api/v1/processing/stop``
+    arrives without the X-Admin-Token (the JS fetch wrapper only
+    injects it for same-origin URLs) and returns 401, which is what
+    made "■ Stop" appear to do nothing.
+
+    Action whitelist matches the peer's processing endpoints. Query
+    string and JSON body are forwarded verbatim so flags like
+    ``graceful=1`` work.
+    """
+    allowed = {'start', 'stop', 'pause', 'resume', 'single', 'retry'}
+    if action not in allowed:
+        return jsonify({'error': f'unknown action {action!r}'}), 400
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return jsonify({'error': f'Peer {peer_id} not found'}), 404
+    url = (peer.get('url') or '').rstrip('/')
+    if not url:
+        # Local primary: dispatch to the same-process route. The
+        # dashboard already does this directly when meta.url is null,
+        # but we accept it here too for symmetry.
+        from flask import url_for
+        try:
+            from werkzeug.test import EnvironBuilder
+            return app.full_dispatch_request()
+        except Exception:
+            return jsonify({'error': 'primary peer has no url; call /api/v1/processing/' + action + ' directly'}), 400
+    target = url + '/api/v1/processing/' + action
+    try:
+        import requests as _req
+        headers = {'X-Admin-Token': _current_admin_token() or ''}
+        # Forward query string + JSON body verbatim.
+        body = request.get_json(silent=True)
+        r = _req.post(target,
+                      params=request.args.to_dict(flat=True) or None,
+                      json=body if body is not None else None,
+                      headers=headers, timeout=20)
+        try:
+            return jsonify(r.json()), r.status_code
+        except Exception:
+            return (r.text, r.status_code, {'Content-Type': r.headers.get('Content-Type', 'text/plain')})
+    except Exception as e:
+        return jsonify({'error': f'proxy to {peer_id} failed: {e}'}), 502
 
 
 @app.route('/api/v1/director/peers/<peer_id>', methods=['DELETE'])

@@ -25,6 +25,13 @@ log = logging.getLogger(__name__)
 # Maximum tiles per block — tuned for hardware/time constraints
 MAX_TILES_PER_BLOCK = 22
 
+# Force-split list: KGs that are below the tile threshold but produce
+# excessive objects (>~50k) and OOM during gpkg_full. Map kg_code → n_blocks.
+# Add an entry here when a KG fails repeatedly with no other obvious cause.
+FORCE_SPLIT = {
+    "60336": 2,  # Melling — 12 tiles but 86k objects, OOMs in gpkg_full
+}
+
 
 def _compute_n_tiles(west, south, east, north, tile_km=1.5, overlap_km=0.1):
     """Count how many tiles a bbox would produce (without building the list)."""
@@ -99,16 +106,22 @@ def maybe_split_kg(kg: dict) -> list:
     west, south = bb["min_lon"], bb["min_lat"]
     east, north = bb["max_lon"], bb["max_lat"]
 
-    n_tiles = _compute_n_tiles(west, south, east, north)
-    if n_tiles <= MAX_TILES_PER_BLOCK:
-        return [kg]
-
-    n_blocks = math.ceil(n_tiles / MAX_TILES_PER_BLOCK)
     kg_code = kg["kg_code"]
     kg_name = kg.get("kg_name", "")
 
-    log.info("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
-             kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
+    n_tiles = _compute_n_tiles(west, south, east, north)
+    forced = FORCE_SPLIT.get(str(kg_code))
+    if n_tiles <= MAX_TILES_PER_BLOCK and not forced:
+        return [kg]
+
+    if forced:
+        n_blocks = max(forced, math.ceil(n_tiles / MAX_TILES_PER_BLOCK) if n_tiles > MAX_TILES_PER_BLOCK else 1)
+        log.info("KG %s (%s): force-split into %d blocks (object density override)",
+                 kg_code, kg_name, n_blocks)
+    else:
+        n_blocks = math.ceil(n_tiles / MAX_TILES_PER_BLOCK)
+        log.info("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
+                 kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
 
     return _split_bbox_grid(kg, n_blocks)
 

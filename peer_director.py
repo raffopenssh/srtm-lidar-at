@@ -1172,6 +1172,15 @@ class PeerDirector:
             wr = (ps or {}).get('warning_rates') or {}
             if not wr:
                 continue
+            # Skip stopped / unreachable peers — their 5/10-min sliding
+            # warning windows still contain pre-shutdown entries for
+            # ~10 min after exit (e.g. during a rolling update). Those
+            # are stale signals about upstream state, not current
+            # pressure. Only live peers reflect what BEV/Zenodo/
+            # Copernicus are doing right now.
+            state = (ps or {}).get('state')
+            if state and state not in ('running', 'processing', 'idle'):
+                continue
             peer_count += 1
             for kind in agg:
                 # 5-min window is the sweet spot: long enough to ignore

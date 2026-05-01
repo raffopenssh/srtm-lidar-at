@@ -1310,6 +1310,8 @@ class PeerDirector:
                 # frontier_cred_plan / frontier_strip_plan is stale/empty.
                 '_reported_cred_indices': ps.get('cred_indices'),
                 '_reported_lat_strips': ps.get('lat_strip_filter'),
+                # Stale-update tracking (auto-retry status)
+                'update_state': (state.get('peer_update_state') or {}).get(pid),
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
@@ -2805,6 +2807,87 @@ class PeerDirector:
             self.state['frontier_strip_plan'] = strip_plan
             save_director_state(self.state)
 
+    # --- Stale-peer auto-retry update -----------------------------
+    # If a graceful update was triggered but the peer didn't pull the
+    # new commit (e.g. dropped connection, restart skipped), re-trigger
+    # an immediate update once the peer has been idle for >10 min. After
+    # a second failed retry, surface the peer as needing a manual update
+    # in the dashboard.
+    STALE_UPDATE_GRACE_S = 600          # 10 min idle before first auto-retry
+    STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
+    STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
+
+    def _orchestrate_stale_peer_updates(self, statuses: dict):
+        """Re-trigger update on peers stuck on an old commit while idle.
+
+        Only acts on peers that are reachable, on a stale commit, and
+        whose processor is not actively running a KG (stopped / idle /
+        complete). Never interrupts running work.
+        """
+        if not _LOCAL_GIT_COMMIT or _LOCAL_GIT_COMMIT == 'unknown':
+            return
+        with self._lock:
+            cfg = self.cfg.copy()
+            tracked = dict(self.state.get('peer_update_state') or {})
+        now = time.time()
+        live_ids = set()
+        for peer in cfg.get('peers', []):
+            pid = peer.get('id')
+            url = peer.get('url')
+            if not pid or not url:
+                continue
+            ps = statuses.get(pid) or {}
+            commit = (ps.get('git_commit') or '').strip()
+            proc_state = ps.get('state', 'unknown')
+            online = proc_state != 'unreachable' and not ps.get('error')
+            # Idle = no active KG processing. 'running'/'processing' means
+            # the peer is mid-work; we never interrupt that.
+            idle = proc_state in ('stopped', 'idle', 'complete', 'paused')
+            stale = bool(commit) and commit != _LOCAL_GIT_COMMIT
+            if not (online and stale):
+                tracked.pop(pid, None)
+                continue
+            live_ids.add(pid)
+            rec = dict(tracked.get(pid) or {})
+            rec.setdefault('first_seen_stale', now)
+            rec.setdefault('attempts', 0)
+            rec['commit'] = commit
+            rec['last_state'] = proc_state
+            if not idle:
+                rec['waiting_for_idle'] = True
+                tracked[pid] = rec
+                continue
+            rec.pop('waiting_for_idle', None)
+            attempts = int(rec.get('attempts') or 0)
+            last_attempt = float(rec.get('last_attempt') or 0)
+            if attempts >= self.STALE_UPDATE_MAX_ATTEMPTS:
+                if (now - last_attempt) >= self.STALE_UPDATE_RETRY_GAP_S:
+                    rec['needs_manual_update'] = True
+                tracked[pid] = rec
+                continue
+            if attempts == 0:
+                ready = (now - float(rec['first_seen_stale'])) >= self.STALE_UPDATE_GRACE_S
+            else:
+                ready = (now - last_attempt) >= self.STALE_UPDATE_RETRY_GAP_S
+            if not ready:
+                tracked[pid] = rec
+                continue
+            log.info('Auto-retry update on stale peer %s (commit=%s, attempt=%d)',
+                     pid, commit, attempts + 1)
+            try:
+                res = trigger_peer_update(url, graceful=False)
+            except Exception as e:
+                res = {'error': str(e)}
+            rec['attempts'] = attempts + 1
+            rec['last_attempt'] = now
+            rec['last_result'] = res
+            tracked[pid] = rec
+        for pid in list(tracked.keys()):
+            if pid not in live_ids:
+                tracked.pop(pid, None)
+        with self._lock:
+            self.state['peer_update_state'] = tracked
+
     def _orchestrate_cache_only(self):
         """Start/stop cache-only peers around the frontier peer.
 
@@ -3237,6 +3320,15 @@ class PeerDirector:
                     if _clear_completed_reservations(self.cfg):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
+                # Auto-retry stale peer updates: re-trigger update on
+                # peers that are idle on an old commit (graceful update
+                # didn't take). After 2 failed attempts surfaces a
+                # manual-update prompt in the dashboard.
+                try:
+                    self._orchestrate_stale_peer_updates(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('Stale-peer update orchestration error')
                 # Parallel-frontier orchestration: start additional
                 # frontier peers when credential capacity permits.
                 try:

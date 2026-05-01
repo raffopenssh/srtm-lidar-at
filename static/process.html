@@ -3529,9 +3529,19 @@ function renderDirector(d) {
         '</select></div>';
     }
 
-    if (!p.online) {
+    const _us = p.update_state || {};
+    const needsManual = !!_us.needs_manual_update;
+    if (!p.online || needsManual) {
       const cmd = 'cd ~/srtm-lidar && git pull --ff-only && sudo systemctl restart srv';
-      html += '<div style="margin-top:4px;display:flex;gap:4px;align-items:center"><code style="flex:1;font-size:9px;background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:2px 4px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Run on peer (offline — cannot push from director)">' + esc(cmd) + '</code><button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="event.stopPropagation();navigator.clipboard.writeText(\'' + cmd + '\');this.textContent=\'✓\';setTimeout(()=>this.textContent=\'⧉\',1000)" title="Copy manual update command">⧉</button></div>';
+      const reason = !p.online
+        ? 'Run on peer (offline — cannot push from director)'
+        : 'Auto-update retried ' + (_us.attempts || 0) + 'x and peer is still on ' + esc(_us.commit || '?') + '. Run manually:';
+      const label = !p.online ? '' : '<div style="font-size:10px;color:var(--yellow);margin-top:4px">⚠ manual update needed (auto-retry exhausted)</div>';
+      html += label;
+      html += '<div style="margin-top:4px;display:flex;gap:4px;align-items:center"><code style="flex:1;font-size:9px;background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:2px 4px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + reason + '">' + esc(cmd) + '</code><button class="btn" style="font-size:9px;padding:0 5px;line-height:16px" onclick="event.stopPropagation();navigator.clipboard.writeText(\'' + cmd + '\');this.textContent=\'✓\';setTimeout(()=>this.textContent=\'⧉\',1000)" title="Copy manual update command">⧉</button></div>';
+    } else if (_us.attempts) {
+      // Auto-retry in progress (1 attempt done, may try again)
+      html += '<div style="font-size:10px;color:var(--dim);margin-top:4px" title="Director auto-retried update; waiting for commit to change">↻ auto-retrying update (' + (_us.attempts) + '/2)</div>';
     }
     if (isInactive) html += '</div>'; // close .peer-detail
     html += '</div>'; // close card

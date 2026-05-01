@@ -1452,6 +1452,14 @@ read as zero so a single chatty peer can't drag capacity off 100 %.
 Drift amplitude reduced from ±10 % to ±4 % (cosmetic-only, was loud
 enough to flip dashboard colors on its own).
 
+The fleet aggregator also filters out peers whose state is `stopped`
+(clean exit — their warning window is stale immediately) and peers
+that have been `unreachable` for more than 30 minutes. A peer that
+just became unreachable is still trusted: it may be doing a long
+GPKG upload and briefly not responding to `/processing/status`.
+Last-seen-live timestamps live in `director_state.json` under
+`peer_last_live_ts`.
+
 Backoff timings are also more tender:
 - `BANDWIDTH_BACKOFF_SECONDS = 900` (15 min after 3 failed bandwidth polls)
 - `ZENODO_NETWORK_COOLDOWN_MIN = 60` (was 30)

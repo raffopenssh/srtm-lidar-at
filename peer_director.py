@@ -1168,19 +1168,36 @@ class PeerDirector:
         """
         agg = {'bev': 0.0, 'zenodo': 0.0, 'copernicus': 0.0}
         peer_count = 0
-        for ps in (statuses or {}).values():
+        # Track per-peer 'last seen running' so we can give unreachable
+        # peers a grace period before excluding them. A peer doing a
+        # heavy GPKG upload may stop responding to /processing/status
+        # for several minutes — we don't want to drop its warning
+        # signal in that case. Only after UNREACHABLE_GRACE seconds do
+        # we treat the peer's stale warning window as no-longer-current.
+        UNREACHABLE_GRACE = 30 * 60   # 30 minutes
+        now = time.time()
+        last_live = self.state.setdefault('peer_last_live_ts', {})
+        for pid, ps in (statuses or {}).items():
             wr = (ps or {}).get('warning_rates') or {}
+            state = (ps or {}).get('state')
+            is_live = state in ('running', 'processing', 'idle')
+            if is_live:
+                last_live[pid] = int(now)
             if not wr:
                 continue
-            # Skip stopped / unreachable peers — their 5/10-min sliding
-            # warning windows still contain pre-shutdown entries for
-            # ~10 min after exit (e.g. during a rolling update). Those
-            # are stale signals about upstream state, not current
-            # pressure. Only live peers reflect what BEV/Zenodo/
-            # Copernicus are doing right now.
-            state = (ps or {}).get('state')
-            if state and state not in ('running', 'processing', 'idle'):
+            # Stopped is a clean exit (SIGTERM during update / manual
+            # stop) — we know the peer isn't doing work, so its stale
+            # warning window is safely droppable immediately.
+            if state == 'stopped':
                 continue
+            # Unreachable peers may be busy uploading or briefly
+            # network-flaky. Honour their last warning rates until
+            # they've been silent for UNREACHABLE_GRACE.
+            if state == 'unreachable':
+                last = last_live.get(pid, 0)
+                if last and (now - last) > UNREACHABLE_GRACE:
+                    continue
+                # else: include as if live (peer may be uploading)
             peer_count += 1
             for kind in agg:
                 # 5-min window is the sweet spot: long enough to ignore

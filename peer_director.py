@@ -158,6 +158,13 @@ THROTTLE_SATURATION_RATE = {
 # purpose: once we've upset Zenodo/BEV, easing back gradually is far
 # safer than snapping back to full throttle the moment warnings stop.
 THROTTLE_EMA_ALPHA = 0.15
+# Slow per-peer noise EMA. Updated every director tick from the peer's
+# current 5-min warning rate. Used by choose_active_peer / orchestrators
+# so a peer that has been noisy in the last few hours stays penalised
+# even after the 5/10-min sliding windows have rolled to zero. With a
+# 30 s tick cadence, alpha=0.006 gives ~58 min half-life — a peer that
+# upset Zenodo at 06:00 still scores noisy at 09:00.
+PEER_NOISE_LONG_EMA_ALPHA = 0.006
 # Sinusoidal drift: period and amplitude (fraction of total range).
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
 THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value
@@ -956,14 +963,19 @@ def _peer_noise_score(peer_id: str, state: dict) -> float:
     preferred for the next slot).
     """
     wr = ((state.get('peer_warning_rates') or {}).get(peer_id) or {})
-    if not wr:
+    long_ema = ((state.get('peer_noise_long_ema') or {}).get(peer_id) or {})
+    if not wr and not long_ema:
         return 0.0
     score = 0.0
     for kind, sat in THROTTLE_SATURATION_RATE.items():
         if sat <= 0:
             continue
-        r = float(((wr.get(kind) or {}).get('5m')) or 0.0)
-        score += r / sat
+        r_now = float(((wr.get(kind) or {}).get('5m')) or 0.0)
+        r_long = float(long_ema.get(kind) or 0.0)
+        # Take the max of "current pressure" and "recent-history pressure"
+        # so a peer that just upset Zenodo five minutes ago still scores
+        # noisy even though its 5-min rate already rolled back to zero.
+        score += max(r_now, r_long) / sat
     return score
 
 
@@ -1035,10 +1047,14 @@ class PeerDirector:
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
-        # EMA capacity factor (0..1). Survives ticks but not restarts —
-        # which is fine: a fresh director starts optimistic and lets the
-        # warning rate pull it down within a few minutes if needed.
-        self._capacity_ema: float = THROTTLE_MAX_FACTOR
+        # EMA capacity factor (0..1). Persisted to director_state.json so
+        # restart of the director (or a gunicorn worker swap) doesn't
+        # erase recent fleet-wide warning history. We also restore a
+        # per-peer slow noise EMA below so a peer that misbehaved is
+        # remembered for hours, not just for the 10-min sliding window.
+        self._capacity_ema: float = float(
+            self.state.get('capacity_ema_persisted',
+                           THROTTLE_MAX_FACTOR) or THROTTLE_MAX_FACTOR)
         self._capacity_components: dict = {}
         # Sliding history of (ts, factor, bev, zenodo, copernicus) tuples.
         # Sized for ~2h of 30s ticks (240 entries). Survives ticks but not
@@ -1331,6 +1347,7 @@ class PeerDirector:
             # Per-peer warning rates from the last director tick. Used
             # by the dashboard noise pill and by load-shifting logic.
             'peer_warning_rates': state.get('peer_warning_rates') or {},
+            'peer_noise_long_ema': state.get('peer_noise_long_ema') or {},
             'peers': peers_status,
         }
 
@@ -3023,10 +3040,36 @@ class PeerDirector:
                     _peer_wr: dict[str, dict] = {}
                     for _pid, _ps in (_statuses or {}).items():
                         _peer_wr[_pid] = (_ps or {}).get('warning_rates') or {}
+                    # Slow per-peer noise EMA across ALL warning kinds.
+                    # Persists across director restarts via director_state.json,
+                    # so a peer that misbehaved an hour ago stays penalised
+                    # even though its 5/10-min sliding windows have decayed.
                     with self._lock:
+                        _long = dict(self.state.get('peer_noise_long_ema') or {})
+                        _alpha = PEER_NOISE_LONG_EMA_ALPHA
+                        for _pid, _wr in _peer_wr.items():
+                            _prev = dict(_long.get(_pid) or {})
+                            for _kind in ('bev', 'zenodo', 'copernicus'):
+                                _r = float(((_wr.get(_kind) or {}).get('5m')) or 0.0)
+                                _p = float(_prev.get(_kind) or 0.0)
+                                # Asymmetric: ramp up fast on new pressure,
+                                # decay slow when quiet. We take max of the
+                                # standard EMA and the current rate so a
+                                # spike registers immediately.
+                                _new = max(_r, _alpha * _r + (1.0 - _alpha) * _p)
+                                _prev[_kind] = round(_new, 4)
+                            _long[_pid] = _prev
+                        # Drop entries for peers no longer in the fleet.
+                        _live = {p['id'] for p in self.cfg.get('peers', [])}
+                        for _pid in list(_long.keys()):
+                            if _pid not in _live:
+                                _long.pop(_pid, None)
+                        self.state['peer_noise_long_ema'] = _long
                         self.state['capacity_factor'] = round(factor, 3)
                         self.state['capacity_components'] = (
                             self._capacity_components)
+                        self.state['capacity_ema_persisted'] = round(
+                            self._capacity_ema, 4)
                         self.state['peer_warning_rates'] = _peer_wr
                 except Exception:
                     log.exception('capacity factor computation failed')

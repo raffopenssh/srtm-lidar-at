@@ -345,6 +345,16 @@ def get_peer_bandwidth(peer_url: str) -> dict:
                 'estimated': True}
 
 
+# Last-known peer status cache. Busy peers (e.g. running heavy GPKG
+# builds) sometimes take >8s to respond on /processing/status, which
+# blows past PEER_TIMEOUT_PROBE and makes the dashboard report them as
+# 'unreachable, completed=0' even though they're actively working. We
+# stash the last successful response per peer_url and surface it (with
+# state='busy') when a fresh poll times out, as long as it's recent.
+_PEER_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
+_PEER_STATUS_CACHE_TTL = 300.0   # 5 min — covers a slow GPKG step.
+
+
 def get_peer_status(peer_url: str | None) -> dict:
     """Get processing status from a peer. None = local."""
     if peer_url is None:
@@ -375,8 +385,22 @@ def get_peer_status(peer_url: str | None) -> dict:
             timeout=PEER_TIMEOUT_PROBE,
         headers=_admin_headers())
         r.raise_for_status()
-        return r.json()
+        d = r.json()
+        _PEER_STATUS_CACHE[peer_url] = (time.time(), d)
+        return d
     except Exception as e:
+        # Fall back to last-known good status if recent enough — a slow
+        # peer that's actually doing work shouldn't show as unreachable.
+        cached = _PEER_STATUS_CACHE.get(peer_url)
+        if cached and (time.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+            d = dict(cached[1])
+            d['_stale'] = True
+            d['_stale_age_s'] = round(time.time() - cached[0], 1)
+            d['_stale_error'] = str(e)[:120]
+            # Don't override the original 'state' — the peer is most
+            # likely still doing whatever it was doing. The dashboard
+            # surfaces _stale so it's clear data is cached.
+            return d
         return {'state': 'unreachable', 'error': str(e)}
 
 
@@ -1207,7 +1231,18 @@ class PeerDirector:
                         timeout=max(0.1, deadline - _t.time())
                     )
                 except (FTimeout, Exception) as e:
-                    statuses[p['id']] = {'state': 'unreachable', 'error': str(e)}
+                    # Worker-pool budget blew up before the per-call
+                    # timeout fired — try the last-known cached status
+                    # before declaring this peer unreachable.
+                    cached = _PEER_STATUS_CACHE.get(p.get('url') or '')
+                    if cached and (_t.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+                        d = dict(cached[1])
+                        d['_stale'] = True
+                        d['_stale_age_s'] = round(_t.time() - cached[0], 1)
+                        d['_stale_error'] = str(e)[:120]
+                        statuses[p['id']] = d
+                    else:
+                        statuses[p['id']] = {'state': 'unreachable', 'error': str(e)}
 
         peers_status = []
         for peer in peers_list:
@@ -1224,6 +1259,8 @@ class PeerDirector:
                 'not_before': peer.get('not_before'),
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
+                'stale_status': bool(ps.get('_stale')),
+                'stale_age_s': ps.get('_stale_age_s'),
                 'zenodo_cooldown_history': peer.get('zenodo_cooldown_history') or [],
                 # Warning fingerprint for load-shifting visibility.
                 'warning_rates': ps.get('warning_rates') or {},
@@ -2790,10 +2827,54 @@ class PeerDirector:
             role = self._peer_role(p)
             running = st in ('running', 'processing')
             is_cache_only_run = bool(ps.get('cache_only'))
-            if running and is_cache_only_run:
+            # Stale cached status — don't make stop/start decisions on
+            # potentially out-of-date information. Treat as 'leave alone'.
+            stale = bool(ps.get('_stale'))
+            if running and is_cache_only_run and not stale:
                 running_cache_only.append(pid)
             candidates.append({'peer': p, 'role': role, 'state': st,
-                               'is_cache_only_run': is_cache_only_run})
+                               'is_cache_only_run': is_cache_only_run,
+                               'stale': stale})
+
+        # If we're over the cap (e.g. capacity factor dropped, or peers
+        # were started before the cap shrank), gracefully stop the
+        # excess. Pick the noisiest peers first — they're the ones
+        # we want off the upstreams anyway. The graceful stop lets them
+        # finish the current KG; we keep the count unchanged so we
+        # don't start a fresh peer in the same tick to replace one
+        # we just told to drain.
+        excess = len(running_cache_only) - max_cache_only
+        if excess > 0:
+            # Rank running peers by noise score (highest first), then by
+            # id for stability. Bias toward stopping recently-started
+            # peers if scores tie (fresh starts are cheap to forfeit).
+            noisy_first = sorted(
+                running_cache_only,
+                key=lambda pid: (-_peer_noise_score(pid, state_copy), pid),
+            )
+            to_stop = noisy_first[:excess]
+            log.info(
+                'cache-only over cap: %d running > %d max — gracefully '
+                'stopping %d (noisiest first): %s',
+                len(running_cache_only), max_cache_only, excess, to_stop,
+            )
+            for pid in to_stop:
+                p = get_peer_by_id(cfg, pid)
+                if not p:
+                    continue
+                try:
+                    stop_peer_processor(p.get('url'), graceful=True)
+                except Exception as e:
+                    log.warning('Graceful stop excess cache-only %s failed: %s',
+                                pid, e)
+            # Deliberately *don't* shrink running_cache_only — a graceful
+            # stop only takes effect when the peer finishes its current
+            # KG. Until then it's still consuming an upstream slot, so
+            # max_add must stay clamped to zero or negative.
+            # Also drop them from `to_start` candidate pools later.
+            _draining_cache_only = set(to_stop)
+        else:
+            _draining_cache_only = set()
 
         # Compute reserve target.  Reserve peers must be enabled+online
         # but idle.  Count idle-eligible peers in `candidates`.
@@ -2916,8 +2997,9 @@ class PeerDirector:
         # across whitelist size changes (peer X always gets the same
         # relative position).  Each peer gets every Nth KG starting at
         # its sorted index.
-        all_workers = sorted(set(running_cache_only) |
-                             {p['id'] for p in to_start})
+        all_workers = sorted((set(running_cache_only) |
+                              {p['id'] for p in to_start})
+                             - _draining_cache_only)
         if not all_workers:
             return
         n = len(all_workers)
@@ -2938,8 +3020,11 @@ class PeerDirector:
                 log.warning('Start cache-only on %s failed: %s', p['id'], e)
 
         # Re-sync slices to already-running peers (whitelist may have
-        # grown/shrunk since they started).  Cheap PUT.
+        # grown/shrunk since they started).  Cheap PUT.  Skip peers we
+        # asked to drain — we don't want to feed them more work.
         for pid in running_cache_only:
+            if pid in _draining_cache_only:
+                continue
             p = get_peer_by_id(cfg, pid)
             if not p:
                 continue

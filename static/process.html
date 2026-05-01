@@ -3406,7 +3406,13 @@ function renderDirector(d) {
     const stCls = !p.online ? 'st-stopped' :
       p.processor_state === 'running' ? 'st-running' :
       p.processor_state === 'stopped' ? 'st-stopped' : 'st-idle';
-    const stLabel = !p.online ? 'offline' : p.processor_state;
+    let stLabel = !p.online ? 'offline' : p.processor_state;
+    // Status came from a cached fallback because the live poll timed
+    // out (busy peer, slow network). Mark it so users know the data
+    // is a few minutes old rather than a fresh truth.
+    if (p.stale_status) {
+      stLabel += ' (cached ' + Math.round(p.stale_age_s || 0) + 's)';
+    }
 
     // Determine if this peer is "inactive" (not active, not running)
     const isRunning = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');

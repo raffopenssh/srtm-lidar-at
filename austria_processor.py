@@ -7542,6 +7542,12 @@ def _record_failure(kg_code: str, failure_counts: dict,
                   kg_code, count, step, error)
         return True
     else:
+        # Bump strike count so the splitter can adapt on next attempt.
+        try:
+            from kg_splitter import bump_strike
+            bump_strike(kg_code)
+        except Exception:
+            pass
         progress.add_log(
             "warning",
             f"KG {kg_code} failed ({count}/{MAX_FAILURES}) at {step}: {error}",
@@ -7822,8 +7828,14 @@ def main():
     if IN_PROGRESS_FILE.exists():
         interrupted_kg = IN_PROGRESS_FILE.read_text().strip()
         if interrupted_kg:
+            try:
+                from kg_splitter import bump_strike
+                strikes = bump_strike(interrupted_kg)
+            except Exception:
+                strikes = 0
             log.info("Previous run interrupted during KG %s — will retry "
-                     "(not marking as failed)", interrupted_kg)
+                     "(strike %d, not marking as failed)",
+                     interrupted_kg, strikes)
             # Make sure it's not in the failed set so it gets retried
             failed_kgs.discard(interrupted_kg)
             completed_codes.discard(interrupted_kg)
@@ -8566,6 +8578,15 @@ def main():
                     # Clear any tombstone entries so the dashboard stops showing
                     # this KG as pending reprocessing.
                     _clear_tombstones(kg_code)
+
+                    # Reset adaptive-split strike counter on success.
+                    try:
+                        from kg_splitter import clear_strikes, parent_kg_code, is_block_code
+                        clear_strikes(kg_code)
+                        if is_block_code(kg_code):
+                            clear_strikes(parent_kg_code(kg_code))
+                    except Exception:
+                        pass
 
                     # Proactively flush tile cache to Zenodo so tiles
                     # survive disk cleanup between KGs.

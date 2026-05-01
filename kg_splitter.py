@@ -22,15 +22,93 @@ from collections import defaultdict
 
 log = logging.getLogger(__name__)
 
+# Strike counter file — written by austria_processor when a KG is
+# interrupted (silent subprocess death) or records a non-permanent
+# failure. Read on every maybe_split_kg() call so the splitter adapts
+# dynamically without code changes.
+_STRIKES_FILE = None
+
+
+def _strikes_file_path():
+    global _STRIKES_FILE
+    if _STRIKES_FILE is not None:
+        return _STRIKES_FILE
+    import os
+    from pathlib import Path
+    base = os.environ.get("SRTM_DATA_DIR")
+    if base:
+        _STRIKES_FILE = Path(base) / "austria_processor" / "kg_strikes.json"
+    else:
+        _STRIKES_FILE = Path(__file__).resolve().parent / "data" / "austria_processor" / "kg_strikes.json"
+    return _STRIKES_FILE
+
+
+def _get_strike_count(kg_code: str) -> int:
+    """Return the number of strikes (interruptions + non-perm failures)
+    recorded for a KG. 0 if the file doesn't exist or the KG isn't tracked.
+    """
+    import json
+    p = _strikes_file_path()
+    try:
+        if p.exists():
+            data = json.loads(p.read_text())
+            return int(data.get(str(kg_code), 0))
+    except Exception:
+        pass
+    return 0
+
+
+def bump_strike(kg_code: str) -> int:
+    """Atomically increment the strike count for a KG; returns new value."""
+    import json
+    p = _strikes_file_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                data = {}
+        data[str(kg_code)] = int(data.get(str(kg_code), 0)) + 1
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+        return data[str(kg_code)]
+    except Exception:
+        return 0
+
+
+def clear_strikes(kg_code: str):
+    """Remove a KG (and any of its block codes) from strike file on success."""
+    import json
+    p = _strikes_file_path()
+    try:
+        if not p.exists():
+            return
+        data = json.loads(p.read_text())
+        keys_to_drop = [k for k in data
+                        if k == str(kg_code) or k.startswith(str(kg_code) + "-")]
+        if not keys_to_drop:
+            return
+        for k in keys_to_drop:
+            data.pop(k, None)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
 # Maximum tiles per block — tuned for hardware/time constraints
 MAX_TILES_PER_BLOCK = 22
 
-# Force-split list: KGs that are below the tile threshold but produce
-# excessive objects (>~50k) and OOM during gpkg_full. Map kg_code → n_blocks.
-# Add an entry here when a KG fails repeatedly with no other obvious cause.
-FORCE_SPLIT = {
-    "60336": 2,  # Melling — 12 tiles but 86k objects, OOMs in gpkg_full
-}
+# After this many silent interruptions / explicit failures we force-split
+# a KG that would otherwise be processed as a single block. The signal
+# typically means an OOM kill or watchdog-killed subprocess during the
+# heavy gpkg_full / segmentation step — splitting halves the per-child
+# working set without operator intervention.
+ADAPTIVE_SPLIT_THRESHOLD = 2
 
 
 def _compute_n_tiles(west, south, east, north, tile_km=1.5, overlap_km=0.1):
@@ -110,18 +188,36 @@ def maybe_split_kg(kg: dict) -> list:
     kg_name = kg.get("kg_name", "")
 
     n_tiles = _compute_n_tiles(west, south, east, north)
-    forced = FORCE_SPLIT.get(str(kg_code))
+
+    # Adaptive force-split: KGs that have been interrupted/failed multiple
+    # times without succeeding are split even when below the tile limit.
+    # The strike count comes from data/austria_processor/kg_strikes.json,
+    # written by austria_processor when it detects an interrupted run or
+    # records a non-permanent failure.
+    strikes = _get_strike_count(str(kg_code))
+    forced = strikes >= ADAPTIVE_SPLIT_THRESHOLD
+
     if n_tiles <= MAX_TILES_PER_BLOCK and not forced:
         return [kg]
 
-    if forced:
-        n_blocks = max(forced, math.ceil(n_tiles / MAX_TILES_PER_BLOCK) if n_tiles > MAX_TILES_PER_BLOCK else 1)
-        log.info("KG %s (%s): force-split into %d blocks (object density override)",
-                 kg_code, kg_name, n_blocks)
+    if forced and n_tiles <= MAX_TILES_PER_BLOCK:
+        # Each strike doubles the block count, capped so each block has ≥2 tiles
+        n_blocks = min(2 ** (strikes - ADAPTIVE_SPLIT_THRESHOLD + 1),
+                       max(2, n_tiles // 2))
+        log.info("KG %s (%s): adaptive split into %d blocks after %d strikes "
+                 "(%d tiles, below %d-tile limit)",
+                 kg_code, kg_name, n_blocks, strikes, n_tiles,
+                 MAX_TILES_PER_BLOCK)
     else:
         n_blocks = math.ceil(n_tiles / MAX_TILES_PER_BLOCK)
-        log.info("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
-                 kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
+        if forced:
+            # Already over the limit AND has strikes — bump block count
+            n_blocks = max(n_blocks, n_blocks * 2)
+            log.info("KG %s (%s): %d tiles > %d limit, %d strikes → splitting into %d blocks (doubled)",
+                     kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, strikes, n_blocks)
+        else:
+            log.info("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
+                     kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
 
     return _split_bbox_grid(kg, n_blocks)
 

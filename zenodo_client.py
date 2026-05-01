@@ -500,7 +500,14 @@ class Client:
                 # Retryable
                 if resp.status_code in _RETRYABLE_STATUS:
                     body_preview = resp.text[:500] if not stream else "<stream>"
-                    log.warning(
+                    # Per-attempt retries log at INFO so they don't feed
+                    # the fleet-wide zenodo throttle counter — Zenodo flakes
+                    # on individual PUTs constantly and the retry loop
+                    # recovers cleanly. Only the final, exhausted-retries
+                    # case escalates to WARNING (handled below at the
+                    # `raise last_exc` site).
+                    is_final = attempt > self.max_retries
+                    (log.warning if is_final else log.info)(
                         "%s %s returned %d (attempt %d/%d): %s",
                         method, url, resp.status_code, attempt,
                         self.max_retries + 1, body_preview,
@@ -542,7 +549,11 @@ class Client:
                 )
 
             except requests.exceptions.RequestException as exc:
-                log.warning(
+                # Same INFO/WARNING split as the 5xx/429 path above:
+                # transient connection blips during retries are not
+                # "upstream stress" — only the final exhaustion is.
+                is_final = attempt > self.max_retries
+                (log.warning if is_final else log.info)(
                     "%s %s network error (attempt %d/%d): %s",
                     method, url, attempt, self.max_retries + 1, exc,
                 )

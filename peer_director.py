@@ -1516,6 +1516,7 @@ class PeerDirector:
             # by the dashboard noise pill and by load-shifting logic.
             'peer_warning_rates': state.get('peer_warning_rates') or {},
             'peer_noise_long_ema': state.get('peer_noise_long_ema') or {},
+            'peer_last_live_ts': state.get('peer_last_live_ts') or {},
             'peers': peers_status,
         }
 

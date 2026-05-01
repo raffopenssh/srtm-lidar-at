@@ -3277,7 +3277,8 @@ function renderCapacityHistory() {
   const t0 = hist[0].t, tN = hist[n-1].t;
   const span = Math.max(1, tN - t0);
   // Saturation rates from peer_director.THROTTLE_SATURATION_RATE.
-  const sat = {bev: 6.0, zen: 1.5, cop: 0.5};
+  // Keep in sync with backend (re-tuned 2026-04-23 for ~50-peer fleet).
+  const sat = {bev: 5.0, zen: 1.5, cop: 0.4};
   // Determine y-range. Factor stays in [0.30, 1.00]; rates are
   // normalised by saturation so they share the same axis as factor.
   let dataMin = 1.0, dataMax = 0.30;

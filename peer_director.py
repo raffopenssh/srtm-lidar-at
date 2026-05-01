@@ -147,11 +147,20 @@ THROTTLE_MAX_FACTOR = 1.00
 # servers. Lower saturation rates ⇒ throttle bites earlier, peers back
 # off sooner. We'd rather lose ~30 % of cache-only slots for an hour
 # than get the whole token banned.
+# Re-tuned 2026-04-23 for the ~50 peer fleet. Saturation is computed
+# against the fleet-wide *max* per-peer rate, but ambient noise (one
+# log line every few minutes per peer) aggregates faster as the fleet
+# grows. Values below assume ~50 peers; scale up roughly proportional
+# to len(peers)/50 if the fleet keeps growing.
 THROTTLE_SATURATION_RATE = {
-    'bev': 3.0,
-    'zenodo': 0.8,        # Zenodo rate-limits aggressively
-    'copernicus': 0.3,    # 402s should be near-zero in steady state
+    'bev': 5.0,
+    'zenodo': 1.5,        # Zenodo rate-limits aggressively
+    'copernicus': 0.4,    # 402s should be near-zero in steady state
 }
+# Dead-zone: fleet-max rates below this fraction of saturation are
+# treated as zero. Keeps ambient noise (a stale-manifest 404 every
+# couple of minutes from one peer) from pulling capacity off 100%.
+THROTTLE_DEAD_ZONE_FRAC = 0.10
 # EMA smoothing factor for the capacity decision (per tick, ~30 s).
 # Smaller = slower to react / recover. 0.25 gives a half‑life of ~3 ticks.
 # Smaller alpha → slower reaction up *and* down. Recovery is slow on
@@ -167,7 +176,11 @@ THROTTLE_EMA_ALPHA = 0.15
 PEER_NOISE_LONG_EMA_ALPHA = 0.006
 # Sinusoidal drift: period and amplitude (fraction of total range).
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
-THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value
+# Sinusoidal drift amplitude. Reduced 2026-04-23 from 0.10 to 0.04 —
+# the previous ±10 % was loud enough to flip the dashboard color
+# between green/yellow/red on its own when the EMA sat near a
+# threshold, even with no upstream pressure. Cosmetic, not operational.
+THROTTLE_DRIFT_AMPLITUDE = 0.04        # ±4% wobble around the EMA value
 
 # Ramp limiter: how many *new* peers we start per director tick. Without
 # this, after a restart we can fire up 19 peers in ~2 seconds, each of
@@ -1185,8 +1198,15 @@ class PeerDirector:
             if sat <= 0:
                 sub[kind] = 1.0
                 continue
-            # 1.0 at r=0, MIN_FACTOR at r>=sat, linear in between.
-            frac = max(0.0, min(1.0, r / sat))
+            # Dead-zone: tiny ambient rates read as zero. Without this,
+            # a single peer logging one warning every ~3 min sits at
+            # ~0.3/min fleet-max and drags capacity off 100% forever.
+            dead = THROTTLE_DEAD_ZONE_FRAC * sat
+            if r <= dead:
+                sub[kind] = THROTTLE_MAX_FACTOR
+                continue
+            # 1.0 at r=dead, MIN_FACTOR at r>=sat, linear in between.
+            frac = max(0.0, min(1.0, (r - dead) / (sat - dead)))
             sub[kind] = THROTTLE_MAX_FACTOR - frac * (
                 THROTTLE_MAX_FACTOR - THROTTLE_MIN_FACTOR)
         raw = min(sub.values()) if sub else THROTTLE_MAX_FACTOR

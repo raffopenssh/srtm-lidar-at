@@ -1439,11 +1439,18 @@ them. The mechanism:
    tooltip.
 
 Saturation thresholds (warnings per minute) live in
-`peer_director.py → THROTTLE_SATURATION_RATE` (tightened 2026-04-30 for
-the 20+ peer fleet — small per-peer rates aggregate fast):
-- bev: 3.0  (a few range-read retries are normal noise)
-- zenodo: 0.8  (Zenodo rate-limits aggressively)
-- copernicus: 0.3  (402s should be near zero in steady state)
+`peer_director.py → THROTTLE_SATURATION_RATE` (re-tuned 2026-04-23 for
+the ~50-peer fleet — the previous values were too tight at this scale
+and were causing the throttle to bite on ambient noise):
+- bev: 5.0  (a few range-read retries are normal noise)
+- zenodo: 1.5  (Zenodo rate-limits aggressively)
+- copernicus: 0.4  (402s should be near zero in steady state)
+
+A dead-zone (`THROTTLE_DEAD_ZONE_FRAC = 0.10`, i.e. 10 % of saturation)
+is applied before the linear ramp — fleet-max rates below the dead-zone
+read as zero so a single chatty peer can't drag capacity off 100 %.
+Drift amplitude reduced from ±10 % to ±4 % (cosmetic-only, was loud
+enough to flip dashboard colors on its own).
 
 Backoff timings are also more tender:
 - `BANDWIDTH_BACKOFF_SECONDS = 900` (15 min after 3 failed bandwidth polls)

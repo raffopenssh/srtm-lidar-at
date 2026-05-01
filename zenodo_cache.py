@@ -1037,10 +1037,38 @@ class ZenodoCache:
                     continue
                 local_entries[entry_name] = local_path
 
-            # Check what Zenodo already has for this strip
+            # Check what Zenodo already has for this strip.
+            # _get_zip_index returns lazily — list_entries() may HEAD/GET
+            # the URL and discover that the manifest is stale (404 because
+            # the file was never actually uploaded, or was deleted). We
+            # treat that as "remote has nothing" rather than a warning, and
+            # drop the stale manifest entry so future flushes don't keep
+            # re-probing it.
             existing = self.manifest.get_file(zip_name)
             remote_idx = self._get_zip_index(zip_name) if existing else None
-            remote_entry_names = set(remote_idx.list_entries()) if remote_idx else set()
+            remote_entry_names: set = set()
+            if remote_idx is not None:
+                try:
+                    remote_entry_names = set(remote_idx.list_entries())
+                except requests.HTTPError as he:
+                    code = getattr(he.response, "status_code", None)
+                    if code == 404:
+                        log.info(
+                            "Zenodo cache: stale manifest entry for %s (404), "
+                            "dropping and uploading fresh", zip_name)
+                        try:
+                            with self.manifest._lock:
+                                self.manifest._data.get("files", {}).pop(
+                                    zip_name, None)
+                            self.manifest.save()
+                        except Exception:
+                            pass
+                        remote_idx = None
+                    else:
+                        raise
+                except Exception as exc:
+                    log.debug("Zenodo cache: cannot list %s: %s", zip_name, exc)
+                    remote_idx = None
 
             # If remote already contains every local entry, skip
             if remote_entry_names and set(local_entries.keys()).issubset(remote_entry_names):

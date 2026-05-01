@@ -1319,6 +1319,7 @@ class PeerDirector:
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
                    'peer_warning_rates', 'peer_noise_long_ema',
+                   'peer_last_live_ts',
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
                    'active_peer', 'mode', 'last_switch'):

@@ -1239,9 +1239,28 @@ class PeerDirector:
                 self.cfg = disk_cfg
         except Exception:
             pass
+        # Also pull director_state from disk so workers that don't run
+        # the director loop (e.g. the worker handling this request) see
+        # fields written by the worker that does — peer_update_state,
+        # capacity_factor, etc.
+        try:
+            disk_state = load_director_state()
+        except Exception:
+            disk_state = {}
         with self._lock:
             cfg = self.cfg.copy()
             state = self.state.copy()
+        # Merge disk values for fields the director writes; keep our
+        # in-memory values otherwise so per-worker scratch state isn't
+        # clobbered.
+        for _k in ('peer_update_state', 'capacity_factor',
+                   'capacity_components', 'capacity_history',
+                   'peer_warning_rates', 'peer_noise_long_ema',
+                   'parallel_frontiers_active', 'frontier_cred_plan',
+                   'frontier_strip_plan', 'cache_only_active',
+                   'active_peer', 'mode', 'last_switch'):
+            if _k in disk_state:
+                state[_k] = disk_state[_k]
 
         # Poll all peer statuses in parallel — a single wedged peer
         # must never wedge the dashboard request.
@@ -2823,12 +2842,36 @@ class PeerDirector:
         Only acts on peers that are reachable, on a stale commit, and
         whose processor is not actively running a KG (stopped / idle /
         complete). Never interrupts running work.
+
+        Before retrying, ensures the director's local commit is pushed
+        to origin/main — peers update via ``git fetch origin && reset
+        --hard origin/main``, so an unpushed local commit causes peers
+        to silently reset to the *previous* tip and report success.
+        Whenever the director commit advances past the value seen on
+        the previous tick, all per-peer attempt counters are reset so
+        peers get a fresh round of retries (instead of being stuck on
+        ``needs_manual_update`` from a previous, now-superseded commit).
         """
         if not _LOCAL_GIT_COMMIT or _LOCAL_GIT_COMMIT == 'unknown':
             return
         with self._lock:
             cfg = self.cfg.copy()
             tracked = dict(self.state.get('peer_update_state') or {})
+            last_director_commit = self.state.get('peer_update_director_commit')
+        # If the director's commit advanced since last tick, reset retry
+        # counters so peers get a fresh round (a new push effectively
+        # invalidates the previous "manual required" verdict).
+        if last_director_commit and last_director_commit != _LOCAL_GIT_COMMIT:
+            log.info('Director commit advanced %s -> %s; resetting peer update retry state',
+                     last_director_commit[:8], _LOCAL_GIT_COMMIT[:8])
+            tracked = {}
+        # Make sure origin/main matches our local HEAD before we ask peers
+        # to fetch+reset. Without this, peers reset to a stale origin and
+        # silently stay behind.
+        try:
+            self._ensure_origin_synced()
+        except Exception:
+            log.exception('Origin push during stale-peer orchestration failed')
         now = time.time()
         live_ids = set()
         for peer in cfg.get('peers', []):
@@ -2887,6 +2930,41 @@ class PeerDirector:
                 tracked.pop(pid, None)
         with self._lock:
             self.state['peer_update_state'] = tracked
+            self.state['peer_update_director_commit'] = _LOCAL_GIT_COMMIT
+
+    def _ensure_origin_synced(self) -> None:
+        """Push local main to origin if it's ahead.
+
+        Peers update via ``git fetch origin && reset --hard origin/main``,
+        so the director must keep origin in sync with its own HEAD.
+        Cheap to call every tick: a no-op when origin is already current
+        (single ``git rev-parse`` + ``git rev-list --count``).
+        """
+        import subprocess as sp
+        repo = str(Path(__file__).parent)
+        try:
+            local = sp.run(['git', 'rev-parse', 'main'],
+                           capture_output=True, text=True, timeout=5,
+                           cwd=repo).stdout.strip()
+            if not local or local != _LOCAL_GIT_COMMIT:
+                # Branch and HEAD diverged (detached HEAD?); skip — the
+                # human-driven /director/update_peers route handles that.
+                return
+            ahead = sp.run(['git', 'rev-list', '--count',
+                            'origin/main..main'],
+                           capture_output=True, text=True, timeout=5,
+                           cwd=repo).stdout.strip()
+            if ahead and int(ahead) > 0:
+                log.info('Origin behind by %s commit(s); pushing main', ahead)
+                push = sp.run(['git', 'push', 'origin', 'main'],
+                              capture_output=True, text=True, timeout=60,
+                              cwd=repo)
+                if push.returncode != 0:
+                    log.warning('git push failed (rc=%d): %s',
+                                push.returncode,
+                                (push.stdout + push.stderr)[-300:])
+        except Exception as e:
+            log.warning('_ensure_origin_synced error: %s', e)
 
     def _orchestrate_cache_only(self):
         """Start/stop cache-only peers around the frontier peer.

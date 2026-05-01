@@ -128,6 +128,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/processing/throttle',
     '/api/v1/processing/queue',
     '/api/v1/processing/cache_manifest',
+    '/api/v1/processing/kg_strikes',
     '/api/v1/zenodo/lock',
     '/api/v1/credentials',
     '/api/v1/processing/cache_misses',
@@ -143,6 +144,7 @@ _AUTH_SELF_HANDLED = ('/api/v1/admin/install_token',)
 _PROTECTED_GET_OPEN = (
     '/api/v1/processing/queue',
     '/api/v1/processing/cache_manifest',
+    '/api/v1/processing/kg_strikes',
 )
 
 
@@ -1880,6 +1882,52 @@ def processing_peers_status():
         result['tombstones'] = {}
 
     return jsonify(result)
+
+
+@app.route('/api/v1/processing/kg_strikes', methods=['GET', 'PUT'])
+def processing_kg_strikes():
+    """GET/PUT the adaptive-split strike counter (kg_strikes.json).
+
+    GET: returns {kg_code: strike_count}.
+    PUT: merges (max(local, incoming) per KG) so we never undo a peer's
+         observed strikes.
+    """
+    p = Path('data/austria_processor/kg_strikes.json')
+    if request.method == 'GET':
+        if not p.exists():
+            return jsonify({})
+        try:
+            return jsonify(json.loads(p.read_text()))
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    incoming = request.get_json(force=True) or {}
+    if not isinstance(incoming, dict):
+        return jsonify({'error': 'expected object'}), 400
+    try:
+        local = {}
+        if p.exists():
+            try:
+                local = json.loads(p.read_text())
+            except Exception:
+                local = {}
+        merged = dict(local)
+        updated = 0
+        for k, v in incoming.items():
+            try:
+                v_int = int(v)
+            except Exception:
+                continue
+            if v_int > int(merged.get(k, 0)):
+                merged[k] = v_int
+                updated += 1
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.tmp')
+        tmp.write_text(json.dumps(merged, indent=2))
+        tmp.replace(p)
+        return jsonify({'updated': updated, 'total': len(merged)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/v1/processing/cache_manifest', methods=['GET', 'PUT'])

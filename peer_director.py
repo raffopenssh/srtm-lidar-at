@@ -437,6 +437,33 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
 _SYNC_BACKOFF: dict[str, dict] = {}
 
 
+def _sync_kg_strikes_to_peer(peer_url: str) -> None:
+    """Push local kg_strikes.json (adaptive-split counters) to a peer.
+
+    Best-effort, max(local, remote) per KG. Without it, peers would only
+    see strikes they observed themselves, missing strikes accumulated on
+    other peers (e.g. the same KG bounced between three frontiers).
+    """
+    p = DATA_DIR / 'kg_strikes.json'
+    if not p.exists():
+        return
+    try:
+        local = json.loads(p.read_text())
+        if not local:
+            return
+        r = requests.put(
+            peer_url.rstrip('/') + '/api/v1/processing/kg_strikes',
+            json=local, timeout=PEER_TIMEOUT_CONTROL,
+            headers=_admin_headers())
+        if r.ok:
+            log.info('KG strikes sync to %s: %d updated', peer_url,
+                     r.json().get('updated', 0))
+        else:
+            log.debug('KG strikes sync to %s: HTTP %d', peer_url, r.status_code)
+    except Exception as e:
+        log.debug('KG strikes sync to %s: %s', peer_url, e)
+
+
 def _sync_cache_manifest_to_peer(peer_url: str) -> None:
     """Push local Zenodo tile-cache manifest to a remote peer.
 
@@ -720,8 +747,9 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
             return {'error': str(e)}
-    # Remote peer — sync cache manifest + priority queue before starting
+    # Remote peer — sync cache manifest + KG strikes + priority queue before starting
     _sync_cache_manifest_to_peer(peer_url)
+    _sync_kg_strikes_to_peer(peer_url)
     if queue_whitelist is not None:
         queue_result = _push_queue_to_peer(peer_url, list(queue_whitelist))
     else:

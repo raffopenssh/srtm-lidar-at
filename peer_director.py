@@ -2642,15 +2642,37 @@ class PeerDirector:
             # gaps for new peers from whatever strips remain. Without
             # this, churn in `ordered` re-shuffles every peer's strip
             # range each tick, triggering plan-drift restarts.
+            #
+            # However: cap each preserved slice at the peer's fair
+            # share for the current ``n_peers``. Otherwise an existing
+            # peer that was activated alone (and given ALL strips) would
+            # hog them forever, leaving newly-promoted parallel
+            # frontiers with empty plans → trimmed → never started.
+            # Fair share: base = n_strips // n_peers, plus 1 extra for
+            # the first ``n_strips % n_peers`` peers in ``ordered``.
+            base_fair = n_strips // n_peers
+            extra_fair = n_strips % n_peers
+            fair_share = {
+                pid: base_fair + (1 if i < extra_fair else 0)
+                for i, pid in enumerate(ordered)
+            }
             strip_set = {tuple(s) for s in strips}
             used: set[tuple[float, float]] = set()
             for pid in ordered:
                 old = prior_strip_plan.get(pid) or []
                 old_t = [tuple(s) for s in old]
-                if old and all(s in strip_set and s not in used
-                               for s in old_t):
-                    strip_plan[pid] = [list(s) for s in old_t]
-                    used.update(old_t)
+                if not old:
+                    continue
+                # Drop entries no longer in the canonical strip set or
+                # already taken by another peer (preserves order).
+                kept = [s for s in old_t
+                        if s in strip_set and s not in used]
+                # Trim to fair share so leftover strips remain for new
+                # frontiers.
+                kept = kept[:fair_share.get(pid, 0)]
+                if kept:
+                    strip_plan[pid] = [list(s) for s in kept]
+                    used.update(kept)
             leftover = [s for s in strips if tuple(s) not in used]
             unassigned = [pid for pid in ordered if pid not in strip_plan]
             if unassigned and leftover:

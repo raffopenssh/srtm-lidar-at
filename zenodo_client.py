@@ -316,12 +316,20 @@ def landscape_metadata(
 
 
 class ZenodoError(Exception):
-    """Raised on non-retryable Zenodo API errors."""
+    """Raised on non-retryable Zenodo API errors.
 
-    def __init__(self, message: str, status_code: int = 0, body: str = "") -> None:
+    ``retry_after`` (seconds) is set when Zenodo returns a Retry-After
+    header on the failing response.  Callers (peer director, austria
+    processor) honour it for cooldown sizing, falling back to their own
+    defaults when it's 0/missing.
+    """
+
+    def __init__(self, message: str, status_code: int = 0, body: str = "",
+                 retry_after: float = 0.0) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.retry_after = retry_after
 
 
 class ReadOnlyError(ZenodoError):
@@ -497,20 +505,25 @@ class Client:
                         method, url, resp.status_code, attempt,
                         self.max_retries + 1, body_preview,
                     )
+                    # Parse Retry-After once and stash it on the exception
+                    # so callers can size their own cooldowns from it.
+                    retry_after_secs = 0.0
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            retry_after_secs = float(retry_after)
+                        except ValueError:
+                            pass
                     last_exc = ZenodoError(
                         f"HTTP {resp.status_code}",
                         status_code=resp.status_code,
                         body=body_preview,
+                        retry_after=retry_after_secs,
                     )
                     if attempt <= self.max_retries:
                         wait = self.retry_base_wait * (2 ** (attempt - 1))
-                        # Honour Retry-After header if present.
-                        retry_after = resp.headers.get("Retry-After")
-                        if retry_after:
-                            try:
-                                wait = max(wait, float(retry_after))
-                            except ValueError:
-                                pass
+                        if retry_after_secs > 0:
+                            wait = max(wait, retry_after_secs)
                         log.info("Retrying in %.1fs …", wait)
                         time.sleep(wait)
                         # Reset seekable data for retry.

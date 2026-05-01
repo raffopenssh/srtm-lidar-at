@@ -7193,6 +7193,10 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                 "error": str(e),
                 "status_code": int(getattr(e, "status_code", 0) or 0),
                 "reason": _classify_zenodo_error(e),
+                # Retry-After (seconds) if Zenodo provided one. The
+                # peer director uses this to size its cooldown rather
+                # than the default ZENODO_NETWORK_COOLDOWN_MIN.
+                "retry_after": float(getattr(e, "retry_after", 0) or 0),
             })
             log.error("KG %s: Zenodo upload failed for %s: %s",
                       kg_code, file_key, e)
@@ -8483,8 +8487,18 @@ def main():
 
                 if _zenodo_transient:
                     _global = _zenodo_pause_is_global(_zenodo_reason)
-                    log.warning("KG %s: Zenodo upload failure (reason=%s, global=%s) \u2014 re-queuing",
-                                kg_code, _zenodo_reason, _global)
+                    # Propagate max Retry-After if Zenodo gave one, so
+                    # the director can size the per-peer cooldown to
+                    # match exactly what the server asked for.
+                    _retry_after = 0.0
+                    for _e in upload_stats["errors"]:
+                        try:
+                            _retry_after = max(_retry_after,
+                                                float(_e.get("retry_after", 0) or 0))
+                        except Exception:
+                            pass
+                    log.warning("KG %s: Zenodo upload failure (reason=%s, global=%s, retry_after=%.0fs) \u2014 re-queuing",
+                                kg_code, _zenodo_reason, _global, _retry_after)
                     progress.add_log("warning",
                                      f"KG {kg_code}: Zenodo {_zenodo_reason} \u2014 re-queued",
                                      kg_code)
@@ -8495,6 +8509,7 @@ def main():
                             "step": "upload",
                             "reason": _zenodo_reason,
                             "global": _global,
+                            "retry_after": _retry_after,
                             "error": "; ".join(str(e.get('error', '')) for e in upload_stats["errors"]) or result.get("zenodo_error", ""),
                         }))
                     except Exception:

@@ -3440,7 +3440,13 @@ def director_add_peer():
     except Exception:
         pass
 
-    cfg['peers'].append({'id': peer_id, 'url': peer_url, 'enabled': enabled})
+    from datetime import datetime as _dtnow, timezone as _tznow
+    cfg['peers'].append({
+        'id': peer_id, 'url': peer_url, 'enabled': enabled,
+        # Warmup hold: record first-seen timestamp so the director
+        # holds off on frontier promotion for ~5 min.
+        'first_seen': _dtnow.now(_tznow.utc).isoformat(),
+    })
     pd.save_peers_config(cfg)
     d = pd.get_director()
     d.reload_config()

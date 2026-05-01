@@ -173,6 +173,24 @@ THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value
 RAMP_MIN_STARTS_PER_TICK = 1
 RAMP_MAX_STARTS_PER_TICK = 3
 
+# Warmup hold for fresh peers. A brand-new peer has no tile cache and
+# zero history; throwing it straight at frontier work means it starts
+# by hammering Copernicus/BEV. We let it sit eligible-but-unused for a
+# few minutes so the first cache-only or cache-manifest pre-sync can
+# warm its local caches before it's asked to do real work.
+#
+# 'first_seen' is recorded in peers.json the first time the director
+# observes a peer. Cache-only is allowed (it's the gentlest workload),
+# but frontier promotion is held off for this many seconds.
+WARMUP_HOLD_SECONDS = 5 * 60  # 5 minutes
+
+# Cache-manifest sync backoff. After this many consecutive PUT failures
+# we skip the peer's manifest sync for SYNC_BACKOFF_SECONDS, mirroring
+# bandwidth backoff. Without this, a peer with a flaky network triggers
+# a full sync on every start, every tick, blowing latency budgets.
+SYNC_BACKOFF_THRESHOLD = 3
+SYNC_BACKOFF_SECONDS = 600        # 10 min
+
 
 def _default_peers_config() -> dict:
     """Return default peers.json structure."""
@@ -382,14 +400,29 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         return []
 
 
+# Per-peer cache-manifest sync backoff state. Module-global so we
+# don't have to thread the director instance through every call site.
+# Maps peer_url -> {fails: int, suppress_until: float epoch}.
+_SYNC_BACKOFF: dict[str, dict] = {}
+
+
 def _sync_cache_manifest_to_peer(peer_url: str) -> None:
     """Push local Zenodo tile-cache manifest to a remote peer.
 
     Ensures the peer shares the same Zenodo cache deposit, so it can
     read cached Copernicus/Hansen tiles instead of re-fetching them.
+
+    Backs off after ``SYNC_BACKOFF_THRESHOLD`` consecutive failures so a
+    peer with a flaky network doesn't burn the budget on every tick.
+    Honours ``Retry-After`` if the peer responds with one.
     """
     manifest_path = DATA_DIR / 'cache_manifest.json'
     if not manifest_path.exists():
+        return
+    bo = _SYNC_BACKOFF.get(peer_url) or {}
+    if bo.get('suppress_until', 0) > time.time():
+        log.debug('Cache manifest sync to %s suppressed (%.0fs left)',
+                  peer_url, bo['suppress_until'] - time.time())
         return
     try:
         local_cm = json.loads(manifest_path.read_text())
@@ -403,10 +436,44 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
             result = r.json()
             log.info('Cache manifest sync to %s: %d entries updated',
                      peer_url, result.get('updated', 0))
+            _SYNC_BACKOFF[peer_url] = {'fails': 0, 'suppress_until': 0}
         else:
-            log.warning('Cache manifest sync to %s: HTTP %d', peer_url, r.status_code)
+            # Honour Retry-After if present (Zenodo proxy etc).
+            ra = r.headers.get('Retry-After')
+            ra_secs = 0.0
+            if ra:
+                try:
+                    ra_secs = float(ra)
+                except ValueError:
+                    pass
+            fails = int(bo.get('fails', 0)) + 1
+            entry = {'fails': fails, 'suppress_until': 0.0}
+            if fails >= SYNC_BACKOFF_THRESHOLD or ra_secs > 0:
+                entry['suppress_until'] = (
+                    time.time() + max(SYNC_BACKOFF_SECONDS, ra_secs))
+                log.warning(
+                    'Cache manifest sync to %s: HTTP %d (fail %d) — '
+                    'suppressing for %.0fs%s',
+                    peer_url, r.status_code, fails,
+                    entry['suppress_until'] - time.time(),
+                    f' (Retry-After {ra_secs:.0f}s)' if ra_secs else '',
+                )
+            else:
+                log.warning('Cache manifest sync to %s: HTTP %d (fail %d)',
+                            peer_url, r.status_code, fails)
+            _SYNC_BACKOFF[peer_url] = entry
     except Exception as e:
-        log.warning('Cache manifest sync to %s failed: %s', peer_url, e)
+        fails = int(bo.get('fails', 0)) + 1
+        entry = {'fails': fails, 'suppress_until': 0.0}
+        if fails >= SYNC_BACKOFF_THRESHOLD:
+            entry['suppress_until'] = time.time() + SYNC_BACKOFF_SECONDS
+            log.warning(
+                'Cache manifest sync to %s failed (%s, fail %d) — '
+                'suppressing for %ds',
+                peer_url, e, fails, SYNC_BACKOFF_SECONDS)
+        else:
+            log.warning('Cache manifest sync to %s failed: %s', peer_url, e)
+        _SYNC_BACKOFF[peer_url] = entry
 
 
 def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
@@ -846,6 +913,34 @@ def _ready_reservation_holder(cfg: dict) -> str | None:
     return None
 
 
+def _peer_age_seconds(peer: dict) -> float:
+    """Seconds since the peer was first seen by the director.
+
+    Falls back to a large value if first_seen is missing (legacy entries)
+    so the warmup hold doesn't block long-lived peers retroactively.
+    """
+    fs = peer.get('first_seen')
+    if not fs:
+        return float('inf')
+    try:
+        from datetime import datetime as _dt
+        t = _dt.fromisoformat(fs)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return float('inf')
+
+
+def _peer_in_warmup(peer: dict) -> bool:
+    """True if peer is too fresh to be promoted to frontier work.
+
+    During warmup we still allow cache-only assignments (which are the
+    gentlest workload) so the peer's tile cache fills naturally.
+    """
+    return _peer_age_seconds(peer) < WARMUP_HOLD_SECONDS
+
+
 def _peer_noise_score(peer_id: str, state: dict) -> float:
     """Return a [0, +inf) noise score for a peer.
 
@@ -905,6 +1000,8 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
             continue  # user-pinned idle
         if pinned in ('cache_only', 'cache-only', 'cacheonly'):
             continue  # user-pinned cache_only — not eligible as primary frontier
+        if _peer_in_warmup(peer):
+            continue  # fresh peer — hold off frontier promotion
         pid = peer['id']
         bw = state.get('peer_bandwidth', {}).get(pid, {})
         used = bw.get('used_bytes', 0)
@@ -1575,15 +1672,30 @@ class PeerDirector:
                         ZENODO_NETWORK_COOLDOWN_MIN * (HOLD_TENDENCY_FACTOR ** (repeat_count - 1)),
                         HOLD_TENDENCY_MAX_MIN,
                     )
+                    # Honour Retry-After if Zenodo provided one. We use
+                    # the larger of our escalated cooldown vs the server's
+                    # ask, capped at the hold-tendency ceiling. This is
+                    # the cooperative thing to do: the server told us
+                    # exactly when to come back, so don't come back
+                    # earlier just because our own escalation said so.
+                    try:
+                        ra_secs = float(zinfo.get('retry_after', 0) or 0)
+                    except Exception:
+                        ra_secs = 0.0
+                    if ra_secs > 0:
+                        cd_min = min(
+                            max(cd_min, ra_secs / 60.0),
+                            HOLD_TENDENCY_MAX_MIN,
+                        )
                     if repeat_count > 1:
                         log.warning('Active peer %s: Zenodo network failure '
-                                    '(repeat #%d in %dh) \u2014 cooling down '
-                                    '%d min (escalated) and switching',
+                                    '(repeat #%d in %dh, retry_after=%.0fs) \u2014 cooling down '
+                                    '%.1f min (escalated) and switching',
                                     active_id, repeat_count,
-                                    HOLD_TENDENCY_WINDOW_HOURS, cd_min)
+                                    HOLD_TENDENCY_WINDOW_HOURS, ra_secs, cd_min)
                     else:
-                        log.warning('Active peer %s: Zenodo network failure \u2014 cooling down %d min and switching',
-                                    active_id, cd_min)
+                        log.warning('Active peer %s: Zenodo network failure (retry_after=%.0fs) \u2014 cooling down %.1f min and switching',
+                                    active_id, ra_secs, cd_min)
                     # Apply not_before cooldown so choose_active_peer skips this peer.
                     # Also reserve the in-progress KG so substitute peers skip
                     # it — the cooled peer keeps its tile checkpoints and
@@ -2344,6 +2456,8 @@ class PeerDirector:
             role = self._peer_role(p)
             if role in ('idle', 'cache_only'):
                 continue
+            if _peer_in_warmup(p):
+                continue  # fresh peer — not yet eligible for frontier work
             # Reservation holders are eligible as parallel frontiers —
             # they just process their reserved KG first (priority queue
             # ensures it is at the head, _reserved_kgs excludes other
@@ -2863,6 +2977,17 @@ class PeerDirector:
                         for key in ('active_peer', 'mode', 'last_switch'):
                             if key in disk_state:
                                 self.state[key] = disk_state[key]
+                    # Stamp first_seen on legacy peers that lack it so
+                    # the warmup hold doesn't retroactively block them.
+                    # New peers added via the API already get a stamp.
+                    _now_iso = datetime.now(timezone.utc).isoformat()
+                    _dirty = False
+                    for _p in self.cfg.get('peers', []):
+                        if not _p.get('first_seen'):
+                            _p['first_seen'] = _now_iso
+                            _dirty = True
+                    if _dirty:
+                        save_peers_config(self.cfg)
                 except Exception:
                     pass
                 self._update_bandwidth()

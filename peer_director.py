@@ -162,6 +162,17 @@ THROTTLE_EMA_ALPHA = 0.15
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
 THROTTLE_DRIFT_AMPLITUDE = 0.10        # ±10% wobble around the EMA value
 
+# Ramp limiter: how many *new* peers we start per director tick. Without
+# this, after a restart we can fire up 19 peers in ~2 seconds, each of
+# which immediately POSTs cache-manifest sync + priority-queue PUT to
+# the primary AND starts hammering BEV/Zenodo. A gentler ramp (1-3 per
+# tick depending on capacity factor) lets each new peer warm its caches
+# and the upstreams notice gradually. Empirically this is the difference
+# between Zenodo accepting all uploads and Zenodo emitting blanket 429s
+# on the whole cluster for 30 minutes.
+RAMP_MIN_STARTS_PER_TICK = 1
+RAMP_MAX_STARTS_PER_TICK = 3
+
 
 def _default_peers_config() -> dict:
     """Return default peers.json structure."""
@@ -835,6 +846,32 @@ def _ready_reservation_holder(cfg: dict) -> str | None:
     return None
 
 
+def _peer_noise_score(peer_id: str, state: dict) -> float:
+    """Return a [0, +inf) noise score for a peer.
+
+    Sums (rate_5m / saturation) across BEV / Zenodo / Copernicus from
+    the peer's last reported ``warning_rates`` (cached on the director
+    state under ``peer_warning_rates``). Higher = noisier upstreams
+    *seen by this peer*. Used to bias scheduling toward quiet peers so
+    fresh peers without warnings carry more load while peers that just
+    upset Zenodo cool off naturally.
+
+    Score 0.0 means "silent" — either truly quiet or no data yet (a
+    fresh peer has no warning history, which is what we want: it's
+    preferred for the next slot).
+    """
+    wr = ((state.get('peer_warning_rates') or {}).get(peer_id) or {})
+    if not wr:
+        return 0.0
+    score = 0.0
+    for kind, sat in THROTTLE_SATURATION_RATE.items():
+        if sat <= 0:
+            continue
+        r = float(((wr.get(kind) or {}).get('5m')) or 0.0)
+        score += r / sat
+    return score
+
+
 def choose_active_peer(cfg: dict, state: dict) -> str | None:
     """Pick the best peer to run the processor on.
 
@@ -853,9 +890,11 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
             return holder
     budget_gb = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB)
     budget_bytes = budget_gb * (1024 ** 3)
-    best_id = None
-    best_remaining = -1
 
+    # Score-based pick: prefer quiet peers (low warning fingerprint),
+    # break ties by remaining bandwidth. Fresh peers have score 0 and
+    # a full budget, so they naturally win until they earn warnings.
+    candidates: list[tuple[float, int, str]] = []
     for peer in cfg.get('peers', []):
         if not peer.get('enabled', True):
             continue
@@ -870,15 +909,17 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         bw = state.get('peer_bandwidth', {}).get(pid, {})
         used = bw.get('used_bytes', 0)
         remaining = budget_bytes - used
-        if remaining > best_remaining:
-            best_remaining = remaining
-            best_id = pid
+        if remaining < 2 * (1024 ** 3):
+            continue  # not enough headroom
+        noise = _peer_noise_score(pid, state)
+        # Sort key: low noise first, then high remaining bandwidth.
+        # Negate remaining so larger sorts earlier under ascending sort.
+        candidates.append((noise, -remaining, pid))
 
-    # Don't use a peer that has < 2 GB remaining
-    if best_remaining < 2 * (1024 ** 3):
+    if not candidates:
         return None
-
-    return best_id
+    candidates.sort()
+    return candidates[0][2]
 
 
 def get_peer_by_id(cfg: dict, peer_id: str) -> dict | None:
@@ -1058,6 +1099,9 @@ class PeerDirector:
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
                 'zenodo_cooldown_history': peer.get('zenodo_cooldown_history') or [],
+                # Warning fingerprint for load-shifting visibility.
+                'warning_rates': ps.get('warning_rates') or {},
+                'noise_score': round(_peer_noise_score(pid, state), 3),
                 'role': self._peer_role(peer),
                 'cache_only_run': bool(ps.get('cache_only')),
                 'is_active': pid == state.get('active_peer'),
@@ -1187,6 +1231,9 @@ class PeerDirector:
                 {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
                 for (t, f, b, z, c) in list(self._capacity_history)
             ],
+            # Per-peer warning rates from the last director tick. Used
+            # by the dashboard noise pill and by load-shifting logic.
+            'peer_warning_rates': state.get('peer_warning_rates') or {},
             'peers': peers_status,
         }
 
@@ -2328,14 +2375,26 @@ class PeerDirector:
         slack = max(0, total_enabled - (1 if active_id else 0)
                     - len(running) - min_reserve)
         max_add = min(slack, max_par - 1 - len(running))
+        # Ramp limiter (see RAMP_*_STARTS_PER_TICK). Scale gentleness
+        # to capacity factor: never burst more than a few new frontier
+        # peers per tick.
+        _ramp_span = RAMP_MAX_STARTS_PER_TICK - RAMP_MIN_STARTS_PER_TICK
+        _ramp_cap = RAMP_MIN_STARTS_PER_TICK + int(round(_ramp_span * _factor))
+        _ramp_cap = max(RAMP_MIN_STARTS_PER_TICK, _ramp_cap)
+        max_add = min(max_add, _ramp_cap)
 
         # Stable assignment: active + sorted(running+candidates) -> ids in
         # order define which cred slice and lat strip they get.
         # Prefer idle/stopped candidates over cache-only-running ones so
         # we don't kill in-progress cache-only work when there's a free
         # peer available.
-        candidates.sort(key=lambda c: (1 if c.get('needs_stop_cache_only') else 0,
-                                       c['peer']['id']))
+        # Order: don't preempt running cache-only peers; among the rest,
+        # quiet peers first (so fresh peers absorb new frontier slots).
+        candidates.sort(key=lambda c: (
+            1 if c.get('needs_stop_cache_only') else 0,
+            _peer_noise_score(c['peer']['id'], state_copy),
+            c['peer']['id'],
+        ))
         ordered = [active_id] + sorted(running)
         if max_add > 0:
             ordered += sorted(c['peer']['id'] for c in candidates[:max_add])
@@ -2638,8 +2697,26 @@ class PeerDirector:
 
         # Choose new peers to start.  Prefer peers explicitly tagged
         # role=='cache_only'; fall back to idle frontier peers.
-        idle_cache_only = [c for c in idle_eligible if c['role'] == 'cache_only']
-        idle_frontier = [c for c in idle_eligible if c['role'] != 'cache_only']
+        # Within each group prefer quiet peers (low warning fingerprint)
+        # so fresh / clean peers absorb load while noisy ones cool off.
+        def _noise_key(c):
+            return (_peer_noise_score(c['peer']['id'], state_copy),
+                    c['peer']['id'])
+        idle_cache_only = sorted(
+            [c for c in idle_eligible if c['role'] == 'cache_only'],
+            key=_noise_key)
+        idle_frontier = sorted(
+            [c for c in idle_eligible if c['role'] != 'cache_only'],
+            key=_noise_key)
+        # Ramp limiter: scale starts/tick by capacity_factor so we add
+        # peers gradually when upstreams are unhappy. At factor=1.0 we
+        # add up to RAMP_MAX_STARTS_PER_TICK; at THROTTLE_MIN_FACTOR
+        # only RAMP_MIN_STARTS_PER_TICK. The cap shrinks max_add but the
+        # next tick (~30s later) will fill any remaining slots.
+        ramp_span = RAMP_MAX_STARTS_PER_TICK - RAMP_MIN_STARTS_PER_TICK
+        ramp_cap = RAMP_MIN_STARTS_PER_TICK + int(round(ramp_span * _factor))
+        ramp_cap = max(RAMP_MIN_STARTS_PER_TICK, ramp_cap)
+        max_add = min(max_add, ramp_cap)
         to_start = []
         for c in idle_cache_only + idle_frontier:
             if len(to_start) >= max_add:
@@ -2815,10 +2892,17 @@ class PeerDirector:
                             except (_Fto, Exception):
                                 _statuses[_p['id']] = {'state': 'unreachable'}
                     factor = self._capacity_factor(_statuses)
+                    # Per-peer warning fingerprint for load-shifting:
+                    # let cleaner peers carry more work. Stored in state
+                    # so choose_active_peer + orchestrators can use it.
+                    _peer_wr: dict[str, dict] = {}
+                    for _pid, _ps in (_statuses or {}).items():
+                        _peer_wr[_pid] = (_ps or {}).get('warning_rates') or {}
                     with self._lock:
                         self.state['capacity_factor'] = round(factor, 3)
                         self.state['capacity_components'] = (
                             self._capacity_components)
+                        self.state['peer_warning_rates'] = _peer_wr
                 except Exception:
                     log.exception('capacity factor computation failed')
                 with self._lock:

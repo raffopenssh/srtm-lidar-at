@@ -3204,7 +3204,21 @@ class PeerDirector:
         # the frontier) target the same KG.  We pull each peer's current
         # KG from the status snapshot we already gathered above, plus
         # the active frontier's current_kg.
+        #
+        # Split-KG awareness: a peer mid-work on block ``60336-northwest``
+        # also blocks the parent ``60336`` (cache-only whitelist contains
+        # parent KG codes from kg_list.json, never block codes), so we
+        # always add the parent for any block we see.
+        import re as _re
         in_progress: set[str] = set()
+        def _mark(code):
+            if not code:
+                return
+            s = str(code)
+            in_progress.add(s)
+            m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
+            if m:
+                in_progress.add(m.group(1))
         for c in candidates:
             ps_pid = c['peer']['id']
             try:
@@ -3212,13 +3226,8 @@ class PeerDirector:
             except Exception:
                 ps2 = {}
             ckg = (ps2.get('current_kg') or {})
-            code = ckg.get('code') if isinstance(ckg, dict) else None
-            if code:
-                in_progress.add(str(code))
-            # Also consider in_progress_kg.txt-style hint
-            ip = ps2.get('in_progress')
-            if ip:
-                in_progress.add(str(ip))
+            _mark(ckg.get('code') if isinstance(ckg, dict) else None)
+            _mark(ps2.get('in_progress'))
             del ps_pid  # silence linter
         # Frontier's KG
         if active_frontier:
@@ -3227,9 +3236,7 @@ class PeerDirector:
                 try:
                     fps = get_peer_status(fp.get('url'))
                     fkg = (fps.get('current_kg') or {})
-                    fcode = fkg.get('code') if isinstance(fkg, dict) else None
-                    if fcode:
-                        in_progress.add(str(fcode))
+                    _mark(fkg.get('code') if isinstance(fkg, dict) else None)
                 except Exception:
                     pass
         # Filter the whitelist before partitioning.

@@ -7931,13 +7931,24 @@ def main():
     _n_split = 0
     for kg_item in pending:
         code = kg_item["kg_code"]
+        # If another peer is mid-work on the *parent* code (e.g. an old
+        # pre-splitter peer reports current=60336), skip the entire
+        # split set: we'd otherwise spawn a block-level race against the
+        # peer's whole-KG processing. The parent-code check is in addition
+        # to the per-block check so block siblings still parallelise when
+        # a different peer holds one specific block.
+        if code in peer_claimed:
+            log.debug("  Skipping split of %s — parent claimed by peer", code)
+            continue
         blocks = maybe_split_kg(kg_item)
         if len(blocks) > 1:
             _n_split += 1
             # Filter out already-completed or failed blocks
             for blk in blocks:
                 bc = blk["kg_code"]
-                if bc not in completed_codes and bc not in failed_kgs and bc not in peer_claimed:
+                if (bc not in completed_codes
+                        and bc not in failed_kgs
+                        and bc not in peer_claimed):
                     _expanded_pending.append(blk)
                 else:
                     log.debug("  Block %s already done/failed — skipping", bc)

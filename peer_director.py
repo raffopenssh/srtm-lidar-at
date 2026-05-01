@@ -1061,6 +1061,19 @@ class PeerDirector:
         # restarts; that's fine for a UI sparkline.
         from collections import deque as _dq
         self._capacity_history = _dq(maxlen=240)
+        # Restore persisted history on startup (and let non-director
+        # gunicorn workers see the same data via load_director_state).
+        try:
+            for entry in (self.state.get('capacity_history') or []):
+                self._capacity_history.append((
+                    int(entry.get('t') or 0),
+                    float(entry.get('f') or 0.0),
+                    float(entry.get('bev') or 0.0),
+                    float(entry.get('zen') or 0.0),
+                    float(entry.get('cop') or 0.0),
+                ))
+        except Exception:
+            pass
 
     # --- Server-friendliness throttle ------------------------------------
     def _fleet_warning_rates(self, statuses: dict) -> dict:
@@ -1340,10 +1353,15 @@ class PeerDirector:
                 'capacity_factor', self._capacity_ema),
             'capacity_components': state.get(
                 'capacity_components', self._capacity_components),
-            'capacity_history': [
-                {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
-                for (t, f, b, z, c) in list(self._capacity_history)
-            ],
+            # Use in-memory history if this worker runs the loop;
+            # otherwise fall back to the persisted snapshot so workers
+            # that never tick still serve a populated chart.
+            'capacity_history': (
+                [{'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+                 for (t, f, b, z, c) in list(self._capacity_history)]
+                if self._capacity_history
+                else (state.get('capacity_history') or [])
+            ),
             # Per-peer warning rates from the last director tick. Used
             # by the dashboard noise pill and by load-shifting logic.
             'peer_warning_rates': state.get('peer_warning_rates') or {},
@@ -3070,6 +3088,13 @@ class PeerDirector:
                             self._capacity_components)
                         self.state['capacity_ema_persisted'] = round(
                             self._capacity_ema, 4)
+                        # Persist the rolling sparkline history so other
+                        # gunicorn workers + a fresh director after restart
+                        # all see the same chart immediately.
+                        self.state['capacity_history'] = [
+                            {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+                            for (t, f, b, z, c) in list(self._capacity_history)
+                        ]
                         self.state['peer_warning_rates'] = _peer_wr
                 except Exception:
                     log.exception('capacity factor computation failed')

@@ -338,6 +338,18 @@ class ZipIndex:
 
     def _load_or_fetch(self) -> Dict[str, zipfile.ZipInfo]:
         """Return dict of entry_name → ZipInfo."""
+        # If we have an in-memory index but the on-disk file has been
+        # deleted by an external invalidator (e.g. cache_manifest sync
+        # detecting a strip rewrite by another peer), drop the cached
+        # entries and re-fetch the central directory. Without this,
+        # long-running subprocesses keep using stale offsets and we
+        # only recover via the bad-local-header retry path.
+        if self._entries is not None:
+            try:
+                if not self._index_path.exists():
+                    self._entries = None
+            except OSError:
+                pass
         if self._entries is not None:
             return self._entries
 
@@ -464,7 +476,11 @@ class ZipIndex:
         try:
             return self._try_read_with_entries(name, entries)
         except _StaleOffsetError as e:
-            log.warning(
+            # Self-healing path: another peer rewrote the strip ZIP, so
+            # our cached offsets are off. We invalidate + refetch + retry
+            # transparently. INFO not WARNING because it's expected when
+            # multiple peers share a Zenodo deposit.
+            log.info(
                 "%s for %s in %s — invalidating index and retrying",
                 e, name, self.url,
             )

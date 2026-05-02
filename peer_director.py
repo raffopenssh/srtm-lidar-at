@@ -82,6 +82,13 @@ MIN_RESERVE_PEERS = 0
 # from spinning up an absurd number of peers if min_reserve is misset.
 MAX_CACHE_ONLY_PEERS = 64
 
+# Per-peer dedup for graceful cache-only stop signals. The processor's
+# signal handler sets _shutdown_requested=True but only exits *after*
+# the current KG finishes — sometimes 1–2h later. Without dedup, every
+# director tick re-sends SIGTERM (we observed 63 in 36h on one peer).
+# Map peer_id → unix ts of last graceful stop emitted by this director.
+_LAST_GRACEFUL_STOP_TS: dict[str, float] = {}
+
 # How often the director checks state (seconds)
 DIRECTOR_POLL_INTERVAL = 30
 # Grace period after stopping a peer before starting another (seconds)
@@ -1409,8 +1416,7 @@ class PeerDirector:
             valid_creds = self._valid_credentials()
         except Exception:
             valid_creds = []
-        per = max(1, int(cfg.get('min_creds_per_frontier',
-                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        per = self._effective_creds_per_frontier(cfg)
         active_id_now = state.get('active_peer')
         max_par = self._max_parallel_frontiers(cfg)
         cred_plan = state.get('frontier_cred_plan') or {}
@@ -1493,6 +1499,11 @@ class PeerDirector:
             'credentials': cred_pool,
             'valid_credentials': valid_creds,
             'min_creds_per_frontier': per,
+            'min_creds_per_frontier_floor': max(1, int(cfg.get(
+                'min_creds_per_frontier',
+                self.MIN_CREDS_PER_FRONTIER_DEFAULT))),
+            'adaptive_creds_per_frontier': bool(cfg.get(
+                'adaptive_creds_per_frontier', True)),
             'max_parallel_frontiers': max_par,
             'cached_lat_strips': [[s, n] for s, n in cached_strips],
             'austria_lat_strips': [[s, n] for s, n in austria_strips],
@@ -2208,6 +2219,47 @@ class PeerDirector:
                       'cred_count': cred_count}
         return caps
 
+    def _effective_creds_per_frontier(self, cfg: dict) -> int:
+        """Resolve the runtime min_creds_per_frontier.
+
+        Static path: ``min_creds_per_frontier`` from peers.json (default 2).
+
+        Adaptive path (default ON): if ``adaptive_creds_per_frontier`` is
+        truthy in peers.json, drop to 1 cred/frontier when Copernicus is
+        healthy (no recent 402 noise), restore to the configured floor
+        otherwise. The signal is the live ``capacity_components.copernicus``
+        sub-factor (1.0 = clean, 0.2 = saturated). When healthy we double
+        the available frontier slots without changing any retry semantics:
+        with 8 valid creds and per=1, we can run 8 frontiers in parallel
+        instead of 4.
+
+        On a 402 the worker still retries up to ``len(_CREDENTIALS)+1``
+        times (the slice expands transparently because the worker's
+        slice is per-frontier, not global). The only difference is that
+        in the per=1 regime, retries borrow neighbour creds via the
+        rotation path; in the per=2 regime, retries stay within the
+        peer's reserved pair. Either is fine when there's no contention.
+        """
+        floor = max(1, int(cfg.get('min_creds_per_frontier',
+                                    self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        if not bool(cfg.get('adaptive_creds_per_frontier', True)):
+            return floor
+        # Pull the latest copernicus sub-factor from state. Defaults to
+        # 1.0 when nothing has been computed yet (boot, or no peers
+        # reporting) — i.e. assume healthy until proven otherwise.
+        sub = 1.0
+        try:
+            comps = self.state.get('capacity_components') or {}
+            sf = (comps.get('sub_factors') or {}).get('copernicus')
+            if isinstance(sf, (int, float)):
+                sub = float(sf)
+        except Exception:
+            pass
+        if sub >= 0.90:
+            return 1
+        # Mid-range: keep the configured floor (typically 2).
+        return floor
+
     def _max_parallel_frontiers(self, cfg: dict) -> int:
         """How many frontier peers we may run concurrently.
 
@@ -2216,13 +2268,15 @@ class PeerDirector:
         on 402. With per=2 and 8 valid creds, we get 4 frontiers, each
         with its own pair (1 working + 1 spare).
 
+        With adaptive mode and a healthy Copernicus sub-factor we drop
+        per=1 — 8 valid creds give 8 frontier slots.
+
         Also bounded by the number of 0.5° lat strips covering Austria
         (so each frontier can take a disjoint strip). With 7 strips this
         rarely binds.
         """
         valid = self._valid_credentials()
-        per = max(1, int(cfg.get('min_creds_per_frontier',
-                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        per = self._effective_creds_per_frontier(cfg)
         if not valid:
             return 0
         cap_creds = max(1, len(valid) // per)
@@ -2245,8 +2299,7 @@ class PeerDirector:
         by membership churn re-sorting the assignment.
         """
         valid = sorted(self._valid_credentials())
-        per = max(1, int(cfg.get('min_creds_per_frontier',
-                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        per = self._effective_creds_per_frontier(cfg)
         out: dict[str, list[int]] = {}
         if not valid or not frontier_ids:
             return out
@@ -2588,13 +2641,15 @@ class PeerDirector:
             return
 
         valid = self._valid_credentials()
-        per = max(1, int(cfg.get('min_creds_per_frontier',
-                                  self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        per = self._effective_creds_per_frontier(cfg)
 
         # Cap on total concurrent frontiers (incl. active). With 8 valid
         # creds and per=2 this is min(3, 7) = 3 — we always reserve `per`
         # creds as a fleet-wide spare so a 402 can rotate without
-        # colliding with another peer's slice.
+        # colliding with another peer's slice. With adaptive mode and a
+        # healthy Copernicus sub-factor we drop to per=1 — 8 frontier
+        # slots, one cred per slot.
+
         max_par = self._max_parallel_frontiers(cfg)
         # Server-friendliness throttle: scale down when BEV / Zenodo /
         # Copernicus are getting hammered. Round, but never below 1 if
@@ -3153,15 +3208,31 @@ class PeerDirector:
                 'stopping %d (noisiest first): %s',
                 len(running_cache_only), max_cache_only, excess, to_stop,
             )
+            # Don't re-send graceful stop within 60s — the peer's signal
+            # handler sets _shutdown_requested=True but only exits after
+            # finishing its current KG. Re-sending every director tick
+            # spams the peer's log with SIGTERM warnings (we saw 63 in 36h
+            # on at32 with only 1 actual restart). The first stop is
+            # enough; let the peer drain in peace.
+            now_ts = time.time()
+            stop_skipped = []
             for pid in to_stop:
+                last = _LAST_GRACEFUL_STOP_TS.get(pid, 0)
+                if now_ts - last < 60:
+                    stop_skipped.append(pid)
+                    continue
                 p = get_peer_by_id(cfg, pid)
                 if not p:
                     continue
                 try:
                     stop_peer_processor(p.get('url'), graceful=True)
+                    _LAST_GRACEFUL_STOP_TS[pid] = now_ts
                 except Exception as e:
                     log.warning('Graceful stop excess cache-only %s failed: %s',
                                 pid, e)
+            if stop_skipped:
+                log.debug('Graceful stop already in flight for %d peers (<60s ago): %s',
+                          len(stop_skipped), stop_skipped)
             # Deliberately *don't* shrink running_cache_only — a graceful
             # stop only takes effect when the peer finishes its current
             # KG. Until then it's still consuming an upstream slot, so

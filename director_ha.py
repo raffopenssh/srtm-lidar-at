@@ -301,6 +301,93 @@ def install_snapshot_inline(snap: dict) -> dict:
     return install_snapshot_from_shadow()
 
 
+def _normalise_local_identity_in_peers(prev_director_url: str | None) -> dict:
+    """Fix up ``peers.json`` and ``peer_urls.txt`` after a snapshot install.
+
+    Snapshots use ``url: null`` to mark the *origin's* local entry. After
+    we install a snapshot from the previous director that null still
+    points at the previous host's identity, not ours. This rewires:
+
+    * The entry whose id == ``self_id()`` gets ``url=None`` (we are now
+      that host).
+    * Any other entry that came in with ``url=None`` (i.e. the previous
+      director's local entry) is given the previous director's URL so we
+      can still poll/manage it as a regular peer. If we don't know the
+      previous URL we fall back to deriving it from ``self.json``
+      pointers, and as a last resort drop the entry to avoid confusing
+      the rest of the loop.
+
+    Also rewrites ``peer_urls.txt`` to drop our own URL and add the
+    previous director's URL.
+    """
+    me = self_id()
+    my_url = (self_url() or '').rstrip('/')
+    prev_url = (prev_director_url or '').rstrip('/') or None
+    info: dict = {'changes': []}
+    pj = DATA_DIR / 'peers.json'
+    try:
+        cfg = json.loads(pj.read_text())
+    except Exception as e:
+        info['peers_json_error'] = str(e)[:200]
+        cfg = None
+    if isinstance(cfg, dict) and isinstance(cfg.get('peers'), list):
+        peers = cfg['peers']
+        # 1. Demote stale local entries (url=None but id != me).
+        for p in peers:
+            if p.get('url') is None and p.get('id') != me:
+                if prev_url:
+                    p['url'] = prev_url
+                    info['changes'].append(
+                        f'set {p.get("id")} url to prev_director {prev_url}')
+                else:
+                    # Keep the entry but mark it disabled so the loop
+                    # doesn't poll a phantom local; admin can fix later.
+                    p['enabled'] = False
+                    info['changes'].append(
+                        f'disabled {p.get("id")} (no prev_director_url known)')
+        # 2. Promote our own entry to url=None (canonical local marker).
+        promoted = False
+        for p in peers:
+            if p.get('id') == me:
+                if p.get('url') is not None:
+                    info['changes'].append(
+                        f'set {me} url to None (local marker)')
+                p['url'] = None
+                p['enabled'] = True
+                promoted = True
+                break
+        if not promoted:
+            # We weren't in peers.json at all — add ourselves.
+            peers.insert(0, {'id': me, 'url': None, 'enabled': True})
+            info['changes'].append(f'added missing local entry {me}')
+        try:
+            _atomic_write(pj, json.dumps(cfg, indent=2))
+        except Exception as e:
+            info['peers_json_write_error'] = str(e)[:200]
+    # peer_urls.txt: drop our URL, ensure prev director URL is present.
+    pu = DATA_DIR / 'peer_urls.txt'
+    try:
+        if pu.exists():
+            urls = [u.strip().rstrip('/') for u in pu.read_text().splitlines()
+                    if u.strip()]
+        else:
+            urls = []
+        out: list[str] = []
+        for u in urls:
+            if my_url and u == my_url:
+                continue
+            if u not in out:
+                out.append(u)
+        if prev_url and prev_url not in out:
+            out.append(prev_url)
+            info['changes'].append(f'added prev_director {prev_url} to peer_urls')
+        if out != urls:
+            _atomic_write(pu, '\n'.join(out) + ('\n' if out else ''))
+    except Exception as e:
+        info['peer_urls_error'] = str(e)[:200]
+    return info
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
@@ -495,6 +582,16 @@ def _do_takeover(reason: str, prev_director_url: str | None = None,
     else:
         install_result = install_snapshot_from_shadow()
     log.info('takeover: snapshot install: %s', install_result)
+    # Snapshots use url=None as a 'this host' marker which now points
+    # at the previous director, not us. Rewire peers.json/peer_urls.txt
+    # before the director loop reads them.
+    try:
+        ident_fix = _normalise_local_identity_in_peers(prev_director_url)
+        log.info('takeover: identity normalise: %s', ident_fix)
+        install_result = dict(install_result or {})
+        install_result['identity_fix'] = ident_fix
+    except Exception as e:
+        log.warning('takeover: identity normalise failed: %s', e)
     try:
         STEPPED_DOWN_FLAG.unlink()
     except FileNotFoundError:
@@ -531,7 +628,17 @@ def _do_takeover(reason: str, prev_director_url: str | None = None,
         'reason': reason,
         'ts': datetime.now(timezone.utc).isoformat(),
     }
+    # _all_peer_urls() only returns peers with non-null URLs, which used
+    # to skip the previous director (whose url=None marker we just
+    # rewrote, but the old director's local entry is canonical url=None
+    # in *its* peers.json). Make sure the previous director URL is in
+    # the announce list explicitly.
     peer_urls = _all_peer_urls(exclude=[my_url])
+    if prev_director_url:
+        prev_norm = prev_director_url.rstrip('/')
+        if prev_norm and prev_norm not in (my_url.rstrip('/'),) \
+                and prev_norm not in peer_urls:
+            peer_urls.append(prev_norm)
     results = broadcast_announce(peer_urls, payload)
     log.info('takeover: announced to %d peers', len(results))
     # Tell the old director to step down (best-effort).

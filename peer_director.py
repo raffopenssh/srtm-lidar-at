@@ -3657,6 +3657,12 @@ class PeerDirector:
                     self._maintain_shadow(_statuses)
                 except Exception as _e:
                     log.debug('shadow maintenance failed: %s', _e)
+                # Push identity to one peer per tick that doesn't yet
+                # know who the director is.
+                try:
+                    self._push_identity_to_unaware_peers()
+                except Exception as _e:
+                    log.debug('identity push failed: %s', _e)
                 with self._lock:
                     save_director_state(self.state)
             except Exception:
@@ -3664,6 +3670,48 @@ class PeerDirector:
             time.sleep(DIRECTOR_POLL_INTERVAL)
 
     # --- Shadow election & snapshot push ---------------------------------
+    def _push_identity_to_unaware_peers(self) -> None:
+        """Push director_url + peer_id to peers that don't yet know us.
+
+        Cheap GET to ``/api/v1/director/identity``; if the peer reports
+        ``director_url=null`` we POST it. Throttled to one peer per tick.
+        """
+        try:
+            import director_ha as dha
+        except Exception:
+            return
+        my_url = dha.self_url()
+        if not my_url:
+            return
+        # Cycle through peers, one per tick.
+        peers = [p for p in self.cfg.get('peers') or [] if p.get('url')]
+        if not peers:
+            return
+        idx = int(self.state.get('_identity_push_idx', 0)) % len(peers)
+        peer = peers[idx]
+        self.state['_identity_push_idx'] = idx + 1
+        try:
+            r = requests.get(
+                peer['url'].rstrip('/') + '/api/v1/director/identity',
+                headers=_admin_headers(), timeout=PEER_TIMEOUT_PROBE,
+            )
+            if not r.ok:
+                return
+            d = r.json() or {}
+            needs = (not d.get('director_url')) or (d.get('director_url') != my_url) \
+                or (d.get('id') != peer['id'])
+            if not needs:
+                return
+            requests.post(
+                peer['url'].rstrip('/') + '/api/v1/director/identity',
+                json={'id': peer['id'], 'url': peer['url'],
+                      'director_url': my_url},
+                headers=_admin_headers(), timeout=PEER_TIMEOUT_CONTROL,
+            )
+            log.info('director identity pushed to %s', peer['id'])
+        except Exception:
+            pass
+
     def _maintain_shadow(self, statuses: dict) -> None:
         """Elect a shadow each tick and push the current state snapshot.
 
@@ -3678,20 +3726,48 @@ class PeerDirector:
             return
         cfg = self.cfg
         peers = cfg.get('peers') or []
-        # Candidate set: enabled, has URL (i.e. not local), reachable.
+        my_commit = _LOCAL_GIT_COMMIT
+        # Candidate filter: enabled, reachable, running OUR git commit
+        # (so the snapshot endpoint exists), enough disk (>5 GB free) and
+        # enough remaining bandwidth (>10 GB) to act as director if needed.
+        SHADOW_MIN_DISK_GB = 5.0
+        SHADOW_MIN_BANDWIDTH_GB = 10.0
         candidates: list[tuple[float, dict]] = []
+        rejected: list[tuple[str, str]] = []
         for p in peers:
-            if not p.get('enabled'):
-                continue
-            if not p.get('url'):
+            if not p.get('enabled') or not p.get('url'):
                 continue
             ps = (statuses or {}).get(p['id']) or {}
             if ps.get('state') == 'unreachable':
+                rejected.append((p['id'], 'unreachable'))
+                continue
+            commit = (ps.get('git_commit') or '').strip()
+            if my_commit != 'unknown' and commit and commit != my_commit:
+                rejected.append((p['id'], f'commit_mismatch({commit})'))
+                continue
+            sysd = ps.get('system') or {}
+            disk_free = sysd.get('disk_free_gb')
+            if disk_free is not None and disk_free < SHADOW_MIN_DISK_GB:
+                rejected.append((p['id'], f'low_disk({disk_free}GB)'))
+                continue
+            bw = (self.state.get('peer_bandwidth') or {}).get(p['id']) or {}
+            rem_gb = bw.get('remaining_gb')
+            if rem_gb is not None and rem_gb < SHADOW_MIN_BANDWIDTH_GB:
+                rejected.append((p['id'], f'low_bw({rem_gb}GB)'))
                 continue
             score = _peer_noise_score(p['id'], self.state)
             candidates.append((score, p))
         if not candidates:
+            # Log only when set changes to avoid spam.
+            tag = ','.join(f'{i}:{r}' for i, r in rejected[:6])
+            if self.state.get('_shadow_reject_tag') != tag:
+                log.warning('director shadow: no eligible candidates (%s)', tag)
+                self.state['_shadow_reject_tag'] = tag
+                self.state['shadow_peer'] = None
+                self.state['shadow_url'] = None
             return
+        else:
+            self.state.pop('_shadow_reject_tag', None)
         candidates.sort(key=lambda x: x[0])
         prev_shadow = self.state.get('shadow_peer')
         # Stickiness: keep the previous shadow unless it's gone or we have

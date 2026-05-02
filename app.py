@@ -2175,6 +2175,23 @@ def processing_start():
     if cache_only:
         args.append('--cache-only')
 
+    # Pass peer URLs so the subprocess can de-dup against peers' current
+    # KGs (block-aware via parent_kg_code). Without this, two cache-only
+    # peers can race the same KG when their whitelist slices overlap or
+    # they fall through to nearest-neighbour scanning. Self-URL is
+    # filtered out so we don't claim work against ourselves.
+    try:
+        peer_urls_for_proc = _get_peer_urls() or []
+        # Drop our own URL — match by host
+        import socket as _sock
+        _self_host = _sock.gethostname()
+        peer_urls_for_proc = [u for u in peer_urls_for_proc if _self_host not in u]
+        if peer_urls_for_proc:
+            args.append('--peers')
+            args.extend(peer_urls_for_proc)
+    except Exception as _pe:
+        log.warning('Could not enumerate peer URLs for subprocess: %s', _pe)
+
     log_file = Path('data/austria_processor/logs/processor.log')
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(log_file, 'a')

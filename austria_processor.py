@@ -7610,36 +7610,80 @@ def _fetch_peer_state(peer_url: str) -> dict | None:
         return None
 
 
-def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
-    """Return set of KG codes claimed by any peer (completed + current + priority).
+def _get_peer_claims_detailed(peer_urls: list[str]) -> dict:
+    """Return structured peer claims so split-KG blocks can parallelise.
 
-    Split-KG awareness: a peer that reports it's currently processing
-    block ``60336-northwest`` also claims the parent code ``60336`` so
-    a *different* peer (especially an older one running pre-splitter
-    code) doesn't simultaneously start the un-split parent KG. Without
-    this, two peers race the same area: at17 on ``60336-northwest`` and
-    at19 on ``60336`` was the failure mode this guards against.
+    A peer that is mid-work on ``92117-west`` should not block another
+    peer from picking up ``92117-east`` — they cover disjoint geography.
+    But the same peer's current claim *should* block any peer that has
+    not split the parent KG (legacy peer running pre-splitter code, or
+    a director that put the bare parent code in the queue).
+
+    Returns dict with sets:
+      * ``blocks`` — explicit block codes a peer is currently processing
+        (e.g. ``92117-west``).
+      * ``parents_with_block_claim`` — parent codes for which at least
+        one peer claims a specific block. The bare parent code is
+        blocked (we don't want a legacy peer to grab the unsplit KG)
+        but sibling blocks of these parents stay eligible.
+      * ``parents_unsplit`` — parent codes claimed in non-block form
+        (a peer is processing the whole KG without splitting). All
+        sibling blocks of these are blocked.
+      * ``completed`` — codes any peer reports as completed.
     """
     import re as _re
-    claimed: set[str] = set()
-    def _add(c):
+    block_re = _re.compile(r'^(\d+)-[a-z][-a-z0-9]*$')
+    blocks: set[str] = set()
+    parents_with_block_claim: set[str] = set()
+    parents_unsplit: set[str] = set()
+    completed: set[str] = set()
+
+    def _classify_current(c):
         if not c:
             return
         s = str(c)
-        claimed.add(s)
-        m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
+        m = block_re.match(s)
         if m:
-            claimed.add(m.group(1))
+            blocks.add(s)
+            parents_with_block_claim.add(m.group(1))
+        else:
+            parents_unsplit.add(s)
+
     for url in peer_urls:
         state = _fetch_peer_state(url)
         if state is None:
             continue
         for c in state.get('completed', []) or []:
-            _add(c)
-        _add(state.get('current'))
-        _add(state.get('current_parent'))   # explicit parent hint from peer
-        _add(state.get('in_progress'))
-    return claimed
+            if c:
+                completed.add(str(c))
+        _classify_current(state.get('current'))
+        _classify_current(state.get('in_progress'))
+        cp = state.get('current_parent')
+        if cp:
+            cps = str(cp)
+            # Only treat as unsplit if no block-form claim exists for
+            # the same parent (avoid clobbering sibling-block parallelism).
+            if cps not in parents_with_block_claim:
+                parents_unsplit.add(cps)
+    return {
+        'blocks': blocks,
+        'parents_with_block_claim': parents_with_block_claim,
+        'parents_unsplit': parents_unsplit,
+        'completed': completed,
+    }
+
+
+def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
+    """Flat claimed-set used for the cheap pending-list pre-filter.
+
+    Excludes the bare parent of a block claim so sibling blocks remain
+    eligible — the per-iteration check uses the detailed view to enforce
+    finer-grained de-duplication.
+    """
+    d = _get_peer_claims_detailed(peer_urls)
+    # Block siblings stay eligible: don't fold parent_with_block_claim
+    # into the flat set. Only fully-unsplit parent claims block siblings.
+    return d['blocks'] | d['parents_unsplit'] | d['completed']
 
 
 def main():
@@ -7960,6 +8004,41 @@ def main():
                  _n_split, len(pending), len(_expanded_pending))
     pending = _expanded_pending
 
+    # --- Re-apply lat-strip filter to *blocks* ---
+    # The first strip filter ran on parent KG bboxes (centroid). For
+    # very large KGs (Ramsau, Sölden) the parent bbox can span several
+    # strips, but we sent it to one strip owner via centroid. Now that
+    # we've expanded into blocks, distribute blocks across frontier
+    # peers by block centroid so each peer only does blocks in its
+    # assigned strips. Without this, one peer ends up with all 30
+    # Ramsau blocks while others sit idle.
+    if _strip_raw:
+        try:
+            _strips_for_blocks = json.loads(_strip_raw)
+            _strips_for_blocks = [(float(s), float(n))
+                                  for s, n in _strips_for_blocks]
+        except Exception:
+            _strips_for_blocks = []
+        if _strips_for_blocks:
+            def _block_in_strips(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat")
+                n = bb.get("max_lat")
+                if s is None or n is None:
+                    return True  # be permissive on malformed
+                mid = 0.5 * (s + n)
+                for ls, ln in _strips_for_blocks:
+                    if ls - 1e-9 <= mid < ln - 1e-9:
+                        return True
+                return False
+            before_blk = len(pending)
+            pending = [kg for kg in pending if _block_in_strips(kg)]
+            n_dropped = before_blk - len(pending)
+            if n_dropped:
+                log.info("Lat-strip filter on blocks: %d → %d items "
+                         "(dropped %d blocks outside strips)",
+                         before_blk, len(pending), n_dropped)
+
     # --- Load priority queue and prepend to pending ---
     priority_codes = _read_retry_queue()
     # Filter out completed / permanently-failed from the file too
@@ -8003,21 +8082,34 @@ def main():
         priority_kgs = []
         non_priority = pending
 
-    # Sort non-priority by nearest-neighbor traversal for maximum cache reuse
-    from tile_cache import order_kgs_nearest_neighbor
-    # Resume from last completed KG if available
-    resume_from = None
-    if completed_codes:
-        # Find the last completed KG that has a local JSON
-        json_files = sorted(JSON_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
-        if json_files:
-            resume_from = json_files[-1].stem
-            log.info("Resuming nearest-neighbor traversal from last KG: %s", resume_from)
-    non_priority = order_kgs_nearest_neighbor(non_priority, start_code=resume_from)
-    log.info("Non-priority KGs ordered by nearest-neighbor traversal for cache locality")
+    # Cache-only peers run *only* the director-provided whitelist.
+    # We deliberately drop the NN fallback so two cache-only peers
+    # can't race on the same KG when they fall through their slices.
+    # When the priority list is drained the loop exits and the peer
+    # idles, awaiting the next /processing/start from the director.
+    if args.cache_only:
+        if non_priority:
+            log.info("Cache-only mode: dropping %d non-priority KGs — "
+                     "will only process the director-provided whitelist",
+                     len(non_priority))
+        non_priority = []
+        pending = list(priority_kgs)
+    else:
+        # Sort non-priority by nearest-neighbor traversal for maximum cache reuse
+        from tile_cache import order_kgs_nearest_neighbor
+        # Resume from last completed KG if available
+        resume_from = None
+        if completed_codes:
+            # Find the last completed KG that has a local JSON
+            json_files = sorted(JSON_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+            if json_files:
+                resume_from = json_files[-1].stem
+                log.info("Resuming nearest-neighbor traversal from last KG: %s", resume_from)
+        non_priority = order_kgs_nearest_neighbor(non_priority, start_code=resume_from)
+        log.info("Non-priority KGs ordered by nearest-neighbor traversal for cache locality")
 
-    # Priority KGs go first, then nearest-neighbor ordered rest
-    pending = priority_kgs + non_priority
+        # Priority KGs go first, then nearest-neighbor ordered rest
+        pending = priority_kgs + non_priority
     if priority_kgs:
         log.info("Pending starts with %d priority KGs, then %d nearest-neighbor",
                  len(priority_kgs), len(non_priority))
@@ -8927,8 +9019,19 @@ def main():
             if _already:
                 _known_queue_codes.add(rq_code)
                 continue
-            # Find the KG dict from full list
-            rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
+            # Resolve the KG dict (handle both parent codes and block
+            # codes the director may push for cache-only / split-aware
+            # distribution).
+            if is_block_code(rq_code):
+                _parent = parent_kg_code(rq_code)
+                _parent_kg = next((k for k in kgs if k["kg_code"] == _parent), None)
+                if _parent_kg:
+                    _blocks = maybe_split_kg(_parent_kg)
+                    rq_kg = next((b for b in _blocks if b["kg_code"] == rq_code), None)
+                else:
+                    rq_kg = None
+            else:
+                rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
             if rq_kg:
                 rq_kg = dict(rq_kg)
                 rq_kg["_defer_attempt"] = 0

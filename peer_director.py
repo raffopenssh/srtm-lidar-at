@@ -3294,6 +3294,58 @@ class PeerDirector:
                      '%d in-progress KGs', len(in_progress))
             return
 
+        # --- Expand parent KG codes into block codes for split KGs.
+        # Each peer independently runs maybe_split_kg() at startup, but
+        # they all start at block 0 — so two peers given the same parent
+        # code race the first block (e.g. both grabbing 92117-west).
+        # Pre-expanding here means the stride partition below hands
+        # different blocks of e.g. Ramsau to different peers.
+        # Honors strikes (adaptive split for repeat-failed KGs that are
+        # otherwise quick from cache).
+        try:
+            from kg_splitter import maybe_split_kg, is_block_code
+            kg_list_path = DATA_DIR / 'kg_list.json'
+            kg_by_code = {}
+            if kg_list_path.exists():
+                for kg in json.loads(kg_list_path.read_text()):
+                    c = kg.get('kg_code')
+                    if c:
+                        kg_by_code[c] = kg
+            expanded: list[str] = []
+            n_split = 0
+            for code in whitelist:
+                if is_block_code(code):
+                    # Already a block code (e.g. queued explicitly) —
+                    # honor as-is, skip in_progress siblings.
+                    if code not in in_progress:
+                        expanded.append(code)
+                    continue
+                kg = kg_by_code.get(code)
+                if not kg:
+                    expanded.append(code)
+                    continue
+                blocks = maybe_split_kg(kg)
+                if len(blocks) > 1:
+                    n_split += 1
+                    for blk in blocks:
+                        bc = blk['kg_code']
+                        # Drop sibling blocks already claimed by some peer.
+                        if bc in in_progress:
+                            continue
+                        expanded.append(bc)
+                else:
+                    expanded.append(code)
+            if n_split:
+                log.info('Cache-only whitelist: expanded %d parent KGs into '
+                         'blocks (%d → %d codes) for cross-peer distribution',
+                         n_split, len(whitelist), len(expanded))
+            whitelist = expanded
+            if not whitelist:
+                log.info('Cache-only orchestrate: whitelist empty after block expansion')
+                return
+        except Exception as e:
+            log.warning('Block expansion failed (continuing with parent codes): %s', e)
+
         # --- Stable, non-overlapping partition by sorted peer id.
         # Stride assignment guarantees disjoint chunks and is stable
         # across whitelist size changes (peer X always gets the same

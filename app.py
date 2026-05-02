@@ -2255,10 +2255,30 @@ def processing_start():
             cgroup_props += ['-p', p]
         else:
             log.warning('systemd-run does not accept %s on this host — dropping', p)
+    # Drop privileges back to the exedev user so the subprocess can
+    # import packages installed under ~/.local (e.g. pyproj). sudo +
+    # systemd-run --scope otherwise spawns the processor as root with
+    # HOME=/root, which fails to discover user-site packages and dies
+    # with `ModuleNotFoundError: No module named 'pyproj'` at the very
+    # first import. PYTHONUNBUFFERED keeps the log tail responsive.
+    import pwd as _pwd
+    try:
+        _user = _pwd.getpwuid(os.getuid())
+        _user_name = _user.pw_name
+        _user_home = _user.pw_dir
+    except Exception:
+        _user_name, _user_home = 'exedev', '/home/exedev'
+    user_props = [
+        '-p', f'User={_user_name}',
+        '-p', f'Group={_user_name}',
+        '-E', f'HOME={_user_home}',
+        '-E', 'PYTHONUNBUFFERED=1',
+    ]
     scope_args = (
         ['sudo', '-n', 'systemd-run', '--scope', '--quiet',
          '--unit', unit_name]
         + cgroup_props
+        + user_props
         + ['--']
         + args
     )

@@ -3670,6 +3670,45 @@ class PeerDirector:
             time.sleep(DIRECTOR_POLL_INTERVAL)
 
     # --- Shadow election & snapshot push ---------------------------------
+    def _broadcast_identity_to_all_peers(self) -> None:
+        """One-shot: push (peer_id, peer_url, director_url) to every peer
+        in parallel. Used at director startup so every peer learns who
+        the director is without waiting len(peers) ticks.
+        """
+        try:
+            import director_ha as dha
+        except Exception:
+            return
+        my_url = dha.self_url()
+        if not my_url:
+            return
+        peers = [p for p in self.cfg.get('peers') or [] if p.get('url')]
+        if not peers:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _push(peer):
+            try:
+                requests.post(
+                    peer['url'].rstrip('/') + '/api/v1/director/identity',
+                    json={'id': peer['id'], 'url': peer['url'],
+                          'director_url': my_url},
+                    headers=_admin_headers(),
+                    timeout=PEER_TIMEOUT_CONTROL,
+                )
+                return True
+            except Exception:
+                return False
+
+        ok = 0
+        with ThreadPoolExecutor(max_workers=10,
+                                thread_name_prefix='dir-id-bcast') as ex:
+            for r in ex.map(_push, peers):
+                if r:
+                    ok += 1
+        log.info('director identity broadcast: %d/%d peers reachable',
+                 ok, len(peers))
+
     def _push_identity_to_unaware_peers(self) -> None:
         """Push director_url + peer_id to peers that don't yet know us.
 

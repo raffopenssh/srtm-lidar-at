@@ -4787,6 +4787,14 @@ def _start_director():
         return
     d = pd.get_director()
     d.start()
+    # Best-effort bulk identity broadcast — tells every peer who the
+    # current director is (and what their own peer_id is) so their
+    # watchdog can start probing /director/heartbeat. Self-healed each
+    # tick, but a one-shot at startup gets the cluster aware faster.
+    try:
+        d._broadcast_identity_to_all_peers()  # noqa: SLF001
+    except Exception as _e:
+        log.warning('startup identity broadcast failed: %s', _e)
 threading.Thread(target=_start_director, daemon=True).start()
 
 # Start the director high-availability watchdog on every VM. On the

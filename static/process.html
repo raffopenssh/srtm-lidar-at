@@ -331,6 +331,12 @@
   }
   .prio-tag.kg-active { animation: prioKgGlow 1.8s ease-in-out infinite; }
   .prio-tag.kg-active .prio-code { color: var(--blue); }
+  /* Per-block (split-KG) pip glow: pulses the individual tile being processed */
+  @keyframes prioPipGlow {
+    0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); border-color: var(--blue); background: rgba(88,166,255,0.15); }
+    50%     { box-shadow: 0 0 6px 2px rgba(88,166,255,0.85); border-color: #79b8ff; background: rgba(88,166,255,0.45); }
+  }
+  .prio-tag .split-pip.active { animation: prioPipGlow 1.4s ease-in-out infinite; }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
     #zenTbl .zen-th-name { width: 46%; }
@@ -1888,14 +1894,69 @@ async function fetchManifestSummary() {
 let _zenFilterCode = '';  // active KG code filter for manifest
 let _activeProcessingKgs = new Set();  // KG codes currently being processed across all peers
 
-// Update the kg-active class on existing priority-queue tags without re-rendering.
+// Parse a (possibly block) code into {parent, label}.
+// '49006-north-1' -> { parent: '49006', label: 'north-1' }
+// '49006'         -> { parent: '49006', label: '' }
+function _parseKgCode(code) {
+  if (!code) return { parent: '', label: '' };
+  const s = String(code);
+  const i = s.indexOf('-');
+  if (i < 0) return { parent: s, label: '' };
+  const parent = s.slice(0, i);
+  if (!/^\d+$/.test(parent)) return { parent: s, label: '' };
+  return { parent, label: s.slice(i + 1) };
+}
+
+// Returns map { parentCode -> Set(blockLabel|'') } from _activeProcessingKgs.
+function _activeKgIndex() {
+  const idx = new Map();
+  _activeProcessingKgs.forEach(code => {
+    const { parent, label } = _parseKgCode(code);
+    if (!parent) return;
+    if (!idx.has(parent)) idx.set(parent, new Set());
+    idx.get(parent).add(label);
+  });
+  return idx;
+}
+
+// Update the kg-active class on existing priority-queue tags + per-pip glow
+// without a full re-render. Handles split KGs: when only sub-blocks are
+// active, the pip(s) for those blocks pulse instead of (or in addition to)
+// the whole tag.
 function _applyActiveKgGlow() {
   const container = document.getElementById('prioQueueTags');
   if (!container) return;
+  const idx = _activeKgIndex();
   container.querySelectorAll('.prio-tag').forEach(tag => {
     const code = tag.getAttribute('data-kg');
-    if (code && _activeProcessingKgs.has(code)) tag.classList.add('kg-active');
-    else tag.classList.remove('kg-active');
+    if (!code) { tag.classList.remove('kg-active'); return; }
+    // The queue tag may use a parent code ('67109') or, rarely, a block
+    // code ('67109-south-1'). Look up by parent in either case.
+    const parsed = _parseKgCode(code);
+    const labels = idx.get(parsed.parent);
+    const pips = tag.querySelectorAll('.split-pip');
+    if (!labels) {
+      tag.classList.remove('kg-active');
+      pips.forEach(p => p.classList.remove('active'));
+      return;
+    }
+    if (pips.length === 0) {
+      // Non-split KG (or pips not rendered yet): glow the whole tag.
+      tag.classList.add('kg-active');
+      return;
+    }
+    // Split KG: glow only the matching pip(s). Drop the tag-level glow so
+    // the eye is drawn to the specific tile being processed.
+    let anyMatch = false;
+    pips.forEach(p => {
+      const lbl = p.getAttribute('data-block-label') || '';
+      if (labels.has(lbl)) { p.classList.add('active'); anyMatch = true; }
+      else p.classList.remove('active');
+    });
+    // Fallback: if we know the parent is active but couldn't pin it to a
+    // specific pip (label mismatch / older payload), keep the tag glow.
+    if (anyMatch) tag.classList.remove('kg-active');
+    else tag.classList.add('kg-active');
   });
 }
 
@@ -2968,7 +3029,8 @@ function renderPrioQueue() {
     if (isDeferred) cls += ' deferred';
     else if (isTomb) cls += ' tombstoned';
     else if (fc) cls += ' ' + fc;
-    if (kg.code && _activeProcessingKgs && _activeProcessingKgs.has(String(kg.code))) cls += ' kg-active';
+    // Active-glow decision: handled later via _applyActiveKgGlow once pips
+    // are in the DOM (so split KGs can pulse just the running block).
     tag.className = cls;
     tag.draggable = true;
     tag.dataset.idx = i;
@@ -3002,7 +3064,8 @@ function renderPrioQueue() {
       const allLabels = [...(kg.blocks_done || []), ...pending];
       for (const lbl of allLabels) {
         const isDone = doneSet.has(lbl);
-        pips += '<span class="split-pip' + (isDone ? ' done' : '') + '" title="' + esc(lbl) + (isDone ? ' ✓' : '') + '"></span>';
+        pips += '<span class="split-pip' + (isDone ? ' done' : '') +
+          '" data-block-label="' + esc(lbl) + '" title="' + esc(lbl) + (isDone ? ' ✓' : '') + '"></span>';
       }
       splitHtml = '<span class="split-pips" title="' + done + '/' + total + ' blocks done">' + pips + '</span>';
     }
@@ -3038,6 +3101,7 @@ function renderPrioQueue() {
     });
     container.appendChild(tag);
   });
+  _applyActiveKgGlow();
 }
 
 function renderPermFailed() {

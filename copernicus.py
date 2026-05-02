@@ -60,6 +60,10 @@ _BUILTIN_CREDENTIALS = [
 
 # Credentials store path (instance-local; not in git)
 _CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")
+# Per-credential usage stats (success/error counts + per-minute buckets).
+# Written by every process that uses Copernicus, read by the dashboard.
+_USAGE_STORE = pathlib.Path("data/austria_processor/copernicus_credential_usage.json")
+_USAGE_BUCKET_HOURS = 24 * 7  # keep last 7 days of per-hour buckets
 # Per-credential metadata: label, added_at, last_validated_at, last_status,
 # notes. Indexed by client_id.
 _cred_meta: Dict[str, Dict[str, Any]] = {}
@@ -287,6 +291,132 @@ def FUNCTIONING_CREDENTIALS() -> list:
     return idxs
 
 
+# === SECTION: Credential usage telemetry ===
+# Lightweight per-credential usage tracking: success/error counts +
+# per-minute buckets for a sparkline. Written atomically; multi-process
+# safe via best-effort merge (concurrent writers may briefly overwrite
+# each other but the buckets are coarse enough that this is fine).
+
+_usage_lock = threading.Lock()
+
+def _product_from_title(title: str) -> str:
+    t = (title or "").lower()
+    if "ndvi" in t and ("composite" in t or "compose" in t):
+        return "ndvi"
+    if "ndvi" in t:
+        return "ndvi"
+    if "worldcover" in t or "land cover" in t or "esa worldcover" in t:
+        return "worldcover"
+    if "sar" in t or "backscatter" in t:
+        return "sar"
+    if "harmonic" in t:
+        return "harmonics"
+    return ""
+
+def _load_usage() -> dict:
+    try:
+        if _USAGE_STORE.exists():
+            with _USAGE_STORE.open() as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def _save_usage(data: dict) -> None:
+    try:
+        _USAGE_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _USAGE_STORE.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f)
+        tmp.replace(_USAGE_STORE)
+    except Exception as e:
+        logger.debug("usage save failed: %s", e)
+
+def _prune_buckets(buckets: dict, now_h: int) -> dict:
+    cutoff = now_h - _USAGE_BUCKET_HOURS
+    return {k: v for k, v in buckets.items() if int(k) >= cutoff}
+
+def record_credential_usage(cred_index: int, kind: str, product: str = "") -> None:
+    """Record one credential request outcome.
+
+    Parameters
+    ----------
+    cred_index : int
+        Credential index in ``_CREDENTIALS``.
+    kind : str
+        ``success``, ``error``, or ``rotated`` (transient 402).
+    product : str
+        Optional product label (ndvi, sar, worldcover, harmonics).
+    """
+    if cred_index < 0 or cred_index >= len(_CREDENTIALS):
+        return
+    cid = _CREDENTIALS[cred_index][0]
+    now = int(time.time())
+    now_h = now // 3600
+    with _usage_lock:
+        data = _load_usage()
+        entry = data.setdefault(cid, {
+            "success": 0, "error": 0, "rotated": 0,
+            "last_use": 0, "last_success": 0, "last_error": 0,
+            "buckets": {},
+            "by_product": {},
+        })
+        if kind in ("success", "error", "rotated"):
+            entry[kind] = int(entry.get(kind, 0)) + 1
+        entry["last_use"] = now
+        if kind == "success":
+            entry["last_success"] = now
+        elif kind == "error":
+            entry["last_error"] = now
+        if product:
+            bp = entry.setdefault("by_product", {}).setdefault(product, {"success": 0, "error": 0, "rotated": 0})
+            if kind in bp:
+                bp[kind] += 1
+        # Per-hour bucket: "<hour_epoch>": {s, e, r}
+        buckets = entry.setdefault("buckets", {})
+        bk = str(now_h)
+        bb = buckets.setdefault(bk, {"s": 0, "e": 0, "r": 0})
+        if kind == "success":
+            bb["s"] += 1
+        elif kind == "error":
+            bb["e"] += 1
+        elif kind == "rotated":
+            bb["r"] += 1
+        entry["buckets"] = _prune_buckets(buckets, now_h)
+        _save_usage(data)
+
+def _read_usage_for(cid: str) -> dict:
+    with _usage_lock:
+        data = _load_usage()
+    e = data.get(cid) or {}
+    if not e:
+        return {"success": 0, "error": 0, "rotated": 0, "buckets": [], "by_product": {}}
+    # Return buckets as a sorted list for the last 7 days (per-hour)
+    now_h = int(time.time()) // 3600
+    cutoff = now_h - _USAGE_BUCKET_HOURS
+    out_buckets = []
+    s7 = e7 = r7 = 0
+    for h in range(cutoff + 1, now_h + 1):
+        bb = e.get("buckets", {}).get(str(h), {"s": 0, "e": 0, "r": 0})
+        s = int(bb.get("s", 0)); er = int(bb.get("e", 0)); ro = int(bb.get("r", 0))
+        out_buckets.append({"h": h, "s": s, "e": er, "r": ro})
+        s7 += s; e7 += er; r7 += ro
+    return {
+        "success": int(e.get("success", 0)),
+        "error": int(e.get("error", 0)),
+        "rotated": int(e.get("rotated", 0)),
+        "last_use": int(e.get("last_use", 0)),
+        "last_success": int(e.get("last_success", 0)),
+        "last_error": int(e.get("last_error", 0)),
+        "by_product": e.get("by_product", {}),
+        "buckets": out_buckets,
+        "window_hours": _USAGE_BUCKET_HOURS,
+        "success_7d": s7,
+        "error_7d": e7,
+        "rotated_7d": r7,
+    }
+
+
 def list_credentials() -> list:
     """Return public credential metadata (client_id, source, last_validated_at,
     last_status, exhausted, label). Never returns secrets."""
@@ -305,6 +435,10 @@ def list_credentials() -> list:
         meta["exhausted"] = i in exhausted
         if _ALLOWED_CRED_INDICES is not None:
             meta["allowed_in_process"] = i in _ALLOWED_CRED_INDICES
+        try:
+            meta["usage"] = _read_usage_for(cid)
+        except Exception:
+            meta["usage"] = {"success": 0, "error": 0, "rotated": 0, "buckets": []}
         out.append(meta)
     return out
 
@@ -917,6 +1051,10 @@ def _run_datacube(
             if tmp_path.exists() and tmp_path.stat().st_size > 0:
                 tmp_path.rename(output_path)
                 logger.info("Synchronous download complete: %s", output_path)
+                try:
+                    record_credential_usage(_credential_index, "success", _product_from_title(title))
+                except Exception:
+                    pass
                 return output_path
             else:
                 _cleanup_tmp()
@@ -927,6 +1065,10 @@ def _run_datacube(
                           SYNC_DOWNLOAD_TIMEOUT)
         except Exception as exc:
             _cleanup_tmp()
+            try:
+                record_credential_usage(_credential_index, "error", _product_from_title(title))
+            except Exception:
+                pass
             # 402 → CredentialRotatedError (propagates to decorator) or
             #        CreditsExhaustedError/IPThrottledError (propagates out)
             _check_credits_error(exc)
@@ -971,6 +1113,10 @@ def _run_datacube(
         shutil.copy2(str(output_dir), str(output_path))
 
     _enforce_cache_limit()
+    try:
+        record_credential_usage(_credential_index, "success", _product_from_title(title))
+    except Exception:
+        pass
     return output_path
 
 
@@ -1213,6 +1359,10 @@ def get_ndvi_timeseries(
                     raise
                 logger.info("NDVI %s downloaded OK%s", label,
                             " (via proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "")
+                try:
+                    record_credential_usage(cred_idx, "success", "ndvi_ts")
+                except Exception:
+                    pass
                 # Clear proxy on success
                 try:
                     c.session.proxies.clear()
@@ -1220,6 +1370,10 @@ def get_ndvi_timeseries(
                     pass
                 return label, None
             except CredentialRotatedError:
+                try:
+                    record_credential_usage(cred_idx, "rotated", "ndvi_ts")
+                except Exception:
+                    pass
                 tried_creds.add(cred_idx)
                 if len(tried_creds) >= len(_CREDENTIALS):
                     logger.warning("NDVI %s: 402 on all %d credentials — IP-throttled",
@@ -1239,6 +1393,11 @@ def get_ndvi_timeseries(
             except Exception as exc:
                 last_exc = exc
                 exc_str = str(exc)
+
+                try:
+                    record_credential_usage(cred_idx, "error", "ndvi_ts")
+                except Exception:
+                    pass
 
                 # --- No data / overcast month detection ---
                 is_nodata = False

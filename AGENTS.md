@@ -1493,6 +1493,68 @@ Tuning knobs: `THROTTLE_MIN_FACTOR`, `THROTTLE_EMA_ALPHA`,
 | `manual` | Director keeps the manually-activated peer running, no auto-switch |
 | `paused` | Director does nothing — all peers stay in current state |
 
+#### Director High-Availability (`director_ha.py`)
+
+Failover is automatic. Every VM (primary + peers) runs a watchdog
+thread that pings the director's `GET /api/v1/director/heartbeat`
+every 30 s. The director elects a *shadow* each tick — the most-reliable
+peer that is **enabled, reachable, on the same git commit, has ≥ 5 GB
+free disk and ≥ 10 GB remaining bandwidth**. Sticky: keeps the current
+shadow unless the noise-score gap to the best alternative exceeds 0.3.
+The director PUTs a full state snapshot to the shadow every 30 s.
+
+**Snapshot contents** (small JSON, ~200 KB total): `director_state.json`,
+`kg_strikes.json`, `failure_counts.json`, `cache_miss_kgs.json`,
+`deferred_kgs.json`, `retry_queue.json`, `failed_kgs.json`,
+`manifest_tombstones.json`, `copernicus_credentials.json`,
+`peers.json`, `cache_manifest.json`, `peer_urls.txt`. Staged under
+`data/austria_processor/shadow/`.
+
+**Auto-failover**: shadow misses 3 consecutive heartbeats (90 s) →
+promotes itself: installs staged snapshot, writes `is_director`,
+restarts director loop in-process (singleton replaced so EMA /
+capacity_history reload), broadcasts `POST /api/v1/director/announce`
+to every peer. Peers flip `data/austria_processor/zenodo_lock_url.txt`
+and `self.json:director_url`. Old director, if it ever comes back,
+finds `stepped_down` flag and refuses to start its director loop —
+lives on as a regular peer until manually re-promoted.
+
+**Manual handover**: dashboard `⇋ Hand Over` button (next to `+ Add
+Peer`) → `POST /api/v1/director/handover?to=<peer_id>` on the current
+director. Director ships fresh snapshot inline to target via
+`/api/v1/director/takeover`, target promotes itself, broadcasts
+announce. Old director steps down proactively. Reload the dashboard
+against the new director's URL afterwards.
+
+**Identity** (`data/austria_processor/self.json`): `{id, url,
+director_url}`. On the primary, `director_url=null` (it *is* the
+director). Peers learn their identity at registration time (deploy.sh
+or `+ Add Peer`); the director also broadcasts identity to all peers
+at startup, and self-heals one peer per tick.
+
+**HA endpoints** (all admin-token protected except heartbeat):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/director/heartbeat` | Liveness probe (public). 200 if director, 410 otherwise. |
+| GET\|PUT | `/api/v1/director/snapshot` | Director GETs snapshot, shadow accepts staged PUT. |
+| POST | `/api/v1/director/announce` | New director claims authority — peers flip pointer / step down. |
+| POST | `/api/v1/director/step_down` | Voluntarily relinquish director role. |
+| POST | `/api/v1/director/takeover` | Inbound takeover (manual handover or watchdog promotion). |
+| POST | `/api/v1/director/handover?to=<id>` | Initiated by current director; ships state + steps down. |
+| GET\|POST | `/api/v1/director/identity` | Read/set self.json. |
+
+**Files**: `is_director` (this VM is director), `stepped_down`
+(refused promotion, written by step-down), `self.json` (identity),
+`zenodo_lock_url.txt` (peer's pointer to current director),
+`shadow/` (staged snapshot), `shadow/meta.json` (origin + shadow_id
+stamp — watchdog only takes over if `meta.shadow_id == self_id`).
+
+**Disaster recovery (planned)**: just press `⇋ Hand Over` and pick a
+peer. Or stop the primary and wait 90 s; the shadow takes over
+automatically.
+
+
 #### Cross-Cutting Concerns (director changes)
 
 **Adding a peer**: Use the dashboard "+ Add Peer" button or API. This updates

@@ -1485,6 +1485,12 @@ class PeerDirector:
         # Annotate cred_pool entries with holders
         for i, c in enumerate(cred_pool):
             c['holders'] = cred_holders.get(i, [])
+        # Aggregate per-credential usage telemetry across all peers — the
+        # processor runs on peers, so the director's local stats are 0.
+        try:
+            self._aggregate_credential_usage(cred_pool, peers_list)
+        except Exception as e:
+            log.debug('aggregate_credential_usage: %s', e)
         return {
             'mode': state.get('mode', 'auto'),
             'active_peer': state.get('active_peer'),
@@ -2148,6 +2154,134 @@ class PeerDirector:
         except Exception as e:
             log.warning('credential_pool: %s', e)
             return []
+
+    def _aggregate_credential_usage(self, cred_pool: list[dict],
+                                     peers_list: list[dict]) -> None:
+        """Merge per-peer /api/v1/credentials usage into cred_pool entries.
+
+        The processor only runs on peers, so credential traffic is recorded
+        there. The director (primary) shows zero unless we sum across the
+        fleet. Keyed by client_id (stable across peers; index is identical
+        when the builtin list matches but client_id is the safer key).
+
+        Cheap: each peer's /api/v1/credentials returns ~ a few KB. Run in
+        parallel and tolerate failures (legacy peers without `usage` are
+        simply skipped).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch(peer_url: str | None) -> list[dict]:
+            if peer_url is None:
+                return []
+            try:
+                r = requests.get(peer_url.rstrip('/') + '/api/v1/credentials',
+                                 timeout=PEER_TIMEOUT_PROBE,
+                                 headers=_admin_headers())
+                if not r.ok:
+                    return []
+                return (r.json() or {}).get('credentials') or []
+            except Exception:
+                return []
+
+        # Initialise aggregate buckets per client_id
+        agg: dict[str, dict] = {}
+        for c in cred_pool:
+            cid = c.get('client_id')
+            if not cid:
+                continue
+            agg[cid] = {'success_7d': 0, 'error_7d': 0, 'rotated_7d': 0,
+                        'success': 0, 'error': 0, 'rotated': 0,
+                        'last_use': 0, 'last_success': 0, 'last_error': 0,
+                        'buckets_by_hour': {},  # h -> {s,e,r}
+                        'by_product': {},
+                        'sources': [],  # peer ids contributing
+                        'window_hours': 168}
+
+        targets = [p for p in peers_list if p.get('url')]
+        if not targets:
+            return
+        with ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
+            futs = {ex.submit(_fetch, p.get('url')): p for p in targets}
+            try:
+                done_iter = as_completed(futs, timeout=20)
+            except Exception:
+                return
+            for fut in done_iter:
+                peer = futs[fut]
+                pid = peer.get('id')
+                try:
+                    creds = fut.result()
+                except Exception:
+                    continue
+                for c in creds:
+                    cid = c.get('client_id')
+                    u = c.get('usage')
+                    if not cid or not u or cid not in agg:
+                        continue
+                    a = agg[cid]
+                    contributed = False
+                    for k in ('success_7d', 'error_7d', 'rotated_7d',
+                              'success', 'error', 'rotated'):
+                        v = int(u.get(k) or 0)
+                        a[k] += v
+                        if v:
+                            contributed = True
+                    for k in ('last_use', 'last_success', 'last_error'):
+                        v = int(u.get(k) or 0)
+                        if v > a[k]:
+                            a[k] = v
+                    # Merge per-hour buckets
+                    for b in (u.get('buckets') or []):
+                        h = b.get('h')
+                        if h is None:
+                            continue
+                        cell = a['buckets_by_hour'].setdefault(
+                            int(h), {'s': 0, 'e': 0, 'r': 0})
+                        cell['s'] += int(b.get('s') or 0)
+                        cell['e'] += int(b.get('e') or 0)
+                        cell['r'] += int(b.get('r') or 0)
+                    # Merge per-product counts (best-effort)
+                    for prod, pc in (u.get('by_product') or {}).items():
+                        dst = a['by_product'].setdefault(
+                            prod, {'success': 0, 'error': 0, 'rotated': 0})
+                        if isinstance(pc, dict):
+                            dst['success'] += int(pc.get('success') or 0)
+                            dst['error'] += int(pc.get('error') or 0)
+                            dst['rotated'] += int(pc.get('rotated') or 0)
+                    if contributed and pid and pid not in a['sources']:
+                        a['sources'].append(pid)
+
+        # Materialise back onto cred_pool: convert buckets_by_hour to a
+        # sorted list spanning the standard 168-hour window.
+        now_h = int(time.time()) // 3600
+        for c in cred_pool:
+            cid = c.get('client_id')
+            if not cid or cid not in agg:
+                continue
+            a = agg[cid]
+            window = a['window_hours']
+            cutoff = now_h - window
+            buckets_out = []
+            bb = a['buckets_by_hour']
+            for h in range(cutoff + 1, now_h + 1):
+                cell = bb.get(h, {'s': 0, 'e': 0, 'r': 0})
+                buckets_out.append({'h': h, 's': cell['s'],
+                                     'e': cell['e'], 'r': cell['r']})
+            c['usage'] = {
+                'success_7d': a['success_7d'],
+                'error_7d': a['error_7d'],
+                'rotated_7d': a['rotated_7d'],
+                'success': a['success'],
+                'error': a['error'],
+                'rotated': a['rotated'],
+                'last_use': a['last_use'],
+                'last_success': a['last_success'],
+                'last_error': a['last_error'],
+                'buckets': buckets_out,
+                'window_hours': window,
+                'by_product': a['by_product'],
+                'aggregated_from': a['sources'],
+            }
 
     def _valid_credentials(self) -> list[int]:
         """Return indices of credentials that are not exhausted.

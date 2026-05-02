@@ -440,6 +440,19 @@ These are the dangerous changes — they touch many files and are easy to break.
    (no body) to re-probe everything, e.g. on the 1st of the month after
    credit renewals.
 6. **Important**: the `@_retry_on_rotation` decorator tries `len(_CREDENTIALS)+1` attempts. Adding/removing credentials changes retry behaviour automatically.
+7. **Per-credential usage telemetry**: every Copernicus call records
+   success/error/rotated outcomes into
+   `data/austria_processor/copernicus_credential_usage.json` (per-hour
+   buckets, 7-day window). Hooked in `_run_datacube` (sync + batch) and
+   `_download_month_sequential` (NDVI TS). `copernicus.list_credentials()`
+   returns `usage:{success_7d, error_7d, rotated_7d, last_use, buckets,
+   by_product}`; the dashboard 🔑 Credentials panel renders a stacked
+   sparkline + totals + success rate per credential. To reset stats: `rm
+   data/austria_processor/copernicus_credential_usage.json`. Multi-process
+   safe via best-effort merge (coarse buckets tolerate occasional
+   overwrites). When adding new code paths that hit Copernicus, call
+   `copernicus.record_credential_usage(cred_index, kind, product)` on
+   success/error so the dashboard stays accurate.
 
 **Per-peer credential & lat-strip dedication (parallel frontiers):**
 The director assigns disjoint slices of valid credentials and disjoint

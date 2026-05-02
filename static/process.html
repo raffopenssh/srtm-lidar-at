@@ -443,6 +443,7 @@
         <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
         <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
         <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
+        <button class="btn" id="btnDirHandover" onclick="showHandoverModal()" style="font-size:10px;padding:1px 6px;" title="Hand over director role to another peer">⇋ Hand Over</button>
       </span>
     </div>
     <div id="directorBody" class="coll-b" style="margin-top:6px;">
@@ -3884,6 +3885,56 @@ async function updateSinglePeer(peerId) {
   } catch(e) {
     btn.textContent = '\u274c';
     setTimeout(() => { fetchDirectorStatus(); }, 3000);
+  }
+}
+
+// ── Director handover ─────────────────────────────────
+async function showHandoverModal() {
+  const dd = _directorData || {};
+  if (!dd.is_director_local) {
+    if (!confirm('This dashboard is not connected to the current director.\n'
+      + 'Handover must be initiated from the director itself. Continue anyway?')) return;
+  }
+  const peers = (dd.peers || []).filter(p => p.enabled && p.url
+    && p.id !== (dd.self_id || 'primary'));
+  if (!peers.length) { alert('No eligible peers.'); return; }
+  const shadow = dd.shadow_peer;
+  const opts = peers.map(p => {
+    const tag = (p.id === shadow) ? ' [shadow]' : '';
+    const reach = (p.last_status && p.last_status.state) || '';
+    return `<option value="${p.id}">${p.id}${tag} (${reach})</option>`;
+  }).join('');
+  const sel = prompt('Hand over director role to which peer?\n\n'
+    + 'Eligible peers:\n  '
+    + peers.map(p => p.id + (p.id === shadow ? ' (shadow, recommended)' : '')).join('\n  ')
+    + '\n\nType the peer id:', shadow || peers[0].id);
+  if (!sel) return;
+  const target = peers.find(p => p.id === sel.trim());
+  if (!target) { alert('Unknown peer: ' + sel); return; }
+  if (!confirm(`Hand over director role to ${target.id} (${target.url})?\n\n`
+    + 'This VM will step down and become a regular peer. The new director\n'
+    + 'will broadcast the change to all peers.')) return;
+  const btn = document.getElementById('btnDirHandover');
+  btn.textContent = '⏳ Handing over…';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/v1/director/handover?to=' + encodeURIComponent(target.id),
+      {method:'POST'});
+    const d = await r.json();
+    if (r.ok && d.status === 'handed_over') {
+      btn.textContent = '✅ Handed over';
+      alert('Director handed over to ' + target.id
+        + '.\n\nReload the dashboard against ' + target.url + '/process.html');
+    } else {
+      btn.textContent = '❌ ' + (d.error || 'failed');
+      alert('Handover failed: ' + JSON.stringify(d));
+    }
+  } catch(e) {
+    btn.textContent = '❌ Failed';
+    alert('Handover error: ' + e);
+  } finally {
+    setTimeout(() => { btn.textContent = '⇋ Hand Over'; btn.disabled = false;
+      fetchDirectorStatus(); }, 4000);
   }
 }
 

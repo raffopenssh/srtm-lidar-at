@@ -119,6 +119,11 @@ _PROTECTED_PREFIXES = (
     '/api/v1/director/throttle',
     '/api/v1/director/update_peers',
     '/api/v1/director/restart_peer',
+    '/api/v1/director/handover',
+    '/api/v1/director/takeover',
+    '/api/v1/director/step_down',
+    '/api/v1/director/announce',
+    '/api/v1/director/snapshot',
     '/api/v1/processing/start',
     '/api/v1/processing/stop',
     '/api/v1/processing/pause',
@@ -3534,6 +3539,26 @@ def director_add_peer():
     except Exception:
         pass
 
+    # Push self-identity to the new peer so it knows its own id, URL and
+    # who the current director is. This is the source-of-truth for
+    # director_ha (watchdog comparisons, takeover gating, announce flips).
+    try:
+        import director_ha as dha
+        my_url = dha.self_url() or request.host_url.rstrip('/')
+        admin_tok = ''
+        try:
+            admin_tok = Path('data/admin_token').read_text().strip()
+        except Exception:
+            pass
+        requests.post(
+            peer_url + '/api/v1/director/identity',
+            json={'id': peer_id, 'url': peer_url, 'director_url': my_url},
+            headers=({'X-Admin-Token': admin_tok} if admin_tok else {}),
+            timeout=10,
+        )
+    except Exception as _e:
+        log.warning('Could not push identity to new peer %s: %s', peer_id, _e)
+
     from datetime import datetime as _dtnow, timezone as _tznow
     cfg['peers'].append({
         'id': peer_id, 'url': peer_url, 'enabled': enabled,
@@ -4617,18 +4642,178 @@ def admin_disable_autostart():
         return jsonify({'error': str(e)}), 500
 
 
+# === SECTION: Director high-availability (heartbeat / shadow / handover) ===
+
+@app.route('/api/v1/director/heartbeat', methods=['GET'])
+def director_heartbeat():
+    """Liveness ping. Public (no admin token) so peers can probe cheaply.
+
+    Returns 200 only when this VM holds ``is_director``. Otherwise 410 so
+    callers know to look elsewhere (peer watchdog will then check whom it
+    thinks the director is and re-evaluate).
+    """
+    import director_ha as dha
+    if not dha.IS_DIRECTOR_FLAG.exists():
+        return jsonify({'is_director': False, 'self': dha.load_self()}), 410
+    try:
+        d = pd.get_director()
+        running = bool(getattr(d, '_running', False))
+    except Exception:
+        running = False
+    state = {}
+    try:
+        state = pd.load_director_state()
+    except Exception:
+        pass
+    return jsonify({
+        'is_director': True,
+        'running': running,
+        'self': dha.load_self(),
+        'shadow_peer': state.get('shadow_peer'),
+        'active_peer': state.get('active_peer'),
+        'mode': state.get('mode'),
+        'ts': time.time(),
+    })
+
+
+@app.route('/api/v1/director/snapshot', methods=['GET', 'PUT'])
+def director_snapshot():
+    """GET: build & return a snapshot (director only).
+    PUT: stage a snapshot from the director (shadow only).
+    """
+    import director_ha as dha
+    if request.method == 'GET':
+        if not dha.IS_DIRECTOR_FLAG.exists():
+            return jsonify({'error': 'not_director'}), 410
+        return jsonify(dha.build_snapshot())
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict) or '_meta' not in body:
+        return jsonify({'error': 'invalid_snapshot'}), 400
+    dha.stage_snapshot(body)
+    return jsonify({'status': 'staged', 'self': dha.load_self()})
+
+
+@app.route('/api/v1/director/announce', methods=['POST'])
+def director_announce():
+    """Inbound announce — a new director claims authority."""
+    import director_ha as dha
+    body = request.get_json(silent=True) or {}
+    return jsonify(dha.accept_announce(body))
+
+
+@app.route('/api/v1/director/step_down', methods=['POST'])
+def director_step_down():
+    """Old director is asked to step down (idempotent)."""
+    import director_ha as dha
+    body = request.get_json(silent=True) or {}
+    return jsonify(dha.step_down(body))
+
+
+@app.route('/api/v1/director/takeover', methods=['POST'])
+def director_takeover():
+    """Inbound takeover (manual handover or shadow promotion).
+
+    Body: ``{snapshot, prev_director_url, reason}``. If snapshot provided,
+    install it inline; otherwise promote the staged shadow snapshot.
+    """
+    import director_ha as dha
+    body = request.get_json(silent=True) or {}
+    snap = body.get('snapshot')
+    return jsonify(dha._do_takeover(
+        reason=body.get('reason', 'inbound_takeover'),
+        prev_director_url=body.get('prev_director_url'),
+        snapshot_inline=snap if isinstance(snap, dict) else None,
+    ))
+
+
+@app.route('/api/v1/director/handover', methods=['POST'])
+def director_handover():
+    """Manual handover initiated by the current director.
+
+    Body: ``{to: <peer_id>}`` (or ?to=<peer_id>).
+    """
+    import director_ha as dha
+    if not dha.IS_DIRECTOR_FLAG.exists():
+        return jsonify({'error': 'not_director'}), 409
+    target = (request.args.get('to') or
+              (request.get_json(silent=True) or {}).get('to', '')).strip()
+    if not target:
+        return jsonify({'error': 'to=<peer_id> required'}), 400
+    cfg = pd.load_peers_config()
+    peer = pd.get_peer_by_id(cfg, target)
+    if not peer or not peer.get('url'):
+        return jsonify({'error': f'unknown peer: {target}'}), 404
+    return jsonify(dha.do_handover(target, peer['url']))
+
+
+@app.route('/api/v1/director/identity', methods=['GET', 'POST'])
+def director_identity():
+    """GET/POST self identity (id, url, director_url)."""
+    import director_ha as dha
+    if request.method == 'GET':
+        return jsonify({**dha.load_self(),
+                        'is_director': dha.IS_DIRECTOR_FLAG.exists(),
+                        'stepped_down': dha.STEPPED_DOWN_FLAG.exists(),
+                        'watchdog': dha.watchdog_state()})
+    body = request.get_json(silent=True) or {}
+    cur = dha.load_self()
+    for k in ('id', 'url', 'director_url'):
+        if k in body and body[k] is not None:
+            cur[k] = body[k]
+    dha.save_self(cur)
+    if 'director_url' in body:
+        dha.set_director_url(body['director_url'])
+    return jsonify(cur)
+
+
 # Start the director background thread — only on the primary instance.
 # The director loop actively starts/stops processors on peers, so only one
 # instance should run it. Enabled by the flag file data/austria_processor/is_director.
 def _start_director():
     time.sleep(3)  # let Flask boot first
     flag = Path('data/austria_processor/is_director')
+    stepped_down = Path('data/austria_processor/stepped_down')
+    if stepped_down.exists() and flag.exists():
+        # Conflict: both flags set. stepped_down wins (safer). The peer
+        # was demoted; don't re-promote it on cold restart.
+        try:
+            flag.unlink()
+            log.warning('Both is_director and stepped_down present; honouring '
+                        'stepped_down and removing is_director.')
+        except Exception:
+            pass
     if not flag.exists():
         log.info('Not a director instance (no %s) — director loop disabled', flag)
         return
     d = pd.get_director()
     d.start()
 threading.Thread(target=_start_director, daemon=True).start()
+
+# Start the director high-availability watchdog on every VM. On the
+# director it's mostly a no-op; on peers it pings the director every 30s
+# and if the shadow misses 3 in a row, the shadow promotes itself.
+try:
+    import director_ha as dha
+    # Bootstrap self.json on the primary if missing so dha has a known id.
+    _self = dha.load_self()
+    if dha.IS_DIRECTOR_FLAG.exists():
+        # The director should not have a director_url pointer.
+        if _self.get('director_url'):
+            _self['director_url'] = None
+            dha.save_self(_self)
+        # Force id='primary' if hostname suggests so and unset.
+        if not _self.get('url'):
+            try:
+                import socket as _sock
+                h = _sock.gethostname().split('.')[0]
+                if h.startswith('srtm-lidar-'):
+                    _self['url'] = f'https://{h}.exe.xyz:8000'
+                    dha.save_self(_self)
+            except Exception:
+                pass
+    dha.start_watchdog()
+except Exception as _e:
+    log.warning('director_ha watchdog disabled: %s', _e)
 
 
 # === SECTION: Search index API endpoints ===

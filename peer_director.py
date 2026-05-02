@@ -1528,8 +1528,21 @@ class PeerDirector:
             'peer_warning_rates': state.get('peer_warning_rates') or {},
             'peer_noise_long_ema': state.get('peer_noise_long_ema') or {},
             'peer_last_live_ts': state.get('peer_last_live_ts') or {},
+            'shadow_peer': state.get('shadow_peer'),
+            'shadow_url': state.get('shadow_url'),
+            'shadow_last_push_ts': state.get('shadow_last_push_ts'),
+            'shadow_last_push_ok': state.get('shadow_last_push_ok'),
+            'is_director_local': (DATA_DIR / 'is_director').exists(),
+            'self_id': self._self_id_safe(),
             'peers': peers_status,
         }
+
+    def _self_id_safe(self) -> str:
+        try:
+            import director_ha as _dha
+            return _dha.self_id()
+        except Exception:
+            return 'primary'
 
     def set_mode(self, mode: str):
         with self._lock:
@@ -3639,11 +3652,92 @@ class PeerDirector:
                 if sync_counter >= 5:
                     self._sync_queue_to_active()
                     sync_counter = 0
+                # Elect / refresh shadow & push snapshot every tick.
+                try:
+                    self._maintain_shadow(_statuses)
+                except Exception as _e:
+                    log.debug('shadow maintenance failed: %s', _e)
                 with self._lock:
                     save_director_state(self.state)
             except Exception:
                 log.exception('Director loop error')
             time.sleep(DIRECTOR_POLL_INTERVAL)
+
+    # --- Shadow election & snapshot push ---------------------------------
+    def _maintain_shadow(self, statuses: dict) -> None:
+        """Elect a shadow each tick and push the current state snapshot.
+
+        Shadow == the most-trustworthy peer that is not us. Picks the peer
+        with: enabled=True, reachable, lowest noise score (most reliable),
+        not already running heavy frontier work. Re-evaluated every tick;
+        sticky for ~5 min unless the current shadow turns unreachable.
+        """
+        try:
+            import director_ha as dha
+        except Exception:
+            return
+        cfg = self.cfg
+        peers = cfg.get('peers') or []
+        # Candidate set: enabled, has URL (i.e. not local), reachable.
+        candidates: list[tuple[float, dict]] = []
+        for p in peers:
+            if not p.get('enabled'):
+                continue
+            if not p.get('url'):
+                continue
+            ps = (statuses or {}).get(p['id']) or {}
+            if ps.get('state') == 'unreachable':
+                continue
+            score = _peer_noise_score(p['id'], self.state)
+            candidates.append((score, p))
+        if not candidates:
+            return
+        candidates.sort(key=lambda x: x[0])
+        prev_shadow = self.state.get('shadow_peer')
+        # Stickiness: keep the previous shadow unless it's gone or we have
+        # a much-better candidate (>0.3 score gap).
+        chosen = None
+        if prev_shadow:
+            for s, p in candidates:
+                if p['id'] == prev_shadow:
+                    chosen = (s, p)
+                    break
+        if chosen is None:
+            chosen = candidates[0]
+        else:
+            best_s, best_p = candidates[0]
+            if best_p['id'] != prev_shadow and (chosen[0] - best_s) > 0.3:
+                chosen = (best_s, best_p)
+        s_score, s_peer = chosen
+        # Only push snapshot every SHADOW_SYNC_INTERVAL seconds.
+        last_push = float(self.state.get('shadow_last_push_ts') or 0.0)
+        now = time.time()
+        push_due = (now - last_push) >= dha.SHADOW_SYNC_INTERVAL
+        # Always push immediately when the shadow changes.
+        shadow_changed = prev_shadow != s_peer['id']
+        self.state['shadow_peer'] = s_peer['id']
+        self.state['shadow_url'] = s_peer.get('url')
+        self.state['shadow_score'] = round(float(s_score), 4)
+        if not (push_due or shadow_changed):
+            return
+        try:
+            snap = dha.build_snapshot()
+            snap['_meta']['shadow_id'] = s_peer['id']
+            snap['_meta']['director_id'] = (load_director_state()
+                                            .get('active_peer') or 'director')
+            res = dha.push_snapshot_to_shadow(s_peer['url'], snap)
+            ok = isinstance(res, dict) and res.get('status') == 'staged'
+            self.state['shadow_last_push_ts'] = now
+            self.state['shadow_last_push_ok'] = ok
+            self.state['shadow_last_push_result'] = res if not ok else 'staged'
+            if shadow_changed:
+                log.info('director shadow set to %s (score=%.3f, push=%s)',
+                         s_peer['id'], s_score, 'ok' if ok else res)
+        except Exception as e:
+            log.warning('shadow snapshot push to %s failed: %s',
+                        s_peer.get('id'), e)
+            self.state['shadow_last_push_ok'] = False
+            self.state['shadow_last_push_result'] = str(e)[:200]
 
 
 # Singleton

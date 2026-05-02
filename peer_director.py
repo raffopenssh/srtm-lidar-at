@@ -2197,15 +2197,60 @@ class PeerDirector:
                         'sources': [],  # peer ids contributing
                         'window_hours': 168}
 
+        # Include primary (url=None) by reading its local copernicus.list_credentials
+        # so its own traffic counts when it ever runs frontier work.
+        try:
+            import copernicus as _cop_local
+            local_creds = _cop_local.list_credentials()
+        except Exception:
+            local_creds = []
+        for c in local_creds:
+            cid = c.get('client_id')
+            u = c.get('usage')
+            if not cid or not u or cid not in agg:
+                continue
+            a = agg[cid]
+            contributed = False
+            for k in ('success_7d', 'error_7d', 'rotated_7d',
+                      'success', 'error', 'rotated'):
+                v = int(u.get(k) or 0)
+                a[k] += v
+                if v:
+                    contributed = True
+            for k in ('last_use', 'last_success', 'last_error'):
+                v = int(u.get(k) or 0)
+                if v > a[k]:
+                    a[k] = v
+            for b in (u.get('buckets') or []):
+                h = b.get('h')
+                if h is None:
+                    continue
+                cell = a['buckets_by_hour'].setdefault(
+                    int(h), {'s': 0, 'e': 0, 'r': 0})
+                cell['s'] += int(b.get('s') or 0)
+                cell['e'] += int(b.get('e') or 0)
+                cell['r'] += int(b.get('r') or 0)
+            for prod, pc in (u.get('by_product') or {}).items():
+                dst = a['by_product'].setdefault(
+                    prod, {'success': 0, 'error': 0, 'rotated': 0})
+                if isinstance(pc, dict):
+                    dst['success'] += int(pc.get('success') or 0)
+                    dst['error'] += int(pc.get('error') or 0)
+                    dst['rotated'] += int(pc.get('rotated') or 0)
+            if contributed and 'primary' not in a['sources']:
+                a['sources'].append('primary')
+
         targets = [p for p in peers_list if p.get('url')]
         if not targets:
-            return
-        with ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
+            # Still materialise local-only contributions below.
+            pass
+        if targets:
+          with ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
             futs = {ex.submit(_fetch, p.get('url')): p for p in targets}
             try:
                 done_iter = as_completed(futs, timeout=20)
             except Exception:
-                return
+                done_iter = []
             for fut in done_iter:
                 peer = futs[fut]
                 pid = peer.get('id')

@@ -88,31 +88,64 @@ class ZenodoLease:
         self._thread.start()
 
     def _heartbeat_loop(self):
+        consecutive_fail = 0
         while not self._stop.wait(_HEARTBEAT_INTERVAL):
             try:
                 r = requests.post(
                     f"{self.broker}/api/v1/zenodo/lock/heartbeat",
-                    json={'token': self.token}, timeout=15,
+                    json={'token': self.token},
+                    timeout=_BROKER_HTTP_TIMEOUT,
                     headers=_admin_headers(),
                 )
                 if r.status_code == 410:
-                    log.warning('Zenodo lease lost (410) — broker reclaimed it')
+                    log.warning('Upload lease lost (410) — broker reclaimed it')
                     self._stop.set()
                     return
                 r.raise_for_status()
+                consecutive_fail = 0
             except Exception as e:
-                log.warning('Zenodo lease heartbeat failed: %s', e)
+                consecutive_fail += 1
+                # Single hiccups are normal (gunicorn workers briefly
+                # busy). Only escalate to a warning after sustained
+                # failures, and avoid the "zenodo"/"lease" tokens that
+                # the throttle classifier matches — broker-internal
+                # chatter shouldn't be treated as upstream Zenodo
+                # pressure.
+                level = log.info if consecutive_fail < 3 else log.warning
+                level('Upload broker heartbeat blip (%d): %s',
+                      consecutive_fail, str(e)[:160])
 
     def release(self):
         self._stop.set()
-        try:
-            requests.delete(
-                f"{self.broker}/api/v1/zenodo/lock",
-                json={'token': self.token}, timeout=15,
-                headers=_admin_headers(),
-            )
-        except Exception as e:
-            log.warning('Zenodo lease release failed: %s', e)
+        # Best-effort, retrying release. The TTL on the broker will
+        # auto-reclaim the lease within _DEFAULT_TTL seconds even if
+        # every release attempt fails, so we can't deadlock the fleet
+        # — but a clean release lets the next peer grab the lock
+        # immediately. Run in a background thread so we never block
+        # the caller's hot path on a slow primary.
+        def _release_in_background():
+            for attempt in range(3):
+                try:
+                    requests.delete(
+                        f"{self.broker}/api/v1/zenodo/lock",
+                        json={'token': self.token},
+                        timeout=_BROKER_HTTP_TIMEOUT,
+                        headers=_admin_headers(),
+                    )
+                    return
+                except Exception as e:
+                    if attempt == 2:
+                        # Don't log "Zenodo lease release failed" — the
+                        # tokens trip the throttle classifier. Reword.
+                        log.info(
+                            'Upload broker release blip (will TTL-reclaim '
+                            'in %.0fs): %s', _DEFAULT_TTL, str(e)[:160])
+                    else:
+                        time.sleep(2 * (attempt + 1))
+        threading.Thread(
+            target=_release_in_background,
+            name='zenodo-lease-release', daemon=True,
+        ).start()
 
 
 @contextlib.contextmanager

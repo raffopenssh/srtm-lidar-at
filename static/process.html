@@ -443,7 +443,6 @@
         <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
         <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
         <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
-        <button class="btn" id="btnDirHandover" onclick="showHandoverModal()" style="font-size:10px;padding:1px 6px;" title="Hand over director role to another peer">⇋ Hand Over</button>
       </span>
     </div>
     <div id="directorBody" class="coll-b" style="margin-top:6px;">
@@ -789,6 +788,23 @@ function fmtT(iso) {
   try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
 }
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtRelPast(ts) {
+  // ts: epoch seconds (number) or ISO string. Returns 'Ns ago' / 'Nm ago' / 'Nh ago'.
+  if (ts == null || ts === '') return '';
+  let t;
+  if (typeof ts === 'number') t = ts * 1000;
+  else { t = Date.parse(ts); if (isNaN(t)) return ''; }
+  const ms = Date.now() - t;
+  if (ms < 0) return 'just now';
+  const s = Math.round(ms/1000);
+  if (s < 60) return s + 's ago';
+  const m = Math.round(s/60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m/60), mm = m % 60;
+  if (h < 24) return h + 'h' + (mm ? mm + 'm' : '') + ' ago';
+  const d = Math.floor(h/24);
+  return d + 'd ago';
+}
 function fmtRelFuture(iso) {
   if (!iso) return '';
   const t = Date.parse(iso);
@@ -1658,6 +1674,17 @@ function peerActionsMenu(p, opts) {
   if (!isActive && p.enabled && p.online && !isScheduled) {
     items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => activatePeer(${idJ}))">▶ Activate</button>`);
   }
+  // Manual director handover — only if local instance is currently director,
+  // target peer is reachable and isn't already the director.
+  try {
+    const dd = (typeof _directorData !== 'undefined') ? (_directorData || {}) : {};
+    const myId = dd.self_id || 'primary';
+    if (dd.is_director_local && p.url && p.online && p.id !== myId) {
+      const isShadow = dd.shadow_peer === p.id;
+      const lbl = isShadow ? '⇋ Hand over director (shadow)' : '⇋ Hand over director here';
+      items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => handoverDirectorTo(${idJ}))" title="Step down and promote this peer to director">${lbl}</button>`);
+    }
+  } catch(_) {}
   if (isRunning) {
     items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => peerCmd(${idJ}, 'pause'))">‖ Pause</button>`);
   } else if (isPaused) {
@@ -3465,6 +3492,23 @@ function renderDirector(d) {
     }
     return tag;
   }
+  // Director/shadow indicators (last sync info)
+  const directorId = d.is_director_local ? (d.self_id || 'primary') : null;
+  const shadowId = d.shadow_peer || null;
+  const shadowLastPushTs = d.shadow_last_push_ts || null;
+  const shadowLastPushOk = d.shadow_last_push_ok;
+  function roleBadge(p) {
+    if (directorId && p.id === directorId) {
+      return ' <span title="This peer is the active director" style="font-size:9px;padding:1px 5px;border:1px solid var(--blue);border-radius:8px;color:var(--blue);font-weight:600">★ director</span>';
+    }
+    if (shadowId && p.id === shadowId) {
+      const rel = shadowLastPushTs ? fmtRelPast(shadowLastPushTs) : 'never synced';
+      const okMark = shadowLastPushOk === false ? ' ⚠' : '';
+      const color = shadowLastPushOk === false ? 'var(--yellow)' : 'var(--dim)';
+      return ' <span title="Shadow director (standby) · last snapshot push: ' + esc(rel) + (shadowLastPushOk === false ? ' (failed)' : '') + '" style="font-size:9px;padding:1px 5px;border:1px solid ' + color + ';border-radius:8px;color:' + color + ';font-weight:600">◐ shadow · ' + esc(rel) + okMark + '</span>';
+    }
+    return '';
+  }
   let html = '';
   for (const p of peers) {
     const isActive = p.id === active;
@@ -3503,7 +3547,7 @@ function renderDirector(d) {
       // Collapsed card — single line with expand toggle
       html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;opacity:0.7;' + border + '">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="this.parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">';
-      html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id);
+      html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id) + roleBadge(p);
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
       html += ' · ' + (p.completed||0) + ' done';
       if (isScheduled && p.not_before) {
@@ -3535,7 +3579,7 @@ function renderDirector(d) {
       else if (isCacheOnly && isRunning) badge = ' · <span style="color:var(--blue);font-weight:500" title="cache-only peer (no Copernicus/Hansen fetches)">cache-only</span>';
       else if (isReady) badge = ' ⏯ holds KG ' + esc(p.reserved_kg);
       else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + badge + '</span>';
+      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + badge + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
       html += peerActionsMenu(p, {isActive: isActive});
       html += '</span>';
@@ -3555,7 +3599,7 @@ function renderDirector(d) {
     if (isInactive) {
       // Show inside hidden detail
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + '</span>';
+      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + '</span>';
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
@@ -3889,52 +3933,32 @@ async function updateSinglePeer(peerId) {
 }
 
 // ── Director handover ─────────────────────────────────
-async function showHandoverModal() {
+async function handoverDirectorTo(peerId) {
   const dd = _directorData || {};
   if (!dd.is_director_local) {
     if (!confirm('This dashboard is not connected to the current director.\n'
       + 'Handover must be initiated from the director itself. Continue anyway?')) return;
   }
-  const peers = (dd.peers || []).filter(p => p.enabled && p.url
-    && p.id !== (dd.self_id || 'primary'));
-  if (!peers.length) { alert('No eligible peers.'); return; }
-  const shadow = dd.shadow_peer;
-  const opts = peers.map(p => {
-    const tag = (p.id === shadow) ? ' [shadow]' : '';
-    const reach = (p.last_status && p.last_status.state) || '';
-    return `<option value="${p.id}">${p.id}${tag} (${reach})</option>`;
-  }).join('');
-  const sel = prompt('Hand over director role to which peer?\n\n'
-    + 'Eligible peers:\n  '
-    + peers.map(p => p.id + (p.id === shadow ? ' (shadow, recommended)' : '')).join('\n  ')
-    + '\n\nType the peer id:', shadow || peers[0].id);
-  if (!sel) return;
-  const target = peers.find(p => p.id === sel.trim());
-  if (!target) { alert('Unknown peer: ' + sel); return; }
+  const target = (dd.peers || []).find(p => p.id === peerId);
+  if (!target) { alert('Unknown peer: ' + peerId); return; }
+  if (!target.url) { alert('Peer has no URL: ' + peerId); return; }
   if (!confirm(`Hand over director role to ${target.id} (${target.url})?\n\n`
     + 'This VM will step down and become a regular peer. The new director\n'
     + 'will broadcast the change to all peers.')) return;
-  const btn = document.getElementById('btnDirHandover');
-  btn.textContent = '⏳ Handing over…';
-  btn.disabled = true;
   try {
     const r = await fetch('/api/v1/director/handover?to=' + encodeURIComponent(target.id),
       {method:'POST'});
-    const d = await r.json();
-    if (r.ok && d.status === 'handed_over') {
-      btn.textContent = '✅ Handed over';
+    const j = await r.json();
+    if (r.ok && j.status === 'handed_over') {
       alert('Director handed over to ' + target.id
         + '.\n\nReload the dashboard against ' + target.url + '/process.html');
     } else {
-      btn.textContent = '❌ ' + (d.error || 'failed');
-      alert('Handover failed: ' + JSON.stringify(d));
+      alert('Handover failed: ' + JSON.stringify(j));
     }
   } catch(e) {
-    btn.textContent = '❌ Failed';
     alert('Handover error: ' + e);
   } finally {
-    setTimeout(() => { btn.textContent = '⇋ Hand Over'; btn.disabled = false;
-      fetchDirectorStatus(); }, 4000);
+    setTimeout(() => fetchDirectorStatus(), 1500);
   }
 }
 

@@ -4673,6 +4673,62 @@ def admin_backfill_status():
     return jsonify({'running': running, 'pid': pid, 'log_tail': tail})
 
 
+@app.route('/api/v1/admin/proc_env', methods=['GET'])
+def admin_proc_env():
+    """Diagnostic: dump environ + cmdline for the running processor.
+    Used to debug whether director-set assignment env vars actually
+    reach the subprocess. Returns a small filtered set of keys.
+    """
+    import subprocess as sp
+    info = {}
+    try:
+        out = sp.check_output(['pgrep', '-af', 'austria_processor.py'],
+                              text=True, timeout=3).strip().splitlines()
+        info['pgrep'] = out
+    except Exception as e:
+        info['pgrep'] = f'err: {e}'
+        out = []
+    rows = []
+    for line in out:
+        try:
+            pid_s, *_ = line.split(None, 1)
+            pid = int(pid_s)
+        except Exception:
+            continue
+        row = {'pid': pid}
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                row['cmdline'] = f.read().replace(b'\0', b' ').decode('utf-8', 'ignore').strip()
+        except Exception as e:
+            row['cmdline_err'] = str(e)
+        try:
+            st = open(f'/proc/{pid}/status').read()
+            for ln in st.splitlines():
+                if ln.startswith(('Uid:', 'Name:', 'PPid:', 'State:')):
+                    row[ln.split(':')[0].lower()] = ln.split(':',1)[1].strip()
+        except Exception as e:
+            row['status_err'] = str(e)
+        try:
+            with open(f'/proc/{pid}/environ', 'rb') as f:
+                envs = f.read().split(b'\0')
+            interesting = {}
+            for kv in envs:
+                if not kv or b'=' not in kv:
+                    continue
+                k, v = kv.split(b'=', 1)
+                k = k.decode('utf-8', 'ignore')
+                if k in ('COPERNICUS_CRED_INDICES', 'KG_LAT_STRIP_FILTER',
+                        'ZENODO_LOCK_URL', 'COPERNICUS_FORBIDDEN', 'HOME',
+                        'PYTHONUNBUFFERED', 'USER'):
+                    interesting[k] = v.decode('utf-8', 'ignore')
+            row['env'] = interesting
+        except Exception as e:
+            row['env_err'] = str(e)
+        rows.append(row)
+    info['procs'] = rows
+    return jsonify(info)
+
+
 @app.route('/api/v1/admin/disable_autostart', methods=['POST'])
 def admin_disable_autostart():
     """Disable austria_processor systemd auto-start.

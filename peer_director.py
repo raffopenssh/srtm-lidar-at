@@ -1542,6 +1542,8 @@ class PeerDirector:
             'shadow_last_push_ok': state.get('shadow_last_push_ok'),
             'is_director_local': (DATA_DIR / 'is_director').exists(),
             'self_id': self._self_id_safe(),
+            'frontier_cred_plan': state.get('frontier_cred_plan') or {},
+            'frontier_strip_plan': state.get('frontier_strip_plan') or {},
             'peers': peers_status,
         }
 

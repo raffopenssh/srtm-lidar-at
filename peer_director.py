@@ -3842,6 +3842,15 @@ class PeerDirector:
                     self._push_identity_to_unaware_peers()
                 except Exception as _e:
                     log.debug('identity push failed: %s', _e)
+                # Auto-handback: if we're not the primary, and the
+                # primary is healthy enough, hand the director role
+                # back to it. Primary is the canonical home for the
+                # director: it has the search index, dashboard URL,
+                # public DNS, and operators expect to find it there.
+                try:
+                    self._maybe_handback_to_primary()
+                except Exception as _e:
+                    log.debug('auto-handback check failed: %s', _e)
                 with self._lock:
                     save_director_state(self.state)
             except Exception:
@@ -3929,6 +3938,94 @@ class PeerDirector:
             log.info('director identity pushed to %s', peer['id'])
         except Exception:
             pass
+
+    def _maybe_handback_to_primary(self) -> None:
+        """If we're not the primary, hand the director role back to
+        primary as soon as it is reachable, on the same git commit, and
+        not in a stepped_down/scheduled state.
+
+        Throttled to one attempt every 5 minutes to avoid loops on a
+        flapping primary. Logged at INFO so it's visible in journals.
+        """
+        try:
+            import director_ha as dha
+        except Exception:
+            return
+        me = dha.self_id()
+        if me == 'primary':
+            return
+        # Throttle: don't retry handback faster than every 5 min.
+        last = float(self.state.get('_handback_last_attempt') or 0.0)
+        if (time.time() - last) < 300:
+            return
+        # Find the primary entry.
+        cfg = self.cfg
+        primary = None
+        for p in cfg.get('peers') or []:
+            if p.get('id') == 'primary' and p.get('url'):
+                primary = p
+                break
+        if not primary:
+            return
+        if not primary.get('enabled', True):
+            return
+        if _peer_is_scheduled(primary):
+            return
+        url = primary['url']
+        # Probe primary: must be reachable, on our git commit, and not
+        # currently flagged stepped_down (which would mean operator
+        # demoted it on purpose).
+        try:
+            r = requests.get(url.rstrip('/') + '/api/v1/director/identity',
+                             headers=_admin_headers(),
+                             timeout=PEER_TIMEOUT_PROBE)
+            if not r.ok:
+                return
+            d = r.json() or {}
+        except Exception:
+            return
+        if d.get('stepped_down'):
+            # Primary still has the stepped_down flag set. Clear it
+            # remotely so it's eligible again — the flag exists to
+            # prevent cold restarts from auto-promoting; once we hand
+            # back voluntarily it must be cleared.
+            try:
+                requests.post(url.rstrip('/')
+                              + '/api/v1/admin/clear_stepped_down',
+                              headers=_admin_headers(),
+                              timeout=PEER_TIMEOUT_CONTROL)
+            except Exception:
+                pass
+            return
+        # Same git commit?
+        try:
+            info = requests.get(url.rstrip('/') + '/api/v1/info',
+                                timeout=PEER_TIMEOUT_PROBE).json()
+            primary_commit = (info.get('git_commit') or '')[:7]
+        except Exception:
+            primary_commit = ''
+        my_commit = ''
+        try:
+            import subprocess as _sp
+            my_commit = _sp.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=str(Path(__file__).parent), stderr=_sp.DEVNULL,
+                timeout=2).decode().strip()
+        except Exception:
+            pass
+        if my_commit and primary_commit and primary_commit != my_commit:
+            log.info('handback skipped: primary on %s, we are on %s',
+                     primary_commit, my_commit)
+            return
+        # Healthy enough — hand over.
+        log.warning('Auto-handback: primary is healthy, handing director '
+                    'role back from %s to primary', me)
+        self.state['_handback_last_attempt'] = time.time()
+        try:
+            res = dha.do_handover('primary', url)
+            log.warning('Auto-handback result: %s', res)
+        except Exception as e:
+            log.warning('Auto-handback failed: %s', e)
 
     def _maintain_shadow(self, statuses: dict) -> None:
         """Elect a shadow each tick and push the current state snapshot.

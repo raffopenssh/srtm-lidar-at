@@ -305,26 +305,31 @@ def install_snapshot_inline(snap: dict) -> dict:
 def _normalise_local_identity_in_peers(prev_director_url: str | None) -> dict:
     """Fix up ``peers.json`` and ``peer_urls.txt`` after a snapshot install.
 
-    Snapshots use ``url: null`` to mark the *origin's* local entry. After
-    we install a snapshot from the previous director that null still
-    points at the previous host's identity, not ours. This rewires:
+    Snapshots use ``url=None`` to mark the *origin's* local entry. We
+    must rewire only that single entry — NEVER touch other peers'
+    URLs (cascading handovers used to clobber every ``url=None`` entry
+    with stale ``prev_director_url`` values, which is how the cluster
+    ended up with multiple peers all pointing at the same URL).
 
-    * The entry whose id == ``self_id()`` gets ``url=None`` (we are now
-      that host).
-    * Any other entry that came in with ``url=None`` (i.e. the previous
-      director's local entry) is given the previous director's URL so we
-      can still poll/manage it as a regular peer. If we don't know the
-      previous URL we fall back to deriving it from ``self.json``
-      pointers, and as a last resort drop the entry to avoid confusing
-      the rest of the loop.
-
-    Also rewrites ``peer_urls.txt`` to drop our own URL and add the
-    previous director's URL.
+    Rules:
+    * Promote our own entry to ``url=None`` (canonical local marker).
+    * If the *previous director's* entry is ``url=None`` after install
+      (because the snapshot came from them), set its url to
+      ``prev_director_url``. Identify that entry by ``id == origin`` in
+      ``shadow/meta.json``, NOT by “any other url=None”.
+    * Leave every other peer entry alone.
     """
     me = self_id()
     my_url = (self_url() or '').rstrip('/')
     prev_url = (prev_director_url or '').rstrip('/') or None
-    info: dict = {'changes': []}
+    # Read the snapshot meta to learn the previous director's id.
+    prev_id = None
+    try:
+        meta = json.loads(SHADOW_META_FILE.read_text())
+        prev_id = meta.get('origin')
+    except Exception:
+        pass
+    info: dict = {'changes': [], 'prev_id': prev_id, 'prev_url': prev_url}
     pj = DATA_DIR / 'peers.json'
     try:
         cfg = json.loads(pj.read_text())
@@ -333,20 +338,7 @@ def _normalise_local_identity_in_peers(prev_director_url: str | None) -> dict:
         cfg = None
     if isinstance(cfg, dict) and isinstance(cfg.get('peers'), list):
         peers = cfg['peers']
-        # 1. Demote stale local entries (url=None but id != me).
-        for p in peers:
-            if p.get('url') is None and p.get('id') != me:
-                if prev_url:
-                    p['url'] = prev_url
-                    info['changes'].append(
-                        f'set {p.get("id")} url to prev_director {prev_url}')
-                else:
-                    # Keep the entry but mark it disabled so the loop
-                    # doesn't poll a phantom local; admin can fix later.
-                    p['enabled'] = False
-                    info['changes'].append(
-                        f'disabled {p.get("id")} (no prev_director_url known)')
-        # 2. Promote our own entry to url=None (canonical local marker).
+        # 1. Promote our own entry to url=None.
         promoted = False
         for p in peers:
             if p.get('id') == me:
@@ -358,9 +350,17 @@ def _normalise_local_identity_in_peers(prev_director_url: str | None) -> dict:
                 promoted = True
                 break
         if not promoted:
-            # We weren't in peers.json at all — add ourselves.
             peers.insert(0, {'id': me, 'url': None, 'enabled': True})
             info['changes'].append(f'added missing local entry {me}')
+        # 2. Heal the previous director's entry IFF identified by
+        #    snapshot origin and currently url=None and not us.
+        if prev_id and prev_id != me and prev_url:
+            for p in peers:
+                if p.get('id') == prev_id and p.get('url') is None:
+                    p['url'] = prev_url
+                    info['changes'].append(
+                        f'set {prev_id} url to prev_director {prev_url}')
+                    break
         try:
             _atomic_write(pj, json.dumps(cfg, indent=2))
         except Exception as e:

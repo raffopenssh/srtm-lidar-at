@@ -4642,6 +4642,23 @@ def admin_disable_autostart():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/admin/clear_stepped_down', methods=['POST'])
+def admin_clear_stepped_down():
+    """Clear the ``stepped_down`` flag so this peer is eligible to be
+    re-promoted to director (e.g. via auto-handback to primary).
+    """
+    try:
+        from director_ha import STEPPED_DOWN_FLAG
+        existed = STEPPED_DOWN_FLAG.exists()
+        try:
+            STEPPED_DOWN_FLAG.unlink()
+        except FileNotFoundError:
+            pass
+        return jsonify({'cleared': existed})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # === SECTION: Director high-availability (heartbeat / shadow / handover) ===
 
 @app.route('/api/v1/director/heartbeat', methods=['GET'])
@@ -4757,13 +4774,40 @@ def director_identity():
                         'watchdog': dha.watchdog_state()})
     body = request.get_json(silent=True) or {}
     cur = dha.load_self()
-    for k in ('id', 'url', 'director_url'):
-        if k in body and body[k] is not None:
-            cur[k] = body[k]
+    # SECURITY/SANITY: only the receiver itself can authoritatively know its
+    # own id and url. We therefore NEVER override `id`/`url` from a remote
+    # POST: the director may have stale peers.json mappings that point an
+    # id at a different host, and accepting them would corrupt our self.json
+    # (which has happened during cascaded director handovers). The receiver
+    # derives id from hostname via dha.load_self() and trusts that.
+    # Only `director_url` is accepted from a remote POST — that's the whole
+    # point of the identity broadcast: tell the peer who its director is.
+    incoming_id = body.get('id')
+    incoming_url = body.get('url')
+    rejected = {}
+    if incoming_id and incoming_id != cur.get('id'):
+        rejected['id'] = {'incoming': incoming_id, 'self': cur.get('id')}
+    if incoming_url and incoming_url != cur.get('url'):
+        rejected['url'] = {'incoming': incoming_url, 'self': cur.get('url')}
+    if rejected:
+        log.warning('director_identity: refusing to override self id/url '
+                    'from remote POST: %s', rejected)
+    # Local writes (loopback / same-process) are still permitted to set
+    # id/url so the on-box bootstrap can fix things up.
+    is_local = request.remote_addr in ('127.0.0.1', '::1', 'localhost')
+    if is_local:
+        for k in ('id', 'url'):
+            if k in body and body[k] is not None:
+                cur[k] = body[k]
+    if 'director_url' in body:
+        cur['director_url'] = body['director_url']
     dha.save_self(cur)
     if 'director_url' in body:
         dha.set_director_url(body['director_url'])
-    return jsonify(cur)
+    out = dict(cur)
+    if rejected:
+        out['_rejected'] = rejected
+    return jsonify(out)
 
 
 # Start the director background thread — only on the primary instance.

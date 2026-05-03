@@ -88,8 +88,17 @@ AT_WEST, AT_SOUTH, AT_EAST, AT_NORTH = 9.0, 46.0, 17.5, 49.5
 COP_STEP = 0.1   # Copernicus grid
 HANSEN_STEP = 0.5  # Hansen grid
 
-# Latitude strip height for ZIP bundling
-STRIP_HEIGHT = 0.5
+# Bundle cell dimensions for ZIP grouping. Old layout used
+# latitude-only strips (STRIP_HEIGHT = 0.5°). New layout adds a
+# longitude axis (STRIP_HEIGHT × STRIP_WIDTH cells) so the Peer
+# Director can give each frontier peer a disjoint cell -- which lifts
+# the parallel-frontier ceiling above the cred count.
+#
+# Readers transparently support BOTH layouts so existing cached tiles
+# bundled as strip ZIPs remain accessible without re-uploading
+# anything (avoiding 700 MB of redundant Zenodo traffic).
+STRIP_HEIGHT = 1.0
+STRIP_WIDTH = 2.0
 
 # Copernicus product types
 COP_PRODUCTS = ("ndvi", "sar", "worldcover", "harmonics")
@@ -109,30 +118,90 @@ _ZIP_INDEX_CACHE_DIR = DATA_DIR / "zenodo_zip_index"
 _POLLUTION_LOG_PATH = DATA_DIR / "pollution_log.jsonl"
 
 
-# === SECTION: Latitude strips ===
+# === SECTION: Bundle cells (lat × lon) ===
 
-def _lat_strips() -> List[Tuple[float, float]]:
-    """Return (south, north) bounds for each 0.5° latitude strip covering Austria."""
-    strips = []
+def _lat_lon_cells() -> List[Tuple[float, float, float, float]]:
+    """Return (south, north, west, east) bounds for each bundle cell
+    covering Austria. Cells partition the plane on the
+    STRIP_HEIGHT × STRIP_WIDTH grid.
+    """
+    cells = []
     s = math.floor(AT_SOUTH / STRIP_HEIGHT) * STRIP_HEIGHT
     while s < AT_NORTH:
-        n = s + STRIP_HEIGHT
-        strips.append((round(s, 4), round(n, 4)))
+        n = round(s + STRIP_HEIGHT, 4)
+        w = math.floor(AT_WEST / STRIP_WIDTH) * STRIP_WIDTH
+        while w < AT_EAST:
+            e = round(w + STRIP_WIDTH, 4)
+            cells.append((round(s, 4), n, round(w, 4), e))
+            w = e
         s = n
-    return strips
+    return cells
+
+
+def _cell_for_bbox(lat: float, lon: float) -> Tuple[float, float, float, float]:
+    """Return the (south, north, west, east) cell containing the point."""
+    s = math.floor(lat / STRIP_HEIGHT) * STRIP_HEIGHT
+    w = math.floor(lon / STRIP_WIDTH) * STRIP_WIDTH
+    return (round(s, 4), round(s + STRIP_HEIGHT, 4),
+            round(w, 4), round(w + STRIP_WIDTH, 4))
+
+
+# --- Legacy strip helpers (kept for read-side compat with old ZIPs) ---
+
+def _lat_strips() -> List[Tuple[float, float]]:
+    """DEPRECATED: returns 1° lat-only ranges. Kept so callers that still
+    plan by lat-strip don't break. New code should use _lat_lon_cells().
+    """
+    out = []
+    s = math.floor(AT_SOUTH / STRIP_HEIGHT) * STRIP_HEIGHT
+    while s < AT_NORTH:
+        n = round(s + STRIP_HEIGHT, 4)
+        out.append((round(s, 4), n))
+        s = n
+    return out
 
 
 def _strip_for_lat(lat: float) -> Tuple[float, float]:
-    """Return the (south, north) strip containing the given latitude."""
+    """DEPRECATED: returns lat-only range for *lat*. Use _cell_for_bbox.
+    Used by readers to look up legacy strip ZIPs as a fallback.
+    """
     s = math.floor(lat / STRIP_HEIGHT) * STRIP_HEIGHT
     return (round(s, 4), round(s + STRIP_HEIGHT, 4))
 
 
-def _zip_filename(product: str, strip_south: float, strip_north: float) -> str:
-    """Canonical ZIP filename for a product + strip."""
+def _zip_filename(product: str, *cell: float) -> str:
+    """Canonical ZIP filename.
+
+    Accepts either:
+      * ``(south, north, west, east)`` -- new cell bundle name
+        ``copernicus_<prod>_cell_<S>_<N>_<W>_<E>.zip``
+      * ``(south, north)`` -- legacy strip name
+        ``copernicus_<prod>_strip_<S>_<N>.zip`` (for read-side compat
+        with deposits uploaded before the cell layout).
+    """
+    if len(cell) == 4:
+        s, n, w, e = cell
+        suffix = f"cell_{s:.1f}_{n:.1f}_{w:.1f}_{e:.1f}"
+    elif len(cell) == 2:
+        s, n = cell
+        suffix = f"strip_{s:.1f}_{n:.1f}"
+    else:
+        raise ValueError(f"_zip_filename: expected 2 or 4 coords, got {cell!r}")
     if product == "hansen":
-        return f"hansen_strip_{strip_south:.1f}_{strip_north:.1f}.zip"
-    return f"copernicus_{product}_strip_{strip_south:.1f}_{strip_north:.1f}.zip"
+        return f"hansen_{suffix}.zip"
+    return f"copernicus_{product}_{suffix}.zip"
+
+
+def _legacy_strip_zip_for(product: str, lat_south: float) -> str:
+    """Filename of the legacy 0.5° lat-strip ZIP that may contain a tile.
+
+    Old deposits used STRIP_HEIGHT=0.5; this returns BOTH possible
+    legacy filenames (the 0.5° step that the lat falls into).
+    Returned as a list so callers can probe each.
+    """
+    # Pre-migration step was 0.5° -- snap the input lat to that grid.
+    base = math.floor(lat_south / 0.5) * 0.5
+    return _zip_filename(product, round(base, 4), round(base + 0.5, 4))
 
 
 def _npz_entry_name(product: str, w: float, s: float, e: float, n: float,
@@ -1004,8 +1073,9 @@ class ZenodoCache:
         stats = {"zips_built": 0, "zips_uploaded": 0, "tiles_total": 0,
                  "bytes_total": 0}
 
-        # Group local files by (product, strip)
-        groups: Dict[Tuple[str, float, float], List] = {}
+        # Group local files by (product, cell). Cell key is the
+        # 4-tuple (south, north, west, east) bounding the bundle.
+        groups: Dict[Tuple[str, float, float, float, float], List] = {}
 
         # Copernicus tiles
         cop_files = _scan_local_copernicus()
@@ -1015,8 +1085,8 @@ class ZenodoCache:
                 if info is None:
                     continue
                 prod, w, s, e, n, extra = info
-                strip_s, strip_n = _strip_for_lat(s)
-                key = (product, strip_s, strip_n)
+                cs, cn, cw, ce = _cell_for_bbox(s, w)
+                key = (product, cs, cn, cw, ce)
                 groups.setdefault(key, []).append((p, w, s, e, n, extra))
 
         # Hansen tiles
@@ -1026,8 +1096,8 @@ class ZenodoCache:
             if info is None:
                 continue
             _, w, s, e, n, extra = info
-            strip_s, strip_n = _strip_for_lat(s)
-            key = ("hansen", strip_s, strip_n)
+            cs, cn, cw, ce = _cell_for_bbox(s, w)
+            key = ("hansen", cs, cn, cw, ce)
             groups.setdefault(key, []).append((p, w, s, e, n, extra))
 
         if not groups:
@@ -1036,8 +1106,16 @@ class ZenodoCache:
 
         depo_id = None if dry_run else self._ensure_deposit()
 
-        for (product, strip_s, strip_n), files in sorted(groups.items()):
-            zip_name = _zip_filename(product, strip_s, strip_n)
+        for (product, cs, cn, cw, ce), files in sorted(groups.items()):
+            zip_name = _zip_filename(product, cs, cn, cw, ce)
+            # Read-side compat: if a legacy strip ZIP already covers
+            # these tiles on Zenodo, keep extending it instead of
+            # creating a parallel cell ZIP. This avoids re-uploading
+            # ~700 MB worth of cached tiles already on Zenodo.
+            legacy_name = _legacy_strip_zip_for(product, cs)
+            if (self.manifest.get_file(legacy_name)
+                    and not self.manifest.get_file(zip_name)):
+                zip_name = legacy_name
 
             # Build set of entry names we have locally, validating each
             local_entries = {}
@@ -1222,24 +1300,32 @@ class ZenodoCache:
         if self.manifest.depo_id != old_depo:
             self._zip_indices.clear()  # URLs changed, invalidate cached indices
 
-        strip_s, strip_n = _strip_for_lat(s)
-        zip_name = _zip_filename(product, strip_s, strip_n)
+        cs, cn, cw, ce = _cell_for_bbox(s, w)
+        candidates = [
+            _zip_filename(product, cs, cn, cw, ce),
+            _legacy_strip_zip_for(product, cs),
+        ]
+        seen = set()
+        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
         extra = {"year": year} if product in ("ndvi", "sar", "harmonics") else {}
         entry_name = _npz_entry_name(product, w, s, e, n, **extra)
 
-        idx = self._get_zip_index(zip_name)
+        idx = None
+        for zip_name in candidates:
+            idx = self._get_zip_index(zip_name)
+            if idx is None:
+                continue
+            if idx.has_entry(entry_name):
+                break
+            if product == "worldcover":
+                alt = _npz_entry_name(product, w, s, e, n)
+                if idx.has_entry(alt):
+                    entry_name = alt
+                    break
+            idx = None
         if idx is None:
             return None
-
-        if not idx.has_entry(entry_name):
-            # Try without year for worldcover
-            if product == "worldcover":
-                entry_name = _npz_entry_name(product, w, s, e, n)
-                if not idx.has_entry(entry_name):
-                    return None
-            else:
-                return None
 
         data = idx.read_entry(entry_name)
         if data is None:
@@ -1291,15 +1377,22 @@ class ZenodoCache:
         if self.manifest.depo_id != old_depo:
             self._zip_indices.clear()
 
-        strip_s, strip_n = _strip_for_lat(s)
-        zip_name = _zip_filename("hansen", strip_s, strip_n)
+        cs, cn, cw, ce = _cell_for_bbox(s, w)
+        candidates = [
+            _zip_filename("hansen", cs, cn, cw, ce),
+            _legacy_strip_zip_for("hansen", cs),
+        ]
+        seen = set()
+        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
         entry_name = _npz_entry_name("hansen", w, s, e, n)
 
-        idx = self._get_zip_index(zip_name)
+        idx = None
+        for zip_name in candidates:
+            idx = self._get_zip_index(zip_name)
+            if idx is not None and idx.has_entry(entry_name):
+                break
+            idx = None
         if idx is None:
-            return None
-
-        if not idx.has_entry(entry_name):
             return None
 
         data = idx.read_entry(entry_name)
@@ -1380,22 +1473,27 @@ class ZenodoCache:
         stats = {"entries_found": 0, "zips_rebuilt": 0,
                  "local_deleted": 0, "dry_run": dry_run}
 
-        # Group entries by ZIP
+        # Group entries by ZIP. Probe both the new cell ZIP and the
+        # legacy strip ZIP -- old uploads still live under the strip
+        # name and we must rebuild the right container.
         zip_entries: Dict[str, List[str]] = {}  # zip_name → [entry_names]
         for entry in to_remove_set:
-            # Parse entry name to find its ZIP
-            # Format: {product}_{s}_{w}_{n}_{e}[_{year}].npz
-            base = entry.rsplit(".", 1)[0]  # strip .npz
+            base = entry.rsplit(".", 1)[0]
             parts = base.split("_")
             product = parts[0]
             try:
                 s_val = float(parts[1])
+                w_val = float(parts[2])
             except (IndexError, ValueError):
                 log.warning("Cannot parse entry name: %s", entry)
                 continue
-            strip_s, strip_n = _strip_for_lat(s_val)
-            zip_name = _zip_filename(product, strip_s, strip_n)
-            zip_entries.setdefault(zip_name, []).append(entry)
+            cs, cn, cw, ce = _cell_for_bbox(s_val, w_val)
+            cell_name = _zip_filename(product, cs, cn, cw, ce)
+            legacy_name = _legacy_strip_zip_for(product, cs)
+            target = (legacy_name if self.manifest.get_file(legacy_name)
+                                       and not self.manifest.get_file(cell_name)
+                      else cell_name)
+            zip_entries.setdefault(target, []).append(entry)
 
         depo_id = None if dry_run else self._ensure_deposit()
 

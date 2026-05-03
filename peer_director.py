@@ -1505,6 +1505,7 @@ class PeerDirector:
                 # frontier_cred_plan / frontier_strip_plan is stale/empty.
                 '_reported_cred_indices': ps.get('cred_indices'),
                 '_reported_lat_strips': ps.get('lat_strip_filter'),
+                '_reported_cells': ps.get('cell_filter'),
                 # Stale-update tracking (auto-retry status)
                 'update_state': (state.get('peer_update_state') or {}).get(pid),
             })
@@ -1528,6 +1529,7 @@ class PeerDirector:
         strip_plan = state.get('frontier_strip_plan') or {}
         cached_strips = self._cached_lat_ranges() if hasattr(self, '_cached_lat_ranges') else []
         austria_strips = self._austria_lat_strips()
+        austria_cells = self._austria_cells()
         # Annotate peer rows with their assignments — but only when
         # the peer is actually doing frontier work. A stale frontier_cred_plan
         # for a peer currently running cache-only would otherwise mislead
@@ -1548,13 +1550,24 @@ class PeerDirector:
                 elif pid in cred_plan:
                     row['cred_indices'] = cred_plan[pid]
                 reported_strips = row.pop('_reported_lat_strips', None)
-                if reported_strips:
+                reported_cells = row.pop('_reported_cells', None)
+                if reported_cells:
+                    row['cells'] = list(reported_cells)
+                elif reported_strips:
                     row['lat_strips'] = list(reported_strips)
                 elif pid in strip_plan:
-                    row['lat_strips'] = strip_plan[pid]
+                    # strip_plan now stores cell 4-tuples; report under
+                    # whichever key matches the data shape so the
+                    # dashboard can render it.
+                    plan = strip_plan[pid]
+                    if plan and len(plan[0]) == 4:
+                        row['cells'] = plan
+                    else:
+                        row['lat_strips'] = plan
             else:
                 row.pop('_reported_cred_indices', None)
                 row.pop('_reported_lat_strips', None)
+                row.pop('_reported_cells', None)
             row['pinned_role'] = (
                 next((p.get('pinned_role') for p in cfg.get('peers', [])
                       if p['id'] == pid), None)
@@ -1618,6 +1631,7 @@ class PeerDirector:
             'max_parallel_frontiers': max_par,
             'cached_lat_strips': [[s, n] for s, n in cached_strips],
             'austria_lat_strips': [[s, n] for s, n in austria_strips],
+            'austria_cells': [[s, n, w, e] for s, n, w, e in austria_cells],
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
@@ -1649,6 +1663,7 @@ class PeerDirector:
             'self_id': self._self_id_safe(),
             'frontier_cred_plan': state.get('frontier_cred_plan') or {},
             'frontier_strip_plan': state.get('frontier_strip_plan') or {},
+            'frontier_cell_plan': state.get('frontier_strip_plan') or {},
             'peers': peers_status,
         }
 
@@ -2086,7 +2101,7 @@ class PeerDirector:
                             plan_cred = (self._assign_cred_indices([active_id], cfg)
                                           .get(active_id))
                         if not plan_strip:
-                            strips = self._austria_lat_strips()
+                            strips = self._austria_cells()
                             # No prior plan: give all strips to this
                             # lone frontier; orchestrator will trim later.
                             plan_strip = [list(s) for s in strips] if strips else None
@@ -2224,7 +2239,7 @@ class PeerDirector:
                     self._refresh_peer_caps(peer)
                     plan = self._assign_cred_indices([new_peer], cfg)
                     creds_for_peer = plan.get(new_peer)
-                    strips = self._austria_lat_strips()
+                    strips = self._austria_cells()
                     # Lone frontier on activation: own all strips.
                     # The parallel orchestrator will redistribute later
                     # when more frontiers come online.
@@ -2620,8 +2635,11 @@ class PeerDirector:
         if not valid:
             return 0
         cap_creds = max(1, len(valid) // per)
-        cap_strips = len(self._austria_lat_strips())
-        return max(1, min(cap_creds, cap_strips))
+        # Cap on how many disjoint cells we can hand out. With ~14
+        # non-empty cells across Austria this should never bind
+        # — cred capacity is the real ceiling.
+        cap_cells = max(1, len(self._austria_cells()))
+        return max(1, min(cap_creds, cap_cells))
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
                               prior: dict | None = None) -> dict:
@@ -2669,23 +2687,46 @@ class PeerDirector:
         return out
 
     def _austria_lat_strips(self) -> list[tuple[float, float]]:
-        """Return the 0.5° lat strips that cover Austria.
+        """DEPRECATED. Returns 1° lat-only ranges covering Austria.
 
-        Independent of cache state — these are the canonical strips that
-        the Zenodo cache + tile_cache use, so frontier peers pinned to a
-        strip will never collide on a Zenodo ZIP write.
+        Kept only for backward compat with old state on disk; new
+        planning uses :py:meth:`_austria_cells` (1° lat × 2° lon cells).
         """
         try:
             from zenodo_cache import _lat_strips
             return [tuple(s) for s in _lat_strips()]
         except Exception:
-            # Fallback: Austria spans 46.0–49.5°N, snapped to 0.5°.
             strips = []
             s = 46.0
             while s < 49.5:
-                strips.append((round(s, 4), round(s + 0.5, 4)))
-                s += 0.5
+                strips.append((round(s, 4), round(s + 1.0, 4)))
+                s += 1.0
             return strips
+
+    def _austria_cells(self) -> list[tuple[float, float, float, float]]:
+        """Return the canonical (south, north, west, east) cells that
+        cover Austria. These match the Zenodo cache bundle layout, so
+        frontier peers pinned to disjoint cells never collide on a
+        Zenodo ZIP write.
+
+        With STRIP_HEIGHT=1° × STRIP_WIDTH=2° there are ~16 cells
+        across Austria's 9–17.5° × 46–49.5° envelope (after pruning
+        the few empty corners we'd never assign).
+        """
+        try:
+            from zenodo_cache import _lat_lon_cells
+            return [tuple(c) for c in _lat_lon_cells()]
+        except Exception:
+            cells = []
+            s = 46.0
+            while s < 49.5:
+                w = 8.0
+                while w < 18.0:
+                    cells.append((round(s, 4), round(s + 1.0, 4),
+                                  round(w, 4), round(w + 2.0, 4)))
+                    w += 2.0
+                s += 1.0
+            return cells
 
     def _strip_fingerprint(self, lat_south: float, lat_north: float) -> str:
         """Return a cheap fingerprint of the cache manifest for one lat strip.
@@ -2703,14 +2744,32 @@ class PeerDirector:
         except Exception:
             return ''
         files = d.get('files') or {}
+        # Match both old strip ZIPs and new cell ZIPs that fall inside
+        # this 1° lat band. Cells are 1°-tall so any cell whose south
+        # is in [lat_south, lat_north) overlaps. Strips are 0.5°-tall;
+        # treat any strip whose midpoint falls in this band as matching.
         parts = []
         for product in ('ndvi', 'sar', 'harmonics', 'worldcover', 'hansen'):
-            if product == 'hansen':
-                name = f'hansen_strip_{lat_south:.1f}_{lat_north:.1f}.zip'
-            else:
-                name = f'copernicus_{product}_strip_{lat_south:.1f}_{lat_north:.1f}.zip'
-            ent = files.get(name) or {}
-            parts.append(name + '@' + str(ent.get('updated_at') or '-'))
+            prefix = ('hansen_' if product == 'hansen'
+                      else f'copernicus_{product}_')
+            for name, ent in sorted(files.items()):
+                if not name.startswith(prefix):
+                    continue
+                base_n = name.replace('.zip', '')
+                try:
+                    if '_cell_' in base_n:
+                        coords = base_n.split('_cell_', 1)[1].split('_')
+                        s_val = float(coords[0])
+                    elif '_strip_' in base_n:
+                        coords = base_n.split('_strip_', 1)[1].split('_')
+                        s_val = float(coords[0])
+                    else:
+                        continue
+                except Exception:
+                    continue
+                if not (lat_south - 1e-9 <= s_val < lat_north - 1e-9):
+                    continue
+                parts.append(name + '@' + str(ent.get('updated_at') or '-'))
         import hashlib
         return hashlib.md5('|'.join(parts).encode()).hexdigest()[:12]
 
@@ -2835,20 +2894,32 @@ class PeerDirector:
         except Exception:
             return []
         files = d.get('files') or {}
-        # parse 'copernicus_<product>_strip_<S>_<N>.zip' / 'hansen_strip_<S>_<N>.zip'
+        # Parse both legacy strip names and new cell names. We only
+        # care about latitude coverage here -- frontier cell
+        # disjointness is enforced separately via _austria_cells().
+        # Normalise to the new 1°-tall lat band so legacy 0.5°
+        # strips and new 1° cells line up in the intersection.
+        import math as _m
+        def _norm_lat_band(s: float) -> tuple[float, float]:
+            base = _m.floor(s / 1.0) * 1.0
+            return (round(base, 4), round(base + 1.0, 4))
         per_product: dict[str, set[tuple[float, float]]] = {}
         for name in files:
             try:
-                base = name.replace('.zip', '')
-                parts = base.split('_strip_')
-                if len(parts) != 2:
+                base_n = name.replace('.zip', '')
+                if '_cell_' in base_n:
+                    head, coords = base_n.split('_cell_', 1)
+                    s, n, _w, _e = coords.split('_')
+                elif '_strip_' in base_n:
+                    head, coords = base_n.split('_strip_', 1)
+                    s, n = coords.split('_')
+                else:
                     continue
-                product = parts[0]
+                product = head
                 if product.startswith('copernicus_'):
                     product = product[len('copernicus_'):]
-                south, north = parts[1].split('_')
-                pair = (float(south), float(north))
-                per_product.setdefault(product, set()).add(pair)
+                per_product.setdefault(product, set()).add(
+                    _norm_lat_band(float(s)))
             except Exception:
                 continue
         required = ['ndvi', 'sar', 'harmonics', 'worldcover', 'hansen']
@@ -3005,12 +3076,12 @@ class PeerDirector:
                 )
             max_par = max_par_throttled
 
-        # Frontier peers each pin to a disjoint Austria-wide 0.5° lat
-        # strip so they never collide on a Zenodo cache ZIP write — even
-        # when opening regions that aren't yet cached. Cached vs uncached
-        # strips are equivalent here: tile uploads are scoped to one
-        # strip per ZIP.
-        strips = self._austria_lat_strips()
+        # Frontier peers each pin to a disjoint Austria-wide cell
+        # (1° lat × 2° lon by default) so they never collide on a
+        # Zenodo cache ZIP write — even when opening regions that aren't
+        # yet cached. Cached vs uncached cells are equivalent here:
+        # tile uploads are scoped to one cell per ZIP.
+        strips = self._austria_cells()
         if not strips:
             with self._lock:
                 self.state['parallel_frontiers_active'] = []
@@ -3168,7 +3239,7 @@ class PeerDirector:
                         strip_plan[pid] = []
                         continue
                     slice_ = leftover[offset:offset + size]
-                    strip_plan[pid] = [[s, n] for s, n in slice_]
+                    strip_plan[pid] = [list(c) for c in slice_]
                     offset += size
             for pid in ordered:
                 strip_plan.setdefault(pid, [])

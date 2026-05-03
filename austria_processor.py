@@ -7917,13 +7917,43 @@ def main():
                and kg["kg_code"] not in failed_kgs
                and kg["kg_code"] not in peer_claimed]
 
-    # --- Optional latitude-strip filter (per-peer dedication) ---
-    # KG_LAT_STRIP_FILTER=[[s1,n1],[s2,n2],...] limits this peer to KGs
-    # whose bbox falls inside any allowed strip. Set by the director on
-    # cache-only / strip-pinned peers to avoid two peers touching the
-    # same Zenodo cache strip simultaneously.
+    # --- Optional cell filter (per-peer dedication) ---
+    # Preferred: KG_CELL_FILTER=[[s,n,w,e],...] -- 1° lat × 2° lon
+    # cells matching the Zenodo cache bundle layout. Each frontier
+    # peer owns disjoint cells so two peers never write the same
+    # Zenodo ZIP simultaneously.
+    # Legacy: KG_LAT_STRIP_FILTER=[[s,n],...] -- pre-cell layout,
+    # still honored so a rolling restart works without churn.
+    _cell_raw = os.environ.get("KG_CELL_FILTER", "").strip()
+    if _cell_raw:
+        try:
+            _cells = json.loads(_cell_raw)
+            _cells = [(float(s), float(n), float(w), float(e))
+                      for s, n, w, e in _cells]
+        except Exception as e:
+            log.warning("Bad KG_CELL_FILTER=%r: %s", _cell_raw, e)
+            _cells = []
+        if _cells:
+            def _kg_in_cells(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat"); n = bb.get("max_lat")
+                w = bb.get("min_lon"); e = bb.get("max_lon")
+                if None in (s, n, w, e):
+                    return False
+                lat_mid = 0.5 * (s + n)
+                lon_mid = 0.5 * (w + e)
+                for cs, cn, cw, ce in _cells:
+                    if (cs - 1e-9 <= lat_mid < cn - 1e-9
+                            and cw - 1e-9 <= lon_mid < ce - 1e-9):
+                        return True
+                return False
+            before = len(pending)
+            pending = [kg for kg in pending if _kg_in_cells(kg)]
+            log.info("KG_CELL_FILTER active (%d cells): %d -> %d KGs",
+                     len(_cells), before, len(pending))
+
     _strip_raw = os.environ.get("KG_LAT_STRIP_FILTER", "").strip()
-    if _strip_raw:
+    if _strip_raw and not _cell_raw:
         try:
             _strips = json.loads(_strip_raw)
             _strips = [(float(s), float(n)) for s, n in _strips]

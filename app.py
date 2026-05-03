@@ -1891,6 +1891,12 @@ def processing_status():
                                         kv.split(b'=', 1)[1].decode('utf-8', 'ignore'))
                                 except Exception:
                                     pass
+                            elif kv.startswith(b'KG_CELL_FILTER='):
+                                try:
+                                    data['cell_filter'] = json.loads(
+                                        kv.split(b'=', 1)[1].decode('utf-8', 'ignore'))
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
             if _ci:
@@ -2387,8 +2393,14 @@ def processing_start():
             pass
     if lat_strips:
         try:
-            # Encode as JSON list of [south, north] pairs.
-            proc_env['KG_LAT_STRIP_FILTER'] = json.dumps(lat_strips)
+            # Cells are 4-tuples [south, north, west, east]; legacy
+            # strips are 2-tuples [south, north]. Route to the right
+            # env var so the processor can apply the correct filter.
+            tuples = [list(t) for t in lat_strips]
+            if tuples and len(tuples[0]) == 4:
+                proc_env['KG_CELL_FILTER'] = json.dumps(tuples)
+            else:
+                proc_env['KG_LAT_STRIP_FILTER'] = json.dumps(tuples)
         except Exception:
             pass
     if 'ZENODO_LOCK_URL' not in proc_env:
@@ -2463,6 +2475,7 @@ def processing_start():
     _forward_keys = (
         'COPERNICUS_CRED_INDICES',
         'KG_LAT_STRIP_FILTER',
+        'KG_CELL_FILTER',
         'ZENODO_LOCK_URL',
         'COPERNICUS_FORBIDDEN',
         'PATH',
@@ -4928,6 +4941,7 @@ def admin_proc_env():
                 k, v = kv.split(b'=', 1)
                 k = k.decode('utf-8', 'ignore')
                 if k in ('COPERNICUS_CRED_INDICES', 'KG_LAT_STRIP_FILTER',
+                        'KG_CELL_FILTER',
                         'ZENODO_LOCK_URL', 'COPERNICUS_FORBIDDEN', 'HOME',
                         'PYTHONUNBUFFERED', 'USER'):
                     interesting[k] = v.decode('utf-8', 'ignore')
@@ -10542,6 +10556,7 @@ def info():
         "capabilities": [
             'cred_subset_env',     # honors COPERNICUS_CRED_INDICES
             'lat_strip_filter',    # honors KG_LAT_STRIP_FILTER
+            'cell_filter',         # honors KG_CELL_FILTER (1° lat × 2° lon)
             'cred_api_v1',         # /api/v1/credentials available
             'parallel_frontiers',  # safe to run alongside other frontiers
         ],

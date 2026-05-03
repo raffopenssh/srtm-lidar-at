@@ -360,20 +360,33 @@ class CopernicusTileCache:
                 if self._zenodo_cache is None:
                     return False
                 try:
-                    from zenodo_cache import _strip_for_lat, _zip_filename, _npz_entry_name
-                    strip_s, strip_n = _strip_for_lat(cs)
-                    zip_name = _zip_filename(product, strip_s, strip_n)
-                    idx = self._zenodo_cache._get_zip_index(zip_name)
-                    if idx is None:
-                        return False
+                    from zenodo_cache import (_cell_for_bbox, _zip_filename,
+                                              _npz_entry_name,
+                                              _legacy_strip_zip_for)
+                    bs, bn, bw, be = _cell_for_bbox(cs, cw)
+                    candidates = [
+                        _zip_filename(product, bs, bn, bw, be),
+                        _legacy_strip_zip_for(product, bs),
+                    ]
+                    seen_c = set()
+                    candidates = [c for c in candidates
+                                  if not (c in seen_c or seen_c.add(c))]
                     entry_name = _npz_entry_name(product, cw, cs, ce, cn, **extra)
-                    if not idx.has_entry(entry_name):
+                    found = False
+                    for zip_name in candidates:
+                        idx = self._zenodo_cache._get_zip_index(zip_name)
+                        if idx is None:
+                            continue
+                        if idx.has_entry(entry_name):
+                            found = True
+                            break
                         if product == "worldcover":
-                            entry_name = _npz_entry_name(product, cw, cs, ce, cn)
-                            if not idx.has_entry(entry_name):
-                                return False
-                        else:
-                            return False
+                            alt = _npz_entry_name(product, cw, cs, ce, cn)
+                            if idx.has_entry(alt):
+                                found = True
+                                break
+                    if not found:
+                        return False
                 except Exception:
                     return False
         return True
@@ -1056,14 +1069,25 @@ class HansenTileCache:
                 if self._zenodo_cache is None:
                     return False
                 try:
-                    from zenodo_cache import _strip_for_lat, _zip_filename, _npz_entry_name
-                    strip_s, strip_n = _strip_for_lat(cs)
-                    zip_name = _zip_filename("hansen", strip_s, strip_n)
-                    idx = self._zenodo_cache._get_zip_index(zip_name)
-                    if idx is None:
-                        return False
+                    from zenodo_cache import (_cell_for_bbox, _zip_filename,
+                                              _npz_entry_name,
+                                              _legacy_strip_zip_for)
+                    bs, bn, bw, be = _cell_for_bbox(cs, cw)
+                    candidates = [
+                        _zip_filename("hansen", bs, bn, bw, be),
+                        _legacy_strip_zip_for("hansen", bs),
+                    ]
+                    seen_c = set()
+                    candidates = [c for c in candidates
+                                  if not (c in seen_c or seen_c.add(c))]
                     entry_name = _npz_entry_name("hansen", cw, cs, ce, cn)
-                    if not idx.has_entry(entry_name):
+                    found = False
+                    for zip_name in candidates:
+                        idx = self._zenodo_cache._get_zip_index(zip_name)
+                        if idx is not None and idx.has_entry(entry_name):
+                            found = True
+                            break
+                    if not found:
                         return False
                 except Exception:
                     return False

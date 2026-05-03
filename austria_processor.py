@@ -5617,6 +5617,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         }
         tmp = _tile_ckpt_dir / f"tile_{tile_idx}.pkl.tmp"
         dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
+        # The dir may have been rmtree'd earlier in the same KG run
+        # (e.g. "freed tile checkpoints after full GPKG" — happens before
+        # light GPKG / JSON, but those steps don't write checkpoints; on
+        # crash-restart the dir is recreated below). Always ensure the
+        # parent dir exists so a stale rmtree never raises ENOENT here.
+        _tile_ckpt_dir.mkdir(parents=True, exist_ok=True)
         with open(tmp, "wb") as f:
             _pkl.dump(ckpt, f, protocol=_pkl.HIGHEST_PROTOCOL)
         tmp.rename(dst)

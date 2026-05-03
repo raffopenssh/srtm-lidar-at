@@ -3054,7 +3054,21 @@ function renderPrioQueue() {
   wrap.style.display = 'block';
   countEl.textContent = '(' + _prioQueue.length + ')';
   container.innerHTML = '';
-  _prioQueue.forEach((kg, i) => {
+  // Hoist queue items whose KG (or any of its blocks) is currently being
+  // processed to the front of the rendered list — so the kg-active glow
+  // is actually visible to the user. Original ordering is preserved
+  // among non-active items, and `data-idx` is set to the original
+  // queue index so reorder/remove still target the right entry.
+  const _activeIdx = _activeKgIndex();
+  const _isActive = (code) => {
+    if (!code) return false;
+    const p = _parseKgCode(code).parent;
+    return p && _activeIdx.has(p);
+  };
+  const _renderOrder = _prioQueue
+    .map((kg, i) => ({ kg, i, active: _isActive(kg && kg.code) }))
+    .sort((a, b) => (b.active - a.active) || (a.i - b.i));
+  _renderOrder.forEach(({ kg, i }) => {
     const tag = document.createElement('span');
     const fc = _failClass(kg.failures);
     const isTomb = !!kg.tombstoned;

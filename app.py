@@ -5326,18 +5326,40 @@ def director_heartbeat():
     # IS_DIRECTOR_FLAG still on disk means the cluster is unmanaged —
     # report 410 so peers fail over to a healthier shadow instead of
     # trusting our flag forever.
+    #
+    # Use ON-DISK signals, not the in-process singleton. With 2 gunicorn
+    # workers only 1 holds the director loop (fcntl lock); the other
+    # worker's singleton is initialised but never started, so a naive
+    # `_running` check would return 410 on ~50% of heartbeats, which
+    # makes peer watchdogs trigger spurious takeovers (this caused
+    # ~hourly cascading failovers on the cluster). Instead, trust
+    # director_state.json freshness — it's rewritten every ~30s by
+    # whichever worker holds the loop, regardless of which worker is
+    # serving this heartbeat.
     try:
         d = pd.get_director()
         thr = getattr(d, '_thread', None)
-        running = bool(getattr(d, '_running', False)) and bool(
+        in_proc_running = bool(getattr(d, '_running', False)) and bool(
             thr and thr.is_alive())
     except Exception:
-        running = False
+        in_proc_running = False
+    state_fresh = False
+    state_age = None
+    try:
+        st_path = pd.DIRECTOR_STATE
+        if st_path.exists():
+            state_age = time.time() - st_path.stat().st_mtime
+            # Loop saves state every ~30s; allow 3x slack for slow ticks.
+            state_fresh = state_age < 120.0
+    except Exception:
+        pass
+    running = in_proc_running or state_fresh
     if not running:
         return jsonify({
             'is_director': True,
             'running': False,
             'note': 'flag set but loop not running',
+            'state_age_s': state_age,
             'self': dha.load_self(),
         }), 410
     state = {}

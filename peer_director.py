@@ -1144,6 +1144,16 @@ class PeerDirector:
         self._capacity_ema: float = float(
             self.state.get('capacity_ema_persisted',
                            THROTTLE_MAX_FACTOR) or THROTTLE_MAX_FACTOR)
+        # Per-kind smoothed sub-factor EMAs (bev / zenodo / copernicus).
+        # Used by ``_effective_creds_per_frontier`` so the per=1↔per=2
+        # decision doesn't flap on every transient cop blip — only the
+        # smoothed signal crosses the hysteresis thresholds.
+        _persisted_sub_ema = self.state.get('sub_factor_ema') or {}
+        self._sub_factor_ema: dict[str, float] = {
+            k: float(_persisted_sub_ema.get(k, THROTTLE_MAX_FACTOR)
+                      or THROTTLE_MAX_FACTOR)
+            for k in ('bev', 'zenodo', 'copernicus')
+        }
         self._capacity_components: dict = {}
         # Sliding history of (ts, factor, bev, zenodo, copernicus) tuples.
         # Sized for ~2h of 30s ticks (240 entries). Survives ticks but not
@@ -1246,6 +1256,13 @@ class PeerDirector:
         # EMA smoothing.
         a = THROTTLE_EMA_ALPHA
         self._capacity_ema = a * raw + (1.0 - a) * self._capacity_ema
+        # Per-kind EMAs (same alpha) — feed adaptive decisions that
+        # depend only on one upstream (e.g. cred-per-frontier).
+        for _k in ('bev', 'zenodo', 'copernicus'):
+            _v = float(sub.get(_k, THROTTLE_MAX_FACTOR))
+            self._sub_factor_ema[_k] = (
+                a * _v + (1.0 - a) * self._sub_factor_ema.get(
+                    _k, THROTTLE_MAX_FACTOR))
         # Slow sinusoidal drift to mimic an organic activity pattern.
         # Phase derived from local hostname so different primaries (and
         # the future-self of the same primary post‑restart) stay roughly
@@ -1260,6 +1277,8 @@ class PeerDirector:
             'rates': {k: rates.get(k, 0.0)
                        for k in ('bev', 'zenodo', 'copernicus')},
             'sub_factors': {k: round(v, 3) for k, v in sub.items()},
+            'sub_factor_emas': {k: round(float(v), 3)
+                                 for k, v in self._sub_factor_ema.items()},
             'raw': round(raw, 3),
             'ema': round(self._capacity_ema, 3),
             'drift': round(drift, 3),
@@ -2443,18 +2462,27 @@ class PeerDirector:
         # Pull the latest copernicus sub-factor from state. Defaults to
         # 1.0 when nothing has been computed yet (boot, or no peers
         # reporting) — i.e. assume healthy until proven otherwise.
-        sub = 1.0
-        try:
-            comps = self.state.get('capacity_components') or {}
-            sf = (comps.get('sub_factors') or {}).get('copernicus')
-            if isinstance(sf, (int, float)):
-                sub = float(sf)
-        except Exception:
-            pass
-        if sub >= 0.90:
-            return 1
-        # Mid-range: keep the configured floor (typically 2).
-        return floor
+        # Use the smoothed per-kind EMA, not the instantaneous sub-factor.
+        # Without smoothing the cop sub-factor flaps between 1.0 and ~0.69
+        # every tick (one 402 in a 5-min window pulls it down, the next
+        # tick clears it), which would re-derive the cred plan and trigger
+        # peer restarts. Hysteresis: drop to per=1 only when the EMA is
+        # solidly healthy; restore the floor only when it's clearly
+        # degraded. The middle band keeps the previous decision.
+        sub_ema = float(self._sub_factor_ema.get(
+            'copernicus', THROTTLE_MAX_FACTOR))
+        prev = self.state.get('_creds_per_frontier_decision', floor)
+        if sub_ema >= 0.92:
+            decision = 1
+        elif sub_ema <= 0.78:
+            decision = floor
+        else:
+            # Hysteresis band — keep the prior decision.
+            decision = int(prev) if prev in (1, floor) else floor
+        # Persist for next tick (cheap dict assignment, lock not needed —
+        # this runs in the director thread).
+        self.state['_creds_per_frontier_decision'] = decision
+        return decision
 
     def _max_parallel_frontiers(self, cfg: dict) -> int:
         """How many frontier peers we may run concurrently.
@@ -3794,6 +3822,10 @@ class PeerDirector:
                             self._capacity_components)
                         self.state['capacity_ema_persisted'] = round(
                             self._capacity_ema, 4)
+                        self.state['sub_factor_ema'] = {
+                            k: round(float(v), 4)
+                            for k, v in self._sub_factor_ema.items()
+                        }
                         # Persist the rolling sparkline history so other
                         # gunicorn workers + a fresh director after restart
                         # all see the same chart immediately.

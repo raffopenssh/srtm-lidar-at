@@ -2505,6 +2505,39 @@ def processing_stop():
                 method = 'kill9'
         except Exception:
             pass
+    # Final escalation: processor was launched via `sudo systemd-run
+    # --scope`, which puts the python child in its own systemd cgroup
+    # owned by root. Plain SIGKILL from the gunicorn user fails with
+    # EPERM on a few processes (the scope wrapper) even though the
+    # python child is exedev-owned. Killing the entire scope cgroup via
+    # sudo systemctl kill is the only thing that reliably reaches
+    # everything (parent + multiprocessing children + any sudo wrapper).
+    if _proc_alive():
+        try:
+            scopes = _sp.check_output(
+                ['systemctl', 'list-units', '--type=scope', '--no-legend',
+                 '--plain', '--all'],
+                text=True, timeout=5,
+            ).splitlines()
+            for ln in scopes:
+                name = ln.strip().split(None, 1)[0]
+                if name.startswith('austria-processor-') and name.endswith('.scope'):
+                    _sp.run(['sudo', '-n', 'systemctl', 'kill',
+                             '--signal=SIGKILL', '--kill-whom=all', name],
+                            capture_output=True, text=True, timeout=10)
+                    _sp.run(['sudo', '-n', 'systemctl', 'stop', name],
+                            capture_output=True, text=True, timeout=10)
+                    method = (method or '') + '+scope_kill'
+        except Exception as _e:
+            log.warning('scope-kill failed: %s', _e)
+        # Last resort: sudo pkill -9 (matches root-owned wrapper too).
+        try:
+            _sp.run(['sudo', '-n', 'pkill', '-9', '-f', 'austria_processor.py'],
+                    capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+        if _proc_alive():
+            method = (method or '') + '+still_alive'
     if not method:
         return jsonify({'error': 'Processor not running'}), 404
     pf = Path('data/austria_processor/progress.json')

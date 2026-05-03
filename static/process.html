@@ -3726,13 +3726,18 @@ function renderUsageCell(u) {
   let bars = '';
   for (const b of buckets) {
     const sc = b.s||0, ec = b.e||0, rc = b.r||0, t = sc+ec+rc;
-    const h = t === 0 ? 1 : Math.max(1, Math.round((t / max) * 18));
-    // Stack: success (green) bottom, rotated (yellow) middle, error (red) top.
-    const sH = t === 0 ? 0 : Math.round((sc / t) * h);
-    const rH = t === 0 ? 0 : Math.round((rc / t) * h);
-    const eH = h - sH - rH;
     const ts = b.h ? new Date(b.h * 3600 * 1000).toISOString().slice(0,13).replace('T',' ') + ':00Z' : '';
     const tip = ts + ' — ' + sc + '✓ ' + ec + '✗ ' + rc + '↻';
+    if (t === 0) {
+      // Empty bucket — just placeholder, no coloured fill.
+      bars += '<span class="spk-bar" title="' + tip + '" style="height:18px"></span>';
+      continue;
+    }
+    const h = Math.max(1, Math.round((t / max) * 18));
+    // Stack: success (green) bottom, rotated (yellow) middle, error (red) top.
+    const sH = Math.round((sc / t) * h);
+    const rH = Math.round((rc / t) * h);
+    const eH = Math.max(0, h - sH - rH);
     bars += '<span class="spk-bar" title="' + tip + '" style="height:18px">' +
             (eH > 0 ? '<i style="height:' + eH + 'px;background:var(--red)"></i>' : '') +
             (rH > 0 ? '<i style="height:' + rH + 'px;background:var(--yellow)"></i>' : '') +
@@ -3756,9 +3761,9 @@ function renderUsageCell(u) {
   }
   const succRate = total > 0 ? Math.round((s / total) * 100) : 0;
   const rateColor = succRate >= 90 ? 'var(--green)' : (succRate >= 60 ? 'var(--yellow)' : 'var(--red)');
-  return '<div style="display:flex;align-items:center;gap:6px">' +
-         '<span class="spk" style="display:inline-flex;align-items:flex-end;height:18px;gap:1px">' + bars + '</span>' +
-         '<span style="font-family:monospace;font-size:10px;white-space:nowrap">' +
+  return '<div style="display:flex;align-items:center;gap:8px;justify-content:flex-start">' +
+         '<span class="spk" style="display:inline-flex;align-items:flex-end;height:18px;gap:1px;flex:0 0 auto">' + bars + '</span>' +
+         '<span style="font-family:monospace;font-size:10px;white-space:nowrap;flex:0 0 auto">' +
            '<span style="color:var(--green)">' + s + '</span>' +
            (e ? '<span style="color:var(--dim)">/</span><span style="color:var(--red)">' + e + '</span>' : '') +
            (r ? '<span style="color:var(--dim)">/</span><span style="color:var(--yellow)">' + r + '</span>' : '') +

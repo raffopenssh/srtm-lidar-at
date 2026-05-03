@@ -173,7 +173,7 @@ THROTTLE_DEAD_ZONE_FRAC = 0.10
 # Smaller alpha → slower reaction up *and* down. Recovery is slow on
 # purpose: once we've upset Zenodo/BEV, easing back gradually is far
 # safer than snapping back to full throttle the moment warnings stop.
-THROTTLE_EMA_ALPHA = 0.15
+THROTTLE_EMA_ALPHA = 0.30
 # Slow per-peer noise EMA. Updated every director tick from the peer's
 # current 5-min warning rate. Used by choose_active_peer / orchestrators
 # so a peer that has been noisy in the last few hours stays penalised
@@ -2566,53 +2566,72 @@ class PeerDirector:
         return caps
 
     def _effective_creds_per_frontier(self, cfg: dict) -> int:
-        """Resolve the runtime min_creds_per_frontier.
+        """Legacy hook — returns floor (per-peer cred count) for the
+        static path or the value derived from adaptive frontier-count
+        planning. Kept because several callers (status payload,
+        cred-slice assignment, cache-only orchestrator) read it.
 
         Static path: ``min_creds_per_frontier`` from peers.json (default 2).
 
-        Adaptive path (default ON): if ``adaptive_creds_per_frontier`` is
-        truthy in peers.json, drop to 1 cred/frontier when Copernicus is
-        healthy (no recent 402 noise), restore to the configured floor
-        otherwise. The signal is the live ``capacity_components.copernicus``
-        sub-factor (1.0 = clean, 0.2 = saturated). When healthy we double
-        the available frontier slots without changing any retry semantics:
-        with 8 valid creds and per=1, we can run 8 frontiers in parallel
-        instead of 4.
-
-        On a 402 the worker still retries up to ``len(_CREDENTIALS)+1``
-        times (the slice expands transparently because the worker's
-        slice is per-frontier, not global). The only difference is that
-        in the per=1 regime, retries borrow neighbour creds via the
-        rotation path; in the per=2 regime, retries stay within the
-        peer's reserved pair. Either is fine when there's no contention.
+        Adaptive path (default ON): scales the *target frontier count*
+        from the smoothed Copernicus sub-factor (see
+        :py:meth:`_target_frontier_count`) and back-derives a per-peer
+        cred count = floor(len(valid) / target). With 8 valid creds:
+        target=8 → per=1, target=5 → per=1 (3 peers get 1, 5 get 1 —
+        see _assign_cred_indices for the uneven split), target=2 →
+        per=4. Per is always ≥ 1 and never exceeds the static floor.
         """
         floor = max(1, int(cfg.get('min_creds_per_frontier',
                                     self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
         if not bool(cfg.get('adaptive_creds_per_frontier', True)):
             return floor
-        # Pull the latest copernicus sub-factor from state. Defaults to
-        # 1.0 when nothing has been computed yet (boot, or no peers
-        # reporting) — i.e. assume healthy until proven otherwise.
-        # Use the smoothed per-kind EMA, not the instantaneous sub-factor.
-        # Without smoothing the cop sub-factor flaps between 1.0 and ~0.69
-        # every tick (one 402 in a 5-min window pulls it down, the next
-        # tick clears it), which would re-derive the cred plan and trigger
-        # peer restarts. Hysteresis: drop to per=1 only when the EMA is
-        # solidly healthy; restore the floor only when it's clearly
-        # degraded. The middle band keeps the previous decision.
+        valid = self._valid_credentials()
+        if not valid:
+            return floor
+        target = self._target_frontier_count(cfg, len(valid))
+        # Per-peer cred count: at least 1, capped by floor. Frontiers
+        # past the first ``len(valid) % target`` get the floor (= per),
+        # the rest get one extra cred — but the worker only sees its
+        # own slice, so reporting ``per`` here is fine for status.
+        per = max(1, min(floor, len(valid) // max(1, target)))
+        return per
+
+    def _target_frontier_count(self, cfg: dict, n_valid: int) -> int:
+        """Smoothly scaled target frontier count in [1, n_valid].
+
+        Driven by the smoothed Copernicus sub-factor EMA:
+          * EMA = 1.0 (clean) → target = n_valid (e.g. 8)
+          * EMA = THROTTLE_MIN_FACTOR (saturated) → target = ceil(n_valid / floor)
+            (e.g. 4 with floor=2)
+
+        Linear interp between those endpoints, with sticky rounding
+        (±0.4 hysteresis around the previous decision) so we don't
+        flap one frontier up/down on every tick. Decision is persisted
+        across ticks in ``state['_target_frontier_count']``.
+        """
+        floor = max(1, int(cfg.get('min_creds_per_frontier',
+                                    self.MIN_CREDS_PER_FRONTIER_DEFAULT)))
+        ceiling = max(1, n_valid)
+        baseline = max(1, n_valid // floor)
+        if ceiling <= baseline:
+            return ceiling
         sub_ema = float(self._sub_factor_ema.get(
             'copernicus', THROTTLE_MAX_FACTOR))
-        prev = self.state.get('_creds_per_frontier_decision', floor)
-        if sub_ema >= 0.92:
-            decision = 1
-        elif sub_ema <= 0.78:
-            decision = floor
+        # Map [MIN_FACTOR, MAX_FACTOR] → [baseline, ceiling].
+        span = max(1e-6, THROTTLE_MAX_FACTOR - THROTTLE_MIN_FACTOR)
+        frac = (sub_ema - THROTTLE_MIN_FACTOR) / span
+        frac = max(0.0, min(1.0, frac))
+        raw = baseline + frac * (ceiling - baseline)
+        prev = float(self.state.get('_target_frontier_count', raw))
+        # Sticky rounding: only move when raw is >0.4 away from prev,
+        # otherwise keep prev rounded. Prevents a single 402 from
+        # bumping us 5↔6.
+        if abs(raw - prev) < 0.4:
+            decision = int(round(prev))
         else:
-            # Hysteresis band — keep the prior decision.
-            decision = int(prev) if prev in (1, floor) else floor
-        # Persist for next tick (cheap dict assignment, lock not needed —
-        # this runs in the director thread).
-        self.state['_creds_per_frontier_decision'] = decision
+            decision = int(round(raw))
+        decision = max(baseline, min(ceiling, decision))
+        self.state['_target_frontier_count'] = float(decision)
         return decision
 
     def _max_parallel_frontiers(self, cfg: dict) -> int:
@@ -2631,10 +2650,13 @@ class PeerDirector:
         rarely binds.
         """
         valid = self._valid_credentials()
-        per = self._effective_creds_per_frontier(cfg)
         if not valid:
             return 0
-        cap_creds = max(1, len(valid) // per)
+        if not bool(cfg.get('adaptive_creds_per_frontier', True)):
+            per = self._effective_creds_per_frontier(cfg)
+            cap_creds = max(1, len(valid) // per)
+        else:
+            cap_creds = self._target_frontier_count(cfg, len(valid))
         # Cap on how many disjoint cells we can hand out. With ~14
         # non-empty cells across Austria this should never bind
         # — cred capacity is the real ceiling.
@@ -2661,29 +2683,47 @@ class PeerDirector:
         out: dict[str, list[int]] = {}
         if not valid or not frontier_ids:
             return out
+        n_peers = len(frontier_ids)
+        # When the planner asked for more frontiers than per*N can
+        # cover (uneven split: e.g. 8 creds, 5 frontiers with per=1),
+        # spread the leftover creds one extra each across the first K
+        # peers. Each peer thus gets per or per+1 creds. If
+        # n_peers*per > len(valid) we fall back to per=1 for everyone
+        # and drop the last few peers if there still aren't enough.
+        if per * n_peers > len(valid):
+            per_eff = max(1, len(valid) // max(1, n_peers))
+        else:
+            per_eff = per
+        extra = max(0, len(valid) - per_eff * n_peers)  # leftovers
         valid_set = set(valid)
         used: set[int] = set()
         prior = prior or {}
-        # Keep existing assignments where possible.
+        # Keep existing assignments where possible (any size in [per_eff, per_eff+1]).
         for pid in frontier_ids:
             slice_ = prior.get(pid)
             if not slice_:
                 continue
             slice_ = sorted(int(i) for i in slice_)
-            if (len(slice_) == per
+            if (per_eff <= len(slice_) <= per_eff + 1
                     and all(i in valid_set for i in slice_)
                     and not (set(slice_) & used)):
                 out[pid] = slice_
                 used.update(slice_)
-        # Assign fresh slices from leftover creds for newcomers, sorted
-        # by id for determinism.
+        # Recompute extras based on what's already locked in.
         leftovers = [i for i in valid if i not in used]
-        for pid in sorted(p for p in frontier_ids if p not in out):
-            slice_ = leftovers[:per]
-            if len(slice_) < per:
+        remaining_peers = sorted(p for p in frontier_ids if p not in out)
+        # Distribute: each peer gets per_eff; first ``extra`` peers get +1.
+        # ``extra`` is the number of leftover creds beyond per_eff*n_peers,
+        # but we've already given some peers their share via ``out``
+        # — so recompute as (leftovers - per_eff*remaining).
+        bonus = max(0, len(leftovers) - per_eff * len(remaining_peers))
+        for i, pid in enumerate(remaining_peers):
+            take = per_eff + (1 if i < bonus else 0)
+            slice_ = leftovers[:take]
+            if len(slice_) < per_eff:
                 break
             out[pid] = slice_
-            leftovers = leftovers[per:]
+            leftovers = leftovers[take:]
         return out
 
     def _austria_lat_strips(self) -> list[tuple[float, float]]:

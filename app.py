@@ -4810,6 +4810,76 @@ def _zenodo_lock_is_stale(now: float) -> bool:
     return (now - _ZENODO_LOCK['last_heartbeat']) > _ZENODO_LOCK_TTL
 
 
+# === SECTION: Zenodo lock broker proxy ===
+#
+# When the standalone broker on :8001 is up, gunicorn's lock routes
+# transparently proxy to it. Peers can keep their existing
+# ZENODO_LOCK_URL pointing at :8000 (the public exe.dev proxy) and
+# still benefit from the broker's slow-path isolation — their lock
+# traffic still goes via gunicorn, but gunicorn just forwards it,
+# which is much cheaper than holding the lock state itself.
+# Falls back to in-process state when the broker is unreachable.
+
+_BROKER_BASE = 'http://127.0.0.1:8001'
+_BROKER_HEALTHY_AT = 0.0
+_BROKER_HEALTHY_TTL = 30.0   # re-probe at most every 30s
+_BROKER_HEALTHY = False
+_BROKER_LOCK = threading.Lock()
+
+
+def _broker_alive() -> bool:
+    """Cached liveness probe for the standalone broker."""
+    global _BROKER_HEALTHY, _BROKER_HEALTHY_AT
+    now = time.time()
+    with _BROKER_LOCK:
+        if (now - _BROKER_HEALTHY_AT) < _BROKER_HEALTHY_TTL:
+            return _BROKER_HEALTHY
+    try:
+        import requests as _req
+        r = _req.get(_BROKER_BASE + '/api/v1/zenodo/lock', timeout=0.5)
+        ok = r.status_code == 200
+    except Exception:
+        ok = False
+    with _BROKER_LOCK:
+        _BROKER_HEALTHY = ok
+        _BROKER_HEALTHY_AT = time.time()
+    return ok
+
+
+def _broker_proxy(method: str, path_suffix: str = '') -> tuple | None:
+    """Forward the current request to the broker. Returns Flask response
+    tuple ``(body, status)`` or None when the broker is unreachable
+    (caller should fall back to local state).
+    """
+    if not _broker_alive():
+        return None
+    try:
+        import requests as _req
+        url = _BROKER_BASE + '/api/v1/zenodo/lock' + path_suffix
+        # Forward auth header so the broker sees the same token check.
+        hdrs = {}
+        tok = request.headers.get('X-Admin-Token')
+        if tok:
+            hdrs['X-Admin-Token'] = tok
+        body = request.get_data() or None
+        if body is not None:
+            hdrs['Content-Type'] = request.headers.get(
+                'Content-Type', 'application/json')
+        r = _req.request(method, url, data=body, headers=hdrs, timeout=3.0)
+        # Mirror broker's status + JSON body.
+        try:
+            return jsonify(r.json()), r.status_code
+        except Exception:
+            return r.text, r.status_code
+    except Exception as e:
+        log.debug('Zenodo lock broker proxy failed: %s', e)
+        with _BROKER_LOCK:
+            global _BROKER_HEALTHY, _BROKER_HEALTHY_AT
+            _BROKER_HEALTHY = False
+            _BROKER_HEALTHY_AT = time.time()
+        return None
+
+
 @app.route('/api/v1/zenodo/lock', methods=['POST'])
 def zenodo_lock_acquire():
     """Acquire the global Zenodo upload lease.
@@ -4818,6 +4888,9 @@ def zenodo_lock_acquire():
     Returns 200 + {token, ttl_s} on success, 423 + {holder, age_s} on conflict.
     The caller must POST /api/v1/zenodo/lock/heartbeat at least every TTL/2 s.
     """
+    proxied = _broker_proxy('POST')
+    if proxied is not None:
+        return proxied
     import uuid as _uuid
     body = request.get_json(silent=True) or {}
     peer = str(body.get('peer') or 'anon')
@@ -4859,6 +4932,9 @@ def zenodo_lock_acquire():
 @app.route('/api/v1/zenodo/lock/heartbeat', methods=['POST'])
 def zenodo_lock_heartbeat():
     """Renew an active lease.  Body: {token: <uuid>}."""
+    proxied = _broker_proxy('POST', '/heartbeat')
+    if proxied is not None:
+        return proxied
     body = request.get_json(silent=True) or {}
     token = body.get('token')
     now = time.time()
@@ -4874,6 +4950,9 @@ def zenodo_lock_heartbeat():
 @app.route('/api/v1/zenodo/lock', methods=['DELETE'])
 def zenodo_lock_release():
     """Release the lease.  Body: {token: <uuid>}."""
+    proxied = _broker_proxy('DELETE')
+    if proxied is not None:
+        return proxied
     body = request.get_json(silent=True) or {}
     token = body.get('token')
     with _ZENODO_LOCK_LOCK:
@@ -4894,6 +4973,9 @@ def zenodo_lock_release():
 @app.route('/api/v1/zenodo/lock', methods=['GET'])
 def zenodo_lock_status():
     """Inspect current lease (no auth)."""
+    proxied = _broker_proxy('GET')
+    if proxied is not None:
+        return proxied
     now = time.time()
     with _ZENODO_LOCK_LOCK:
         if _ZENODO_LOCK['holder'] is None:

@@ -4846,23 +4846,34 @@ threading.Thread(target=_start_director, daemon=True).start()
 # and if the shadow misses 3 in a row, the shadow promotes itself.
 try:
     import director_ha as dha
-    # Bootstrap self.json on the primary if missing so dha has a known id.
+    import socket as _sock
+    # ALWAYS heal self.json on startup from the local hostname — it is
+    # the only authoritative source of identity for this VM. Past
+    # cascading handovers corrupted self.json with the wrong id/url
+    # (e.g. at37 ended up with id='at44'). The hostname does not lie.
     _self = dha.load_self()
-    if dha.IS_DIRECTOR_FLAG.exists():
-        # The director should not have a director_url pointer.
-        if _self.get('director_url'):
+    _hn = _sock.gethostname().split('.')[0]
+    if _hn.startswith('srtm-lidar-'):
+        _suffix = _hn[len('srtm-lidar-'):]
+        _correct_id = 'primary' if _suffix == 'at' else _suffix
+        _correct_url = f'https://{_hn}.exe.xyz:8000'
+        _changed = False
+        if _self.get('id') != _correct_id:
+            log.warning('self.json id mismatch: was %r, healing to %r',
+                        _self.get('id'), _correct_id)
+            _self['id'] = _correct_id
+            _changed = True
+        if _self.get('url') != _correct_url:
+            log.warning('self.json url mismatch: was %r, healing to %r',
+                        _self.get('url'), _correct_url)
+            _self['url'] = _correct_url
+            _changed = True
+        if dha.IS_DIRECTOR_FLAG.exists() and _self.get('director_url'):
+            # The director should not have a director_url pointer.
             _self['director_url'] = None
+            _changed = True
+        if _changed:
             dha.save_self(_self)
-        # Force id='primary' if hostname suggests so and unset.
-        if not _self.get('url'):
-            try:
-                import socket as _sock
-                h = _sock.gethostname().split('.')[0]
-                if h.startswith('srtm-lidar-'):
-                    _self['url'] = f'https://{h}.exe.xyz:8000'
-                    dha.save_self(_self)
-            except Exception:
-                pass
     dha.start_watchdog()
 except Exception as _e:
     log.warning('director_ha watchdog disabled: %s', _e)

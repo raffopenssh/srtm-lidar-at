@@ -2948,11 +2948,43 @@ def processing_prioritize():
     if not kgs:
         return jsonify({'error': 'No KGs found in the given area'}), 404
 
-    # Filter out already-processed KGs
+    # Filter out already-processed KGs.
+    # `processed` covers direct completion + block codes (e.g. '49006-south').
+    # If a parent KG was *split* and all blocks are done, the parent code
+    # itself is NOT in `processed` (only its block codes are). Detect that
+    # case so we don't requeue '49006' when '49006-south/center/north' are
+    # already done. Mirrors the GET handler's `_parent_fully_done` logic.
     data_dir = Path('data/austria_processor')
     processed = _get_completed_kgs()
-    unprocessed = [k for k in kgs if k not in processed]
-    already_done = [k for k in kgs if k in processed]
+    try:
+        from kg_splitter import maybe_split_kg, all_block_codes_for_parent, is_block_code
+        idx = si.get_index()
+        _conn = idx._conn()
+        def _parent_fully_done(code: str) -> bool:
+            if is_block_code(code):
+                return False
+            row = _conn.execute(
+                'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
+                'FROM kg WHERE kg_code=?', (code,)).fetchone()
+            if not row or row['min_lon'] is None:
+                return False
+            fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
+                       'bbox': {'min_lon': row['min_lon'],
+                                'min_lat': row['min_lat'],
+                                'max_lon': row['max_lon'],
+                                'max_lat': row['max_lat']}}
+            blocks = maybe_split_kg(fake_kg)
+            if len(blocks) <= 1:
+                return False
+            done = all_block_codes_for_parent(code, processed)
+            return len(done) >= len(blocks)
+    except Exception:
+        def _parent_fully_done(code: str) -> bool:
+            return False
+    unprocessed = [k for k in kgs
+                   if k not in processed and not _parent_fully_done(k)]
+    already_done = [k for k in kgs
+                    if k in processed or _parent_fully_done(k)]
 
     # Write unprocessed to front of retry queue (priority = first)
     queued = []
@@ -5038,11 +5070,24 @@ def director_heartbeat():
     import director_ha as dha
     if not dha.IS_DIRECTOR_FLAG.exists():
         return jsonify({'is_director': False, 'self': dha.load_self()}), 410
+    # Liveness check: the loop must actually be running. A dead loop with
+    # IS_DIRECTOR_FLAG still on disk means the cluster is unmanaged —
+    # report 410 so peers fail over to a healthier shadow instead of
+    # trusting our flag forever.
     try:
         d = pd.get_director()
-        running = bool(getattr(d, '_running', False))
+        thr = getattr(d, '_thread', None)
+        running = bool(getattr(d, '_running', False)) and bool(
+            thr and thr.is_alive())
     except Exception:
         running = False
+    if not running:
+        return jsonify({
+            'is_director': True,
+            'running': False,
+            'note': 'flag set but loop not running',
+            'self': dha.load_self(),
+        }), 410
     state = {}
     try:
         state = pd.load_director_state()

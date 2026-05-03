@@ -1175,6 +1175,7 @@ class PeerDirector:
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
+        self._lock_fd = None
         # EMA capacity factor (0..1). Persisted to director_state.json so
         # restart of the director (or a gunicorn worker swap) doesn't
         # erase recent fleet-wide warning history. We also restore a
@@ -1370,8 +1371,39 @@ class PeerDirector:
         self._thread.start()
         log.info('PeerDirector started (lock acquired)')
 
-    def stop(self):
+    def stop(self, *, join_timeout: float = 8.0):
+        """Stop the director loop, join the thread, and release the file lock.
+
+        Critical for in-process handover: ``_do_takeover`` calls
+        ``old.stop()`` and immediately tries ``new.start()``. If we don't
+        join + release here, the new instance's ``fcntl.LOCK_NB`` fails
+        (same-process), the takeover silently aborts, and we end up with
+        ``IS_DIRECTOR_FLAG`` set on disk but no loop running. The
+        heartbeat then returns 200 forever while the cluster is
+        actually unmanaged.
+        """
         self._running = False
+        thr = self._thread
+        if thr and thr.is_alive() and thr is not threading.current_thread():
+            try:
+                thr.join(timeout=join_timeout)
+            except Exception as e:
+                log.warning('PeerDirector.stop: thread join failed: %s', e)
+        self._thread = None
+        # Explicitly release the file lock so the next instance can
+        # acquire it in this same process.
+        fd = getattr(self, '_lock_fd', None)
+        if fd is not None:
+            try:
+                import fcntl as _fcntl
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fd.close()
+            except Exception:
+                pass
+            self._lock_fd = None
 
     def get_status(self) -> dict:
         """Full director status for the dashboard."""

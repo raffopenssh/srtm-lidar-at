@@ -551,6 +551,19 @@ def _watchdog_tick() -> None:
         log.info('director watchdog: %d misses but I am not shadow '
                  '(shadow=%s, me=%s) — waiting', misses, designated_shadow, me)
         return
+    # Freshness gate: stale shadow_meta is the #1 cause of split-brain.
+    # A peer that *was* shadow once, then was de-elected, keeps a stale
+    # meta.json forever. On any later heartbeat blip the watchdog reads
+    # 'shadow_id == me' and re-promotes. We refuse to promote unless the
+    # meta was received recently (3 × push interval = 90 s).
+    received_ts = float(meta.get('received_ts') or 0.0)
+    age = time.time() - received_ts
+    SHADOW_META_FRESH_S = SHADOW_SYNC_INTERVAL * 3
+    if received_ts <= 0 or age > SHADOW_META_FRESH_S:
+        log.warning('director watchdog: shadow meta stale (age=%.0fs > %ds) — '
+                    'refusing to promote, will wait for fresh push',
+                    age, SHADOW_META_FRESH_S)
+        return
     log.warning('director watchdog: director %s missed %d heartbeats — '
                 'promoting self (%s) to director', durl, misses, me)
     with _WATCHDOG.lock:
@@ -685,6 +698,16 @@ def step_down(announce_payload: dict) -> dict:
         IS_DIRECTOR_FLAG.unlink()
     except FileNotFoundError:
         pass
+    # Invalidate any stale shadow_meta. We are no longer the shadow
+    # of anyone (we just stepped down). Without this, a future heartbeat
+    # blip would let our watchdog re-promote based on a meta file that
+    # still says 'shadow_id == me'. This is the cascade trigger.
+    try:
+        SHADOW_META_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
     STEPPED_DOWN_FLAG.write_text(
         json.dumps({
             'ts': datetime.now(timezone.utc).isoformat(),
@@ -722,6 +745,15 @@ def accept_announce(payload: dict) -> dict:
     if IS_DIRECTOR_FLAG.exists():
         return step_down(payload)
     set_director_url(new_url)
+    # Same invariant as in step_down: any peer that receives an announce
+    # is now a follower of ``new_id``, so its prior shadow_meta (if any)
+    # is stale by definition.
+    try:
+        SHADOW_META_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
     # Clear watchdog miss counter so we don't immediately try to re-takeover.
     with _WATCHDOG.lock:
         _WATCHDOG.misses = 0

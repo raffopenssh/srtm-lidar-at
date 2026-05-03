@@ -1577,6 +1577,18 @@ class PeerDirector:
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        # Freshen director_state.json mtime immediately so heartbeats
+        # return 200 right after a srv restart. Without this, the file
+        # carries its pre-restart mtime (often 5+ minutes old), the
+        # heartbeat liveness check fails, peer watchdogs trip a takeover,
+        # and the cluster cascades. The loop will refresh the contents
+        # within ~30s; this is just a marker that says 'a director loop
+        # is here'.
+        try:
+            DIRECTOR_STATE.parent.mkdir(parents=True, exist_ok=True)
+            DIRECTOR_STATE.touch(exist_ok=True)
+        except Exception:
+            pass
         log.info('PeerDirector started (lock acquired)')
 
     def stop(self, *, join_timeout: float = 8.0):

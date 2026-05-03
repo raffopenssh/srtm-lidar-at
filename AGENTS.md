@@ -1593,6 +1593,75 @@ the primary and wait 90 s; the shadow takes over automatically. After
 recovery, auto-handback returns the role to primary as soon as primary
 is healthy and on the same commit.
 
+#### Role-data eviction (free disk on demoted peers)
+
+The per-KG JSON corpus (`data/austria_processor/json/*.json`, ~1 GB on a
+fully-built fleet) and `data/search_index.db` (~120 MB) are only useful
+to:
+* the **primary** (canonical home for search index + dashboard) — always keep
+* the **current director** (peer_director consults the index for cache-ready
+  KGs, KG-split lookups)
+* the **current shadow** (must be ready to take over)
+
+A peer that *was* director (e.g. after handback to primary) accumulates
+the full corpus. Without eviction, that data crowds out expensive
+Copernicus tile caches and trips the disk-pressure threshold (1.6 GB
+free on at17 was the trigger for adding this).
+
+**Loop** (`app.py:_role_data_eviction_loop`, 10 min tick):
+1. Classify role via `_is_keep_role_data()` — reads `is_director`,
+   `self.json:id`, and `shadow/meta.json:shadow_id`.
+2. If demoted, stamp `data/austria_processor/role_demoted_at`.
+3. After `ROLE_EVICT_GRACE_SECONDS` (1 h) of continuous demotion,
+   delete `json/*.json` + `search_index.db{,-wal,-shm,-journal}`.
+4. Promotion (becoming director or designated shadow) clears the marker.
+5. `_sync_peer_data` and `_init_search_index` short-circuit on demoted
+   peers so we don't immediately re-fetch what we just freed.
+
+**Primary special-case**: `id == 'primary'` is always keep-role, even
+when not director, so the search index has a stable canonical home that
+survives any failover.
+
+**Endpoints**:
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/admin/diskstat` | Per-VM disk + role status (sizes_mb, role.demoted_at, role.grace_remaining_s) |
+| POST | `/api/v1/admin/role_evict` | Force-run a tick. `{"force": true}` purges regardless of role (decommission). |
+
+**Tuning** (top of `app.py`):
+* `ROLE_EVICT_GRACE_SECONDS = 3600`
+* `ROLE_EVICT_TICK_SECONDS = 600`
+
+**When NOT to enable**: never delete on uncertainty — if the
+keep-role check raises, `_is_keep_role_data()` returns True (fail-safe).
+
+#### Processor uid (must be exedev, never root)
+
+**Background**: the processor is launched via
+`sudo systemd-run --scope -p User=exedev ...`. **`-p User=` is silently
+ignored on `--scope` units** (only `--service` units honour it). For
+months the processor ran as uid=0, with two consequences:
+1. `/proc/<pid>/environ` was unreadable from gunicorn (uid=exedev) —
+   the dashboard couldn't display per-process credential indices,
+   masking director-assigned `COPERNICUS_CRED_INDICES` /
+   `KG_LAT_STRIP_FILTER`.
+2. `pkill` from gunicorn couldn't kill a root-owned processor; only the
+   sudo escalation chain (`sudo systemctl kill --signal=SIGKILL` →
+   `sudo pkill -9`) succeeded.
+
+**Fix** (`app.py:start_peer_processor`): keep the scope + `-E env`
+forwarding, but invoke the python child via
+`runuser --user exedev --preserve-environment --` *inside* the scope.
+Result: scope = uid 0 (sudo), runuser = uid 0, python3 = uid 1000.
+The sudo and runuser shims are tiny supervisors with no env of their
+own; the python child is the only thing whose `/proc/<pid>/environ`
+matters, and it's now readable.
+
+Verify with `GET /api/v1/admin/proc_env`. Look for the python3 row —
+`uid` should start with `1000`, and `env` should include
+`COPERNICUS_CRED_INDICES`, `KG_LAT_STRIP_FILTER`, `ZENODO_LOCK_URL`,
+`HOME=/home/exedev`, `USER=exedev`. The sudo and runuser rows show
+`env_err: Permission denied` (expected — they're still uid 0 / sudo).
 
 #### Cross-Cutting Concerns (director changes)
 

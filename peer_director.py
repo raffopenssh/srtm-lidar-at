@@ -1518,6 +1518,8 @@ class PeerDirector:
             'cycle_start': get_billing_cycle_start().isoformat(),
             'capacity_factor': state.get(
                 'capacity_factor', self._capacity_ema),
+            'capacity_ema': state.get(
+                'capacity_ema_persisted', self._capacity_ema),
             'capacity_components': state.get(
                 'capacity_components', self._capacity_components),
             # Use in-memory history if this worker runs the loop;

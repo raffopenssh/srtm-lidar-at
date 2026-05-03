@@ -2279,6 +2279,23 @@ def processing_start():
         '-E', f'HOME={_user_home}',
         '-E', 'PYTHONUNBUFFERED=1',
     ]
+    # systemd-run --scope with -p User= drops the Popen env=. Only -E
+    # values are forwarded into the new user session. Promote our
+    # director-set assignment env vars (and a few critical infra ones)
+    # into -E flags so they actually reach the subprocess.
+    _forward_keys = (
+        'COPERNICUS_CRED_INDICES',
+        'KG_LAT_STRIP_FILTER',
+        'ZENODO_LOCK_URL',
+        'COPERNICUS_FORBIDDEN',
+        'PATH',
+        'LANG',
+        'LC_ALL',
+    )
+    for _k in _forward_keys:
+        _v = proc_env.get(_k)
+        if _v:
+            user_props += ['-E', f'{_k}={_v}']
     scope_args = (
         ['sudo', '-n', 'systemd-run', '--scope', '--quiet',
          '--unit', unit_name]

@@ -3453,7 +3453,14 @@ function renderCapacityHistory() {
 function renderDirector(d) {
   const mode = d.mode || 'auto';
   const active = d.active_peer;
-  const peers = d.peers || [];
+  // Dedupe by id — duplicate rows appeared when peers.json briefly had
+  // a dup or proxied status carried the same id twice. Last entry wins.
+  const _peersRaw = d.peers || [];
+  const _peerById = {};
+  for (const _p of _peersRaw) {
+    if (_p && _p.id) _peerById[_p.id] = _p;
+  }
+  const peers = Object.values(_peerById);
   // Prefer DB-sourced count (from _lastStatus); fall back to summing peer counters
   const totalCompleted = (_lastStatus && _lastStatus.db_processed != null)
     ? _lastStatus.db_processed

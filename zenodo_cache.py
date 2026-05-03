@@ -934,6 +934,8 @@ class ZenodoCache:
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
         self._zip_indices: Dict[str, ZipIndex] = {}  # zip_name → ZipIndex
+        self._missing_zips: set = set()  # negative cache of ZIPs not in manifest
+        self._missing_zips_mtime: float = 0.0  # manifest mtime when cache was built
 
     # --- Zenodo API helpers ---
 
@@ -1249,12 +1251,37 @@ class ZenodoCache:
     # --- Download (single tile from Zenodo) ---
 
     def _get_zip_index(self, zip_name: str) -> Optional[ZipIndex]:
-        """Get or create a ZipIndex for a remote ZIP."""
+        """Get or create a ZipIndex for a remote ZIP.
+
+        Negative-caches ZIPs not listed in the local cache_manifest --
+        without this, every cache-only peer would re-probe Zenodo for
+        every missing cell ZIP on every KG, triggering hundreds of
+        404s/min during the cell rollout.
+        """
         if zip_name in self._zip_indices:
             return self._zip_indices[zip_name]
+        # Drop the negative cache when the manifest changes (another
+        # peer may have uploaded the bundle).
+        try:
+            mtime = self.manifest._last_mtime
+        except AttributeError:
+            mtime = 0.0
+        if mtime != self._missing_zips_mtime:
+            self._missing_zips.clear()
+            self._missing_zips_mtime = mtime
+        if zip_name in self._missing_zips:
+            return None
+
+        # Negative cache: if the manifest doesn't list this ZIP, don't
+        # bother probing Zenodo. Manifest sync will populate the entry
+        # once another peer uploads the bundle.
+        if not self.manifest.get_file(zip_name):
+            self._missing_zips.add(zip_name)
+            return None
 
         url = self._file_download_url(zip_name)
         if not url:
+            self._missing_zips.add(zip_name)
             return None
 
         try:
@@ -1264,6 +1291,7 @@ class ZenodoCache:
             return idx
         except Exception as e:
             log.debug("Cannot access ZIP %s on Zenodo: %s", zip_name, e)
+            self._missing_zips.add(zip_name)
             return None
 
     def fetch_copernicus(
@@ -1299,6 +1327,7 @@ class ZenodoCache:
         self.manifest.reload_if_changed()
         if self.manifest.depo_id != old_depo:
             self._zip_indices.clear()  # URLs changed, invalidate cached indices
+            self._missing_zips.clear()
 
         cs, cn, cw, ce = _cell_for_bbox(s, w)
         candidates = [
@@ -1376,6 +1405,7 @@ class ZenodoCache:
         self.manifest.reload_if_changed()
         if self.manifest.depo_id != old_depo:
             self._zip_indices.clear()
+            self._missing_zips.clear()
 
         cs, cn, cw, ce = _cell_for_bbox(s, w)
         candidates = [

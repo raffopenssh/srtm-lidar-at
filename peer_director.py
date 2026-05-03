@@ -200,6 +200,14 @@ THROTTLE_DRIFT_AMPLITUDE = 0.04        # ±4% wobble around the EMA value
 RAMP_MIN_STARTS_PER_TICK = 1
 RAMP_MAX_STARTS_PER_TICK = 3
 
+# Minimum interval between processor restarts on the same active frontier
+# peer when the cred/strip plan + exclude set haven't changed. The
+# director sees ``state in ('idle','stopped')`` between KGs (the
+# subprocess exits cleanly per-KG) and would otherwise fire a fresh
+# start every 30s tick. Empirically we see ~8 restarts/hour without
+# this guard. Plan changes always restart immediately regardless.
+FRONTIER_RESTART_COOLDOWN_S = 180
+
 # Warmup hold for fresh peers. A brand-new peer has no tile cache and
 # zero history; throwing it straight at frontier work means it starts
 # by hammering Copernicus/BEV. We let it sit eligible-but-unused for a
@@ -791,27 +799,58 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         queue_result = _push_queue_to_peer(peer_url, list(queue_whitelist))
     else:
         queue_result = sync_queue_to_peer(peer_url, exclude=exclude_kgs)
-    # Try API start first, fall back to systemd restart via admin endpoint
-    try:
-        r = requests.post(
-            peer_url.rstrip('/') + '/api/v1/processing/start',
-            json=payload,
-            timeout=PEER_TIMEOUT_CONTROL,
-        headers=_admin_headers())
-        if r.ok:
-            result = r.json()
-            result['queue_sync'] = queue_result
-            return result
-        if r.status_code == 409:
-            # Already running — that's fine
-            result = r.json()
-            result['queue_sync'] = queue_result
-            result['already_running'] = True
-            return result
-        # API start failed (500 etc) — try systemd restart as fallback
-        log.warning('API start on %s returned %d, trying systemd fallback', peer_url, r.status_code)
-    except Exception as e:
-        log.warning('API start on %s failed: %s, trying systemd fallback', peer_url, e)
+    # Try API start; if it transiently 500s (often due to a race in
+    # processor state — e.g. an externally-detected processor that
+    # didn't fully exit), retry once after a short sleep.
+    last_err: str | None = None
+    last_status: int | None = None
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                peer_url.rstrip('/') + '/api/v1/processing/start',
+                json=payload,
+                timeout=PEER_TIMEOUT_CONTROL,
+            headers=_admin_headers())
+            if r.ok:
+                result = r.json()
+                result['queue_sync'] = queue_result
+                if attempt > 1:
+                    result['retry'] = attempt
+                return result
+            if r.status_code == 409:
+                # Already running — that's fine
+                result = r.json()
+                result['queue_sync'] = queue_result
+                result['already_running'] = True
+                return result
+            last_status = r.status_code
+            last_err = (r.text or '')[:200]
+        except Exception as e:
+            last_err = str(e)
+        if attempt < 2:
+            time.sleep(1.5)
+    # The systemd fallback restarts ``austria_processor.service`` which
+    # (a) is disabled on peers and (b) has no awareness of cache_only,
+    # cred_indices, lat_strips, or queue_whitelist. Falling back here
+    # silently bypasses the director's per-peer assignments — e.g. a
+    # cache-only start turns into a full frontier start, then the
+    # director kills it as 'non-active running frontier' and retries
+    # forever. Only fall back when the call had no per-peer contract.
+    is_constrained = bool(cache_only or cred_indices or lat_strips
+                            or queue_whitelist is not None)
+    if is_constrained:
+        log.warning(
+            'API start on %s failed (status=%s err=%s); skipping systemd '
+            'fallback because contract requires cache_only=%s '
+            'cred_indices=%s lat_strips=%s queue_whitelist=%s',
+            peer_url, last_status, last_err,
+            cache_only, cred_indices, lat_strips,
+            None if queue_whitelist is None else len(queue_whitelist))
+        return {'error': f'api_start_failed: {last_status or last_err}',
+                'queue_sync': queue_result,
+                'method': 'no_fallback_constrained'}
+    log.warning('API start on %s returned %s, trying systemd fallback',
+                peer_url, last_status if last_status else last_err)
     # Fallback: ask the peer to restart the processor via systemd
     try:
         r2 = requests.post(
@@ -1223,6 +1262,19 @@ class PeerDirector:
                 if rate > agg[kind]:
                     agg[kind] = rate
         agg['_peers_reporting'] = peer_count
+        # Track which peers contributed and which didn't so we can
+        # surface gaps in /api/v1/director/status. Useful when we
+        # expect 50 peers and only 45 report — the missing 5 are
+        # silent because they're scheduled, unreachable past grace,
+        # or stopped.
+        all_pids = sorted((statuses or {}).keys())
+        reporting_pids = sorted(
+            pid for pid, ps in (statuses or {}).items()
+            if (ps or {}).get('warning_rates')
+            and (ps or {}).get('state') != 'stopped')
+        agg['_peers_reporting_ids'] = reporting_pids
+        agg['_peers_silent_ids'] = [
+            pid for pid in all_pids if pid not in set(reporting_pids)]
         return agg
 
     def _capacity_factor(self, statuses: dict) -> float:
@@ -1284,6 +1336,8 @@ class PeerDirector:
             'drift': round(drift, 3),
             'factor': round(final, 3),
             'peers_reporting': rates.get('_peers_reporting', 0),
+            'peers_reporting_ids': rates.get('_peers_reporting_ids') or [],
+            'peers_silent_ids': rates.get('_peers_silent_ids') or [],
         }
         # Append to ring buffer. Compact tuple (no dict) to keep the
         # JSON payload small even when serialised in get_status().
@@ -2004,17 +2058,47 @@ class PeerDirector:
                             # No prior plan: give all strips to this
                             # lone frontier; orchestrator will trim later.
                             plan_strip = [list(s) for s in strips] if strips else None
-                        log.info(
-                            'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
-                            active_id, remaining_gb,
-                            (' — excluding ' + ','.join(sorted(excl))) if excl else '',
-                            plan_cred, plan_strip,
-                        )
-                        start_peer_processor(
-                            peer.get('url'), exclude_kgs=excl,
-                            cred_indices=plan_cred,
-                            lat_strips=plan_strip,
-                        )
+                        # Throttle: don't fire restart more than once per
+                        # FRONTIER_RESTART_COOLDOWN_S unless the cred/strip
+                        # plan or the exclude set actually changed. Without
+                        # this we issue ~8 restarts/hour just because the
+                        # processor reports idle between KGs (each KG ends
+                        # in a clean subprocess exit).
+                        plan_fp = [
+                            sorted(int(i) for i in (plan_cred or [])),
+                            [list(s) for s in (plan_strip or [])],
+                            sorted(excl),
+                        ]
+                        last_restart = self.state.setdefault(
+                            '_frontier_restart_log', {})
+                        last_entry = last_restart.get(active_id) or {}
+                        last_ts = float(last_entry.get('ts') or 0)
+                        last_fp = last_entry.get('fp')
+                        now_ts = time.time()
+                        cooldown = float(
+                            cfg.get('frontier_restart_cooldown_s',
+                                     FRONTIER_RESTART_COOLDOWN_S))
+                        plan_unchanged = (last_fp == plan_fp)
+                        if plan_unchanged and (now_ts - last_ts) < cooldown:
+                            log.debug(
+                                'Skip restart on %s: plan unchanged and '
+                                'within cooldown (%.0fs/%.0fs)',
+                                active_id, now_ts - last_ts, cooldown)
+                        else:
+                            log.info(
+                                'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
+                                active_id, remaining_gb,
+                                (' — excluding ' + ','.join(sorted(excl))) if excl else '',
+                                plan_cred, plan_strip,
+                            )
+                            start_peer_processor(
+                                peer.get('url'), exclude_kgs=excl,
+                                cred_indices=plan_cred,
+                                lat_strips=plan_strip,
+                            )
+                            last_restart[active_id] = {
+                                'ts': now_ts, 'fp': plan_fp,
+                            }
                     else:
                         log.info('Peer %s depleted, finding next peer', active_id)
                         with self._lock:

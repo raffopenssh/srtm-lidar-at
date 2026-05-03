@@ -1485,6 +1485,40 @@ Tuning knobs: `THROTTLE_MIN_FACTOR`, `THROTTLE_EMA_ALPHA`,
 `THROTTLE_DRIFT_PERIOD_S`, `THROTTLE_DRIFT_AMPLITUDE` at the top of
 `peer_director.py`.
 
+**Per-kind sub-factor EMAs**: `capacity_components.sub_factor_emas`
+holds smoothed `bev` / `zenodo` / `copernicus` sub-factors (same
+α = THROTTLE_EMA_ALPHA, persisted across worker swaps). Used by
+`_effective_creds_per_frontier` with hysteresis (per=1 above 0.92,
+per=floor below 0.78, sticky band) so the per=1↔per=2 decision
+doesn't flap on a single 402 inside the 5-min window. The flap was
+causing ~8 frontier restarts/hour because each flip re-derived
+`max_parallel_frontiers` and the cred-slice plan.
+
+**Frontier restart cooldown** (`FRONTIER_RESTART_COOLDOWN_S = 180`):
+each KG ends with a clean subprocess exit, so the active frontier
+reports `state in ('idle','stopped')` between KGs. The director
+used to fire a fresh start on every 30 s tick. Now it only restarts
+when the cred slice, lat strips, or excluded-KG set actually
+changed; otherwise it waits at least 180 s. Last decisions are
+tracked in `_frontier_restart_log[peer_id] = {ts, fp}`.
+
+**Constrained starts skip systemd fallback**: when
+`start_peer_processor` carries `cache_only` / `cred_indices` /
+`lat_strips` / `queue_whitelist`, an API 500 is retried once after
+1.5 s. If still failing, we return
+`{method: 'no_fallback_constrained'}` instead of calling
+`/api/v1/admin/restart_processor` (which restarts
+`austria_processor.service` and ignores the per-peer contract).
+Without this guard, a cache-only start was turning into a frontier
+start, the director then killed it as 'non-active running
+frontier', and the loop repeated forever.
+
+**Silent-peer surfacing**: `capacity_components.peers_silent_ids`
+lists peers in the fleet that didn't contribute warning signal in
+the latest tick (scheduled, stopped, or unreachable past the 30-min
+grace). Useful when capacity_factor looks low but you can't tell
+which peer is the source.
+
 #### Director Modes
 
 | Mode | Behaviour |

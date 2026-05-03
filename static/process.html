@@ -2037,7 +2037,11 @@ async function fetchManifest() {
   document.getElementById('zenSummary').textContent =
     fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
   const entries = d.entries || {};
-  const keys = Object.keys(entries).sort();
+  // Hide error placeholders (depo_id=0, empty filename) from the table —
+  // they're internal retry markers, not actual Zenodo files.
+  const keys = Object.keys(entries)
+    .filter(k => !k.endsWith('_error'))
+    .sort();
   let sorted = keys.map(k => ({key:k, ...entries[k]}))
     .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''));
   // Apply filter

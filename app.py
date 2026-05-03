@@ -4649,6 +4649,40 @@ _ZENODO_LOCK = {
 }
 _ZENODO_LOCK_LOCK = threading.Lock()
 _ZENODO_LOCK_TTL = 120.0  # seconds without heartbeat → stale
+# Persistence: surviving an srv restart matters because peers heartbeat
+# every 30s and a fresh in-memory dict would 410 every active lease,
+# aborting in-flight uploads. We dump on every mutation and restore at
+# import time. Only the most recent (still-fresh) lease is restored.
+_ZENODO_LOCK_FILE = Path('data/austria_processor/zenodo_lock_state.json')
+
+
+def _zenodo_lock_persist() -> None:
+    try:
+        _ZENODO_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ZENODO_LOCK_FILE.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(_ZENODO_LOCK))
+        tmp.replace(_ZENODO_LOCK_FILE)
+    except Exception as e:
+        log.warning('Zenodo lock persist failed: %s', e)
+
+
+def _zenodo_lock_restore() -> None:
+    try:
+        if not _ZENODO_LOCK_FILE.exists():
+            return
+        d = json.loads(_ZENODO_LOCK_FILE.read_text())
+        # Skip stale leases on restore.
+        last_hb = float(d.get('last_heartbeat') or 0.0)
+        if last_hb and (time.time() - last_hb) <= _ZENODO_LOCK_TTL:
+            _ZENODO_LOCK.update(d)
+            log.info('Zenodo lock restored: holder=%s purpose=%s idle=%.1fs',
+                     d.get('holder'), d.get('purpose'),
+                     time.time() - last_hb)
+    except Exception as e:
+        log.warning('Zenodo lock restore failed: %s', e)
+
+
+_zenodo_lock_restore()
 
 
 def _zenodo_lock_is_stale(now: float) -> bool:
@@ -4699,6 +4733,7 @@ def zenodo_lock_acquire():
             'acquired_at': now, 'last_heartbeat': now,
             'purpose': purpose, 'kg': kg,
         })
+        _zenodo_lock_persist()
         return jsonify({'token': token, 'ttl_s': _ZENODO_LOCK_TTL})
 
 
@@ -4712,6 +4747,7 @@ def zenodo_lock_heartbeat():
         if _ZENODO_LOCK['holder'] is None or _ZENODO_LOCK['token'] != token:
             return jsonify({'error': 'no_lease'}), 410
         _ZENODO_LOCK['last_heartbeat'] = now
+        _zenodo_lock_persist()
         return jsonify({'ok': True, 'ttl_s': _ZENODO_LOCK_TTL,
                         'age_s': round(now - _ZENODO_LOCK['acquired_at'], 1)})
 
@@ -4732,6 +4768,7 @@ def zenodo_lock_release():
             'acquired_at': 0.0, 'last_heartbeat': 0.0,
             'purpose': None, 'kg': None,
         })
+        _zenodo_lock_persist()
         return jsonify({'ok': True})
 
 

@@ -940,12 +940,48 @@ class ZenodoCache:
     # --- Zenodo API helpers ---
 
     def _api(self, method: str, path: str, **kwargs) -> requests.Response:
+        """Zenodo API call with retry on transient 5xx / network errors.
+
+        With ~50 peers all flushing tile caches concurrently, Zenodo's
+        gateway occasionally responds 502/503/504 (gateway timeout) on
+        otherwise-fine deposits. These are transient — the next attempt
+        almost always succeeds. We retry up to 4 times with exponential
+        backoff (2/4/8/16 s) before letting the exception propagate.
+        Non-retryable status codes (4xx other than 429) raise immediately.
+        """
         url = f"{self.base_url}{path}"
         kwargs.setdefault("params", {})["access_token"] = self.token
         kwargs.setdefault("timeout", 60)
-        r = self._session.request(method, url, **kwargs)
-        r.raise_for_status()
-        return r
+        last_exc: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                r = self._session.request(method, url, **kwargs)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = requests.HTTPError(
+                        f"{r.status_code} {r.reason} for url: {url}",
+                        response=r)
+                    if attempt < 4:
+                        delay = 2.0 * (2 ** attempt)
+                        log.info(
+                            "Zenodo %s %s → %d, retry %d/4 in %.0fs",
+                            method, path, r.status_code, attempt + 1, delay)
+                        time.sleep(delay)
+                        continue
+                r.raise_for_status()
+                return r
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                if attempt < 4:
+                    delay = 2.0 * (2 ** attempt)
+                    log.info(
+                        "Zenodo %s %s network error (%s), retry %d/4 in %.0fs",
+                        method, path, str(e)[:80], attempt + 1, delay)
+                    time.sleep(delay)
+                    continue
+        # Exhausted retries
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Zenodo {method} {path}: retries exhausted")
 
     def _ensure_deposit(self) -> int:
         """Get or create the cache Zenodo deposit.  Returns depo_id."""

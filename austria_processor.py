@@ -103,14 +103,52 @@ _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 _last_zenodo_cache_flush: float = 0.0
 # Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
 _ZENODO_CACHE_FLUSH_INTERVAL = 1800  # 30 minutes
+# Threshold for "local cache grew enough to be worth force-flushing at
+# end of KG" — measured as bytes added under copernicus_tiles +
+# hansen_tiles since the previous flush.
+_FLUSH_GROWTH_BYTES = 50 * 1024 * 1024  # 50 MB
+_last_flush_cache_size_bytes: int = 0
+
+
+def _measure_local_cache_size() -> int:
+    total = 0
+    for sub in ('copernicus_tiles', 'hansen_tiles'):
+        d = DATA_DIR / sub
+        if not d.exists():
+            continue
+        try:
+            for p in d.rglob('*.npz'):
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return total
+
+
+def _local_cache_grew_since_last_flush() -> bool:
+    """True if the local tile cache has gained > _FLUSH_GROWTH_BYTES bytes
+    since the last successful flush. Cheap (one rglob over .npz files).
+    """
+    global _last_flush_cache_size_bytes
+    cur = _measure_local_cache_size()
+    delta = cur - _last_flush_cache_size_bytes
+    return delta > _FLUSH_GROWTH_BYTES
 
 
 def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
     """Upload local Copernicus/Hansen tile cache to Zenodo for persistence.
 
     Called proactively after each KG and reactively before disk cleanup
-    would evict expensive tiles.  Skips if fewer than 5 minutes since the
-    last flush (unless *force* is True).
+    would evict expensive tiles.  Skips when:
+      * fewer than _ZENODO_CACHE_FLUSH_INTERVAL seconds since the last
+        flush (unless *force* is True), OR
+      * we're a cache-only peer (``COPERNICUS_FORBIDDEN=1``) — cache-only
+        peers never fetch new tiles, so they have nothing to add. They
+        only download from Zenodo, never upload. Without this check, 8
+        cache-only peers all queue on the upload lock every 30 min and
+        contribute nothing.
 
     The tile cache is shared across all peers (same Zenodo deposit).
     Concurrent writes are safe because the Peer Director enforces
@@ -120,6 +158,10 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
     """
     global _last_zenodo_cache_flush
     import time as _t
+    if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
+        # Cache-only peer — never flushes. Pretend we did so callers
+        # don't keep retrying.
+        return False
     now = _t.time()
     if not force and (now - _last_zenodo_cache_flush) < _ZENODO_CACHE_FLUSH_INTERVAL:
         return False
@@ -136,6 +178,8 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
             log.info("Zenodo cache flush: uploaded %d tiles in %d ZIPs (%.1f MB)",
                      n_tiles, n_zips, stats.get("bytes_total", 0) / 1e6)
         _last_zenodo_cache_flush = _t.time()
+        global _last_flush_cache_size_bytes
+        _last_flush_cache_size_bytes = _measure_local_cache_size()
         return True
     except Exception as e:
         log.warning("Zenodo cache flush failed: %s", e)
@@ -6381,12 +6425,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 seg_pixels=tvalid,
             )
 
-            # Flush tile cache to Zenodo so expensive Copernicus/Hansen
-            # tiles survive OOM kills.  Throttled internally (5 min).
-            try:
-                flush_tile_cache_to_zenodo()
-            except Exception as _zfe:
-                log.debug("Zenodo cache flush after tile: %s", _zfe)
+            # Per-tile flushes removed — _ZENODO_CACHE_FLUSH_INTERVAL
+            # (30 min) and the per-KG flush in main() are sufficient to
+            # protect tiles from OOM. Flushing every tile floods the
+            # Zenodo lock with 50 × (tiles/KG) acquire requests.
 
             # Free tile memory
             del tdata, t_labels, t_objects, seg_result, spectral
@@ -6676,10 +6718,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # Clean up tile checkpoints on success
         _clear_tile_checkpoints()
 
-        # Final flush — ensure all tiles from this KG are persisted
-        # before the subprocess exits and memory is reclaimed.
+        # End-of-KG flush: only forced when our local cache has grown
+        # significantly since the last upload. Otherwise rely on the
+        # 30 min interval. Cuts upload-lock contention by ~3x.
         try:
-            flush_tile_cache_to_zenodo(force=True)
+            if _local_cache_grew_since_last_flush():
+                flush_tile_cache_to_zenodo(force=True)
+            else:
+                flush_tile_cache_to_zenodo()  # honours interval
         except Exception as _zfe:
             log.debug("Zenodo cache flush at KG end: %s", _zfe)
 

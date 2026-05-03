@@ -1,0 +1,21 @@
+[Unit]
+Description=SRTM-LiDAR Zenodo upload-lock broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=exedev
+Group=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+ExecStart=/usr/bin/python3 /home/exedev/srtm-lidar/zenodo_lock_broker.py
+Environment=ZENODO_LOCK_BROKER_PORT=8001
+Restart=always
+RestartSec=2
+MemoryMax=64M
+Nice=-5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

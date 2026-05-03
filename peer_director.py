@@ -82,6 +82,130 @@ MIN_RESERVE_PEERS = 0
 # from spinning up an absurd number of peers if min_reserve is misset.
 MAX_CACHE_ONLY_PEERS = 64
 
+# Per-peer circuit breaker. Each peer has a (failure_count, open_until)
+# tuple. After CB_OPEN_THRESHOLD consecutive failures across *any*
+# director-outbound HTTP call, the peer is skipped for CB_OPEN_SECONDS
+# (exponential up to CB_OPEN_MAX_SECONDS) on every subsequent
+# `_peer_request`. A single success resets the counter. Distinct from
+# the bandwidth-specific backoff above (which only suppresses bandwidth
+# polls), this stops the director from spending its whole tick waiting
+# for a wedged peer's gunicorn to time out.
+CB_OPEN_THRESHOLD = 3
+CB_OPEN_BASE_SECONDS = 60        # 1 min on first trip
+CB_OPEN_MAX_SECONDS = 1800       # cap at 30 min
+_PEER_CB: dict[str, dict] = {}   # peer_id -> {fails, open_until, trips}
+_PEER_CB_LOCK = threading.Lock()
+# Reverse map: peer_url -> peer_id. Updated by the director loop each
+# tick from peers.json so module-level helpers (get_peer_bandwidth,
+# get_peer_status) can attribute failures to the right peer without
+# threading peer_id through every call site.
+_PEER_URL_TO_ID: dict[str, str] = {}
+
+
+def _peer_id_for_url(peer_url: str) -> str:
+    if not peer_url:
+        return ''
+    return _PEER_URL_TO_ID.get(peer_url.rstrip('/'), '')
+
+
+class _CircuitOpenError(Exception):
+    """Raised when a peer's breaker is open and we skip the call."""
+
+
+def _cb_should_skip(peer_id: str) -> bool:
+    if not peer_id:
+        return False
+    with _PEER_CB_LOCK:
+        ent = _PEER_CB.get(peer_id)
+        if not ent:
+            return False
+        return time.time() < ent.get('open_until', 0.0)
+
+
+def _cb_record_success(peer_id: str) -> None:
+    if not peer_id:
+        return
+    with _PEER_CB_LOCK:
+        if peer_id in _PEER_CB:
+            _PEER_CB[peer_id]['fails'] = 0
+            _PEER_CB[peer_id]['open_until'] = 0.0
+
+
+def _cb_record_failure(peer_id: str, exc: Exception | None = None) -> None:
+    if not peer_id:
+        return
+    with _PEER_CB_LOCK:
+        ent = _PEER_CB.setdefault(
+            peer_id, {'fails': 0, 'open_until': 0.0, 'trips': 0})
+        ent['fails'] = int(ent.get('fails', 0)) + 1
+        if ent['fails'] >= CB_OPEN_THRESHOLD:
+            trips = int(ent.get('trips', 0)) + 1
+            ent['trips'] = trips
+            cooldown = min(
+                CB_OPEN_MAX_SECONDS,
+                CB_OPEN_BASE_SECONDS * (2 ** min(trips - 1, 8)))
+            ent['open_until'] = time.time() + cooldown
+            ent['fails'] = 0
+            log.warning(
+                'Peer %s circuit breaker OPEN for %ds (trip #%d, last err=%s)',
+                peer_id, int(cooldown), trips, str(exc)[:120] if exc else 'n/a')
+
+
+def _cb_state_for(peer_id: str) -> dict:
+    """Return a serialisable snapshot of one peer's breaker state."""
+    if not peer_id:
+        return {}
+    with _PEER_CB_LOCK:
+        ent = _PEER_CB.get(peer_id)
+        if not ent:
+            return {'open': False, 'fails': 0, 'trips': 0}
+        now = time.time()
+        open_until = float(ent.get('open_until', 0.0))
+        return {
+            'open': now < open_until,
+            'fails': int(ent.get('fails', 0)),
+            'trips': int(ent.get('trips', 0)),
+            'cooldown_remaining_s': max(0, int(open_until - now)),
+        }
+
+
+def _peer_request(method: str, url: str, *,
+                  peer_id: str = '',
+                  timeout=None,
+                  raise_circuit: bool = False,
+                  **kwargs):
+    """requests.request wrapper with per-peer circuit breaker.
+
+    * Refuses (raises ``_CircuitOpenError`` / returns None) when the
+      peer's breaker is open.
+    * On any transport exception or 5xx response, records a failure.
+    * On 2xx/3xx/4xx (i.e. peer responded), records a success.
+
+    Callers that already have peer-id context should pass ``peer_id``.
+    Returns the ``Response`` on success or None if the call was
+    short-circuited (and ``raise_circuit`` is False).
+    """
+    if peer_id and _cb_should_skip(peer_id):
+        if raise_circuit:
+            raise _CircuitOpenError(peer_id)
+        return None
+    if timeout is None:
+        timeout = PEER_TIMEOUT_PROBE  # resolved at call time
+    kwargs.setdefault('headers', {})
+    if 'X-Admin-Token' not in kwargs['headers']:
+        kwargs['headers'].update(_admin_headers())
+    try:
+        r = requests.request(method, url, timeout=timeout, **kwargs)
+    except Exception as e:
+        _cb_record_failure(peer_id, e)
+        raise
+    if r.status_code >= 500:
+        _cb_record_failure(peer_id, RuntimeError(f'HTTP {r.status_code}'))
+    else:
+        _cb_record_success(peer_id)
+    return r
+
+
 # Per-peer dedup for graceful cache-only stop signals. The processor's
 # signal handler sets _shutdown_requested=True but only exits *after*
 # the current KG finishes — sometimes 1–2h later. Without dedup, every
@@ -355,13 +479,26 @@ def get_local_bandwidth() -> dict:
                 'remaining_gb': BANDWIDTH_BUDGET_GB, 'pct_used': 0}
 
 
-def get_peer_bandwidth(peer_url: str) -> dict:
+def get_peer_bandwidth(peer_url: str, peer_id: str = '') -> dict:
     """Get bandwidth from a remote peer.  Short timeout — must not block the loop."""
+    pid = peer_id or _peer_id_for_url(peer_url)
+    # Prefer pushed bandwidth if fresh — saves an HTTP round-trip.
+    pushed = get_pushed_bandwidth(pid)
+    if pushed is not None:
+        out = dict(pushed)
+        out['_pushed'] = True
+        return out
     try:
-        r = requests.get(
+        r = _peer_request(
+            'GET',
             peer_url.rstrip('/') + '/api/v1/bandwidth',
+            peer_id=pid,
             timeout=PEER_TIMEOUT_PROBE,
-        headers=_admin_headers())
+        )
+        if r is None:
+            return {'error': 'circuit_open', 'used_bytes': 0, 'used_gb': 0,
+                    'remaining_gb': BANDWIDTH_BUDGET_GB, 'pct_used': 0,
+                    'estimated': True, '_circuit_open': True}
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -381,9 +518,50 @@ def get_peer_bandwidth(peer_url: str) -> dict:
 # state='busy') when a fresh poll times out, as long as it's recent.
 _PEER_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _PEER_STATUS_CACHE_TTL = 300.0   # 5 min — covers a slow GPKG step.
+# Status-push cache: peers POST /api/v1/director/peer_status every
+# PEER_PUSH_INTERVAL seconds. The director loop prefers this over
+# pulling /processing/status; polls only when push is stale or
+# unavailable. Slashes outbound director traffic ~50x at fleet scale.
+PEER_PUSH_INTERVAL = 30          # seconds (peers run a ticker)
+PEER_PUSH_FRESH_S = 75           # consider push fresh for this long
+_PEER_PUSH: dict[str, dict] = {}  # peer_id -> {ts, status, bandwidth}
+_PEER_PUSH_LOCK = threading.Lock()
 
 
-def get_peer_status(peer_url: str | None) -> dict:
+def record_peer_push(peer_id: str, status: dict,
+                     bandwidth: dict | None = None) -> None:
+    """Record a peer-pushed status payload. Called from the HTTP handler."""
+    if not peer_id:
+        return
+    with _PEER_PUSH_LOCK:
+        _PEER_PUSH[peer_id] = {
+            'ts': time.time(),
+            'status': status or {},
+            'bandwidth': bandwidth,
+        }
+
+
+def get_pushed_status(peer_id: str) -> dict | None:
+    """Return fresh pushed status for a peer, or None if stale/missing."""
+    if not peer_id:
+        return None
+    with _PEER_PUSH_LOCK:
+        ent = _PEER_PUSH.get(peer_id)
+        if not ent:
+            return None
+        if (time.time() - ent['ts']) > PEER_PUSH_FRESH_S:
+            return None
+        return ent
+
+
+def get_pushed_bandwidth(peer_id: str) -> dict | None:
+    ent = get_pushed_status(peer_id)
+    if ent is None:
+        return None
+    return ent.get('bandwidth')
+
+
+def get_peer_status(peer_url: str | None, peer_id: str = '') -> dict:
     """Get processing status from a peer. None = local."""
     if peer_url is None:
         # Local — read progress.json directly
@@ -407,11 +585,34 @@ def get_peer_status(peer_url: str | None) -> dict:
             except Exception:
                 pass
         return {'state': 'idle', 'git_commit': _LOCAL_GIT_COMMIT}
+    pid = peer_id or _peer_id_for_url(peer_url)
+    # Prefer pushed status if fresh — avoids polling the peer entirely.
+    pushed = get_pushed_status(pid)
+    if pushed is not None:
+        d = dict(pushed.get('status') or {})
+        d['_pushed'] = True
+        d['_push_age_s'] = round(time.time() - pushed['ts'], 1)
+        # Still cache for fallback / proxy reads.
+        _PEER_STATUS_CACHE[peer_url] = (time.time(), d)
+        return d
     try:
-        r = requests.get(
+        r = _peer_request(
+            'GET',
             peer_url.rstrip('/') + '/api/v1/processing/status',
+            peer_id=pid,
             timeout=PEER_TIMEOUT_PROBE,
-        headers=_admin_headers())
+        )
+        if r is None:
+            # Circuit open — use cached value if available.
+            cached = _PEER_STATUS_CACHE.get(peer_url)
+            if cached and (time.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+                d = dict(cached[1])
+                d['_stale'] = True
+                d['_circuit_open'] = True
+                d['_stale_age_s'] = round(time.time() - cached[0], 1)
+                return d
+            return {'state': 'unreachable', 'error': 'circuit_open',
+                    '_circuit_open': True}
         r.raise_for_status()
         d = r.json()
         _PEER_STATUS_CACHE[peer_url] = (time.time(), d)
@@ -1172,6 +1373,13 @@ class PeerDirector:
     def __init__(self):
         self.cfg = load_peers_config()
         self.state = load_director_state()
+        # Seed URL→id reverse map for circuit-breaker attribution.
+        global _PEER_URL_TO_ID
+        _PEER_URL_TO_ID = {
+            (p.get('url') or '').rstrip('/'): p.get('id') or ''
+            for p in (self.cfg.get('peers') or [])
+            if p.get('url') and p.get('id')
+        }
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -1488,6 +1696,7 @@ class PeerDirector:
                 # Warning fingerprint for load-shifting visibility.
                 'warning_rates': ps.get('warning_rates') or {},
                 'noise_score': round(_peer_noise_score(pid, state), 3),
+                'circuit_breaker': _cb_state_for(pid),
                 'role': self._peer_role(peer),
                 'cache_only_run': bool(ps.get('cache_only')),
                 'is_active': pid == state.get('active_peer'),
@@ -1689,6 +1898,14 @@ class PeerDirector:
     def reload_config(self):
         with self._lock:
             self.cfg = load_peers_config()
+        # Refresh the URL→id reverse map so module-level helpers can
+        # attribute circuit-breaker events without threaded peer_id args.
+        global _PEER_URL_TO_ID
+        _PEER_URL_TO_ID = {
+            (p.get('url') or '').rstrip('/'): p.get('id') or ''
+            for p in (self.cfg.get('peers') or [])
+            if p.get('url') and p.get('id')
+        }
 
     def propagate_throttle(self, enabled: bool) -> dict:
         """Propagate throttle state to all remote peers."""

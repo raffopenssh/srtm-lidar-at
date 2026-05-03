@@ -808,6 +808,91 @@ def _sync_peer_data():
 threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
 
 
+# === SECTION: Status push to director ===
+#
+# Every peer pushes its /processing/status payload to the director
+# every PEER_PUSH_INTERVAL_S seconds. The director consults this cache
+# instead of polling 50 peers on every tick. Cuts director outbound
+# traffic by ~50x at fleet scale and isolates the director from peer
+# slowdowns (a wedged peer no longer blocks the director loop).
+#
+# Skipped on the director itself — it reads its own progress.json
+# directly. Skipped when director_url is null (single-instance mode).
+
+PEER_PUSH_INTERVAL_S = 30
+PEER_PUSH_TIMEOUT_S = 5
+
+
+def _peer_status_push_loop():
+    import requests as _req
+    import director_ha as _dha
+    import peer_director as _pd
+    while True:
+        try:
+            time.sleep(PEER_PUSH_INTERVAL_S)
+            # Skip on the director itself.
+            try:
+                if _dha.IS_DIRECTOR_FLAG.exists():
+                    continue
+            except Exception:
+                pass
+            # Resolve target director URL.
+            try:
+                self_info = _dha.load_self() or {}
+                director_url = (self_info.get('director_url') or '').strip()
+            except Exception:
+                director_url = ''
+            if not director_url:
+                # Fallback: read zenodo_lock_url.txt (always points at
+                # the current director on a healthy peer).
+                try:
+                    p = Path('data/austria_processor/zenodo_lock_url.txt')
+                    if p.exists():
+                        director_url = p.read_text().strip()
+                except Exception:
+                    pass
+            if not director_url:
+                continue
+            # Build payload from local progress.json + bandwidth.
+            try:
+                pf = Path('data/austria_processor/progress.json')
+                status = json.loads(pf.read_text()) if pf.exists() else {}
+            except Exception:
+                status = {}
+            try:
+                bw = _pd.get_local_bandwidth()
+            except Exception:
+                bw = None
+            try:
+                peer_id = (self_info or {}).get('id') or ''
+            except Exception:
+                peer_id = ''
+            if not peer_id:
+                continue
+            try:
+                tok = Path('data/admin_token').read_text().strip()
+                hdrs = {'X-Admin-Token': tok} if tok else {}
+            except Exception:
+                hdrs = {}
+            try:
+                _req.post(
+                    director_url.rstrip('/') + '/api/v1/director/peer_status',
+                    json={'peer_id': peer_id, 'status': status,
+                          'bandwidth': bw},
+                    timeout=PEER_PUSH_TIMEOUT_S,
+                    headers=hdrs,
+                )
+            except Exception as e:
+                log.debug('peer status push failed: %s', e)
+        except Exception as e:
+            log.debug('peer status push loop: %s', e)
+            time.sleep(PEER_PUSH_INTERVAL_S)
+
+
+threading.Thread(target=_peer_status_push_loop, daemon=True,
+                 name='peer-status-push').start()
+
+
 # === SECTION: Role-data eviction (free disk on demoted peers) ===
 #
 # The per-KG JSON corpus and search_index.db are only needed by:
@@ -2409,7 +2494,19 @@ def processing_start():
         if lock_file.exists():
             proc_env['ZENODO_LOCK_URL'] = lock_file.read_text().strip()
         elif is_director:
-            proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+            # On the director, prefer the standalone broker on port
+            # 8001 when reachable. Insulates lock state from gunicorn
+            # slow paths. Fallback to in-gunicorn route on port 8000.
+            broker = 'http://127.0.0.1:8001'
+            try:
+                import requests as _req
+                _r = _req.get(broker + '/api/v1/zenodo/lock', timeout=1.0)
+                if _r.status_code == 200:
+                    proc_env['ZENODO_LOCK_URL'] = broker
+                else:
+                    proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+            except Exception:
+                proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
 
     import subprocess
     # Launch inside a transient systemd scope so the processor lives in its
@@ -4116,6 +4213,28 @@ def director_throttle():
     enabled = data.get('throttle', True)
     results = d.propagate_throttle(enabled)
     return jsonify({'status': 'propagated', 'throttle': enabled, 'peers': results})
+
+
+@app.route('/api/v1/director/peer_status', methods=['POST'])
+def director_peer_status():
+    """Peer pushes its own /processing/status payload here.
+
+    Cached on the primary so the director loop reads from cache instead
+    of polling 50 peers every tick. Optional fields:
+      * peer_id (preferred) or peer (id fallback)
+      * status: full status dict from /api/v1/processing/status
+      * bandwidth: optional bandwidth dict to avoid a separate poll
+
+    No body validation — we trust admin-token auth.
+    """
+    body = request.get_json(silent=True) or {}
+    peer_id = (body.get('peer_id') or body.get('peer') or '').strip()
+    if not peer_id:
+        return jsonify({'error': 'peer_id required'}), 400
+    status = body.get('status') or {}
+    bw = body.get('bandwidth')
+    pd.record_peer_push(peer_id, status, bandwidth=bw)
+    return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL})
 
 
 @app.route('/api/v1/director/proxy/status')

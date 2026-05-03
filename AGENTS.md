@@ -1550,9 +1550,48 @@ at startup, and self-heals one peer per tick.
 `shadow/` (staged snapshot), `shadow/meta.json` (origin + shadow_id
 stamp — watchdog only takes over if `meta.shadow_id == self_id`).
 
-**Disaster recovery (planned)**: just press `⇋ Hand Over` and pick a
-peer. Or stop the primary and wait 90 s; the shadow takes over
-automatically.
+**Auto-handback to primary**: every director tick, if `self_id != 'primary'`
+and the primary is reachable, on the same git commit, enabled and not
+scheduled, the director hands the role back via `do_handover('primary',
+primary_url)`. Throttled to 5 min between attempts. If the primary still
+carries `stepped_down` (set when it was demoted), the director clears it
+remotely via `POST /api/v1/admin/clear_stepped_down` first. The primary is
+the canonical home for the director (search index, public DNS, dashboard
+URL).
+
+**Identity hardening** (after the 2026-05-03 split-brain incident where
+at2/at37/at39/at49 all believed themselves director and self.json files
+were cross-corrupted):
+
+* `POST /api/v1/director/identity` refuses to override `id`/`url` from a
+  remote address. Only loopback may. Receivers derive identity from
+  hostname — the broadcaster cannot lie. Bad inputs are logged at
+  WARN with `_rejected={...}` in the response.
+* `app.py` startup heals `self.json` from the hostname on every srv
+  restart (id and url). The hostname is authoritative.
+* `_normalise_local_identity_in_peers` (called during takeover) only
+  rewires the *single* entry whose id == snapshot origin (read from
+  `shadow/meta.json`). Other peers' URLs are never touched. Earlier
+  versions stamped `prev_director_url` onto every `url=None` entry,
+  which is how the cluster ended up with multiple peers pointing at
+  the same URL after a few cascading handovers.
+
+**Recovery from split-brain**: if multiple peers claim director, write
+`is_director` on the primary, restart srv, then broadcast a manual
+announce from the primary to every peer:
+```python
+payload = {'new_director_id': 'primary',
+           'new_director_url': 'https://srtm-lidar-at.exe.xyz:8000',
+           'reason': 'manual_consolidation'}
+# POST to /api/v1/director/announce on every peer’s URL
+```
+`accept_announce` will step down any competing director and update
+pointers on the rest. Survey afterwards via `/api/v1/director/identity`.
+
+**Disaster recovery**: press `⇋ Hand Over` and pick a peer. Or stop
+the primary and wait 90 s; the shadow takes over automatically. After
+recovery, auto-handback returns the role to primary as soon as primary
+is healthy and on the same commit.
 
 
 #### Cross-Cutting Concerns (director changes)

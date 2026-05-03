@@ -393,6 +393,16 @@ _INDEX_WATCH_LOCK_PATH = '/tmp/srtm_index_watch.lock'
 
 def _init_search_index():
     import fcntl as _fcntl, os as _os
+    # Demoted peers (not primary/director/shadow) skip the index entirely.
+    # The role-data eviction loop will purge any leftover database files
+    # after the grace period. This avoids rebuilding ~5 GB of FTS+R-tree
+    # indices on a peer that's about to delete them anyway.
+    try:
+        if not _is_keep_role_data():
+            log.info('🔍 Search index disabled on demoted peer (not primary/director/shadow)')
+            return
+    except Exception:
+        pass
     try:
         idx = si.get_index()
         feedback_db.ensure_schema()
@@ -524,6 +534,16 @@ def _sync_peer_data():
 
     while True:
         try:
+            # Skip JSON download + manifest merge entirely on demoted peers
+            # (not primary, not director, not shadow). Those VMs are about to
+            # purge their JSON corpus via the role-data eviction loop — there
+            # is no point downloading new ones in the meantime.
+            try:
+                if not _is_keep_role_data():
+                    time.sleep(300)
+                    continue
+            except Exception:
+                pass
             peer_urls = _get_peer_urls()
             if not peer_urls:
                 time.sleep(300)
@@ -786,6 +806,158 @@ def _sync_peer_data():
         time.sleep(300)  # Every 5 minutes
 
 threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
+
+
+# === SECTION: Role-data eviction (free disk on demoted peers) ===
+#
+# The per-KG JSON corpus and search_index.db are only needed by:
+#   - the **primary** (canonical home for search/dashboard)
+#   - the **current director** (peer_director consults the index for
+#     cache-ready KGs, KG splits, etc.)
+#   - the **current shadow** (must be ready to take over)
+#
+# A peer that *was* director (e.g. at17 after handback) accumulates the
+# full JSON corpus + search_index.db (~5–10 GB on a fully-built fleet).
+# When such a peer is demoted, that data becomes dead weight and triggers
+# disk-pressure eviction of expensive Copernicus tile caches.
+#
+# Policy:
+#   1. Every tick, classify our role (primary / director / shadow / other).
+#   2. If "other", record the demotion timestamp in role_demoted_at.
+#   3. After ROLE_EVICT_GRACE_SECONDS (1h) of continuous demotion, delete
+#      data/austria_processor/json/*.json and data/search_index.db*.
+#   4. Skip the JSON peer-sync download and the index rebuild on demoted
+#      peers (so we don't immediately re-fetch what we just freed).
+#   5. Promotion clears the timestamp; data starts replenishing via
+#      _sync_peer_data on the next tick.
+#
+# The primary (id=='primary') is *always* kept-role, even when it is not
+# currently the director. This guarantees the search index has a stable
+# home that survives any failover.
+
+ROLE_EVICT_GRACE_SECONDS = 3600        # 1h grace before purging
+ROLE_EVICT_TICK_SECONDS = 600          # check every 10 min
+_ROLE_DEMOTED_AT_FILE = Path('data/austria_processor/role_demoted_at')
+
+
+def _is_keep_role_data() -> bool:
+    """Return True iff this VM should retain the JSON corpus + index.
+
+    Keep when:
+      - we are the primary (canonical home, regardless of director state)
+      - we are the current director (running peer_director loop)
+      - we are the designated shadow (per shadow/meta.json)
+    """
+    try:
+        import director_ha as _dha
+        if _dha.IS_DIRECTOR_FLAG.exists():
+            return True
+        sid = _dha.self_id()
+        if sid == 'primary':
+            return True
+        meta = {}
+        try:
+            if _dha.SHADOW_META_FILE.exists():
+                meta = json.loads(_dha.SHADOW_META_FILE.read_text())
+        except Exception:
+            meta = {}
+        designated = (meta.get('shadow_id')
+                      or (meta.get('director_state') or {}).get('shadow_peer'))
+        if designated and designated == sid:
+            return True
+    except Exception as e:
+        log.debug('keep-role check failed (assuming keep): %s', e)
+        return True   # fail-safe: never delete on uncertainty
+    return False
+
+
+def _role_data_eviction_tick() -> dict:
+    """Single tick of the role-data eviction policy. Returns a status dict."""
+    keep = _is_keep_role_data()
+    now = time.time()
+    json_dir = Path('data/austria_processor/json')
+    idx_path = Path('data/search_index.db')
+    status = {
+        'keep_role': keep,
+        'demoted_at': None,
+        'grace_remaining_s': None,
+        'purged': False,
+        'json_count': 0,
+        'index_size_mb': 0.0,
+    }
+    try:
+        if json_dir.exists():
+            status['json_count'] = sum(1 for _ in json_dir.glob('*.json'))
+        if idx_path.exists():
+            status['index_size_mb'] = round(idx_path.stat().st_size / (1024 ** 2), 1)
+    except Exception:
+        pass
+    if keep:
+        # Clear any stale demotion marker.
+        try:
+            if _ROLE_DEMOTED_AT_FILE.exists():
+                _ROLE_DEMOTED_AT_FILE.unlink()
+                log.info('Role-data eviction: cleared demotion marker (we are keep-role again)')
+        except Exception:
+            pass
+        return status
+    # Demoted. Stamp timestamp on first observation.
+    try:
+        if not _ROLE_DEMOTED_AT_FILE.exists():
+            _ROLE_DEMOTED_AT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _ROLE_DEMOTED_AT_FILE.write_text(str(int(now)))
+            log.info('Role-data eviction: demoted; will purge JSON+index after %ds grace',
+                     ROLE_EVICT_GRACE_SECONDS)
+        demoted_at = int(_ROLE_DEMOTED_AT_FILE.read_text().strip() or now)
+    except Exception:
+        demoted_at = int(now)
+    status['demoted_at'] = demoted_at
+    status['grace_remaining_s'] = max(0, ROLE_EVICT_GRACE_SECONDS - int(now - demoted_at))
+    if now - demoted_at < ROLE_EVICT_GRACE_SECONDS:
+        return status
+    # Grace expired — purge.
+    n_purged = 0
+    purged_bytes = 0
+    try:
+        if json_dir.exists():
+            for f in list(json_dir.glob('*.json')):
+                try:
+                    purged_bytes += f.stat().st_size
+                    f.unlink()
+                    n_purged += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning('Role-data eviction: JSON purge failed: %s', e)
+    for sfx in ('', '-wal', '-shm', '-journal'):
+        p = Path(f'{idx_path}{sfx}')
+        try:
+            if p.exists():
+                purged_bytes += p.stat().st_size
+                p.unlink()
+        except Exception as e:
+            log.warning('Role-data eviction: %s purge failed: %s', p, e)
+    log.warning('Role-data eviction: purged %d JSONs + index (%.1f MB freed)',
+                n_purged, purged_bytes / (1024 ** 2))
+    status['purged'] = True
+    status['purged_count'] = n_purged
+    status['purged_mb'] = round(purged_bytes / (1024 ** 2), 1)
+    return status
+
+
+def _role_data_eviction_loop():
+    time.sleep(60)   # let role/identity settle after boot
+    while True:
+        try:
+            _role_data_eviction_tick()
+        except Exception as e:
+            log.warning('Role-data eviction tick failed: %s', e)
+        time.sleep(ROLE_EVICT_TICK_SECONDS)
+
+
+threading.Thread(target=_role_data_eviction_loop, daemon=True,
+                 name='role-data-evict').start()
+
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
 
@@ -2273,10 +2445,15 @@ def processing_start():
         _user_home = _user.pw_dir
     except Exception:
         _user_name, _user_home = 'exedev', '/home/exedev'
+    # NOTE: `-p User=` is silently ignored by systemd-run --scope (it only
+    # applies to --service units). The processor was running as root,
+    # which made /proc/<pid>/environ unreadable from gunicorn (uid=exedev)
+    # and required sudo escalation just to kill it. Fix: drop privileges
+    # explicitly via `runuser -u exedev --preserve-environment` inside the
+    # scope, so all -E env vars reach the python child but uid is exedev.
     user_props = [
-        '-p', f'User={_user_name}',
-        '-p', f'Group={_user_name}',
         '-E', f'HOME={_user_home}',
+        '-E', f'USER={_user_name}',
         '-E', 'PYTHONUNBUFFERED=1',
     ]
     # systemd-run --scope with -p User= drops the Popen env=. Only -E
@@ -2301,7 +2478,8 @@ def processing_start():
          '--unit', unit_name]
         + cgroup_props
         + user_props
-        + ['--']
+        + ['--', 'runuser', '--user', _user_name,
+           '--preserve-environment', '--']
         + args
     )
     # Verify the scope can actually start by waiting briefly. If systemd-run
@@ -4727,6 +4905,88 @@ def admin_proc_env():
         rows.append(row)
     info['procs'] = rows
     return jsonify(info)
+
+
+@app.route('/api/v1/admin/diskstat', methods=['GET'])
+def admin_diskstat():
+    """Per-VM disk + role status. Used to diagnose disk pressure on
+    demoted peers and verify the role-data eviction policy."""
+    import shutil
+    out = {}
+    try:
+        u = shutil.disk_usage('/')
+        out['disk_total_gb'] = round(u.total / (1024 ** 3), 1)
+        out['disk_free_gb'] = round(u.free / (1024 ** 3), 1)
+        out['disk_used_pct'] = round(100 * u.used / u.total, 1)
+    except Exception as e:
+        out['disk_err'] = str(e)
+    paths = {
+        'json': 'data/austria_processor/json',
+        'search_index': 'data/search_index.db',
+        'shares': 'data/shares',
+        'tile_checkpoints': 'data/austria_processor/tile_checkpoints',
+        'zenodo_zip_index': 'data/austria_processor/zenodo_zip_index',
+        'logs': 'data/austria_processor/logs',
+        'cop_cache': '/tmp/copernicus_cache',
+        'hansen_cache': '/tmp/hansen_cache',
+        'segment_results': '/tmp/segment_results',
+    }
+    sizes = {}
+    for k, p in paths.items():
+        pp = Path(p)
+        try:
+            if not pp.exists():
+                sizes[k] = None; continue
+            if pp.is_file():
+                sizes[k] = round(pp.stat().st_size / (1024 ** 2), 1)
+            else:
+                tot = sum(f.stat().st_size for f in pp.rglob('*') if f.is_file())
+                sizes[k] = round(tot / (1024 ** 2), 1)
+        except Exception as e:
+            sizes[k] = f'err:{e}'
+    out['sizes_mb'] = sizes
+    try:
+        out['role'] = _role_data_eviction_tick()
+    except Exception as e:
+        out['role_err'] = str(e)
+    return jsonify(out)
+
+
+@app.route('/api/v1/admin/role_evict', methods=['POST'])
+def admin_role_evict():
+    """Force-run a role-data eviction tick. If keep_role and force=true,
+    purge anyway (use only on standalone peers being decommissioned)."""
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get('force', False))
+    if force:
+        # Bypass keep_role check by stamping a far-past demotion marker.
+        try:
+            _ROLE_DEMOTED_AT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _ROLE_DEMOTED_AT_FILE.write_text(str(int(time.time()) - ROLE_EVICT_GRACE_SECONDS - 1))
+        except Exception as e:
+            return jsonify({'ok': False, 'err': str(e)}), 500
+        # Override keep check for one tick by directly running the purge body.
+        # Simpler: call tick. If force pretends keep=False, the existing tick
+        # would still see keep=True. So bypass: do the purge inline.
+        json_dir = Path('data/austria_processor/json')
+        idx_path = Path('data/search_index.db')
+        n = 0; bytes_freed = 0
+        for f in list(json_dir.glob('*.json')) if json_dir.exists() else []:
+            try:
+                bytes_freed += f.stat().st_size
+                f.unlink(); n += 1
+            except Exception:
+                pass
+        for sfx in ('', '-wal', '-shm', '-journal'):
+            p = Path(f'{idx_path}{sfx}')
+            try:
+                if p.exists():
+                    bytes_freed += p.stat().st_size; p.unlink()
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'forced': True, 'purged_count': n,
+                        'purged_mb': round(bytes_freed / (1024 ** 2), 1)})
+    return jsonify({'ok': True, 'tick': _role_data_eviction_tick()})
 
 
 @app.route('/api/v1/admin/disable_autostart', methods=['POST'])

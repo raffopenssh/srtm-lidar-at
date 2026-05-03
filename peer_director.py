@@ -4089,8 +4089,17 @@ class PeerDirector:
             return
         if not primary.get('enabled', True):
             return
+        # NOTE: we deliberately do NOT gate on _peer_is_scheduled() here.
+        # `not_before` parks the primary out of frontier / cache-only work
+        # (those gates honour it in choose_active_peer / _orchestrate_*),
+        # but the director role itself is just HTTP orchestration + the
+        # Zenodo lock broker — ~zero bandwidth. The primary is the
+        # canonical home for the director (search index, public DNS,
+        # dashboard URL), so hand the role back even when scheduled.
         if _peer_is_scheduled(primary):
-            return
+            log.info('Auto-handback: primary scheduled (not_before=%s) — '
+                     'frontier-disabled but still eligible for director role',
+                     primary.get('not_before'))
         url = primary['url']
         # Probe primary: must be reachable, on our git commit, and not
         # currently flagged stepped_down (which would mean operator

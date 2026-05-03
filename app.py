@@ -5457,8 +5457,13 @@ def director_identity():
                     'from remote POST: %s', rejected)
     # Local writes (loopback / same-process) are still permitted to set
     # id/url so the on-box bootstrap can fix things up.
-    is_local = request.remote_addr in ('127.0.0.1', '::1', 'localhost')
-    if is_local:
+    # NOTE: must use _request_is_loopback() — exe.dev's HTTPS proxy makes
+    # remote_addr=127.0.0.1 for *every* request, so a naive check would let
+    # any peer overwrite our id/url. _request_is_loopback() also requires
+    # X-Forwarded-For to be absent, which the proxy always sets for remote
+    # callers. Without this guard, cascading takeovers on at26 corrupted
+    # the primary's self.json (id flipped primary→at8→at3).
+    if _request_is_loopback():
         for k in ('id', 'url'):
             if k in body and body[k] is not None:
                 cur[k] = body[k]

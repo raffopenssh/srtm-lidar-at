@@ -1043,15 +1043,28 @@ class ZenodoCache:
         except Exception:
             pass
 
-        # Upload
-        with open(local_path, "rb") as fh:
-            r = self._session.put(
-                f"{bucket_url}/{filename}",
-                data=fh,
-                params={"access_token": self.token},
-                timeout=600,
-            )
-            r.raise_for_status()
+        # Upload (retry on transient SSL/connection errors)
+        last_exc = None
+        for attempt in range(4):
+            try:
+                with open(local_path, "rb") as fh:
+                    r = self._session.put(
+                        f"{bucket_url}/{filename}",
+                        data=fh,
+                        params={"access_token": self.token},
+                        timeout=600,
+                    )
+                    r.raise_for_status()
+                break
+            except (requests.ConnectionError, requests.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                last_exc = e
+                wait = 2 ** attempt * 5
+                log.warning("Upload of %s failed (%s); retrying in %ds (attempt %d/4)",
+                            filename, type(e).__name__, wait, attempt + 1)
+                time.sleep(wait)
+        else:
+            raise last_exc if last_exc else RuntimeError("upload failed")
 
         result = r.json()
         log.info("Uploaded %s to deposit %d (%.1f MB)",

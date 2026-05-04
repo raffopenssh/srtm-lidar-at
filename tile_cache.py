@@ -437,6 +437,13 @@ class CopernicusTileCache:
         mosaic_result = {"crs": first_crs}
         mosaic_tf = None
 
+        # Adjacent Copernicus cells can come back in different UTM zones
+        # (zone 32 vs 33 across Austria). rasterio.merge insists on a
+        # uniform CRS, so reproject any cells whose CRS differs from the
+        # first cell's into ``first_crs`` before writing the temp TIFF.
+        from rasterio.warp import (calculate_default_transform,
+                                     reproject, Resampling)
+        from rasterio.transform import array_bounds
         for dk in data_keys:
             tmp_paths = []
             datasets = []
@@ -447,10 +454,27 @@ class CopernicusTileCache:
                     crs_str = str(cr.get("crs", "EPSG:4326"))
                     tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
                     tmp_paths.append(tmp.name)
+                    if crs_str != first_crs:
+                        h, w = arr.shape
+                        src_bounds = array_bounds(h, w, tf)
+                        dst_tf, dst_w, dst_h = calculate_default_transform(
+                            crs_str, first_crs, w, h, *src_bounds)
+                        dst_arr = np.zeros((dst_h, dst_w), dtype=arr.dtype)
+                        resamp = (Resampling.nearest
+                                  if np.issubdtype(arr.dtype, np.integer)
+                                  else Resampling.bilinear)
+                        reproject(
+                            source=arr, destination=dst_arr,
+                            src_transform=tf, src_crs=crs_str,
+                            dst_transform=dst_tf, dst_crs=first_crs,
+                            resampling=resamp,
+                        )
+                        arr = dst_arr
+                        tf = dst_tf
                     with rasterio.open(
                         tmp.name, "w", driver="GTiff",
                         height=arr.shape[0], width=arr.shape[1], count=1,
-                        dtype=arr.dtype, crs=crs_str, transform=tf,
+                        dtype=arr.dtype, crs=first_crs, transform=tf,
                     ) as dst:
                         dst.write(arr, 1)
                     datasets.append(rasterio.open(tmp.name))

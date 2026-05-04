@@ -522,6 +522,26 @@ class ProgressTracker:
             d["10m"] = round(d["10m"] / 10.0, 3)
         return out
 
+    # Meta-log substrings that REFLECT prior warnings rather than being
+    # new ones. Without this guard, "KG X: copernicus (Ns) completed with
+    # warnings" would be re-tallied as a fresh copernicus warning every
+    # time a step ended — doubling the signal and pinning the EMA.
+    _META_LOG_TOKENS = (
+        "completed with warnings",
+        "completed with errors",
+    )
+    # Substrings that are documented as NORMAL behaviour and must not
+    # contribute to the throttle EMA. Keep them visible in the log so
+    # operators can still see what's happening.
+    _BENIGN_TOKENS = (
+        # Per AGENTS.md: "Synchronous download timed out — Normal
+        # Copernicus behavior — falls back to batch job automatically"
+        "synchronous download timed out",
+        # Connection blip with internal retry; usually succeeds.
+        "urllib3.connectionpool: retrying",
+        "remote end closed connection without response",
+    )
+
     def add_log(self, level: str, msg: str, kg: str = ""):
         with self._lock:
             entry = {"ts": datetime.now(timezone.utc).isoformat(),
@@ -529,6 +549,11 @@ class ProgressTracker:
             self._state["recent_log"].append(entry)
             self._state["recent_log"] = self._state["recent_log"][-200:]
         # Classify + tally outside the lock — _tally_warning takes its own.
+        ml = (msg or "").lower()
+        if any(tok in ml for tok in self._META_LOG_TOKENS):
+            return  # meta-reflection of an earlier warning, don't double-count
+        if any(tok in ml for tok in self._BENIGN_TOKENS):
+            return  # documented benign noise
         kind = self._classify_warning(level, msg)
         if kind:
             self._tally_warning(kind)

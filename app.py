@@ -5024,6 +5024,25 @@ def zenodo_lock_status():
         })
 
 
+@app.route('/api/v1/admin/flush_tiles', methods=['POST'])
+def admin_flush_tiles():
+    """Force-upload local Copernicus + Hansen tiles to Zenodo.
+
+    Idempotent. Skips on cache-only peers (COPERNICUS_FORBIDDEN=1).
+    Returns immediately; the actual upload runs in the background so
+    the request doesn't tie up the gunicorn worker for minutes.
+    """
+    import threading as _th
+    def _do():
+        try:
+            from austria_processor import flush_tile_cache_to_zenodo
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as _e:
+            log.warning('flush_tiles background: %s', _e)
+    _th.Thread(target=_do, daemon=True).start()
+    return jsonify({'status': 'started'})
+
+
 @app.route('/api/v1/admin/restart_processor', methods=['POST'])
 def admin_restart_processor():
     """Restart the austria_processor via systemd (called by director as fallback)."""
@@ -5243,8 +5262,10 @@ def admin_diskstat():
         'tile_checkpoints': 'data/austria_processor/tile_checkpoints',
         'zenodo_zip_index': 'data/austria_processor/zenodo_zip_index',
         'logs': 'data/austria_processor/logs',
-        'cop_cache': '/tmp/copernicus_cache',
-        'hansen_cache': '/tmp/hansen_cache',
+        'cop_cache': 'data/austria_processor/copernicus_tiles',
+        'hansen_cache': 'data/austria_processor/hansen_tiles',
+        'bev_cache': 'data/austria_processor/bev_tile_cache',
+        'ortho_cache': 'data/austria_processor/ortho_tile_cache',
         'segment_results': '/tmp/segment_results',
     }
     sizes = {}

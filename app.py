@@ -3461,19 +3461,26 @@ def processing_queue_add():
                 mentries = None
         changed = False
         for c in new_codes:
-            if c not in completed:
-                continue
-            # Always mark as force-requeued so GET keeps it visible.
-            _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
-            tombstoned.append(c + '_requeue')
+            # Mark as force-requeued whenever the KG is either fully
+            # completed OR has any partial manifest entries from a
+            # failed prior run (e.g. _full_gpkg / _light_gpkg uploaded
+            # but _json missing). Without this, partial entries linger
+            # in the Zenodo manifest and get re-merged via peer-sync.
+            partial_keys = []
             if mentries is not None:
                 for suffix in ('_full_gpkg', '_light_gpkg', '_json'):
                     key = c + suffix
                     if key in mentries:
-                        del mentries[key]
-                        _MANIFEST_TOMBSTONES[key] = ts
-                        tombstoned.append(key)
-                        changed = True
+                        partial_keys.append(key)
+            if c not in completed and not partial_keys:
+                continue
+            _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
+            tombstoned.append(c + '_requeue')
+            for key in partial_keys:
+                del mentries[key]
+                _MANIFEST_TOMBSTONES[key] = ts
+                tombstoned.append(key)
+                changed = True
         if changed and mentries is not None:
             try:
                 import tempfile as _tf

@@ -540,6 +540,12 @@ class ProgressTracker:
         # Connection blip with internal retry; usually succeeds.
         "urllib3.connectionpool: retrying",
         "remote end closed connection without response",
+        # openeo's preflight POST /validation is best-effort: per upstream,
+        # "a failed validation does not block the job from running". The
+        # actual download retries+rotates on its own, so a 502/503 on the
+        # /validation endpoint is pure noise.
+        "preflight process graph validation failed",
+        "preflight process graph validation raised",
     )
 
     def add_log(self, level: str, msg: str, kg: str = ""):

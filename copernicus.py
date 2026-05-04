@@ -1450,8 +1450,13 @@ def get_ndvi_timeseries(
                 _retryable = (
                     "429" in exc_str
                     or "500" in exc_str
+                    or "502" in exc_str
                     or "503" in exc_str
+                    or "504" in exc_str
                     or "Internal" in exc_str
+                    or "Bad Gateway" in exc_str
+                    or "Gateway Time" in exc_str
+                    or "Service Unavailable" in exc_str
                     or "Server error" in exc_str
                     or "max connections" in exc_str
                 )
@@ -1460,6 +1465,8 @@ def get_ndvi_timeseries(
                     wait_secs = 15 * attempt
                     _reason = (
                         '429' if '429' in exc_str
+                        else '502' if ('502' in exc_str or 'Bad Gateway' in exc_str)
+                        else '504' if ('504' in exc_str or 'Gateway Time' in exc_str)
                         else '500' if ('500' in exc_str or 'Internal' in exc_str or 'Server error' in exc_str)
                         else '503'
                     )

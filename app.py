@@ -3466,11 +3466,24 @@ def processing_queue_add():
             # failed prior run (e.g. _full_gpkg / _light_gpkg uploaded
             # but _json missing). Without this, partial entries linger
             # in the Zenodo manifest and get re-merged via peer-sync.
+            # A re-queued parent code (e.g. '91119') expands into block
+            # codes ('91119-west', '91119-east', ...) at processing time;
+            # partial manifest entries can be keyed by either form.  Match
+            # both: ``c_<suffix>`` AND ``c-<dir>_<suffix>``.
             partial_keys = []
             if mentries is not None:
-                for suffix in ('_full_gpkg', '_light_gpkg', '_json'):
-                    key = c + suffix
-                    if key in mentries:
+                suffixes = ('_full_gpkg', '_light_gpkg', '_json')
+                for key in mentries:
+                    if not any(key.endswith(s) for s in suffixes):
+                        continue
+                    code = key.rsplit('_', 2)[0] if key.endswith('_full_gpkg') or key.endswith('_light_gpkg') else key.rsplit('_', 1)[0]
+                    # Strip suffix more reliably: split off the trailing
+                    # _full_gpkg / _light_gpkg / _json.
+                    for s in suffixes:
+                        if key.endswith(s):
+                            code = key[:-len(s)]
+                            break
+                    if code == c or code.startswith(c + '-'):
                         partial_keys.append(key)
             if c not in completed and not partial_keys:
                 continue

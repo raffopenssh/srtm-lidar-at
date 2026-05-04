@@ -456,10 +456,17 @@ These are the dangerous changes — they touch many files and are easy to break.
 
 **Per-peer credential & lat-strip dedication (parallel frontiers):**
 The director assigns disjoint slices of valid credentials and disjoint
-cached lat strips to peers running frontier work in parallel.
-* `min_creds_per_frontier` (default 2) in `peers.json` sets the minimum
-  cred count per frontier peer. `max_parallel_frontiers = floor(valid /
-  per)`.
+cells (1°×2° lat×lon, matching the Zenodo cache bundle layout) to
+peers running frontier work in parallel.
+* `min_creds_per_frontier` (default 2) in `peers.json` is the FLOOR
+  per-peer cred count. The adaptive planner (default ON via
+  `adaptive_creds_per_frontier`) overrides it: when the smoothed
+  Copernicus sub-factor is healthy it drops to per=1 so all 8 valid
+  creds support 8 concurrent frontiers; under throttle it climbs back
+  to the floor. See `_target_frontier_count()` and
+  `_effective_creds_per_frontier()` in peer_director.py.
+* `_max_parallel_frontiers()` = `min(target_frontier_count, len(_austria_cells()))`.
+  With 20 Austria cells, cred capacity is the binding ceiling.
 * Capability-gated: only peers exposing `cred_subset_env` in
   `/api/v1/info→capabilities` get parallel work. Pre-upgrade peers run
   single-frontier as before (graceful upgrade).
@@ -467,8 +474,45 @@ cached lat strips to peers running frontier work in parallel.
   (`frontier`, `cache_only`, `idle`). Set via dashboard dropdown or
   `POST /api/v1/director/peers/<id>/pin {pinned_role}`.
 * The processor honors `COPERNICUS_CRED_INDICES="0,2"` and
-  `KG_LAT_STRIP_FILTER="[[47.0,47.5],[48.0,48.5]]"` env vars set by the
-  director when starting the subprocess.
+  `KG_CELL_FILTER="[[s,n,w,e],...]"` env vars set by the director when
+  starting the subprocess (legacy `KG_LAT_STRIP_FILTER="[[s,n],...]"`
+  is still honoured for compat).
+
+**Parallel-frontier ramp — plan-drift restart and cache-only ping-pong:**
+The ramp from 1 → N parallel frontiers depends on three pieces of
+bookkeeping working together. All three must be correct or the
+dashboard plateaus at "running parallel: 1" despite plenty of capacity:
+1. `_assign_cred_indices()` preserves the prior plan where it can.
+   When the adaptive target rises (e.g. per=2 → per=1), oversized
+   prior slices MUST be trimmed to `per_eff` rather than kept.
+   Otherwise an early peer hangs on to creds=[0,1] and the leftover
+   pool runs short for new peers. Drop indices that overlap with
+   already-locked slices; defer under-allocated peers to the
+   leftover-distribution pass which can top them up.
+2. `_orchestrate_cache_only()` MUST skip both the active frontier AND
+   any peer in `parallel_frontiers_active` / `frontier_cred_plan`.
+   Otherwise the cache-only orchestrator hard-stops a freshly-promoted
+   parallel peer (~18s after promotion) and re-starts it as cache-only,
+   then the parallel orchestrator re-promotes the next tick. Net: only
+   the active peer ever runs frontier.
+3. `_orchestrate_parallel_frontiers()` MUST inspect
+   `start_peer_processor()`'s return dict for `error`. Constrained
+   starts (cache_only / cred_indices / lat_strips / queue_whitelist)
+   skip the systemd fallback (see `is_constrained` branch in
+   `start_peer_processor`) and return
+   `{'error': 'api_start_failed', 'method': 'no_fallback_constrained'}`
+   instead of raising. A peer that 500s on every start (e.g. a wedged
+   gunicorn on the peer side) would otherwise hold its cred slice
+   forever. Only append to `started` when the call actually succeeded.
+
+**Plan-drift detection (no peer-side change needed for cred resizing):**
+`_orchestrate_parallel_frontiers()` compares the current cred/strip
+plan to `frontier_cred_plan` / `frontier_strip_plan` in director_state
+and hard-stops any peer whose env vars don't match. The peer's next
+start inherits the new `COPERNICUS_CRED_INDICES` / `KG_CELL_FILTER`.
+Tile checkpoints survive (cost: one partial tile, ~3-10 min). No peer
+code change is needed when the planner downsizes per (per=2 → per=1)
+— just wait for the drift restart to fire on the next tick.
 
 **Cache-only cache-miss avoidance:**
 When a cache-only peer hits a missing tile, the processor records the KG

@@ -2953,17 +2953,34 @@ class PeerDirector:
         valid_set = set(valid)
         used: set[int] = set()
         prior = prior or {}
-        # Keep existing assignments where possible (any size in [per_eff, per_eff+1]).
+        # Keep existing assignments where possible. We trim down
+        # over-allocated slices (e.g. peer was activated solo with
+        # per=2, target now wants per_eff=1) so cred capacity isn't
+        # hoarded by early peers. Lengths above per_eff+1 are also
+        # trimmed to per_eff. This was the bug that capped parallel
+        # frontiers at 5 (with 8 valid creds and target=8) because
+        # the active peer's prior creds=[0,1] survived as a 2-cred
+        # slice instead of being squeezed to a single index.
         for pid in frontier_ids:
             slice_ = prior.get(pid)
             if not slice_:
                 continue
-            slice_ = sorted(int(i) for i in slice_)
-            if (per_eff <= len(slice_) <= per_eff + 1
-                    and all(i in valid_set for i in slice_)
-                    and not (set(slice_) & used)):
-                out[pid] = slice_
-                used.update(slice_)
+            slice_ = sorted(int(i) for i in slice_ if int(i) in valid_set)
+            if not slice_:
+                continue
+            if set(slice_) & used:
+                # Drop indices already locked in by earlier peers.
+                slice_ = [i for i in slice_ if i not in used]
+                if not slice_:
+                    continue
+            if len(slice_) > per_eff:
+                slice_ = slice_[:per_eff]
+            if len(slice_) < per_eff:
+                # Defer to the leftover-distribution pass; it can top
+                # up shorts from the leftover pool.
+                continue
+            out[pid] = slice_
+            used.update(slice_)
         # Recompute extras based on what's already locked in.
         leftovers = [i for i in valid if i not in used]
         remaining_peers = sorted(p for p in frontier_ids if p not in out)
@@ -3638,13 +3655,24 @@ class PeerDirector:
                      (' (excluding ' + ','.join(sorted(par_excl)) + ')')
                      if par_excl else '')
             try:
-                start_peer_processor(peer.get('url'),
-                                     exclude_kgs=par_excl,
-                                     cred_indices=creds,
-                                     lat_strips=strips_for)
-                started.append(pid)
+                res = start_peer_processor(peer.get('url'),
+                                            exclude_kgs=par_excl,
+                                            cred_indices=creds,
+                                            lat_strips=strips_for)
             except Exception as e:
                 log.warning('Start parallel frontier on %s failed: %s', pid, e)
+                continue
+            if not isinstance(res, dict) or res.get('error'):
+                # API start failed (e.g. 500 on the peer, no systemd
+                # fallback for constrained starts). Don't mark this
+                # peer as an active parallel frontier — otherwise its
+                # cred slice is held hostage forever and the cache-only
+                # orchestrator also leaves it alone.
+                log.warning(
+                    'Parallel frontier start on %s did not succeed: %s',
+                    pid, (res or {}).get('error') or res)
+                continue
+            started.append(pid)
 
         with self._lock:
             self.state['parallel_frontiers_active'] = list(set(running) | set(started))
@@ -3852,6 +3880,16 @@ class PeerDirector:
             )
 
         active_frontier = state_copy.get('active_peer')
+        # Peers the parallel-frontier orchestrator has authorised /
+        # plans to run as additional frontiers. Cache-only must NOT
+        # touch them, otherwise we ping-pong: parallel orch starts a
+        # peer with creds+strips, 18s later cache-only orch hard-stops
+        # and re-starts it as cache-only, then parallel re-promotes
+        # the next tick. Net: only the active peer ever runs frontier.
+        parallel_authorised: set[str] = set(
+            state_copy.get('parallel_frontiers_active') or [])
+        parallel_authorised |= set(
+            (state_copy.get('frontier_cred_plan') or {}).keys())
         peers = list(cfg.get('peers', []))
 
         # Currently running cache-only peers (by id).
@@ -3867,6 +3905,10 @@ class PeerDirector:
             if _peer_is_scheduled(p):
                 continue
             if pid == active_frontier:
+                continue
+            if pid in parallel_authorised:
+                # Owned by the parallel-frontier orchestrator — leave
+                # alone, otherwise we ping-pong frontier↔cache-only.
                 continue
             if p.get('reserved_kg'):
                 # Holds a frontier-only reservation — leave alone.

@@ -5687,6 +5687,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # logging "attempt 1/N read failed" before re-raising.  All tiles
             # complete successfully; this is expected at operate boundaries.
             "Intersection is empty Window(",
+            # urllib3 transient retry chatter — emitted per retry attempt
+            # for any HTTP connection blip (RemoteDisconnected, read timeout,
+            # connection reset). The retries are handled internally and the
+            # call usually succeeds. Real Copernicus throttling surfaces as
+            # 402 / CreditsExhaustedError / IPThrottledError through other
+            # log paths. Treating these as copernicus warnings dragged the
+            # fleet capacity_factor EMA down to ~0.2 even when nothing was
+            # actually failing.
+            "urllib3.connectionpool: Retrying (Retry(",
         )
         # Messages to downgrade from error → warning (non-fatal)
         _DOWNGRADE = (

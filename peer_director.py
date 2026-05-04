@@ -2933,7 +2933,26 @@ class PeerDirector:
         from whatever credentials remain. This avoids restarts caused
         by membership churn re-sorting the assignment.
         """
-        valid = sorted(self._valid_credentials())
+        valid_set_all = set(self._valid_credentials())
+        # Order leftover creds by least 7-day usage so fresh peers pick
+        # up under-used credentials (e.g. cred 5 / cred 7 with 0 success_7d)
+        # before re-loading cred 0 / cred 4. We still keep the index order
+        # as the tie-breaker for stable assignment across ticks.
+        try:
+            cred_pool = self.state.get('credentials') or self._credential_pool()
+        except Exception:
+            cred_pool = []
+        usage_by_idx: dict[int, tuple[int, int]] = {}
+        for c in cred_pool:
+            try:
+                idx = int(c.get('index'))
+            except Exception:
+                continue
+            u = c.get('usage') or {}
+            s7 = int(u.get('success_7d') or 0)
+            usage_by_idx[idx] = (s7, idx)
+        valid = sorted(valid_set_all,
+                       key=lambda i: usage_by_idx.get(i, (0, i)))
         per = self._effective_creds_per_frontier(cfg)
         out: dict[str, list[int]] = {}
         if not valid or not frontier_ids:

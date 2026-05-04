@@ -1453,7 +1453,14 @@ class PeerDirector:
             # Stopped is a clean exit (SIGTERM during update / manual
             # stop) — we know the peer isn't doing work, so its stale
             # warning window is safely droppable immediately.
-            if state == 'stopped':
+            #
+            # 'complete' is the post-run terminal state when a peer
+            # finishes its assigned KGs. Same logic applies: the
+            # processor isn't running, no new warnings are landing,
+            # whatever's in warning_rates is a frozen snapshot of the
+            # last KG. Including it pinned the fleet capacity_factor at
+            # ~0.2 even when nothing live was emitting warnings.
+            if state in ('stopped', 'complete'):
                 continue
             # Unreachable peers may be busy uploading or briefly
             # network-flaky. Honour their last warning rates until
@@ -1480,7 +1487,7 @@ class PeerDirector:
         reporting_pids = sorted(
             pid for pid, ps in (statuses or {}).items()
             if (ps or {}).get('warning_rates')
-            and (ps or {}).get('state') != 'stopped')
+            and (ps or {}).get('state') not in ('stopped', 'complete'))
         agg['_peers_reporting_ids'] = reporting_pids
         agg['_peers_silent_ids'] = [
             pid for pid in all_pids if pid not in set(reporting_pids)]

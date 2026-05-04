@@ -5721,6 +5721,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # fleet capacity_factor EMA down to ~0.2 even when nothing was
             # actually failing.
             "urllib3.connectionpool: Retrying (Retry(",
+            # GDAL >=3.11 emits a one-shot deprecation warning the
+            # first time rasterio writes via the legacy 'Memory'
+            # driver. Self-suppresses after the first hit (the message
+            # itself says so) but the first emission still spams the
+            # log on every fresh subprocess. Pure cosmetic.
+            "rasterio._env: CPLE_AppDefined in DeprecationWarning: 'Memory' driver is deprecated",
         )
         # Messages to downgrade from error → warning (non-fatal)
         _DOWNGRADE = (

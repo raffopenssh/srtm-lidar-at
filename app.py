@@ -4656,6 +4656,18 @@ def admin_update():
         if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
             sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
                    capture_output=True, timeout=60)
+        # Fix ownership of data/ tree. Earlier processor runs (before the
+        # uid=exedev fix) wrote files as root, which the now-uid=exedev
+        # subprocess can't read or rewrite. Symptoms: "Permission denied:
+        # 'data/austria_processor/zenodo_manifest.json'", "Corrupt BEV
+        # cache <hash>.npz: Permission denied". Idempotent — only chowns
+        # files actually owned by another uid.
+        try:
+            data_dir = str(Path(repo) / 'data')
+            sp.run(['sudo', 'chown', '-R', 'exedev:exedev', data_dir],
+                   capture_output=True, timeout=60)
+        except Exception as _e:
+            log.warning('data/ chown failed: %s', _e)
         # Install / refresh systemd watchdog units (idempotent).  These
         # restart srv if /api/v1/ping stops answering — protects against
         # the wedged-gunicorn failure mode.

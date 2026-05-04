@@ -4395,14 +4395,9 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         temp["method"] = "DTM/DSM differencing across BEV ALS dates"
     summary["temporal_change"] = temp
     # --- Phenology ---
-    # Always emit the section so the JSON validator's required-key check
-    # passes; populate the distribution only when at least one object got
-    # classified (i.e. harmonics were available).
-    summary["phenology"] = {"distribution": {}, "method": "harmonic fit"}
     if objects:
         pc = Counter(o.phenology_class for o in objects if o.phenology_class)
-        if pc:
-            summary["phenology"]["distribution"] = dict(pc.most_common())
+        if pc: summary["phenology"] = {"distribution": dict(pc.most_common()), "method": "harmonic fit"}
     # --- Hansen ---
     hs = {}
     if hansen_info:

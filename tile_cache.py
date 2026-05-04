@@ -321,12 +321,19 @@ class CopernicusTileCache:
 
     def has_cached(self, bbox_wgs: dict, *, ndvi: bool = True,
                    landcover: bool = True, sar: bool = False,
-                   harmonics: bool = False, year: int = 2024) -> bool:
+                   harmonics: bool = False, year: int = 2024,
+                   local_ok: bool = True) -> bool:
         """Check if all requested products are cached (local or Zenodo).
 
         Iterates over individual 0.1° grid cells — the same granularity
         that the Austria processor stores.  Does NOT download anything;
         only checks file existence and Zenodo ZIP indices.
+
+        ``local_ok=False`` skips the local-disk shortcut and only
+        accepts tiles that are present in the Zenodo ZIP index.  Use
+        this when computing the cache-ready whitelist on the director
+        (primary) for *other* peers — the primary's local cache says
+        nothing about what a cache-only peer can fetch.
         """
         products = []
         if ndvi:
@@ -354,7 +361,7 @@ class CopernicusTileCache:
         for cw, cs, ce, cn in self._iter_cells(bbox_wgs):
             for product, extra in products:
                 path = self._tile_path(product, cw, cs, ce, cn, **extra)
-                if path.exists():
+                if local_ok and path.exists():
                     continue
                 # Check Zenodo ZIP index (no download)
                 if self._zenodo_cache is None:
@@ -1063,11 +1070,15 @@ class HansenTileCache:
         w, s, e, n = bbox_wgs
         return snap_bbox_to_grid(w, s, e, n, self.GRID_STEP)
 
-    def has_cached(self, bbox_wgs: tuple) -> bool:
+    def has_cached(self, bbox_wgs: tuple, local_ok: bool = True) -> bool:
         """Check if Hansen tile is cached (local or Zenodo).  No downloads.
 
         Iterates 0.5° cells covering *bbox_wgs* and verifies each is on
         local disk or recorded in the Zenodo cache manifest's ZIP index.
+
+        ``local_ok=False`` skips the local-disk shortcut — see the
+        Copernicus version's docstring for why this matters on the
+        director.
         """
         try:
             if self._zenodo_cache is None and not self._zenodo_tried:
@@ -1087,7 +1098,7 @@ class HansenTileCache:
                 ce = round(cw + step, 5)
                 cn = round(cs + step, 5)
                 path = self._tile_path(cw, cs, ce, cn)
-                if path.exists():
+                if local_ok and path.exists():
                     cs += step
                     continue
                 if self._zenodo_cache is None:
@@ -1484,16 +1495,25 @@ def cache_summary() -> dict:
 def is_kg_fully_cached(bbox_wgs: dict, year: int = 2024,
                       check_hansen: bool = True,
                       cop_cache: "CopernicusTileCache | None" = None,
-                      hansen_cache: "HansenTileCache | None" = None) -> bool:
+                      hansen_cache: "HansenTileCache | None" = None,
+                      local_ok: bool = True) -> bool:
     """True iff all Copernicus + Hansen tiles for *bbox_wgs* are cached.
 
     Used by the Peer Director to identify KGs a *cache-only* peer can
     process without burning Copernicus credentials.  Checks local disk
     and the Zenodo persistent cache index — never downloads anything.
+
+    ``local_ok=False`` ignores local cache files and only counts tiles
+    that are visible to other peers via the Zenodo ZIP index.  The
+    director must pass this when whitelisting KGs for cache-only
+    peers, otherwise the primary's own local cache leaks into the
+    decision and peers hit ``CacheMissError`` on tiles that exist only
+    on the director's disk.
     """
     cop = cop_cache or CopernicusTileCache()
     if not cop.has_cached(bbox_wgs, ndvi=True, landcover=True,
-                          sar=True, harmonics=True, year=year):
+                          sar=True, harmonics=True, year=year,
+                          local_ok=local_ok):
         return False
     if check_hansen:
         hc = hansen_cache or HansenTileCache()
@@ -1502,6 +1522,6 @@ def is_kg_fully_cached(bbox_wgs: dict, year: int = 2024,
                    bbox_wgs["east"], bbox_wgs["north"])
         except Exception:
             return False
-        if not hc.has_cached(tup):
+        if not hc.has_cached(tup, local_ok=local_ok):
             return False
     return True

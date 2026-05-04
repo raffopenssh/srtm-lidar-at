@@ -3342,7 +3342,8 @@ class PeerDirector:
                 try:
                     if is_kg_fully_cached(bbox, year=year,
                                           cop_cache=cop_cache,
-                                          hansen_cache=hansen_cache):
+                                          hansen_cache=hansen_cache,
+                                          local_ok=False):
                         codes.append(code)
                         if len(codes) >= max_kgs:
                             break

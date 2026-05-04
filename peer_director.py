@@ -1657,6 +1657,8 @@ class PeerDirector:
         # clobbered.
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
+                   'capacity_ema_persisted', 'sub_factor_ema',
+                   '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
                    'peer_last_live_ts',
                    'parallel_frontiers_active', 'frontier_cred_plan',
@@ -1664,6 +1666,23 @@ class PeerDirector:
                    'active_peer', 'mode', 'last_switch'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
+        # Sync the per-process EMA caches from disk too. Workers that
+        # don't run the director loop never update these in memory, so
+        # _max_parallel_frontiers / _target_frontier_count would compute
+        # against the THROTTLE_MAX_FACTOR defaults — producing a higher
+        # frontier target than the director-running worker. Two workers
+        # serving alternating /api/v1/director/status requests then make
+        # the dashboard flicker between e.g. 4 and 8 max frontiers.
+        try:
+            _disk_ema = disk_state.get('capacity_ema_persisted')
+            if _disk_ema is not None:
+                self._capacity_ema = float(_disk_ema)
+            _disk_sub = disk_state.get('sub_factor_ema') or {}
+            for _kk in ('bev', 'zenodo', 'copernicus'):
+                if _kk in _disk_sub:
+                    self._sub_factor_ema[_kk] = float(_disk_sub[_kk])
+        except Exception:
+            pass
 
         # Poll all peer statuses in parallel — a single wedged peer
         # must never wedge the dashboard request.

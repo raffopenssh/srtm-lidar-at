@@ -2930,13 +2930,44 @@ def _merge_boundary_segments(
 
 # === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
 
+def _purge_stale_gpkg(path: str) -> None:
+    """Remove a stale GPKG and its SQLite sidecars before rebuilding.
+
+    Earlier processor runs (uid=root, pre-runuser fix) sometimes left
+    behind ``.gpkg-wal``/``.gpkg-shm``/``.gpkg-journal`` files owned by
+    root.  When the new uid=exedev subprocess opens the GPKG, SQLite sees
+    the unwritable journal, falls back to read-only mode, and segment-
+    vector inserts then fail with ``attempt to write a readonly database``.
+    Plain ``os.unlink(path)`` of just the .gpkg leaves the sidecars in
+    place — we have to nuke all of them.  Also tries ``sudo rm`` as a
+    last resort if a sidecar is owned by root.
+    """
+    import errno
+    import subprocess as _sp
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        p = path + suffix
+        if not os.path.exists(p):
+            continue
+        try:
+            os.unlink(p)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                try:
+                    _sp.run(["sudo", "-n", "rm", "-f", p],
+                            capture_output=True, timeout=10)
+                except Exception:
+                    pass
+            else:
+                log.warning("_purge_stale_gpkg: cannot remove %s: %s", p, e)
+
+
 def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=False):
     """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
     segment_height) covering the full KG bbox, plus unified segment vectors."""
     import rasterio
     import rasterio.transform
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
-    if os.path.exists(out_path): os.unlink(out_path)
+    _purge_stale_gpkg(out_path)
     if not tile_seg_results:
         open(out_path, 'w').close()
         return out_path
@@ -3545,7 +3576,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     from fiona.crs import from_epsg
 
     out_path = str(GPKG_DIR / f"{kg_code}_light.gpkg")
-    if os.path.exists(out_path): os.unlink(out_path)
+    _purge_stale_gpkg(out_path)
 
     table_count = 0
     _GPKG_NODATA_L = -9999.0

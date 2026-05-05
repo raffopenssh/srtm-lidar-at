@@ -4605,6 +4605,7 @@ def director_heal_peers_json():
     Idempotent: peers with already-canonical URLs report no changes.
     """
     import director_ha as dha
+    import requests as _rq
     results: dict = {}
     # Local first.
     try:
@@ -4625,7 +4626,7 @@ def director_heal_peers_json():
         if not pid or pid == dha.self_id() or not url:
             continue
         try:
-            r = requests.post(
+            r = _rq.post(
                 url.rstrip('/') + '/api/v1/admin/heal_peers_json',
                 headers=headers, timeout=10)
             try:

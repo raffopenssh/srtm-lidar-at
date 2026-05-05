@@ -119,6 +119,39 @@ footer a{margin:0 6px}
   </div>
 </section>
 
+<!-- 3b. PER-PARCEL TYPE COVERAGE (FRAV) -->
+<section>
+  <h2>🧬 Every parcel, broken down by type <span class="tag green">frav</span></h2>
+  <div class="tl">A compact <i>Fraction-Area Vector</i> (frav) on every parcel · 25 single-letter codes · ~30 bytes/parcel</div>
+  <div class="two">
+    <div>
+      <p class="lead">For each of the <b>188,192 parcels</b> we record the area covered by every object type as a tiny letter→m² map. <b>t</b>=tree, <b>g</b>=grass, <b>c</b>=crop, <b>R</b>=roof, <b>v</b>=vineyard, <b>h</b>=hedge … 25 letters in total (lowercase=natural, uppercase=man-made). A typical farmstead might read <code style="color:var(--accent)">{g:1840, R:280, t:90, p:60}</code> — instantly tells you it's 76% grass, 12% roof, with a few trees and a path.</p>
+      <p class="lead" style="font-size:14px;color:var(--mute)">The frav is the <b>raw substrate</b> the parcel auto-classifier reads. It also feeds <code>vegetated_fraction</code>, <code>forested_fraction</code>, and <code>dominant_type</code> — the three indexed columns that make per-parcel cross-Austria queries return in &lt; 50 ms.</p>
+      <table style="margin-top:14px">
+        <tr><th>queryable today</th><th>where</th><th>speed</th></tr>
+        <tr><td><code>dominant_type</code></td><td>SQL index</td><td>&lt; 50 ms</td></tr>
+        <tr><td><code>vegetated_fraction</code> (sum of all natural)</td><td>SQL index</td><td>&lt; 50 ms</td></tr>
+        <tr><td><code>forested_fraction</code> (tree+shrub+hedge)</td><td>SQL index</td><td>&lt; 50 ms</td></tr>
+        <tr><td><code>auto_class</code> / <code>auto_subclass</code></td><td>SQL index (built from frav)</td><td>&lt; 50 ms</td></tr>
+        <tr><td><code>types=t,g</code> + <code>min_type_fraction=0.2</code></td><td>frav in JSON · <code>/parcels/landscape</code></td><td>~1 s/KG</td></tr>
+        <tr><td>full per-type m² breakdown</td><td><code>/parcel/&lt;id&gt;/detail</code> · light GPKG</td><td>~100 ms</td></tr>
+      </table>
+    </div>
+    <div>
+      <p class="lead">Just from the SQL-indexed reductions, here's how Austria stacks up:</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dtree%26min_forested_fraction%3D0.7%26limit%3D200">🌲 <span class="n">31,760</span> tree-dominant, &gt;70% forested</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dgrass%26min_vegetated_fraction%3D0.9%26max_forested_fraction%3D0.05%26has_buildings%3Dfalse%26limit%3D200">🌿 <span class="n">25,063</span> pure grass, no trees, no buildings</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dcrop%26min_vegetated_fraction%3D0.9%26limit%3D200">🌾 <span class="n">14,736</span> healthy cropland</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dshrub%26min_forested_fraction%3D0.5%26max_forested_fraction%3D0.85%26limit%3D200">🌳 <span class="n">9,116</span> shrub/transitional woodland</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dvineyard%26limit%3D200">🍇 <span class="n">828</span> vineyard-dominant parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Dgrass%2Ccrop%26min_forested_fraction%3D0.2%26max_forested_fraction%3D0.5%26limit%3D200">🌳🌾 <span class="n">11,876</span> agroforestry candidates</a>
+      </div>
+      <p class="lead" style="font-size:13px;color:var(--mute);margin-top:12px">For the full per-type m² breakdown (e.g. <i>parcels with ≥20% tree AND ≥20% grass AND ≥10% crop</i>) hit <code>/api/v1/parcels/landscape</code> with <code>types=t,g,c&amp;min_type_fraction=0.2</code> — slower (loads frav from each KG JSON) but answers any combinatorial question. The full vector also flows into the light GPKG <code>parcels</code> layer for offline GIS use.</p>
+    </div>
+  </div>
+</section>
+
 <!-- 4. GIANT TREE ATLAS -->
 <section>
   <h2>🌲 The Giant Tree Atlas <span class="tag green">discovery</span></h2>

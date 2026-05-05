@@ -4668,6 +4668,37 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     _VEGETATED_TYPES = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard',
                         'vineyard', 'garden'}
     _parcel_obj_map = defaultdict(list)  # parcel_idx → [obj, ...]
+
+    def _strtree_area_summary(p_objs, parcel_area_sqm):
+        """Build area_summary from STRtree-assigned objects, clamped to parcel area.
+
+        STRtree assigns whole objects to a parcel by centroid containment, so
+        objects that straddle the parcel boundary contribute their *entire*
+        area to a single parcel. Without correction the m² values can exceed
+        the cadastre parcel area by 2–4× (sample of 1000 random parcels: 20%
+        had >1.5× over-coverage). Fractions are unaffected (they're computed
+        relative to the sum), but absolute m² in `area_summary` and `frav`
+        was wrong. Clamp by scaling so the sum equals min(Σ, parcel_area).
+        """
+        from collections import Counter as _C, defaultdict as _D
+        tc = _C(); th = _D(list)
+        for obj in p_objs:
+            tc[obj.obj_type] += float(obj.area_sqm)
+            th[obj.obj_type].append(obj.height_max)
+        tot = sum(tc.values())
+        if tot <= 0:
+            return {}, th, 0.0
+        # Scale down (never up) so absolute m² never exceeds cadastre area.
+        scale = 1.0
+        if parcel_area_sqm and parcel_area_sqm > 0 and tot > parcel_area_sqm:
+            scale = parcel_area_sqm / tot
+        scaled = {t: a * scale for t, a in tc.items()}
+        ssum = max(sum(scaled.values()), 1.0)
+        area_summary = {
+            t: {'area_sqm': int(round(a)), 'fraction': round(a / ssum, 4)}
+            for t, a in sorted(scaled.items(), key=lambda kv: -kv[1])
+        }
+        return area_summary, th, ssum
     if objects and cadastre_data["parcels"]:
         try:
             from shapely import STRtree
@@ -4822,28 +4853,29 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     p_idx = _parcel_idx_by_id[id(p)]
                     p_objs = _parcel_obj_map.get(p_idx, [])
                     if p_objs:
-                        tc_f = Counter()
-                        th_f = defaultdict(list)
-                        for obj in p_objs:
-                            tc_f[obj.obj_type] += int(obj.area_sqm)
-                            th_f[obj.obj_type].append(obj.height_max)
-                        tpx_f = max(sum(tc_f.values()), 1)
-                        pd['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx_f, 4)}
-                                              for t, px in tc_f.most_common()}
+                        as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                        pd['area_summary'] = as_
                         pd['height_distribution'] = {
                             t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
                                 'mean': round(sum(hs) / len(hs), 2)}
                             for t, hs in th_f.items() if hs}
-                        vpx = sum(v for k, v in tc_f.items() if k in _VEGETATED_TYPES)
+                        tpx_f = max(ssum, 1.0)
+                        vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
                         pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
                         pd['is_vegetated'] = vpx / tpx_f > 0.5
-                        fpx = sum(v for k, v in tc_f.items() if k in _FOREST_TYPES)
+                        fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
                         pd['forested_fraction'] = round(fpx / tpx_f, 4)
-                        pd['dominant_type'] = tc_f.most_common(1)[0][0] if tc_f else None
+                        pd['dominant_type'] = next(iter(as_)) if as_ else None
                         hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
                         if hmax_vals:
                             pd['ndsm_max_m'] = round(max(hmax_vals), 2)
-                        cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(tc_f))
+                        # classifier still uses true (unscaled) per-type areas
+                        # for confidence stats (reflects evidence volume).
+                        from collections import Counter as _CC
+                        true_tc = _CC()
+                        for obj in p_objs:
+                            true_tc[obj.obj_type] += int(obj.area_sqm)
+                        cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
                         if cls:
                             pd['classification'] = cls
                 # Ensure forested_fraction and dominant_type are always present
@@ -4928,28 +4960,27 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 p_idx = _parcel_idx_by_id[id(p)]
                 p_objs = _parcel_obj_map.get(p_idx, [])
                 if p_objs:
-                    tc_f = Counter()
-                    th_f = defaultdict(list)
-                    for obj in p_objs:
-                        tc_f[obj.obj_type] += int(obj.area_sqm)
-                        th_f[obj.obj_type].append(obj.height_max)
-                    tpx_f = max(sum(tc_f.values()), 1)
-                    pd['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx_f, 4)}
-                                          for t, px in tc_f.most_common()}
+                    as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                    pd['area_summary'] = as_
                     pd['height_distribution'] = {
                         t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
                             'mean': round(sum(hs) / len(hs), 2)}
                         for t, hs in th_f.items() if hs}
-                    vpx = sum(v for k, v in tc_f.items() if k in _VEGETATED_TYPES)
+                    tpx_f = max(ssum, 1.0)
+                    vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
                     pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
                     pd['is_vegetated'] = vpx / tpx_f > 0.5
-                    fpx = sum(v for k, v in tc_f.items() if k in _FOREST_TYPES)
+                    fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
                     pd['forested_fraction'] = round(fpx / tpx_f, 4)
-                    pd['dominant_type'] = tc_f.most_common(1)[0][0] if tc_f else None
+                    pd['dominant_type'] = next(iter(as_)) if as_ else None
                     hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
                     if hmax_vals:
                         pd['ndsm_max_m'] = round(max(hmax_vals), 2)
-                    cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(tc_f))
+                    from collections import Counter as _CC
+                    true_tc = _CC()
+                    for obj in p_objs:
+                        true_tc[obj.obj_type] += int(obj.area_sqm)
+                    cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
                     if cls:
                         pd['classification'] = cls
         except Exception as e:
@@ -4986,10 +5017,10 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 if frav:
                     pd['frav'] = frav
             elif p_objs:
-                tc_f = Counter()
-                for obj in p_objs:
-                    tc_f[obj.obj_type] += int(obj.area_sqm)
-                frav = {TYPE_LETTER.get(t, '?'): a for t, a in tc_f.items() if a > 0}
+                # Same clamp as area_summary fallback: scale so Σ ≤ parcel area.
+                as_fb, _, _ = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                frav = {TYPE_LETTER.get(t, '?'): info['area_sqm']
+                        for t, info in as_fb.items() if info.get('area_sqm', 0) > 0}
                 if frav:
                     pd['frav'] = frav
             if p_objs:

@@ -219,7 +219,10 @@ def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
                     pd['frav'] = frav
                     n_frav += 1
             continue
-        # frav: prefer rasterised area_summary (more accurate); else aggregate segments.
+        # frav: prefer rasterised area_summary (more accurate); else aggregate
+        # segments. When aggregating segments we clamp to parcel area because
+        # segment-points are attributed by centroid containment, so straddling
+        # segments would otherwise contribute their full area to one parcel.
         as_ = pd.get('area_summary') or {}
         if as_:
             frav = {TYPE_LETTER.get(t, '?'): int(info.get('area_sqm', 0))
@@ -229,8 +232,14 @@ def _enrich_parcels(js: dict, gpkg_path: Path) -> int:
             for s in segs:
                 otype = s.get('type') or ''
                 k = TYPE_LETTER.get(otype, '?')
-                agg[k] = agg.get(k, 0) + int(float(s.get('area_sqm') or 0))
-            frav = {k: v for k, v in agg.items() if v > 0}
+                agg[k] = agg.get(k, 0) + float(s.get('area_sqm') or 0)
+            tot = sum(agg.values())
+            parcel_area = float(pd.get('area_sqm') or 0)
+            scale = 1.0
+            if parcel_area > 0 and tot > parcel_area:
+                scale = parcel_area / tot
+            frav = {k: int(round(v * scale)) for k, v in agg.items()
+                    if v * scale >= 0.5}
         if frav:
             pd['frav'] = frav
             n_frav += 1

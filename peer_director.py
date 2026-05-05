@@ -1911,6 +1911,29 @@ class PeerDirector:
             self._aggregate_credential_usage(cred_pool, peers_list)
         except Exception as e:
             log.debug('aggregate_credential_usage: %s', e)
+        # Append a fleet-shape sample using the SAME numbers we return
+        # to the dashboard so the sparkline's last point always matches
+        # the card text. Throttled to avoid pile-on from concurrent
+        # dashboard polls; the director tick still records its own
+        # samples on the 30s cadence as a fallback.
+        try:
+            _now = int(time.time())
+            _last_t = (
+                self._peer_history[-1][0]
+                if self._peer_history else 0
+            )
+            if _now - _last_t >= 5:
+                _fr = len(state.get('parallel_frontiers_active') or [])
+                _co = int(cache_only_running)
+                _cr = len(cache_ready.get('codes') or [])
+                self._peer_history.append((_now, _fr, _co, _cr))
+                with self._lock:
+                    self.state['peer_history'] = [
+                        {'t': t, 'fr': fr, 'co': co, 'cr': cr}
+                        for (t, fr, co, cr) in list(self._peer_history)
+                    ]
+        except Exception:
+            log.debug('peer_history status snapshot failed', exc_info=True)
         return {
             'mode': state.get('mode', 'auto'),
             'active_peer': state.get('active_peer'),
@@ -4489,6 +4512,10 @@ class PeerDirector:
                     _statuses_for_hist = locals().get('_statuses') or {}
                     _fr = len(self.state.get(
                         'parallel_frontiers_active') or [])
+                    # Match status()'s definition exactly: cache_only_run
+                    # (peer self-report) AND running/processing. Using
+                    # ps['cache_only'] alone misses peers whose status
+                    # poll didn't include the flag this tick.
                     _co = 0
                     for _pid, _ps in _statuses_for_hist.items():
                         if not isinstance(_ps, dict):

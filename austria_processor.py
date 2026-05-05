@@ -4788,6 +4788,20 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                             if 0 <= vr < dh and 0 <= vc < dw:
                                 v = float(dtm[vr, vc])
                                 if np.isfinite(v): dtm_val = round(v, 2)
+                            if dtm_val is None:
+                                # Vertex outside centroid tile — try other tiles
+                                try:
+                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
+                                    if vtdata is not None and vtr is not tr:
+                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
+                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
+                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
+                                        vdh, vdw = vdtm.shape
+                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
+                                            vv = float(vdtm[vvr2, vvc2])
+                                            if np.isfinite(vv): dtm_val = round(vv, 2)
+                                except Exception:
+                                    pass
                             verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
                     if verts:
                         pd["vertex_heights"] = verts
@@ -4874,6 +4888,42 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 elev = _point_elevation_fallback(c3.x, c3.y)
                 if elev is not None:
                     pd["elevation_m"] = elev
+                # Vertex heights with geometry-only fallback (dtm_m=None)
+                # so vertex_heights is always present for known parcels
+                try:
+                    verts = []
+                    geom_w = p.get("geometry_wgs")
+                    if geom_w is not None:
+                        if geom_w.geom_type == 'Polygon':
+                            rings = [geom_w.exterior] + list(geom_w.interiors)
+                        elif geom_w.geom_type == 'MultiPolygon':
+                            rings = []
+                            for poly in geom_w.geoms:
+                                rings.append(poly.exterior)
+                                rings.extend(poly.interiors)
+                        else:
+                            rings = []
+                        for ring in rings:
+                            for x, y in ring.coords:
+                                pt_3035 = _tx_to_3035.transform(x, y)
+                                dtm_val = None
+                                try:
+                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
+                                    if vtdata is not None:
+                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
+                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
+                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
+                                        vdh, vdw = vdtm.shape
+                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
+                                            vv = float(vdtm[vvr2, vvc2])
+                                            if np.isfinite(vv): dtm_val = round(vv, 2)
+                                except Exception:
+                                    pass
+                                verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
+                        if verts:
+                            pd["vertex_heights"] = verts
+                except Exception:
+                    pass
                 # STRtree fallback for parcels outside all tile bounds
                 p_idx = _parcel_idx_by_id[id(p)]
                 p_objs = _parcel_obj_map.get(p_idx, [])

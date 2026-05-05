@@ -7240,6 +7240,41 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
 
 # === SECTION: Zenodo upload helpers ===
 
+def _push_manifest_entry_to_director(zenodo_key: str, manifest) -> None:
+    """Best-effort push of a freshly-saved manifest entry to the director.
+
+    Uses ZENODO_LOCK_URL (set on peers) or http://127.0.0.1:8000 (primary)
+    as the director endpoint.  Director's /api/v1/manifest/push merges the
+    entry with timestamp-aware overwrite. Silent failures are fine — the
+    5-minute peer-sync poll is the safety net.
+    """
+    import os as _os, requests as _req, json as _j
+    director_url = _os.environ.get('ZENODO_LOCK_URL') or 'http://127.0.0.1:8000'
+    director_url = director_url.rstrip('/')
+    entry = manifest.get(zenodo_key) if hasattr(manifest, 'get') else None
+    if entry is None:
+        return
+    payload = {'key': zenodo_key,
+               'entry': entry.to_dict() if hasattr(entry, 'to_dict') else entry}
+    headers = {'Content-Type': 'application/json'}
+    # Forward admin token if available (peers carry it via env or file)
+    tok = _os.environ.get('ADMIN_TOKEN', '')
+    if not tok:
+        try:
+            tp = Path('data/admin_token')
+            if tp.exists():
+                tok = tp.read_text().strip()
+        except Exception:
+            pass
+    if tok:
+        headers['X-Admin-Token'] = tok
+    try:
+        _req.post(director_url + '/api/v1/manifest/push',
+                  data=_j.dumps(payload), headers=headers, timeout=8)
+    except Exception as e:
+        log.debug('manifest push to %s: %s', director_url, e)
+
+
 def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                         manifest, quality_score: float = 0.0,
                         quality_grade: str = "",
@@ -7315,6 +7350,15 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
             upload_stats["uploaded"].append(zenodo_key)
             upload_stats["total_bytes"] += fsize
+
+            # Push the freshly-uploaded manifest entry to the director so
+            # the fleet learns of it within seconds rather than waiting
+            # ~5 min for the next peer-sync tick.  Best-effort — if the
+            # broker is unreachable, peer-sync will catch it later.
+            try:
+                _push_manifest_entry_to_director(zenodo_key, manifest)
+            except Exception as _e:
+                log.debug("KG %s: manifest push failed for %s: %s", kg_code, zenodo_key, _e)
 
         except Exception as e:
             upload_stats["errors"].append({

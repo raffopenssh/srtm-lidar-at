@@ -807,6 +807,24 @@ def _do_takeover(reason: str, prev_director_url: str | None = None,
         except Exception as e:
             log.info('takeover: prev director %s unreachable for step_down: %s',
                      prev_director_url, e)
+    # Catch-up reconciliation: any uploads that happened during the
+    # handover window may not be reflected in the snapshot we just
+    # installed.  Pull every peer's manifest in parallel and merge
+    # timestamp-aware so we have a fully-consistent view immediately.
+    # Best-effort — the regular peer-sync loop is the safety net.
+    try:
+        import requests as _req, threading as _th
+        def _reconcile():
+            try:
+                _req.post('http://127.0.0.1:8000/api/v1/manifest/reconcile',
+                          headers=_admin_headers(), timeout=60)
+                log.info('takeover: triggered manifest reconcile')
+            except Exception as e:
+                log.warning('takeover: reconcile trigger failed: %s', e)
+        # Fire async — don't block the takeover response on a 16-way fan-out.
+        _th.Thread(target=_reconcile, daemon=True, name='takeover-reconcile').start()
+    except Exception as e:
+        log.warning('takeover: reconcile setup failed: %s', e)
     return {'status': 'promoted', 'install': install_result,
             'announced': len(results), 'reason': reason}
 

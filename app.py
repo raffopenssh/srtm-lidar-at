@@ -138,6 +138,8 @@ _PROTECTED_PREFIXES = (
     '/api/v1/zenodo/lock',
     '/api/v1/credentials',
     '/api/v1/processing/cache_misses',
+    '/api/v1/manifest/push',
+    '/api/v1/manifest/reconcile',
 )
 
 
@@ -535,16 +537,15 @@ def _sync_peer_data():
 
     while True:
         try:
-            # Skip JSON download + manifest merge entirely on demoted peers
-            # (not primary, not director, not shadow). Those VMs are about to
-            # purge their JSON corpus via the role-data eviction loop — there
-            # is no point downloading new ones in the meantime.
+            # Demoted peers (not primary/director/shadow) skip the heavy bits
+            # (JSON downloads, search-index update) but still merge peer
+            # manifests. Manifest is ~370KB and is the catch-up substrate:
+            # keeping it fresh means a promoted peer has an instantly-correct
+            # view of what's already on Zenodo with no discovery lag.
             try:
-                if not _is_keep_role_data():
-                    time.sleep(300)
-                    continue
+                _keep_role = _is_keep_role_data()
             except Exception:
-                pass
+                _keep_role = True   # fail-safe
             peer_urls = _get_peer_urls()
             if not peer_urls:
                 time.sleep(300)
@@ -590,7 +591,9 @@ def _sync_peer_data():
                 # Download KG JSONs we don't have, OR re-download when the
                 # peer's manifest entry is newer/larger than our local copy
                 # (e.g. after a backfill rewrite on a peer).
-                for key, entry in peer_manifest.items():
+                # Demoted peers skip the JSON download phase entirely — they
+                # would just be evicted again. Manifest merge below still runs.
+                for key, entry in (peer_manifest.items() if _keep_role else ()):
                     if not key.endswith('_json'):
                         continue
                     code = key.replace('_json', '')
@@ -3810,6 +3813,174 @@ def processing_manifest_delete(key):
         return jsonify({'deleted': key, 'remaining': len(entries)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/manifest/push', methods=['POST'])
+def api_manifest_push():
+    """Accept a single manifest entry pushed by a peer right after upload.
+
+    Merges with timestamp-aware overwrite. Tombstones still apply: an
+    entry uploaded_at <= tombstone_ts is rejected as stale.
+
+    Body: {"key": "<kg>_<file_kind>", "entry": {<manifest entry dict>}}.
+
+    This is the fast path for cross-peer manifest propagation — it
+    converts the up-to-5-minute peer-sync discovery window into ~1
+    second after upload completion.
+    """
+    body = request.get_json(silent=True) or {}
+    key = body.get('key')
+    entry = body.get('entry')
+    if not key or not isinstance(entry, dict):
+        return jsonify({'error': 'key and entry required'}), 400
+    new_ts = entry.get('uploaded_at') or ''
+
+    # Tombstone gate: stale entries (older than tombstone) are rejected.
+    tomb_ts = _MANIFEST_TOMBSTONES.get(key) or ''
+    if tomb_ts and new_ts and new_ts <= tomb_ts:
+        return jsonify({'rejected': 'stale_vs_tombstone',
+                        'tombstone_ts': tomb_ts}), 409
+    # Per-KG _requeue tombstones also apply.
+    import re as _re
+    m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
+    if m:
+        rq_ts = _MANIFEST_TOMBSTONES.get(m.group(1) + '_requeue') or ''
+        if rq_ts and new_ts and new_ts <= rq_ts:
+            return jsonify({'rejected': 'stale_vs_requeue',
+                            'tombstone_ts': rq_ts}), 409
+
+    # Atomic read-modify-write of local manifest.
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    try:
+        local = {}
+        if manifest_path.exists():
+            md = json.loads(manifest_path.read_text())
+            local = md.get('entries', md)
+        cur = local.get(key)
+        cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
+        if cur is not None and (not new_ts or new_ts <= cur_ts):
+            return jsonify({'noop': 'not_newer', 'cur_ts': cur_ts, 'new_ts': new_ts})
+        local[key] = entry
+        import tempfile as _tf
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'entries': local}, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+        return jsonify({'merged': key, 'previous_ts': cur_ts, 'new_ts': new_ts,
+                        'total_entries': len(local)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/manifest/reconcile', methods=['POST'])
+def api_manifest_reconcile():
+    """Pull every peer's manifest in parallel and merge timestamp-aware.
+
+    Use after a director takeover, after promoting a shadow, or as a
+    manual catch-up sweep.  Synchronous — returns counts.
+    """
+    import requests as _req
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    peer_urls = _get_peer_urls()
+    if not peer_urls:
+        return jsonify({'merged_new': 0, 'merged_updated': 0, 'peers': 0})
+    headers = {}
+    try:
+        tok = Path('data/admin_token').read_text().strip()
+        if tok:
+            headers['X-Admin-Token'] = tok
+    except Exception:
+        pass
+
+    def _fetch(url):
+        try:
+            r = _req.get(url.rstrip('/') + '/api/v1/processing/peers',
+                         headers=headers, timeout=15, verify=False)
+            r.raise_for_status()
+            return url, r.json().get('manifest', {}) or {}
+        except Exception as e:
+            return url, {'__err': str(e)}
+
+    peer_manifests = []
+    reachable = 0
+    with ThreadPoolExecutor(max_workers=min(16, len(peer_urls))) as pool:
+        for fut in as_completed([pool.submit(_fetch, u) for u in peer_urls]):
+            url, m = fut.result()
+            if isinstance(m, dict) and '__err' not in m:
+                reachable += 1
+                peer_manifests.append((url, m))
+
+    # Compute the strictly-newest entry per key across all peers.
+    best: dict = {}
+    for _url, m in peer_manifests:
+        for key, entry in m.items():
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get('uploaded_at') or ''
+            cur = best.get(key)
+            if cur is None or ts > (cur.get('uploaded_at') or ''):
+                best[key] = entry
+
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    local = {}
+    if manifest_path.exists():
+        try:
+            md = json.loads(manifest_path.read_text())
+            local = md.get('entries', md)
+        except Exception:
+            local = {}
+
+    added = updated = blocked = 0
+    import re as _re2
+    for key, entry in best.items():
+        new_ts = entry.get('uploaded_at') or ''
+        # tombstone gate
+        tomb_ts = _MANIFEST_TOMBSTONES.get(key) or ''
+        if tomb_ts and new_ts <= tomb_ts:
+            blocked += 1
+            continue
+        m = _re2.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
+        if m:
+            rq_ts = _MANIFEST_TOMBSTONES.get(m.group(1) + '_requeue') or ''
+            if rq_ts and new_ts <= rq_ts:
+                blocked += 1
+                continue
+        cur = local.get(key)
+        if cur is None:
+            local[key] = entry; added += 1
+            continue
+        cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
+        if new_ts and new_ts > cur_ts:
+            local[key] = entry; updated += 1
+
+    if added or updated:
+        import tempfile as _tf
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp', prefix='.manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'entries': local}, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+
+    return jsonify({
+        'peers_polled': len(peer_urls),
+        'peers_reachable': reachable,
+        'merged_new': added,
+        'merged_updated': updated,
+        'blocked_by_tombstone': blocked,
+        'total_entries': len(local),
+    })
 
 
 # === SECTION: Bandwidth & Peer Director ===

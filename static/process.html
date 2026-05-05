@@ -1080,30 +1080,12 @@ function updateCards(d) {
   const bar = document.getElementById('cProgBar');
   bar.style.width = pct.toFixed(1) + '%';
   bar.className = 'bar-fill ' + ((d.failed || 0) > done * 0.1 ? 'y' : 'g');
+  // Compact det: only failed count + currently-processing KG.
+  // Totals + frontier/cache-only counts moved to the fleet sparkline
+  // legend below to free up vertical space.
   let pdet = '';
-  if (d.failed > 0) pdet += '<span style="color:var(--red)">' + d.failed + ' failed</span> · ';
-  if (d.current_kg) pdet += esc(d.current_kg.code) + ' ' + esc(d.current_kg.name || '');
-  else if (d.last_kg_code) pdet += 'last: ' + d.last_kg_code;
-  const _np = d.db_parcels_total || 0, _na = d.db_area_km2 || 0;
-  if (_np || _na) {
-    pdet += (pdet ? ' · ' : '') +
-      '<span style="opacity:0.75">TOTAL: ' +
-      _np.toLocaleString() + ' parcels · ' +
-      _na.toLocaleString(undefined,{maximumFractionDigits:0}) + ' km²</span>';
-  }
-  // Director peer counts (frontier / cache-only).
-  const _dd = (typeof _directorData !== 'undefined') ? _directorData : null;
-  if (_dd) {
-    const parA = (_dd.parallel_frontiers_active || []).length;
-    const parM = _dd.max_parallel_frontiers || 0;
-    const coA = _dd.cache_only_running || 0;
-    const coM = _dd.max_cache_only_peers || 0;
-    if (parM || coM) {
-      pdet += (pdet ? ' · ' : '') +
-        '<span style="opacity:0.75">frontier <b>' + parA + '</b>/' + parM +
-        ' · cache-only <b>' + coA + '</b>/' + coM + '</span>';
-    }
-  }
+  if (d.failed > 0) pdet += '<span style="color:var(--red)">' + d.failed + ' failed</span>';
+  if (d.current_kg) pdet += (pdet ? ' · ' : '') + esc(d.current_kg.code);
   document.getElementById('cProgDet').innerHTML = pdet || '—';
 
   // Failed KG tags in progress card
@@ -3451,11 +3433,13 @@ function renderFleetHistory() {
     rangeLbl;
   svg.style.visibility = 'visible';
   det.style.visibility = 'visible';
+  const _frMax = (d.max_parallel_frontiers != null) ? d.max_parallel_frontiers : '';
+  const _coMax = (d.max_cache_only_peers != null) ? d.max_cache_only_peers : '';
   det.innerHTML =
-    '<span style="color:#3fc26b" title="Active parallel frontiers"><b>' +
-      (last.fr||0) + '</b> frontier' + ((last.fr===1)?'':'s') + '</span> · ' +
-    '<span style="color:#3fb6c2" title="Cache-only peers running"><b>' +
-      (last.co||0) + '</b> cache</span> · ' +
+    '<span style="color:#3fc26b" title="Active parallel frontiers / max"><b>' +
+      (last.fr||0) + '</b>' + (_frMax!==''?'/'+_frMax:'') + ' frontier' + ((last.fr===1)?'':'s') + '</span> · ' +
+    '<span style="color:#3fb6c2" title="Cache-only peers running / max"><b>' +
+      (last.co||0) + '</b>' + (_coMax!==''?'/'+_coMax:'') + ' cache</span> · ' +
     '<span style="color:#9b6df0" title="KGs whose tiles are fully cached on Zenodo"><b>' +
       (last.cr||0) + '</b> ready</span>';
 }

@@ -22,6 +22,40 @@ import rasterio
 
 import bev_proxy
 
+try:
+    from osgeo import gdal as _gdal
+except Exception:  # pragma: no cover
+    _gdal = None
+
+
+def _clear_vsicurl_cache(url: str) -> None:
+    """Drop GDAL's /vsicurl cached metadata for *url*.
+
+    GDAL caches the result of HEAD + initial range read per URL. When a
+    transient HTTP 0 / partial-body response poisons that cache, every
+    subsequent ``rasterio.open(url)`` returns 'not recognized as being
+    in a supported file format' even though the server is healthy. We
+    purge the per-URL cache between retries so each attempt re-probes
+    the server fresh.
+    """
+    if _gdal is None:
+        return
+    try:
+        # Strip /vsicurl/ prefix — VSICurlPartialClearCache wants the
+        # raw URL, not the GDAL prefix.
+        target = url
+        if target.startswith('/vsicurl/'):
+            target = target[len('/vsicurl/'):]
+        if hasattr(_gdal, 'VSICurlPartialClearCache'):
+            _gdal.VSICurlPartialClearCache(target)
+    except Exception:
+        # Last resort: nuke the whole vsicurl cache.
+        try:
+            if hasattr(_gdal, 'VSICurlClearCache'):
+                _gdal.VSICurlClearCache()
+        except Exception:
+            pass
+
 log = logging.getLogger(__name__)
 
 # Retry configuration
@@ -122,6 +156,9 @@ def read_with_retry(
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
+        if attempt > 0:
+            # Drop any poisoned per-URL cache from the previous attempt.
+            _clear_vsicurl_cache(url)
         if direct_first and attempt < direct_retries:
             os.environ.pop("GDAL_HTTP_PROXY", None)
             os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
@@ -190,6 +227,9 @@ def open_with_retry(
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
+        if attempt > 0:
+            # Drop any poisoned per-URL cache from the previous attempt.
+            _clear_vsicurl_cache(url)
         if attempt == 0:
             # First attempt: direct (no proxy)
             os.environ.pop("GDAL_HTTP_PROXY", None)

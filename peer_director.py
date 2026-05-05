@@ -4654,10 +4654,35 @@ class PeerDirector:
                 timeout=2).decode().strip()
         except Exception:
             pass
+        # We used to require an exact commit match; that made handback fail
+        # any time the operator pushed an update on the primary while a non-
+        # primary peer was acting as director. The snapshot format is stable
+        # across recent commits, so allow handback whenever primary is at
+        # least as fresh as us. Only refuse when primary is *behind* (commit
+        # not in our local git history) — that's the case where running an
+        # older director on a newer state could lose schema fields.
         if my_commit and primary_commit and primary_commit != my_commit:
-            log.info('handback skipped: primary on %s, we are on %s',
+            primary_is_behind = False
+            try:
+                import subprocess as _sp
+                _sp.check_output(
+                    ['git', 'merge-base', '--is-ancestor',
+                     primary_commit, my_commit],
+                    cwd=str(Path(__file__).parent),
+                    stderr=_sp.DEVNULL, timeout=3,
+                )
+                # Exit 0 → primary_commit is an ancestor of my_commit →
+                # primary is behind us.
+                primary_is_behind = True
+            except Exception:
+                primary_is_behind = False
+            if primary_is_behind:
+                log.info('handback skipped: primary on %s is behind us %s',
+                         primary_commit, my_commit)
+                return
+            log.info('handback proceeding despite commit mismatch '
+                     '(primary=%s us=%s) — primary is fresher or unrelated',
                      primary_commit, my_commit)
-            return
         # Healthy enough — hand over.
         log.warning('Auto-handback: primary is healthy, handing director '
                     'role back from %s to primary', me)

@@ -8779,6 +8779,17 @@ def segment_overlay():
                 cached = _seg_cache_scan(bounds_prefix)
             if cached is not None:
                 log.info("segment overlay: rendering with share type overrides (share=%s)", share_id)
+                # Promote whatever cache hit to the per-share persistent
+                # cache so subsequent cold loads skip the seg-cache scan
+                # entirely (the seg cache may have been written by a
+                # different geometry+options key, or be evicted soon).
+                # Skip re-save when this hit already came from the share cache.
+                if cached.get('share_id') != share_id:
+                    _seg_share_cache_save(
+                        share_id, cached["labels"], cached["objects"],
+                        cached["mask"], cached["transform"],
+                        cached["shape"], cached.get("ndsm"),
+                    )
                 return _render_seg_overlay(
                     cached["labels"], cached["objects"],
                     cached["mask"], cached["transform"],

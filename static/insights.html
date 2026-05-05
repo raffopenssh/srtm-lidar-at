@@ -209,8 +209,8 @@ footer a{margin:0 6px}
       <canvas id="triForest" height="180" style="margin-top:16px"></canvas>
     </div>
     <div>
-      <p class="lead"><b>48% of parcels are level</b> (TRI &lt; 0.1) — grass, crop, roofs. As roughness rises, nature takes over: forested fraction climbs from <b>19% on flat ground</b> to <b>86% in intermediately rugged</b> terrain. Buildings vanish: <b>28% → 6%</b>. Parcel area triples — rugged land resists subdivision.</p>
-      <p class="lead" style="font-size:14px;color:var(--mute)">Level ground is Austria's <b>grass + roof + crop</b> belt: 37% grass-dominant, 21% roof-dominant. Once TRI exceeds 0.3, trees take majority — 53% of slightly rugged parcels are tree-dominant, rising to 76% in moderately rugged terrain. The 35 roughest parcels average 50° slope and 476 m elevation — steep gorges and cliff faces.</p>
+      <p class="lead"><b>48% of parcels are level</b> (TRI &lt; 0.1) — grass, crop, roofs at <b>315 m avg elevation</b> and <b>3° avg slope</b>. As roughness rises, nature takes over: forested fraction climbs from <b>19% on flat ground</b> to <b>86% in intermediately rugged</b> terrain. Buildings vanish: <b>28% → 6%</b>. Parcel area triples — rugged land resists subdivision.</p>
+      <p class="lead" style="font-size:14px;color:var(--mute)">Level ground is Austria's <b>grass + roof + crop</b> belt: 37% grass-dominant, 21% roof-dominant. Once TRI exceeds 0.3, trees take majority — 53% of slightly rugged parcels are tree-dominant, rising to 76% in moderately rugged terrain. Mean elevation rises steadily: <b>315 m → 400 m → 558 m</b> as roughness increases. The 35 roughest parcels average <b>50° slope</b> and <b>476 m elevation</b> — steep gorges and cliff faces.</p>
       <table id="triTable" style="margin-top:14px"></table>
       <div class="qgrid" style="margin-top:14px">
         <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=terrain_class%3Dlevel%26min_area%3D5000%26has_buildings%3Dfalse%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">🟢 <span class="n">large level parcels</span> no buildings</a>
@@ -244,14 +244,14 @@ footer a{margin:0 6px}
   </div>
 </section>
 
-<!-- 9. WHERE THE AI DISAGREES -->
+<!-- 9. WHERE THE CLASSIFIERS DISAGREE -->
 <section>
-  <h2>🎯 Where the AI disagrees with itself <span class="tag blue">quality</span></h2>
+  <h2>🎯 Where the classifiers disagree <span class="tag blue">quality</span></h2>
   <div class="tl">RF classifier vs rule-based fallback · 97% agreement, 3% divergence</div>
   <div class="two">
     <canvas id="divChart" height="240"></canvas>
     <div>
-      <p class="lead"><b>117k path↔grass</b> confusions — the biggest disagreement. Unpaved Austrian farm tracks are spectrally identical to mown grass. This concentrates in the <b>Wachau wine country</b> where terraced vineyards, stone walls and narrow paths create a mosaic. The AI disagreement is <b>detecting cultural landscape complexity</b> — a UNESCO World Heritage site.</p>
+      <p class="lead"><b>117k path↔grass</b> confusions — the biggest disagreement. Unpaved Austrian farm tracks are spectrally identical to mown grass. This concentrates in the <b>Wachau wine country</b> where terraced vineyards, stone walls and narrow paths create a mosaic. The classifier disagreement is <b>detecting cultural landscape complexity</b> — a UNESCO World Heritage site.</p>
       <div class="qgrid">
         <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=divergence_pairs%3Dtrue">🔀 All divergence pairs</a>
         <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=divergence%3Dtrue%26min_divergence%3D10%26limit%3D20">⚠️ High-divergence KGs</a>
@@ -448,15 +448,16 @@ fetch('insights/data.json').then(r=>r.json()).then(D=>{
       }
     });
 
-    // Forest+veg fraction line chart
+    // Forest+veg fraction + elevation + slope line chart
     new Chart(document.getElementById('triForest'),{
       type:'line',
       data:{
         labels:triLabels,
         datasets:[
-          {label:'Forested fraction',data:td.map(r=>r.forest*100),borderColor:'#3d8c5b',backgroundColor:'#3d8c5b33',fill:true,tension:.3,pointRadius:5,pointBackgroundColor:'#3d8c5b'},
-          {label:'Vegetated fraction',data:td.map(r=>r.veg*100),borderColor:'#a8ec78',backgroundColor:'#a8ec7822',fill:true,tension:.3,pointRadius:5,pointBackgroundColor:'#a8ec78'},
-          {label:'Avg slope (°)',data:td.map(r=>r.slope),borderColor:CC.blue,borderDash:[4,3],fill:false,tension:.3,pointRadius:4,pointBackgroundColor:CC.blue,yAxisID:'y1'}
+          {label:'Forested %',data:td.map(r=>r.forest*100),borderColor:'#3d8c5b',backgroundColor:'#3d8c5b33',fill:true,tension:.3,pointRadius:5,pointBackgroundColor:'#3d8c5b'},
+          {label:'Vegetated %',data:td.map(r=>r.veg*100),borderColor:'#a8ec78',backgroundColor:'#a8ec7822',fill:true,tension:.3,pointRadius:5,pointBackgroundColor:'#a8ec78'},
+          {label:'Avg slope (°)',data:td.map(r=>r.slope),borderColor:CC.blue,borderDash:[4,3],fill:false,tension:.3,pointRadius:4,pointBackgroundColor:CC.blue,yAxisID:'y1'},
+          {label:'Avg elevation (m)',data:td.map(r=>r.elev),borderColor:CC.warn,borderDash:[6,3],fill:false,tension:.3,pointRadius:4,pointBackgroundColor:CC.warn,pointStyle:'rectRot',yAxisID:'y2'}
         ]
       },
       options:{
@@ -464,7 +465,8 @@ fetch('insights/data.json').then(r=>r.json()).then(D=>{
         scales:{
           x:{grid:{display:false}},
           y:{grid:{color:CC.line},title:{display:true,text:'%'},min:0,max:100,position:'left'},
-          y1:{grid:{display:false},title:{display:true,text:'Slope °'},position:'right',min:0,max:70}
+          y1:{grid:{display:false},title:{display:true,text:'Slope °'},position:'right',min:0,max:70},
+          y2:{display:false,min:200,max:700}
         }
       }
     });
@@ -472,13 +474,13 @@ fetch('insights/data.json').then(r=>r.json()).then(D=>{
     // Detail table
     const triTbl=document.getElementById('triTable');
     if(triTbl){
-      let html='<thead><tr><th>TRI class</th><th>Parcels</th><th>Avg slope</th><th>Top types</th></tr></thead><tbody>';
+      let html='<thead><tr><th>TRI class</th><th>Parcels</th><th>Elev</th><th>Slope</th><th>Top types</th></tr></thead><tbody>';
       for(const r of td){
         const topTypes=(r.dom_types||[]).slice(0,3).map(d=>{
           const total=r.c;
           return d.type+' '+(d.n/total*100).toFixed(0)+'%';
         }).join(', ');
-        html+=`<tr><td style="color:${triColors[r.t]||CC.ac};font-weight:600">${r.t.replace(/_/g,' ')}</td><td>${r.c.toLocaleString()}</td><td>${r.slope}°</td><td style="color:var(--mute)">${topTypes}</td></tr>`;
+        html+=`<tr><td style="color:${triColors[r.t]||CC.ac};font-weight:600">${r.t.replace(/_/g,' ')}</td><td>${r.c.toLocaleString()}</td><td>${r.elev} m</td><td>${r.slope}°</td><td style="color:var(--mute)">${topTypes}</td></tr>`;
       }
       html+='</tbody>';
       triTbl.innerHTML=html;

@@ -676,12 +676,21 @@ def _sync_peer_data():
                         local_manifest = md.get('entries', md)
 
                     added = 0
+                    updated = 0
                     for key, entry in merged_manifest_entries.items():
-                        if key not in local_manifest:
+                        cur = local_manifest.get(key)
+                        if cur is None:
                             local_manifest[key] = entry
                             added += 1
+                            continue
+                        # Overwrite when peer entry is strictly newer.
+                        cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
+                        new_ts = entry.get('uploaded_at') or ''
+                        if new_ts and new_ts > cur_ts:
+                            local_manifest[key] = entry
+                            updated += 1
 
-                    if added > 0:
+                    if added > 0 or updated > 0:
                         # Atomic write: temp file then rename (same pattern as Manifest.save())
                         import tempfile as _tf
                         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -694,7 +703,7 @@ def _sync_peer_data():
                             try: os.unlink(tmp)
                             except OSError: pass
                             raise
-                        log.info('Peer sync: merged %d manifest entries from peers', added)
+                        log.info('Peer sync: merged %d new + %d refreshed manifest entries from peers', added, updated)
                 except Exception as e:
                     log.warning('Peer sync: manifest merge failed: %s', e)
 

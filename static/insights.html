@@ -3,298 +3,438 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>What we've learnt — Austrian Landscape Atlas</title>
+<title>Insights — Austrian Landscape Atlas</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  :root{--bg:#0e1014;--panel:#161a22;--ink:#e8edf2;--mute:#8b95a3;--accent:#7cdca6;--warn:#f5b969;--bad:#ee7878;--line:#262c36}
-  *{box-sizing:border-box}
-  html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,Segoe UI,Inter,Roboto,sans-serif}
-  a{color:var(--accent)}
-  header{padding:60px 24px 30px;text-align:center;border-bottom:1px solid var(--line)}
-  header h1{font-size:38px;margin:0 0 10px;font-weight:700;letter-spacing:-.5px}
-  header h1 .lb{display:inline-block;transform:translateY(2px);margin-right:6px}
-  header p{margin:0;color:var(--mute);max-width:720px;margin:0 auto;font-size:17px}
-  main{max-width:1180px;margin:0 auto;padding:24px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:32px}
-  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
-  .stat .v{font-size:28px;font-weight:700;letter-spacing:-.5px}
-  .stat .l{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-top:4px}
-  .stat .s{font-size:11px;color:var(--mute);margin-top:6px}
-  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-bottom:22px}
-  section h2{margin:0 0 4px;font-size:20px;letter-spacing:-.3px}
-  section h2 .em{font-size:22px;margin-right:8px}
-  section .tl{color:var(--mute);font-size:13px;margin-bottom:18px}
-  .two{display:grid;grid-template-columns:1.2fr 1fr;gap:24px;align-items:start}
-  @media(max-width:760px){.two{grid-template-columns:1fr}}
-  canvas{max-width:100%}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line)}
-  th{color:var(--mute);font-weight:500;text-transform:uppercase;font-size:11px;letter-spacing:.6px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:#252b36;color:var(--mute)}
-  .pill.ok{background:#1d3a2a;color:var(--accent)}
-  .pill.warn{background:#3a2e1a;color:var(--warn)}
-  .pill.bad{background:#3a1e1e;color:var(--bad)}
-  .lead{font-size:17px;line-height:1.6}
-  .lead b{color:var(--accent)}
-  .compass{display:grid;grid-template-columns:repeat(3,60px);grid-template-rows:repeat(3,60px);gap:6px;justify-content:center;margin:10px 0}
-  .cell{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1d2230;border-radius:8px;font-size:11px;color:var(--mute)}
-  .cell b{color:var(--ink);font-size:14px}
-  .cell.center{background:none}
-  footer{text-align:center;padding:30px;color:var(--mute);font-size:13px;border-top:1px solid var(--line);margin-top:30px}
-  .row{display:flex;align-items:baseline;gap:6px;margin:4px 0}
-  .bar{flex:1;height:10px;background:#1d2230;border-radius:6px;overflow:hidden}
-  .bar i{display:block;height:100%;background:linear-gradient(90deg,#7cdca6,#5cbf85)}
-  .legend{font-size:12px;color:var(--mute);margin-top:6px}
+:root{--bg:#0e1014;--panel:#161a22;--ink:#e8edf2;--mute:#8b95a3;--accent:#7cdca6;--warn:#f5b969;--bad:#ee7878;--blue:#6bb3e0;--purple:#b38cdb;--line:#262c36}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,Segoe UI,Inter,Roboto,sans-serif}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+header{padding:52px 24px 28px;text-align:center;border-bottom:1px solid var(--line)}
+header h1{font-size:36px;margin:0 0 10px;font-weight:700;letter-spacing:-.5px}
+header p{margin:0;color:var(--mute);max-width:760px;margin:0 auto;font-size:16px}
+main{max-width:1180px;margin:0 auto;padding:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:32px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.stat .v{font-size:26px;font-weight:700;letter-spacing:-.5px}
+.stat .l{color:var(--mute);font-size:11.5px;text-transform:uppercase;letter-spacing:.6px;margin-top:3px}
+.stat .s{font-size:11px;color:var(--mute);margin-top:5px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-bottom:22px}
+section h2{margin:0 0 4px;font-size:20px;letter-spacing:-.3px}
+section .tl{color:var(--mute);font-size:13px;margin-bottom:16px}
+.two{display:grid;grid-template-columns:1.2fr 1fr;gap:24px;align-items:start}
+@media(max-width:760px){.two{grid-template-columns:1fr}}
+canvas{max-width:100%}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line)}
+th{color:var(--mute);font-weight:500;text-transform:uppercase;font-size:11px;letter-spacing:.5px}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:500}
+.pill.ok{background:#1d3a2a;color:var(--accent)}.pill.bad{background:#3a1e1e;color:var(--bad)}.pill.warn{background:#3a2e1a;color:var(--warn)}
+.lead{font-size:16px;line-height:1.6}
+.lead b{color:var(--accent)}
+.qlink{display:inline-flex;align-items:center;gap:5px;background:#1a2636;border:1px solid #253a50;color:var(--blue);font-size:12.5px;padding:4px 12px;border-radius:20px;margin:3px 3px 3px 0;white-space:nowrap;transition:all .15s}
+.qlink:hover{background:#253a50;border-color:var(--blue);text-decoration:none;color:#fff}
+.qlink .n{font-weight:600;color:var(--ink)}
+.qgrid{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+.compass{display:grid;grid-template-columns:repeat(3,60px);grid-template-rows:repeat(3,60px);gap:6px;justify-content:center;margin:10px 0}
+.cell{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1d2230;border-radius:8px;font-size:11px;color:var(--mute)}
+.cell b{color:var(--ink);font-size:14px}
+.cell.center{background:none}
+footer{text-align:center;padding:30px;color:var(--mute);font-size:13px;border-top:1px solid var(--line);margin-top:30px}
+footer a{margin:0 6px}
+.tag{display:inline-block;padding:1px 9px;border-radius:20px;font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-left:6px;vertical-align:2px}
+.tag.red{background:rgba(238,120,120,.15);color:var(--bad)}.tag.blue{background:rgba(107,179,224,.15);color:var(--blue)}.tag.green{background:rgba(124,220,166,.15);color:var(--accent)}.tag.orange{background:rgba(245,185,105,.15);color:var(--warn)}
 </style>
 </head>
 <body>
 <header>
-  <h1><span class="lb">💡</span>What we've learnt about Austria</h1>
-  <p>An atlas of every Katastralgemeinde, segmented from BEV LiDAR, BEV orthophotos, Sentinel-1/2, ESA WorldCover, Hansen and the Austrian cadastre. Each parcel gets terrain, vegetation, buildings, change and an auto-class. Here's what falls out so far.</p>
+  <h1>💡 What we've learnt about Austria</h1>
+  <p>Every finding links to a live query you can run, filter and map right now.</p>
 </header>
 <main>
 
 <div class="grid" id="hero"></div>
 
+<!-- 1. FOREST LOSS -->
 <section>
-  <h2><span class="em">🌳</span>Land cover by area</h2>
-  <div class="tl">Total area classified across 239 KGs · 3,350 km² · 25 object types collapsed below</div>
-  <div class="two"><canvas id="lc" height="260"></canvas>
-  <div>
-    <p class="lead">Trees alone cover <b>1,593 km²</b> — <b>48%</b> of all classified ground. Crops add 611 km², grass 584 km². Buildings (roofs) take 87 km², roads + paths + parking another 90 km². Austria is overwhelmingly green: even in this lowland-heavy sample (most KGs are NÖ), tree+grass+crop+shrub+hedge make up ~88% of land.</p>
-    <p class="lead" style="color:var(--mute);font-size:14px">3.4M individual trees, 1.6M grass patches, 352k roof segments, 47k vineyard polygons, 12k waterbodies — segmented and classified.</p>
-  </div>
+  <h2>🪓 The 2018–2020 forest loss shock <span class="tag red">critical</span></h2>
+  <div class="tl">Hansen GFC annual loss inside processed KGs · resampled to 1 m² from Hansen 30 m</div>
+  <canvas id="hansen" height="170"></canvas>
+  <div class="two" style="margin-top:16px">
+    <div>
+      <p class="lead"><b>2019 was the worst year on record</b> — 3,400 ha lost in our processed area alone, <b>4× the 2001–2016 average</b>. The shock begins in 2018, peaks in 2019, and remains elevated through 2024 (1,175 ha). This tracks the European bark beetle outbreak (<i>Ips typographus</i>) driven by the 2018 drought.</p>
+      <p class="lead">Disturbance parcels sit at <b>511 m average</b> — 70 m higher than intact forest — squarely in spruce's altitudinal preference band. <b>4,812 parcels</b> are classified as earthwork (salvage logging sites), 945 as recent clearfell.</p>
+    </div>
+    <div>
+      <p class="lead" style="font-size:14px;color:var(--mute)">We can now track this at individual-parcel resolution: which parcels were clear-felled, which are regenerating, which still show active loss.</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Drecent_clearfell%26sort%3Dhansen_recent_5yr_pixels%26sort_dir%3Ddesc%26limit%3D200">🔍 <span class="n">945</span> recent clearfells</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dyoung_forest%26auto_subclass%3Dregenerating%26sort%3Delevation_m%26sort_dir%3Ddesc%26limit%3D200">🌱 <span class="n">5,925</span> regenerating forests</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=min_hansen_recent_5yr%3D20%26min_forested_fraction%3D0.3%26sort%3Dhansen_recent_5yr_pixels%26sort_dir%3Ddesc%26limit%3D200">📉 <span class="n" id="q_defor">4,216</span> deforestation hotspots</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dforest%26auto_subclass%3Drecently_thinned%26sort%3Dhansen_recent_5yr_pixels%26sort_dir%3Ddesc">🪚 <span class="n">32</span> recently thinned</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=hansen%3Dtrue%26year_from%3D2018%26year_to%3D2020%26limit%3D50">📊 KGs by Hansen loss 2018–20</a>
+      </div>
+    </div>
   </div>
 </section>
 
+<!-- 2. LAND COVER -->
 <section>
-  <h2><span class="em">🏘️</span>How parcels live</h2>
-  <div class="tl">Auto-classified from per-parcel terrain, vegetation, buildings and Hansen loss</div>
-  <div class="two"><canvas id="auto" height="320"></canvas>
-  <div>
-    <p class="lead">Of 188k parcels: <b>22%</b> are mixed (multiple uses), <b>19%</b> meadow, <b>11%</b> built-up, <b>11%</b> forest. <b>4,632 parcels are flagged as recent-clearfell or active disturbance</b> — visible mostly in Steiermark/OÖ alpine forest. Only 82 parcels are dominated by water.</p>
-    <p class="lead" style="color:var(--mute);font-size:14px">The classifier finds <b>5,925 "young/regenerating forest"</b> parcels — places where Hansen-loss happened years ago and trees are now under 5m. That's a recovery signal we can track year over year.</p>
-  </div>
-  </div>
-</section>
-
-<section>
-  <h2><span class="em">🪓</span>24 years of forest loss (Hansen)</h2>
-  <div class="tl">Annual forest loss inside processed KGs · 1 px = 900 m²</div>
-  <canvas id="hansen" height="180"></canvas>
-  <p class="lead" style="margin-top:14px">Loss is <b>not flat</b>. The cluster <b>2018–2020</b> stands out: <b>~8,400 ha lost in three years</b> across our processed area — the European bark-beetle/storm wave. <b>2024 alone:</b> 1,175 ha. <b>2019 was the worst year on record</b> at 3,400 ha. Six of the ten worst KGs are in Steiermark; Innerbreitenau (OÖ) leads with ~100 ha lost since 2000.</p>
-</section>
-
-<section>
-  <h2><span class="em">⛰️</span>Where do parcels point?</h2>
-  <div class="tl">Dominant aspect of each parcel · 188k parcels</div>
+  <h2>🌳 Land cover: Austria is 88% green <span class="tag green">composition</span></h2>
+  <div class="tl">25 object types across 3,350 km² · 153k segments classified</div>
   <div class="two">
-    <div id="compass"></div>
+    <canvas id="lc" height="260"></canvas>
     <div>
-      <p class="lead">Eastern slopes win. <b>SE+E+NE = 43%</b> of all parcels — these face the morning sun, the steepest are typically <b>vineyards (S+SW+W = 44% of vineyard parcels)</b> and <b>orchards</b>. The terrain is mostly gentle: <b>83%</b> of parcels are level or nearly-level, only 0.5% are intermediately or moderately rugged. Forested fraction climbs sharply with ruggedness — from <b>19%</b> on level ground to <b>83%+</b> in rugged terrain.</p>
+      <p class="lead">Trees cover <b>1,593 km² (48%)</b>, crops 611 km², grass 584 km². Even in this lowland-heavy sample, tree+grass+crop+shrub = 88% of ground. Roofs take 87 km², roads+paths+parking 90 km².</p>
+      <p class="lead" style="font-size:14px;color:var(--mute)">3.4M trees, 1.6M grass patches, 352k roofs, 47k vineyard polygons — each individually segmented and classified.</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=type%3Dtree%26metric%3Darea%26limit%3D20">🌲 Top KGs by tree area</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=type%3Droof%26metric%3Dfraction%26limit%3D20">🏘️ Most built-up KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_shannon_diversity%3D2.0%26min_ndvi%3D0.4%26min_vegetated_fraction%3D0.6">🌈 High biodiversity KGs</a>
+      </div>
     </div>
   </div>
 </section>
 
+<!-- 3. PARCEL AUTO-CLASSIFICATION -->
 <section>
-  <h2><span class="em">🏗️</span>Buildings: 63k catalogued, 287k newly vectorised</h2>
-  <div class="two"><canvas id="stories" height="260"></canvas>
-  <div>
-    <p class="lead"><b>Pitched roofs (51%)</b> average 10.7 m and 3.6 storeys — village + farmhouse Austria. <b>Flat roofs (49%)</b> average 5.6 m and 1.9 storeys — sheds, garages, barns and modern multi-storey. The mode is 3 storeys (22.8k buildings); 11 buildings are estimated 11 storeys or more. The processor also discovered <b>286,984 new building footprints</b> (6,552 ha) that weren't in the cadastre or have grown since the last update — most clustered around Feldkirch (VLBG), Krems (NÖ) and Vienna's leafier districts.</p>
-  </div>
-  </div>
-</section>
-
-<section>
-  <h2><span class="em">🏔️</span>Earth moved</h2>
-  <div class="tl">Net DTM change between 2022 and 2024 LiDAR campaigns · 239 KGs</div>
-  <p class="lead">Total disturbed volume: <b>106 million m³</b>. Net volume change: <b>−16 million m³</b> (Austria is shedding material on balance). The biggest cuts are in Vorarlberg's Walgau valley — <b>St. Gallenkirch −7.8 Mm³</b>, Nofels −3.4 Mm³, Altenstadt −2.8 Mm³ — a mix of construction, gravel pits and floodplain regrading. The biggest fills are in Kärnten: <b>Lassach +3.9 Mm³</b>, almost certainly a hydro reservoir or quarry refill.</p>
-</section>
-
-<section>
-  <h2><span class="em">🚩</span>What flags taught us about the highest objects</h2>
-  <div class="tl">372k flags raised by the rule auditor across 329k objects · 4 of 1.5M objects flagged manually so far</div>
-  <div class="two"><canvas id="flags" height="320"></canvas>
-  <div>
-    <p class="lead">The auditor catches our mistakes <b>before we report them</b>. Three quarters of all height records are <b>flagged as implausible</b> — and the flags reveal a pattern: the apparent "tallest tree in Austria" at <b>194.8 m</b> in KG 67501-north isn't a tree at all — it's a <b>radio tower next to a hedge that the segmenter merged</b>, and the auditor caught both (<i>tree_height_implausible</i> + <i>hedge_likely_tree_row</i>). Four of the next ten "137.8 m trees" are flagged <i>mast_likely_misclassified</i> — reception masts that the RF thinks are trees because their nDSM is high and narrow.</p>
-    <p class="lead" style="color:var(--mute);font-size:14px"><b>1,853</b> trees and <b>283</b> buildings carry an implausible-height flag. They're our backlog of high-confidence corrections.</p>
-  </div>
-  </div>
-</section>
-
-<section>
-  <h2><span class="em">🌲</span>Tallest objects (raw vs. trusted)</h2>
+  <h2>🏘️ How 188k parcels actually live <span class="tag blue">auto-class</span></h2>
+  <div class="tl">Every parcel gets terrain, vegetation, buildings and Hansen loss → auto-classified into 15 types</div>
   <div class="two">
+    <canvas id="auto" height="320"></canvas>
     <div>
-      <h3 style="margin:0 0 8px;font-size:14px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px">Raw — top of the leaderboard</h3>
-      <table id="tallraw"></table>
-    </div>
-    <div>
-      <h3 style="margin:0 0 8px;font-size:14px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px">After flag filtering — what we believe</h3>
-      <table id="tallclean"></table>
+      <p class="lead"><b>22% mixed</b>, 19% meadow, 12% forest, 11% built-up, 11% shrubland. The "mixed" class is the most Austrian thing: a parcel that is part garden, part orchard, part shed. Then the real stories emerge from the subclasses:</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Ddisturbance%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">🚩 <span class="n" id="q_dist">6,475</span> disturbed parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dcropland%2Cvineyard%2Corchard%26min_area%3D1000%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">🌾 <span class="n" id="q_agri">12,636</span> productive agriculture</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dfarmstead%26auto_subclass%3Dwith_house%26min_area%3D2000%26limit%3D200">🏡 <span class="n" id="q_farm">1,389</span> working farmsteads</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dalpine_meadow%26min_elevation%3D1500%26aspect%3DS%2CSE%2CSW%26sort%3Darea_sqm%26sort_dir%3Ddesc">⛰️ Alpine pastures above 1500 m</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=state%3DWien%26auto_class%3Dmixed%26min_auto_class_confidence%3D0.4">🏙️ Vienna mixed-use parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dwater_body%26sort%3Darea_sqm%26sort_dir%3Ddesc">💧 82 water body parcels</a>
+      </div>
     </div>
   </div>
-  <p class="lead" style="margin-top:14px">Once flagged objects are dropped, every "tallest tree" sits at exactly <b>50.0 m</b> — the natural height ceiling for old-growth Austrian conifers (typically <i>Picea abies</i> in 80–120 yr stands). The processor's measured maximum for clean trees converges on the canopy plateau seen in BEV LiDAR national plots. Tallest believed roof: <b>48.6 m in Krems-Stein (KG 12171)</b> — a riverside tower or church spire.</p>
-  <p class="lead" style="color:var(--mute);font-size:14px">88,779 trees ≥ 30 m have <em>no</em> implausibility flag. They're our giant-tree atlas in waiting.</p>
 </section>
 
+<!-- 4. GIANT TREE ATLAS -->
 <section>
-  <h2><span class="em">🌲</span>The Giant Tree Atlas</h2>
+  <h2>🌲 The Giant Tree Atlas <span class="tag green">discovery</span></h2>
   <div class="tl">7,742 verified trees ≥ 40 m · deduplicated, flag-filtered · click any point</div>
-  <div id="giantmap" style="height:540px;border-radius:10px;overflow:hidden;border:1px solid var(--line)"></div>
-  <div style="display:flex;flex-wrap:wrap;gap:18px;margin-top:14px;align-items:center;font-size:13px;color:var(--mute)">
-    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#a8ec78;margin-right:5px;vertical-align:-2px;box-shadow:0 0 6px #a8ec78"></span>40–44 m</div>
-    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ffcc66;margin-right:5px;vertical-align:-2px;box-shadow:0 0 7px #ffcc66"></span>45–49 m</div>
-    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ff7878;margin-right:5px;vertical-align:-2px;box-shadow:0 0 8px #ff7878"></span>50 m (canopy ceiling)</div>
-    <div><span style="display:inline-block;width:18px;height:10px;border:1.5px dashed #ffd24a;margin-right:5px;vertical-align:-2px"></span>top-30 giant parcels</div>
+  <div id="giantmap" style="height:500px;border-radius:10px;overflow:hidden;border:1px solid var(--line)"></div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;align-items:center;font-size:13px;color:var(--mute)">
+    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#a8ec78;margin-right:4px;vertical-align:-1px"></span>40–44 m</div>
+    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#ffcc66;margin-right:4px;vertical-align:-1px"></span>45–49 m</div>
+    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#ff7878;margin-right:4px;vertical-align:-1px"></span>≥ 50 m (canopy ceiling)</div>
+    <div><span style="display:inline-block;width:16px;height:8px;border:1.5px dashed #ffd24a;margin-right:4px;vertical-align:0"></span>giant parcels</div>
     <div style="flex:1"></div>
     <div id="giantcount"></div>
   </div>
-  <p class="lead" style="margin-top:16px">The clusters tell a story. <b>Wachau and the southern NÖ limestone Alps</b> hold dense pockets of 45 m+ stems — mature mixed-broadleaf in steep north-facing ravines that escaped a century of forestry. <b>Vorarlberg's Bregenzerwald</b> shows another hot-spot of old-growth spruce. Most parcels at the 50 m ceiling sit on <b>SE/E aspects between 350–700 m elevation</b> — enough soil, enough water, just steep enough to be left alone.</p>
-  <p class="lead" style="color:var(--mute);font-size:14px">Each marker is a single segmented crown that survived the auditor (no <i>tree_height_implausible</i>, no <i>mast_likely_misclassified</i>). Heights are nDSM = DSM−DTM at 1 m. The 50 m hard ceiling is a sensor + canopy-physics limit, not a measurement artefact.</p>
+  <div class="two" style="margin-top:14px">
+    <p class="lead">After the auditor strips masts and sensor artefacts, every "tallest tree" converges at <b>50.0 m</b> — the canopy ceiling for old-growth <i>Picea abies</i> in 80–120 yr stands. The clusters tell a story: <b>Wachau's limestone ravines</b> and <b>Bregenzerwald's old-growth spruce</b> hold the densest pockets. Most 50 m stems sit on SE/E aspects between 350–700 m.</p>
+    <div>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=top_features%3Dtrees%26min_confidence%3D0.9%26limit%3D50">🌲 Tallest trees (RF conf > 0.9)</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_tree_count%3D1000%26min_tree_volume%3D10000%26sort%3Dtree_stem_volume_m3%26sort_dir%3Ddesc">🪵 Highest biomass KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=min_forested_fraction%3D0.7%26min_elevation%3D1500%26max_hansen_total%3D10%26sort%3Dforested_fraction%26sort_dir%3Ddesc">🏔️ Undisturbed alpine forest</a>
+      </div>
+    </div>
+  </div>
 </section>
 
+<!-- 5. BUILDINGS -->
 <section>
-  <h2><span class="em">🌱</span>Phenology &amp; greenness</h2>
-  <p class="lead">Mean Sentinel-2 NDVI across processed KGs: <b>0.68</b>. Phenology dominance: <b>145 KGs are crop-dominant</b> (high NDVI amplitude 0.18 — strong spring-green/autumn-brown), <b>69 are pasture</b> (amp 0.17, smoother), only <b>21 are forest-dominant</b> (amp 0.14, evergreen-flat). The auto-class "vineyard" parcels prefer SW/W exposures (44%) — exactly the canonical wine-growing aspect.</p>
+  <h2>🏗️ 287k new buildings the cadastre doesn't know about <span class="tag orange">development</span></h2>
+  <div class="tl">63k catalogued buildings + 287k newly detected · roof type, height, stories estimated from nDSM</div>
+  <div class="two">
+    <canvas id="stories" height="260"></canvas>
+    <div>
+      <p class="lead"><b>Pitched roofs (51%)</b> average 10.7 m / 3.6 storeys — village Austria. <b>Flat roofs (49%)</b> average 5.6 m — sheds, garages, modern builds. Vienna's Josefstadt has new structures averaging <b>18.1 m</b> (6 stories). Vorarlberg's Altenstadt leads in count (9,645) at 8.3 m — suburban sprawl vs urban densification.</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Dapartments%26min_building_stories%3D5%26sort%3Dbuilding_max_height_m%26sort_dir%3Ddesc%26limit%3D100">🏢 <span class="n" id="q_apt">2,618</span> apartment blocks (5+ stories)</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Ddense%26min_buildings%3D3%26min_building_stories%3D4%26sort%3Dbuilding_max_height_m%26sort_dir%3Ddesc">🏙️ Dense urban blocks</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_new_buildings%3D3%26min_new_building_footprint%3D500%26min_new_building_height%3D5%26sort%3Dnew_building_count%26sort_dir%3Ddesc">🚧 New construction hotspots</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=max_building_stories_max%3D2%26max_building_footprint%3D10000%26min_building_pitched_pct%3D80">🏘️ Rural character KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=new_buildings%3Dtrue%26min_count%3D50%26limit%3D50">📊 KGs with 50+ new buildings</a>
+      </div>
+    </div>
+  </div>
 </section>
 
+<!-- 6. ELEVATION GRADIENT -->
 <section>
-  <h2><span class="em">🎯</span>Where we're confident</h2>
-  <p class="lead">RF mean confidence across the fleet: <b>70.9%</b>. Divergence between RF and rule-based fallback is <b>only 3.1%</b> on average — the two heads agree. The biggest disagreements are <i>path → grass</i> (117k cases, narrow tracks bleeding into vegetation) and <i>road → grass</i> (68k). These are now logged and mineable for retraining.</p>
-  <p class="lead">All 239 processed KGs achieve quality grade <b>A</b>. 100% RF-classified, 0% unclassified. The pipeline holds.</p>
+  <h2>⛰️ The elevation story <span class="tag blue">ecology</span></h2>
+  <div class="tl">How landscape character changes with altitude</div>
+  <canvas id="elevChart" height="200"></canvas>
+  <div class="two" style="margin-top:14px">
+    <p class="lead">At <b>200 m</b>: diversity 1.63, flat cropland. At <b>700 m</b>: diversity drops to 1.01 as forest takes over (22k trees/KG vs 3.8k). Above <b>1,700 m</b>: diversity spikes back to 1.69 — alpine meadow, rock, sparse vegetation. NDVI drops from 0.80 at 700 m to 0.63 above treeline.</p>
+    <div>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_elevation_min%3D1500%26min_elevation_max%3D2500%26min_elevation_range%3D800%26terrain_class%3Dhighly_rugged">🏔️ High alpine KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=terrain_class%3Dlevel%26max_elevation%3D300%26min_parcels%3D200%26min_total_area%3D5000000">🌾 Flat agricultural lowlands</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_slope%3D20%26aspect%3DSE%2CS%26min_elevation%3D1000%26max_elevation%3D2000%26min_ndvi%3D0.5">☀️ Steep south-facing alpine meadows</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=max_elevation_min%3D400%26min_elevation_range%3D500%26terrain_class%3Dlevel">🏞️ Deep valley floors</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 7. ASPECT & TERRAIN -->
+<section>
+  <h2>🧭 Where do parcels point? <span class="tag blue">terrain</span></h2>
+  <div class="tl">Dominant aspect of 188k parcels</div>
+  <div class="two">
+    <div id="compass"></div>
+    <div>
+      <p class="lead">Eastern slopes win: <b>SE+E+NE = 43%</b>. Vineyards prefer the warm S+SW+W band. 83% of parcels are level or nearly-level; only 0.5% are rugged. Forested fraction climbs from <b>19% on level ground</b> to <b>83%+ in rugged terrain</b>.</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=has_buildings%3Dtrue%26max_buildings%3D1%26max_building_stories%3D2%26aspect%3DS%2CSE%2CSW%26min_slope%3D17%26min_elevation%3D900%26sort%3Delevation_m%26sort_dir%3Ddesc">⛷️ <span class="n">8</span> alpine chalets</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=aspect%3DS%2CSE%2CSW%26max_slope%3D10%26min_area%3D5000%26has_buildings%3Dtrue%26sort%3Darea_sqm%26sort_dir%3Ddesc">☀️ <span class="n" id="q_solar">589</span> solar-potential parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=terrain_class%3Dlevel%26max_elevation%3D400%26min_vegetated_fraction%3D0.6%26has_buildings%3Dtrue%26max_buildings%3D3%26sort%3Dvegetated_fraction%26sort_dir%3Ddesc">🌿 <span class="n" id="q_garden">5,587</span> suburban gardens</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=dominant_type%3Drock%26min_slope%3D25%26max_vegetated_fraction%3D0.1%26sort%3Dslope_mean_deg%26sort_dir%3Ddesc">🪨 Cliffs & quarries</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 8. EARTH MOVED -->
+<section>
+  <h2>🏔️ 106 million m³ of earth moved <span class="tag orange">temporal</span></h2>
+  <div class="tl">Net DTM change between 2022 and 2024 LiDAR campaigns</div>
+  <div class="two">
+    <div>
+      <p class="lead">Net: <b>−16 million m³</b> — Austria is shedding material on balance. Biggest cuts: Vorarlberg's Walgau valley (<b>St. Gallenkirch −7.8 Mm³</b>). Biggest fills: <b>Lassach +3.9 Mm³</b> (hydro/quarry refill). Rapidly-changing KGs (stability < 0.5) sit at <b>1,613 m avg</b> — it's the alpine construction + erosion band.</p>
+      <p class="lead" style="font-size:14px;color:var(--mute)">207 KGs (87%) are "stable". But the "very stable" ones (>0.9) still have 1,551 avg new buildings — flat terrain absorbs construction without moving the DTM.</p>
+    </div>
+    <div>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_changed_segments%3D20%26min_disturbed_volume%3D5000%26sort%3Dtotal_disturbed_volume_m3%26sort_dir%3Ddesc">💥 Active earthworks</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=max_volume_change%3D-1000%26sort%3Dnet_volume_change_m3%26sort_dir%3Dasc">📉 Erosion / subsidence</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Dearthwork%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">🚜 <span class="n">4,812</span> earthwork parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Dconstruction%26sort%3Darea_sqm%26sort_dir%3Ddesc">🏗️ 17 active construction sites</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 9. WHERE THE AI DISAGREES -->
+<section>
+  <h2>🎯 Where the AI disagrees with itself <span class="tag blue">quality</span></h2>
+  <div class="tl">RF classifier vs rule-based fallback · 97% agreement, 3% divergence</div>
+  <div class="two">
+    <canvas id="divChart" height="240"></canvas>
+    <div>
+      <p class="lead"><b>117k path↔grass</b> confusions — the biggest disagreement. Unpaved Austrian farm tracks are spectrally identical to mown grass. This concentrates in the <b>Wachau wine country</b> where terraced vineyards, stone walls and narrow paths create a mosaic. The AI disagreement is <b>detecting cultural landscape complexity</b> — a UNESCO World Heritage site.</p>
+      <div class="qgrid">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=divergence_pairs%3Dtrue">🔀 All divergence pairs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=divergence%3Dtrue%26min_divergence%3D10%26limit%3D20">⚠️ High-divergence KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=divergence%3Dtrue%26rf_type%3Dpath%26final_type%3Dgrass">🔍 path→grass cases</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=confidence_rank%3Dasc%26limit%3D20">📊 Lowest confidence KGs</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 10. FLAGS & TALLEST -->
+<section>
+  <h2>🚩 What 372k quality flags taught us <span class="tag orange">audit</span></h2>
+  <div class="tl">The rule auditor catches mistakes before we report them</div>
+  <div class="two">
+    <canvas id="flags" height="300"></canvas>
+    <div>
+      <p class="lead">The "tallest tree in Austria" at <b>194.8 m</b>? A <b>radio tower merged with a hedge</b> — the auditor caught both flags. Four of the next ten "137 m trees" are <b>reception masts</b> the RF thinks are trees. After filtering: every tallest tree sits at exactly <b>50.0 m</b> — the natural canopy ceiling.</p>
+      <p class="lead" style="font-size:14px;color:var(--mute)"><b>88,779 trees ≥ 30 m</b> have no implausibility flag. They're the verified giant-tree atlas.</p>
+    </div>
+  </div>
+  <div class="two" style="margin-top:14px">
+    <div>
+      <h3 style="margin:0 0 8px;font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.5px">Raw leaderboard</h3>
+      <table id="tallraw"></table>
+    </div>
+    <div>
+      <h3 style="margin:0 0 8px;font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.5px">After flag filtering</h3>
+      <table id="tallclean"></table>
+    </div>
+  </div>
+</section>
+
+<!-- 11. THE QUESTIONS PEOPLE ASK -->
+<section>
+  <h2>🔎 The questions people actually ask <span class="tag green">explore</span></h2>
+  <div class="tl">Every query runs live against the index in &lt; 50 ms · click any to explore on the map</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+    <div style="background:#111620;border-radius:10px;padding:14px 16px">
+      <div style="font-size:13px;color:var(--accent);font-weight:600;margin-bottom:8px">🏔️ TERRAIN & NATURE</div>
+      <div class="qgrid" style="margin-top:0">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=max_buildings%3D0%26aspect%3DS%2CSW%2CW%26min_roughness%3D2.0%26min_tree_count%3D100%26min_ndvi%3D0.5%26min_confidence%3D0.6">🌿 Wilderness candidates</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dyoung_forest%26min_elevation%3D1000%26sort%3Delevation_m%26sort_dir%3Ddesc">🌱 <span class="n">58</span> young forest > 1000 m</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_slope%3D15%26min_tree_count%3D1000%26sort%3Dtree_canopy_sqm%26sort_dir%3Ddesc">🌲 Steep forested slopes</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/nature&params=min_score%3D70%26limit%3D50">🦎 Nature conservation score > 70</a>
+      </div>
+    </div>
+    <div style="background:#111620;border-radius:10px;padding:14px 16px">
+      <div style="font-size:13px;color:var(--warn);font-weight:600;margin-bottom:8px">🏘️ BUILDINGS & URBAN</div>
+      <div class="qgrid" style="margin-top:0">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_buildings%3D500%26min_building_stories%3D3%26min_building_stories_max%3D5%26sort%3Dbuilding_max_height_m%26sort_dir%3Ddesc">🏢 Dense urban KGs (500+ bldgs)</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_building_max_height%3D20%26min_building_pitched_pct%3D30">🏰 Tall buildings, pitched roofs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/compound&params=min_buildings%3D200%26min_tree_count%3D500%26min_shannon_diversity%3D2.0%26sort%3Dshannon_diversity%26sort_dir%3Ddesc">🌳 Urban + green KGs</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=top_features%3Dnew_buildings%26min_confidence%3D0.75%26limit%3D50">🔍 New buildings, high confidence</a>
+      </div>
+    </div>
+    <div style="background:#111620;border-radius:10px;padding:14px 16px">
+      <div style="font-size:13px;color:var(--blue);font-weight:600;margin-bottom:8px">🌾 AGRICULTURE & LAND USE</div>
+      <div class="qgrid" style="margin-top:0">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dvineyard%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">🍇 <span class="n">1,057</span> vineyard parcels</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=state%3DVorarlberg%26dominant_type%3Dgrass%26min_area%3D10000%26sort%3Darea_sqm%26sort_dir%3Ddesc">🌿 Large grassy parcels (VLBG)</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dcropland%26auto_subclass%3Dfallow%26sort%3Darea_sqm%26sort_dir%3Ddesc">🌱 Fallow cropland</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dorchard%26sort%3Darea_sqm%26sort_dir%3Ddesc">🍎 <span class="n">149</span> orchard parcels</a>
+      </div>
+    </div>
+    <div style="background:#111620;border-radius:10px;padding:14px 16px">
+      <div style="font-size:13px;color:var(--purple);font-weight:600;margin-bottom:8px">📐 SPECIFIC PARCEL HUNTS</div>
+      <div class="qgrid" style="margin-top:0">
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=building_roof_type%3Dpitched%26building_max_stories%3D1%26aspect%3DS%2CSE%2CSW%26min_slope%3D17%26max_area%3D5000%26min_elevation%3D900%26max_hansen_recent_5yr%3D5%26sort%3Delevation_m%26sort_dir%3Ddesc">🇦🇹 The Austrian dream parcel</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=min_forested_fraction%3D0.7%26min_elevation%3D1500%26max_hansen_recent_5yr%3D0%26sort%3Dforested_fraction%26sort_dir%3Ddesc">🌲 Pristine forest > 1500 m</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query&params=top_features%3Dinfrastructure%26type%3Dmast%26min_confidence%3D0.8">📡 Masts (RF conf > 0.8)</a>
+        <a class="qlink" href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Dtree_loss%26sort%3Dhansen_recent_5yr_pixels%26sort_dir%3Ddesc%26limit%3D200">🔥 Active tree loss parcels</a>
+      </div>
+    </div>
+  </div>
 </section>
 
 <footer>
-  <p>3,350 / 84,000 km² done · 239 / 8,440 KGs · the rest is being processed across the peer fleet right now.</p>
-  <p><a href="/">Map</a> · <a href="/process.html">Processor</a> · <a href="/query.html">Query</a> · <a href="/api/v1/docs/llm.txt">API docs</a></p>
+  <p>3,350 / 84,000 km² done · 239 / 8,440 KGs · processing continues across the peer fleet.</p>
+  <p><a href="/">Map</a><a href="/process.html">Processor</a><a href="/query.html">Query Explorer</a><a href="/api/v1/docs/llm.txt">API docs</a></p>
 </footer>
 </main>
 
 <script>
-const CC={fg:'#e8edf2',mute:'#8b95a3',line:'#262c36',ac:'#7cdca6',warn:'#f5b969',bad:'#ee7878'};
+const CC={fg:'#e8edf2',mute:'#8b95a3',line:'#262c36',ac:'#7cdca6',warn:'#f5b969',bad:'#ee7878',blue:'#6bb3e0'};
 Chart.defaults.color=CC.fg;Chart.defaults.borderColor=CC.line;Chart.defaults.font.family='-apple-system,Segoe UI,Inter,sans-serif';
+Chart.defaults.font.size=12;
 
 fetch('insights/data.json').then(r=>r.json()).then(D=>{
   const h=D.headline;
-  const fmt=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(0)+'k':n;
+  const fmt=(n,d)=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(d||1)+'M':n>=1e3?(n/1e3).toFixed(d||0)+'k':n;
   document.getElementById('hero').innerHTML=[
-    ['Parcels indexed',fmt(h.parcels),h.kg_processed+' / '+fmt(h.kg_total)+' KGs · grade A'],
-    ['Area classified',fmt(h.area_km2)+' km²','BEV 1m DTM/DSM + 0.2m ortho'],
+    ['Parcels indexed',fmt(h.parcels),h.kg_processed+' / '+fmt(h.kg_total)+' KGs'],
+    ['Area classified',fmt(h.area_km2,1)+' km\u00b2','1 m LiDAR + 0.2 m ortho'],
     ['Trees segmented',fmt(h.tree_count),fmt(h.tree_volume_m3)+' m³ stem volume'],
-    ['New buildings found',fmt(h.new_buildings),fmt(h.new_bldg_ha)+' ha not in cadastre'],
-    ['Forest lost since 2000',fmt(h.hansen_loss_ha_total)+' ha','Hansen GFC — in our processed KGs'],
-    ['Quality flags raised',fmt(h.flags_total),fmt(h.flagged_objects)+' objects affected'],
-    ['RF confidence',(h.rf_mean_conf*100).toFixed(0)+'%',h.rf_diverged_pct+'% disagree with rules'],
-    ['Net earth moved','−'+fmt(Math.abs(h.net_volume_change_m3))+' m³',fmt(h.disturbed_volume_m3)+' m³ disturbed total'],
+    ['New buildings',fmt(h.new_buildings),fmt(h.new_bldg_ha)+' ha not in cadastre'],
+    ['Forest lost since 2000',fmt(h.hansen_loss_ha_total)+' ha','Hansen GFC — processed KGs'],
+    ['Flags raised',fmt(h.flags_total),fmt(h.flagged_objects)+' objects affected'],
+    ['RF confidence',(h.rf_mean_conf*100).toFixed(0)+'%',h.rf_diverged_pct+'% divergence'],
+    ['Net earth moved','−'+fmt(Math.abs(h.net_volume_change_m3))+' m³',fmt(h.disturbed_volume_m3)+' m³ total'],
   ].map(([l,v,s])=>`<div class="stat"><div class="v">${v}</div><div class="l">${l}</div><div class="s">${s}</div></div>`).join('');
 
-  // Land cover
+  // --- Hansen ---
+  new Chart(document.getElementById('hansen'),{type:'bar',data:{labels:D.hansen.map(r=>r.yr),datasets:[{label:'hectares',data:D.hansen.map(r=>r.ha),backgroundColor:D.hansen.map(r=>r.yr>=2018&&r.yr<=2020?CC.bad:r.ha>900?CC.warn:CC.ac),borderRadius:2}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{grid:{color:CC.line},title:{display:true,text:'hectares lost'}}}}});
+
+  // --- Land cover ---
   const lc=D.lc.filter(r=>r.area_km2>=0.5);
   new Chart(document.getElementById('lc'),{type:'bar',data:{labels:lc.map(r=>r.object_type),datasets:[{label:'km²',data:lc.map(r=>r.area_km2),backgroundColor:CC.ac}]},options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{type:'logarithmic',grid:{color:CC.line},title:{display:true,text:'km² (log)'}},y:{grid:{display:false}}}}});
 
-  // Auto class
-  const colors={forest:'#3d8c5b',young_forest:'#7cdca6',wooded:'#5fa67c',meadow:'#c4d96b',alpine_meadow:'#dde58a',cropland:'#e8c562',vineyard:'#a566c9',orchard:'#d77ec9',shrubland:'#9bb061',built_up:'#cf6868',farmstead:'#dd8866',infrastructure:'#888',disturbance:'#e0524d',mixed:'#6b9bd1',water_body:'#4ab0d6'};
-  new Chart(document.getElementById('auto'),{type:'doughnut',data:{labels:D.auto.map(r=>r.auto_class),datasets:[{data:D.auto.map(r=>r.c),backgroundColor:D.auto.map(r=>colors[r.auto_class]||'#888'),borderColor:CC.line,borderWidth:2}]},options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:12}}}}}});
+  // --- Auto class donut ---
+  const acColors={forest:'#3d8c5b',young_forest:'#7cdca6',wooded:'#5fa67c',meadow:'#c4d96b',alpine_meadow:'#dde58a',cropland:'#e8c562',vineyard:'#a566c9',orchard:'#d77ec9',shrubland:'#9bb061',built_up:'#cf6868',farmstead:'#dd8866',infrastructure:'#888',disturbance:'#e0524d',mixed:'#6b9bd1',water_body:'#4ab0d6'};
+  new Chart(document.getElementById('auto'),{type:'doughnut',data:{labels:D.auto.map(r=>r.auto_class),datasets:[{data:D.auto.map(r=>r.c),backgroundColor:D.auto.map(r=>acColors[r.auto_class]||'#888'),borderColor:CC.line,borderWidth:2}]},options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}}}}});
 
-  // Hansen
-  new Chart(document.getElementById('hansen'),{type:'bar',data:{labels:D.hansen.map(r=>r.yr),datasets:[{label:'hectares lost',data:D.hansen.map(r=>r.ha),backgroundColor:D.hansen.map(r=>r.yr>=2018&&r.yr<=2020?CC.bad:r.ha>9000?CC.warn:CC.ac)}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{grid:{color:CC.line},title:{display:true,text:'hectares'}}}}});
+  // --- Stories ---
+  new Chart(document.getElementById('stories'),{type:'bar',data:{labels:D.stories.map(r=>r.s+' st'),datasets:[{label:'buildings',data:D.stories.map(r=>r.c),backgroundColor:CC.ac,borderRadius:2}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{grid:{color:CC.line}}}}});
 
-  // Compass
+  // --- Elevation gradient ---
+  if(D.elev_bands){
+    const eb=D.elev_bands;
+    new Chart(document.getElementById('elevChart'),{
+      type:'bar',
+      data:{
+        labels:eb.map(r=>r.band+'m'),
+        datasets:[
+          {label:'Avg trees/KG',data:eb.map(r=>r.trees),backgroundColor:'#3d8c5b',yAxisID:'y',borderRadius:2},
+          {label:'Shannon diversity',data:eb.map(r=>r.diversity),type:'line',borderColor:CC.blue,backgroundColor:CC.blue+'33',yAxisID:'y1',tension:.3,pointRadius:4,pointBackgroundColor:CC.blue,fill:true}
+        ]
+      },
+      options:{
+        plugins:{legend:{labels:{boxWidth:12}}},
+        scales:{
+          x:{grid:{display:false}},
+          y:{grid:{color:CC.line},title:{display:true,text:'Trees/KG'},position:'left'},
+          y1:{grid:{display:false},title:{display:true,text:'Diversity'},position:'right',min:0.8,max:2.0}
+        }
+      }
+    });
+  }
+
+  // --- Compass ---
   const aspMap={};D.aspect.forEach(r=>{aspMap[r.a]=r.c});
   const ord=[['NW','N','NE'],['W','center','E'],['SW','S','SE']];
   const max=Math.max(...Object.values(aspMap));
   document.getElementById('compass').innerHTML='<div class="compass">'+ord.flat().map(k=>{
     if(k==='center')return '<div class="cell center"></div>';
-    const v=aspMap[k]||0;const pct=(v/max*100).toFixed(0);
+    const v=aspMap[k]||0;
     return `<div class="cell" style="background:linear-gradient(135deg,#1d2230,rgba(124,220,166,${v/max*0.55}))"><b>${k}</b>${(v/1000).toFixed(1)}k</div>`;
-  }).join('')+'</div><div class="legend">Each cell shows parcel count by dominant aspect — eastern slopes (SE/E/NE) clearly dominate.</div>';
+  }).join('')+'</div>';
 
-  // Stories
-  new Chart(document.getElementById('stories'),{type:'bar',data:{labels:D.stories.map(r=>r.s+' st'),datasets:[{label:'buildings',data:D.stories.map(r=>r.c),backgroundColor:CC.ac}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false},title:{display:true,text:'estimated stories'}},y:{grid:{color:CC.line},title:{display:true,text:'count'}}}}});
+  // --- Divergence ---
+  if(D.divergence){
+    const dv=D.divergence.filter(d=>d.total>50);
+    new Chart(document.getElementById('divChart'),{
+      type:'bar',
+      data:{
+        labels:dv.map(r=>r.rf_type+' → '+r.final_type),
+        datasets:[{label:'disagreements',data:dv.map(r=>r.total),backgroundColor:dv.map(r=>r.total>10000?CC.bad:r.total>1000?CC.warn:CC.blue),borderRadius:2}]
+      },
+      options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{type:'logarithmic',grid:{color:CC.line}},y:{grid:{display:false}}}}
+    });
+  }
 
-  // Flags
-  new Chart(document.getElementById('flags'),{type:'bar',data:{labels:D.flags.map(r=>r.f.replace(/_/g,' ')),datasets:[{label:'count',data:D.flags.map(r=>r.c),backgroundColor:D.flags.map(r=>r.f.includes('implausible')||r.f.includes('mismatch')?CC.bad:r.f.includes('low')||r.f.includes('tiny')?CC.warn:CC.ac)}]},options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{grid:{color:CC.line},title:{display:true,text:'flagged objects'}},y:{grid:{display:false}}}}});
+  // --- Flags ---
+  new Chart(document.getElementById('flags'),{type:'bar',data:{labels:D.flags.map(r=>r.f.replace(/_/g,' ')),datasets:[{label:'count',data:D.flags.map(r=>r.c),backgroundColor:D.flags.map(r=>r.f.includes('implausible')||r.f.includes('mismatch')?CC.bad:r.f.includes('low')||r.f.includes('tiny')?CC.warn:CC.ac),borderRadius:2}]},options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{grid:{color:CC.line}},y:{grid:{display:false}}}}});
 
-  // Tall tables
-  const mkRow=r=>`<tr><td>${r.obj_type}</td><td><b>${r.h} m</b></td><td>${r.kg_code}</td><td>${r.flags?'<span class="pill bad">⚠ '+r.flags.split(';').length+' flag(s)</span>':'<span class="pill ok">clean</span>'}</td></tr>`;
-  document.getElementById('tallraw').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.tall.slice(0,10).map(mkRow).join('')+'</tbody>';
-  document.getElementById('tallclean').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.clean_tall.map(mkRow).join('')+'</tbody>';
+  // --- Tall tables ---
+  const mkRow=r=>`<tr><td>${r.obj_type}</td><td><b>${r.h} m</b></td><td>${r.kg_code}</td><td>${r.flags?'<span class="pill bad">⚠ '+r.flags.split(';').length+'</span>':'<span class="pill ok">✓</span>'}</td></tr>`;
+  document.getElementById('tallraw').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th></th></tr></thead><tbody>'+D.tall.slice(0,8).map(mkRow).join('')+'</tbody>';
+  document.getElementById('tallclean').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th></th></tr></thead><tbody>'+D.clean_tall.map(mkRow).join('')+'</tbody>';
+
   initGiantMap();
 });
 
 function initGiantMap(){
-  window._giantMap = null;
   const map=L.map('giantmap',{zoomControl:true,scrollWheelZoom:true}).setView([47.95,14.8],7);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
     attribution:'© OpenStreetMap, © CARTO',subdomains:'abcd',maxZoom:18
   }).addTo(map);
-  window._giantMap=map;
-
-  // SVG glow filter
-  const ensureFilter=()=>{
-    map.whenReady(()=>{
-      const svg=document.querySelector('#giantmap svg');
-      if(!svg||svg.querySelector('#glow'))return;
-      const NS='http://www.w3.org/2000/svg';
-      const defs=document.createElementNS(NS,'defs');
-      defs.innerHTML=`<filter id="glow" x="-200%" y="-200%" width="500%" height="500%">
-        <feGaussianBlur stdDeviation="3.5" result="b"/>
-        <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-      </filter>`;
-      svg.insertBefore(defs,svg.firstChild);
-      const g=svg.querySelector('g');
-      if(g)g.setAttribute('filter','url(#glow)');
-    });
-  };
 
   const renderer=L.svg({padding:0.5});
   fetch('insights/giants.json').then(r=>r.json()).then(D=>{
     const rows=D.rows;
     const layer=L.layerGroup().addTo(map);
     const color=h=>h>=50?'#ff7878':h>=45?'#ffcc66':'#a8ec78';
-    const radius=h=>{const z=map.getZoom();const base=h>=50?6:h>=45?4.2:2.8;return base+Math.max(0,(z-7))*1.1;};
+    const radius=h=>{const z=map.getZoom();const base=h>=50?5.5:h>=45?3.8:2.5;return base+Math.max(0,(z-7))*1.1;};
     const markers=[];
     for(const r of rows){
       const [h,lat,lon,a,kg,ref]=r;
       const m=L.circleMarker([lat,lon],{
-        renderer:renderer,
-        radius:radius(h),color:color(h),fillColor:color(h),
+        renderer,radius:radius(h),color:color(h),fillColor:color(h),
         fillOpacity:0.85,weight:0,stroke:false
       });
       markers.push([m,h]);
       m.bindPopup(`<div style="font:13px sans-serif"><b>${h.toFixed(1)} m tree</b><br>area: ${a.toLocaleString()} m²<br>KG: <a href="/?kg=${kg}">${kg}</a><br><a href="/query.html?obj_ref=${encodeURIComponent(ref)}">flag explorer ↗</a></div>`);
       m.addTo(layer);
     }
-    document.getElementById('giantcount').textContent=`${rows.length.toLocaleString()} trees plotted`;
+    document.getElementById('giantcount').textContent=`${rows.length.toLocaleString()} trees`;
     map.on('zoomend',()=>{for(const [m,h] of markers)m.setRadius(radius(h));});
-    ensureFilter();
   });
 
-  // Top-giant parcel polygons (real boundaries from vertex_heights)
   fetch('insights/giant_parcels.json').then(r=>r.json()).then(D=>{
     const pLayer=L.layerGroup().addTo(map);
     for(const p of D.parcels){
       const ring=p.ring.map(([lon,lat])=>[lat,lon]);
       const poly=L.polygon(ring,{
-        color:'#ffe27a', weight:1.4, fill:true, fillColor:'#ffd24a',
-        fillOpacity:0.07, opacity:0.85, dashArray:'3,4'
+        color:'#ffe27a',weight:1.4,fill:true,fillColor:'#ffd24a',
+        fillOpacity:0.07,opacity:0.85,dashArray:'3,4'
       });
-      const elevTxt=p.elev_min?`${Math.round(p.elev_min)}–${Math.round(p.elev_max)} m`:'—';
-      poly.bindPopup(`<div style="font:13px sans-serif;min-width:200px">
-        <div style="font-size:14px"><b>🌲 ${p.h.toFixed(1)} m giant</b></div>
-        <div style="color:#666;font-size:11px;margin-bottom:6px">parcel ${p.parcel_id}</div>
-        <table style="font-size:12px;border-collapse:collapse">
-          <tr><td style="color:#888;padding:1px 8px 1px 0">area</td><td><b>${(p.area_sqm/1e4).toFixed(2)} ha</b></td></tr>
-          <tr><td style="color:#888">elevation</td><td>${elevTxt}</td></tr>
-          <tr><td style="color:#888">aspect</td><td>${p.aspect||'—'}</td></tr>
-          <tr><td style="color:#888">terrain</td><td>${(p.terrain||'').replace(/_/g,' ')}</td></tr>
-          <tr><td style="color:#888">forested</td><td>${p.forested?Math.round(p.forested*100)+'%':'—'}</td></tr>
-        </table>
-        <div style="margin-top:6px"><a href="/?kg=${p.kg_code}">open KG ↗</a> · <a href="/query.html?obj_ref=${encodeURIComponent(p.kg_code+':parcel:'+p.parcel_id)}">flags ↗</a></div>
-      </div>`);
+      poly.bindPopup(`<div style="font:13px sans-serif"><b>🌲 ${p.h.toFixed(1)} m</b> · ${p.parcel_id}<br>${(p.area_sqm/1e4).toFixed(2)} ha · ${p.aspect||'—'} · ${Math.round(p.forested*100)}% forested<br><a href="/?kg=${p.kg_code}">open KG ↗</a></div>`);
       poly.addTo(pLayer);
     }
   });

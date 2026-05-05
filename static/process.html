@@ -1088,6 +1088,19 @@ function updateCards(d) {
       _np.toLocaleString() + ' parcels · ' +
       _na.toLocaleString(undefined,{maximumFractionDigits:0}) + ' km²</span>';
   }
+  // Director peer counts (frontier / cache-only).
+  const _dd = (typeof _directorData !== 'undefined') ? _directorData : null;
+  if (_dd) {
+    const parA = (_dd.parallel_frontiers_active || []).length;
+    const parM = _dd.max_parallel_frontiers || 0;
+    const coA = _dd.cache_only_running || 0;
+    const coM = _dd.max_cache_only_peers || 0;
+    if (parM || coM) {
+      pdet += (pdet ? ' · ' : '') +
+        '<span style="opacity:0.75">frontier <b>' + parA + '</b>/' + parM +
+        ' · cache-only <b>' + coA + '</b>/' + coM + '</span>';
+    }
+  }
   document.getElementById('cProgDet').innerHTML = pdet || '—';
 
   // Failed KG tags in progress card

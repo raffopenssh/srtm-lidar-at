@@ -56,6 +56,10 @@ _RETRYABLE_PATTERNS = (
     "Read error at row",
     "Read failed",
     "response_code=0",
+    # GDAL surfaces non-TIFF responses (HTML 5xx pages, truncated bodies)
+    # as 'not recognized as being in a supported file format'.  Treat as
+    # transient: a retry / proxy rotation usually fetches the real TIFF.
+    "not recognized as being in a supported file format",
 )
 
 

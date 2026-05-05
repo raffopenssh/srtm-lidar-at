@@ -4899,9 +4899,11 @@ def admin_update():
         # cache <hash>.npz: Permission denied". Idempotent — only chowns
         # files actually owned by another uid.
         try:
-            data_dir = str(Path(repo) / 'data')
-            sp.run(['sudo', 'chown', '-R', 'exedev:exedev', data_dir],
-                   capture_output=True, timeout=60)
+            for sub in ('data', 'rf_training_data'):
+                p = Path(repo) / sub
+                if p.exists():
+                    sp.run(['sudo', 'chown', '-R', 'exedev:exedev', str(p)],
+                           capture_output=True, timeout=120)
         except Exception as _e:
             log.warning('data/ chown failed: %s', _e)
         # Install / refresh systemd watchdog units (idempotent).  These

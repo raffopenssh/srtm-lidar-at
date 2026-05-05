@@ -3701,6 +3701,8 @@ function renderDirector(d) {
     const maxPar = d.max_parallel_frontiers || 0;
     const strips = (d.cached_lat_strips || []).length;
     const parActive = (d.parallel_frontiers_active || []).length;
+    const coRun = d.cache_only_running || 0;
+    const coMax = d.max_cache_only_peers || 0;
     const cmCount = d.cache_miss_count || 0;
     // Server-friendliness throttle pill
     let capHtml = '';
@@ -3722,7 +3724,8 @@ function renderDirector(d) {
     }
     cap.innerHTML = '🔑 <b>' + valid + '/' + total + '</b> valid creds · ⚡ max parallel frontiers: <b>' + maxPar + '</b> (need ' + per + ' each)' +
       ' · 🗺️ cached strips: <b>' + strips + '</b>' +
-      (parActive ? ' · → running parallel: <b>' + parActive + '</b>' : '') +
+      ' · 🛰️ frontiers: <b>' + parActive + '</b>/<b>' + maxPar + '</b>' +
+      ' · 💾 cache-only: <b>' + coRun + '</b>/<b>' + coMax + '</b>' +
       capHtml +
       (cmCount ? ' · ⚠️ <span style="color:var(--yellow)" title="KGs excluded from cache-only whitelist until their Zenodo strip updates">' + cmCount + ' cache-miss KGs</span>' : '');
   }

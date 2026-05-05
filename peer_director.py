@@ -372,9 +372,22 @@ def _default_peers_config() -> dict:
 
 
 def load_peers_config() -> dict:
-    """Load or create peers config."""
+    """Load or create peers config.
+
+    Always passes through ``director_ha.sanitise_peers_json`` first to
+    repair URL corruption before any caller (director loop, dashboard,
+    snapshot builder) sees it.
+    """
     if PEERS_CONFIG.exists():
         try:
+            import director_ha as _dha  # local import to avoid cycle
+            try:
+                rep = _dha.sanitise_peers_json()
+                if rep.get('changes'):
+                    log.warning('load_peers_config: sanitised peers.json: %s',
+                                rep['changes'])
+            except Exception as e:
+                log.warning('load_peers_config: sanitise failed: %s', e)
             return json.loads(PEERS_CONFIG.read_text())
         except Exception:
             pass

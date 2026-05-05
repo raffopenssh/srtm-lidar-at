@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -74,6 +75,98 @@ WATCHDOG_MISS_THRESHOLD = 3      # consecutive misses → shadow takes over
 WATCHDOG_TIMEOUT = (3, 5)        # (connect, read)
 SHADOW_SYNC_INTERVAL = 30        # seconds between snapshot pushes
 HEARTBEAT_GRACE = 90             # seconds before director is considered dead
+
+
+# ── Peer-URL canonicalisation ───────────────────────────────────
+#
+# Every peer's URL is fully determined by its id. ``primary`` lives at
+# ``srtm-lidar-at.exe.xyz``; ``atN`` lives at ``srtm-lidar-atN.exe.xyz``.
+# Anything else in peers.json is corruption (cascading-handover bug, manual
+# edit, propagated stale snapshot, ...) and must be repaired before it can
+# spread.  See the split-brain incident note in AGENTS.md.
+
+def canonical_peer_url(peer_id: str | None) -> str | None:
+    """Return the canonical URL for ``peer_id`` or None if unknown.
+
+    ``primary`` → https://srtm-lidar-at.exe.xyz:8000
+    ``atNNN``  → https://srtm-lidar-atNNN.exe.xyz:8000
+    Any other id (custom deploy, hand-rolled peer): unknown → None,
+    leave the existing URL alone.
+    """
+    if not peer_id:
+        return None
+    if peer_id == 'primary':
+        return 'https://srtm-lidar-at.exe.xyz:8000'
+    if re.match(r'^at\d+$', peer_id):
+        return f'https://srtm-lidar-{peer_id}.exe.xyz:8000'
+    return None
+
+
+def sanitise_peers_json(*, allow_local_url_none: bool = True,
+                       me: str | None = None) -> dict:
+    """Enforce canonical URLs in ``peers.json``. Returns a report dict.
+
+    * Every peer with a recognised id gets its URL reset to the canonical
+      form derived from the id, EXCEPT the local entry which may carry
+      ``url=None`` (the canonical local marker).
+    * Peers with unrecognised ids are left untouched.
+    * Duplicate entries (same id appearing twice) are collapsed to one.
+    * Idempotent and safe to call repeatedly.
+    """
+    info: dict = {'changes': [], 'errors': []}
+    pj = DATA_DIR / 'peers.json'
+    try:
+        cfg = json.loads(pj.read_text())
+    except Exception as e:
+        info['errors'].append(f'read: {e}')
+        return info
+    if not isinstance(cfg, dict) or not isinstance(cfg.get('peers'), list):
+        info['errors'].append('peers.json structure invalid')
+        return info
+    if me is None:
+        me = self_id()
+    seen: dict = {}
+    deduped: list = []
+    for p in cfg['peers']:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get('id')
+        if not pid:
+            continue
+        if pid in seen:
+            # Merge: prefer the entry with non-None URL or more recent fields.
+            prev = seen[pid]
+            if prev.get('url') is None and p.get('url') is not None:
+                idx = deduped.index(prev)
+                deduped[idx] = p
+                seen[pid] = p
+            info['changes'].append(f'dedup duplicate entry for {pid}')
+            continue
+        seen[pid] = p
+        deduped.append(p)
+    cfg['peers'] = deduped
+    for p in deduped:
+        pid = p.get('id')
+        url = p.get('url')
+        canon = canonical_peer_url(pid)
+        if canon is None:
+            continue  # unrecognised id, leave alone
+        if pid == me and allow_local_url_none:
+            if url not in (None, canon):
+                info['changes'].append(
+                    f'{pid}: url={url!r} ≠ None (local) and ≠ canon → None')
+                p['url'] = None
+            # otherwise keep whatever it is (None or canon both fine)
+            continue
+        if url != canon:
+            info['changes'].append(f'{pid}: {url!r} → {canon}')
+            p['url'] = canon
+    if info['changes']:
+        try:
+            _atomic_write(pj, json.dumps(cfg, indent=2))
+        except Exception as e:
+            info['errors'].append(f'write: {e}')
+    return info
 
 
 # ── Self identity ────────────────────────────────────────────────
@@ -192,6 +285,16 @@ def _admin_headers() -> dict:
 
 def build_snapshot() -> dict:
     """Read every snapshot file from disk and return a JSON-safe dict."""
+    # Sanitise peers.json BEFORE reading it into the snapshot. Otherwise
+    # any corruption (cascading-handover URL drift, manual edit) would
+    # propagate to the shadow on the next push.
+    try:
+        sa = sanitise_peers_json()
+        if sa.get('changes'):
+            log.warning('build_snapshot: sanitised peers.json: %s',
+                        sa['changes'])
+    except Exception as e:
+        log.warning('build_snapshot: peers.json sanitise failed: %s', e)
     snap: dict[str, dict | str | None] = {}
     for name in SNAPSHOT_FILES:
         p = DATA_DIR / name
@@ -363,6 +466,18 @@ def _normalise_local_identity_in_peers(prev_director_url: str | None) -> dict:
         cfg = None
     if isinstance(cfg, dict) and isinstance(cfg.get('peers'), list):
         peers = cfg['peers']
+        # 0. Hard-canonicalise every recognised peer's URL. This is the
+        #    last line of defence against URL drift propagated through
+        #    snapshots from a previously-corrupted director.
+        for p in peers:
+            pid = p.get('id')
+            if pid == me:
+                continue
+            canon = canonical_peer_url(pid)
+            if canon and p.get('url') != canon:
+                info['changes'].append(
+                    f'canonicalise {pid}: {p.get("url")!r} → {canon}')
+                p['url'] = canon
         # 1. Promote our own entry to url=None.
         promoted = False
         for p in peers:

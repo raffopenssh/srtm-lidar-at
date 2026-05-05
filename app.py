@@ -118,6 +118,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/director/peers',  # POST/PUT/DELETE; GET also requires token (contains URLs)
     '/api/v1/director/throttle',
     '/api/v1/director/update_peers',
+    '/api/v1/director/heal_peers_json',
     '/api/v1/director/restart_peer',
     '/api/v1/director/handover',
     '/api/v1/director/takeover',
@@ -4596,6 +4597,47 @@ def director_update_peers():
     })
 
 
+@app.route('/api/v1/director/heal_peers_json', methods=['POST'])
+def director_heal_peers_json():
+    """Run the peers.json sanitiser locally AND on every reachable peer.
+
+    Use after a suspected cascading-handover or split-brain incident.
+    Idempotent: peers with already-canonical URLs report no changes.
+    """
+    import director_ha as dha
+    results: dict = {}
+    # Local first.
+    try:
+        results['local'] = dha.sanitise_peers_json()
+    except Exception as e:
+        results['local'] = {'error': str(e)}
+    # Fan out to peers.
+    try:
+        cfg = pd.load_peers_config()
+    except Exception as e:
+        results['_fanout_error'] = str(e)
+        return jsonify(results)
+    tok = _current_admin_token()
+    headers = {'X-Admin-Token': tok} if tok else {}
+    for p in (cfg.get('peers') or []):
+        pid = p.get('id')
+        url = p.get('url')
+        if not pid or pid == dha.self_id() or not url:
+            continue
+        try:
+            r = requests.post(
+                url.rstrip('/') + '/api/v1/admin/heal_peers_json',
+                headers=headers, timeout=10)
+            try:
+                results[pid] = r.json()
+            except Exception:
+                results[pid] = {'http': r.status_code,
+                                'body': r.text[:200]}
+        except Exception as e:
+            results[pid] = {'error': str(e)}
+    return jsonify(results)
+
+
 @app.route('/api/v1/admin/update', methods=['POST'])
 def admin_update():
     """Git pull and restart the web server (called by director on peers).
@@ -5341,6 +5383,21 @@ def admin_disable_autostart():
         # Mask prevents manual start too — use unmask to re-enable
         # sp.run(['sudo', 'systemctl', 'mask', 'austria_processor'], ...)
         return jsonify({'status': 'disabled'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/admin/heal_peers_json', methods=['POST'])
+def admin_heal_peers_json():
+    """Run the peers.json sanitiser on this host and return the report.
+
+    Idempotent. Repairs canonical-URL drift (cascading-handover bug,
+    stale snapshot propagation, manual edit). Safe to call on any VM.
+    """
+    try:
+        import director_ha as dha
+        rep = dha.sanitise_peers_json()
+        return jsonify(rep)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

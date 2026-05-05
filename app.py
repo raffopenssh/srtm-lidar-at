@@ -8446,6 +8446,74 @@ def _seg_cache_load(cache_key: str):
         return None
 
 
+_SEG_SHARE_CACHE_DIR = _SEG_CACHE_DIR / 'shares'
+_SEG_SHARE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_SEG_SHARE_CACHE_TTL = 30 * 86400  # 30 days
+_SEG_SHARE_CACHE_MAX = 200          # LRU cap on per-share label files
+
+def _seg_share_cache_path(share_id: str) -> Path:
+    """Per-share label cache (persists across srv restarts and seg cache eviction)."""
+    safe = ''.join(c for c in share_id if c.isalnum() or c in ('-', '_'))[:64]
+    return _SEG_SHARE_CACHE_DIR / f'share_{safe}.pkl'
+
+def _seg_share_cache_save(share_id: str, labels, objects, mask, transform, shape_hw, ndsm):
+    """Persist labels keyed by share_id so the share's overlay is instant on cold start."""
+    if not share_id:
+        return
+    payload = {
+        'share_id': share_id,
+        'labels': labels,
+        'objects': objects,
+        'mask': mask,
+        'transform': tuple(transform)[:6] if hasattr(transform, '__iter__') else transform,
+        'shape': shape_hw,
+        'ndsm': ndsm,
+        'ts': time.time(),
+    }
+    def _do_save():
+        try:
+            p = _seg_share_cache_path(share_id)
+            tmp = p.with_suffix('.tmp')
+            with open(tmp, 'wb') as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.rename(p)
+            log.info("seg_share_cache: saved %s (%.1f MB)", share_id, p.stat().st_size / 1e6)
+            entries = sorted(_SEG_SHARE_CACHE_DIR.glob('share_*.pkl'),
+                             key=lambda f: f.stat().st_mtime)
+            for old in entries[:-_SEG_SHARE_CACHE_MAX]:
+                old.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("seg_share_cache: save failed for %s: %s", share_id, e)
+    threading.Thread(target=_do_save, daemon=True).start()
+
+def _seg_share_cache_load(share_id: str):
+    """Load labels stored for this share. Refreshes mtime on hit so LRU keeps it warm."""
+    if not share_id:
+        return None
+    try:
+        p = _seg_share_cache_path(share_id)
+        if not p.exists():
+            return None
+        if time.time() - p.stat().st_mtime > _SEG_SHARE_CACHE_TTL:
+            p.unlink(missing_ok=True)
+            return None
+        with open(p, 'rb') as f:
+            data = pickle.load(f)
+        from rasterio.transform import Affine
+        t = data.get('transform')
+        if isinstance(t, (list, tuple)):
+            data['transform'] = Affine(*t[:6])
+        try:
+            p.touch()  # refresh mtime so the LRU keeps active shares
+        except Exception:
+            pass
+        log.info("seg_share_cache: hit for %s", share_id)
+        return data
+    except Exception as e:
+        log.warning("seg_share_cache: load failed for %s: %s", share_id, e)
+        return None
+
+
 def _seg_cache_scan(cache_key_substring: str):
     """Scan all disk cache files for one whose key contains the substring.
 
@@ -8698,8 +8766,10 @@ def segment_overlay():
         if type_overrides:
             bounds_prefix = str(geom_3035.bounds)
             cached = None
-            # Check in-process cache first (any key with same bounds)
-            if _seg_cache["labels"] is not None and _seg_cache.get("key", "").startswith(bounds_prefix):
+            # 1. Per-share persistent label cache (survives srv restarts + LRU eviction).
+            cached = _seg_share_cache_load(share_id)
+            # 2. In-process cache (any key with same bounds)
+            if cached is None and _seg_cache["labels"] is not None and _seg_cache.get("key", "").startswith(bounds_prefix):
                 cached = _seg_cache
             if cached is None:
                 # Try exact key on disk
@@ -8844,6 +8914,12 @@ def segment_overlay():
         log.info("segment overlay: full pipeline %.1fs, cached for re-renders", time.time() - t0)
         _seg_cache_save(cache_key, labels, objects, data['mask'],
                         data['transform'], data['shape'], data['ndsm'])
+        # When the call was on behalf of a share, persist labels keyed by
+        # share_id so cold reloads (after srv restart / LRU eviction) skip
+        # the 100s+ Felzenszwalb pipeline.
+        if share_id:
+            _seg_share_cache_save(share_id, labels, objects, data['mask'],
+                                  data['transform'], data['shape'], data['ndsm'])
 
         if top_n_classes:
             from collections import Counter

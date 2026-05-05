@@ -408,6 +408,9 @@
     <div class="bar"><div class="bar-fill g" id="cProgBar" style="width:0"></div></div>
     <div class="det" id="cProgDet">—</div>
     <div id="cProgFailed" style="margin-top:4px"></div>
+    <svg id="cFleetSpark" viewBox="0 0 120 28" preserveAspectRatio="none"
+         style="width:100%;height:28px;margin-top:6px;display:block;visibility:hidden"></svg>
+    <div class="det" id="cFleetDet" style="font-size:10px;opacity:0.85;margin-top:2px;min-height:14px;visibility:hidden">&nbsp;</div>
   </div>
   <div class="card" id="cRate">
     <div class="lb">Rate</div>
@@ -3368,7 +3371,93 @@ async function fetchDirectorStatus() {
     _directorData = await r.json();
     renderDirector(_directorData);
     renderCapacityHistory();
+    renderFleetHistory();
   } catch(e) { console.error('director:', e); }
+}
+
+// Render fleet-shape sparkline in the Progress card: parallel
+// frontiers (green, bold), cache-only peers (cyan), cache-ready KG
+// count (purple, scaled to its own axis on the right). Same data
+// retention + persistence as the capacity sparkline.
+function renderFleetHistory() {
+  const svg = document.getElementById('cFleetSpark');
+  const det = document.getElementById('cFleetDet');
+  if (!svg || !det) return;
+  const d = _directorData;
+  const hist = (d && d.peer_history) || [];
+  if (!d || hist.length < 2) {
+    svg.style.visibility = 'hidden';
+    det.style.visibility = 'hidden';
+    return;
+  }
+  const W = 120, H = 28;
+  const n = hist.length;
+  const t0 = hist[0].t, tN = hist[n-1].t;
+  const span = Math.max(1, tN - t0);
+  // Two y-axes: peer counts (left) and cache-ready KGs (right).
+  let peerMax = 1, krMax = 1;
+  for (const e of hist) {
+    peerMax = Math.max(peerMax, e.fr || 0, e.co || 0);
+    krMax = Math.max(krMax, e.cr || 0);
+  }
+  // Round headroom up to a sensible tick.
+  function ceilTick(v) {
+    if (v <= 5) return 5;
+    if (v <= 10) return 10;
+    if (v <= 25) return 25;
+    if (v <= 50) return 50;
+    return Math.ceil(v / 50) * 50;
+  }
+  const peerHi = ceilTick(peerMax);
+  const krHi = ceilTick(krMax);
+  function nyPeer(v) { return H - (Math.min(peerHi, v) / peerHi) * H; }
+  function nyKr(v)   { return H - (Math.min(krHi, v) / krHi) * H; }
+  function pathFor(key, mapper) {
+    let p = '';
+    for (let i=0; i<n; i++) {
+      const e = hist[i];
+      const x = ((e.t - t0) / span) * W;
+      const y = mapper(e[key] || 0);
+      p += (i===0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    }
+    return p;
+  }
+  const last = hist[n-1];
+  const elapsedMin = Math.round((tN - t0) / 60);
+  const tip = 'Fleet shape over last ' + elapsedMin + 'm.\n' +
+    'Frontiers do full processing (Copernicus + Hansen).\n' +
+    'Cache-only peers consume KGs whose tiles are already on Zenodo.\n' +
+    'Cache-ready KGs grow as frontiers flush new tiles.';
+  const rangeLbl =
+    '<text x="1" y="7" font-size="7" fill="#888">' + peerHi + ' peers</text>' +
+    '<text x="' + (W-1) + '" y="7" font-size="7" fill="#9b6df0" text-anchor="end">' +
+      krHi + ' KGs</text>';
+  // Gridlines at quartiles of the peer axis.
+  let grids = '';
+  for (const f of [0.25, 0.5, 0.75]) {
+    const y = (H * (1 - f)).toFixed(1);
+    grids += '<line x1="0" y1="' + y + '" x2="' + W + '" y2="' + y +
+      '" stroke="#444" stroke-width="0.5" stroke-dasharray="2,2"/>';
+  }
+  svg.innerHTML =
+    '<title>' + tip + '</title>' +
+    grids +
+    // cache-ready (right axis, thin purple)
+    '<path d="' + pathFor('cr', nyKr) + '" fill="none" stroke="#9b6df0" stroke-width="0.9" opacity="0.7"/>' +
+    // cache-only peers (cyan)
+    '<path d="' + pathFor('co', nyPeer) + '" fill="none" stroke="#3fb6c2" stroke-width="1.2"/>' +
+    // frontiers (green, bold)
+    '<path d="' + pathFor('fr', nyPeer) + '" fill="none" stroke="#3fc26b" stroke-width="1.6"/>' +
+    rangeLbl;
+  svg.style.visibility = 'visible';
+  det.style.visibility = 'visible';
+  det.innerHTML =
+    '<span style="color:#3fc26b" title="Active parallel frontiers"><b>' +
+      (last.fr||0) + '</b> frontier' + ((last.fr===1)?'':'s') + '</span> · ' +
+    '<span style="color:#3fb6c2" title="Cache-only peers running"><b>' +
+      (last.co||0) + '</b> cache</span> · ' +
+    '<span style="color:#9b6df0" title="KGs whose tiles are fully cached on Zenodo"><b>' +
+      (last.cr||0) + '</b> ready</span>';
 }
 
 // Render the rolling capacity-factor sparkline + tooltip in the Service

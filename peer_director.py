@@ -1439,6 +1439,12 @@ class PeerDirector:
         # restarts; that's fine for a UI sparkline.
         from collections import deque as _dq
         self._capacity_history = _dq(maxlen=240)
+        # Sliding history of (ts, frontiers, cache_only, cache_ready)
+        # tuples for the Progress card sparkline. Same retention
+        # window (~2h) and persistence as capacity_history so the
+        # chart survives restarts and is visible to all gunicorn
+        # workers.
+        self._peer_history = _dq(maxlen=240)
         # Restore persisted history on startup (and let non-director
         # gunicorn workers see the same data via load_director_state).
         try:
@@ -1449,6 +1455,16 @@ class PeerDirector:
                     float(entry.get('bev') or 0.0),
                     float(entry.get('zen') or 0.0),
                     float(entry.get('cop') or 0.0),
+                ))
+        except Exception:
+            pass
+        try:
+            for entry in (self.state.get('peer_history') or []):
+                self._peer_history.append((
+                    int(entry.get('t') or 0),
+                    int(entry.get('fr') or 0),
+                    int(entry.get('co') or 0),
+                    int(entry.get('cr') or 0),
                 ))
         except Exception:
             pass
@@ -1688,6 +1704,7 @@ class PeerDirector:
         # clobbered.
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
+                   'peer_history',
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
@@ -1934,6 +1951,12 @@ class PeerDirector:
                  for (t, f, b, z, c) in list(self._capacity_history)]
                 if self._capacity_history
                 else (state.get('capacity_history') or [])
+            ),
+            'peer_history': (
+                [{'t': t, 'fr': fr, 'co': co, 'cr': cr}
+                 for (t, fr, co, cr) in list(self._peer_history)]
+                if self._peer_history
+                else (state.get('peer_history') or [])
             ),
             # Per-peer warning rates from the last director tick. Used
             # by the dashboard noise pill and by load-shifting logic.
@@ -4458,6 +4481,34 @@ class PeerDirector:
                     self._orchestrate_cache_only()
                 except Exception:
                     log.exception('Cache-only orchestration error')
+                # Record fleet-shape sample for the Progress card
+                # sparkline. Counts as observed *after* orchestration
+                # this tick — gives the truest 30s-resolution view of
+                # what's actually running.
+                try:
+                    _statuses_for_hist = locals().get('_statuses') or {}
+                    _fr = len(self.state.get(
+                        'parallel_frontiers_active') or [])
+                    _co = 0
+                    for _pid, _ps in _statuses_for_hist.items():
+                        if not isinstance(_ps, dict):
+                            continue
+                        if (_ps.get('cache_only') and
+                                _ps.get('state') in (
+                                    'running', 'processing')):
+                            _co += 1
+                    _cr_cache = self.state.get(
+                        '_cache_ready_cache') or {}
+                    _cr = len(_cr_cache.get('codes') or [])
+                    self._peer_history.append((
+                        int(time.time()), int(_fr), int(_co), int(_cr),
+                    ))
+                    self.state['peer_history'] = [
+                        {'t': t, 'fr': fr, 'co': co, 'cr': cr}
+                        for (t, fr, co, cr) in list(self._peer_history)
+                    ]
+                except Exception:
+                    log.exception('peer-history sample failed')
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)
                 sync_counter += 1
                 if sync_counter >= 5:

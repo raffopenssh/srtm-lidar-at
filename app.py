@@ -872,6 +872,31 @@ def _peer_status_push_loop():
                 status = json.loads(pf.read_text()) if pf.exists() else {}
             except Exception:
                 status = {}
+            # Mirror the /processing/status route's liveness override:
+            # if the processor isn't actually running, flip state to
+            # 'stopped' AND blank out warning_rates. Without this, the
+            # last-saved sliding-window rates from before the processor
+            # exited keep getting pushed to the director, which counts
+            # them in the fleet capacity factor and pins capacity off
+            # 100% even after the underlying processor is long gone.
+            try:
+                import subprocess as _sp_chk
+                _alive = _sp_chk.run(
+                    ['pgrep', '-f', 'austria_processor.py'],
+                    capture_output=True, timeout=2,
+                ).returncode == 0
+            except Exception:
+                _alive = True  # fail-safe: don't lie about state
+            if not _alive:
+                if status.get('state') in ('running', 'processing'):
+                    status['state'] = 'stopped'
+                # Blank rates so the director's fleet-max stops
+                # counting a dead processor.
+                status['warning_rates'] = {
+                    'bev': {'1m': 0.0, '5m': 0.0, '10m': 0.0},
+                    'zenodo': {'1m': 0.0, '5m': 0.0, '10m': 0.0},
+                    'copernicus': {'1m': 0.0, '5m': 0.0, '10m': 0.0},
+                }
             try:
                 bw = _pd.get_local_bandwidth()
             except Exception:

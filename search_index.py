@@ -1418,6 +1418,25 @@ class SearchIndex:
     # Query: parcel
     # ════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _kg_json_paths(kg_code):
+        """Return all local JSON files for a KG (parent + any split blocks).
+
+        Split KGs (>22 tiles) live in `<code>-<block>.json`, never `<code>.json`.
+        Both the parent and the block files are returned in deterministic order
+        so callers can iterate and short-circuit on first match.
+        """
+        jdir = Path('data/austria_processor/json')
+        out = []
+        plain = jdir / f'{kg_code}.json'
+        if plain.exists():
+            out.append(plain)
+        try:
+            out += sorted(jdir.glob(f'{kg_code}-*.json'))
+        except Exception:
+            pass
+        return out
+
     def query_parcel(self, parcel_id):
         """Look up a parcel. Returns KG summary + tries to find parcel in JSON."""
         if '-' not in parcel_id:
@@ -1427,17 +1446,18 @@ class SearchIndex:
         if not kg:
             return None
         result = {'kg': kg, 'parcel_id': parcel_id, 'parcel_detail': None}
-        # Try to read detail from local JSON
-        jp = Path(f'data/austria_processor/json/{kg_code}.json')
-        if jp.exists():
+        # Search parent JSON + any split-block JSONs for this kg_code.
+        for jp in self._kg_json_paths(kg_code):
             try:
                 data = json.loads(jp.read_text())
                 for p in data.get('parcels', {}).get('details', []):
                     if p.get('parcel_id') == parcel_id:
                         result['parcel_detail'] = p
-                        break
+                        if jp.stem != kg_code:
+                            result['source_block'] = jp.stem
+                        return result
             except Exception:
-                pass
+                continue
         return result
 
     # ════════════════════════════════════════════════════════════════
@@ -2031,11 +2051,14 @@ class SearchIndex:
             if len(results) >= limit + offset:
                 break
             kg_code = kg_row['kg_code']
-            jp = Path(f'data/austria_processor/json/{kg_code}.json')
-            if not jp.exists():
-                continue
-            try:
-                data = json.loads(jp.read_text())
+            for jp in self._kg_json_paths(kg_code):
+                if len(results) >= limit + offset:
+                    break
+                try:
+                    data = json.loads(jp.read_text())
+                except Exception as e:
+                    log.warning('query_parcels_by_type_confidence read %s: %s', jp, e)
+                    continue
                 for p in data.get('parcels', {}).get('details', []):
                     cls = p.get('classification', {})
                     bt = cls.get('by_type', {}).get(object_type)
@@ -2057,8 +2080,6 @@ class SearchIndex:
                             'rules_count': bt.get('rules_count', 0),
                             'diverged_count': bt.get('diverged_count', 0),
                         })
-            except Exception as e:
-                log.warning('query_parcels_by_type_confidence %s: %s', kg_code, e)
         total = len(results)
         return {
             'total': total,
@@ -2093,13 +2114,15 @@ class SearchIndex:
                 'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code'
             ).fetchall()
         results = []
+        sort_key = 'height_m'
         for kg_row in kg_rows:
             kg_code = kg_row['kg_code']
-            jp = Path(f'data/austria_processor/json/{kg_code}.json')
-            if not jp.exists():
-                continue
-            try:
-                data = json.loads(jp.read_text())
+            for jp in self._kg_json_paths(kg_code):
+                try:
+                    data = json.loads(jp.read_text())
+                except Exception as e:
+                    log.warning('query_top_features %s %s: %s', feature_type, jp, e)
+                    continue
                 if feature_type == 'trees':
                     items = data.get('top_10_trees', [])
                     sort_key = 'height_m'
@@ -2127,8 +2150,6 @@ class SearchIndex:
                     item_out = dict(item)
                     item_out['kg_code'] = kg_code
                     results.append(item_out)
-            except Exception as e:
-                log.warning('query_top_features %s %s: %s', feature_type, kg_code, e)
         # Sort by height/area descending
         results.sort(key=lambda x: x.get(sort_key, 0) or 0, reverse=True)
         total = len(results)

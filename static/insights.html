@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>What we've learnt — Austrian Landscape Atlas</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root{--bg:#0e1014;--panel:#161a22;--ink:#e8edf2;--mute:#8b95a3;--accent:#7cdca6;--warn:#f5b969;--bad:#ee7878;--line:#262c36}
   *{box-sizing:border-box}
@@ -139,6 +141,22 @@
 </section>
 
 <section>
+  <h2><span class="em">🌲</span>The Giant Tree Atlas</h2>
+  <div class="tl">7,742 verified trees ≥ 40 m · deduplicated, flag-filtered · click any point</div>
+  <div id="giantmap" style="height:540px;border-radius:10px;overflow:hidden;border:1px solid var(--line)"></div>
+  <div style="display:flex;flex-wrap:wrap;gap:18px;margin-top:14px;align-items:center;font-size:13px;color:var(--mute)">
+    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#a8ec78;margin-right:5px;vertical-align:-2px;box-shadow:0 0 6px #a8ec78"></span>40–44 m</div>
+    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ffcc66;margin-right:5px;vertical-align:-2px;box-shadow:0 0 7px #ffcc66"></span>45–49 m</div>
+    <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ff7878;margin-right:5px;vertical-align:-2px;box-shadow:0 0 8px #ff7878"></span>50 m (canopy ceiling)</div>
+    <div><span style="display:inline-block;width:18px;height:10px;border:1.5px dashed #ffd24a;margin-right:5px;vertical-align:-2px"></span>top-30 giant parcels</div>
+    <div style="flex:1"></div>
+    <div id="giantcount"></div>
+  </div>
+  <p class="lead" style="margin-top:16px">The clusters tell a story. <b>Wachau and the southern NÖ limestone Alps</b> hold dense pockets of 45 m+ stems — mature mixed-broadleaf in steep north-facing ravines that escaped a century of forestry. <b>Vorarlberg's Bregenzerwald</b> shows another hot-spot of old-growth spruce. Most parcels at the 50 m ceiling sit on <b>SE/E aspects between 350–700 m elevation</b> — enough soil, enough water, just steep enough to be left alone.</p>
+  <p class="lead" style="color:var(--mute);font-size:14px">Each marker is a single segmented crown that survived the auditor (no <i>tree_height_implausible</i>, no <i>mast_likely_misclassified</i>). Heights are nDSM = DSM−DTM at 1 m. The 50 m hard ceiling is a sensor + canopy-physics limit, not a measurement artefact.</p>
+</section>
+
+<section>
   <h2><span class="em">🌱</span>Phenology &amp; greenness</h2>
   <p class="lead">Mean Sentinel-2 NDVI across processed KGs: <b>0.68</b>. Phenology dominance: <b>145 KGs are crop-dominant</b> (high NDVI amplitude 0.18 — strong spring-green/autumn-brown), <b>69 are pasture</b> (amp 0.17, smoother), only <b>21 are forest-dominant</b> (amp 0.14, evergreen-flat). The auto-class "vineyard" parcels prefer SW/W exposures (44%) — exactly the canonical wine-growing aspect.</p>
 </section>
@@ -204,7 +222,83 @@ fetch('insights/data.json').then(r=>r.json()).then(D=>{
   const mkRow=r=>`<tr><td>${r.obj_type}</td><td><b>${r.h} m</b></td><td>${r.kg_code}</td><td>${r.flags?'<span class="pill bad">⚠ '+r.flags.split(';').length+' flag(s)</span>':'<span class="pill ok">clean</span>'}</td></tr>`;
   document.getElementById('tallraw').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.tall.slice(0,10).map(mkRow).join('')+'</tbody>';
   document.getElementById('tallclean').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.clean_tall.map(mkRow).join('')+'</tbody>';
+  initGiantMap();
 });
+
+function initGiantMap(){
+  window._giantMap = null;
+  const map=L.map('giantmap',{zoomControl:true,scrollWheelZoom:true}).setView([47.95,14.8],7);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
+    attribution:'© OpenStreetMap, © CARTO',subdomains:'abcd',maxZoom:18
+  }).addTo(map);
+  window._giantMap=map;
+
+  // SVG glow filter
+  const ensureFilter=()=>{
+    map.whenReady(()=>{
+      const svg=document.querySelector('#giantmap svg');
+      if(!svg||svg.querySelector('#glow'))return;
+      const NS='http://www.w3.org/2000/svg';
+      const defs=document.createElementNS(NS,'defs');
+      defs.innerHTML=`<filter id="glow" x="-200%" y="-200%" width="500%" height="500%">
+        <feGaussianBlur stdDeviation="3.5" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>`;
+      svg.insertBefore(defs,svg.firstChild);
+      const g=svg.querySelector('g');
+      if(g)g.setAttribute('filter','url(#glow)');
+    });
+  };
+
+  const renderer=L.svg({padding:0.5});
+  fetch('insights/giants.json').then(r=>r.json()).then(D=>{
+    const rows=D.rows;
+    const layer=L.layerGroup().addTo(map);
+    const color=h=>h>=50?'#ff7878':h>=45?'#ffcc66':'#a8ec78';
+    const radius=h=>{const z=map.getZoom();const base=h>=50?6:h>=45?4.2:2.8;return base+Math.max(0,(z-7))*1.1;};
+    const markers=[];
+    for(const r of rows){
+      const [h,lat,lon,a,kg,ref]=r;
+      const m=L.circleMarker([lat,lon],{
+        renderer:renderer,
+        radius:radius(h),color:color(h),fillColor:color(h),
+        fillOpacity:0.85,weight:0,stroke:false
+      });
+      markers.push([m,h]);
+      m.bindPopup(`<div style="font:13px sans-serif"><b>${h.toFixed(1)} m tree</b><br>area: ${a.toLocaleString()} m²<br>KG: <a href="/?kg=${kg}">${kg}</a><br><a href="/query.html?obj_ref=${encodeURIComponent(ref)}">flag explorer ↗</a></div>`);
+      m.addTo(layer);
+    }
+    document.getElementById('giantcount').textContent=`${rows.length.toLocaleString()} trees plotted`;
+    map.on('zoomend',()=>{for(const [m,h] of markers)m.setRadius(radius(h));});
+    ensureFilter();
+  });
+
+  // Top-giant parcel polygons (real boundaries from vertex_heights)
+  fetch('insights/giant_parcels.json').then(r=>r.json()).then(D=>{
+    const pLayer=L.layerGroup().addTo(map);
+    for(const p of D.parcels){
+      const ring=p.ring.map(([lon,lat])=>[lat,lon]);
+      const poly=L.polygon(ring,{
+        color:'#ffe27a', weight:1.4, fill:true, fillColor:'#ffd24a',
+        fillOpacity:0.07, opacity:0.85, dashArray:'3,4'
+      });
+      const elevTxt=p.elev_min?`${Math.round(p.elev_min)}–${Math.round(p.elev_max)} m`:'—';
+      poly.bindPopup(`<div style="font:13px sans-serif;min-width:200px">
+        <div style="font-size:14px"><b>🌲 ${p.h.toFixed(1)} m giant</b></div>
+        <div style="color:#666;font-size:11px;margin-bottom:6px">parcel ${p.parcel_id}</div>
+        <table style="font-size:12px;border-collapse:collapse">
+          <tr><td style="color:#888;padding:1px 8px 1px 0">area</td><td><b>${(p.area_sqm/1e4).toFixed(2)} ha</b></td></tr>
+          <tr><td style="color:#888">elevation</td><td>${elevTxt}</td></tr>
+          <tr><td style="color:#888">aspect</td><td>${p.aspect||'—'}</td></tr>
+          <tr><td style="color:#888">terrain</td><td>${(p.terrain||'').replace(/_/g,' ')}</td></tr>
+          <tr><td style="color:#888">forested</td><td>${p.forested?Math.round(p.forested*100)+'%':'—'}</td></tr>
+        </table>
+        <div style="margin-top:6px"><a href="/?kg=${p.kg_code}">open KG ↗</a> · <a href="/query.html?obj_ref=${encodeURIComponent(p.kg_code+':parcel:'+p.parcel_id)}">flags ↗</a></div>
+      </div>`);
+      poly.addTo(pLayer);
+    }
+  });
+}
 </script>
 </body>
 </html>

@@ -1789,7 +1789,14 @@ class PeerDirector:
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
-        cache_only_running = sum(1 for p in peers_status if p['cache_only_run'])
+        # Count only peers whose processor is actively running in cache-only
+        # mode — ``cache_only_run`` reflects last-started mode and stays True
+        # for stopped/complete peers too.
+        cache_only_running = sum(
+            1 for p in peers_status
+            if p['cache_only_run']
+            and p.get('processor_state') in ('running', 'processing')
+        )
 
         # --- Credential pool & assignment plan ----------------------
         try:

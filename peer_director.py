@@ -1032,11 +1032,29 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                     result['retry'] = attempt
                 return result
             if r.status_code == 409:
-                # Already running — that's fine
-                result = r.json()
-                result['queue_sync'] = queue_result
-                result['already_running'] = True
-                return result
+                # Already running. If body says "external", the previous
+                # subprocess hasn't fully exited yet — surface as a
+                # transient error so the caller retries on the next tick
+                # (don't drop the error key, callers gate on it).
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {'error': r.text[:200]}
+                err = (body.get('error') or '').lower()
+                if 'external' in err:
+                    last_err = body.get('error') or 'external processor'
+                    last_status = 409
+                    if attempt < 2:
+                        time.sleep(3.0)
+                        continue
+                    return {'error': f'api_start_failed: {last_err}',
+                            'queue_sync': queue_result,
+                            'method': 'no_fallback_constrained'}
+                # Tracked-state 409 (we already started it) — fine.
+                body['queue_sync'] = queue_result
+                body['already_running'] = True
+                body.pop('error', None)
+                return body
             last_status = r.status_code
             last_err = (r.text or '')[:200]
         except Exception as e:
@@ -3675,9 +3693,23 @@ class PeerDirector:
                 except Exception as e:
                     log.warning('Stop cache-only on %s failed: %s', pid, e)
                     continue
-                # Brief settle so the peer's processor_state flips to
-                # stopped before we POST /start (avoid 409 race).
-                import time as _t; _t.sleep(2)
+                # Poll until processor_state reflects stopped — the
+                # subprocess can take several seconds to exit (and the
+                # `Processor already running (external)` 409 will fire
+                # otherwise, blocking the promotion for many ticks).
+                import time as _t
+                settled = False
+                for _ in range(15):
+                    _t.sleep(1.0)
+                    ps2 = get_peer_status(peer.get('url'))
+                    st = ps2.get('state', '')
+                    if st in ('idle', 'stopped', 'complete', 'unreachable'):
+                        settled = True
+                        break
+                if not settled:
+                    log.warning('Parallel frontier: %s did not settle after '
+                                'cache-only stop; deferring', pid)
+                    continue
             # Exclude KGs reserved for OTHER peers from this peer's
             # priority queue, so we don't double-process a reservation
             # holder's KG on a parallel frontier that happens to share

@@ -283,6 +283,31 @@ def install_snapshot_from_shadow() -> dict:
             continue
         try:
             content = src.read_bytes()
+            # retry_queue.json: merge (union, dedup, preserve order)
+            # rather than replace, so KGs added on the demoted director
+            # in the gap between last snapshot push and takeover aren't
+            # lost. Snapshot order wins (it represents the authoritative
+            # priority); local-only codes append at the tail.
+            if name == 'retry_queue.json' and dst.exists():
+                try:
+                    snap_q = json.loads(content) or []
+                    local_q = json.loads(dst.read_bytes()) or []
+                    if isinstance(snap_q, list) and isinstance(local_q, list):
+                        seen = set()
+                        merged: list = []
+                        for code in list(snap_q) + list(local_q):
+                            if code in seen:
+                                continue
+                            seen.add(code)
+                            merged.append(code)
+                        if merged != snap_q:
+                            log.info('install_snapshot retry_queue: merged '
+                                     '%d snapshot + %d local → %d',
+                                     len(snap_q), len(local_q), len(merged))
+                        content = json.dumps(merged).encode()
+                except Exception as e:
+                    log.warning('install_snapshot retry_queue merge failed '
+                                '(%s); using snapshot as-is', e)
             _atomic_write_bytes(dst, content)
             installed.append(name)
         except Exception as e:

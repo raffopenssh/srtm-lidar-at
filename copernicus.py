@@ -39,6 +39,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Silence noisy openeo client lib warnings about unparseable error bodies.
+# Every 503/502 produces a 'Failed to parse API error response' WARNING
+# line that doubles the signal feeding the director's copernicus EMA.
+# The retry layer below already handles the response correctly.
+try:
+    logging.getLogger('openeo.rest._connection').setLevel(logging.ERROR)
+    logging.getLogger('openeo.rest.connection').setLevel(logging.ERROR)
+except Exception:
+    pass
+
 # === SECTION: Credentials & configuration (multi-account rotation) ===
 # Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
 # OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
@@ -1470,14 +1480,19 @@ def get_ndvi_timeseries(
                         else '500' if ('500' in exc_str or 'Internal' in exc_str or 'Server error' in exc_str)
                         else '503'
                     )
-                    logger.warning(
+                    # Interim retries log at INFO so they don't feed the
+                    # fleet-wide copernicus throttle counter — one bad
+                    # NDVI month would otherwise emit 3 WARNING lines
+                    # plus library noise. Final-attempt exhaustion is
+                    # logged as WARNING by the 'failed: ... — skipping
+                    # month' path below.
+                    logger.info(
                         "NDVI %s: server error (%s), retry %d/%d in %ds...",
                         label, _reason,
                         attempt, max_retries_per_cred, wait_secs,
                     )
                     _time.sleep(wait_secs)
                     continue
-
                 # --- Other errors — skip month ---
                 logger.warning("NDVI %s failed: %s — skipping month", label, exc)
                 return label, exc
@@ -1516,11 +1531,13 @@ def get_ndvi_timeseries(
             logger.info("Downloading %d NDVI months (sequential, single credential)...",
                         len(actually_download))
         consecutive_402 = 0  # track 402 cascade
+        consecutive_5xx = 0  # track upstream-stress cascade (503/502/500)
         for label, m_start, m_end, month_cache in actually_download:
             lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
             if exc is None:
                 n_done += 1
                 consecutive_402 = 0  # reset on success
+                consecutive_5xx = 0
                 logger.info("Month %s done (%d/%d)", lbl, n_done, n_total)
                 if progress_fn:
                     try:
@@ -1546,6 +1563,18 @@ def get_ndvi_timeseries(
                 else:
                     cooldown = _FAILED_MONTH_402_COOLDOWN_SECS
                     consecutive_402 = 0
+                # Track upstream-stress cascade (503/502/500/504) separately
+                # from 402: it indicates the openeo origin is overloaded,
+                # not that our credential is exhausted.
+                if any(s in exc_str for s in ('500', '502', '503', '504',
+                                              'Bad Gateway', 'Gateway Time',
+                                              'Service Unavailable',
+                                              'Server error',
+                                              'too many 503',
+                                              'no available server')):
+                    consecutive_5xx += 1
+                else:
+                    consecutive_5xx = 0
                 _FAILED_MONTH_COOLDOWNS[(_bbox_hash, lbl)] = _time.time() + cooldown
 
                 if progress_fn:
@@ -1553,6 +1582,22 @@ def get_ndvi_timeseries(
                         progress_fn(n_done, n_total)
                     except Exception:
                         pass
+
+                # 5xx cascade breaker: if 2+ consecutive months fail with
+                # upstream errors, the openeo origin is sick. Stop hammering
+                # it — raise IPThrottledError so the parent process pauses
+                # this peer for 15 min via the existing copernicus_paused
+                # path. The director will switch to another peer.
+                if consecutive_5xx >= 2:
+                    logger.warning(
+                        "Upstream-stress cascade detected (%d consecutive 5xx) — "
+                        "aborting NDVI downloads to give openeo origin a break",
+                        consecutive_5xx,
+                    )
+                    raise IPThrottledError(
+                        f"openeo origin returned {consecutive_5xx} consecutive 5xx "
+                        f"— backing off"
+                    )
 
                 # 402 cascade breaker: if 2+ consecutive months fail with 402,
                 # the credential is rate-limited. Stop wasting time on remaining months.

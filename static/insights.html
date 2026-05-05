@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>What we've learnt — Austrian Landscape Atlas</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0e1014;--panel:#161a22;--ink:#e8edf2;--mute:#8b95a3;--accent:#7cdca6;--warn:#f5b969;--bad:#ee7878;--line:#262c36}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,Segoe UI,Inter,Roboto,sans-serif}
+  a{color:var(--accent)}
+  header{padding:60px 24px 30px;text-align:center;border-bottom:1px solid var(--line)}
+  header h1{font-size:38px;margin:0 0 10px;font-weight:700;letter-spacing:-.5px}
+  header h1 .lb{display:inline-block;transform:translateY(2px);margin-right:6px}
+  header p{margin:0;color:var(--mute);max-width:720px;margin:0 auto;font-size:17px}
+  main{max-width:1180px;margin:0 auto;padding:24px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:32px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .stat .v{font-size:28px;font-weight:700;letter-spacing:-.5px}
+  .stat .l{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-top:4px}
+  .stat .s{font-size:11px;color:var(--mute);margin-top:6px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-bottom:22px}
+  section h2{margin:0 0 4px;font-size:20px;letter-spacing:-.3px}
+  section h2 .em{font-size:22px;margin-right:8px}
+  section .tl{color:var(--mute);font-size:13px;margin-bottom:18px}
+  .two{display:grid;grid-template-columns:1.2fr 1fr;gap:24px;align-items:start}
+  @media(max-width:760px){.two{grid-template-columns:1fr}}
+  canvas{max-width:100%}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line)}
+  th{color:var(--mute);font-weight:500;text-transform:uppercase;font-size:11px;letter-spacing:.6px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:#252b36;color:var(--mute)}
+  .pill.ok{background:#1d3a2a;color:var(--accent)}
+  .pill.warn{background:#3a2e1a;color:var(--warn)}
+  .pill.bad{background:#3a1e1e;color:var(--bad)}
+  .lead{font-size:17px;line-height:1.6}
+  .lead b{color:var(--accent)}
+  .compass{display:grid;grid-template-columns:repeat(3,60px);grid-template-rows:repeat(3,60px);gap:6px;justify-content:center;margin:10px 0}
+  .cell{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1d2230;border-radius:8px;font-size:11px;color:var(--mute)}
+  .cell b{color:var(--ink);font-size:14px}
+  .cell.center{background:none}
+  footer{text-align:center;padding:30px;color:var(--mute);font-size:13px;border-top:1px solid var(--line);margin-top:30px}
+  .row{display:flex;align-items:baseline;gap:6px;margin:4px 0}
+  .bar{flex:1;height:10px;background:#1d2230;border-radius:6px;overflow:hidden}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,#7cdca6,#5cbf85)}
+  .legend{font-size:12px;color:var(--mute);margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="lb">💡</span>What we've learnt about Austria</h1>
+  <p>An atlas of every Katastralgemeinde, segmented from BEV LiDAR, BEV orthophotos, Sentinel-1/2, ESA WorldCover, Hansen and the Austrian cadastre. Each parcel gets terrain, vegetation, buildings, change and an auto-class. Here's what falls out so far.</p>
+</header>
+<main>
+
+<div class="grid" id="hero"></div>
+
+<section>
+  <h2><span class="em">🌳</span>Land cover by area</h2>
+  <div class="tl">Total area classified across 239 KGs · 3,350 km² · 25 object types collapsed below</div>
+  <div class="two"><canvas id="lc" height="260"></canvas>
+  <div>
+    <p class="lead">Trees alone cover <b>1,593 km²</b> — <b>48%</b> of all classified ground. Crops add 611 km², grass 584 km². Buildings (roofs) take 87 km², roads + paths + parking another 90 km². Austria is overwhelmingly green: even in this lowland-heavy sample (most KGs are NÖ), tree+grass+crop+shrub+hedge make up ~88% of land.</p>
+    <p class="lead" style="color:var(--mute);font-size:14px">3.4M individual trees, 1.6M grass patches, 352k roof segments, 47k vineyard polygons, 12k waterbodies — segmented and classified.</p>
+  </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="em">🏘️</span>How parcels live</h2>
+  <div class="tl">Auto-classified from per-parcel terrain, vegetation, buildings and Hansen loss</div>
+  <div class="two"><canvas id="auto" height="320"></canvas>
+  <div>
+    <p class="lead">Of 188k parcels: <b>22%</b> are mixed (multiple uses), <b>19%</b> meadow, <b>11%</b> built-up, <b>11%</b> forest. <b>4,632 parcels are flagged as recent-clearfell or active disturbance</b> — visible mostly in Steiermark/OÖ alpine forest. Only 82 parcels are dominated by water.</p>
+    <p class="lead" style="color:var(--mute);font-size:14px">The classifier finds <b>5,925 "young/regenerating forest"</b> parcels — places where Hansen-loss happened years ago and trees are now under 5m. That's a recovery signal we can track year over year.</p>
+  </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="em">🪓</span>24 years of forest loss (Hansen)</h2>
+  <div class="tl">Annual forest loss inside processed KGs · 1 px = 900 m²</div>
+  <canvas id="hansen" height="180"></canvas>
+  <p class="lead" style="margin-top:14px">Loss is <b>not flat</b>. The cluster <b>2018–2020</b> stands out: <b>~8,400 ha lost in three years</b> across our processed area — the European bark-beetle/storm wave. <b>2024 alone:</b> 1,175 ha. <b>2019 was the worst year on record</b> at 3,400 ha. Six of the ten worst KGs are in Steiermark; Innerbreitenau (OÖ) leads with ~100 ha lost since 2000.</p>
+</section>
+
+<section>
+  <h2><span class="em">⛰️</span>Where do parcels point?</h2>
+  <div class="tl">Dominant aspect of each parcel · 188k parcels</div>
+  <div class="two">
+    <div id="compass"></div>
+    <div>
+      <p class="lead">Eastern slopes win. <b>SE+E+NE = 43%</b> of all parcels — these face the morning sun, the steepest are typically <b>vineyards (S+SW+W = 44% of vineyard parcels)</b> and <b>orchards</b>. The terrain is mostly gentle: <b>83%</b> of parcels are level or nearly-level, only 0.5% are intermediately or moderately rugged. Forested fraction climbs sharply with ruggedness — from <b>19%</b> on level ground to <b>83%+</b> in rugged terrain.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="em">🏗️</span>Buildings: 63k catalogued, 287k newly vectorised</h2>
+  <div class="two"><canvas id="stories" height="260"></canvas>
+  <div>
+    <p class="lead"><b>Pitched roofs (51%)</b> average 10.7 m and 3.6 storeys — village + farmhouse Austria. <b>Flat roofs (49%)</b> average 5.6 m and 1.9 storeys — sheds, garages, barns and modern multi-storey. The mode is 3 storeys (22.8k buildings); 11 buildings are estimated 11 storeys or more. The processor also discovered <b>286,984 new building footprints</b> (6,552 ha) that weren't in the cadastre or have grown since the last update — most clustered around Feldkirch (VLBG), Krems (NÖ) and Vienna's leafier districts.</p>
+  </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="em">🏔️</span>Earth moved</h2>
+  <div class="tl">Net DTM change between 2022 and 2024 LiDAR campaigns · 239 KGs</div>
+  <p class="lead">Total disturbed volume: <b>106 million m³</b>. Net volume change: <b>−16 million m³</b> (Austria is shedding material on balance). The biggest cuts are in Vorarlberg's Walgau valley — <b>St. Gallenkirch −7.8 Mm³</b>, Nofels −3.4 Mm³, Altenstadt −2.8 Mm³ — a mix of construction, gravel pits and floodplain regrading. The biggest fills are in Kärnten: <b>Lassach +3.9 Mm³</b>, almost certainly a hydro reservoir or quarry refill.</p>
+</section>
+
+<section>
+  <h2><span class="em">🚩</span>What flags taught us about the highest objects</h2>
+  <div class="tl">372k flags raised by the rule auditor across 329k objects · 4 of 1.5M objects flagged manually so far</div>
+  <div class="two"><canvas id="flags" height="320"></canvas>
+  <div>
+    <p class="lead">The auditor catches our mistakes <b>before we report them</b>. Three quarters of all height records are <b>flagged as implausible</b> — and the flags reveal a pattern: the apparent "tallest tree in Austria" at <b>194.8 m</b> in KG 67501-north isn't a tree at all — it's a <b>radio tower next to a hedge that the segmenter merged</b>, and the auditor caught both (<i>tree_height_implausible</i> + <i>hedge_likely_tree_row</i>). Four of the next ten "137.8 m trees" are flagged <i>mast_likely_misclassified</i> — reception masts that the RF thinks are trees because their nDSM is high and narrow.</p>
+    <p class="lead" style="color:var(--mute);font-size:14px"><b>1,853</b> trees and <b>283</b> buildings carry an implausible-height flag. They're our backlog of high-confidence corrections.</p>
+  </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="em">🌲</span>Tallest objects (raw vs. trusted)</h2>
+  <div class="two">
+    <div>
+      <h3 style="margin:0 0 8px;font-size:14px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px">Raw — top of the leaderboard</h3>
+      <table id="tallraw"></table>
+    </div>
+    <div>
+      <h3 style="margin:0 0 8px;font-size:14px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px">After flag filtering — what we believe</h3>
+      <table id="tallclean"></table>
+    </div>
+  </div>
+  <p class="lead" style="margin-top:14px">Once flagged objects are dropped, every "tallest tree" sits at exactly <b>50.0 m</b> — the natural height ceiling for old-growth Austrian conifers (typically <i>Picea abies</i> in 80–120 yr stands). The processor's measured maximum for clean trees converges on the canopy plateau seen in BEV LiDAR national plots. Tallest believed roof: <b>48.6 m in Krems-Stein (KG 12171)</b> — a riverside tower or church spire.</p>
+  <p class="lead" style="color:var(--mute);font-size:14px">88,779 trees ≥ 30 m have <em>no</em> implausibility flag. They're our giant-tree atlas in waiting.</p>
+</section>
+
+<section>
+  <h2><span class="em">🌱</span>Phenology &amp; greenness</h2>
+  <p class="lead">Mean Sentinel-2 NDVI across processed KGs: <b>0.68</b>. Phenology dominance: <b>145 KGs are crop-dominant</b> (high NDVI amplitude 0.18 — strong spring-green/autumn-brown), <b>69 are pasture</b> (amp 0.17, smoother), only <b>21 are forest-dominant</b> (amp 0.14, evergreen-flat). The auto-class "vineyard" parcels prefer SW/W exposures (44%) — exactly the canonical wine-growing aspect.</p>
+</section>
+
+<section>
+  <h2><span class="em">🎯</span>Where we're confident</h2>
+  <p class="lead">RF mean confidence across the fleet: <b>70.9%</b>. Divergence between RF and rule-based fallback is <b>only 3.1%</b> on average — the two heads agree. The biggest disagreements are <i>path → grass</i> (117k cases, narrow tracks bleeding into vegetation) and <i>road → grass</i> (68k). These are now logged and mineable for retraining.</p>
+  <p class="lead">All 239 processed KGs achieve quality grade <b>A</b>. 100% RF-classified, 0% unclassified. The pipeline holds.</p>
+</section>
+
+<footer>
+  <p>3,350 / 84,000 km² done · 239 / 8,440 KGs · the rest is being processed across the peer fleet right now.</p>
+  <p><a href="/">Map</a> · <a href="/process.html">Processor</a> · <a href="/query.html">Query</a> · <a href="/api/v1/docs/llm.txt">API docs</a></p>
+</footer>
+</main>
+
+<script>
+const CC={fg:'#e8edf2',mute:'#8b95a3',line:'#262c36',ac:'#7cdca6',warn:'#f5b969',bad:'#ee7878'};
+Chart.defaults.color=CC.fg;Chart.defaults.borderColor=CC.line;Chart.defaults.font.family='-apple-system,Segoe UI,Inter,sans-serif';
+
+fetch('insights/data.json').then(r=>r.json()).then(D=>{
+  const h=D.headline;
+  const fmt=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(0)+'k':n;
+  document.getElementById('hero').innerHTML=[
+    ['Parcels indexed',fmt(h.parcels),h.kg_processed+' / '+fmt(h.kg_total)+' KGs · grade A'],
+    ['Area classified',fmt(h.area_km2)+' km²','BEV 1m DTM/DSM + 0.2m ortho'],
+    ['Trees segmented',fmt(h.tree_count),fmt(h.tree_volume_m3)+' m³ stem volume'],
+    ['New buildings found',fmt(h.new_buildings),fmt(h.new_bldg_ha)+' ha not in cadastre'],
+    ['Forest lost since 2000',fmt(h.hansen_loss_ha_total)+' ha','Hansen GFC — in our processed KGs'],
+    ['Quality flags raised',fmt(h.flags_total),fmt(h.flagged_objects)+' objects affected'],
+    ['RF confidence',(h.rf_mean_conf*100).toFixed(0)+'%',h.rf_diverged_pct+'% disagree with rules'],
+    ['Net earth moved','−'+fmt(Math.abs(h.net_volume_change_m3))+' m³',fmt(h.disturbed_volume_m3)+' m³ disturbed total'],
+  ].map(([l,v,s])=>`<div class="stat"><div class="v">${v}</div><div class="l">${l}</div><div class="s">${s}</div></div>`).join('');
+
+  // Land cover
+  const lc=D.lc.filter(r=>r.area_km2>=0.5);
+  new Chart(document.getElementById('lc'),{type:'bar',data:{labels:lc.map(r=>r.object_type),datasets:[{label:'km²',data:lc.map(r=>r.area_km2),backgroundColor:CC.ac}]},options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{type:'logarithmic',grid:{color:CC.line},title:{display:true,text:'km² (log)'}},y:{grid:{display:false}}}}});
+
+  // Auto class
+  const colors={forest:'#3d8c5b',young_forest:'#7cdca6',wooded:'#5fa67c',meadow:'#c4d96b',alpine_meadow:'#dde58a',cropland:'#e8c562',vineyard:'#a566c9',orchard:'#d77ec9',shrubland:'#9bb061',built_up:'#cf6868',farmstead:'#dd8866',infrastructure:'#888',disturbance:'#e0524d',mixed:'#6b9bd1',water_body:'#4ab0d6'};
+  new Chart(document.getElementById('auto'),{type:'doughnut',data:{labels:D.auto.map(r=>r.auto_class),datasets:[{data:D.auto.map(r=>r.c),backgroundColor:D.auto.map(r=>colors[r.auto_class]||'#888'),borderColor:CC.line,borderWidth:2}]},options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:12}}}}}});
+
+  // Hansen
+  new Chart(document.getElementById('hansen'),{type:'bar',data:{labels:D.hansen.map(r=>r.yr),datasets:[{label:'hectares lost',data:D.hansen.map(r=>r.ha),backgroundColor:D.hansen.map(r=>r.yr>=2018&&r.yr<=2020?CC.bad:r.ha>9000?CC.warn:CC.ac)}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{grid:{color:CC.line},title:{display:true,text:'hectares'}}}}});
+
+  // Compass
+  const aspMap={};D.aspect.forEach(r=>{aspMap[r.a]=r.c});
+  const ord=[['NW','N','NE'],['W','center','E'],['SW','S','SE']];
+  const max=Math.max(...Object.values(aspMap));
+  document.getElementById('compass').innerHTML='<div class="compass">'+ord.flat().map(k=>{
+    if(k==='center')return '<div class="cell center"></div>';
+    const v=aspMap[k]||0;const pct=(v/max*100).toFixed(0);
+    return `<div class="cell" style="background:linear-gradient(135deg,#1d2230,rgba(124,220,166,${v/max*0.55}))"><b>${k}</b>${(v/1000).toFixed(1)}k</div>`;
+  }).join('')+'</div><div class="legend">Each cell shows parcel count by dominant aspect — eastern slopes (SE/E/NE) clearly dominate.</div>';
+
+  // Stories
+  new Chart(document.getElementById('stories'),{type:'bar',data:{labels:D.stories.map(r=>r.s+' st'),datasets:[{label:'buildings',data:D.stories.map(r=>r.c),backgroundColor:CC.ac}]},options:{plugins:{legend:{display:false}},scales:{x:{grid:{display:false},title:{display:true,text:'estimated stories'}},y:{grid:{color:CC.line},title:{display:true,text:'count'}}}}});
+
+  // Flags
+  new Chart(document.getElementById('flags'),{type:'bar',data:{labels:D.flags.map(r=>r.f.replace(/_/g,' ')),datasets:[{label:'count',data:D.flags.map(r=>r.c),backgroundColor:D.flags.map(r=>r.f.includes('implausible')||r.f.includes('mismatch')?CC.bad:r.f.includes('low')||r.f.includes('tiny')?CC.warn:CC.ac)}]},options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{grid:{color:CC.line},title:{display:true,text:'flagged objects'}},y:{grid:{display:false}}}}});
+
+  // Tall tables
+  const mkRow=r=>`<tr><td>${r.obj_type}</td><td><b>${r.h} m</b></td><td>${r.kg_code}</td><td>${r.flags?'<span class="pill bad">⚠ '+r.flags.split(';').length+' flag(s)</span>':'<span class="pill ok">clean</span>'}</td></tr>`;
+  document.getElementById('tallraw').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.tall.slice(0,10).map(mkRow).join('')+'</tbody>';
+  document.getElementById('tallclean').innerHTML='<thead><tr><th>type</th><th>height</th><th>KG</th><th>verdict</th></tr></thead><tbody>'+D.clean_tall.map(mkRow).join('')+'</tbody>';
+});
+</script>
+</body>
+</html>

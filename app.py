@@ -4787,6 +4787,45 @@ def director_update_peers():
     # ~60 s instead of ~5 s.
     targets = [p for p in cfg.get('peers', [])
                if p.get('url') and (not target_id or p['id'] == target_id)]
+    # Include the LOCAL node if its peer entry has no url (primary's
+    # entry is typically url=null). Without this, /update_peers updates
+    # every peer except the host running the director, which is exactly
+    # the host that needs to pull new code so auto-handback (ancestry
+    # check) can succeed. Cause of the 2026-05-06 stuck-on-at40 incident.
+    try:
+        import director_ha as _dha
+        _self_id = _dha.self_id()
+    except Exception:
+        _self_id = None
+    local_entry = None
+    for p in cfg.get('peers', []):
+        if p.get('url'):
+            continue
+        if target_id and p['id'] != target_id:
+            continue
+        if _self_id and p['id'] == _self_id:
+            local_entry = p
+            break
+    if local_entry is not None:
+        # Schedule the local update in a daemon thread so we can return
+        # a response before srv bounces. The thread calls /admin/update
+        # over loopback (auth-exempt) so we reuse the exact same code
+        # path peers go through, including the graceful/deferred logic.
+        import threading as _th_local, time as _t_local
+        def _local_update():
+            _t_local.sleep(2)
+            try:
+                import requests as _rq_local
+                _rq_local.post(
+                    'http://127.0.0.1:8000/api/v1/admin/update',
+                    json={'graceful': graceful},
+                    timeout=120,
+                )
+            except Exception as _e:
+                log.warning('local self-update via loopback failed: %s', _e)
+        _th_local.Thread(target=_local_update, daemon=True).start()
+        results[local_entry['id']] = {'status': 'scheduled_local_update',
+                                      'graceful': graceful}
     WAVE = int(body.get('wave_size') or 5)
     GAP_S = float(body.get('wave_gap_s') or 6.0)
     if targets:

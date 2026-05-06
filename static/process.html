@@ -683,6 +683,8 @@
           </div>
           <span class="zen-filter-badge" id="zenFilterBadge"></span>
           <button class="zen-filter-clear" id="zenFilterClear" title="Clear filter" style="display:none">✕</button>
+          <svg id="zenRateSpark" width="120" height="22" style="flex-shrink:0" title="Zenodo upload rate (last 24h, hourly)"></svg>
+          <span id="zenRateLabel" style="font-size:10px;color:var(--dim);white-space:nowrap"></span>
         </div>
         <table id="zenTbl">
           <thead><tr>
@@ -2069,8 +2071,51 @@ async function fetchManifest() {
   } else {
     document.getElementById('zenFilterBadge').textContent = '';
   }
+  _renderZenRateSpark(keys.map(k => entries[k]));
   sorted = sorted.slice(0, 200);
   document.querySelector('#zenTbl tbody').innerHTML = sorted.map(_zenManifestRow).join('');
+}
+
+function _renderZenRateSpark(entries) {
+  const svg = document.getElementById('zenRateSpark');
+  const label = document.getElementById('zenRateLabel');
+  if (!svg) return;
+  const N = 24; // last 24 hours, 1h buckets
+  const buckets = new Array(N).fill(0);
+  const now = Date.now();
+  const hourMs = 3600 * 1000;
+  let total = 0;
+  for (const e of entries) {
+    if (!e || !e.uploaded_at) continue;
+    const t = Date.parse(e.uploaded_at);
+    if (!isFinite(t)) continue;
+    const ageH = (now - t) / hourMs;
+    if (ageH < 0 || ageH >= N) continue;
+    const idx = N - 1 - Math.floor(ageH);
+    if (idx >= 0 && idx < N) { buckets[idx] += 1; total += 1; }
+  }
+  const W = 120, H = 22;
+  const max = Math.max(1, ...buckets);
+  const bw = W / N;
+  let bars = '';
+  for (let i = 0; i < N; i++) {
+    const v = buckets[i];
+    const h = (v / max) * (H - 2);
+    const x = i * bw;
+    const y = H - h;
+    const isNow = (i === N - 1);
+    const fill = isNow ? 'var(--blue)' : 'rgba(88,166,255,0.45)';
+    bars += '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
+            '" width="' + Math.max(bw - 0.5, 0.5).toFixed(2) +
+            '" height="' + Math.max(h, 0.5).toFixed(2) +
+            '" fill="' + fill + '"><title>' + v + ' upload' + (v===1?'':'s') + ' (' +
+            (N - 1 - i) + 'h ago)</title></rect>';
+  }
+  svg.innerHTML = bars;
+  if (label) {
+    const perH = total / N;
+    label.textContent = total + '/24h · ' + perH.toFixed(1) + '/h';
+  }
 }
 
 // ── Zenodo Filter ───────────────────────────────────────────────────────

@@ -18,6 +18,9 @@ MemoryMax=5G
 MemoryHigh=4G
 OOMScoreAdjust=500
 OOMPolicy=continue
+# 50+ peers x ~6 connections each + Zenodo + tile cache fanout adds up.
+# The default 1024 was the EMFILE source on 2026-05-06.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

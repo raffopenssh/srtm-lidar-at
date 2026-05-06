@@ -4778,22 +4778,33 @@ def director_update_peers():
             peer['url'], cluster_tok)
 
     results = {}
-    # Update peers in parallel with bounded concurrency. Sequential loops
-    # don't scale to 150 peers; trigger_peer_update returns quickly
-    # because the peer drops the connection on srv restart.
+    # Update peers in stepwise waves to avoid the thundering-herd
+    # restart that hammered the cluster on 2026-05-06 (50 peers all
+    # restarting srv simultaneously → EMFILE on primary, 45 circuit
+    # breakers tripped, dashboard down for ~2 min). Cap concurrency
+    # at 5 in flight, with a 6 s gap between waves so the previous
+    # wave's restarts have time to settle. Total: ~50 peers in
+    # ~60 s instead of ~5 s.
     targets = [p for p in cfg.get('peers', [])
                if p.get('url') and (not target_id or p['id'] == target_id)]
+    WAVE = int(body.get('wave_size') or 5)
+    GAP_S = float(body.get('wave_gap_s') or 6.0)
     if targets:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=min(20, len(targets))) as ex:
-            futs = {ex.submit(pd.trigger_peer_update, p['url'], graceful): p['id']
-                    for p in targets}
-            for f in as_completed(futs):
-                pid = futs[f]
-                try:
-                    results[pid] = f.result(timeout=60)
-                except Exception as e:
-                    results[pid] = {'error': str(e)}
+        import time as _t
+        for i in range(0, len(targets), WAVE):
+            batch = targets[i:i + WAVE]
+            with ThreadPoolExecutor(max_workers=min(WAVE, len(batch))) as ex:
+                futs = {ex.submit(pd.trigger_peer_update, p['url'], graceful):
+                        p['id'] for p in batch}
+                for f in as_completed(futs):
+                    pid = futs[f]
+                    try:
+                        results[pid] = f.result(timeout=60)
+                    except Exception as e:
+                        results[pid] = {'error': str(e)}
+            if i + WAVE < len(targets):
+                _t.sleep(GAP_S)
     return jsonify({
         'results': results,
         'token_install': token_results,

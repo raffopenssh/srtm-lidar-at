@@ -1746,29 +1746,64 @@ class PeerDirector:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FTimeout
         statuses: dict[str, dict] = {}
         peers_list = list(cfg.get('peers', []))
-        with ThreadPoolExecutor(max_workers=BANDWIDTH_POLL_CONCURRENCY,
-                                thread_name_prefix='dir-st') as ex:
-            futs = {ex.submit(get_peer_status, p.get('url')): p for p in peers_list}
+
+        def _fallback_from_cache(reason: str) -> None:
+            """Populate ``statuses`` from the per-URL cache (or mark
+            as unreachable). Used when the thread pool is unusable.
+            """
             import time as _t
-            deadline = _t.time() + 15
-            for fut, p in list(futs.items()):
-                try:
-                    statuses[p['id']] = fut.result(
-                        timeout=max(0.1, deadline - _t.time())
-                    )
-                except (FTimeout, Exception) as e:
-                    # Worker-pool budget blew up before the per-call
-                    # timeout fired — try the last-known cached status
-                    # before declaring this peer unreachable.
-                    cached = _PEER_STATUS_CACHE.get(p.get('url') or '')
-                    if cached and (_t.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
-                        d = dict(cached[1])
-                        d['_stale'] = True
-                        d['_stale_age_s'] = round(_t.time() - cached[0], 1)
-                        d['_stale_error'] = str(e)[:120]
-                        statuses[p['id']] = d
-                    else:
-                        statuses[p['id']] = {'state': 'unreachable', 'error': str(e)}
+            for p in peers_list:
+                cached = _PEER_STATUS_CACHE.get(p.get('url') or '')
+                if cached and (_t.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+                    d = dict(cached[1])
+                    d['_stale'] = True
+                    d['_stale_age_s'] = round(_t.time() - cached[0], 1)
+                    d['_stale_error'] = reason
+                    statuses[p['id']] = d
+                else:
+                    statuses[p['id']] = {'state': 'unreachable',
+                                         'error': reason}
+
+        # Guard against ``RuntimeError: cannot schedule new futures
+        # after interpreter shutdown`` — happens when a gunicorn worker
+        # has hit EMFILE (Too many open files) and is mid-shutdown but
+        # Flask is still trying to dispatch /director/status. The
+        # exception used to fire on every poll for the dying request,
+        # spamming the log with thousands of identical tracebacks
+        # (which previously masqueraded as a recursion error in the
+        # dashboard log).
+        try:
+            with ThreadPoolExecutor(
+                max_workers=BANDWIDTH_POLL_CONCURRENCY,
+                thread_name_prefix='dir-st',
+            ) as ex:
+                futs = {ex.submit(get_peer_status, p.get('url')): p
+                        for p in peers_list}
+                import time as _t
+                deadline = _t.time() + 15
+                for fut, p in list(futs.items()):
+                    try:
+                        statuses[p['id']] = fut.result(
+                            timeout=max(0.1, deadline - _t.time())
+                        )
+                    except (FTimeout, Exception) as e:
+                        # Worker-pool budget blew up before the per-call
+                        # timeout fired — try the last-known cached
+                        # status before declaring this peer unreachable.
+                        cached = _PEER_STATUS_CACHE.get(p.get('url') or '')
+                        if cached and (_t.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+                            d = dict(cached[1])
+                            d['_stale'] = True
+                            d['_stale_age_s'] = round(_t.time() - cached[0], 1)
+                            d['_stale_error'] = str(e)[:120]
+                            statuses[p['id']] = d
+                        else:
+                            statuses[p['id']] = {'state': 'unreachable',
+                                                 'error': str(e)}
+        except RuntimeError as _rte:
+            log.warning('get_status: thread pool unavailable (%s) — '
+                        'returning cached peer statuses', _rte)
+            _fallback_from_cache('interpreter_shutdown')
 
         peers_status = []
         for peer in peers_list:
@@ -3856,6 +3891,16 @@ class PeerDirector:
     STALE_UPDATE_GRACE_S = 600          # 10 min idle before first auto-retry
     STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
     STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
+    # Wave-based update rollout: cap how many peers we trigger per tick
+    # so the cluster restarts in waves rather than a single thundering
+    # herd. With 50 peers all triggered at once (the 2026-05-06
+    # incident) gunicorn workers exhausted file descriptors, circuit
+    # breakers tripped fleet-wide, and orchestrators couldn't see
+    # candidates for ~2 minutes. Stepping by ~3-5 peers/tick spreads
+    # restarts over ~5 minutes — dashboard / cache-only / frontier
+    # never lose more than a fraction of the fleet at once.
+    STALE_UPDATE_HARD_PER_TICK = 3      # hard restarts (idle peers)
+    STALE_UPDATE_GRACEFUL_PER_TICK = 5  # graceful nudges (mid-KG peers)
 
     def _orchestrate_stale_peer_updates(self, statuses: dict):
         """Re-trigger update on peers stuck on an old commit while idle.
@@ -3895,6 +3940,10 @@ class PeerDirector:
             log.exception('Origin push during stale-peer orchestration failed')
         now = time.time()
         live_ids = set()
+        # Pre-classify so we can apply per-tick budgets across the
+        # fleet rather than fire-and-forget on every stale peer.
+        graceful_candidates: list[tuple[dict, dict, str]] = []  # (peer, rec, commit)
+        hard_candidates: list[tuple[dict, dict, str, int]] = []  # (peer, rec, commit, attempts)
         for peer in cfg.get('peers', []):
             pid = peer.get('id')
             url = peer.get('url')
@@ -3904,8 +3953,8 @@ class PeerDirector:
             commit = (ps.get('git_commit') or '').strip()
             proc_state = ps.get('state', 'unknown')
             online = proc_state != 'unreachable' and not ps.get('error')
-            # Idle = no active KG processing. 'running'/'processing' means
-            # the peer is mid-work; we never interrupt that.
+            # Idle = no active KG processing. 'running'/'processing'
+            # means the peer is mid-work; we never interrupt that.
             idle = proc_state in ('stopped', 'idle', 'complete', 'paused')
             stale = bool(commit) and commit != _LOCAL_GIT_COMMIT
             if not (online and stale):
@@ -3918,27 +3967,12 @@ class PeerDirector:
             rec['commit'] = commit
             rec['last_state'] = proc_state
             if not idle:
-                # Mid-KG. Send a graceful update to the peer so it
-                # schedules ``git pull + restart srv`` after the
-                # current KG finishes. Throttle: only resend every
-                # 30 min (peer already has the deferred-update thread
-                # running once asked). Without this, a long-running
-                # KG would mean the peer never updates — even though
-                # ``/admin/update?graceful=1`` does exactly the right
-                # thing on its own.
                 rec['waiting_for_idle'] = True
                 last_graceful = float(rec.get('last_graceful_attempt') or 0)
                 if (now - last_graceful) >= 1800:
-                    log.info('Stale peer %s mid-KG (%s on %s); sending '
-                             'graceful update to schedule restart at KG boundary',
-                             pid, proc_state, commit)
-                    try:
-                        gres = trigger_peer_update(url, graceful=True)
-                    except Exception as e:
-                        gres = {'error': str(e)}
-                    rec['last_graceful_attempt'] = now
-                    rec['last_graceful_result'] = gres
-                tracked[pid] = rec
+                    graceful_candidates.append((peer, rec, commit))
+                else:
+                    tracked[pid] = rec
                 continue
             rec.pop('waiting_for_idle', None)
             attempts = int(rec.get('attempts') or 0)
@@ -3955,16 +3989,63 @@ class PeerDirector:
             if not ready:
                 tracked[pid] = rec
                 continue
-            log.info('Auto-retry update on stale peer %s (commit=%s, attempt=%d)',
+            hard_candidates.append((peer, rec, commit, attempts))
+
+        # Stable ordering: oldest "first_seen_stale" first, so peers
+        # waiting longest get serviced first. Tie-break by id.
+        graceful_candidates.sort(
+            key=lambda t: (float(t[1].get('first_seen_stale') or 0),
+                           t[0]['id']))
+        hard_candidates.sort(
+            key=lambda t: (float(t[1].get('first_seen_stale') or 0),
+                           t[0]['id']))
+
+        graceful_budget = self.STALE_UPDATE_GRACEFUL_PER_TICK
+        hard_budget = self.STALE_UPDATE_HARD_PER_TICK
+        graceful_done: list[str] = []
+        hard_done: list[str] = []
+        for peer, rec, commit in graceful_candidates:
+            pid = peer['id']
+            if graceful_budget <= 0:
+                tracked[pid] = rec  # try again next tick
+                continue
+            log.info('Stale peer %s mid-KG (%s on %s); sending '
+                     'graceful update to schedule restart at KG boundary',
+                     pid, rec.get('last_state'), commit)
+            try:
+                gres = trigger_peer_update(peer['url'], graceful=True)
+            except Exception as e:
+                gres = {'error': str(e)}
+            rec['last_graceful_attempt'] = now
+            rec['last_graceful_result'] = gres
+            tracked[pid] = rec
+            graceful_budget -= 1
+            graceful_done.append(pid)
+        for peer, rec, commit, attempts in hard_candidates:
+            pid = peer['id']
+            if hard_budget <= 0:
+                tracked[pid] = rec  # try again next tick
+                continue
+            log.info('Auto-retry update on stale peer %s '
+                     '(commit=%s, attempt=%d)',
                      pid, commit, attempts + 1)
             try:
-                res = trigger_peer_update(url, graceful=False)
+                res = trigger_peer_update(peer['url'], graceful=False)
             except Exception as e:
                 res = {'error': str(e)}
             rec['attempts'] = attempts + 1
             rec['last_attempt'] = now
             rec['last_result'] = res
             tracked[pid] = rec
+            hard_budget -= 1
+            hard_done.append(pid)
+        if graceful_done or hard_done:
+            log.info('Stale-peer rollout this tick: %d graceful (%s), '
+                     '%d hard (%s); deferred=%d/%d',
+                     len(graceful_done), ','.join(graceful_done) or '-',
+                     len(hard_done), ','.join(hard_done) or '-',
+                     max(0, len(graceful_candidates) - len(graceful_done)),
+                     max(0, len(hard_candidates) - len(hard_done)))
         for pid in list(tracked.keys()):
             if pid not in live_ids:
                 tracked.pop(pid, None)
@@ -4789,35 +4870,66 @@ class PeerDirector:
                 timeout=2).decode().strip()
         except Exception:
             pass
-        # We used to require an exact commit match; that made handback fail
-        # any time the operator pushed an update on the primary while a non-
-        # primary peer was acting as director. The snapshot format is stable
-        # across recent commits, so allow handback whenever primary is at
-        # least as fresh as us. Only refuse when primary is *behind* (commit
-        # not in our local git history) — that's the case where running an
-        # older director on a newer state could lose schema fields.
+        # We used to require an exact commit match; that made handback
+        # fail any time the operator pushed an update on the primary
+        # while a non-primary peer was acting as director. Now we use
+        # ancestry checks: primary must be at-or-ahead (my_commit is an
+        # ancestor of primary_commit, OR commits are equal). We refuse
+        # if primary is strictly behind us (could lose schema fields)
+        # OR if commits are unrelated (we can't reason about state
+        # compatibility — operator must intervene).
         if my_commit and primary_commit and primary_commit != my_commit:
-            primary_is_behind = False
-            try:
-                import subprocess as _sp
-                _sp.check_output(
-                    ['git', 'merge-base', '--is-ancestor',
-                     primary_commit, my_commit],
-                    cwd=str(Path(__file__).parent),
-                    stderr=_sp.DEVNULL, timeout=3,
-                )
-                # Exit 0 → primary_commit is an ancestor of my_commit →
-                # primary is behind us.
-                primary_is_behind = True
-            except Exception:
-                primary_is_behind = False
-            if primary_is_behind:
-                log.info('handback skipped: primary on %s is behind us %s',
-                         primary_commit, my_commit)
+            import subprocess as _sp
+            repo = str(Path(__file__).parent)
+            def _is_ancestor(a: str, b: str) -> bool | None:
+                """True if a is ancestor of b. None if either commit is
+                not resolvable locally (try `git fetch` first)."""
+                try:
+                    _sp.check_output(
+                        ['git', 'cat-file', '-e', a + '^{commit}'],
+                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
+                    )
+                    _sp.check_output(
+                        ['git', 'cat-file', '-e', b + '^{commit}'],
+                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
+                    )
+                except Exception:
+                    return None
+                try:
+                    _sp.check_output(
+                        ['git', 'merge-base', '--is-ancestor', a, b],
+                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
+                    )
+                    return True
+                except Exception:
+                    return False
+            primary_is_behind = _is_ancestor(primary_commit, my_commit)
+            primary_is_ahead = _is_ancestor(my_commit, primary_commit)
+            if primary_is_behind is None or primary_is_ahead is None:
+                # Try a cheap fetch to resolve unknown commits.
+                try:
+                    _sp.run(['git', 'fetch', '--quiet', 'origin'],
+                            cwd=repo, capture_output=True, timeout=20)
+                    primary_is_behind = _is_ancestor(primary_commit, my_commit)
+                    primary_is_ahead = _is_ancestor(my_commit, primary_commit)
+                except Exception:
+                    pass
+            if primary_is_behind is True:
+                log.warning('handback skipped: primary on %s is behind '
+                            'us %s — primary needs to git pull first',
+                            primary_commit, my_commit)
                 return
-            log.info('handback proceeding despite commit mismatch '
-                     '(primary=%s us=%s) — primary is fresher or unrelated',
-                     primary_commit, my_commit)
+            if primary_is_ahead is True:
+                log.info('handback proceeding: primary on %s is ahead '
+                         'of us %s', primary_commit, my_commit)
+            else:
+                # Commits unrelated (different branches?) or unresolvable.
+                # Refuse — operator must reconcile.
+                log.warning('handback skipped: primary commit %s and '
+                            'our commit %s are unrelated/unresolvable; '
+                            'operator must reconcile',
+                            primary_commit, my_commit)
+                return
         # Healthy enough — hand over.
         log.warning('Auto-handback: primary is healthy, handing director '
                     'role back from %s to primary', me)

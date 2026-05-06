@@ -4159,8 +4159,16 @@ class PeerDirector:
 
         # Compute reserve target.  Reserve peers must be enabled+online
         # but idle.  Count idle-eligible peers in `candidates`.
+        # 'complete' is a terminal post-run state set when a peer's
+        # processor exited cleanly after finishing its last KG; it's
+        # just as idle as 'stopped' from our perspective. Without
+        # including it here, peers that finished a cache-only KG
+        # would never be re-eligible for the next one, and the fleet
+        # would drain to ~1 running cache-only peer (matches the
+        # observed '1/24 cache' state).
         idle_eligible = [c for c in candidates
-                         if c['state'] in ('idle', 'stopped', 'unknown')]
+                         if c['state'] in ('idle', 'stopped', 'complete',
+                                            'unknown')]
 
         # Total enabled peers excluding scheduled-out (e.g. not_before in
         # the future, like a primary that's been parked until the next

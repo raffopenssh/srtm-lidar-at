@@ -1594,6 +1594,44 @@ which peer is the source.
 | `manual` | Director keeps the manually-activated peer running, no auto-switch |
 | `paused` | Director does nothing — all peers stay in current state |
 
+#### Credential revalidation — director-only
+
+`_valid_credentials()` is a **pure cache read**. It never triggers an
+OIDC probe. The dashboard hot path (`get_status` running in any
+gunicorn worker) and every other reader sees the cached `last_status`
+values from `copernicus.list_credentials()` (refreshed on disk via
+`_save_credentials_to_disk()`).
+
+The *only* call site permitted to refresh credential health is
+`_refresh_credentials_if_due()` invoked from the director loop (once
+per tick, gated to `_REVALIDATE_INTERVAL_S = 600s`). It uses a
+process-wide `_REVALIDATE_LOCK` for single-flight semantics, so even if
+a future caller wires a second invocation in, only one OIDC probe per
+process runs at a time.
+
+Why this is strict: in 2026-05-06 we wedged the primary's worker pool
+with ~50 OIDC requests/s after a srv restart. The bug was that
+`_valid_credentials` had a per-call `if now-last > 600` guard reading
+an in-memory timestamp — which non-director workers never updated
+from disk, and which 4 racing dashboard threads all passed
+simultaneously. Each cache miss fanned out into 8 OIDC token requests
+(one per credential), the listen backlog overflowed, and process.html
+became unreachable. The architectural fix (this section) is that the
+request path *cannot* probe — only the director loop can. To force a
+fresh probe (e.g. after credential renewals), call
+`POST /api/v1/credentials/validate` (no body).
+
+#### Director link on peer dashboards
+
+`/api/v1/director/status` returns `self_url`, `director_url`, and
+`is_director_local`. When the dashboard is open against a non-director
+VM, the Peer Director header renders a `⇗ director: <id>` pill linking
+to the current director's `process.html`. This works even when the
+local `self.json` hasn't been updated by the latest announce: the JS
+resolves the id by matching `director_url` against peer URLs in
+`d.peers`. On the director itself the pill is hidden (the existing
+`★ director` peer-card badge already marks who is in charge).
+
 #### Director High-Availability (`director_ha.py`)
 
 Failover is automatic. Every VM (primary + peers) runs a watchdog

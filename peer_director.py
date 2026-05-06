@@ -104,7 +104,27 @@ _PEER_URL_TO_ID: dict[str, str] = {}
 # worker has its own copy; the primary check is still the persisted
 # state['_creds_revalidated_at'], but this avoids hitting OIDC twice
 # in the same worker within a tick.
+#
+# Single-flight semantics: only one thread per process may run the
+# OIDC probe at a time. Other threads see the throttle window as
+# closed and use cached ``last_status`` instead. This is what stops
+# the dashboard-induced OIDC storm: with 4 threads × 2 workers each
+# racing past a stale timestamp, we'd otherwise issue 8 OIDC requests
+# × 8 credentials = 64 outbound requests per tick.
 _LAST_CREDS_REVALIDATED_AT: float = 0.0
+_REVALIDATE_LOCK = threading.Lock()
+# Hard floor on revalidation cadence. Even the director loop won't
+# probe more often than this. The dashboard hot path uses cached
+# ``last_status`` from ``copernicus.list_credentials()``; that cache
+# is updated by ``_save_credentials_to_disk()`` after each probe.
+_REVALIDATE_INTERVAL_S = 600
+# Hard kill switch: only the director loop is permitted to call
+# ``revalidate_all_credentials()``. The dashboard path
+# (``get_status`` → ``_valid_credentials``) reads cached statuses
+# only. This is the architectural fix for the OIDC storm: the hot
+# request path can never trigger network probes, regardless of
+# any cache miss or worker swap.
+_REVALIDATE_OWNER_THREAD: int | None = None
 
 
 def _peer_id_for_url(peer_url: str) -> str:
@@ -2042,6 +2062,13 @@ class PeerDirector:
             'shadow_last_push_ok': state.get('shadow_last_push_ok'),
             'is_director_local': (DATA_DIR / 'is_director').exists(),
             'self_id': self._self_id_safe(),
+            # Pointer to the current director (peer view): when this
+            # VM is *not* the director, the dashboard renders a
+            # "⇗ director: <id>" link to the director's process.html
+            # so the user always knows where to find the live
+            # orchestration view.
+            'self_url': self._self_url_safe(),
+            'director_url': self._director_url_safe(),
             'frontier_cred_plan': state.get('frontier_cred_plan') or {},
             'frontier_strip_plan': state.get('frontier_strip_plan') or {},
             'frontier_cell_plan': state.get('frontier_strip_plan') or {},
@@ -2054,6 +2081,31 @@ class PeerDirector:
             return _dha.self_id()
         except Exception:
             return 'primary'
+
+    def _self_url_safe(self) -> str | None:
+        try:
+            import director_ha as _dha
+            return _dha.self_url()
+        except Exception:
+            return None
+
+    def _director_url_safe(self) -> str | None:
+        """URL of the currently-authoritative director.
+
+        On the director itself this returns its own URL (self_url).
+        On a peer it returns the pointer in ``self.json:director_url``
+        (mirrored from ``zenodo_lock_url.txt``). Used by the dashboard
+        to render a link to the director's process.html so users
+        opening a peer dashboard can navigate to the live
+        orchestration view in one click.
+        """
+        try:
+            if (DATA_DIR / 'is_director').exists():
+                return self._self_url_safe()
+            import director_ha as _dha
+            return _dha.director_url()
+        except Exception:
+            return None
 
     def set_mode(self, mode: str):
         with self._lock:
@@ -2905,47 +2957,23 @@ class PeerDirector:
     def _valid_credentials(self) -> list[int]:
         """Return indices of credentials that are not exhausted.
 
-        Re-runs cheap probes at most every 10 minutes; uses cached
-        ``last_status`` from copernicus.list_credentials() in between.
+        **Pure cache read.** Never triggers an OIDC probe. The
+        director loop is the *only* call site permitted to refresh
+        the credential health (via ``_refresh_credentials_if_due``);
+        every other reader — including ``get_status`` running in any
+        gunicorn worker — sees the cached ``last_status`` from
+        ``copernicus.list_credentials()``.
 
-        The throttle timestamp must be persisted: this method is called
-        from the dashboard ``get_status`` endpoint, which runs in any
-        gunicorn worker (state shared only via disk). Without disk
-        persistence each /director/status request re-runs the probe —
-        with 8 creds × OIDC token = 8 outbound HTTPS calls per request,
-        and the dashboard polls continuously per open tab. We saw the
-        primary's worker pool wedge with ~50 OIDC requests/s, listen
-        backlog overflow, and process.html become unreachable.
-
-        Also persisted at module level so multiple worker processes on
-        the same host share the throttle without disk round-trips on
-        the hot path.
+        Why this is strict: in 2026-05-06 we saw the primary's worker
+        pool wedge with ~50 OIDC requests/s and the listen backlog
+        overflow (process.html became unreachable). Root cause: any
+        cache miss in any worker thread fanned out into 8 OIDC token
+        requests. Multiple threads racing past a stale timestamp
+        amplified that to 64+ probes per tick. The architectural fix
+        is that the request path *cannot* probe — only the director
+        loop can.
         """
         creds = self._credential_pool()
-        # Process-local fast path first: avoids any state lookup +
-        # save when called multiple times within the same tick
-        # (e.g. from _orchestrate_parallel_frontiers + status()).
-        global _LAST_CREDS_REVALIDATED_AT
-        now = time.time()
-        last = max(
-            float(_LAST_CREDS_REVALIDATED_AT or 0),
-            float(self.state.get('_creds_revalidated_at') or 0),
-        )
-        if now - last > 600:
-            try:
-                import copernicus as _cop
-                _cop.revalidate_all_credentials()
-                creds = _cop.list_credentials()
-                _LAST_CREDS_REVALIDATED_AT = now
-                with self._lock:
-                    self.state['_creds_revalidated_at'] = now
-                    try:
-                        save_director_state(self.state)
-                    except Exception:
-                        log.debug('save_director_state during revalidate failed',
-                                  exc_info=True)
-            except Exception as e:
-                log.debug('revalidate_all_credentials failed: %s', e)
         valid = []
         for c in creds:
             if c.get('exhausted'):
@@ -2955,6 +2983,57 @@ class PeerDirector:
                 continue
             valid.append(int(c.get('index')))
         return valid
+
+    def _refresh_credentials_if_due(self) -> None:
+        """Director-loop hook: re-run OIDC probes at most once every
+        ``_REVALIDATE_INTERVAL_S`` seconds. Single-flight via a process-
+        wide lock + module-level timestamp; if another thread is
+        already probing (extremely rare given the loop is single-
+        threaded but defensive against future call-sites), this returns
+        immediately. Cached ``last_status`` updates land on disk via
+        ``copernicus._save_credentials_to_disk()`` so all gunicorn
+        workers see fresh data without each having to probe.
+        """
+        global _LAST_CREDS_REVALIDATED_AT, _REVALIDATE_OWNER_THREAD
+        now = time.time()
+        last_mem = float(_LAST_CREDS_REVALIDATED_AT or 0)
+        last_disk = float(self.state.get('_creds_revalidated_at') or 0)
+        last = max(last_mem, last_disk)
+        if now - last <= _REVALIDATE_INTERVAL_S:
+            return
+        # Single-flight — if another thread already holds the lock,
+        # skip this tick. The next tick will retry once the holder is
+        # done; meanwhile cached statuses remain valid.
+        if not _REVALIDATE_LOCK.acquire(blocking=False):
+            return
+        try:
+            # Re-check inside the lock (someone else may have just
+            # finished a probe).
+            if (time.time() - max(
+                    float(_LAST_CREDS_REVALIDATED_AT or 0),
+                    float(self.state.get('_creds_revalidated_at') or 0),
+                )) <= _REVALIDATE_INTERVAL_S:
+                return
+            _REVALIDATE_OWNER_THREAD = threading.get_ident()
+            try:
+                import copernicus as _cop
+                _cop.revalidate_all_credentials()
+            except Exception as e:
+                log.debug('revalidate_all_credentials failed: %s', e)
+                return
+            _LAST_CREDS_REVALIDATED_AT = time.time()
+            with self._lock:
+                self.state['_creds_revalidated_at'] = (
+                    _LAST_CREDS_REVALIDATED_AT
+                )
+                try:
+                    save_director_state(self.state)
+                except Exception:
+                    log.debug('save_director_state during revalidate failed',
+                              exc_info=True)
+        finally:
+            _REVALIDATE_OWNER_THREAD = None
+            _REVALIDATE_LOCK.release()
 
     def _peer_capabilities(self, ps: dict) -> set[str]:
         """Read capability flags from a peer's /api/v1/info response.
@@ -4633,6 +4712,13 @@ class PeerDirector:
                 except Exception:
                     pass
                 self._update_bandwidth()
+                # Refresh credential health on the director thread only.
+                # Hot request paths (dashboard get_status) read cached
+                # last_status; only the loop is permitted to probe.
+                try:
+                    self._refresh_credentials_if_due()
+                except Exception:
+                    log.debug('_refresh_credentials_if_due failed', exc_info=True)
                 # Capacity factor: poll each peer's processing status once
                 # per tick (cheap; we already do it implicitly inside the
                 # orchestrators) and use the warning_rates field to derive

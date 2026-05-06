@@ -443,6 +443,9 @@
       <span style="cursor:pointer" id="directorHead" class="coll-h" onclick="toggle('director')">
         <span class="arr">▶</span> 🌐 Peer Director
         <span id="directorSummary" style="color:var(--text);font-weight:600;margin-left:6px"></span>
+        <a id="directorLink" style="display:none;margin-left:8px;font-size:11px;font-weight:600;padding:1px 6px;border:1px solid var(--blue);border-radius:8px;color:var(--blue);text-decoration:none"
+           target="_blank" rel="noopener"
+           title="Open the active director's dashboard">⇗ director: <span id="directorLinkLabel"></span></a>
       </span>
       <span id="directorControls" style="display:flex;gap:4px;">
         <button class="btn" id="btnDirAuto" onclick="setDirectorMode('auto')" style="font-size:10px;padding:1px 6px;" title="Auto-select peer by bandwidth">Auto</button>
@@ -3594,6 +3597,37 @@ function renderDirector(d) {
   }
   sumText += ' \u00b7 ' + totalCompleted + ' total done';
   document.getElementById('directorSummary').textContent = sumText;
+
+  // Director link: when this dashboard is NOT the live director,
+  // show a pill with the director's id linking to its process.html.
+  // When this IS the director, hide the pill.
+  try {
+    const dlink = document.getElementById('directorLink');
+    const dlabel = document.getElementById('directorLinkLabel');
+    if (dlink && dlabel) {
+      const isLocalDir = !!d.is_director_local;
+      const dirUrl = d.director_url || null;
+      // Find the director's id by matching director_url against
+      // peer URLs in the fleet (works even when the local self.json
+      // hasn't been told about the new director yet — we still know
+      // the URL and can resolve the label from peers).
+      let dirId = null;
+      if (dirUrl) {
+        const norm = u => (u || '').replace(/\/$/, '');
+        const target = norm(dirUrl);
+        for (const p of peers) {
+          if (norm(p.url) === target) { dirId = p.id; break; }
+        }
+      }
+      if (!isLocalDir && dirUrl) {
+        dlabel.textContent = dirId || 'open';
+        dlink.href = dirUrl.replace(/\/$/, '') + '/process.html';
+        dlink.style.display = '';
+      } else {
+        dlink.style.display = 'none';
+      }
+    }
+  } catch (e) { /* non-fatal */ }
 
   // Highlight active mode button
   document.getElementById('btnDirAuto').style.borderColor = mode === 'auto' ? 'var(--green)' : '';

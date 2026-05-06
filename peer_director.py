@@ -3133,24 +3133,64 @@ class PeerDirector:
         frontier peers pinned to disjoint cells never collide on a
         Zenodo ZIP write.
 
-        With STRIP_HEIGHT=1° × STRIP_WIDTH=2° there are ~16 cells
-        across Austria's 9–17.5° × 46–49.5° envelope (after pruning
-        the few empty corners we'd never assign).
+        With STRIP_HEIGHT=1° × STRIP_WIDTH=2° the raw grid spans
+        46–50°N × 8–18°E (20 cells), but Austria only occupies
+        ~13 of them — the 49–50°N row is entirely empty, as are
+        (48–49, 8–12). Cells with zero KGs are pruned so frontier
+        peers never get pinned to dead cells (which causes the
+        processor to start, find nothing, exit, repeat — and the
+        peer's assigned credential is never used).
+
+        Result is cached on the instance for the life of the director.
         """
+        cached = getattr(self, '_austria_cells_cache', None)
+        if cached is not None:
+            return cached
         try:
             from zenodo_cache import _lat_lon_cells
-            return [tuple(c) for c in _lat_lon_cells()]
+            raw = [tuple(c) for c in _lat_lon_cells()]
         except Exception:
-            cells = []
+            raw = []
             s = 46.0
             while s < 49.5:
                 w = 8.0
                 while w < 18.0:
-                    cells.append((round(s, 4), round(s + 1.0, 4),
-                                  round(w, 4), round(w + 2.0, 4)))
+                    raw.append((round(s, 4), round(s + 1.0, 4),
+                                round(w, 4), round(w + 2.0, 4)))
                     w += 2.0
                 s += 1.0
-            return cells
+        # Prune cells with no KGs. kg_list.json is the canonical KG
+        # list (~8440 entries), each carrying lat/lon centroids.
+        try:
+            kg_path = DATA_DIR / 'kg_list.json'
+            if kg_path.exists():
+                kgs = json.loads(kg_path.read_text())
+                non_empty: set[tuple[float, float, float, float]] = set()
+                for k in kgs:
+                    bb = k.get('bbox') or {}
+                    try:
+                        lat = (float(bb['min_lat']) + float(bb['max_lat'])) / 2
+                        lon = (float(bb['min_lon']) + float(bb['max_lon'])) / 2
+                    except Exception:
+                        lat = k.get('lat'); lon = k.get('lon')
+                        if lat is None or lon is None:
+                            continue
+                    for c in raw:
+                        s, n, w, e = c
+                        if s <= lat < n and w <= lon < e:
+                            non_empty.add(c)
+                            break
+                pruned = [c for c in raw if c in non_empty]
+                if pruned:
+                    dropped = len(raw) - len(pruned)
+                    if dropped:
+                        log.info('austria_cells: pruned %d empty cells '
+                                 '(%d → %d)', dropped, len(raw), len(pruned))
+                    raw = pruned
+        except Exception as e:
+            log.warning('austria_cells: empty-cell prune failed: %s', e)
+        self._austria_cells_cache = raw
+        return raw
 
     def _strip_fingerprint(self, lat_south: float, lat_north: float) -> str:
         """Return a cheap fingerprint of the cache manifest for one lat strip.

@@ -3210,7 +3210,15 @@ def processing_completed_recent():
     """
     data_dir = Path('data/austria_processor')
     manifest_path = data_dir / 'zenodo_manifest.json'
-    items = []
+    try:
+        from kg_splitter import parent_kg_code
+    except Exception:
+        def parent_kg_code(c):
+            return c.split('-', 1)[0] if '-' in c else c
+    # Source of truth: search index (matches db_processed counter — covers all
+    # peer-synced KGs, not just locally-uploaded ones). Order by Zenodo upload
+    # time from local manifest where available; fall back to generated_at.
+    by_parent = {}
     if manifest_path.exists():
         try:
             m = json.loads(manifest_path.read_text())
@@ -3220,11 +3228,25 @@ def processing_completed_recent():
                     continue
                 if 'error' in (val.get('status', '') or ''):
                     continue
-                code = key[:-5]
+                parent = parent_kg_code(key[:-5])
                 ua = val.get('uploaded_at') or ''
-                items.append((ua, code))
+                prev = by_parent.get(parent)
+                if prev is None or ua > prev:
+                    by_parent[parent] = ua
         except Exception:
             pass
+    items = []
+    try:
+        import search_index as _si
+        rows = _si.get_index()._conn().execute(
+            'SELECT kg_code, generated_at FROM kg WHERE processed=1'
+        ).fetchall()
+        for code, gen_at in rows:
+            ua = by_parent.get(code) or (gen_at or '')
+            items.append((ua, code))
+    except Exception:
+        for parent, ua in by_parent.items():
+            items.append((ua, parent))
     items.sort()
     codes = [c for _, c in items]
     try:

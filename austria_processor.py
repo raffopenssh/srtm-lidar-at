@@ -3223,15 +3223,21 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             except Exception:
                 pass
         if any_data:
-            hd2 = wsum2 > 0
-            dtm_extra = np.where(hd2, dtm_sum2 / wsum2, np.nan).astype(np.float32)
-            dsm_extra = np.where(hd2, dsm_sum2 / wsum2, np.nan).astype(np.float32)
-            _write_table(f'DTM_{year}', [dtm_extra], full_h, full_w, full_tf,
-                         descs=[f'DTM {year} (m)'])
-            _write_table(f'DSM_{year}', [dsm_extra], full_h, full_w, full_tf,
-                         descs=[f'DSM {year} (m)'])
-            log.info("  FULL_GPKG: DTM/DSM %d written", year)
-            del dtm_extra, dsm_extra
+            try:
+                hd2 = wsum2 > 0
+                dtm_extra = np.where(hd2, dtm_sum2 / wsum2, np.nan).astype(np.float32)
+                dsm_extra = np.where(hd2, dsm_sum2 / wsum2, np.nan).astype(np.float32)
+                _write_table(f'DTM_{year}', [dtm_extra], full_h, full_w, full_tf,
+                             descs=[f'DTM {year} (m)'])
+                _write_table(f'DSM_{year}', [dsm_extra], full_h, full_w, full_tf,
+                             descs=[f'DSM {year} (m)'])
+                log.info("  FULL_GPKG: DTM/DSM %d written", year)
+                del dtm_extra, dsm_extra
+            except Exception as e:
+                # Multi-date DTM/DSM is supplementary; skip on transient
+                # GDAL/GPKG failures (e.g. SetGeoTransform errors) so the
+                # primary GPKG completes. Matches gpkg_streamed.py policy.
+                log.warning("FULL_GPKG: multi-date %d failed: %s", year, e)
         del dtm_sum2, dsm_sum2, wsum2
 
     # ------------------------------------------------------------------

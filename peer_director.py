@@ -1265,10 +1265,18 @@ def _clear_completed_reservations(cfg: dict) -> bool:
     return changed
 
 
-def _ready_reservation_holder(cfg: dict) -> str | None:
+def _ready_reservation_holder(cfg: dict, state: dict | None = None) -> str | None:
     """Return peer_id of an enabled, non-scheduled peer that holds a
     reserved KG ready to be resumed. Returns None if no such peer.
+
+    A holder with insufficient bandwidth (<2 GB remaining) cannot
+    actually run the held KG, so it is ignored. Otherwise the
+    director would pre-empt the active peer in a loop without ever
+    being able to activate the holder (choose_active_peer also
+    bandwidth-gates), starving parallel frontiers.
     """
+    bw_map = (state or {}).get('peer_bandwidth', {}) if state else {}
+    budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
     for p in cfg.get('peers', []):
         if not p.get('enabled', True):
             continue
@@ -1276,6 +1284,11 @@ def _ready_reservation_holder(cfg: dict) -> str | None:
             continue
         if _peer_is_scheduled(p):
             continue
+        if state is not None:
+            bw = bw_map.get(p['id'], {})
+            used = bw.get('used_bytes', 0)
+            if (budget_bytes - used) < 2 * (1024 ** 3):
+                continue
         return p['id']
     return None
 
@@ -1348,13 +1361,9 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
     most remaining bandwidth.
     Returns None if all candidates have <2 GB remaining.
     """
-    holder = _ready_reservation_holder(cfg)
+    holder = _ready_reservation_holder(cfg, state)
     if holder:
-        bw = state.get('peer_bandwidth', {}).get(holder, {})
-        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
-        used = bw.get('used_bytes', 0)
-        if (budget_bytes - used) >= 2 * (1024 ** 3):
-            return holder
+        return holder
     budget_gb = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB)
     budget_bytes = budget_gb * (1024 ** 3)
 
@@ -2228,7 +2237,7 @@ class PeerDirector:
         # there than starting fresh on the substitute. We only pre-empt
         # between KGs (never mid-KG) by waiting for idle/stopped state.
         if active_id:
-            holder = _ready_reservation_holder(cfg)
+            holder = _ready_reservation_holder(cfg, state_copy)
             if holder and holder != active_id:
                 active_peer_cfg = get_peer_by_id(cfg, active_id)
                 ps = get_peer_status(active_peer_cfg.get('url')) if active_peer_cfg else {}

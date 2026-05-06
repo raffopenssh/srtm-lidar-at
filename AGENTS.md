@@ -505,6 +505,29 @@ dashboard plateaus at "running parallel: 1" despite plenty of capacity:
    gunicorn on the peer side) would otherwise hold its cred slice
    forever. Only append to `started` when the call actually succeeded.
 
+**Persistence contract for parallel-frontier state (post-2026-05-06):**
+All three of `parallel_frontiers_active`, `frontier_cred_plan`,
+`frontier_strip_plan` survive worker / director restarts — they are
+written to `director_state.json` by `_orchestrate_parallel_frontiers`
+and reloaded by `PeerDirector.__init__`. The single-active-frontier
+guard in `_check_and_switch` consults the **union** of
+`parallel_frontiers_active` and the keys of `frontier_cred_plan`
+before deciding to hard-stop a non-active running frontier. The guard
+runs *before* `_orchestrate_parallel_frontiers` each tick, so without
+this union a freshly-restarted director would kill every authorised
+parallel frontier on its first tick (the original 2026-05-06 cascade:
+at43 was active, at22 was an authorised parallel frontier, srv
+restarted, the new worker's tick-1 hard-stopped at22 with `only at43
+may run frontier`). The cache-only orchestrator already used this
+union; the single-active guard now matches. The empty-`_austria_cells`
+branch in `_orchestrate_parallel_frontiers` no longer wipes
+`parallel_frontiers_active` — that wipe was the trigger for the
+cascade and it gains nothing (the set is rebuilt later in the same
+function body once cells are available). Transient (rebuilt every
+tick, not persisted): `_frontier_restart_log`, `unreachable_count`,
+`graceful_stop_sent`, `_target_frontier_count` (persisted, but as
+an EMA seed only).
+
 **Plan-drift detection (no peer-side change needed for cred resizing):**
 `_orchestrate_parallel_frontiers()` compares the current cred/strip
 plan to `frontier_cred_plan` / `frontier_strip_plan` in director_state

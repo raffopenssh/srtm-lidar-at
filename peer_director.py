@@ -2560,10 +2560,27 @@ class PeerDirector:
         # Enforce single-active for the FRONTIER role: stop any non-active
         # peers that are running a non-cache-only processor UNLESS the
         # director has authorised them as a parallel frontier (in
-        # ``parallel_frontiers_active``) AND the cred pool supports it.
+        # ``parallel_frontiers_active`` or as a key of
+        # ``frontier_cred_plan``) AND the cred pool supports it.
         # Cache-only peers (no Copernicus credentials) may run in parallel —
         # they're managed by ``_orchestrate_cache_only``.
+        #
+        # Why both sets? ``parallel_frontiers_active`` is a current-tick
+        # observation rebuilt by ``_orchestrate_parallel_frontiers``,
+        # which only runs *after* this guard. ``frontier_cred_plan`` is
+        # the director's persisted authorisation map. After a srv
+        # restart the new worker has not yet ticked the parallel orch,
+        # so trusting only ``parallel_frontiers_active`` would hard-stop
+        # any inherited parallel frontier (the 2026-05-06 cascade).
+        # Mirrors the same union used by ``_orchestrate_cache_only``.
+        cred_plan = self.state.get('frontier_cred_plan') or {}
+        strip_plan = self.state.get('frontier_strip_plan') or {}
         parallel_ok = set(self.state.get('parallel_frontiers_active') or [])
+        parallel_ok |= set(cred_plan.keys())
+        # Active peer is implicitly authorised — belt and braces in
+        # case the plan map drifted out from under us.
+        if active_id:
+            parallel_ok.add(active_id)
         if active_id:
             for p in cfg.get('peers', []):
                 if p['id'] != active_id and p.get('url') is not None:
@@ -2573,9 +2590,17 @@ class PeerDirector:
                             continue  # benign — doesn't touch credentials
                         if p['id'] in parallel_ok:
                             continue  # authorised parallel frontier
-                        log.warning('Non-active peer %s is running frontier work — '
-                                    'stopping it (only %s may run frontier)',
-                                    p['id'], active_id)
+                        log.warning(
+                            'Non-active peer %s is running frontier work — '
+                            'stopping it (active=%s, '
+                            'parallel_frontiers_active=%s, '
+                            'cred_plan_keys=%s, strip_plan_keys=%s)',
+                            p['id'], active_id,
+                            sorted(self.state.get(
+                                'parallel_frontiers_active') or []),
+                            sorted(cred_plan.keys()),
+                            sorted(strip_plan.keys()),
+                        )
                         safely_stop_peer(p.get('url'), p['id'])
 
         # If no active peer, choose one
@@ -2590,7 +2615,13 @@ class PeerDirector:
                     # peers don't touch Copernicus credentials and may
                     # remain running in parallel.
                     blocked = False
-                    parallel_ok = set(self.state.get('parallel_frontiers_active') or [])
+                    # Same union as the single-active guard above:
+                    # trust the persisted cred_plan keys, not just the
+                    # current-tick observation set.
+                    parallel_ok = set(
+                        self.state.get('parallel_frontiers_active') or [])
+                    parallel_ok |= set(
+                        (self.state.get('frontier_cred_plan') or {}).keys())
                     for p in cfg.get('peers', []):
                         if p['id'] == new_peer:
                             continue
@@ -3583,8 +3614,14 @@ class PeerDirector:
         # tile uploads are scoped to one cell per ZIP.
         strips = self._austria_cells()
         if not strips:
-            with self._lock:
-                self.state['parallel_frontiers_active'] = []
+            # Empty cells is transient (config glitch / startup race).
+            # Do NOT wipe parallel_frontiers_active here — the
+            # single-active guard in ``_check_and_switch`` consults
+            # this set to decide whether to hard-stop running
+            # frontiers. Wiping it caused the 2026-05-06 cascade
+            # where every authorised parallel frontier was killed on
+            # the next tick. Just bail out and try again next tick.
+            log.debug('parallel orch: no Austria cells available, skipping')
             return
 
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)

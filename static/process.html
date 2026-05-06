@@ -3673,7 +3673,9 @@ function renderDirector(d) {
     const isActive = p.id === active;
     const bw = p.bandwidth || {};
     const usedGb = (bw.used_gb || 0);
-    const budgetGb = d.budget_gb || 95;
+    // Per-peer override (canary peers under raised budgets) wins over
+    // the global cluster default.
+    const budgetGb = bw.effective_budget_gb || d.budget_gb || 95;
     const remainGb = (bw.remaining_gb != null) ? bw.remaining_gb : (budgetGb - usedGb);
     const bwPct = Math.min(100, Math.round(100 * usedGb / budgetGb));
     const bwColor = bwPct > 90 ? 'var(--red)' : bwPct > 70 ? 'var(--yellow)' : 'var(--green)';

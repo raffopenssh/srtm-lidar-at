@@ -63,6 +63,27 @@ BANDWIDTH_BUDGET_GB = 95  # conservative — leave 5 GB headroom out of 100
 BANDWIDTH_BUDGET_BYTES = BANDWIDTH_BUDGET_GB * (1024 ** 3)
 BANDWIDTH_RENEW_DAY = 17  # day of month when exe.dev bandwidth resets
 
+
+def _peer_budget_bytes(peer: dict, cfg: dict) -> int:
+    """Per-peer bandwidth budget in bytes.
+
+    Resolution order: ``peer.budget_gb`` (override) >
+    ``cfg.budget_gb`` (global) > ``BANDWIDTH_BUDGET_GB`` (default).
+    Used to let a few canary peers run past the conservative global
+    cap so we can probe what exe.dev's real billing-cycle limits are
+    without disturbing the rest of the fleet.
+    """
+    try:
+        per = peer.get('budget_gb') if isinstance(peer, dict) else None
+        if per is not None:
+            per = float(per)
+            if per > 0:
+                return int(per * (1024 ** 3))
+    except (TypeError, ValueError):
+        pass
+    g = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) if isinstance(cfg, dict) else BANDWIDTH_BUDGET_GB
+    return int(g * (1024 ** 3))
+
 # Number of enabled peers to keep idle as reserve (never started by
 # the director).  Operational headroom for ad-hoc work, RF training,
 # and bandwidth/credential burst capacity.
@@ -1287,7 +1308,6 @@ def _clear_completed_reservations(cfg: dict, state: dict | None = None) -> bool:
     except Exception:
         pass
     bw_map = (state or {}).get('peer_bandwidth', {}) if state else {}
-    budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
     changed = False
     for p in cfg.get('peers', []):
         kg = p.get('reserved_kg')
@@ -1305,7 +1325,7 @@ def _clear_completed_reservations(cfg: dict, state: dict | None = None) -> bool:
         if state is not None:
             bw = bw_map.get(p['id'], {})
             used = bw.get('used_bytes', 0)
-            if (budget_bytes - used) < 2 * (1024 ** 3):
+            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
                 log.warning('Releasing held KG %s from %s '
                             '(cooldown elapsed but bandwidth exhausted)',
                             kg, p['id'])
@@ -1325,7 +1345,6 @@ def _ready_reservation_holder(cfg: dict, state: dict | None = None) -> str | Non
     bandwidth-gates), starving parallel frontiers.
     """
     bw_map = (state or {}).get('peer_bandwidth', {}) if state else {}
-    budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
     for p in cfg.get('peers', []):
         if not p.get('enabled', True):
             continue
@@ -1336,7 +1355,7 @@ def _ready_reservation_holder(cfg: dict, state: dict | None = None) -> str | Non
         if state is not None:
             bw = bw_map.get(p['id'], {})
             used = bw.get('used_bytes', 0)
-            if (budget_bytes - used) < 2 * (1024 ** 3):
+            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
                 continue
         return p['id']
     return None
@@ -1413,8 +1432,6 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
     holder = _ready_reservation_holder(cfg, state)
     if holder:
         return holder
-    budget_gb = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB)
-    budget_bytes = budget_gb * (1024 ** 3)
 
     # Score-based pick: prefer quiet peers (low warning fingerprint),
     # break ties by remaining bandwidth. Fresh peers have score 0 and
@@ -1435,7 +1452,7 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         pid = peer['id']
         bw = state.get('peer_bandwidth', {}).get(pid, {})
         used = bw.get('used_bytes', 0)
-        remaining = budget_bytes - used
+        remaining = _peer_budget_bytes(peer, cfg) - used
         if remaining < 2 * (1024 ** 3):
             continue  # not enough headroom
         noise = _peer_noise_score(pid, state)
@@ -1861,8 +1878,21 @@ class PeerDirector:
             pid = peer['id']
             url = peer.get('url')
             ps = statuses.get(pid, {'state': 'unreachable'})
-            bw = state.get('peer_bandwidth', {}).get(pid, {})
+            bw = dict(state.get('peer_bandwidth', {}).get(pid, {}))
             proc_status = ps.get('state', 'unknown')
+            # Surface effective per-peer budget so dashboard / API
+            # consumers see the canary override, not just the global.
+            _eff_budget_gb = round(_peer_budget_bytes(peer, cfg) / (1024 ** 3), 2)
+            bw['effective_budget_gb'] = _eff_budget_gb
+            if peer.get('budget_gb') is not None:
+                # Recompute remaining_gb against the per-peer budget so
+                # the dashboard doesn't show "0.0 GB remaining" for a
+                # canary that actually has headroom under its override.
+                _used_bytes = bw.get('used_bytes', 0) or 0
+                bw['remaining_gb'] = round(
+                    max(0, int(_eff_budget_gb * (1024 ** 3)) - _used_bytes)
+                    / (1024 ** 3), 2)
+                bw['budget_gb'] = _eff_budget_gb
 
             peers_status.append({
                 'id': pid,
@@ -2407,7 +2437,9 @@ class PeerDirector:
         if active_id:
             bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
             used = bw.get('used_bytes', 0)
-            remaining_gb = (budget_bytes - used) / (1024 ** 3)
+            active_peer_cfg = get_peer_by_id(cfg, active_id) or {}
+            active_budget_bytes = _peer_budget_bytes(active_peer_cfg, cfg)
+            remaining_gb = (active_budget_bytes - used) / (1024 ** 3)
 
             if remaining_gb < 2:  # less than 2 GB remaining
                 log.info('Peer %s near bandwidth limit (%.1f GB remaining), switching',
@@ -2547,7 +2579,7 @@ class PeerDirector:
                     # Check if it should continue
                     bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
                     used = bw.get('used_bytes', 0)
-                    remaining_gb = (budget_bytes - used) / (1024 ** 3)
+                    remaining_gb = (_peer_budget_bytes(peer, cfg) - used) / (1024 ** 3)
                     # Honour not_before cooldown — if scheduled, demote
                     # the active peer so a different one can be picked.
                     if _peer_is_scheduled(peer):
@@ -3809,7 +3841,7 @@ class PeerDirector:
             # would sit idle indefinitely instead of running parallel
             # frontier work in the meantime.
             bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
-            if (budget_bytes - bw.get('used_bytes', 0)) < 2 * (1024 ** 3):
+            if (_peer_budget_bytes(p, cfg) - bw.get('used_bytes', 0)) < 2 * (1024 ** 3):
                 continue
             ps = get_peer_status(p.get('url'))
             if ps.get('state') == 'unreachable':
@@ -4393,7 +4425,7 @@ class PeerDirector:
                 continue
             bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
             used = bw.get('used_bytes', 0)
-            if (budget_bytes - used) < 2 * (1024 ** 3):
+            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
                 continue
             ps = get_peer_status(p.get('url'))
             st = ps.get('state', 'unknown')

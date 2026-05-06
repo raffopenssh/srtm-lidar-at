@@ -378,6 +378,33 @@ RAMP_MAX_STARTS_PER_TICK = 3
 # this guard. Plan changes always restart immediately regardless.
 FRONTIER_RESTART_COOLDOWN_S = 180
 
+# Canary bandwidth history & auto-park.
+#
+# Peers with a per-peer ``budget_gb`` override are canaries running past
+# the global 95 GB cap to probe what exe.dev actually enforces. We sample
+# their cumulative ``used_bytes`` on every bandwidth poll and, if the
+# observed throughput collapses (exe.dev started shaping) or the peer
+# starts spewing warnings (failed BEV / Zenodo / Copernicus calls — i.e.
+# the network is hurting the cluster), park the canary by sending its
+# processor a graceful stop and writing ``not_before = now + cooldown``
+# so the director leaves it alone until exe.dev has presumably released
+# the throttle.
+#
+# Sampling cadence is whatever ``BANDWIDTH_POLL_INTERVAL`` is doing
+# (every ~minute on the active poll loop, less for backed-off peers).
+# Ring is bounded so the state file can't blow up.
+CANARY_HISTORY_MAX = 240          # ~4h at 1 sample/min
+CANARY_BASELINE_MIN_SAMPLES = 6   # need a baseline before we can compare
+CANARY_BASELINE_WINDOW_S = 1800   # 30-min trailing baseline
+CANARY_RECENT_WINDOW_S = 600      # 10-min recent throughput
+CANARY_SLOWDOWN_RATIO = 0.30      # park if recent < 30% of baseline
+CANARY_NOISE_PARK_THRESHOLD = 1.5 # park if noise_score >= this
+CANARY_PARK_COOLDOWN_S = 6 * 3600 # 6 h not_before
+# Don't trip the slowdown check until the canary has actually moved
+# enough bytes for the average to be meaningful (otherwise a peer that
+# happens to be idle between KGs reads as 'shaped').
+CANARY_MIN_BYTES_FOR_PARK = 500 * 1024 * 1024  # 500 MB in baseline window
+
 # Warmup hold for fresh peers. A brand-new peer has no tile cache and
 # zero history; throwing it straight at frontier work means it starts
 # by hammering Copernicus/BEV. We let it sit eligible-but-unused for a
@@ -1779,7 +1806,7 @@ class PeerDirector:
         # clobbered.
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
-                   'peer_history',
+                   'peer_history', 'canary_history',
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
@@ -1908,6 +1935,7 @@ class PeerDirector:
                 'warning_rates': ps.get('warning_rates') or {},
                 'noise_score': round(_peer_noise_score(pid, state), 3),
                 'circuit_breaker': _cb_state_for(pid),
+                'canary': self._canary_summary(peer, state),
                 'role': self._peer_role(peer),
                 'cache_only_run': bool(ps.get('cache_only')),
                 'is_active': pid == state.get('active_peer'),
@@ -2351,6 +2379,188 @@ class PeerDirector:
                 # else: still in backoff, keep last known value
             self.state['_bandwidth_backoff'] = backoff
             self.state['_bandwidth_misses'] = misses
+        # Sample canary throughput AFTER the bandwidth state has
+        # settled. Cheap (one append per peer) and guarded so the
+        # main loop is unaffected if it raises.
+        try:
+            self._sample_canary_history()
+        except Exception:
+            log.debug('canary sample failed', exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Canary bandwidth history
+    # ------------------------------------------------------------------
+    def _sample_canary_history(self) -> None:
+        """Append a (ts, used_bytes) sample for every canary peer.
+
+        A canary is any peer with a ``budget_gb`` override set in
+        peers.json. Non-canaries are not sampled (we only need history
+        on the peers we're probing).
+        """
+        with self._lock:
+            cfg = self.cfg
+            bw_map = self.state.get('peer_bandwidth') or {}
+            hist = self.state.setdefault('canary_history', {})
+            now = int(time.time())
+            for p in cfg.get('peers', []):
+                if p.get('budget_gb') is None:
+                    # Drop history for peers no longer on canary status
+                    # so we don't confuse a future canary run.
+                    hist.pop(p['id'], None)
+                    continue
+                bw = bw_map.get(p['id']) or {}
+                used = bw.get('used_bytes')
+                if used is None or bw.get('error'):
+                    continue
+                series = hist.setdefault(p['id'], [])
+                # Skip duplicate samples (peer cached, no fresh data).
+                if series and series[-1][0] == now:
+                    continue
+                if series and series[-1][1] == used:
+                    # Same byte count as last sample — still record
+                    # so the time axis advances; the throughput
+                    # calculation correctly reads zero.
+                    pass
+                series.append([now, int(used)])
+                # Trim to ring size.
+                if len(series) > CANARY_HISTORY_MAX:
+                    del series[: len(series) - CANARY_HISTORY_MAX]
+
+    def _canary_throughput(self, pid: str, window_s: int) -> dict | None:
+        """Return mean throughput (bytes/s) over the trailing window.
+
+        Returns dict with ``samples``, ``span_s``, ``delta_bytes``,
+        ``rate_bps``, or None if not enough data.
+        """
+        series = (self.state.get('canary_history') or {}).get(pid) or []
+        if len(series) < 2:
+            return None
+        cutoff = series[-1][0] - window_s
+        # Find first sample >= cutoff.
+        i = 0
+        for i in range(len(series)):
+            if series[i][0] >= cutoff:
+                break
+        window = series[i:]
+        if len(window) < 2:
+            return None
+        span = window[-1][0] - window[0][0]
+        if span <= 0:
+            return None
+        delta = max(0, window[-1][1] - window[0][1])
+        return {
+            'samples': len(window),
+            'span_s': span,
+            'delta_bytes': delta,
+            'rate_bps': delta / span,
+        }
+
+    def _canary_summary(self, peer: dict, state: dict) -> dict | None:
+        """Compact summary for the status payload.
+
+        Returns None for non-canary peers so the dashboard can use
+        ``peer.canary`` as both a presence check and a data source.
+        """
+        if peer.get('budget_gb') is None:
+            return None
+        pid = peer['id']
+        series = (state.get('canary_history') or {}).get(pid) or []
+        base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
+        recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
+        # Last ~30 sample points for sparkline rendering.
+        spark = [
+            {'t': int(t), 'used_bytes': int(b)}
+            for (t, b) in series[-60:]
+        ]
+        return {
+            'budget_gb': peer.get('budget_gb'),
+            'samples': len(series),
+            'baseline_mbps': round(base['rate_bps'] / 1e6, 3) if base else None,
+            'recent_mbps': round(recent['rate_bps'] / 1e6, 3) if recent else None,
+            'ratio': (round(recent['rate_bps'] / base['rate_bps'], 3)
+                       if base and recent and base['rate_bps'] > 0 else None),
+            'noise_score': round(_peer_noise_score(pid, state), 3),
+            'park_thresholds': {
+                'slowdown_ratio': CANARY_SLOWDOWN_RATIO,
+                'noise_score': CANARY_NOISE_PARK_THRESHOLD,
+                'cooldown_s': CANARY_PARK_COOLDOWN_S,
+            },
+            'history': spark,
+            'notes': (peer.get('canary_notes') or [])[-5:],
+        }
+
+    def _check_canary_health(self) -> None:
+        """Park canaries that look shaped or noisy.
+
+        Only acts on peers with a ``budget_gb`` override. Sets
+        ``not_before`` so the director's normal scheduling logic stops
+        sending it work; the existing graceful-stop / not_before paths
+        in ``_check_and_switch`` handle the cleanup.
+        """
+        with self._lock:
+            cfg = self.cfg
+            state = self.state
+            peers = list(cfg.get('peers', []))
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        cfg_changed = False
+        for p in peers:
+            if p.get('budget_gb') is None:
+                continue
+            pid = p['id']
+            # Already parked? skip.
+            if _peer_is_scheduled(p):
+                continue
+            reasons: list[str] = []
+            base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
+            recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
+            if (base and recent
+                    and base['samples'] >= CANARY_BASELINE_MIN_SAMPLES
+                    and base['delta_bytes'] >= CANARY_MIN_BYTES_FOR_PARK
+                    and base['rate_bps'] > 0):
+                ratio = recent['rate_bps'] / base['rate_bps']
+                if ratio < CANARY_SLOWDOWN_RATIO:
+                    reasons.append(
+                        f'throughput collapsed: '
+                        f'recent={recent["rate_bps"]/1e6:.2f} MB/s '
+                        f'vs baseline {base["rate_bps"]/1e6:.2f} MB/s '
+                        f'(ratio={ratio:.2f})'
+                    )
+            noise = _peer_noise_score(pid, state)
+            if noise >= CANARY_NOISE_PARK_THRESHOLD:
+                reasons.append(f'noise_score={noise:.2f}')
+            if not reasons:
+                continue
+            # Park: write not_before, persist, send graceful stop.
+            cooldown = _dt.now(_tz.utc) + _td(seconds=CANARY_PARK_COOLDOWN_S)
+            with self._lock:
+                # Re-resolve under lock in case cfg was reloaded.
+                live = get_peer_by_id(self.cfg, pid)
+                if not live or live.get('budget_gb') is None:
+                    continue
+                if _peer_is_scheduled(live):
+                    continue
+                live['not_before'] = cooldown.isoformat()
+                notes = live.setdefault('canary_notes', [])
+                notes.append({
+                    'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'event': 'auto_park',
+                    'reasons': reasons,
+                    'cooldown_until': cooldown.isoformat(),
+                })
+                cfg_changed = True
+                peer_url = live.get('url')
+            log.warning('canary park %s: %s — not_before=%s',
+                        pid, '; '.join(reasons), cooldown.isoformat())
+            try:
+                if peer_url:
+                    stop_peer_processor(peer_url, graceful=True)
+            except Exception as e:
+                log.warning('canary park %s: graceful stop failed: %s', pid, e)
+        if cfg_changed:
+            try:
+                save_peers_config(self.cfg)
+            except Exception:
+                log.exception('canary park: save_peers_config failed')
 
     def _check_and_switch(self):
         """Check if we need to switch the active peer."""
@@ -4913,6 +5123,13 @@ class PeerDirector:
                     if _clear_completed_reservations(self.cfg, self.state):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
+                # Canary health: park peers running past the global
+                # budget if exe.dev visibly throttles them or they
+                # start polluting the warning stream.
+                try:
+                    self._check_canary_health()
+                except Exception:
+                    log.exception('Canary health check error')
                 # Auto-retry stale peer updates: re-trigger update on
                 # peers that are idle on an old commit (graceful update
                 # didn't take). After 2 failed attempts surfaces a

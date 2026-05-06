@@ -528,6 +528,25 @@ tick, not persisted): `_frontier_restart_log`, `unreachable_count`,
 `graceful_stop_sent`, `_target_frontier_count` (persisted, but as
 an EMA seed only).
 
+**Parallel-frontier slot grace across director takeover:**
+`_orchestrate_parallel_frontiers()` keeps a peer in the authorised
+set (`parallel_frontiers_active`) for up to
+`UNREACHABLE_FAILOVER_THRESHOLD` (3) consecutive ticks of
+`unreachable` instead of dropping it on first miss. Counters live in
+`state['parallel_unreachable_count']` (persisted) and reset on the
+first reachable poll. Without the grace, a director failover would
+drain the parallel-frontier set: peers temporarily unreachable
+during the takeover window (announce-flip, gunicorn worker swap,
+heavy GPKG build) get omitted from `parallel_frontiers_active` on
+the new director's first tick → the single-active guard hard-stops
+them the next tick as non-authorised frontiers. The grace mirrors
+the existing active-peer path. Plus: `ordered` includes
+retained-unreachable peers so their cred/strip plan is reissued
+(preserving prior slice) instead of triggering plan-drift restart
+when they reappear. Symptom of the unfixed bug: dashboard shows
+`5/8 frontiers` after a director swap, recovers only on the next
+takeover.
+
 **Plan-drift detection (no peer-side change needed for cred resizing):**
 `_orchestrate_parallel_frontiers()` compares the current cred/strip
 plan to `frontier_cred_plan` / `frontier_strip_plan` in director_state

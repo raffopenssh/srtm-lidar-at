@@ -1745,6 +1745,7 @@ class PeerDirector:
                    'peer_last_live_ts',
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
+                   'parallel_unreachable_count',
                    '_creds_revalidated_at',
                    'active_peer', 'mode', 'last_switch'):
             if _k in disk_state:
@@ -3743,6 +3744,24 @@ class PeerDirector:
                             and not _peer_is_scheduled(p))
 
         # Already running parallel frontiers (excluding active_peer).
+        # ``prev_par`` is the set of peers we authorised as parallel
+        # frontiers on the previous tick. When a peer in this set
+        # shows up as ``unreachable`` for a single tick (common during
+        # a director takeover, a peer's gunicorn worker swap, or a
+        # heavy GPKG-build that briefly starves the status endpoint)
+        # we keep it in ``running`` for up to
+        # ``UNREACHABLE_FAILOVER_THRESHOLD`` consecutive misses — same
+        # grace the active-peer path already uses (line ~2599). Without
+        # this, a single transient blip drops the peer from
+        # ``running`` → it's omitted from the new
+        # ``parallel_frontiers_active`` set → the next tick's
+        # single-active guard hard-stops it as a non-authorised
+        # frontier. That was the slow drain observed during the
+        # 2026-05-06 at40-as-interim-director window: ~3 peers lost
+        # over ~30 min, never auto-recovered until primary took back
+        # over.
+        prev_par = set(state_copy.get('parallel_frontiers_active') or [])
+        retained_unreachable: list[str] = []
         running: list[str] = []
         candidates: list[dict] = []
         for p in peers:
@@ -3770,7 +3789,33 @@ class PeerDirector:
                 continue
             ps = get_peer_status(p.get('url'))
             if ps.get('state') == 'unreachable':
+                if pid in prev_par:
+                    # Tolerate transient unreachable on an authorised
+                    # parallel frontier. Bump per-peer miss counter;
+                    # only drop after the same threshold the active
+                    # peer uses.
+                    with self._lock:
+                        misses = self.state.setdefault(
+                            'parallel_unreachable_count', {})
+                        misses[pid] = int(misses.get(pid, 0)) + 1
+                        n = int(misses[pid])
+                    if n < UNREACHABLE_FAILOVER_THRESHOLD:
+                        log.info('Parallel frontier %s unreachable '
+                                 '(%d/%d) — preserving slot',
+                                 pid, n, UNREACHABLE_FAILOVER_THRESHOLD)
+                        retained_unreachable.append(pid)
+                        continue
+                    log.warning('Parallel frontier %s unreachable %d '
+                                'times — releasing slot', pid, n)
+                    with self._lock:
+                        self.state.get(
+                            'parallel_unreachable_count', {}).pop(pid, None)
                 continue
+            # Reachable — clear miss counter if any.
+            if pid in (self.state.get('parallel_unreachable_count') or {}):
+                with self._lock:
+                    self.state.get(
+                        'parallel_unreachable_count', {}).pop(pid, None)
             # Refresh caps opportunistically; all current peers expose
             # cred_subset_env so we no longer gate on it.
             self._refresh_peer_caps(p)
@@ -3809,9 +3854,17 @@ class PeerDirector:
             _peer_noise_score(c['peer']['id'], state_copy),
             c['peer']['id'],
         ))
-        ordered = [active_id] + sorted(running)
+        # Include retained_unreachable peers up front so their cred /
+        # strip plan is reissued (preserving their prior slice) instead
+        # of being treated as a fresh candidate and triggering a
+        # plan-drift restart when they reappear.
+        ordered = [active_id] + sorted(set(running) | set(retained_unreachable))
         if max_add > 0:
             ordered += sorted(c['peer']['id'] for c in candidates[:max_add])
+        # De-dup while preserving order (active_id may also be in running).
+        _seen: set[str] = set()
+        ordered = [pid for pid in ordered
+                   if pid and not (pid in _seen or _seen.add(pid))]
         ordered = ordered[:max_par]  # cap to credential capacity
         # Preserve existing peer→creds mapping where valid; only newly
         # promoted peers get fresh slices. Without this, a peer entering
@@ -4025,7 +4078,12 @@ class PeerDirector:
             started.append(pid)
 
         with self._lock:
-            self.state['parallel_frontiers_active'] = list(set(running) | set(started))
+            # Union running + started + retained_unreachable. The
+            # last term keeps temporarily-unreachable peers in the
+            # authorised set so the single-active guard does not
+            # hard-stop them when they reappear next tick.
+            self.state['parallel_frontiers_active'] = list(
+                set(running) | set(started) | set(retained_unreachable))
             self.state['frontier_cred_plan'] = cred_plan
             self.state['frontier_strip_plan'] = strip_plan
             save_director_state(self.state)

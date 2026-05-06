@@ -953,29 +953,43 @@ class ZenodoCache:
         kwargs.setdefault("params", {})["access_token"] = self.token
         kwargs.setdefault("timeout", 60)
         last_exc: Optional[Exception] = None
-        for attempt in range(5):
+        max_attempts = 7
+        for attempt in range(max_attempts):
             try:
                 r = self._session.request(method, url, **kwargs)
                 if r.status_code in (429, 500, 502, 503, 504):
                     last_exc = requests.HTTPError(
                         f"{r.status_code} {r.reason} for url: {url}",
                         response=r)
-                    if attempt < 4:
-                        delay = 2.0 * (2 ** attempt)
+                    if attempt < max_attempts - 1:
+                        delay = min(2.0 * (2 ** attempt), 300.0)
                         log.info(
-                            "Zenodo %s %s → %d, retry %d/4 in %.0fs",
-                            method, path, r.status_code, attempt + 1, delay)
+                            "Zenodo %s %s → %d, retry %d/%d in %.0fs",
+                            method, path, r.status_code,
+                            attempt + 1, max_attempts, delay)
                         time.sleep(delay)
                         continue
                 r.raise_for_status()
                 return r
-            except (requests.ConnectionError, requests.Timeout) as e:
+            except (requests.ConnectionError, requests.Timeout,
+                    requests.exceptions.SSLError) as e:
                 last_exc = e
-                if attempt < 4:
-                    delay = 2.0 * (2 ** attempt)
+                # Drop the wedged session so the retry uses a fresh
+                # TCP+TLS handshake. Zenodo's edge sometimes half-closes
+                # long-lived TLS streams — reusing the keep-alive socket
+                # produces SSLEOFError on every retry.
+                try:
+                    self._session.close()
+                except Exception:
+                    pass
+                self._session = requests.Session()
+                self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+                if attempt < max_attempts - 1:
+                    delay = min(2.0 * (2 ** attempt), 300.0)
                     log.info(
-                        "Zenodo %s %s network error (%s), retry %d/4 in %.0fs",
-                        method, path, str(e)[:80], attempt + 1, delay)
+                        "Zenodo %s %s network error (%s), retry %d/%d in %.0fs",
+                        method, path, str(e)[:80],
+                        attempt + 1, max_attempts, delay)
                     time.sleep(delay)
                     continue
         # Exhausted retries
@@ -1043,9 +1057,15 @@ class ZenodoCache:
         except Exception:
             pass
 
-        # Upload (retry on transient SSL/connection errors)
+        # Upload (retry on transient SSL/connection errors).
+        # SSLError is a subclass of ConnectionError so it's already covered,
+        # but we list it explicitly for clarity. After any network failure
+        # we drop the keep-alive session and rebuild it — Zenodo's edge
+        # sometimes half-closes TLS streams (manifests as SSLEOFError) and
+        # the only reliable recovery is a fresh TCP+TLS handshake.
         last_exc = None
-        for attempt in range(4):
+        max_attempts = 6
+        for attempt in range(max_attempts):
             try:
                 with open(local_path, "rb") as fh:
                     r = self._session.put(
@@ -1057,11 +1077,20 @@ class ZenodoCache:
                     r.raise_for_status()
                 break
             except (requests.ConnectionError, requests.Timeout,
+                    requests.exceptions.SSLError,
                     requests.exceptions.ChunkedEncodingError) as e:
                 last_exc = e
-                wait = 2 ** attempt * 5
-                log.warning("Upload of %s failed (%s); retrying in %ds (attempt %d/4)",
-                            filename, type(e).__name__, wait, attempt + 1)
+                # Drop the wedged session before backing off.
+                try:
+                    self._session.close()
+                except Exception:
+                    pass
+                self._session = requests.Session()
+                self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+                wait = min(2 ** attempt * 5, 300)
+                log.warning("Upload of %s failed (%s); retrying in %ds (attempt %d/%d)",
+                            filename, type(e).__name__, wait,
+                            attempt + 1, max_attempts)
                 time.sleep(wait)
         else:
             raise last_exc if last_exc else RuntimeError("upload failed")

@@ -410,8 +410,8 @@ class Client:
         self,
         token: str = DEFAULT_TOKEN,
         base_url: str = DEFAULT_BASE_URL,
-        max_retries: int = 3,
-        retry_base_wait: float = 2.0,
+        max_retries: int = 5,
+        retry_base_wait: float = 4.0,
         read_only: bool = False,
     ) -> None:
         self.token = token
@@ -420,6 +420,22 @@ class Client:
         self.retry_base_wait = retry_base_wait
         self.read_only = read_only
 
+        self._session = requests.Session()
+        self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+
+    def _reset_session(self) -> None:
+        """Close the underlying HTTP session and start a fresh one.
+
+        Called after a network/SSL failure so the next retry uses a brand-new
+        TCP+TLS connection instead of reusing a wedged keep-alive socket.
+        Zenodo's edge sometimes half-closes long-running TLS streams, which
+        manifests as SSLEOFError; the only reliable recovery is a new
+        handshake.
+        """
+        try:
+            self._session.close()
+        except Exception:
+            pass
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {self.token}"})
 
@@ -558,8 +574,21 @@ class Client:
                     method, url, attempt, self.max_retries + 1, exc,
                 )
                 last_exc = exc
+                # SSL/connection-reset failures often leave the keep-alive
+                # socket in a half-closed state — the next retry on the
+                # same Session will fail immediately with the same error.
+                # Drop the session so the retry uses a fresh TCP+TLS
+                # handshake. Costs ~100ms; saves the upload.
+                if isinstance(exc, (requests.exceptions.SSLError,
+                                    requests.exceptions.ConnectionError,
+                                    requests.exceptions.ChunkedEncodingError)):
+                    self._reset_session()
                 if attempt <= self.max_retries:
                     wait = self.retry_base_wait * (2 ** (attempt - 1))
+                    # Cap at 5 minutes — long enough for Zenodo to recover
+                    # from a transient outage, short enough to keep the
+                    # processor responsive.
+                    wait = min(wait, 300.0)
                     log.info("Retrying in %.1fs …", wait)
                     time.sleep(wait)
                     if hasattr(data, "seek"):

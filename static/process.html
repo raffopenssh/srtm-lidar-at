@@ -3656,6 +3656,41 @@ function renderDirector(d) {
   const shadowId = d.shadow_peer || null;
   const shadowLastPushTs = d.shadow_last_push_ts || null;
   const shadowLastPushOk = d.shadow_last_push_ok;
+  function canaryBadge(p) {
+    const c = p.canary;
+    if (!c) return '';
+    const ratio = (c.ratio != null) ? c.ratio : null;
+    const noise = c.noise_score || 0;
+    const samples = c.samples || 0;
+    const th = c.park_thresholds || {};
+    const slowR = th.slowdown_ratio || 0.3;
+    const noiseR = th.noise_score || 1.5;
+    let color = 'var(--dim)';
+    let label = '🐤';
+    if (samples < 2 || ratio == null) {
+      color = 'var(--dim)';
+      label += ' …';
+    } else if (ratio < slowR || noise >= noiseR) {
+      color = 'var(--red)';
+      label += ' ' + ratio.toFixed(2) + 'x';
+    } else if (ratio < 0.7 || noise >= noiseR * 0.6) {
+      color = 'var(--yellow)';
+      label += ' ' + ratio.toFixed(2) + 'x';
+    } else {
+      color = 'var(--green)';
+      label += ' ' + ratio.toFixed(2) + 'x';
+    }
+    const baseM = (c.baseline_mbps != null) ? c.baseline_mbps.toFixed(2) : '?';
+    const recM = (c.recent_mbps != null) ? c.recent_mbps.toFixed(2) : '?';
+    const reason = (c.notes && c.notes.length) ? c.notes[c.notes.length-1].reason : '';
+    const tip = 'Canary peer (budget ' + (c.budget_gb||'?') + ' GB)' +
+      '\nbaseline: ' + baseM + ' Mbps · recent: ' + recM + ' Mbps · ratio: ' + (ratio!=null?ratio.toFixed(2):'?') +
+      '\nnoise: ' + noise.toFixed(2) + ' (park ≥' + noiseR + ')' +
+      '\nslowdown park: <' + slowR + 'x' +
+      '\nsamples: ' + samples +
+      (reason ? '\nnote: ' + reason : '');
+    return ' <span title="' + esc(tip) + '" style="font-size:9px;padding:1px 5px;border:1px solid ' + color + ';border-radius:8px;color:' + color + ';font-weight:600">' + label + '</span>';
+  }
   function roleBadge(p) {
     if (directorId && p.id === directorId) {
       return ' <span title="This peer is the active director" style="font-size:9px;padding:1px 5px;border:1px solid var(--blue);border-radius:8px;color:var(--blue);font-weight:600">★ director</span>';
@@ -3708,7 +3743,7 @@ function renderDirector(d) {
       // Collapsed card — single line with expand toggle
       html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;opacity:0.7;' + border + '">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="this.parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">';
-      html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id) + roleBadge(p);
+      html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id) + roleBadge(p) + canaryBadge(p);
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
       html += ' · ' + (p.completed||0) + ' done';
       if (isScheduled && p.not_before) {
@@ -3740,7 +3775,7 @@ function renderDirector(d) {
       else if (isCacheOnly && isRunning) badge = ' · <span style="color:var(--blue);font-weight:500" title="cache-only peer (no Copernicus/Hansen fetches)">cache-only</span>';
       else if (isReady) badge = ' ⏯ holds KG ' + esc(p.reserved_kg);
       else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + badge + '</span>';
+      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + canaryBadge(p) + badge + '</span>';
       html += '<span style="display:flex;align-items:center;gap:4px">';
       html += peerActionsMenu(p, {isActive: isActive});
       html += '</span>';
@@ -3760,7 +3795,7 @@ function renderDirector(d) {
     if (isInactive) {
       // Show inside hidden detail
       html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + '</span>';
+      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + canaryBadge(p) + '</span>';
       html += '</div>';
       html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
       if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');

@@ -258,6 +258,11 @@
   .zen-filter-dd .ac-item .ac-code { color: var(--dim); font-size: 10px; min-width: 40px; }
   .zen-filter-dd .ac-item .ac-loc { color: var(--dim); font-size: 10px; }
   .zen-filter-dd .ac-empty { padding: 8px 10px; font-size: 11px; color: var(--dim); font-style: italic; }
+  @media (max-width: 600px) {
+    .zen-rate-spark { width: 60px !important; }
+    .zen-rate-label { display: none; }
+    .zen-filter-bar { gap: 4px; padding: 6px 6px; }
+  }
 
   /* Collapsible */
   .coll-h { cursor: pointer; user-select: none; }
@@ -683,8 +688,8 @@
           </div>
           <span class="zen-filter-badge" id="zenFilterBadge"></span>
           <button class="zen-filter-clear" id="zenFilterClear" title="Clear filter" style="display:none">✕</button>
-          <svg id="zenRateSpark" width="120" height="22" style="flex-shrink:0" title="Zenodo upload rate (last 24h, hourly)"></svg>
-          <span id="zenRateLabel" style="font-size:10px;color:var(--dim);white-space:nowrap"></span>
+          <svg id="zenRateSpark" class="zen-rate-spark" width="100" height="22" style="flex-shrink:0"><title>Zenodo upload rate (last 24h, hourly)</title></svg>
+          <span id="zenRateLabel" class="zen-rate-label" style="font-size:10px;color:var(--dim);white-space:nowrap;flex-shrink:0"></span>
         </div>
         <table id="zenTbl">
           <thead><tr>

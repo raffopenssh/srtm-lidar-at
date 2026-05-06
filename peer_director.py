@@ -4350,9 +4350,33 @@ class PeerDirector:
         # add up to RAMP_MAX_STARTS_PER_TICK; at THROTTLE_MIN_FACTOR
         # only RAMP_MIN_STARTS_PER_TICK. The cap shrinks max_add but the
         # next tick (~30s later) will fill any remaining slots.
+        #
+        # Deficit override: if the running fleet is well below cap
+        # (e.g. after a fleet-wide graceful-update wave drained
+        # cache-only peers at KG boundary), the 1-3 starts/tick cap
+        # can't keep up with the drain rate (5 graceful/tick from
+        # ``_orchestrate_stale_peer_updates``). Without an override
+        # the chart drops to 0/24 cache and stays there for ~10 min
+        # after every srv restart that advances the director commit.
+        # When deficit > ramp_cap we lift the cap so refill matches
+        # drain. Throttle still applies via ``max_cache_only`` itself
+        # (already scaled by capacity_factor above).
         ramp_span = RAMP_MAX_STARTS_PER_TICK - RAMP_MIN_STARTS_PER_TICK
         ramp_cap = RAMP_MIN_STARTS_PER_TICK + int(round(ramp_span * _factor))
         ramp_cap = max(RAMP_MIN_STARTS_PER_TICK, ramp_cap)
+        deficit = max_cache_only - len(running_cache_only)
+        if deficit > ramp_cap and max_add > ramp_cap:
+            log.info(
+                'cache-only deficit %d > ramp_cap %d (running=%d/%d) '
+                '— lifting ramp cap for this tick',
+                deficit, ramp_cap, len(running_cache_only),
+                max_cache_only,
+            )
+            # Cap at the deficit itself so we don't overshoot when
+            # drain catches up. ``max_add`` was already clamped by
+            # ``slack`` (reserve) and (max_cache_only - running),
+            # so this can't push us past the cap.
+            ramp_cap = min(deficit, max_add)
         max_add = min(max_add, ramp_cap)
         to_start = []
         for c in idle_cache_only + idle_frontier:

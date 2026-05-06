@@ -3831,7 +3831,10 @@ function renderDirector(d) {
     const per = d.min_creds_per_frontier || 2;
     const maxPar = d.max_parallel_frontiers || 0;
     const strips = (d.cached_lat_strips || []).length;
-    const parActive = (d.parallel_frontiers_active || []).length;
+    // parallel_frontiers_active excludes the active peer; total
+    // frontier count = parallel + 1 (active) when there is one.
+    const parActive = (d.parallel_frontiers_active || []).length
+      + (d.active_peer ? 1 : 0);
     const coRun = d.cache_only_running || 0;
     const coMax = d.max_cache_only_peers || 0;
     const cmCount = d.cache_miss_count || 0;

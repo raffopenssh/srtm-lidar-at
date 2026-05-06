@@ -1267,11 +1267,16 @@ def _peer_is_scheduled(peer: dict) -> bool:
         return False
 
 
-def _clear_completed_reservations(cfg: dict) -> bool:
-    """Drop reserved_kg for peers whose held KG is already completed.
+def _clear_completed_reservations(cfg: dict, state: dict | None = None) -> bool:
+    """Drop reserved_kg for peers whose held KG is already completed,
+    or whose holder is no longer eligible to claim the reservation.
 
     A reservation otherwise persists past `not_before` so the holding
-    peer can pick its held KG back up after the cooldown lifts.
+    peer can pick its held KG back up after the cooldown lifts. But if
+    the holder's `not_before` has elapsed AND the holder remains
+    bandwidth-exhausted (cannot run the KG), the reservation deadlocks
+    the KG — ``_reserved_kgs`` excludes other peers. Release it so a
+    parallel frontier picks it up.
     Returns True if the config was modified.
     """
     completed = set()
@@ -1281,12 +1286,31 @@ def _clear_completed_reservations(cfg: dict) -> bool:
         completed = _get_completed_kgs()
     except Exception:
         pass
+    bw_map = (state or {}).get('peer_bandwidth', {}) if state else {}
+    budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
     changed = False
     for p in cfg.get('peers', []):
         kg = p.get('reserved_kg')
-        if kg and str(kg) in completed:
+        if not kg:
+            continue
+        if str(kg) in completed:
             p.pop('reserved_kg', None)
             changed = True
+            continue
+        # Holder still in cooldown? keep reservation.
+        if _peer_is_scheduled(p):
+            continue
+        # not_before elapsed (or absent). If holder is bandwidth-
+        # exhausted, it can never claim — release so others can.
+        if state is not None:
+            bw = bw_map.get(p['id'], {})
+            used = bw.get('used_bytes', 0)
+            if (budget_bytes - used) < 2 * (1024 ** 3):
+                log.warning('Releasing held KG %s from %s '
+                            '(cooldown elapsed but bandwidth exhausted)',
+                            kg, p['id'])
+                p.pop('reserved_kg', None)
+                changed = True
     return changed
 
 
@@ -4854,7 +4878,7 @@ class PeerDirector:
                 except Exception:
                     log.exception('capacity factor computation failed')
                 with self._lock:
-                    if _clear_completed_reservations(self.cfg):
+                    if _clear_completed_reservations(self.cfg, self.state):
                         save_peers_config(self.cfg)
                 self._check_and_switch()
                 # Auto-retry stale peer updates: re-trigger update on

@@ -100,6 +100,11 @@ _PEER_CB_LOCK = threading.Lock()
 # get_peer_status) can attribute failures to the right peer without
 # threading peer_id through every call site.
 _PEER_URL_TO_ID: dict[str, str] = {}
+# Process-local throttle for revalidate_all_credentials. Each gunicorn
+# worker has its own copy; the primary check is still the persisted
+# state['_creds_revalidated_at'], but this avoids hitting OIDC twice
+# in the same worker within a tick.
+_LAST_CREDS_REVALIDATED_AT: float = 0.0
 
 
 def _peer_id_for_url(peer_url: str) -> str:
@@ -1720,6 +1725,7 @@ class PeerDirector:
                    'peer_last_live_ts',
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
+                   '_creds_revalidated_at',
                    'active_peer', 'mode', 'last_switch'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
@@ -2901,17 +2907,43 @@ class PeerDirector:
 
         Re-runs cheap probes at most every 10 minutes; uses cached
         ``last_status`` from copernicus.list_credentials() in between.
+
+        The throttle timestamp must be persisted: this method is called
+        from the dashboard ``get_status`` endpoint, which runs in any
+        gunicorn worker (state shared only via disk). Without disk
+        persistence each /director/status request re-runs the probe —
+        with 8 creds × OIDC token = 8 outbound HTTPS calls per request,
+        and the dashboard polls continuously per open tab. We saw the
+        primary's worker pool wedge with ~50 OIDC requests/s, listen
+        backlog overflow, and process.html become unreachable.
+
+        Also persisted at module level so multiple worker processes on
+        the same host share the throttle without disk round-trips on
+        the hot path.
         """
         creds = self._credential_pool()
-        # Force-revalidate every 10 min
-        last = self.state.get('_creds_revalidated_at') or 0
+        # Process-local fast path first: avoids any state lookup +
+        # save when called multiple times within the same tick
+        # (e.g. from _orchestrate_parallel_frontiers + status()).
+        global _LAST_CREDS_REVALIDATED_AT
         now = time.time()
+        last = max(
+            float(_LAST_CREDS_REVALIDATED_AT or 0),
+            float(self.state.get('_creds_revalidated_at') or 0),
+        )
         if now - last > 600:
             try:
                 import copernicus as _cop
                 _cop.revalidate_all_credentials()
                 creds = _cop.list_credentials()
-                self.state['_creds_revalidated_at'] = now
+                _LAST_CREDS_REVALIDATED_AT = now
+                with self._lock:
+                    self.state['_creds_revalidated_at'] = now
+                    try:
+                        save_director_state(self.state)
+                    except Exception:
+                        log.debug('save_director_state during revalidate failed',
+                                  exc_info=True)
             except Exception as e:
                 log.debug('revalidate_all_credentials failed: %s', e)
         valid = []

@@ -5302,9 +5302,25 @@ class PeerDirector:
         primary as soon as it is reachable, on the same git commit, and
         not in a stepped_down/scheduled state.
 
-        Throttled to one attempt every 5 minutes to avoid loops on a
-        flapping primary. Logged at INFO so it's visible in journals.
+        Throttled. Every entry past the basic gates advances the
+        throttle so an early-return path doesn't fire every 30 s tick
+        (the bug that made at40 hammer primary's clear_stepped_down
+        endpoint for an hour on 2026-05-07). The throttle uses two
+        durations:
+
+          * ``HANDBACK_RETRY_S`` (60 s) on transient/early returns —
+            unreachable primary, stepped_down clear in flight, etc.
+            Short enough that handback fires within one or two minutes
+            of conditions becoming favourable; long enough that we
+            don't spam.
+          * ``HANDBACK_BACKOFF_S`` (300 s) on "hard" failures — commit
+            ancestry blocks or operator must reconcile. We retry less
+            often because the situation needs human intervention.
+
+        All logged at INFO/WARNING so journals always show the reason.
         """
+        HANDBACK_RETRY_S = 60
+        HANDBACK_BACKOFF_S = 300
         try:
             import director_ha as dha
         except Exception:
@@ -5312,21 +5328,28 @@ class PeerDirector:
         me = dha.self_id()
         if me == 'primary':
             return
-        # Throttle: don't retry handback faster than every 5 min.
+        # Throttle: read once, advance later based on outcome.
         last = float(self.state.get('_handback_last_attempt') or 0.0)
-        if (time.time() - last) < 300:
+        if (time.time() - last) < HANDBACK_RETRY_S:
             return
-        # Find the primary entry.
+        # Locate primary entry.
         cfg = self.cfg
         primary = None
         for p in cfg.get('peers') or []:
             if p.get('id') == 'primary' and p.get('url'):
                 primary = p
                 break
-        if not primary:
+        if not primary or not primary.get('enabled', True):
+            # No primary configured / primary disabled — throttle longer
+            # so we don't recheck cfg every tick.
+            self.state['_handback_last_attempt'] = time.time()
+            self.state['_handback_last_reason'] = (
+                'no_primary' if not primary else 'primary_disabled')
             return
-        if not primary.get('enabled', True):
-            return
+        # Advance throttle now — every code path below will set it again
+        # with its own reason, but this guarantees no early return
+        # silently re-fires next tick.
+        self.state['_handback_last_attempt'] = time.time()
         # NOTE: we deliberately do NOT gate on _peer_is_scheduled() here.
         # `not_before` parks the primary out of frontier / cache-only work
         # (those gates honour it in choose_active_peer / _orchestrate_*),
@@ -5347,22 +5370,44 @@ class PeerDirector:
                              headers=_admin_headers(),
                              timeout=PEER_TIMEOUT_PROBE)
             if not r.ok:
+                log.info('Auto-handback: primary identity HTTP %d — retry in %ds',
+                         r.status_code, HANDBACK_RETRY_S)
+                self.state['_handback_last_reason'] = f'http_{r.status_code}'
                 return
             d = r.json() or {}
-        except Exception:
+        except Exception as e:
+            log.info('Auto-handback: primary unreachable (%s) — retry in %ds',
+                     str(e)[:80], HANDBACK_RETRY_S)
+            self.state['_handback_last_reason'] = 'unreachable'
             return
         if d.get('stepped_down'):
             # Primary still has the stepped_down flag set. Clear it
             # remotely so it's eligible again — the flag exists to
             # prevent cold restarts from auto-promoting; once we hand
             # back voluntarily it must be cleared.
+            cleared_ok = False
             try:
-                requests.post(url.rstrip('/')
+                cr = requests.post(url.rstrip('/')
                               + '/api/v1/admin/clear_stepped_down',
                               headers=_admin_headers(),
                               timeout=PEER_TIMEOUT_CONTROL)
-            except Exception:
-                pass
+                if cr.ok:
+                    cleared_ok = True
+                    log.info('Auto-handback: cleared stepped_down on primary '
+                             '(was %s) — will retry handover in %ds',
+                             cr.json().get('cleared') if cr.headers.get(
+                                 'content-type', '').startswith('application/json')
+                             else 'unknown',
+                             HANDBACK_RETRY_S)
+                else:
+                    log.warning('Auto-handback: clear_stepped_down on primary '
+                                'returned HTTP %d — retry in %ds',
+                                cr.status_code, HANDBACK_RETRY_S)
+            except Exception as e:
+                log.warning('Auto-handback: clear_stepped_down failed (%s) — '
+                            'retry in %ds', str(e)[:80], HANDBACK_RETRY_S)
+            self.state['_handback_last_reason'] = (
+                'cleared_stepped_down' if cleared_ok else 'clear_failed')
             return
         # Same git commit?
         try:
@@ -5426,8 +5471,14 @@ class PeerDirector:
                     pass
             if primary_is_behind is True:
                 log.warning('handback skipped: primary on %s is behind '
-                            'us %s — primary needs to git pull first',
-                            primary_commit, my_commit)
+                            'us %s — primary needs to git pull first '
+                            '(retry in %ds)',
+                            primary_commit, my_commit, HANDBACK_BACKOFF_S)
+                # Long backoff — needs operator action (or stale-peer
+                # rollout) to update primary.
+                self.state['_handback_last_attempt'] = (
+                    time.time() - HANDBACK_RETRY_S + HANDBACK_BACKOFF_S)
+                self.state['_handback_last_reason'] = 'primary_behind'
                 return
             if primary_is_ahead is True:
                 log.info('handback proceeding: primary on %s is ahead '
@@ -5437,18 +5488,24 @@ class PeerDirector:
                 # Refuse — operator must reconcile.
                 log.warning('handback skipped: primary commit %s and '
                             'our commit %s are unrelated/unresolvable; '
-                            'operator must reconcile',
-                            primary_commit, my_commit)
+                            'operator must reconcile (retry in %ds)',
+                            primary_commit, my_commit, HANDBACK_BACKOFF_S)
+                self.state['_handback_last_attempt'] = (
+                    time.time() - HANDBACK_RETRY_S + HANDBACK_BACKOFF_S)
+                self.state['_handback_last_reason'] = 'commits_unrelated'
                 return
         # Healthy enough — hand over.
         log.warning('Auto-handback: primary is healthy, handing director '
                     'role back from %s to primary', me)
         self.state['_handback_last_attempt'] = time.time()
+        self.state['_handback_last_reason'] = 'attempting'
         try:
             res = dha.do_handover('primary', url)
             log.warning('Auto-handback result: %s', res)
+            self.state['_handback_last_reason'] = 'handed_over'
         except Exception as e:
             log.warning('Auto-handback failed: %s', e)
+            self.state['_handback_last_reason'] = f'handover_failed:{str(e)[:80]}'
 
     def _maintain_shadow(self, statuses: dict) -> None:
         """Elect a shadow each tick and push the current state snapshot.

@@ -1668,11 +1668,15 @@ The director PUTs a full state snapshot to the shadow every 30 s.
 `peers.json`, `cache_manifest.json`, `peer_urls.txt`. Staged under
 `data/austria_processor/shadow/`.
 
-**Auto-failover**: shadow misses 3 consecutive heartbeats (90 s) →
+**Auto-failover**: shadow misses 6 consecutive heartbeats (3 min) →
 promotes itself: installs staged snapshot, writes `is_director`,
 restarts director loop in-process (singleton replaced so EMA /
 capacity_history reload), broadcasts `POST /api/v1/director/announce`
-to every peer. Peers flip `data/austria_processor/zenodo_lock_url.txt`
+to every peer. The threshold was previously 3 misses (90 s) but that
+triggered spurious takeovers during code pushes, long uploads, and
+any tick where the director worker briefly stalled. 3 min still
+fails over a genuinely-dead director quickly while tolerating
+transient saturation. Peers flip `data/austria_processor/zenodo_lock_url.txt`
 and `self.json:director_url`. Old director, if it ever comes back,
 finds `stepped_down` flag and refuses to start its director loop —
 lives on as a regular peer until manually re-promoted.
@@ -1711,11 +1715,36 @@ stamp — watchdog only takes over if `meta.shadow_id == self_id`).
 **Auto-handback to primary**: every director tick, if `self_id != 'primary'`
 and the primary is reachable, on the same git commit, enabled and not
 scheduled, the director hands the role back via `do_handover('primary',
-primary_url)`. Throttled to 5 min between attempts. If the primary still
-carries `stepped_down` (set when it was demoted), the director clears it
-remotely via `POST /api/v1/admin/clear_stepped_down` first. The primary is
-the canonical home for the director (search index, public DNS, dashboard
-URL).
+primary_url)`. The throttle has two scales:
+* `HANDBACK_RETRY_S = 60` after a transient failure (primary unreachable,
+  stepped_down clear in flight, etc.) so handback fires within ~1–2 min
+  of conditions becoming favourable.
+* `HANDBACK_BACKOFF_S = 300` after a hard failure (primary commit behind,
+  commits unrelated) which needs operator intervention.
+
+`_handback_last_attempt` is advanced on **every** entry past the basic
+gates — not just on success. The 2026-05-07 wedge happened because a
+prior bug returned early without setting the timestamp on the
+`stepped_down: true` path, so the function silently re-fired every
+30 s tick for hours, hammering primary's `clear_stepped_down`
+endpoint without ever reaching the actual handover. `_handback_last_reason`
+in `director_state.json` records why the most recent attempt didn't
+hand over.
+
+**Index build deferral on freshly-promoted peers** (`app.py:
+_index_build_deferred`): when a non-primary peer becomes director or
+shadow it stamps `data/austria_processor/role_promoted_at`. For
+`ROLE_INDEX_BUILD_DELAY_S = 1800` (30 min) after promotion the peer
+* skips the initial `SearchIndex.build()` (which loads ~8000 KG JSONs
+  into memory), and
+* skips the JSON download phase of `_sync_peer_data` (manifest merge
+  still runs — cheap).
+
+This prevents the index build's CPU+memory spike from landing on top
+of director-takeover load. On 2026-05-07 we observed a 3.4 GB worker
+on at40 + load avg 6.87 + every non-heartbeat request timing out for
+~30 min after promotion. Primary is unaffected (always keeps the
+index). If a peer is demoted again the stamp is cleared.
 
 **Identity hardening** (after the 2026-05-03 split-brain incident where
 at2/at37/at39/at49 all believed themselves director and self.json files

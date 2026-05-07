@@ -440,6 +440,24 @@ def _init_search_index():
             return
     except Exception:
         pass
+    # Defer initial build on freshly-promoted non-primary peers. Wait until
+    # the cluster has settled (ROLE_INDEX_BUILD_DELAY_S) so the build's
+    # memory + CPU spike doesn't pile onto director-takeover load. Re-check
+    # every 30s; either we cross the threshold or get demoted (in which
+    # case _is_keep_role_data flips and we exit cleanly).
+    while True:
+        try:
+            if not _is_keep_role_data():
+                log.info('🔍 Search index: demoted while waiting; exiting')
+                return
+            deferred, remaining = _index_build_deferred()
+            if not deferred:
+                break
+            log.info('🔍 Search index: deferring build for %ds (cluster settling)',
+                     remaining)
+        except Exception:
+            break
+        time.sleep(30)
     try:
         idx = si.get_index()
         feedback_db.ensure_schema()
@@ -580,6 +598,17 @@ def _sync_peer_data():
                 _keep_role = _is_keep_role_data()
             except Exception:
                 _keep_role = True   # fail-safe
+            # During the post-promotion settle window, treat ourselves as
+            # NOT keep-role for the JSON download phase. We still merge
+            # peer manifests (cheap, ~370 KB) so we have an instantly
+            # correct view of Zenodo, but skip the heavy 8000-file fetch
+            # until the index is allowed to build.
+            try:
+                _deferred, _remaining = _index_build_deferred()
+                if _keep_role and _deferred:
+                    _keep_role = False
+            except Exception:
+                pass
             peer_urls = _get_peer_urls()
             if not peer_urls:
                 time.sleep(300)
@@ -995,6 +1024,87 @@ threading.Thread(target=_peer_status_push_loop, daemon=True,
 ROLE_EVICT_GRACE_SECONDS = 3600        # 1h grace before purging
 ROLE_EVICT_TICK_SECONDS = 600          # check every 10 min
 _ROLE_DEMOTED_AT_FILE = Path('data/austria_processor/role_demoted_at')
+# Non-primary peers that get promoted (director or shadow) defer building
+# the search index for this long. The index build pulls ~8000 KG JSONs into
+# memory and a freshly-promoted director under load (already churning on
+# director-loop work, peer fan-out, snapshot PUTs) is the worst possible
+# moment to also rebuild a 5 GB FTS+R-tree index. Without this delay we
+# observed a 3.4 GB worker on at40 + load avg 6.87 + every non-heartbeat
+# request timing out for ~30 minutes (the at40 wedge of 2026-05-07).
+# Primary is unaffected (it always keeps the index).
+ROLE_INDEX_BUILD_DELAY_S = 1800        # 30 min after non-primary promotion
+_ROLE_PROMOTED_AT_FILE = Path('data/austria_processor/role_promoted_at')
+
+
+def _is_primary_self() -> bool:
+    """Cheap check: are we the primary VM?"""
+    try:
+        import director_ha as _dha
+        return _dha.self_id() == 'primary'
+    except Exception:
+        return False
+
+
+def _record_promotion_if_needed() -> None:
+    """Stamp ``role_promoted_at`` when a non-primary peer first becomes
+    keep-role (director or shadow). Cleared on demotion. Used to defer
+    the search-index build by ``ROLE_INDEX_BUILD_DELAY_S`` so the spike
+    in memory + CPU doesn't land on top of director-takeover load.
+    """
+    if _is_primary_self():
+        # Primary always keeps the index; no promotion concept applies.
+        try:
+            if _ROLE_PROMOTED_AT_FILE.exists():
+                _ROLE_PROMOTED_AT_FILE.unlink()
+        except Exception:
+            pass
+        return
+    try:
+        keep = _is_keep_role_data()
+    except Exception:
+        return
+    if keep:
+        try:
+            if not _ROLE_PROMOTED_AT_FILE.exists():
+                _ROLE_PROMOTED_AT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _ROLE_PROMOTED_AT_FILE.write_text(str(int(time.time())))
+                log.info('Role: promoted to keep-role; deferring search-index '
+                         'build for %ds', ROLE_INDEX_BUILD_DELAY_S)
+        except Exception as e:
+            log.debug('record_promotion: %s', e)
+    else:
+        # Demoted: clear the promotion stamp.
+        try:
+            if _ROLE_PROMOTED_AT_FILE.exists():
+                _ROLE_PROMOTED_AT_FILE.unlink()
+        except Exception:
+            pass
+
+
+def _index_build_deferred() -> tuple[bool, int]:
+    """Return (deferred, seconds_remaining).
+
+    Deferred when:
+      - we are NOT primary, AND
+      - we have a ``role_promoted_at`` stamp younger than
+        ``ROLE_INDEX_BUILD_DELAY_S``.
+
+    Primary always returns (False, 0). Demoted peers (no promotion stamp)
+    also return (False, 0) — they're handled by ``_is_keep_role_data``
+    upstream.
+    """
+    if _is_primary_self():
+        return False, 0
+    try:
+        if not _ROLE_PROMOTED_AT_FILE.exists():
+            return False, 0
+        promoted_at = int(_ROLE_PROMOTED_AT_FILE.read_text().strip() or 0)
+    except Exception:
+        return False, 0
+    age = int(time.time()) - promoted_at
+    if age < ROLE_INDEX_BUILD_DELAY_S:
+        return True, ROLE_INDEX_BUILD_DELAY_S - age
+    return False, 0
 
 
 def _is_keep_role_data() -> bool:
@@ -1030,6 +1140,12 @@ def _is_keep_role_data() -> bool:
 
 def _role_data_eviction_tick() -> dict:
     """Single tick of the role-data eviction policy. Returns a status dict."""
+    # Keep promotion stamp current FIRST so _index_build_deferred() reflects
+    # state before any other consumer reads it this tick.
+    try:
+        _record_promotion_if_needed()
+    except Exception:
+        pass
     keep = _is_keep_role_data()
     now = time.time()
     json_dir = Path('data/austria_processor/json')
@@ -5751,33 +5867,25 @@ def director_heartbeat():
     # report 410 so peers fail over to a healthier shadow instead of
     # trusting our flag forever.
     #
-    # Use ON-DISK signals, not the in-process singleton. With 2 gunicorn
-    # workers only 1 holds the director loop (fcntl lock); the other
-    # worker's singleton is initialised but never started, so a naive
-    # `_running` check would return 410 on ~50% of heartbeats, which
-    # makes peer watchdogs trigger spurious takeovers (this caused
-    # ~hourly cascading failovers on the cluster). Instead, trust
-    # director_state.json freshness — it's rewritten every ~30s by
-    # whichever worker holds the loop, regardless of which worker is
-    # serving this heartbeat.
-    try:
-        d = pd.get_director()
-        thr = getattr(d, '_thread', None)
-        in_proc_running = bool(getattr(d, '_running', False)) and bool(
-            thr and thr.is_alive())
-    except Exception:
-        in_proc_running = False
+    # Use ON-DISK signals ONLY — no Python-side singleton construction,
+    # no module imports beyond what's already loaded. Heartbeat must stay
+    # cheap because every peer hits it every 30 s, and a busy director
+    # cannot afford GIL contention here. With 2 gunicorn workers only 1
+    # holds the director loop (fcntl lock); whichever worker serves this
+    # request just stats the state file and returns. Loop saves state
+    # every ~30s; allow 5x slack (150 s) for slow ticks under load —
+    # tighter values produced false positives that triggered cascading
+    # takeovers during heavy GPKG uploads.
     state_fresh = False
     state_age = None
     try:
         st_path = pd.DIRECTOR_STATE
         if st_path.exists():
             state_age = time.time() - st_path.stat().st_mtime
-            # Loop saves state every ~30s; allow 3x slack for slow ticks.
-            state_fresh = state_age < 120.0
+            state_fresh = state_age < 150.0
     except Exception:
         pass
-    running = in_proc_running or state_fresh
+    running = state_fresh
     if not running:
         return jsonify({
             'is_director': True,

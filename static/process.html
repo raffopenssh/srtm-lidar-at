@@ -61,6 +61,8 @@
   .stp.done-warn::before { content: '⚠ '; }
   .stp.done-err { border-color: #6e2015; color: var(--red); }
   .stp.done-err::before { content: '✗ '; }
+  .stp.done-int { border-color: #555; color: #aaa; opacity: 0.75; }
+  .stp.done-int::before { content: '⊘ '; }
   .stp.act { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.08);
              animation: pulse 1.5s ease-in-out infinite; }
   .stp.pend { opacity: 0.35; }
@@ -1531,7 +1533,8 @@ function updateKgCard(d, peerMeta) {
     let cls = 'stp';
     if (i < curIdx) {
       const issue = stepIssues[st];
-      if (issue === 'error') cls += ' done-err';
+      if (issue === 'interrupted') cls += ' done-int';
+      else if (issue === 'error') cls += ' done-err';
       else if (issue === 'warning') cls += ' done-warn';
       else cls += ' done';
     } else if (i === curIdx) {

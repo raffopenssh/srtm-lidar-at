@@ -8006,6 +8006,27 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # --- Single-instance lock ---
+    # Prevent two processor instances from racing on shared GPKG paths.
+    # We saw real Zenodo data loss when two parents were both finalising
+    # the same KG (KG 01507 — a 0-byte file overwrote a 243 MB upload
+    # because two processes had handles on the same SQLite file when one
+    # of them unlinked it post-upload).
+    import fcntl as _fcntl
+    _processor_lock_fd = None
+    try:
+        _processor_lock_path = DATA_DIR / "processor.lock"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _processor_lock_fd = open(_processor_lock_path, "w")
+        _fcntl.flock(_processor_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        _processor_lock_fd.write(f"{os.getpid()}\n")
+        _processor_lock_fd.flush()
+    except (BlockingIOError, OSError) as _le:
+        log.error("Another austria_processor is already running on this VM "
+                  "(could not acquire %s): %s. Refusing to start to prevent "
+                  "GPKG/Zenodo races.", _processor_lock_path, _le)
+        sys.exit(2)
+
     # --- GDAL config for large raster I/O ---
     # Suppress GDAL 3.11 deprecation warning for 'Memory' driver (used internally by rasterio)
     os.environ.setdefault('GDAL_DEPRECATION_WARNING_THRESHOLD', '99999')
@@ -8180,6 +8201,23 @@ def main():
             # Make sure it's not in the failed set so it gets retried
             failed_kgs.discard(interrupted_kg)
             completed_codes.discard(interrupted_kg)
+            # Clear any stale `step_issues` left in progress.json for the
+            # interrupted KG. They reflect transient errors from the
+            # previous attempt (e.g. fiona writes interrupted by SIGTERM)
+            # that the dashboard would otherwise render as red ✗ chips on
+            # the carousel even though the KG will be cleanly retried.
+            # Mark the previous attempt as `interrupted` so the dashboard
+            # can render a distinct (yellow) chip if the entry is still
+            # the most-recent thing it knows about.
+            try:
+                ckg = progress._state.get("current_kg")
+                if ckg and ckg.get("code") == interrupted_kg:
+                    ckg["step_issues"] = {ckg.get("step", ""): "interrupted"} \
+                        if ckg.get("step") else {}
+                    ckg["interrupted"] = True
+                    progress.save()
+            except Exception:
+                pass
         IN_PROGRESS_FILE.unlink()
 
     if failed_kgs:

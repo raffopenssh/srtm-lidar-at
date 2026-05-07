@@ -1781,7 +1781,62 @@ class PeerDirector:
                 pass
             self._lock_fd = None
 
+    # Short-lived cache for get_status() output. Dashboard polls
+    # /director/status (15s) AND /director/proxy/status (5s, also calls
+    # get_status). Each fanout hits all 60 peers (status + credentials)
+    # with PEER_TIMEOUT_PROBE up to (3,8) — easily 5–15s wall-clock.
+    # Without coalescing, every gunicorn thread (8 total) is permanently
+    # blocked inside as_completed(), wedging the entire web app.
+    # 4s TTL means at most one fanout per dashboard cycle; single-flight
+    # lock means concurrent callers share the same in-flight result
+    # instead of each launching their own 60-peer fanout.
+    _STATUS_CACHE_TTL = 4.0
+
     def get_status(self) -> dict:
+        """Full director status for the dashboard (TTL-cached + single-flight)."""
+        import time as _t
+        # Lazy-init cache attrs (instance is constructed before this method
+        # may be called from multiple threads).
+        if not hasattr(self, '_status_cache_lock'):
+            self._status_cache_lock = threading.Lock()
+            self._status_cache_inflight = threading.Lock()
+            self._status_cache_value: dict | None = None
+            self._status_cache_ts: float = 0.0
+        now = _t.time()
+        with self._status_cache_lock:
+            if (self._status_cache_value is not None and
+                    (now - self._status_cache_ts) < self._STATUS_CACHE_TTL):
+                return self._status_cache_value
+        # Single-flight: only one thread computes; others wait for the
+        # result, then read from cache. Bounded wait so a wedged compute
+        # never wedges every dashboard request.
+        acquired = self._status_cache_inflight.acquire(timeout=20)
+        if not acquired:
+            with self._status_cache_lock:
+                if self._status_cache_value is not None:
+                    return self._status_cache_value
+            # No prior cache and we couldn't get the lock — fall through
+            # and compute (rare, only on first request).
+            self._status_cache_inflight.acquire()
+        try:
+            # Re-check after acquiring lock — another thread may have
+            # just populated the cache.
+            with self._status_cache_lock:
+                if (self._status_cache_value is not None and
+                        (_t.time() - self._status_cache_ts) < self._STATUS_CACHE_TTL):
+                    return self._status_cache_value
+            result = self._compute_status()
+            with self._status_cache_lock:
+                self._status_cache_value = result
+                self._status_cache_ts = _t.time()
+            return result
+        finally:
+            try:
+                self._status_cache_inflight.release()
+            except RuntimeError:
+                pass
+
+    def _compute_status(self) -> dict:
         """Full director status for the dashboard."""
         # Always re-read config from disk so all gunicorn workers see new peers
         try:

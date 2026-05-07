@@ -666,11 +666,44 @@ def _sync_peer_data():
                 # Propagates force-requeue requests across the fleet so
                 # peers with stale local JSONs don't silently skip a
                 # re-queued KG.
+                #
+                # IMPORTANT: skip tombstones that are already satisfied by
+                # a newer _json manifest entry. Without this guard, the
+                # primary's stale-tombstone sweep clears a tombstone, and
+                # the very next peer-sync re-merges it (peers still hold
+                # it because the propagation flows are independent).
+                # Result: 'merged tombstones (now 147)' / 'Cleared 25 stale
+                # tombstone(s)' ping-pong every few seconds, with disk
+                # writes and log spam.
                 if isinstance(peer_tombstones, dict) and peer_tombstones:
+                    # Build a quick lookup of our local _json manifest
+                    # timestamps so the staleness check is O(1) per
+                    # tombstone.
+                    _local_json_ts: dict = {}
+                    try:
+                        _mf_path = Path('data/austria_processor/zenodo_manifest.json')
+                        if _mf_path.exists():
+                            _mf_data = json.loads(_mf_path.read_text())
+                            _mf_entries = _mf_data.get('entries', _mf_data) or {}
+                            for _ek, _ev in _mf_entries.items():
+                                if _ek.endswith('_json') and isinstance(_ev, dict):
+                                    _local_json_ts[_ek[:-5]] = _ev.get('uploaded_at', '') or ''
+                    except Exception:
+                        _local_json_ts = {}
+                    import re as _re_tomb
                     changed_tomb = False
                     for tk, tv in peer_tombstones.items():
                         if not isinstance(tv, str):
                             continue
+                        # Drop already-satisfied tombstones: KG has a
+                        # _json manifest entry strictly newer than the
+                        # tombstone timestamp.
+                        _m = _re_tomb.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', tk)
+                        if _m:
+                            _kg_code = _m.group(1)
+                            _json_ts = _local_json_ts.get(_kg_code, '')
+                            if _json_ts and _json_ts > tv:
+                                continue
                         cur = _MANIFEST_TOMBSTONES.get(tk, '')
                         if tv > cur:
                             _MANIFEST_TOMBSTONES[tk] = tv

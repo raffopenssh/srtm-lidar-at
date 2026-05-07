@@ -391,6 +391,50 @@ def install_snapshot_from_shadow() -> dict:
             # in the gap between last snapshot push and takeover aren't
             # lost. Snapshot order wins (it represents the authoritative
             # priority); local-only codes append at the tail.
+            # copernicus_credentials.json: merge by client_id rather than
+            # replace. User-added credentials registered on the *new*
+            # director after a takeover (or on either director between
+            # snapshot pushes) would otherwise vanish when the role swings
+            # back: the local file gets clobbered by the older snapshot.
+            # Builtins are always kept fresh from the snapshot's view; user
+            # entries are unioned by client_id, with the snapshot side
+            # winning on conflict (the new director just probed them).
+            if name == 'copernicus_credentials.json' and dst.exists():
+                try:
+                    snap_d = json.loads(content) or {}
+                    local_d = json.loads(dst.read_bytes()) or {}
+                    snap_creds = snap_d.get('credentials', []) if isinstance(snap_d, dict) else []
+                    local_creds = local_d.get('credentials', []) if isinstance(local_d, dict) else []
+                    if isinstance(snap_creds, list) and isinstance(local_creds, list):
+                        by_id: dict = {}
+                        order: list = []
+                        # snapshot wins on conflict — but we still want
+                        # local-only entries to survive.
+                        for c in list(snap_creds) + list(local_creds):
+                            if not isinstance(c, dict):
+                                continue
+                            cid = (c.get('client_id') or '').strip()
+                            if not cid:
+                                continue
+                            if cid not in by_id:
+                                by_id[cid] = c
+                                order.append(cid)
+                        merged_creds = [by_id[cid] for cid in order]
+                        added_back = [
+                            cid for cid in by_id
+                            if cid not in {(c.get('client_id') or '').strip()
+                                            for c in snap_creds if isinstance(c, dict)}
+                        ]
+                        if added_back:
+                            log.info('install_snapshot copernicus_credentials: '
+                                     'preserved %d local-only cred(s): %s',
+                                     len(added_back),
+                                     [c[:18] + '…' for c in added_back])
+                        snap_d['credentials'] = merged_creds
+                        content = json.dumps(snap_d, indent=2).encode()
+                except Exception as e:
+                    log.warning('install_snapshot copernicus_credentials merge '
+                                'failed (%s); using snapshot as-is', e)
             if name == 'retry_queue.json' and dst.exists():
                 try:
                     snap_q = json.loads(content) or []

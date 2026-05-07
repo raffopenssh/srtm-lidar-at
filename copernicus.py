@@ -450,9 +450,178 @@ def _read_usage_for(cid: str) -> dict:
     }
 
 
+def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
+    """Score a credential's recent health & freshness for assignment.
+
+    Higher score = better candidate for *new* frontier work. Combines
+    five signals into a value in [0, 1] plus a structured breakdown so
+    the dashboard can explain *why* a particular score landed:
+
+    * **status** — penalises ``invalid`` / ``error`` from the last OIDC
+      probe; ``exhausted`` zeroes the score.
+    * **error_recency** — recent ``last_error`` timestamps lower the
+      score on a ramp from 1 h (heavy) to 24 h (mild).
+    * **error_rate** — ``error_7d / (success_7d + error_7d)``; raw
+      errors over the last week.
+    * **rotation** — ``rotated_7d`` (in-peer credential swaps after
+      402/throttle) shaves off a small penalty since the cred just
+      caused a rotation event.
+    * **exhausted_at** — recent exhaustion (within 7 days) leaves
+      a residual penalty even after recovery.
+    * **freshness** — credentials *not* used recently get a positive
+      bonus, so the director rotates the warm/hot set across peers
+      instead of always reloading the same indices.
+
+    Result fields:
+      * ``score`` — final value in [0, 1] used for ordering.
+      * ``components`` — per-signal contribution (negative = penalty,
+        positive = bonus). Frontend renders this in the tooltip.
+      * ``label`` — "healthy" / "warm" / "hot" / "degraded" / "exhausted".
+    """
+    if now is None:
+        now = time.time()
+    u = meta.get("usage") or {}
+    s7 = int(u.get("success_7d") or 0)
+    e7 = int(u.get("error_7d") or 0)
+    r7 = int(u.get("rotated_7d") or 0)
+    last_use = float(u.get("last_use") or 0)
+    last_err = float(u.get("last_error") or 0)
+
+    components: dict[str, float] = {}
+    score = 1.0
+
+    # Hard zero for exhausted (cred shouldn't be picked at all).
+    if meta.get("exhausted"):
+        return {
+            "score": 0.0,
+            "label": "exhausted",
+            "components": {"status": -1.0},
+            "signals": {
+                "success_7d": s7, "error_7d": e7, "rotated_7d": r7,
+                "last_use_age_s": (now - last_use) if last_use else None,
+                "last_error_age_s": (now - last_err) if last_err else None,
+            },
+        }
+
+    # 1) last_status
+    st = (meta.get("last_status") or "").lower()
+    if st in ("invalid",):
+        score -= 0.6
+        components["status"] = -0.6
+    elif st == "error":
+        score -= 0.25
+        components["status"] = -0.25
+    elif st == "valid":
+        components["status"] = 0.0
+
+    # 2) last_error recency (only counts if there was one)
+    if last_err and last_err > 0:
+        age_h = max(0.0, (now - last_err) / 3600.0)
+        if age_h < 1.0:
+            pen = -0.50
+        elif age_h < 6.0:
+            pen = -0.30
+        elif age_h < 24.0:
+            pen = -0.15
+        elif age_h < 72.0:
+            pen = -0.05
+        else:
+            pen = 0.0
+        if pen:
+            score += pen
+            components["error_recency"] = pen
+
+    # 3) error rate over the 7d window
+    denom = s7 + e7
+    if denom > 0 and e7 > 0:
+        er = e7 / denom
+        pen = -0.4 * er
+        score += pen
+        components["error_rate"] = pen
+
+    # 4) rotation churn — small per-event penalty, capped
+    if r7 > 0:
+        pen = -min(0.2, r7 / 200.0)
+        score += pen
+        components["rotation"] = pen
+
+    # 5) recent exhaustion residual (recovers but lingers)
+    exh_at = float(meta.get("exhausted_at") or 0)
+    if exh_at > 0:
+        age_h = (now - exh_at) / 3600.0
+        if age_h < 24.0:
+            pen = -0.4
+        elif age_h < 24.0 * 7:
+            pen = -0.15
+        else:
+            pen = 0.0
+        if pen:
+            score += pen
+            components["exhausted_recently"] = pen
+
+    # 6) freshness bonus — under-used creds rotate in.
+    if last_use <= 0:
+        bonus = 0.25
+    else:
+        age_h = (now - last_use) / 3600.0
+        if age_h >= 24.0 * 7:
+            bonus = 0.25
+        elif age_h >= 24.0:
+            bonus = 0.15
+        elif age_h >= 6.0:
+            bonus = 0.05
+        else:
+            bonus = 0.0
+    if bonus:
+        score += bonus
+        components["freshness"] = bonus
+
+    # 7) Hot-cred mild de-prioritisation: peers that have absorbed
+    # a lot of work over the last 7d get bumped down a touch so we
+    # rotate the warm/hot set across peers rather than always landing
+    # on the same handful.
+    if s7 > 0:
+        pen = -min(0.2, s7 / 5000.0)
+        if pen <= -0.02:
+            score += pen
+            components["workload"] = pen
+
+    score = max(0.0, min(1.0, score))
+
+    if score >= 0.85:
+        label = "healthy"
+    elif score >= 0.65:
+        label = "warm"
+    elif score >= 0.40:
+        label = "hot"
+    elif score > 0:
+        label = "degraded"
+    else:
+        label = "unusable"
+
+    return {
+        "score": round(score, 4),
+        "label": label,
+        "components": {k: round(v, 4) for k, v in components.items()},
+        "signals": {
+            "success_7d": s7,
+            "error_7d": e7,
+            "rotated_7d": r7,
+            "last_use_age_s": int(now - last_use) if last_use else None,
+            "last_error_age_s": int(now - last_err) if last_err else None,
+            "last_status": meta.get("last_status"),
+            "exhausted_at_age_s": int(now - exh_at) if exh_at else None,
+        },
+    }
+
+
 def list_credentials() -> list:
     """Return public credential metadata (client_id, source, last_validated_at,
-    last_status, exhausted, label). Never returns secrets."""
+    last_status, exhausted, label). Never returns secrets.
+
+    Each entry also includes a ``health`` block with the score and
+    components used by ``peer_director._assign_cred_indices`` — see
+    :func:`score_credential_health`."""
     with _cred_lock:
         # Pick up creds added by sibling gunicorn workers.
         _reload_credentials_from_disk()
@@ -472,6 +641,11 @@ def list_credentials() -> list:
             meta["usage"] = _read_usage_for(cid)
         except Exception:
             meta["usage"] = {"success": 0, "error": 0, "rotated": 0, "buckets": []}
+        try:
+            meta["health"] = score_credential_health(meta)
+        except Exception:
+            meta["health"] = {"score": 0.5, "label": "unknown",
+                              "components": {}, "signals": {}}
         out.append(meta)
     return out
 

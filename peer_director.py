@@ -3220,6 +3220,16 @@ class PeerDirector:
                 'by_product': a['by_product'],
                 'aggregated_from': a['sources'],
             }
+            # Recompute the health score against the *aggregated* usage
+            # so the director's view (process.html) matches the cred
+            # ordering used by ``_assign_cred_indices``. Each peer's
+            # local /api/v1/credentials still returns its own per-peer
+            # score using its local usage.
+            try:
+                import copernicus as _cop_health
+                c['health'] = _cop_health.score_credential_health(c)
+            except Exception:
+                pass
 
     def _valid_credentials(self) -> list[int]:
         """Return indices of credentials that are not exhausted.
@@ -3471,25 +3481,36 @@ class PeerDirector:
         by membership churn re-sorting the assignment.
         """
         valid_set_all = set(self._valid_credentials())
-        # Order leftover creds by least 7-day usage so fresh peers pick
-        # up under-used credentials (e.g. cred 5 / cred 7 with 0 success_7d)
-        # before re-loading cred 0 / cred 4. We still keep the index order
-        # as the tie-breaker for stable assignment across ticks.
+        # Order valid creds by *health* score (highest = best candidate)
+        # so fresh, low-error, under-used credentials are picked first
+        # and recently-erroring or hot creds are deprioritised. This
+        # rotates the warm/hot set across peers instead of always
+        # landing on the same indices. See ``copernicus.score_credential_health``.
         try:
             cred_pool = self.state.get('credentials') or self._credential_pool()
         except Exception:
             cred_pool = []
-        usage_by_idx: dict[int, tuple[int, int]] = {}
+        health_by_idx: dict[int, dict] = {}
         for c in cred_pool:
             try:
                 idx = int(c.get('index'))
             except Exception:
                 continue
-            u = c.get('usage') or {}
-            s7 = int(u.get('success_7d') or 0)
-            usage_by_idx[idx] = (s7, idx)
-        valid = sorted(valid_set_all,
-                       key=lambda i: usage_by_idx.get(i, (0, i)))
+            h = c.get('health')
+            if not h:
+                try:
+                    import copernicus as _cop
+                    h = _cop.score_credential_health(c)
+                except Exception:
+                    h = None
+            health_by_idx[idx] = h or {'score': 0.5}
+        # Sort key: best health first (descending score), then index
+        # ascending for stable tie-break. Negate score so ``sorted``
+        # ascending puts the best candidate first.
+        def _rank(i: int) -> tuple:
+            h = health_by_idx.get(i) or {'score': 0.5}
+            return (-float(h.get('score') or 0.0), i)
+        valid = sorted(valid_set_all, key=_rank)
         per = self._effective_creds_per_frontier(cfg)
         out: dict[str, list[int]] = {}
         if not valid or not frontier_ids:
@@ -3517,15 +3538,41 @@ class PeerDirector:
         # frontiers at 5 (with 8 valid creds and target=8) because
         # the active peer's prior creds=[0,1] survived as a 2-cred
         # slice instead of being squeezed to a single index.
+        # Health threshold below which we evict a held credential and
+        # let the leftover pass refill from a healthier candidate.
+        # 0.35 ~ "degraded" — rotation churn or recent errors.
+        UNHEALTHY = 0.35
         for pid in frontier_ids:
             slice_ = prior.get(pid)
             if not slice_:
                 continue
-            slice_ = sorted(int(i) for i in slice_ if int(i) in valid_set)
+            slice_ = [int(i) for i in slice_ if int(i) in valid_set]
             if not slice_:
                 continue
+            # Evict creds whose health has dropped — only when there's
+            # a strictly healthier leftover candidate available, so a
+            # globally-degraded pool doesn't cause assignment churn.
+            healthy_pool = [
+                i for i in valid
+                if i not in used
+                and i not in slice_
+                and float((health_by_idx.get(i) or {}).get('score') or 0)
+                    > UNHEALTHY + 0.15
+            ]
+            if healthy_pool:
+                slice_ = [
+                    i for i in slice_
+                    if float((health_by_idx.get(i) or {}).get('score') or 0)
+                       >= UNHEALTHY
+                ]
+                if not slice_:
+                    continue
+            # Keep deterministic order, then sort by health for the
+            # in-slice rotation order (worker reads index 0 first).
+            slice_ = sorted(slice_,
+                            key=lambda i: -float(
+                                (health_by_idx.get(i) or {}).get('score') or 0))
             if set(slice_) & used:
-                # Drop indices already locked in by earlier peers.
                 slice_ = [i for i in slice_ if i not in used]
                 if not slice_:
                     continue

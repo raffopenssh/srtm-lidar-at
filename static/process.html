@@ -344,6 +344,32 @@
     50%     { box-shadow: 0 0 6px 2px rgba(88,166,255,0.85); border-color: #79b8ff; background: rgba(88,166,255,0.45); }
   }
   .prio-tag .split-pip.active { animation: prioPipGlow 1.4s ease-in-out infinite; }
+  /* Credentials table — mobile-friendly */
+  #credsList table { width: 100%; }
+  #credsList .cred-bar { display: inline-block; }
+  #credsList .cred-health-label { display: inline; }
+  #credsList .cred-health-pct { display: inline; }
+  #credsList .cred-source-cell { display: table-cell; }
+  #credsList .cred-holders-cell { white-space: nowrap; }
+  #credsList .cred-cid-cell { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+  #credsList .cred-status-cell { white-space: nowrap; }
+  @media (max-width: 720px) {
+    #credsList { font-size: 10px !important; }
+    /* Hide source column on small screens — reachable from client_id title */
+    #credsList .cred-source-cell { display: none; }
+    /* Compact health pill: drop the textual label, keep score + bar */
+    #credsList .cred-health-label { display: none; }
+    #credsList .cred-bar { width: 22px !important; }
+    #credsList .cred-cid-cell { max-width: 90px; }
+    /* Wrap holder pills onto multiple lines */
+    #credsList .cred-holders-cell { white-space: normal; line-height: 1.4; }
+  }
+  @media (max-width: 480px) {
+    /* Drop the bar entirely — keep only numeric score */
+    #credsList .cred-bar { display: none; }
+    /* Hide explicit “status” text — the icon + colour carries it. */
+    #credsList .cred-status-cell .cred-status-text { display: none; }
+  }
   @media (max-width: 600px) {
     #zenTbl .zen-hide-sm { display: none; }
     #zenTbl .zen-th-name { width: 46%; }
@@ -3954,6 +3980,73 @@ function renderDirector(d) {
   renderCredentials(d.credentials || []);
 }
 
+function renderHealthCell(h) {
+  // Compact pill + tooltip. Tooltip lists every component contribution
+  // (matches copernicus.score_credential_health) so operators can see
+  // *why* the director ranks one cred above another.
+  if (!h || typeof h.score === 'undefined') {
+    return '<span style="color:var(--dim)">—</span>';
+  }
+  const s = +h.score;
+  const pct = Math.round(s * 100);
+  const label = h.label || '';
+  let color;
+  if (label === 'exhausted' || label === 'unusable') color = 'var(--red)';
+  else if (label === 'degraded') color = 'var(--red)';
+  else if (label === 'hot') color = 'var(--yellow)';
+  else if (label === 'warm') color = 'var(--yellow)';
+  else if (label === 'healthy') color = 'var(--green)';
+  else color = 'var(--dim)';
+  // Build the multi-line tooltip
+  const comp = h.components || {};
+  const sig = h.signals || {};
+  const lines = [
+    'Health score: ' + pct + '% (' + label + ')',
+    'Higher = preferred for new frontier work.',
+    '',
+  ];
+  const compKeys = Object.keys(comp);
+  if (compKeys.length) {
+    lines.push('Components:');
+    // Sort by absolute magnitude desc so the dominant signal is first.
+    compKeys.sort((a,b) => Math.abs(+comp[b]) - Math.abs(+comp[a]));
+    for (const k of compKeys) {
+      const v = +comp[k];
+      const sign = v > 0 ? '+' : '';
+      lines.push('  ' + k + ': ' + sign + (v*100).toFixed(0) + ' pts');
+    }
+  } else {
+    lines.push('Components: (clean baseline)');
+  }
+  lines.push('');
+  lines.push('Signals:');
+  function fmtAge(s) {
+    if (s === null || typeof s === 'undefined') return 'never';
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s/60) + 'm ago';
+    if (s < 86400) return Math.round(s/3600) + 'h ago';
+    return Math.round(s/86400) + 'd ago';
+  }
+  if (typeof sig.success_7d !== 'undefined') lines.push('  success_7d: ' + sig.success_7d);
+  if (typeof sig.error_7d !== 'undefined')   lines.push('  error_7d: ' + sig.error_7d);
+  if (typeof sig.rotated_7d !== 'undefined') lines.push('  rotated_7d: ' + sig.rotated_7d);
+  if (sig.last_status) lines.push('  last_status: ' + sig.last_status);
+  if (typeof sig.last_use_age_s !== 'undefined') lines.push('  last_use: ' + fmtAge(sig.last_use_age_s));
+  if (typeof sig.last_error_age_s !== 'undefined') lines.push('  last_error: ' + fmtAge(sig.last_error_age_s));
+  if (typeof sig.exhausted_at_age_s !== 'undefined' && sig.exhausted_at_age_s !== null) {
+    lines.push('  last_exhausted: ' + fmtAge(sig.exhausted_at_age_s));
+  }
+  const tip = lines.join('\n');
+  // Mini bar showing score 0–1
+  const bar = '<span class="cred-bar" style="width:36px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;vertical-align:middle">' +
+              '<span style="display:block;height:100%;width:' + pct + '%;background:' + color + '"></span></span>';
+  return '<span style="cursor:help;display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:10px" title="' + tip.replace(/"/g,'&quot;') + '">' +
+         bar +
+         '<span class="cred-health-pct" style="color:' + color + '">' + pct + '</span>' +
+         '<span class="cred-health-label" style="color:var(--dim);font-size:9px">' + label + '</span>' +
+         '</span>';
+}
+
 function renderUsageCell(u) {
   const s = +(u.success_7d || 0);
   const e = +(u.error_7d || 0);
@@ -4056,7 +4149,7 @@ function renderCredentials(creds) {
   }
   let html = '<table style="width:100%;border-collapse:collapse;font-size:11px">' +
     '<thead><tr style="color:var(--dim);text-align:left;border-bottom:1px solid var(--border)">' +
-    '<th>#</th><th>client_id</th><th>source</th><th>status</th><th>held by</th><th title="Last 7 days: ✓ success / ✗ error / ↻ rotated. Bars = per-hour activity.">usage (7d)</th><th></th></tr></thead><tbody>';
+    '<th>#</th><th>client_id</th><th class="cred-source-cell">source</th><th>status</th><th>held by</th><th title="Director assignment score (0–1): blends last-error age, error rate, exhaustion history, rotation churn, and freshness. Higher = preferred for new frontier work.">health</th><th title="Last 7 days: ✓ success / ✗ error / ↻ rotated. Bars = per-hour activity.">usage (7d)</th><th></th></tr></thead><tbody>';
   for (const c of creds) {
     const exhausted = !!c.exhausted;
     const st = (c.last_status || 'unchecked').toLowerCase();
@@ -4086,10 +4179,11 @@ function renderCredentials(creds) {
     }
     html += '<tr style="border-bottom:1px solid var(--border)">' +
       '<td style="color:var(--dim)">' + (c.index+1) + '</td>' +
-      '<td style="font-family:monospace;color:var(--text)" title="' + esc(c.client_id||'') + '">' + esc((c.client_id_short || c.client_id || '').slice(0,18)) + '</td>' +
-      '<td style="color:var(--dim)">' + esc(c.source||'') + '</td>' +
-      '<td style="color:' + stColor + '">' + stIcon + esc(stLabel) + '</td>' +
-      '<td>' + holdersHtml + '</td>' +
+      '<td class="cred-cid-cell" style="font-family:monospace;color:var(--text)" title="' + esc(c.client_id||'') + ' (' + esc(c.source||'') + ')">' + esc((c.client_id_short || c.client_id || '').slice(0,18)) + '</td>' +
+      '<td class="cred-source-cell" style="color:var(--dim)">' + esc(c.source||'') + '</td>' +
+      '<td class="cred-status-cell" style="color:' + stColor + '">' + stIcon + '<span class="cred-status-text">' + esc(stLabel) + '</span></td>' +
+      '<td class="cred-holders-cell">' + holdersHtml + '</td>' +
+      '<td>' + renderHealthCell(c.health || {}) + '</td>' +
       '<td>' + renderUsageCell(c.usage || {}) + '</td>' +
       '<td style="text-align:right">' +
         (c.source==='builtin' ? '' :

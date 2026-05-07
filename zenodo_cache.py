@@ -915,6 +915,13 @@ def _build_zip_for_strip(
 
 # === SECTION: ZenodoCache main class ===
 
+class _NULL_CTX:
+    """No-op context manager. Used by upload_all() when no
+    per-ZIP lock factory is supplied."""
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
 class ZenodoCache:
     """Zenodo-backed persistent tile cache.
 
@@ -1130,7 +1137,8 @@ class ZenodoCache:
 
     # --- Upload ---
 
-    def upload_all(self, dry_run: bool = False) -> Dict[str, Any]:
+    def upload_all(self, dry_run: bool = False,
+                   per_zip_lock=None) -> Dict[str, Any]:
         """Upload all local cache tiles to Zenodo.
 
         Scans local tile cache dirs, bundles into ZIP archives per
@@ -1140,6 +1148,15 @@ class ZenodoCache:
         ----------
         dry_run : bool
             If True, build ZIPs but don't upload.
+        per_zip_lock : callable | None
+            Optional context-manager factory invoked once per ZIP
+            *immediately around the upload+manifest write*. Lets the
+            caller hold the fleet Zenodo upload lease for only the
+            short critical section per ZIP (typically 5–30 s)
+            instead of the entire batch (which may include many ZIPs
+            and SSL-retry storms, blocking other peers for >10 min).
+            When None, no lock is taken — caller is assumed to hold
+            the lease for the whole batch (legacy behaviour).
 
         Returns
         -------
@@ -1293,19 +1310,28 @@ class ZenodoCache:
             stats["bytes_total"] += zip_path.stat().st_size
 
             if not dry_run:
+                # Take the fleet upload lease only for the actual
+                # upload+manifest-write critical section (per ZIP).
+                # Building the ZIP and merging remote-only tiles is
+                # done above without holding the lock, so other peers
+                # can proceed between ZIPs.
+                _zip_lock_ctx = (per_zip_lock(zip_name)
+                                 if per_zip_lock is not None
+                                 else _NULL_CTX())
                 try:
-                    result = self._upload_file(depo_id, zip_path, zip_name)
-                    checksum = result.get("checksum", "")
-                    from datetime import datetime, timezone
-                    self.manifest.set_file(
-                        zip_name,
-                        url=self._file_download_url(zip_name),
-                        size=zip_path.stat().st_size,
-                        checksum=checksum,
-                        tile_count=merged_count,
-                        updated_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                    self.manifest.save()
+                    with _zip_lock_ctx:
+                        result = self._upload_file(depo_id, zip_path, zip_name)
+                        checksum = result.get("checksum", "")
+                        from datetime import datetime, timezone
+                        self.manifest.set_file(
+                            zip_name,
+                            url=self._file_download_url(zip_name),
+                            size=zip_path.stat().st_size,
+                            checksum=checksum,
+                            tile_count=merged_count,
+                            updated_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        self.manifest.save()
                     # Invalidate cached ZipIndex — the file just changed
                     self._zip_indices.pop(zip_name, None)
                     idx_cache = _ZIP_INDEX_CACHE_DIR / f"{hashlib.md5(self.manifest.get_file(zip_name)['url'].encode()).hexdigest()[:12]}.json"

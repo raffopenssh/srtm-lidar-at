@@ -100,9 +100,20 @@ _tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 # === SECTION: Disk cache management (LRU cleanup, free-space checks) ===
 
 # Track the last time we flushed tile cache to Zenodo (epoch seconds).
+# Initialised to the current time minus (interval − startup_delay) so
+# the first flush after a process restart only fires once the peer has
+# settled. Without this, every restart triggers an immediate fleet-lock
+# acquisition that blocks every other peer for 5–10 minutes during the
+# multi-product cache_flush. With the staggered start, peers fan out
+# their flushes naturally instead of dog-piling on the broker after a
+# graceful-update wave.
+_ZENODO_FLUSH_STARTUP_DELAY_S = 300  # 5 min after import
 _last_zenodo_cache_flush: float = 0.0
 # Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
 _ZENODO_CACHE_FLUSH_INTERVAL = 1800  # 30 minutes
+import time as _import_time
+_last_zenodo_cache_flush = _import_time.time() - max(
+    0, _ZENODO_CACHE_FLUSH_INTERVAL - _ZENODO_FLUSH_STARTUP_DELAY_S)
 # Threshold for "local cache grew enough to be worth force-flushing at
 # end of KG" — measured as bytes added under copernicus_tiles +
 # hansen_tiles since the previous flush.
@@ -169,9 +180,18 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
     try:
         from zenodo_cache import ZenodoCache
         from zenodo_lock import zenodo_upload_lock
+        from contextlib import contextmanager
         cache = ZenodoCache()
-        with zenodo_upload_lock(purpose='cache_flush'):
-            stats = cache.upload_all()
+        # Per-ZIP lock: take the fleet lease only around each ZIP's
+        # actual upload+manifest-write (typically 5–30 s), not the
+        # entire batch (which can run >10 min on a 6-attempt SSL
+        # backoff and starves all other peers waiting on the lock).
+        @contextmanager
+        def _per_zip(zip_name):
+            with zenodo_upload_lock(
+                    purpose=f'cache_flush_zip:{zip_name}') as _l:
+                yield _l
+        stats = cache.upload_all(per_zip_lock=_per_zip)
         n_tiles = stats.get("tiles_total", 0)
         n_zips = stats.get("zips_uploaded", 0)
         if n_tiles > 0:

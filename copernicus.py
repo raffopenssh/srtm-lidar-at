@@ -119,11 +119,28 @@ def _load_credentials_from_disk() -> list:
             _exhausted_cred_indices.add(i)
     return creds
 
+# Meta keys that represent freshly-probed runtime state. When merging
+# a stale on-disk snapshot into in-memory meta we MUST NOT clobber
+# these — otherwise a re-save right after revalidate_all_credentials()
+# (which calls _save_credentials_to_disk -> _reload_credentials_from_disk)
+# overwrites the just-probed status with the stale value we're about
+# to overwrite on disk anyway. That bug stuck cred #8 on "error" for
+# days even though OIDC probes were succeeding.
+_VOLATILE_META_KEYS = {
+    "last_status", "last_validated_at", "last_error",
+    "exhausted", "exhausted_at",
+}
+
 def _reload_credentials_from_disk():
     """Re-read on-disk store and merge any user creds we don't know about
     into the in-memory pool. Necessary because gunicorn runs multiple
     workers, each with its own ``_CREDENTIALS`` list — without this,
     worker B will save its stale view and overwrite worker A's additions.
+
+    Volatile probe-result keys (see ``_VOLATILE_META_KEYS``) are only
+    pulled in for credentials we don't already track in memory; for
+    known credentials, in-memory values win so a freshly-probed status
+    is never clobbered by a stale on-disk snapshot.
     """
     global _CREDENTIALS
     if not _CRED_STORE.exists():
@@ -139,11 +156,17 @@ def _reload_credentials_from_disk():
         csec = entry.get("client_secret")
         if not cid or not csec:
             continue
-        # Always pull latest meta (last_status, exhausted, label, etc.)
+        # Pull latest non-volatile meta (label, source, notes, added_at,
+        # usage, ...). For volatile keys (last_status etc.) trust the
+        # in-memory copy if we already know this credential — it may
+        # have just been refreshed by revalidate_all_credentials().
         if cid in _cred_meta:
             for k, v in entry.items():
-                if k != "client_secret":
-                    _cred_meta[cid][k] = v
+                if k == "client_secret":
+                    continue
+                if k in _VOLATILE_META_KEYS:
+                    continue
+                _cred_meta[cid][k] = v
         else:
             _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
         if cid not in seen:

@@ -17,7 +17,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
+import ctypes
 import gc
 import gzip
 import hashlib
@@ -28,6 +30,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import Counter, defaultdict
@@ -7529,6 +7532,123 @@ DEFER_GAP = 5  # re-insert transient failures this many KGs later
 # Graceful shutdown flag
 _shutdown_requested = False
 
+# Track the in-flight Pool so signal/atexit handlers can drain it.
+_active_pool = None
+
+
+def _pool_worker_init():
+    """Pool worker initializer: kernel-level guarantee that the worker dies
+    if the parent dies (Linux PR_SET_PDEATHSIG). Without this, a worker
+    blocked in C-level I/O (SQLite/SSL/GDAL) can outlive a SIGKILLed
+    parent and keep GPKG file descriptors open — corrupting the next
+    parent's Zenodo upload of the same path.
+    """
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+    # Workers must not handle SIGTERM/SIGINT themselves — the parent
+    # owns shutdown and will terminate() the pool. Inheriting the
+    # parent's handler would set _shutdown_requested in the worker copy
+    # (harmless) but ignoring is cleaner.
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    except Exception:
+        pass
+
+
+def _drain_pool(pool, *, hard_timeout: float = 30.0) -> bool:
+    """terminate() + join() a multiprocessing.Pool with a hard deadline.
+
+    Returns True if the pool exited cleanly within the deadline, False if
+    we had to escalate to SIGKILL on surviving worker PIDs.
+
+    The default ``Pool.join()`` blocks indefinitely. A worker stuck in
+    SQLite/SSL I/O on a GPKG would otherwise prevent the parent from
+    exiting — and once the parent is SIGKILLed, that worker becomes an
+    init-reparented orphan still holding GPKG handles, which is exactly
+    how Zenodo uploads got corrupted (KG 01507: 0-byte file overwrote a
+    243 MB upload because a stale worker still had the fd open).
+    """
+    if pool is None:
+        return True
+    # Snapshot worker PIDs *before* terminate() — _pool gets cleared.
+    worker_pids = []
+    try:
+        worker_pids = [p.pid for p in getattr(pool, "_pool", []) if p.pid]
+    except Exception:
+        pass
+    try:
+        pool.terminate()
+    except Exception:
+        pass
+
+    # Bounded join via a watchdog thread.
+    joined = threading.Event()
+
+    def _joiner():
+        try:
+            pool.join()
+        finally:
+            joined.set()
+
+    t = threading.Thread(target=_joiner, daemon=True)
+    t.start()
+    if joined.wait(timeout=hard_timeout):
+        return True
+
+    # Pool.join() didn't return — escalate to SIGKILL on each worker.
+    log.error("Pool.join() exceeded %.1fs after terminate() — "
+              "SIGKILLing %d stuck worker(s) %s",
+              hard_timeout, len(worker_pids), worker_pids)
+    for pid in worker_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Best-effort second join; don't block forever.
+    joined.wait(timeout=10.0)
+    # Reap any direct children that became zombies.
+    try:
+        while True:
+            wpid, _ = os.waitpid(-1, os.WNOHANG)
+            if wpid == 0:
+                break
+    except (ChildProcessError, OSError):
+        pass
+    return False
+
+
+def _atexit_kill_children():
+    """Last-ditch: at parent exit (clean or uncaught), make sure no Pool
+    workers (or their grandchildren) outlive us. multiprocessing's own
+    atexit only runs ``terminate()`` on each Process — it does NOT wait
+    and does NOT escalate, so a wedged worker simply gets reparented to
+    init. This handler escalates with SIGKILL on the whole process group
+    (we are the session leader by virtue of start_new_session=True at
+    spawn time).
+    """
+    global _active_pool
+    try:
+        if _active_pool is not None:
+            _drain_pool(_active_pool, hard_timeout=10.0)
+    except Exception:
+        pass
+    # Final sweep: kill anything else in our process group except us.
+    try:
+        children = multiprocessing.active_children()
+        for c in children:
+            try:
+                if c.is_alive():
+                    os.kill(c.pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool:
     """Classify whether a KG failure is transient (worth auto-retrying).
@@ -7967,7 +8087,7 @@ def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
 
 
 def main():
-    global _shutdown_requested
+    global _shutdown_requested, _active_pool
 
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")
     parser.add_argument("--kg", help="Process single KG code")
@@ -8005,6 +8125,20 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+    # SIGHUP arrives when the controlling terminal goes away (and is what
+    # ``systemctl kill --signal=HUP`` would deliver). SIGQUIT is what an
+    # operator types as Ctrl-\. Treat both as graceful: better to finish
+    # the current KG than to leave a half-uploaded GPKG behind.
+    try:
+        signal.signal(signal.SIGHUP, _handle_signal)
+        signal.signal(signal.SIGQUIT, _handle_signal)
+    except Exception:
+        pass
+
+    # Last-ditch worker reaper. multiprocessing's own atexit only calls
+    # terminate() (no join, no escalate), so a wedged C-level worker
+    # would otherwise be reparented to PID 1 and keep GPKG fds open.
+    atexit.register(_atexit_kill_children)
 
     # --- Single-instance lock ---
     # Prevent two processor instances from racing on shared GPKG paths.
@@ -8728,7 +8862,9 @@ def main():
                                      kg_code)
                     progress.save()
 
-                pool = multiprocessing.Pool(processes=1)
+                pool = multiprocessing.Pool(
+                    processes=1, initializer=_pool_worker_init)
+                _active_pool = pool
                 try:
                     async_result = pool.apply_async(
                         process_one_kg, args=(kg,),
@@ -8768,8 +8904,7 @@ def main():
                             last_step = sd.get("step", "unknown")
                         except Exception:
                             pass
-                        pool.terminate()
-                        pool.join()
+                        _drain_pool(pool)
 
                         if _postponed:
                             # User-requested postpone — defer without fail count bump
@@ -8851,8 +8986,7 @@ def main():
                             last_step = sd.get("step", "unknown")
                         except Exception:
                             pass
-                        pool.terminate()
-                        pool.join()
+                        _drain_pool(pool)
 
                         _err_msg = f"worker killed (OOM?) at {last_step}: {pool_exc}"
                         log.error("KG %s: %s", kg_code, _err_msg)
@@ -8867,8 +9001,27 @@ def main():
                         result = None
                         break
                 finally:
-                    pool.close()
-                    pool.join()
+                    # Always fully drain: close() + bounded join, escalate
+                    # to terminate()+SIGKILL if a worker is stuck. We must
+                    # not leave a worker holding GPKG SQLite handles when
+                    # we move on to the next KG (or exit).
+                    try:
+                        pool.close()
+                    except Exception:
+                        pass
+                    _joined = threading.Event()
+
+                    def _soft_join():
+                        try:
+                            pool.join()
+                        finally:
+                            _joined.set()
+                    _t = threading.Thread(target=_soft_join, daemon=True)
+                    _t.start()
+                    if not _joined.wait(timeout=15.0):
+                        log.warning("Pool soft-join timed out — escalating")
+                        _drain_pool(pool)
+                    _active_pool = None
 
 
             # Stop step monitor

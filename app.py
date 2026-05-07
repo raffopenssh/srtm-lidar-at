@@ -377,8 +377,42 @@ def _safe_git_sync(repo: str, sp):
         # Fetch + hard-reset (robust against divergence; deterministic).
         fetch = sp.run(['git', 'fetch', 'origin', branch],
                        capture_output=True, text=True, timeout=60, cwd=repo)
+        # If we have local commits ahead of origin, push them first so the
+        # subsequent hard-reset doesn't discard them. Symptom of skipping
+        # this: an operator commits on the primary, peers' /admin/update
+        # via update_peers pushes from the calling node only — the primary
+        # itself runs through here and would silently lose its commit on
+        # `git reset --hard origin/main`. Auto-handback then refused
+        # because at55 (and origin) didn't know about the orphaned commit.
+        push_out = ''
+        try:
+            local = sp.run(['git', 'rev-parse', branch],
+                           capture_output=True, text=True, timeout=10,
+                           cwd=repo).stdout.strip()
+            remote = sp.run(['git', 'rev-parse', f'origin/{branch}'],
+                            capture_output=True, text=True, timeout=10,
+                            cwd=repo).stdout.strip()
+            if local and remote and local != remote:
+                ahead = sp.run(['git', 'rev-list', '--count',
+                                f'origin/{branch}..{branch}'],
+                               capture_output=True, text=True, timeout=10,
+                               cwd=repo).stdout.strip()
+                if ahead and ahead != '0':
+                    pr = sp.run(['git', 'push', 'origin', branch],
+                                capture_output=True, text=True,
+                                timeout=60, cwd=repo)
+                    push_out = (pr.stdout + pr.stderr).strip()
+                    if pr.returncode == 0:
+                        # Re-fetch so origin/<branch> includes our push.
+                        sp.run(['git', 'fetch', 'origin', branch],
+                               capture_output=True, text=True,
+                               timeout=60, cwd=repo)
+        except Exception as _pe:
+            push_out = f'push-if-ahead error: {_pe}'
         reset = sp.run(['git', 'reset', '--hard', f'origin/{branch}'],
                        capture_output=True, text=True, timeout=30, cwd=repo)
+        if push_out:
+            reset.stdout = (push_out + '\n' + (reset.stdout or '')).strip()
         # Synthesize a pull-like CompletedProcess for the response.
         reset.stdout = (fetch.stdout + reset.stdout).strip()
         reset.stderr = (fetch.stderr + reset.stderr).strip()

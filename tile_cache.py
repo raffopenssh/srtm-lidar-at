@@ -1187,9 +1187,19 @@ class HansenTileCache:
             except Exception as e:
                 log.debug("Zenodo Hansen fetch failed: %s", e)
 
+        # Hansen GFC is hosted on Google's UMD server with no auth, no
+        # rate limit, and no credit cost — so even cache-only peers may
+        # fetch it directly when the local + Zenodo caches miss.  Once
+        # downloaded the tile is saved locally and (later, by the
+        # director's data-sync thread) pushed into the Zenodo cache so
+        # subsequent peers find it there.
         if FORBID_REMOTE:
-            raise CacheMissError(
-                f"Hansen tile {tw:.2f},{ts:.2f} not cached (forbid_remote)")
+            log.info(
+                "Hansen tile %.2f,%.2f not in local/Zenodo cache; "
+                "fetching directly from UMD (cache-only mode permits this "
+                "because Hansen has no auth/throttle)",
+                tw, ts,
+            )
 
         try:
             import hansen

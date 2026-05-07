@@ -19,9 +19,12 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 
 | Topic | File | When to read |
 |---|---|---|
+| `app.py` mental model | `docs/app.md` | touching `app.py` — section map, async task lifecycle, background threads, auth |
 | Austria Processor mental model | `docs/austria-processor.md` | touching `austria_processor.py`, KG pipeline, tile checkpoints, GPKG/JSON builders, Zenodo upload |
 | Peer Director (multi-VM orchestration) | `docs/peer-director.md` | touching `peer_director.py`, `deploy.sh`, parallel frontiers, HA, throttle, admin token, role eviction |
 | Copernicus throttle & retry | `docs/copernicus-throttle.md` | touching `copernicus.py`, `tile_cache.py`, 402 handling, credential rotation |
+| Search index | `docs/search-index.md` | touching `search_index.py`, schema, compound query, `kg_parcels`, auto-classification |
+| RF training | `docs/rf-training.md` | touching `train_rf_4000kg.py`, ground-truth filters, retraining triggers |
 | Zenodo persistent tile cache | `docs/zenodo-cache.md` | touching `zenodo_cache.py`, tile manifest, ZIP indices |
 | Cross-cutting concerns | `docs/cross-cutting-concerns.md` | adding object types, RF features, tile grid, credential pool, navigation cheatsheet |
 | Planned refactor + speed optimisation | `docs/planned-refactor.md` | next maintenance window work |

@@ -8788,9 +8788,18 @@ def main():
                             # Log the NEW step starting
                             if detail:
                                 progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)
-                            # If the PREVIOUS step had issues, log its completion
-                            # at that level so the log matches the tag badge
+                            # The previous step cleanly transitioned to the next,
+                            # which means it completed successfully (otherwise the
+                            # subprocess would have raised and aborted the KG).
+                            # Any ERROR-level issues observed during that step were
+                            # therefore transient (e.g., Zenodo 500 then 200 retry,
+                            # fiona warn-as-error, BrokenPipe in pool teardown).
+                            # Downgrade error -> warning so the chip is yellow (⚠)
+                            # not red (✗) on a successful step.
                             if prev_step and prev_step in _step_issues:
+                                if _step_issues[prev_step] == "error":
+                                    _step_issues[prev_step] = "warning"
+                                    ckg["step_issues"] = dict(_step_issues)
                                 issue_lvl = _step_issues[prev_step]
                                 step_label = prev_step
                                 step_time = sd.get("step_times", {}).get(prev_step)

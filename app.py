@@ -478,11 +478,44 @@ def _init_search_index():
         # Initial build (only the lock-holder does this)
         idx.build()
 
-        # Initial quality_flags sweep
+        # Initial quality_flags sweep — incremental via mtime watermark.
+        # Without this guard a srv restart re-scans every JSON
+        # (~8000 files at boot), which floods the journal and burns
+        # CPU/memory for no benefit when nothing has changed since last
+        # boot. The watermark file lives next to search_index.db so it
+        # follows the same role-data lifecycle.
+        qf_mark_path = Path('data/quality_flags_sweep_at.txt')
         try:
+            qf_last = float(qf_mark_path.read_text().strip())
+        except Exception:
+            qf_last = 0.0
+        try:
+            scanned = 0
+            high_water = qf_last
             for jp in json_dir.glob('*.json'):
-                try: quality_flags.scan_json(jp)
-                except Exception as e: log.warning('quality_flags initial scan %s: %s', jp.name, e)
+                try:
+                    mt = jp.stat().st_mtime
+                except OSError:
+                    continue
+                if mt > high_water:
+                    high_water = mt
+                if mt <= qf_last:
+                    continue
+                try:
+                    quality_flags.scan_json(jp)
+                    scanned += 1
+                except Exception as e:
+                    log.warning('quality_flags initial scan %s: %s', jp.name, e)
+            try:
+                qf_mark_path.write_text(str(high_water))
+            except Exception:
+                pass
+            if scanned:
+                log.info('quality_flags initial sweep: scanned %d new/changed KG JSON(s)',
+                         scanned)
+            else:
+                log.info('quality_flags initial sweep: no new JSONs since %.0f — skipped',
+                         qf_last)
         except Exception as e:
             log.warning('quality_flags initial sweep: %s', e)
 
@@ -6139,10 +6172,15 @@ def api_kg_outlines():
 
 @app.route('/api/v1/index/rebuild', methods=['POST'])
 def index_rebuild():
-    """Rebuild the search index from scratch."""
+    """Rebuild the search index. Pass ``?force=1`` (or JSON
+    ``{"force": true}``) to drop & recreate all tables; otherwise
+    runs an incremental refresh that only re-enriches KGs whose
+    JSON mtime has changed since the last sweep."""
     try:
+        force = bool(request.args.get('force')) or bool(
+            (request.get_json(silent=True) or {}).get('force'))
         idx = si.get_index()
-        idx.build()
+        idx.build(force=force)
         return jsonify(idx.stats())
     except Exception as e:
         return jsonify({'error': str(e)}), 500

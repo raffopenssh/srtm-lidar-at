@@ -204,6 +204,8 @@ def maybe_split_kg(kg: dict) -> list:
         # Each strike doubles the block count, capped so each block has ≥2 tiles
         n_blocks = min(2 ** (strikes - ADAPTIVE_SPLIT_THRESHOLD + 1),
                        max(2, n_tiles // 2))
+        # Adaptive (strike-driven) splits stay at INFO — they're a
+        # genuine state change worth seeing.
         log.info("KG %s (%s): adaptive split into %d blocks after %d strikes "
                  "(%d tiles, below %d-tile limit)",
                  kg_code, kg_name, n_blocks, strikes, n_tiles,
@@ -211,13 +213,17 @@ def maybe_split_kg(kg: dict) -> list:
     else:
         n_blocks = math.ceil(n_tiles / MAX_TILES_PER_BLOCK)
         if forced:
-            # Already over the limit AND has strikes — bump block count
             n_blocks = max(n_blocks, n_blocks * 2)
             log.info("KG %s (%s): %d tiles > %d limit, %d strikes → splitting into %d blocks (doubled)",
                      kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, strikes, n_blocks)
         else:
-            log.info("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
-                     kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
+            # Plain bbox-driven split decisions are deterministic from
+            # the KG's geometry — logging them on every call (status
+            # poller hits this thousands of times per minute) just
+            # spams the journal. Demote to DEBUG; the *commit* of a
+            # split (austria_processor / queue resolver) keeps INFO.
+            log.debug("KG %s (%s): %d tiles > %d limit → splitting into %d blocks",
+                      kg_code, kg_name, n_tiles, MAX_TILES_PER_BLOCK, n_blocks)
 
     return _split_bbox_grid(kg, n_blocks)
 

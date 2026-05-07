@@ -439,19 +439,138 @@ class SearchIndex:
     # Build / Update
     # ════════════════════════════════════════════════════════════════
 
+    # Bumping this string forces a full rebuild on the next call to
+    # build() — use it when the schema or enrichment logic changes.
+    SCHEMA_VERSION = '2026-05-07-v1'
+
     def build(self, kg_list_path='data/austria_processor/kg_list.json',
               json_dir='data/austria_processor/json',
-              manifest_path='data/austria_processor/zenodo_manifest.json'):
-        """Full rebuild from scratch. Completes in <2s for 8440 KGs."""
+              manifest_path='data/austria_processor/zenodo_manifest.json',
+              force=False):
+        """Build or refresh the index.
+
+        Default is **incremental**: if the on-disk index already has
+        the current schema version and roughly the right KG row count,
+        we only re-enrich JSONs whose mtime changed since the last
+        sweep. The full drop-and-recreate path runs only when:
+
+        * ``force=True`` (admin-triggered ``/api/v1/index/rebuild``),
+        * the schema version on disk doesn't match ``SCHEMA_VERSION``,
+        * the ``kg`` table is empty / missing, or
+        * the kg-list file size has grown by >10% since last build
+          (new KGs added to the corpus).
+
+        This avoids the multi-GB memory spike on every srv restart
+        that historically tripped MemoryMax=4G and recycled workers.
+        Completes in <2s for a full rebuild of 8440 KGs.
+        """
         t0 = time.time()
         # File lock prevents concurrent rebuilds across gunicorn workers
         lock_fd = open(self._file_lock_path, 'w')
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if not force and self._can_skip_full_rebuild(kg_list_path):
+                return self._build_incremental(
+                    kg_list_path, json_dir, manifest_path, t0)
             return self._build_inner(kg_list_path, json_dir, manifest_path, t0)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+
+    def _can_skip_full_rebuild(self, kg_list_path: str) -> bool:
+        """Decide whether the on-disk index is good enough to skip the
+        full DROP+CREATE pass. See ``build()`` for the rules."""
+        try:
+            c = self._conn()
+            # Tables must exist
+            row = c.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='index_meta'").fetchone()
+            if not row:
+                return False
+            meta = {r[0]: r[1] for r in
+                    c.execute('SELECT key, value FROM index_meta')}
+            if meta.get('schema_version') != self.SCHEMA_VERSION:
+                log.info('🔍 Search index: schema_version mismatch '
+                         '(%s != %s) — forcing full rebuild',
+                         meta.get('schema_version'), self.SCHEMA_VERSION)
+                return False
+            row_count = c.execute('SELECT COUNT(*) FROM kg').fetchone()[0]
+            if row_count == 0:
+                return False
+            # Detect kg_list growth (new KGs appended) — use file size as
+            # a cheap proxy. Force rebuild if size grew by >10%.
+            try:
+                sz = Path(kg_list_path).stat().st_size if Path(kg_list_path).exists() else 0
+            except Exception:
+                sz = 0
+            prev_sz = int(meta.get('kg_list_size') or 0)
+            if sz and prev_sz and sz > prev_sz * 1.10:
+                log.info('🔍 Search index: kg_list size grew %d → %d bytes '
+                         '(>10%%) — forcing full rebuild', prev_sz, sz)
+                return False
+            return True
+        except Exception as e:
+            log.warning('Search index: could not inspect existing db (%s); '
+                        'falling back to full rebuild', e)
+            return False
+
+    def _build_incremental(self, kg_list_path, json_dir, manifest_path, t0):
+        """Incremental refresh: only re-enrich JSONs whose mtime changed
+        since the last sweep. Schema/tables are left intact — this is the
+        common case on srv restarts and it costs ~0 RAM/CPU when no
+        JSONs changed.
+
+        State: ``index_meta['json_mtimes_at']`` stores the wall-clock
+        time of the last sweep; we treat that as a high-water mark and
+        re-enrich any JSON whose mtime is newer.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        c = self._conn()
+        meta = {r[0]: r[1] for r in
+                c.execute('SELECT key, value FROM index_meta')}
+        last_sweep = float(meta.get('json_mtimes_at') or 0)
+        json_dir_p = _Path(json_dir)
+        n_changed = 0
+        max_mtime = last_sweep
+        if json_dir_p.exists():
+            manifest = {}
+            mp = _Path(manifest_path)
+            if mp.exists():
+                try:
+                    md = _json.loads(mp.read_text())
+                    manifest = md.get('entries', md)
+                except Exception:
+                    pass
+            for jf in json_dir_p.glob('*.json'):
+                try:
+                    mt = jf.stat().st_mtime
+                except OSError:
+                    continue
+                if mt > max_mtime:
+                    max_mtime = mt
+                if mt <= last_sweep:
+                    continue
+                code = jf.stem
+                try:
+                    self.update_kg(code, json_path=str(jf), manifest=manifest)
+                    n_changed += 1
+                except Exception as e:
+                    log.warning('incremental update %s: %s', code, e)
+        # Update sweep timestamp + bookkeeping
+        with self._write_lock:
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('json_mtimes_at', str(max_mtime)))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('last_incremental_at',
+                       time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+            c.commit()
+        elapsed = time.time() - t0
+        log.info('🔍 Search index: incremental refresh — %d KG(s) '
+                 're-enriched in %.2fs (skipped full rebuild)',
+                 n_changed, elapsed)
+        return None
 
     def _build_inner(self, kg_list_path, json_dir, manifest_path, t0):
         with self._write_lock:
@@ -594,6 +713,18 @@ class SearchIndex:
                       ('kg_count', str(len(kg_rows))))
             c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
                       ('processed_count', str(n_processed)))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('schema_version', self.SCHEMA_VERSION))
+            try:
+                _kg_size = Path(kg_list_path).stat().st_size if Path(kg_list_path).exists() else 0
+            except Exception:
+                _kg_size = 0
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('kg_list_size', str(_kg_size)))
+            # Bump the incremental high-water so subsequent restarts
+            # only re-enrich KGs whose JSONs are newer than "now".
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('json_mtimes_at', str(time.time())))
             c.commit()
             log.info('🔍 Search index built: %d KGs (%d processed) in %.1fs',
                      len(kg_rows), n_processed, elapsed)

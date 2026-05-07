@@ -714,7 +714,7 @@
           </div>
           <span class="zen-filter-badge" id="zenFilterBadge"></span>
           <button class="zen-filter-clear" id="zenFilterClear" title="Clear filter" style="display:none">✕</button>
-          <svg id="zenRateSpark" class="zen-rate-spark" width="100" height="22" style="flex-shrink:0"><title>Zenodo upload rate (last 24h, hourly)</title></svg>
+          <svg id="zenRateSpark" class="zen-rate-spark" width="100" height="22" style="flex-shrink:0;cursor:pointer" onclick="_toggleZenSparkMode()"><title>Zenodo upload rate (last 24h, hourly) · click for all-time history</title></svg>
           <span id="zenRateLabel" class="zen-rate-label" style="font-size:10px;color:var(--dim);white-space:nowrap;flex-shrink:0"></span>
         </div>
         <table id="zenTbl">
@@ -2141,11 +2141,70 @@ async function fetchManifest() {
   document.querySelector('#zenTbl tbody').innerHTML = sorted.map(_zenManifestRow).join('');
 }
 
+let _zenSparkMode = localStorage.getItem('zenSparkMode') || '24h';
+let _zenSparkEntries = [];
+function _toggleZenSparkMode() {
+  _zenSparkMode = (_zenSparkMode === '24h') ? 'all' : '24h';
+  localStorage.setItem('zenSparkMode', _zenSparkMode);
+  _renderZenRateSpark(_zenSparkEntries);
+}
 function _renderZenRateSpark(entries) {
+  _zenSparkEntries = entries || [];
   const svg = document.getElementById('zenRateSpark');
   const label = document.getElementById('zenRateLabel');
   if (!svg) return;
-  const N = 24; // last 24 hours, 1h buckets
+  const H = 22;
+  if (_zenSparkMode === 'all') {
+    // All-time history, 1-day buckets from first upload to today.
+    const dayMs = 86400 * 1000;
+    let minT = Infinity;
+    const times = [];
+    for (const e of entries) {
+      if (!e || !e.uploaded_at) continue;
+      const t = Date.parse(e.uploaded_at);
+      if (!isFinite(t)) continue;
+      times.push(t);
+      if (t < minT) minT = t;
+    }
+    const todayStart = (() => { const d = new Date(); d.setHours(0,0,0,0); return d.getTime(); })();
+    const startDay = (() => { if (!isFinite(minT)) return todayStart; const d = new Date(minT); d.setHours(0,0,0,0); return d.getTime(); })();
+    const N = Math.max(1, Math.round((todayStart - startDay) / dayMs) + 1);
+    const buckets = new Array(N).fill(0);
+    let total = 0;
+    for (const t of times) {
+      const idx = Math.floor((t - startDay) / dayMs);
+      if (idx >= 0 && idx < N) { buckets[idx] += 1; total += 1; }
+    }
+    // Width: scale with number of days, capped.
+    const W = Math.max(120, Math.min(420, N * 4));
+    svg.setAttribute('width', W);
+    const bw = W / N;
+    let bars = '';
+    for (let i = 0; i < N; i++) {
+      const v = buckets[i];
+      const max = Math.max(1, ...buckets);
+      const h = (v / max) * (H - 2);
+      const x = i * bw;
+      const y = H - h;
+      const isToday = (i === N - 1);
+      const fill = isToday ? 'var(--blue)' : (v === 0 ? 'rgba(88,166,255,0.12)' : 'rgba(88,166,255,0.45)');
+      const dt = new Date(startDay + i * dayMs);
+      const dStr = dt.toISOString().slice(0,10);
+      bars += '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
+              '" width="' + Math.max(bw - 0.4, 0.5).toFixed(2) +
+              '" height="' + Math.max(h, 0.5).toFixed(2) +
+              '" fill="' + fill + '"><title>' + dStr + ': ' + v + ' upload' + (v===1?'':'s') + '</title></rect>';
+    }
+    svg.innerHTML = bars;
+    if (label) {
+      const perD = total / N;
+      label.textContent = total + '/' + N + 'd · ' + perD.toFixed(1) + '/d · click for 24h';
+    }
+    svg.querySelector('title')?.remove?.();
+    return;
+  }
+  // Default: last 24 hours, 1h buckets.
+  const N = 24;
   const buckets = new Array(N).fill(0);
   const now = Date.now();
   const hourMs = 3600 * 1000;
@@ -2159,7 +2218,8 @@ function _renderZenRateSpark(entries) {
     const idx = N - 1 - Math.floor(ageH);
     if (idx >= 0 && idx < N) { buckets[idx] += 1; total += 1; }
   }
-  const W = 120, H = 22;
+  const W = 120;
+  svg.setAttribute('width', W);
   const max = Math.max(1, ...buckets);
   const bw = W / N;
   let bars = '';
@@ -2179,7 +2239,7 @@ function _renderZenRateSpark(entries) {
   svg.innerHTML = bars;
   if (label) {
     const perH = total / N;
-    label.textContent = total + '/24h · ' + perH.toFixed(1) + '/h';
+    label.textContent = total + '/24h · ' + perH.toFixed(1) + '/h · click for all-time';
   }
 }
 

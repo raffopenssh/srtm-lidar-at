@@ -4946,6 +4946,16 @@ class PeerDirector:
                 ps2 = get_peer_status(c['peer'].get('url'))
             except Exception:
                 ps2 = {}
+            # Only mark KGs from peers whose processor is actually
+            # running/paused right now. ``current_kg`` lingers in
+            # progress.json after SIGTERM with state='stopped' (e.g.
+            # after a fleet-wide update_peers wave) — using those stale
+            # codes drains the whitelist (``30 in-progress KGs > 15
+            # ready`` -> empty after filter -> 0/60 cache-only running).
+            st2 = ps2.get('state')
+            if st2 not in ('running', 'processing', 'paused',
+                            'paused_zenodo'):
+                continue
             ckg = (ps2.get('current_kg') or {})
             _mark(ckg.get('code') if isinstance(ckg, dict) else None)
             _mark(ps2.get('in_progress'))
@@ -4956,8 +4966,11 @@ class PeerDirector:
             if fp:
                 try:
                     fps = get_peer_status(fp.get('url'))
-                    fkg = (fps.get('current_kg') or {})
-                    _mark(fkg.get('code') if isinstance(fkg, dict) else None)
+                    fst = fps.get('state')
+                    if fst in ('running', 'processing', 'paused',
+                                'paused_zenodo'):
+                        fkg = (fps.get('current_kg') or {})
+                        _mark(fkg.get('code') if isinstance(fkg, dict) else None)
                 except Exception:
                     pass
         # Filter the whitelist before partitioning.

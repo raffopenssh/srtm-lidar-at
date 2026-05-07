@@ -1119,9 +1119,12 @@ function updateCards(d) {
 
 
   // Progress (prefer DB-sourced count which aggregates all peers via
-  // Zenodo manifest sync; falls back to local manifest count otherwise)
+  // Zenodo manifest sync; falls back to local manifest count otherwise).
+  // total_kgs reflects the *current run* (e.g. 1 for a single-KG director
+  // job), so fall back to the Austria-wide constant 8440 when it's small.
   const done = (d.db_processed != null ? d.db_processed : (d.completed || 0));
-  const total = d.total_kgs || 0;
+  const runTotal = d.total_kgs || 0;
+  const total = (runTotal > 0 && runTotal < 200) ? 8440 : (runTotal || 8440);
   const pct = total > 0 ? (done / total * 100) : 0;
   document.getElementById('cProgVal').textContent = done + '/' + total;
   const bar = document.getElementById('cProgBar');
@@ -1280,6 +1283,37 @@ function updateCards(d) {
       zenDet += '<br><span style="color:var(--dim)">Last: ' + esc(last.product + ' — ' + (last.reason||'')) + ' (' + ago + ')</span>';
     }
   }
+  // Fleet-bandwidth bar: total remaining GB across enabled peers until
+  // the next cycle renew (renew_day = 17th).
+  try {
+    const dd = (typeof _directorData !== 'undefined' && _directorData) ? _directorData : null;
+    if (dd && Array.isArray(dd.peers)) {
+      let totRem = 0, totBudget = 0, totUsed = 0, n = 0;
+      const defBudget = dd.budget_gb || 95;
+      for (const p of dd.peers) {
+        if (!p.enabled) continue;
+        const bw = p.bandwidth || {};
+        if (!Object.keys(bw).length) continue;
+        n++;
+        const budget = bw.effective_budget_gb || bw.budget_gb || defBudget;
+        const used = bw.used_gb || 0;
+        const rem = (bw.remaining_gb != null) ? bw.remaining_gb : Math.max(0, budget - used);
+        totRem += rem; totBudget += budget; totUsed += used;
+      }
+      // Days until renew (renew_day or 17), assume monthly cycle.
+      const renewDay = dd.renew_day || 17;
+      const now = new Date();
+      let renew = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), renewDay));
+      if (renew <= now) renew = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, renewDay));
+      const daysLeft = Math.max(0, Math.round((renew - now) / 86400000));
+      const pctRem = totBudget > 0 ? (totRem / totBudget * 100) : 0;
+      const barColor = pctRem > 50 ? 'var(--green)' : pctRem > 20 ? 'var(--yellow)' : 'var(--red)';
+      zenDet += '<div style="margin-top:6px;font-size:11px;color:var(--dim)" title="Sum of remaining bandwidth across all ' + n + ' enabled peers (cycle resets day ' + renewDay + ' of month)">' +
+        'Fleet BW: <b style="color:var(--text)">' + Math.round(totRem) + ' GB</b> left of ' + Math.round(totBudget) + ' GB · ' + n + ' peers · resets in ' + daysLeft + 'd' +
+        '<div class="bar" style="margin-top:3px;height:5px"><div class="bar-fill" style="width:' + pctRem.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
+        '</div>';
+    }
+  } catch(_e) {}
   document.getElementById('cZenDet').innerHTML = zenDet;
 
   // Upload progress bar

@@ -358,19 +358,24 @@
                         overflow: hidden; text-overflow: ellipsis; }
   .pm-bar .pm-kg-meta { color: #b5b9bd; font-variant-numeric: tabular-nums;
                         font-size: 9.5px; flex-shrink: 0; }
-  /* Shimmer overlay for actively-running KGs */
-  .pm-bar.run .pm-fill::after {
-    content: ''; position: absolute; inset: 0;
-    background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.35) 50%, transparent 100%);
-    background-size: 40% 100%; background-repeat: no-repeat;
-    animation: pmShimmer 1.6s linear infinite;
+  /* Subtle 'live' breathing on the active peer's bar fill (no shimmer/sweep) */
+  @keyframes pmBreath { 0%,100% { opacity: 1; } 50% { opacity: 0.78; } }
+  .pm-bar.run .pm-fill { animation: pmBreath 3s ease-in-out infinite; }
+  /* Tag pills inside the bar (FRONTIER / CACHE / PRIMARY / PAUSED / IDLE) */
+  .pm-tag {
+    flex-shrink: 0; font-size: 8px; font-weight: 700;
+    letter-spacing: 0.4px; padding: 1px 4px; border-radius: 2px;
+    text-transform: uppercase; line-height: 1.2;
+    border: 1px solid currentColor;
   }
-  @keyframes pmShimmer { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
-  @keyframes pmActivePulse {
-    0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); }
-    50%     { box-shadow: 0 0 6px 1px rgba(88,166,255,0.7); }
-  }
-  .pm-active .pm-donut { animation: pmActivePulse 1.8s ease-in-out infinite; border-radius: 50%; }
+  .pm-tag.t-frontier { color: var(--blue); }
+  .pm-tag.t-cache    { color: #79b8ff; }
+  .pm-tag.t-primary  { color: #c9b76b; }
+  .pm-tag.t-paused   { color: var(--yellow); }
+  .pm-tag.t-stopped  { color: var(--red); }
+  .pm-tag.t-idle     { color: var(--dim); }
+  .pm-tag.t-offline  { color: var(--dim); opacity: 0.6; }
+  .pm-tag.t-int      { color: var(--yellow); }   /* interrupted KG (was running, now isn't) */
   @media (max-width: 600px) {
     /* Mobile: hide desktop content, show only compact strip. */
     #directorPeers { grid-template-columns: 1fr !important; gap: 3px !important; }
@@ -3931,15 +3936,35 @@ function _pmDonut(usedFrac, color) {
     +   ' transform="rotate(-90 11 11)" stroke-linecap="round"/>'
     + '</svg>';
 }
+// Display alias: 'primary' shows as 'at1' in the mobile strip.
+function _peerDisplayId(id) { return id === 'primary' ? 'at1' : id; }
+// Determine the role tag shown inside the progress bar.
+function _peerRoleTag(p, ctx) {
+  // Primary (the local director instance) doesn't process — always tag PRIMARY.
+  if (p.url == null) return {cls: 't-primary', txt: 'PRIMARY'};
+  if (ctx.isActive)  return {cls: 't-frontier', txt: 'FRONTIER'};
+  if (ctx.isRunning && p.cache_only_run) return {cls: 't-cache', txt: 'CACHE'};
+  if (ctx.isRunning) return {cls: 't-frontier', txt: 'FRONTIER'};
+  if (!p.online)     return {cls: 't-offline', txt: 'OFFLINE'};
+  if (p.processor_state === 'paused')  return {cls: 't-paused',  txt: 'PAUSED'};
+  if (p.processor_state === 'stopped') return {cls: 't-stopped', txt: 'STOPPED'};
+  // Has a KG attached but isn't running anymore → interrupted.
+  if (p.current_kg) return {cls: 't-int', txt: 'INTERRUPTED'};
+  return {cls: 't-idle', txt: 'IDLE'};
+}
 function _peerMobileBlock(p, ctx) {
   // Single horizontal strip: donut · id · [progress-bar with KG info inside] · ⋯
   const kgFrac = _peerKgFrac(p);
   const kgPct = Math.round(kgFrac * 100);
-  const kgColor = ctx.isActive
-    ? 'rgba(88,166,255,0.45)'
-    : (ctx.isRunning ? 'rgba(63,185,80,0.40)'
-                     : 'rgba(139,148,158,0.18)');
+  // Color the fill by role/state, not by activity alone.
+  let kgColor;
+  if (ctx.isActive)              kgColor = 'rgba(88,166,255,0.45)';   // blue (frontier)
+  else if (ctx.isRunning && p.cache_only_run) kgColor = 'rgba(121,184,255,0.30)'; // light blue (cache)
+  else if (ctx.isRunning)        kgColor = 'rgba(63,185,80,0.40)';   // green
+  else if (p.current_kg)         kgColor = 'rgba(210,153,34,0.22)';  // amber (interrupted)
+  else                            kgColor = 'rgba(139,148,158,0.15)';
   const usedFrac = ctx.budgetGb ? Math.min(1, ctx.usedGb / ctx.budgetGb) : 0;
+  const role = _peerRoleTag(p, ctx);
   // Bar contents — inside the bar (text overlays the fill).
   let kgCode, kgName, kgMeta;
   if (p.current_kg) {
@@ -3957,10 +3982,13 @@ function _peerMobileBlock(p, ctx) {
     kgName = '<span style="color:var(--dim)">' + esc(ctx.stLabel) + '</span>';
     kgMeta = '';
   }
-  const tip = 'KG ' + (p.current_kg || '—') + ' — ' + kgPct + '%'
+  const interruptedNote = (!ctx.isRunning && p.current_kg)
+    ? '\n(interrupted — last KG before stop)' : '';
+  const tip = role.txt + ' — KG ' + (p.current_kg || '—') + ' — ' + kgPct + '%'
     + (p.current_kg_name ? '\n' + p.current_kg_name : '')
     + (p.current_kg_step ? '\nstep: ' + p.current_kg_step : '')
-    + (p.current_kg_started_at ? '\nelapsed: ' + _fmtElapsedShort(p.current_kg_started_at) : '');
+    + (p.current_kg_started_at ? '\nelapsed: ' + _fmtElapsedShort(p.current_kg_started_at) : '')
+    + interruptedNote;
   const barCls = 'pm-bar' + (ctx.isRunning ? ' run' : '');
   let h = '<div class="peer-mobile pm-card">';
   // Donut (remaining bandwidth)
@@ -3968,12 +3996,12 @@ function _peerMobileBlock(p, ctx) {
      + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
      + _pmDonut(usedFrac, ctx.bwColor) + '</span>';
   // Peer id (compact)
-  h += '<span class="pm-id">' + esc(p.id) + '</span>';
-  if (p.region) h += '<span class="pm-region">' + esc(p.region) + '</span>';
-  // The progress bar (with KG name baked in)
+  h += '<span class="pm-id">' + esc(_peerDisplayId(p.id)) + '</span>';
+  // The progress bar (with role tag + KG info baked in)
   h += '<div class="' + barCls + '" title="' + esc(tip) + '">';
   h +=   '<div class="pm-fill" style="width:' + kgPct + '%;background:' + kgColor + '"></div>';
   h +=   '<div class="pm-text">';
+  h +=     '<span class="pm-tag ' + role.cls + '">' + role.txt + '</span>';
   if (kgCode) h += '<span class="pm-kg-code">' + kgCode + '</span>';
   h +=     '<span class="pm-kg-name">' + kgName + '</span>';
   if (kgMeta) h += '<span class="pm-kg-meta">' + kgMeta + '</span>';

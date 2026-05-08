@@ -1349,7 +1349,11 @@ function fmtC(n) {
 function updateSubtitle(d) {
   const el = document.getElementById('subtitle');
   const parts = [];
-  const totKg = d.total_kgs || 0;
+  // total_kgs from /processing/status reflects the *current run* (e.g. 1
+  // when the director queued a single KG to this host); fall back to the
+  // Austria-wide constant 8440 so the subtitle isn't "273/1 KGs (27300%)".
+  const runTotalKg = d.total_kgs || 0;
+  const totKg = (runTotalKg > 0 && runTotalKg < 200) ? 8440 : (runTotalKg || 8440);
   const doneDb = d.db_processed != null ? d.db_processed : (d.completed || 0);
   const pct = totKg ? ((doneDb/totKg)*100).toFixed(1) : '0';
   // ── Processed (authoritative DB totals across all peers) ──

@@ -944,20 +944,30 @@ class Client:
             for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                 md5.update(chunk)
         md5_hex = md5.hexdigest()
-        # Distinct log line for ``_full.gpkg`` re-upload attempts: when a
-        # subprocess crashes mid-upload the parent retries the same file
-        # on the next pass; if the previous attempt already poisoned the
-        # remote draft (partial bytes, dangling part) those retries are
-        # doomed and can spin for hours. Surfacing them with a separate
-        # tag makes the wreckage easy to grep for.
+        # Distinct log tag for ``_full.gpkg`` re-upload attempts:
+        #  * intra-process retry on the same Client instance, OR
+        #  * cross-process resume — the manifest already has an entry
+        #    for this key, meaning a previous run uploaded (or tried
+        #    to upload) the same file. After a subprocess crash these
+        #    retries can be doomed (poisoned remote draft, dangling
+        #    multipart parts) and spin for hours. The tag makes them
+        #    trivially greppable in the processor log.
         is_full_gpkg = filename.endswith("_full.gpkg")
         attempt_tag = ""
-        if is_full_gpkg and not getattr(self, "_seen_full_gpkg", set()).__contains__(filename):
+        existing_for_log = manifest.get(key)
+        if is_full_gpkg:
             if not hasattr(self, "_seen_full_gpkg"):
                 self._seen_full_gpkg = set()
+            seen = filename in self._seen_full_gpkg
+            cross_process = (existing_for_log is not None
+                             and existing_for_log.depo_id
+                             and existing_for_log.filename == filename)
+            if seen:
+                attempt_tag = " [FULL-GPKG-REUPLOAD same-process]"
+            elif cross_process:
+                attempt_tag = (" [FULL-GPKG-REUPLOAD cross-process "
+                               f"depo={existing_for_log.depo_id}]")
             self._seen_full_gpkg.add(filename)
-        elif is_full_gpkg:
-            attempt_tag = " [FULL-GPKG-REUPLOAD]"
         log.info("upload_stream:%s %s  size=%.1f MB  md5=%s",
                  attempt_tag, filename, file_size / 1e6, md5_hex)
         # Files >1 GB go through the InvenioRDM multipart bucket API

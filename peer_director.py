@@ -5045,6 +5045,45 @@ class PeerDirector:
         n = len(all_workers)
         slices = {pid: whitelist[i::n] for i, pid in enumerate(all_workers)}
 
+        # --- Sticky ownership: honor prior-tick assignments so a KG
+        # that's already in flight on peer P doesn't get reassigned to
+        # peer Q just because the stride math shifted (peer joined/left
+        # all_workers, whitelist length changed, etc.). Without this, two
+        # peers can be told to run the same KG within a few ticks of
+        # each other; we observed at25 and at26 both processing 72321
+        # Mitteregg.
+        #
+        # The in_progress filter above only catches duplicates *after*
+        # the second peer's status reflects current_kg — there's a small
+        # race window between PUT-queue and current_kg being visible.
+        # Sticky ownership closes that window deterministically.
+        sticky_ttl = 600.0  # seconds; covers a long-running KG comfortably
+        sticky_now = time.time()
+        prior = self.state.get('cache_only_assigned') or {}
+        owner: dict[str, str] = {}
+        worker_set = set(all_workers)
+        for pid_p, info in prior.items():
+            if pid_p not in worker_set:
+                continue  # peer no longer eligible — release its claims
+            ts = info.get('ts', 0)
+            if (sticky_now - ts) > sticky_ttl:
+                continue  # stale — release
+            for kg in info.get('slice', []) or []:
+                # First-write wins; deterministic because prior is a dict
+                # keyed by pid, but iteration order is insertion order so
+                # we sort to be safe.
+                owner.setdefault(kg, pid_p)
+        if owner:
+            fixed = {pid: [kg for kg in chunk
+                           if owner.get(kg, pid) == pid]
+                     for pid, chunk in slices.items()}
+            stolen = sum(len(slices[p]) - len(fixed[p]) for p in slices)
+            if stolen:
+                log.info('Cache-only sticky ownership: kept %d KGs with '
+                         'their prior owners (stride wanted to reshuffle)',
+                         stolen)
+            slices = fixed
+
         # Start new peers with their slice.
         for p in to_start:
             chunk = slices.get(p['id'], [])
@@ -5076,10 +5115,17 @@ class PeerDirector:
             except Exception as e:
                 log.debug('Resync queue to %s failed: %s', pid, e)
 
+        # Persist sticky ownership for next tick. Only record peers that
+        # actually got a non-empty slice this tick — empty-slice peers
+        # have no claims to defend.
+        new_assigned = {pid: {'slice': chunk, 'ts': sticky_now}
+                        for pid, chunk in slices.items() if chunk}
+
         # Status accounting
         with self._lock:
             self.state['cache_only_active'] = list(set(
                 running_cache_only + [p['id'] for p in to_start]))
+            self.state['cache_only_assigned'] = new_assigned
             save_director_state(self.state)
 
     def _sync_queue_to_active(self):

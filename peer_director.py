@@ -4569,7 +4569,12 @@ class PeerDirector:
         ts = float(rec.get('last_graceful_attempt') or 0)
         if ts <= 0:
             return False
-        return (time.time() - ts) < self.STALE_UPDATE_RETRY_GAP_S
+        # Holdoff covers the longest realistic KG tail so a peer
+        # mid-upload of a multi-GB _full.gpkg still finishes before
+        # we consider respawning it. Matches the 1800s gate used in
+        # ``_orchestrate_stale_peer_updates`` for re-firing graceful
+        # updates.
+        return (time.time() - ts) < max(self.STALE_UPDATE_RETRY_GAP_S, 1800.0)
 
     def _orchestrate_stale_peer_updates(self, statuses: dict):
         """Re-trigger update on peers stuck on an old commit while idle.

@@ -5021,6 +5021,7 @@ from pathlib import Path as _Path_log
 _COMBINED_LOG_PATH = _Path_log('data/combined_log_24h.jsonl')
 _COMBINED_LOG_LOCK = _th_log.Lock()
 _COMBINED_LOG_LAST_TS: dict[str, str] = {}      # per-peer last seen ts
+_COMBINED_LOG_LAST_TS_RELOAD = 0.0  # next ts at which we reload watermarks
 _COMBINED_LOG_LAST_PRUNE = 0.0
 _COMBINED_LOG_RETAIN_S = 24 * 3600
 _COMBINED_LOG_PRUNE_EVERY_S = 600   # 10 min
@@ -5042,6 +5043,44 @@ def _combined_log_persist(merged_with_peer: list[dict]) -> int:
     with _COMBINED_LOG_LOCK:
         try:
             _COMBINED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Cross-process dedup: gunicorn runs N workers, each polling
+            # peers independently and calling persist(). A purely
+            # in-memory ts watermark dedups within one worker but not
+            # across workers, so the file ends up with N copies of every
+            # line. Refresh per-peer watermarks from the file tail every
+            # ~30s (and on first run) so workers converge.
+            import time as _t_dedup
+            global _COMBINED_LOG_LAST_TS_RELOAD
+            now_dedup = _t_dedup.time()
+            if now_dedup >= _COMBINED_LOG_LAST_TS_RELOAD:
+                _COMBINED_LOG_LAST_TS_RELOAD = now_dedup + 30.0
+                try:
+                    fsize = (_COMBINED_LOG_PATH.stat().st_size
+                             if _COMBINED_LOG_PATH.exists() else 0)
+                except Exception:
+                    fsize = 0
+                if fsize:
+                    # Read tail (last ~256 KB) — enough to cover the most
+                    # recent ts for every peer in a 60-peer fleet.
+                    try:
+                        with open(_COMBINED_LOG_PATH, 'rb') as fh:
+                            fh.seek(max(0, fsize - 256 * 1024))
+                            tail = fh.read().decode('utf-8',
+                                                    errors='replace')
+                        for line in tail.split('\n'):
+                            if not line.strip():
+                                continue
+                            try:
+                                e = json.loads(line)
+                            except Exception:
+                                continue
+                            pid = e.get('peer') or '?'
+                            ts = e.get('ts', '')
+                            if ts and ts > _COMBINED_LOG_LAST_TS.get(
+                                    pid, ''):
+                                _COMBINED_LOG_LAST_TS[pid] = ts
+                    except Exception:
+                        pass
             # Group by peer, keep only entries strictly newer than the
             # last-persisted ts for that peer.
             by_peer: dict[str, list[dict]] = {}

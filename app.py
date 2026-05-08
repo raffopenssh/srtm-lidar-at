@@ -5000,17 +5000,20 @@ def director_proxy_all_status():
     return jsonify(_all_status_compute())
 
 
-@app.route('/api/v1/director/proxy/combined_log')
-def director_proxy_combined_log():
-    """Return a merged ``recent_log`` from the active frontier peer plus
-    all running cache-only peers, tagged with the source peer id. Used
-    by process.html so the Live Log shows what every running peer is
-    doing — not just the frontier."""
+_COMBINED_LOG_CACHE = {'ts': 0.0, 'data': None, 'refreshing': False}
+_COMBINED_LOG_TTL = 8.0       # serve cached if newer
+_COMBINED_LOG_STALE = 60.0    # serve stale + bg refresh up to here
+
+
+def _combined_log_compute():
+    """Probe every running peer in parallel, merge their recent_log.
+    Hot path: the dashboard polls this every 5s on every open browser."""
+    from concurrent.futures import ThreadPoolExecutor
+    import time as _time
     d = pd.get_director()
     status = d.get_status()
     cfg = pd.load_peers_config()
-    merged: list[dict] = []
-    seen_ids: list[str] = []
+    targets = []
     for p in status.get('peers', []):
         pid = p.get('id')
         if not pid:
@@ -5020,18 +5023,75 @@ def director_proxy_combined_log():
         running = p.get('processor_state') in ('running', 'processing')
         if not (is_active or (is_cache_only and running)):
             continue
+        # Skip peers the director already knows are offline — they hang
+        # the response while we wait for connect timeout.
+        if not p.get('online', True):
+            continue
         peer_cfg = pd.get_peer_by_id(cfg, pid)
         if not peer_cfg:
             continue
-        ps = pd.get_peer_status(peer_cfg.get('url'))
-        for entry in ps.get('recent_log', []) or []:
-            e = dict(entry)
-            e['peer'] = pid
-            merged.append(e)
-        seen_ids.append(pid)
-    # Newest first
+        targets.append((pid, peer_cfg.get('url')))
+
+    def _probe(t):
+        pid, url = t
+        try:
+            ps = pd.get_peer_status(url) or {}
+        except Exception:
+            ps = {}
+        return pid, ps.get('recent_log') or []
+
+    merged: list[dict] = []
+    seen_ids: list[str] = []
+    if targets:
+        with ThreadPoolExecutor(
+                max_workers=min(20, len(targets))) as pool:
+            for pid, log_lines in pool.map(_probe, targets):
+                seen_ids.append(pid)
+                for entry in log_lines:
+                    e = dict(entry)
+                    e['peer'] = pid
+                    merged.append(e)
     merged.sort(key=lambda e: e.get('ts', ''), reverse=True)
-    return jsonify({'log': merged[:300], 'peers': seen_ids})
+    payload = {'log': merged[:300], 'peers': seen_ids,
+               'cached_at': _time.time()}
+    _COMBINED_LOG_CACHE['ts'] = payload['cached_at']
+    _COMBINED_LOG_CACHE['data'] = payload
+    return payload
+
+
+@app.route('/api/v1/director/proxy/combined_log')
+def director_proxy_combined_log():
+    """Return a merged ``recent_log`` from the active frontier peer plus
+    all running cache-only peers, tagged with the source peer id. Used
+    by process.html so the Live Log shows what every running peer is
+    doing — not just the frontier.
+
+    Performance: peers are probed in parallel and the result is cached
+    for ``_COMBINED_LOG_TTL`` seconds (stale-while-refresh up to
+    ``_COMBINED_LOG_STALE``). The dashboard polls this every 5s on
+    every open browser, and the legacy serial implementation could
+    block 15+s with ~20 cache-only peers — wedging gunicorn workers
+    and locking out /process.html itself."""
+    import time as _time
+    import threading as _th
+    now = _time.time()
+    cached = _COMBINED_LOG_CACHE.get('data')
+    age = now - _COMBINED_LOG_CACHE.get('ts', 0)
+    if cached is not None and age < _COMBINED_LOG_TTL:
+        return jsonify(cached)
+    if cached is not None and age < _COMBINED_LOG_STALE and \
+       not _COMBINED_LOG_CACHE.get('refreshing'):
+        def _bg_refresh():
+            try:
+                _combined_log_compute()
+            except Exception:
+                pass
+            finally:
+                _COMBINED_LOG_CACHE['refreshing'] = False
+        _COMBINED_LOG_CACHE['refreshing'] = True
+        _th.Thread(target=_bg_refresh, daemon=True).start()
+        return jsonify(cached)
+    return jsonify(_combined_log_compute())
 
 
 @app.route('/api/v1/director/update_peers', methods=['POST'])

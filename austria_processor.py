@@ -490,12 +490,31 @@ class ProgressTracker:
         "openeo", "copernicus", "sentinel", "402", "ip-throttled",
         "creditsexhausted",
     )
+    # Auth/config-class warnings: NOT a server-friendliness signal.
+    # An invalid_client / 401 means *this* peer's local credentials
+    # store is stale (e.g. cred secret rotated, snapshot not yet
+    # synced) — throttling the rest of the fleet would be wrong.
+    # Tallied separately so the dashboard can surface them, but does
+    # not feed peer_director._capacity_factor (no entry in
+    # THROTTLE_SATURATION_RATE for this bucket).
+    _WARN_AUTH_TOKENS = (
+        "invalid_client", "invalid client",
+        "failed to retrieve access token",
+        "401 'unauthorized'", "401 unauthorized",
+        "unauthorized client",
+    )
 
     @classmethod
     def _classify_warning(cls, level: str, msg: str) -> str | None:
         if level not in ("warning", "error"):
             return None
         m = (msg or "").lower()
+        # Auth FIRST: a 401 message often also contains 'copernicus' /
+        # 'openeo' substrings, which would otherwise misclassify it as
+        # a server-friendliness signal and pin the fleet throttle.
+        for tok in cls._WARN_AUTH_TOKENS:
+            if tok in m:
+                return "auth"
         for tok in cls._WARN_BEV_TOKENS:
             if tok in m:
                 return "bev"
@@ -530,7 +549,7 @@ class ProgressTracker:
         now = time.time()
         windows = (60, 300, 600)
         out = {k: {"1m": 0.0, "5m": 0.0, "10m": 0.0}
-               for k in ("bev", "zenodo", "copernicus")}
+               for k in ("bev", "zenodo", "copernicus", "auth")}
         # Snapshot the deque under the lock to avoid races with appenders.
         with self._lock:
             snap = list(self._warning_history)

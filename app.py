@@ -274,6 +274,84 @@ def credentials_list():
         return jsonify({'error': str(e)}), 500
 
 
+# Header set on inter-peer credential fan-out so the receiving peer
+# does NOT itself re-fan out (would create a O(N²) storm).
+_CRED_FANOUT_HEADER = 'X-Cred-Fanout'
+
+
+def _fanout_credentials(op: str, cid: str, csec: str | None = None,
+                         label: str = '', notes: str = '',
+                         timeout: float = 8.0) -> dict:
+    """Push a credential add/delete to every peer in parallel.
+
+    Only meaningful when this VM is the director; the caller checks.
+    Each peer call sets ``X-Cred-Fanout: 1`` so the recipient skips
+    its own fan-out (no second-order broadcast). Bounded thread pool
+    so 59 peers don't burn 59 connections at once.
+
+    Returns ``{ok: int, failed: [{url, error}], skipped: int}``.
+    """
+    peer_urls = _get_peer_urls() or []
+    if not peer_urls:
+        return {'ok': 0, 'failed': [], 'skipped': 0, 'targets': 0}
+    tok = _current_admin_token()
+    headers = {_CRED_FANOUT_HEADER: '1', 'X-Admin-Token': tok}
+    body = {'client_id': cid}
+    if op == 'add':
+        body.update({'client_secret': csec, 'label': label,
+                      'notes': notes, 'validate': False})
+
+    def _push(url: str) -> tuple[str, dict | None, str | None]:
+        u = url.rstrip('/')
+        try:
+            if op == 'add':
+                r = requests.post(u + '/api/v1/credentials',
+                                    json=body, headers=headers,
+                                    timeout=timeout)
+            else:
+                r = requests.delete(
+                    u + '/api/v1/credentials/' + cid,
+                    headers=headers, timeout=timeout)
+            if 200 <= r.status_code < 300:
+                return (u, r.json() if r.content else {}, None)
+            return (u, None, f'HTTP {r.status_code}: '
+                    f'{(r.text or "")[:200]}')
+        except Exception as e:
+            return (u, None, str(e)[:200])
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    ok = 0
+    failed: list[dict] = []
+    # 59-peer fleet → cap parallelism at 20 to avoid socket storms
+    # while still finishing in <2 ticks (8s timeout × ⌈3 batches⌉).
+    max_workers = min(20, len(peer_urls))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(_push, u) for u in peer_urls]
+        for fut in as_completed(futs):
+            try:
+                url, _resp, err = fut.result()
+            except Exception as e:
+                url, err = '?', str(e)[:200]
+            if err:
+                failed.append({'url': url, 'error': err})
+            else:
+                ok += 1
+    return {'ok': ok, 'failed': failed, 'skipped': 0,
+            'targets': len(peer_urls)}
+
+
+def _is_cred_fanout_request() -> bool:
+    """True when this request is a director→peer credential push."""
+    return bool(request.headers.get(_CRED_FANOUT_HEADER))
+
+
+def _is_director_local() -> bool:
+    try:
+        return Path('data/austria_processor/is_director').exists()
+    except Exception:
+        return False
+
+
 @app.route('/api/v1/credentials', methods=['POST'])
 def credentials_add():
     """Add a Copernicus credential pair, validate, and persist.
@@ -281,21 +359,39 @@ def credentials_add():
     Body JSON: {"client_id":"sh-...","client_secret":"...",
                 "label":"optional","notes":"optional",
                 "validate": true|false}
+
+    When called on the director (and not from another peer's
+    fan-out), the new credential is pushed to every peer in
+    ``peer_urls.txt`` so the whole fleet shares the same store.
+    Peers store the cred locally without re-validating (the
+    director already did) and without re-fanning out.
     """
     data = request.get_json(silent=True) or {}
     cid = (data.get('client_id') or '').strip()
     csec = (data.get('client_secret') or '').strip()
     if not cid or not csec:
         return jsonify({'error': 'client_id and client_secret required'}), 400
+    fanout = _is_cred_fanout_request()
     import copernicus as _cop
+    # Peers receiving a fan-out must NOT validate — the director did,
+    # and 59 simultaneous OIDC probes would just hammer Copernicus.
+    do_validate = bool(data.get('validate', True)) and not fanout
     res = _cop.add_credential(
         cid, csec,
         label=(data.get('label') or '').strip(),
         notes=(data.get('notes') or '').strip(),
-        validate=bool(data.get('validate', True)),
+        validate=do_validate,
     )
     if not res.get('ok'):
         return jsonify(res), 400
+    if not fanout and _is_director_local():
+        try:
+            res['fanout'] = _fanout_credentials(
+                'add', cid, csec=csec,
+                label=(data.get('label') or '').strip(),
+                notes=(data.get('notes') or '').strip())
+        except Exception as e:
+            res['fanout'] = {'error': str(e)[:200]}
     return jsonify(res)
 
 
@@ -305,6 +401,11 @@ def credentials_remove(client_id):
     res = _cop.remove_credential(client_id)
     if not res.get('ok'):
         return jsonify(res), 404
+    if not _is_cred_fanout_request() and _is_director_local():
+        try:
+            res['fanout'] = _fanout_credentials('delete', client_id)
+        except Exception as e:
+            res['fanout'] = {'error': str(e)[:200]}
     return jsonify(res)
 
 

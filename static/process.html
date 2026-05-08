@@ -3716,9 +3716,14 @@ function renderCapacityHistory() {
   }
   // Build tooltip from current rates.
   const elapsedMin = Math.round((tN - t0) / 60);
+  const agg = (comp && comp.aggregation) || 'max';
   const tip = 'Capacity factor over last ' + elapsedMin + 'm.\n' +
     'Pulls peer parallelism down when upstreams emit warnings.\n' +
-    'Now: BEV ' + (r.bev||0) + '/min · Zen ' + (r.zenodo||0) + '/min · Cop ' + (r.copernicus||0) + '/min';
+    'Aggregation: ' + agg.toUpperCase() +
+    (agg === 'p90' ? ' (ignores top 10% outliers)' : '') + '\n' +
+    'Now: BEV ' + (r.bev||0) + '/min · Zen ' + (r.zenodo||0) +
+    '/min · Cop ' + (r.copernicus||0) + '/min' +
+    ((r.auth||0) ? ' · Auth ' + (r.auth||0) + '/min (diag)' : '');
   // y-range label so a zoomed view doesn't lie about absolute values.
   const rangeLbl = '<text x="1" y="7" font-size="7" fill="#888">' +
     Math.round(yHi*100) + '%</text>' +
@@ -4058,11 +4063,22 @@ function renderDirector(d) {
       let color = 'var(--green)';
       if (f < 0.55) color = 'var(--red)';
       else if (f < 0.85) color = 'var(--yellow)';
+      const agg = comp.aggregation || 'max';
+      const top = comp.top_peer || {};
+      const topLine = (kind) => {
+        const t = top[kind];
+        return t ? '   loudest: ' + t.pid + ' @ ' + t.rate + '/min\n' : '';
+      };
       const tip = 'Server-friendliness throttle. Scales peer counts down when ' +
         'BEV / Zenodo / Copernicus emit warnings.\n' +
-        'BEV warnings/min (5m): ' + (r.bev || 0) + '\n' +
-        'Zenodo warnings/min (5m): ' + (r.zenodo || 0) + '\n' +
-        'Copernicus warnings/min (5m): ' + (r.copernicus || 0) + '\n' +
+        'Aggregation across ' + (comp.peers_reporting || 0) +
+        ' peers: ' + agg.toUpperCase() +
+        (agg === 'p90' ? ' (top 10% outliers ignored)' : '') + '\n' +
+        'BEV warnings/min (5m): ' + (r.bev || 0) + '\n' + topLine('bev') +
+        'Zenodo warnings/min (5m): ' + (r.zenodo || 0) + '\n' + topLine('zenodo') +
+        'Copernicus warnings/min (5m): ' + (r.copernicus || 0) + '\n' + topLine('copernicus') +
+        'Auth warnings/min (5m): ' + (r.auth || 0) +
+        ' (diagnostic only — not throttled)\n' + topLine('auth') +
         'EMA: ' + (comp.ema || f) + ' · drift: ' + (comp.drift || 0);
       capHtml = ' · 🌿 <span title="' + tip + '" style="color:' + color + ';cursor:help"><b>' + pct + '%</b> capacity</span>';
     }

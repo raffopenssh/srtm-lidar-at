@@ -1572,15 +1572,43 @@ class PeerDirector:
             pass
 
     # --- Server-friendliness throttle ------------------------------------
-    def _fleet_warning_rates(self, statuses: dict) -> dict:
-        """Aggregate per-peer ``warning_rates`` into a fleet-wide max.
+    # When the fleet has at least this many reporting peers, switch from
+    # ``max`` aggregation to the high-percentile aggregation below.
+    # Below this count a single hot peer must still drive the decision;
+    # above it, one peer in a stale-cred retry storm shouldn't drag the
+    # whole fleet down (we have ~59 peers in production).
+    _PERCENTILE_MIN_PEERS = 10
+    # 90th percentile across reporting peers — i.e. ignore the worst
+    # ~10% of outliers. With 59 peers that means up to 5 hot peers can
+    # be misbehaving without throttling the rest.
+    _PERCENTILE = 0.90
 
-        We use the maximum (not the sum) per kind because a single peer
-        seeing 6 BEV warnings/min is already a strong signal: it means
-        the BEV servers are pushing back, and adding more peers would
-        make it worse no matter how many quiet peers we have.
+    def _fleet_warning_rates(self, statuses: dict) -> dict:
+        """Aggregate per-peer ``warning_rates`` into fleet-wide signals.
+
+        Small fleets (< _PERCENTILE_MIN_PEERS reporting): use ``max`` per
+        kind — a single peer seeing 6 BEV warnings/min is already a
+        strong signal that the upstream is pushing back.
+
+        Large fleets: use the 90th percentile per kind. With 59 peers a
+        couple of misconfigured / stale-cred peers shouldn't drag the
+        capacity factor for the other 57. Persistent saturation across
+        many peers still wins because the 90th percentile follows the
+        body of the distribution.
+
+        ``auth`` is reported but doesn't feed throttle (see comment on
+        ``THROTTLE_SATURATION_RATE`` — 401 / invalid_client means a
+        peer's local cred file is stale, not that the upstream is
+        unhealthy).
         """
-        agg = {'bev': 0.0, 'zenodo': 0.0, 'copernicus': 0.0}
+        # Per-kind collected rates from live peers (one entry per peer).
+        per_kind: dict[str, list[float]] = {
+            'bev': [], 'zenodo': [], 'copernicus': [], 'auth': [],
+        }
+        # Per-kind: which peer pushed the highest rate (for tooltips).
+        top_peer: dict[str, tuple[float, str]] = {
+            k: (0.0, '') for k in per_kind
+        }
         peer_count = 0
         # Track per-peer 'last seen running' so we can give unreachable
         # peers a grace period before excluding them. A peer doing a
@@ -1620,13 +1648,41 @@ class PeerDirector:
                     continue
                 # else: include as if live (peer may be uploading)
             peer_count += 1
-            for kind in agg:
+            for kind in per_kind:
                 # 5-min window is the sweet spot: long enough to ignore
                 # one-off retries, short enough to react within ~5 min.
                 rate = float(((wr.get(kind) or {}).get('5m')) or 0.0)
-                if rate > agg[kind]:
-                    agg[kind] = rate
+                # Always record the rate (even 0) so percentile
+                # computation reflects the true fleet shape.
+                per_kind[kind].append(rate)
+                if rate > top_peer[kind][0]:
+                    top_peer[kind] = (rate, str(pid))
+        # Aggregate per kind. ``auth`` always uses max because it's
+        # diagnostic only (not fed into the throttle).
+        agg: dict[str, float] = {}
+        use_pctl = peer_count >= self._PERCENTILE_MIN_PEERS
+        for kind, rates in per_kind.items():
+            if not rates:
+                agg[kind] = 0.0
+                continue
+            if kind == 'auth' or not use_pctl:
+                agg[kind] = max(rates)
+            else:
+                # 90th percentile via nearest-rank.
+                xs = sorted(rates)
+                idx = max(0, min(len(xs) - 1,
+                                  int(round(self._PERCENTILE *
+                                            (len(xs) - 1)))))
+                agg[kind] = xs[idx]
         agg['_peers_reporting'] = peer_count
+        agg['_aggregation'] = 'p90' if use_pctl else 'max'
+        # Surface the loudest peer per kind so operators can see which
+        # peer is dragging the signal up (especially useful when p90
+        # filtered it out and the throttle didn't engage).
+        agg['_top_peer'] = {
+            k: {'rate': round(v[0], 3), 'pid': v[1]}
+            for k, v in top_peer.items() if v[0] > 0
+        }
         # Track which peers contributed and which didn't so we can
         # surface gaps in /api/v1/director/status. Useful when we
         # expect 50 peers and only 45 report — the missing 5 are
@@ -1692,7 +1748,7 @@ class PeerDirector:
                     min(THROTTLE_MAX_FACTOR, self._capacity_ema + drift))
         self._capacity_components = {
             'rates': {k: rates.get(k, 0.0)
-                       for k in ('bev', 'zenodo', 'copernicus')},
+                       for k in ('bev', 'zenodo', 'copernicus', 'auth')},
             'sub_factors': {k: round(v, 3) for k, v in sub.items()},
             'sub_factor_emas': {k: round(float(v), 3)
                                  for k, v in self._sub_factor_ema.items()},
@@ -1703,6 +1759,12 @@ class PeerDirector:
             'peers_reporting': rates.get('_peers_reporting', 0),
             'peers_reporting_ids': rates.get('_peers_reporting_ids') or [],
             'peers_silent_ids': rates.get('_peers_silent_ids') or [],
+            # Aggregation strategy (max for small fleets, p90 for >=10
+            # reporting peers) and per-kind loudest peer. Both surface
+            # in /api/v1/director/status so the dashboard can show
+            # "Cop signal driven by peer at43 (1.8/min); fleet p90 0.0".
+            'aggregation': rates.get('_aggregation', 'max'),
+            'top_peer': rates.get('_top_peer') or {},
         }
         # Append to ring buffer. Compact tuple (no dict) to keep the
         # JSON payload small even when serialised in get_status().

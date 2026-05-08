@@ -2956,6 +2956,12 @@ class PeerDirector:
                                 'Skip restart on %s: plan unchanged and '
                                 'within cooldown (%.0fs/%.0fs)',
                                 active_id, now_ts - last_ts, cooldown)
+                        elif self._has_pending_graceful_update(active_id):
+                            log.info(
+                                'Skip restart on %s: graceful update '
+                                'pending (waiting for git pull + srv '
+                                'restart on peer)',
+                                active_id)
                         else:
                             log.info(
                                 'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
@@ -4483,6 +4489,11 @@ class PeerDirector:
             # holder's KG on a parallel frontier that happens to share
             # the same lat strip.
             par_excl = _excluded_kgs(cfg, exclude_peer_id=pid)
+            if self._has_pending_graceful_update(pid):
+                log.info('Parallel frontier: skipping %s — graceful '
+                         'update pending (waiting for git pull + srv '
+                         'restart on peer)', pid)
+                continue
             log.info('Parallel frontier: starting %s with creds=%s strips=%s%s',
                      pid, creds, strips_for,
                      (' (excluding ' + ','.join(sorted(par_excl)) + ')')
@@ -4537,6 +4548,28 @@ class PeerDirector:
     # never lose more than a fraction of the fleet at once.
     STALE_UPDATE_HARD_PER_TICK = 3      # hard restarts (idle peers)
     STALE_UPDATE_GRACEFUL_PER_TICK = 5  # graceful nudges (mid-KG peers)
+
+    def _has_pending_graceful_update(self, pid: str) -> bool:
+        """True iff a graceful update was issued to *pid* recently.
+
+        ``/admin/update?graceful=1`` SIGTERMs the processor and spawns
+        a deferred-update thread that polls ``pgrep austria_processor.py``
+        and only runs ``git pull && systemctl restart srv`` once the
+        processor exits. If we respawn the processor before that pgrep
+        empties (cache-only orchestrator, parallel-frontier orchestrator,
+        active-frontier restart), the deferred update never fires and
+        the peer stays on the stale commit while we re-kick it mid-KG
+        every retry window. This predicate gates all respawn paths.
+        """
+        if not pid:
+            return False
+        rec = (self.state.get('peer_update_state') or {}).get(pid)
+        if not rec:
+            return False
+        ts = float(rec.get('last_graceful_attempt') or 0)
+        if ts <= 0:
+            return False
+        return (time.time() - ts) < self.STALE_UPDATE_RETRY_GAP_S
 
     def _orchestrate_stale_peer_updates(self, statuses: dict):
         """Re-trigger update on peers stuck on an old commit while idle.
@@ -4593,8 +4626,24 @@ class PeerDirector:
             # means the peer is mid-work; we never interrupt that.
             idle = proc_state in ('stopped', 'idle', 'complete', 'paused')
             stale = bool(commit) and commit != _LOCAL_GIT_COMMIT
-            if not (online and stale):
+            # Only drop the tracked record when we've *confirmed* the
+            # peer landed on the local commit. If the peer is briefly
+            # offline (e.g. during the graceful-restart window) or its
+            # commit is unknown, keep the rec so debounce timers like
+            # ``last_graceful_attempt`` survive the flicker. Without
+            # this, a SIGTERM/respawn cycle wipes the 30-min debounce
+            # and we re-fire graceful updates every tick — kicking the
+            # peer mid-KG repeatedly without ever pulling the new
+            # commit (the in-flight `_deferred_update` thread can't
+            # see ``pgrep austria_processor.py`` go empty because the
+            # cache-only orchestrator respawns the processor first).
+            if commit and commit == _LOCAL_GIT_COMMIT:
                 tracked.pop(pid, None)
+                continue
+            if not (online and stale):
+                # Offline or unknown-commit: preserve rec for next tick.
+                if pid in tracked:
+                    live_ids.add(pid)
                 continue
             live_ids.add(pid)
             rec = dict(tracked.get(pid) or {})
@@ -4682,8 +4731,14 @@ class PeerDirector:
                      len(hard_done), ','.join(hard_done) or '-',
                      max(0, len(graceful_candidates) - len(graceful_done)),
                      max(0, len(hard_candidates) - len(hard_done)))
+        # Drop only records for peers that have either confirmed-updated
+        # or been gone long enough that any pending graceful-update is
+        # no longer relevant. ``live_ids`` includes peers we kept across
+        # an offline blip, so they survive here. Peers that disappeared
+        # entirely from the config still get cleaned up.
+        cfg_ids = {p.get('id') for p in cfg.get('peers', []) if p.get('id')}
         for pid in list(tracked.keys()):
-            if pid not in live_ids:
+            if pid not in cfg_ids:
                 tracked.pop(pid, None)
         with self._lock:
             self.state['peer_update_state'] = tracked
@@ -4977,11 +5032,28 @@ class PeerDirector:
             # so this can't push us past the cap.
             ramp_cap = min(deficit, max_add)
         max_add = min(max_add, ramp_cap)
+        # Skip peers with a pending graceful update (see
+        # ``_has_pending_graceful_update`` docstring). Their
+        # ``/admin/update?graceful=1`` deferred-update thread waits for
+        # ``pgrep austria_processor.py`` to be empty before pulling +
+        # restarting srv. If we respawn the processor here, that pgrep
+        # never empties and the peer is stuck on the stale commit
+        # forever — while we kick it mid-KG every retry window from
+        # the stale-peer orchestrator.
         to_start = []
+        _skipped_pending: list[str] = []
         for c in idle_cache_only + idle_frontier:
             if len(to_start) >= max_add:
                 break
+            pid = c['peer'].get('id')
+            if pid and self._has_pending_graceful_update(pid):
+                _skipped_pending.append(pid)
+                continue
             to_start.append(c['peer'])
+        if _skipped_pending:
+            log.info('cache-only: skipping %d peer(s) with pending graceful '
+                     'update (waiting for git pull + srv restart): %s',
+                     len(_skipped_pending), ','.join(_skipped_pending))
 
         # --- Build claimed-KG set so no two cache-only peers (and not
         # the frontier) target the same KG.  We pull each peer's current

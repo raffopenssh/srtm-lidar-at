@@ -5004,6 +5004,162 @@ _COMBINED_LOG_CACHE = {'ts': 0.0, 'data': None, 'refreshing': False}
 _COMBINED_LOG_TTL = 8.0       # serve cached if newer
 _COMBINED_LOG_STALE = 60.0    # serve stale + bg refresh up to here
 
+# Persistent 24h merged-log ring (across all peers). Without this we
+# lose every recent_log entry the moment a peer's ring buffer wraps
+# (200 lines / peer) or the peer gets restarted, which destroys our
+# ability to forensically analyse fleet-level patterns (e.g. a KG
+# bouncing between peers, repeated full-GPKG retries, etc.).
+#
+# Schema: JSONL, one entry per line:
+#   {"ts": iso8601, "peer": "at3", "level": "info", "msg": "...",
+#    "kg": "61225"}
+# Append-only; pruned in-place every ~10 min to drop entries > 24h.
+import os as _os_log
+import threading as _th_log
+from datetime import datetime, timedelta, timezone
+from pathlib import Path as _Path_log
+_COMBINED_LOG_PATH = _Path_log('data/combined_log_24h.jsonl')
+_COMBINED_LOG_LOCK = _th_log.Lock()
+_COMBINED_LOG_LAST_TS: dict[str, str] = {}      # per-peer last seen ts
+_COMBINED_LOG_LAST_PRUNE = 0.0
+_COMBINED_LOG_RETAIN_S = 24 * 3600
+_COMBINED_LOG_PRUNE_EVERY_S = 600   # 10 min
+_COMBINED_LOG_HARD_CAP_BYTES = 64 * 1024 * 1024   # 64 MB safety cap
+
+
+def _combined_log_persist(merged_with_peer: list[dict]) -> int:
+    """Append novel entries (not seen on a previous tick for that peer)
+    to the persistent 24h log. Returns the number of new lines written.
+
+    Dedup is per-peer-monotonic on ts: peers append to a ring buffer in
+    chronological order, so we only need to remember the last ts we
+    persisted for each peer to avoid re-appending the same lines on
+    every poll. Cheap, no second pass over the file.
+    """
+    if not merged_with_peer:
+        return 0
+    written = 0
+    with _COMBINED_LOG_LOCK:
+        try:
+            _COMBINED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Group by peer, keep only entries strictly newer than the
+            # last-persisted ts for that peer.
+            by_peer: dict[str, list[dict]] = {}
+            for e in merged_with_peer:
+                pid = e.get('peer') or '?'
+                by_peer.setdefault(pid, []).append(e)
+            with open(_COMBINED_LOG_PATH, 'a', encoding='utf-8') as fh:
+                for pid, entries in by_peer.items():
+                    last = _COMBINED_LOG_LAST_TS.get(pid, '')
+                    # Sort ascending so the file is roughly chronological
+                    # per-peer (helps tail-grep readability).
+                    entries.sort(key=lambda x: x.get('ts', ''))
+                    new_last = last
+                    for e in entries:
+                        ts = e.get('ts', '')
+                        if not ts or ts <= last:
+                            continue
+                        fh.write(json.dumps({
+                            'ts': ts,
+                            'peer': pid,
+                            'level': e.get('level', ''),
+                            'msg': e.get('msg', ''),
+                            'kg': e.get('kg', ''),
+                        }, ensure_ascii=False))
+                        fh.write('\n')
+                        written += 1
+                        if ts > new_last:
+                            new_last = ts
+                    if new_last > last:
+                        _COMBINED_LOG_LAST_TS[pid] = new_last
+        except Exception as _e:
+            log.warning('combined_log persist failed: %s', _e)
+    # Periodic prune (cheap: rewrite-in-place dropping old lines).
+    _combined_log_maybe_prune()
+    return written
+
+
+def _combined_log_maybe_prune() -> None:
+    """Drop entries older than 24h (+ enforce hard size cap) periodically."""
+    global _COMBINED_LOG_LAST_PRUNE
+    import time as _t_log
+    now = _t_log.time()
+    if (now - _COMBINED_LOG_LAST_PRUNE) < _COMBINED_LOG_PRUNE_EVERY_S:
+        return
+    with _COMBINED_LOG_LOCK:
+        if (now - _COMBINED_LOG_LAST_PRUNE) < _COMBINED_LOG_PRUNE_EVERY_S:
+            return
+        _COMBINED_LOG_LAST_PRUNE = now
+        try:
+            if not _COMBINED_LOG_PATH.exists():
+                return
+            size = _COMBINED_LOG_PATH.stat().st_size
+            cutoff_iso = (datetime.now(timezone.utc)
+                          - timedelta(seconds=_COMBINED_LOG_RETAIN_S)
+                          ).isoformat()
+            tmp = _COMBINED_LOG_PATH.with_suffix('.jsonl.tmp')
+            kept = 0
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as src, \
+                 open(tmp, 'w', encoding='utf-8') as dst:
+                lines = src.readlines()
+                # Hard size cap: drop oldest half if file got huge
+                # (e.g. log spam during an incident).
+                if size > _COMBINED_LOG_HARD_CAP_BYTES:
+                    lines = lines[len(lines) // 2:]
+                for line in lines:
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    if e.get('ts', '') >= cutoff_iso:
+                        dst.write(line)
+                        kept += 1
+            _os_log.replace(tmp, _COMBINED_LOG_PATH)
+            log.info('combined_log pruned: kept %d entries (was %.1f MB)',
+                     kept, size / 1e6)
+        except Exception as _e:
+            log.warning('combined_log prune failed: %s', _e)
+
+
+def _combined_log_bootstrap_once() -> None:
+    """On first call after startup, fetch ``recent_log`` from EVERY
+    reachable peer (running or not) and seed the persistent file. Idle
+    peers won't be probed by ``_combined_log_compute`` (it only hits
+    active+cache-only-running), so without this their last 200 lines
+    of history evaporate on the next peer restart."""
+    if getattr(_combined_log_bootstrap_once, '_done', False):
+        return
+    _combined_log_bootstrap_once._done = True
+    try:
+        cfg = pd.load_peers_config()
+        targets = [(p.get('id'), p.get('url'))
+                   for p in cfg.get('peers', [])
+                   if p.get('id') and p.get('url')]
+        if not targets:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        merged: list[dict] = []
+
+        def _probe(t):
+            pid, url = t
+            try:
+                ps = pd.get_peer_status(url) or {}
+            except Exception:
+                return pid, []
+            return pid, ps.get('recent_log') or []
+        with ThreadPoolExecutor(
+                max_workers=min(20, len(targets))) as pool:
+            for pid, log_lines in pool.map(_probe, targets):
+                for entry in log_lines:
+                    e = dict(entry)
+                    e['peer'] = pid
+                    merged.append(e)
+        n = _combined_log_persist(merged)
+        log.info('combined_log bootstrap: seeded %d entries from %d peers',
+                 n, len(targets))
+    except Exception as _e:
+        log.warning('combined_log bootstrap failed: %s', _e)
+
 
 def _combined_log_compute():
     """Probe every running peer in parallel, merge their recent_log.
@@ -5056,7 +5212,81 @@ def _combined_log_compute():
                'cached_at': _time.time()}
     _COMBINED_LOG_CACHE['ts'] = payload['cached_at']
     _COMBINED_LOG_CACHE['data'] = payload
+    # Persist to 24h ring (cheap: per-peer ts watermark dedup).
+    try:
+        _combined_log_persist(merged)
+    except Exception as _e:
+        log.debug('combined_log persist no-op: %s', _e)
+    # First call after startup: also seed history from idle peers.
+    try:
+        _combined_log_bootstrap_once()
+    except Exception:
+        pass
     return payload
+
+
+@app.route('/api/v1/director/log/history')
+def director_log_history():
+    """Query the persistent 24h merged log.
+
+    Query params (all optional):
+      ``since`` ISO-8601 (default: 24h ago)
+      ``until`` ISO-8601 (default: now)
+      ``peer``  comma-separated peer ids (e.g. ``at3,at7``)
+      ``kg``    KG code or substring match against ``msg``+``kg``
+      ``level`` info | warning | error
+      ``q``     free-text substring filter on ``msg``
+      ``limit`` int, default 5000, hard cap 50000
+
+    Returns ``{count, entries: [...]}`` ordered chronologically.
+    """
+    since = request.args.get('since', '')
+    until = request.args.get('until', '')
+    peer_filter = {p.strip() for p in (request.args.get('peer', '')
+                                       ).split(',') if p.strip()}
+    kg_filter = (request.args.get('kg', '') or '').strip()
+    level_filter = (request.args.get('level', '') or '').strip().lower()
+    qstr = (request.args.get('q', '') or '').lower()
+    try:
+        limit = max(1, min(50000, int(request.args.get('limit', '5000'))))
+    except ValueError:
+        limit = 5000
+    if not since:
+        since = (datetime.now(timezone.utc)
+                 - timedelta(hours=24)).isoformat()
+    out: list[dict] = []
+    if not _COMBINED_LOG_PATH.exists():
+        return jsonify({'count': 0, 'entries': []})
+    try:
+        with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                ts = e.get('ts', '')
+                if ts < since:
+                    continue
+                if until and ts > until:
+                    continue
+                if peer_filter and e.get('peer') not in peer_filter:
+                    continue
+                if level_filter and (e.get('level', '').lower()
+                                     != level_filter):
+                    continue
+                if kg_filter:
+                    hay = (str(e.get('kg', '')) + ' '
+                           + str(e.get('msg', '')))
+                    if kg_filter not in hay:
+                        continue
+                if qstr and qstr not in (e.get('msg', '').lower()):
+                    continue
+                out.append(e)
+                if len(out) >= limit:
+                    break
+    except Exception as ex:
+        return jsonify({'error': str(ex)}), 500
+    return jsonify({'count': len(out), 'entries': out})
 
 
 @app.route('/api/v1/director/proxy/combined_log')

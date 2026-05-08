@@ -322,6 +322,75 @@
     .cards { grid-template-columns: 1fr 1fr; }
   }
 
+  /* Director peer cards — ultra-compact mobile view (text inside bars) */
+  .peer-mobile { display: none; }
+  .peer-mobile.pm-card { display: none; }  /* hidden by default — enabled in media query */
+  .pm-donut { width: 20px; height: 20px; flex-shrink: 0; display: block; }
+  .pm-donut .bg { stroke: var(--border); }
+  .pm-id { font-weight: 700; font-size: 10px; color: var(--text);
+           flex-shrink: 0; line-height: 1; font-family: monospace; }
+  .pm-region { font-family: monospace; font-size: 9px; color: var(--dim); flex-shrink: 0; }
+  .pm-menu { flex-shrink: 0; }
+  /* Progress bar with text overlay — the bar IS the row, info lives on top. */
+  .pm-bar {
+    flex: 1; min-width: 0;
+    height: 22px; border-radius: 4px;
+    background: var(--border);
+    position: relative; overflow: hidden;
+    cursor: default;
+  }
+  .pm-bar .pm-fill {
+    position: absolute; top: 0; left: 0; bottom: 0;
+    border-radius: 4px;
+    transition: width 0.6s;
+  }
+  .pm-bar .pm-text {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; gap: 6px;
+    padding: 0 7px; line-height: 1;
+    font-size: 10.5px; color: var(--text);
+    overflow: hidden; white-space: nowrap;
+    /* readability over fill */
+    text-shadow: 0 0 2px rgba(0,0,0,0.85);
+  }
+  .pm-bar .pm-kg-code { font-weight: 700; flex-shrink: 0; font-family: monospace; }
+  .pm-bar .pm-kg-name { color: #d0d4d8; flex: 1; min-width: 0;
+                        overflow: hidden; text-overflow: ellipsis; }
+  .pm-bar .pm-kg-meta { color: #b5b9bd; font-variant-numeric: tabular-nums;
+                        font-size: 9.5px; flex-shrink: 0; }
+  /* Shimmer overlay for actively-running KGs */
+  .pm-bar.run .pm-fill::after {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.35) 50%, transparent 100%);
+    background-size: 40% 100%; background-repeat: no-repeat;
+    animation: pmShimmer 1.6s linear infinite;
+  }
+  @keyframes pmShimmer { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+  @keyframes pmActivePulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); }
+    50%     { box-shadow: 0 0 6px 1px rgba(88,166,255,0.7); }
+  }
+  .pm-active .pm-donut { animation: pmActivePulse 1.8s ease-in-out infinite; border-radius: 50%; }
+  @media (max-width: 600px) {
+    /* Mobile: hide desktop content, show only compact strip. */
+    #directorPeers { grid-template-columns: 1fr !important; gap: 3px !important; }
+    #directorPeers > div > :not(.peer-mobile) { display: none !important; }
+    #directorPeers > div {
+      opacity: 1 !important; padding: 3px 5px !important;
+      min-width: 0 !important;
+      background: transparent !important;
+      border: 1px solid transparent !important;
+      border-radius: 5px !important;
+    }
+    #directorPeers > div.pm-active { border-color: var(--blue) !important;
+                                      background: rgba(88,166,255,0.06) !important; }
+    #directorPeers > div.pm-owner  { border-color: var(--yellow) !important; }
+    #directorPeers > div.pm-idle   { opacity: 0.55 !important; }
+    .peer-mobile.pm-card {
+      display: flex; align-items: center; gap: 5px; min-width: 0;
+    }
+  }
+
   /* Zenodo manifest table — mobile-friendly */
   #zenTbl { width: 100%; table-layout: fixed; font-size: 12px; }
   #zenTbl td, #zenTbl th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -675,6 +744,10 @@
                    user-select:none">
         <span id="logFilterCount">0 warn / 0 err</span>
       </span>
+      <span id="logRange24h" title="Click to show the merged 24-hour log across all peers"
+            style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
+                   padding:2px 7px;border:1px solid var(--border);border-radius:10px;
+                   user-select:none">24h</span>
       <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
         <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
       </label>
@@ -1569,18 +1642,72 @@ function clearKgTimer() {
 
 // ── Log ─────────────────────────────────────────────────────────
 let _logFilterIssues = false;
+let _logRange24h = false;
+let _lastLogPayload = null;       // last d passed to updateLog (for instant re-render)
+let _log24hPayload = null;        // last 24h history payload
+let _log24hFetchInflight = false;
+let _log24hFetchLast = 0;
+function _styleLogChip(el, on, color) {
+  if (!el) return;
+  el.style.background = on ? 'rgba(210,153,34,0.13)' : '';
+  el.style.borderColor = on ? color : 'var(--border)';
+  el.style.color = on ? color : 'var(--dim)';
+}
 (function(){
   const f = document.getElementById('logFilter');
   if (f) f.addEventListener('click', () => {
     _logFilterIssues = !_logFilterIssues;
-    f.style.background = _logFilterIssues ? 'rgba(210,153,34,0.13)' : '';
-    f.style.borderColor = _logFilterIssues ? 'var(--yellow)' : 'var(--border)';
-    f.style.color = _logFilterIssues ? 'var(--yellow)' : 'var(--dim)';
-    prevLogHash = ''; // force re-render
+    _styleLogChip(f, _logFilterIssues, 'var(--yellow)');
+    prevLogHash = '';
+    // Render immediately from cached log — don't wait for next poll.
+    if (_lastLogPayload) updateLog(_lastLogPayload);
+  });
+  const r = document.getElementById('logRange24h');
+  if (r) r.addEventListener('click', () => {
+    _logRange24h = !_logRange24h;
+    _styleLogChip(r, _logRange24h, 'var(--blue)');
+    prevLogHash = '';
+    if (_logRange24h) {
+      fetchLog24h(true);
+    } else if (_lastLogPayload) {
+      // back to live log — flush 24h cache & re-render the live one
+      _log24hPayload = null;
+      updateLog(_lastLogPayload);
+    }
   });
 })();
 
+async function fetchLog24h(force) {
+  if (_log24hFetchInflight) return;
+  // Refresh every 30s while the 24h view is open.
+  if (!force && Date.now() - _log24hFetchLast < 30000) return;
+  _log24hFetchInflight = true;
+  try {
+    const r = await fetch('/api/v1/director/log/history?limit=5000');
+    if (!r.ok) return;
+    const j = await r.json();
+    _log24hPayload = {recent_log: j.entries || [], _multi_peer: true, _is_24h: true};
+    _log24hFetchLast = Date.now();
+    prevLogHash = '';
+    if (_logRange24h) updateLog(_log24hPayload);
+  } catch (_) {} finally {
+    _log24hFetchInflight = false;
+  }
+}
+
 function updateLog(d) {
+  // If 24h mode is active, render the cached 24h payload regardless of
+  // what the live poller passes in. Schedule a refresh so the view
+  // stays current.
+  if (_logRange24h) {
+    if (!d || !d._is_24h) {
+      if (_log24hPayload) d = _log24hPayload;
+      else d = {recent_log: [], _multi_peer: true, _is_24h: true};
+    }
+    fetchLog24h(false);
+  } else {
+    _lastLogPayload = d;
+  }
   const log = d.recent_log || [];
   const multi = !!d._multi_peer;
   // Determine peer source: proxied → _active_peer_id, local → instance field or 'primary'
@@ -1592,7 +1719,7 @@ function updateLog(d) {
   if (cnt) cnt.innerHTML = '<span style="color:' + (nWarn?'var(--yellow)':'var(--dim)') + '">' + nWarn + ' warn</span> / ' +
                            '<span style="color:' + (nErr?'var(--red)':'var(--dim)') + '">' + nErr + ' err</span>';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '');
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + (_logRange24h ? '|24' : '');
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -3751,6 +3878,113 @@ function renderCapacityHistory() {
     '<span style="color:#9b6df0" title="Copernicus warnings/min (5m)">C ' + (r.copernicus||0).toFixed(1) + '</span>';
 }
 
+// Compute KG progress fraction (0..1) from peer fields shaped by
+// peer_director.get_status(). Mirrors _peerProgressKey but returns
+// a positive 0..1 number for use in a progress bar.
+function _peerKgFrac(p) {
+  let step = p.current_kg_step || '';
+  if (/^tile_\d+$/.test(step)) step = 'segment';
+  if (step.startsWith('upload')) step = 'upload';
+  if (step === 'json_summary') step = 'json';
+  let stepIdx = step ? STEPS.indexOf(step) : -1;
+  if (stepIdx < 0) stepIdx = 0;
+  const stepFrac = stepIdx / Math.max(1, STEPS.length - 1);
+  const ct = p.current_kg_tile || 0, nt = p.current_kg_n_tiles || 0;
+  const tileFrac = (nt > 0) ? Math.min(1, Math.max(0, (ct - 1) / nt)) : 0;
+  return Math.min(1, stepFrac + (tileFrac * 1.0 / Math.max(1, STEPS.length - 1)));
+}
+function _fmtElapsedShort(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), ss = s % 60;
+  if (m < 60) return m + 'm' + (ss ? ' ' + ss + 's' : '');
+  const h = Math.floor(m / 60), mm = m % 60;
+  return h + 'h' + (mm ? ' ' + mm + 'm' : '');
+}
+// Sort peers by activity for mobile view (active first, busiest first, idle last).
+function _peerActivityRank(p, activeId) {
+  if (p.id === activeId) return 0;                     // frontier
+  const running = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
+  if (running && p.cache_only_run) return 1;           // running cache-only
+  if (running) return 2;                                // running (other)
+  if (p.reserved_kg) return 3;                          // owner waiting
+  if (p.scheduled) return 4;                            // scheduled
+  if (!p.online) return 7;                              // offline last
+  if (p.processor_state === 'paused') return 5;
+  return 6;                                             // idle/stopped
+}
+// Tiny donut SVG for remaining bandwidth.
+function _pmDonut(usedFrac, color) {
+  // Single circle with stroke-dasharray; tail = remaining.
+  const r = 8, c = 2 * Math.PI * r;
+  const used = Math.max(0, Math.min(1, usedFrac));
+  const usedLen = (used * c).toFixed(2);
+  const remLen = (c - used * c).toFixed(2);
+  return '<svg class="pm-donut" viewBox="0 0 22 22">'
+    + '<circle class="bg" cx="11" cy="11" r="' + r + '" fill="none" stroke-width="3"/>'
+    + '<circle cx="11" cy="11" r="' + r + '" fill="none" stroke="' + color + '" stroke-width="3"'
+    +   ' stroke-dasharray="' + remLen + ' ' + usedLen + '"'
+    +   ' stroke-dashoffset="' + (c * 0.25).toFixed(2) + '"'
+    +   ' transform="rotate(-90 11 11)" stroke-linecap="round"/>'
+    + '</svg>';
+}
+function _peerMobileBlock(p, ctx) {
+  // Single horizontal strip: donut · id · [progress-bar with KG info inside] · ⋯
+  const kgFrac = _peerKgFrac(p);
+  const kgPct = Math.round(kgFrac * 100);
+  const kgColor = ctx.isActive
+    ? 'rgba(88,166,255,0.45)'
+    : (ctx.isRunning ? 'rgba(63,185,80,0.40)'
+                     : 'rgba(139,148,158,0.18)');
+  const usedFrac = ctx.budgetGb ? Math.min(1, ctx.usedGb / ctx.budgetGb) : 0;
+  // Bar contents — inside the bar (text overlays the fill).
+  let kgCode, kgName, kgMeta;
+  if (p.current_kg) {
+    kgCode = esc(p.current_kg);
+    kgName = esc(p.current_kg_name || '');
+    const elapsed = _fmtElapsedShort(p.current_kg_started_at);
+    const step = p.current_kg_step || '';
+    kgMeta = (step ? esc(step) : '') + (elapsed ? ' · ' + elapsed : '');
+  } else if (p.reserved_kg) {
+    kgCode = '⏸';
+    kgName = esc(p.reserved_kg);
+    kgMeta = 'reserved';
+  } else {
+    kgCode = '';
+    kgName = '<span style="color:var(--dim)">' + esc(ctx.stLabel) + '</span>';
+    kgMeta = '';
+  }
+  const tip = 'KG ' + (p.current_kg || '—') + ' — ' + kgPct + '%'
+    + (p.current_kg_name ? '\n' + p.current_kg_name : '')
+    + (p.current_kg_step ? '\nstep: ' + p.current_kg_step : '')
+    + (p.current_kg_started_at ? '\nelapsed: ' + _fmtElapsedShort(p.current_kg_started_at) : '');
+  const barCls = 'pm-bar' + (ctx.isRunning ? ' run' : '');
+  let h = '<div class="peer-mobile pm-card">';
+  // Donut (remaining bandwidth)
+  h += '<span title="bw: ' + ctx.usedGb.toFixed(1) + ' / ' + ctx.budgetGb
+     + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
+     + _pmDonut(usedFrac, ctx.bwColor) + '</span>';
+  // Peer id (compact)
+  h += '<span class="pm-id">' + esc(p.id) + '</span>';
+  if (p.region) h += '<span class="pm-region">' + esc(p.region) + '</span>';
+  // The progress bar (with KG name baked in)
+  h += '<div class="' + barCls + '" title="' + esc(tip) + '">';
+  h +=   '<div class="pm-fill" style="width:' + kgPct + '%;background:' + kgColor + '"></div>';
+  h +=   '<div class="pm-text">';
+  if (kgCode) h += '<span class="pm-kg-code">' + kgCode + '</span>';
+  h +=     '<span class="pm-kg-name">' + kgName + '</span>';
+  if (kgMeta) h += '<span class="pm-kg-meta">' + kgMeta + '</span>';
+  h +=   '</div>';
+  h += '</div>';
+  // ⋯ menu
+  h += '<span class="pm-menu" onclick="event.stopPropagation()">' + peerActionsMenu(p, {isActive: ctx.isActive}) + '</span>';
+  h += '</div>';
+  return h;
+}
+
 function renderDirector(d) {
   const mode = d.mode || 'auto';
   const active = d.active_peer;
@@ -3885,6 +4119,16 @@ function renderDirector(d) {
     }
     return '';
   }
+  // Sort peers by activity for compact mobile-first display: frontier,
+  // running cache-only, owners-waiting, scheduled, paused, idle, offline.
+  // Ties are broken by KG progress (closer to done first), then by id.
+  peers.sort((a, b) => {
+    const ra = _peerActivityRank(a, active), rb = _peerActivityRank(b, active);
+    if (ra !== rb) return ra - rb;
+    const pa = _peerKgFrac(a), pb = _peerKgFrac(b);
+    if (pa !== pb) return pb - pa;
+    return String(a.id).localeCompare(String(b.id));
+  });
   let html = '';
   for (const p of peers) {
     const isActive = p.id === active;
@@ -3921,9 +4165,14 @@ function renderDirector(d) {
     const border = isActive ? 'border-color:var(--blue);'
       : (isOwner ? 'border-color:var(--yellow);' : '');
 
+    // Mobile-only marker class on the outer card.
+    let pmCls = '';
+    if (isActive) pmCls = ' pm-active';
+    else if (isOwner) pmCls = ' pm-owner';
+    else if (!isRunning) pmCls = ' pm-idle';
     if (isInactive) {
       // Collapsed card — single line with expand toggle
-      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;opacity:0.7;' + border + '">';
+      html += '<div class="' + pmCls.trim() + '" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;opacity:0.7;' + border + '">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="this.parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">';
       html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id) + roleBadge(p) + canaryBadge(p);
       html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
@@ -3946,7 +4195,7 @@ function renderDirector(d) {
       html += '<div class="peer-detail" hidden style="margin-top:6px">';
     } else {
       // Expanded card (active or running)
-      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;' + border + '">';
+      html += '<div class="' + pmCls.trim() + '" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;' + border + '">';
     }
 
     const isCacheOnly = !!p.cache_only_run;
@@ -4038,6 +4287,11 @@ function renderDirector(d) {
       html += '<div style="font-size:10px;color:var(--dim);margin-top:4px" title="Director auto-retried update; waiting for commit to change">↻ auto-retrying update (' + (_us.attempts) + '/2)</div>';
     }
     if (isInactive) html += '</div>'; // close .peer-detail
+    // ── Mobile compact view (≤600px) ───────────────────────────────
+    html += _peerMobileBlock(p, {
+      isActive, isOwner, isInactive, isRunning,
+      stCls, stLabel, usedGb, budgetGb, remainGb, bwPct, bwColor,
+    });
     html += '</div>'; // close card
   }
   container.innerHTML = html;

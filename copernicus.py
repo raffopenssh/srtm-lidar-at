@@ -51,22 +51,12 @@ except Exception:
 
 # === SECTION: Credentials & configuration (multi-account rotation) ===
 # Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
-# OLD (expired 2026-04): CLIENT_ID = "sh-19061cbb-c6f9-4464-bba6-006e7fa17435"
-# OLD (expired 2026-04): CLIENT_SECRET = "<REDACTED_SECRET>"
-# OLD (account 1, out of credits): CLIENT_ID = "sh-187c6dab-6b27-4ce8-afa8-b73f38e640f3"
-# OLD (account 1, out of credits): CLIENT_SECRET = "<REDACTED_SECRET>"
-# Built-in credentials (always loaded). Additional credentials can be
-# added at runtime via /api/v1/credentials and are persisted to
-# data/austria_processor/copernicus_credentials.json. The file is the
-# single source of truth at runtime; this list is the seed/fallback.
-_BUILTIN_CREDENTIALS = [
-    ("sh-f36653c6-5d8c-48a1-b86d-476c50eb389c", "<REDACTED_SECRET>"),  # fresh 2026-04
-    ("sh-8d8c685f-df36-4536-b949-666532d08414", "<REDACTED_SECRET>"),  # renews 2026-05-01
-    ("sh-2ed25dbb-857d-4e99-b070-e1954a99a980", "<REDACTED_SECRET>"),  # renews 2026-05-01
-    ("sh-07af1740-88e5-49d1-93c8-e9fca0fe2d49", "<REDACTED_SECRET>"),  # 30k credits
-    ("sh-6db28e03-8090-4194-81b1-4d7db557b5aa", "<REDACTED_SECRET>"),  # added 2026-04 (slot 5)
-    ("sh-9c10ed71-86af-4c72-b6f5-50c0e160128f", "<REDACTED_SECRET>"),  # added 2026-04 (slot 6)
-]
+#
+# All credentials live in data/austria_processor/copernicus_credentials.json
+# (gitignored). They are added/managed at runtime via /api/v1/credentials
+# and synced to peers via the HA snapshot mechanism (director_ha.py).
+# Nothing is hardcoded here — the repo is public.
+_BUILTIN_CREDENTIALS: list = []
 
 # Credentials store path (instance-local; not in git)
 _CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")

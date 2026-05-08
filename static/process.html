@@ -4497,7 +4497,8 @@ async function handoverDirectorTo(peerId) {
 }
 
 // ── Add Peer modal ──────────────────────────────────────────────
-const _GH_TOKEN = '<REDACTED_GITHUB_PAT>';
+// Repo is public — no token needed for raw.githubusercontent.com.
+const _GH_TOKEN = '';
 function _directorPublicUrl() {
   return location.origin.includes('exe.xyz') ? location.origin : 'https://srtm-lidar-at.exe.xyz:8000';
 }
@@ -4530,7 +4531,7 @@ function updateDeployCmd() {
   const adminTok = localStorage.getItem('srtm_admin_token') || '';
   const tokEnv = adminTok ? `ADMIN_TOKEN=${adminTok} ` : '';
   // Build the setup script that deploy.sh runs on first boot
-  const deployScript = `curl -sL https://${_GH_TOKEN}@raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ${tokEnv}SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
+  const deployScript = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ${tokEnv}SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
   // exe.dev new --setup-script supports \n for newlines
   const cmd = `new --name=${vm} --setup-script='${deployScript}'`;
   document.getElementById('addPeerCmd').textContent = cmd;

@@ -22,8 +22,8 @@ set -euo pipefail
 
 PEER_URL="${PEER_URL:-https://srtm-lidar-at.exe.xyz:8000}"
 SELF_URL="${SELF_URL:-}"
-GITHUB_TOKEN="<REDACTED_GITHUB_PAT>"
-GIT_REPO="${GIT_REPO:-https://${GITHUB_TOKEN}@github.com/raffopenssh/srtm-lidar-at.git}"
+# Repo is public — no token needed for clone/pull.
+GIT_REPO="${GIT_REPO:-https://github.com/raffopenssh/srtm-lidar-at.git}"
 # Admin token for director coordination — fetch from primary if not provided.
 # Required to call protected admin endpoints (e.g. peer registration). Without
 # it the VM can run a web server but cannot join the cluster.

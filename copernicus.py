@@ -200,8 +200,15 @@ def _save_credentials_to_disk():
 
 _CREDENTIALS = _load_credentials_from_disk()
 _credential_index = 0  # current credential pair
-CLIENT_ID = _CREDENTIALS[0][0]
-CLIENT_SECRET = _CREDENTIALS[0][1]
+# Cache-only peers may import this module before any credentials have
+# synced from the director (HA snapshot). Don't crash at import time —
+# any actual API call will trip CacheMissError or surface a clear error.
+if _CREDENTIALS:
+    CLIENT_ID = _CREDENTIALS[0][0]
+    CLIENT_SECRET = _CREDENTIALS[0][1]
+else:
+    CLIENT_ID = ""
+    CLIENT_SECRET = ""
 OPENEO_URL = "openeo.dataspace.copernicus.eu"
 
 # Permanent cache survives /tmp cleanup and service restarts.

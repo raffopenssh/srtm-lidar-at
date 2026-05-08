@@ -516,14 +516,18 @@ class Client:
                 # Retryable
                 if resp.status_code in _RETRYABLE_STATUS:
                     body_preview = resp.text[:500] if not stream else "<stream>"
-                    # Per-attempt retries log at INFO so they don't feed
-                    # the fleet-wide zenodo throttle counter — Zenodo flakes
-                    # on individual PUTs constantly and the retry loop
-                    # recovers cleanly. Only the final, exhausted-retries
-                    # case escalates to WARNING (handled below at the
-                    # `raise last_exc` site).
-                    is_final = attempt > self.max_retries
-                    (log.warning if is_final else log.info)(
+                    # First attempt logs INFO so a single transient flake
+                    # on a small PUT doesn't feed the fleet throttle.
+                    # From attempt 2 onward we escalate to WARNING so
+                    # sustained Zenodo pushback (especially during big
+                    # uploads) actually registers in austria_processor's
+                    # zenodo warning-rate bucket and dampens fleet
+                    # parallelism. Without this, 59 peers keep hammering
+                    # Zenodo through a partial outage and multi-GB PUTs
+                    # die with write-timeouts. Final exhaustion is also
+                    # WARNING (handled at the `raise last_exc` site).
+                    is_repeated = attempt >= 2
+                    (log.warning if is_repeated else log.info)(
                         "%s %s returned %d (attempt %d/%d): %s",
                         method, url, resp.status_code, attempt,
                         self.max_retries + 1, body_preview,
@@ -565,11 +569,11 @@ class Client:
                 )
 
             except requests.exceptions.RequestException as exc:
-                # Same INFO/WARNING split as the 5xx/429 path above:
-                # transient connection blips during retries are not
-                # "upstream stress" — only the final exhaustion is.
-                is_final = attempt > self.max_retries
-                (log.warning if is_final else log.info)(
+                # Same WARNING-from-attempt-2 split as the 5xx/429 path:
+                # one blip is noise, repeated blips on the same request
+                # are real upstream stress and should feed the throttle.
+                is_repeated = attempt >= 2
+                (log.warning if is_repeated else log.info)(
                     "%s %s network error (attempt %d/%d): %s",
                     method, url, attempt, self.max_retries + 1, exc,
                 )
@@ -579,9 +583,17 @@ class Client:
                 # same Session will fail immediately with the same error.
                 # Drop the session so the retry uses a fresh TCP+TLS
                 # handshake. Costs ~100ms; saves the upload.
+                # Reset session on any failure that may have left the
+                # underlying socket in a half-closed state. Notably
+                # includes ReadTimeout / Timeout: a multi-GB PUT that
+                # times out leaves a dead TLS stream; reusing it gives
+                # an instant 'write operation timed out' on the next
+                # attempt. Cheap insurance (~100ms handshake).
                 if isinstance(exc, (requests.exceptions.SSLError,
                                     requests.exceptions.ConnectionError,
-                                    requests.exceptions.ChunkedEncodingError)):
+                                    requests.exceptions.ChunkedEncodingError,
+                                    requests.exceptions.ReadTimeout,
+                                    requests.exceptions.Timeout)):
                     self._reset_session()
                 if attempt <= self.max_retries:
                     wait = self.retry_base_wait * (2 ** (attempt - 1))
@@ -595,6 +607,149 @@ class Client:
                         data.seek(0)
                     continue
                 raise
+
+    # -- internal: bucket file PUT (single or multipart) ---------------------
+
+    # InvenioRDM/Zenodo multipart bucket API uses query params on the
+    # bucket file URL:
+    #   POST   {bucket}/{key}?uploads=&size=N&part_size=P  -> {upload_id}
+    #   PUT    {bucket}/{key}?uploadId=U&partNumber=N      (one per part)
+    #   POST   {bucket}/{key}?uploadId=U                   (complete)
+    #   DELETE {bucket}/{key}?uploadId=U                   (abort)
+    # Sandbox/old Zenodo may not support multipart — we fall back to
+    # a single PUT on any 4xx other than 404.
+    _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
+
+    def _put_file_to_bucket(
+        self,
+        bucket_url: str,
+        filename: str,
+        local_path: "Path",
+        file_size: int,
+        progress_callback,
+        *,
+        use_multipart: bool,
+    ) -> None:
+        """Upload one local file to a Zenodo bucket URL.
+
+        Tries multipart for large files (cleaner recovery from edge
+        timeouts on multi-GB streams). Falls back to a single PUT on
+        any setup error so older Zenodo deployments keep working.
+        """
+        put_url = f"{bucket_url}/{filename}"
+
+        if use_multipart:
+            try:
+                self._multipart_upload(
+                    bucket_url, filename, local_path, file_size,
+                    progress_callback)
+                if progress_callback:
+                    progress_callback(file_size, file_size)
+                return
+            except Exception as exc:
+                # Fall through to single-PUT. Worth a WARNING because
+                # multipart was supposed to be the safer path; if it
+                # consistently fails we want to know.
+                log.warning(
+                    "Multipart upload setup failed for %s (%s) — "
+                    "falling back to single PUT", filename, exc,
+                )
+
+        # Single-PUT fallback / small-file path.
+        with open(local_path, "rb") as fh:
+            data = (ProgressFileWrapper(fh, file_size, progress_callback)
+                    if progress_callback else fh)
+            self._do_request(
+                "PUT", put_url,
+                data=data,
+                content_type="application/octet-stream",
+            )
+        if progress_callback:
+            progress_callback(file_size, file_size)
+
+    def _multipart_upload(
+        self,
+        bucket_url: str,
+        filename: str,
+        local_path: "Path",
+        file_size: int,
+        progress_callback,
+    ) -> None:
+        """InvenioRDM multipart bucket upload.
+
+        Each part is at most ``_MULTIPART_PART_SIZE`` (256 MB). On any
+        per-part failure we abort the multipart upload (best-effort)
+        and re-raise so the caller falls back to single-PUT or the
+        outer retry can take over.
+        """
+        part_size = self._MULTIPART_PART_SIZE
+        num_parts = (file_size + part_size - 1) // part_size
+        put_url = f"{bucket_url}/{filename}"
+
+        # 1) Initiate.
+        init_url = (f"{put_url}?uploads=&size={file_size}"
+                    f"&part_size={part_size}")
+        resp = self._do_request("POST", init_url, json_body={},
+                                 content_type="application/json")
+        try:
+            init_info = resp.json() or {}
+        except Exception:
+            init_info = {}
+        # Multipart upload id field name varies across InvenioRDM
+        # versions: 'upload_id' or just embedded in the response links.
+        upload_id = (init_info.get("upload_id")
+                     or init_info.get("id"))
+        if not upload_id:
+            raise ZenodoError(
+                f"multipart init returned no upload_id: "
+                f"{str(init_info)[:300]}")
+
+        log.info(
+            "multipart upload started: %s  size=%.1f MB  parts=%d  "
+            "part_size=%d MB  upload_id=%s",
+            filename, file_size / 1e6, num_parts,
+            part_size // (1024 * 1024), upload_id,
+        )
+
+        sent_total = 0
+        try:
+            with open(local_path, "rb") as fh:
+                for part_no in range(1, num_parts + 1):
+                    part_bytes = fh.read(part_size)
+                    if not part_bytes:
+                        break
+                    part_url = (f"{put_url}?uploadId={upload_id}"
+                                f"&partNumber={part_no}")
+                    self._do_request(
+                        "PUT", part_url,
+                        data=part_bytes,
+                        content_type="application/octet-stream",
+                    )
+                    sent_total += len(part_bytes)
+                    if progress_callback:
+                        progress_callback(sent_total, file_size)
+                    log.info(
+                        "  part %d/%d ok  (%.1f / %.1f MB)",
+                        part_no, num_parts,
+                        sent_total / 1e6, file_size / 1e6,
+                    )
+        except Exception:
+            # Best-effort abort so we don't leave dangling parts.
+            try:
+                self._do_request(
+                    "DELETE",
+                    f"{put_url}?uploadId={upload_id}",
+                )
+            except Exception as _ae:
+                log.warning("multipart abort failed: %s", _ae)
+            raise
+
+        # 3) Complete.
+        complete_url = f"{put_url}?uploadId={upload_id}"
+        self._do_request(
+            "POST", complete_url, json_body={},
+            content_type="application/json",
+        )
 
     # -- public API: upload --------------------------------------------------
 
@@ -789,8 +944,31 @@ class Client:
             for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                 md5.update(chunk)
         md5_hex = md5.hexdigest()
-        log.info("upload_stream: %s  size=%.1f MB  md5=%s",
-                 filename, file_size / 1e6, md5_hex)
+        # Distinct log line for ``_full.gpkg`` re-upload attempts: when a
+        # subprocess crashes mid-upload the parent retries the same file
+        # on the next pass; if the previous attempt already poisoned the
+        # remote draft (partial bytes, dangling part) those retries are
+        # doomed and can spin for hours. Surfacing them with a separate
+        # tag makes the wreckage easy to grep for.
+        is_full_gpkg = filename.endswith("_full.gpkg")
+        attempt_tag = ""
+        if is_full_gpkg and not getattr(self, "_seen_full_gpkg", set()).__contains__(filename):
+            if not hasattr(self, "_seen_full_gpkg"):
+                self._seen_full_gpkg = set()
+            self._seen_full_gpkg.add(filename)
+        elif is_full_gpkg:
+            attempt_tag = " [FULL-GPKG-REUPLOAD]"
+        log.info("upload_stream:%s %s  size=%.1f MB  md5=%s",
+                 attempt_tag, filename, file_size / 1e6, md5_hex)
+        # Files >1 GB go through the InvenioRDM multipart bucket API
+        # when supported. Single-PUT streaming worked for ages but
+        # Zenodo's edge has been timing out long-lived TLS streams on
+        # multi-GB PUTs (`('Connection aborted.', TimeoutError('The
+        # write operation timed out'))`). Multipart caps each PUT at a
+        # few hundred MB so a single timeout only loses one part, not
+        # the whole upload. Falls back to single-PUT on any error.
+        _MULTIPART_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
+        use_multipart = file_size >= _MULTIPART_THRESHOLD
 
         existing = manifest.get(key)
 
@@ -811,18 +989,10 @@ class Client:
                     if exc.status_code != 404:
                         raise
 
-            # Stream-upload new file.
-            put_url = f"{bucket_url}/{filename}"
-            with open(local_path, "rb") as fh:
-                data = ProgressFileWrapper(fh, file_size, progress_callback) if progress_callback else fh
-                resp = self._do_request(
-                    "PUT", put_url,
-                    data=data,
-                    content_type="application/octet-stream",
-                )
-            if progress_callback:
-                progress_callback(file_size, file_size)
-            log.debug("Upload response: %s", resp.json())
+            # Stream-upload new file (multipart for >1 GB).
+            self._put_file_to_bucket(
+                bucket_url, filename, local_path, file_size,
+                progress_callback, use_multipart=use_multipart)
 
             # Update metadata.
             meta_payload = meta_func(key, filename, version)
@@ -844,18 +1014,10 @@ class Client:
             bucket_url = depo["links"]["bucket"]
             log.info("Created draft deposition %d, bucket=%s", depo_id, bucket_url)
 
-            # Stream-upload file.
-            put_url = f"{bucket_url}/{filename}"
-            with open(local_path, "rb") as fh:
-                data = ProgressFileWrapper(fh, file_size, progress_callback) if progress_callback else fh
-                resp = self._do_request(
-                    "PUT", put_url,
-                    data=data,
-                    content_type="application/octet-stream",
-                )
-            if progress_callback:
-                progress_callback(file_size, file_size)
-            log.debug("Upload response: %s", resp.json())
+            # Stream-upload file (multipart for >1 GB).
+            self._put_file_to_bucket(
+                bucket_url, filename, local_path, file_size,
+                progress_callback, use_multipart=use_multipart)
 
             # Set metadata.
             meta_payload = meta_func(key, filename, version)

@@ -1884,10 +1884,45 @@ class PeerDirector:
     # 4s TTL means at most one fanout per dashboard cycle; single-flight
     # lock means concurrent callers share the same in-flight result
     # instead of each launching their own 60-peer fanout.
-    _STATUS_CACHE_TTL = 4.0
+    # Fresh window: callers within this many seconds of the last
+    # successful compute get the cached value with zero work. The
+    # 60-peer fanout costs ~3–6s on a warm system; setting TTL below
+    # that guarantees most callers pay full price (every dashboard
+    # poll, every process.txt curl from an agent). 30s is short
+    # enough that stale director state is never user-visible (the
+    # dashboard refreshes faster than a peer can change role) but
+    # long enough that all five dashboard pollers (process.html
+    # poll/5s, fetchPrioQueue/15s, fetchDirectorStatus/15s,
+    # fetchAllPeerStatuses/8s, fetchLog24h/30s) hit cache during a
+    # single page-load wave.
+    # Cross-worker disk cache: gunicorn runs 2 workers. Without a
+    # shared cache each worker has its own in-memory copy, and a
+    # client doing one request every TTL/2 seconds still pays cold
+    # cost on every alternating worker. The disk file is a tiny
+    # JSON payload written atomically; readers tolerate parse
+    # errors silently.
+    _STATUS_CACHE_FILE = Path('/tmp/srtm_director_status_cache.json')
+    _STATUS_CACHE_TTL = 30.0
+    # Stale window: if a recompute is in flight, callers that arrive
+    # with a cached value at most this old are served the stale copy
+    # immediately instead of blocking. Keeps /process.txt and
+    # /process.html responsive even during fanout. We trigger a
+    # background refresh when the cache crosses TTL but is still
+    # within STALE, so the next caller sees fresh data without any
+    # request having had to wait.
+    _STATUS_CACHE_STALE = 180.0
 
     def get_status(self) -> dict:
-        """Full director status for the dashboard (TTL-cached + single-flight)."""
+        """Full director status for the dashboard.
+
+        TTL-cached + single-flight + stale-while-revalidate:
+        - within ``_STATUS_CACHE_TTL``: serve cache, no work
+        - between TTL and STALE: serve cache, kick a background
+          refresh (if none in flight)
+        - older than STALE or no cache: block on a recompute
+          (single-flight: concurrent callers share the same in-flight
+          result instead of each launching their own 60-peer fanout)
+        """
         import time as _t
         # Lazy-init cache attrs (instance is constructed before this method
         # may be called from multiple threads).
@@ -1898,12 +1933,50 @@ class PeerDirector:
             self._status_cache_ts: float = 0.0
         now = _t.time()
         with self._status_cache_lock:
-            if (self._status_cache_value is not None and
-                    (now - self._status_cache_ts) < self._STATUS_CACHE_TTL):
-                return self._status_cache_value
-        # Single-flight: only one thread computes; others wait for the
-        # result, then read from cache. Bounded wait so a wedged compute
-        # never wedges every dashboard request.
+            cached = self._status_cache_value
+            age = now - self._status_cache_ts if cached is not None else None
+        # Cross-worker promotion: if our in-memory copy is stale (or
+        # missing) but the disk file is fresher, adopt it. This is
+        # what lets the second gunicorn worker piggy-back on a
+        # recompute the first worker just paid for.
+        if cached is None or (age is not None and age >= self._STATUS_CACHE_TTL):
+            disk = self._status_cache_load_disk()
+            if disk is not None:
+                disk_ts = float(disk.get('_cached_at', 0) or 0)
+                disk_age = now - disk_ts
+                if disk_age >= 0 and (age is None or disk_age < age):
+                    with self._status_cache_lock:
+                        self._status_cache_value = disk
+                        self._status_cache_ts = disk_ts
+                    cached = disk
+                    age = disk_age
+        if cached is not None and age is not None and age < self._STATUS_CACHE_TTL:
+            return cached
+        # Stale-while-revalidate: serve aged cache + spawn a refresh.
+        if cached is not None and age is not None and age < self._STATUS_CACHE_STALE:
+            if self._status_cache_inflight.acquire(blocking=False):
+                def _bg_refresh():
+                    try:
+                        result = self._compute_status()
+                        with self._status_cache_lock:
+                            self._status_cache_value = result
+                            self._status_cache_ts = _t.time()
+                        self._status_cache_save_disk(result)
+                    except Exception as _e:  # noqa: BLE001
+                        log.warning('get_status background refresh: %s', _e)
+                    finally:
+                        try:
+                            self._status_cache_inflight.release()
+                        except RuntimeError:
+                            pass
+                threading.Thread(
+                    target=_bg_refresh,
+                    name='dir-status-bg',
+                    daemon=True,
+                ).start()
+            # Else: another thread is already refreshing — fine.
+            return cached
+        # No usable cache: block on compute under single-flight.
         acquired = self._status_cache_inflight.acquire(timeout=20)
         if not acquired:
             with self._status_cache_lock:
@@ -1923,12 +1996,32 @@ class PeerDirector:
             with self._status_cache_lock:
                 self._status_cache_value = result
                 self._status_cache_ts = _t.time()
+            self._status_cache_save_disk(result)
             return result
         finally:
             try:
                 self._status_cache_inflight.release()
             except RuntimeError:
                 pass
+
+    def _status_cache_load_disk(self) -> dict | None:
+        try:
+            if self._STATUS_CACHE_FILE.exists():
+                with self._STATUS_CACHE_FILE.open() as f:
+                    return json.load(f)
+        except Exception:
+            return None
+        return None
+
+    def _status_cache_save_disk(self, payload: dict) -> None:
+        try:
+            d = dict(payload)
+            d['_cached_at'] = time.time()
+            tmp = self._STATUS_CACHE_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(d, default=str))
+            tmp.replace(self._STATUS_CACHE_FILE)
+        except Exception as _e:  # noqa: BLE001
+            log.debug('status cache disk save failed: %s', _e)
 
     def _compute_status(self) -> dict:
         """Full director status for the dashboard."""

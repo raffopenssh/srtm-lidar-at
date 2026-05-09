@@ -4456,24 +4456,28 @@ function renderDirector(d) {
   // Remember commit for sticky version tag (survives state.json wipes).
   for (const _p of peers) _rememberPeerCommit(_p.id, _p.git_commit);
 
-  // Sort peers by ACTUAL pipeline progress on the current KG (closest to
-  // completion first) — same scoring the per-peer KG carousel uses, so
-  // the list and the carousel agree on "who's furthest along".
+  // Sort peers by ACTUAL pipeline progress on the current KG (closest
+  // to completion first — "progress descending"). We sort directly
+  // off the fields director.get_status() already returned for each
+  // peer (current_kg_step, current_kg_tile, current_kg_n_tiles) via
+  // _peerKgFrac — the *same* number the row's progress bar shows.
+  //
+  // Why not piggy-back on _peerCards/_peerProgressKey? That data
+  // comes from /api/v1/director/proxy/all_status which (a) is not
+  // always loaded on mobile, (b) is on a different poll cadence, and
+  // (c) drops peers whose status probe timed out. The result was an
+  // unstable order that re-shuffled every few seconds on mobile.
+  // Using the same source as the rendering keys the sort to what the
+  // user sees — if the bar moved, the order moves; otherwise stable.
   // Non-running peers fall to the bottom by activity rank then id.
-  function _dirPeerProgressKey(p) {
+  function _dirPeerSortKey(p) {
     const isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
-    if (!isRun) return 999;  // non-running goes last
-    const card = (_peerCards || []).find(c => c.id === p.id);
-    if (card) {
-      // _peerProgressKey is negative-score-based; preserve sign so the
-      // smallest (most-progressed) sorts first.
-      return _peerProgressKey(card);
-    }
-    // Fallback when proxy/all_status hasn't returned this peer yet.
-    return 1;
+    if (!isRun) return 999;
+    // Negate so 1.0 (about to finish) sorts before 0.0.
+    return -_peerKgFrac(p);
   }
   peers.sort((a, b) => {
-    const ka = _dirPeerProgressKey(a), kb = _dirPeerProgressKey(b);
+    const ka = _dirPeerSortKey(a), kb = _dirPeerSortKey(b);
     if (ka !== kb) return ka - kb;
     const ra = _peerActivityRank(a, active), rb = _peerActivityRank(b, active);
     if (ra !== rb) return ra - rb;

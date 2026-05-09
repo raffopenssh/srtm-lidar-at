@@ -322,15 +322,32 @@
     .cards { grid-template-columns: 1fr 1fr; }
   }
 
-  /* Director peer cards — ultra-compact mobile view (text inside bars) */
+  /* Director peer cards — unified compact strip (mobile + desktop). */
   .peer-mobile { display: none; }
-  .peer-mobile.pm-card { display: none; }  /* hidden by default — enabled in media query */
+  .peer-mobile.pm-card { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .pm-donut { width: 20px; height: 20px; flex-shrink: 0; display: block; }
   .pm-donut .bg { stroke: var(--border); }
-  .pm-id { font-weight: 700; font-size: 10px; color: var(--text);
+  .pm-id { font-weight: 700; font-size: 11px; color: var(--text);
            flex-shrink: 0; line-height: 1; font-family: monospace; }
+  /* Attention text colours (id) for at-a-glance scanning */
+  .pm-id.att-offline { color: var(--red); }
+  .pm-id.att-update  { color: #f0883e; }   /* orange — manual update needed */
+  .pm-id.att-stale   { color: var(--yellow); } /* status came from cache fallback */
+  .pm-id.att-paused  { color: var(--yellow); }
+  .pm-id.att-stopped { color: var(--dim); }
+  .pm-id.att-active  { color: var(--blue); }
+  .pm-id.att-cache   { color: #79b8ff; }
+  .pm-id.att-int     { color: var(--yellow); }
   .pm-region { font-family: monospace; font-size: 9px; color: var(--dim); flex-shrink: 0; }
   .pm-menu { flex-shrink: 0; }
+  .pm-expander {
+    flex-shrink: 0; cursor: pointer; user-select: none;
+    color: var(--dim); font-size: 11px; line-height: 1;
+    padding: 2px 4px; border-radius: 3px;
+    transition: transform 0.18s, color 0.18s;
+  }
+  .pm-expander:hover { color: var(--text); }
+  .peer-card.expanded .pm-expander { transform: rotate(90deg); color: var(--text); }
   /* Progress bar with text overlay — the bar IS the row, info lives on top. */
   .pm-bar {
     flex: 1; min-width: 0;
@@ -376,24 +393,38 @@
   .pm-tag.t-idle     { color: var(--dim); }
   .pm-tag.t-offline  { color: var(--dim); opacity: 0.6; }
   .pm-tag.t-int      { color: var(--yellow); }   /* interrupted KG (was running, now isn't) */
+  /* Default: single-line compact strip; details collapsed.
+     Desktop packs multiple peers per row via auto-fill; mobile is 1-up. */
+  #directorPeers { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)) !important;
+                   gap: 4px 8px !important; }
+  #directorPeers > .peer-card {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 3px 6px;
+    min-width: 0;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  #directorPeers > .peer-card.pm-active { border-color: var(--blue);
+                                          background: rgba(88,166,255,0.06); }
+  #directorPeers > .peer-card.pm-owner  { border-color: var(--yellow); }
+  #directorPeers > .peer-card.pm-idle   { opacity: 0.55; }
+  /* Details collapsed by default; click expands. Expanded card spans the full
+     row so the legacy detail content has room to breathe. */
+  #directorPeers > .peer-card .peer-detail-body { display: none; }
+  #directorPeers > .peer-card.expanded {
+    grid-column: 1 / -1;
+    padding: 6px 8px;
+    opacity: 1 !important;
+    background: var(--card);
+  }
+  #directorPeers > .peer-card.expanded .peer-detail-body {
+    display: block; margin-top: 6px;
+    padding-top: 6px; border-top: 1px solid var(--border);
+  }
   @media (max-width: 600px) {
-    /* Mobile: hide desktop content, show only compact strip. */
-    #directorPeers { grid-template-columns: 1fr !important; gap: 3px !important; }
-    #directorPeers > div > :not(.peer-mobile) { display: none !important; }
-    #directorPeers > div {
-      opacity: 1 !important; padding: 3px 5px !important;
-      min-width: 0 !important;
-      background: transparent !important;
-      border: 1px solid transparent !important;
-      border-radius: 5px !important;
-    }
-    #directorPeers > div.pm-active { border-color: var(--blue) !important;
-                                      background: rgba(88,166,255,0.06) !important; }
-    #directorPeers > div.pm-owner  { border-color: var(--yellow) !important; }
-    #directorPeers > div.pm-idle   { opacity: 0.55 !important; }
-    .peer-mobile.pm-card {
-      display: flex; align-items: center; gap: 5px; min-width: 0;
-    }
+    #directorPeers { grid-template-columns: 1fr !important; gap: 2px !important; }
+    #directorPeers > .peer-card { padding: 2px 4px; }
   }
 
   /* Zenodo manifest table — mobile-friendly */
@@ -3940,7 +3971,6 @@ function _pmDonut(usedFrac, color) {
 function _peerDisplayId(id) { return id === 'primary' ? 'at1' : id; }
 // Determine the role tag shown inside the progress bar.
 function _peerRoleTag(p, ctx) {
-  // Primary (the local director instance) doesn't process — always tag PRIMARY.
   if (p.url == null) return {cls: 't-primary', txt: 'PRIMARY'};
   if (ctx.isActive)  return {cls: 't-frontier', txt: 'FRONTIER'};
   if (ctx.isRunning && p.cache_only_run) return {cls: 't-cache', txt: 'CACHE'};
@@ -3948,9 +3978,21 @@ function _peerRoleTag(p, ctx) {
   if (!p.online)     return {cls: 't-offline', txt: 'OFFLINE'};
   if (p.processor_state === 'paused')  return {cls: 't-paused',  txt: 'PAUSED'};
   if (p.processor_state === 'stopped') return {cls: 't-stopped', txt: 'STOPPED'};
-  // Has a KG attached but isn't running anymore → interrupted.
   if (p.current_kg) return {cls: 't-int', txt: 'INTERRUPTED'};
   return {cls: 't-idle', txt: 'IDLE'};
+}
+// Attention class for the peer-id text — bubbles up problems for at-a-glance scanning.
+function _peerAttClass(p, ctx) {
+  if (!p.online) return 'att-offline';
+  const us = p.update_state || {};
+  if (us.needs_manual_update) return 'att-update';
+  if (p.stale_status) return 'att-stale';
+  if (p.processor_state === 'paused') return 'att-paused';
+  if (ctx.isActive) return 'att-active';
+  if (ctx.isRunning && p.cache_only_run) return 'att-cache';
+  if (!ctx.isRunning && p.current_kg) return 'att-int';
+  if (p.processor_state === 'stopped') return 'att-stopped';
+  return '';
 }
 function _peerMobileBlock(p, ctx) {
   // Single horizontal strip: donut · id · [progress-bar with KG info inside] · ⋯
@@ -3990,13 +4032,16 @@ function _peerMobileBlock(p, ctx) {
     + (p.current_kg_started_at ? '\nelapsed: ' + _fmtElapsedShort(p.current_kg_started_at) : '')
     + interruptedNote;
   const barCls = 'pm-bar' + (ctx.isRunning ? ' run' : '');
-  let h = '<div class="peer-mobile pm-card">';
+  // Click anywhere on the strip (except menu/expander) toggles details.
+  let h = '<div class="peer-mobile pm-card" onclick="this.closest(\'.peer-card\').classList.toggle(\'expanded\')">';
   // Donut (remaining bandwidth)
   h += '<span title="bw: ' + ctx.usedGb.toFixed(1) + ' / ' + ctx.budgetGb
      + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
      + _pmDonut(usedFrac, ctx.bwColor) + '</span>';
-  // Peer id (compact)
-  h += '<span class="pm-id">' + esc(_peerDisplayId(p.id)) + '</span>';
+  // Peer id (compact, coloured by attention state)
+  const attCls = _peerAttClass(p, ctx);
+  h += '<span class="pm-id' + (attCls ? ' ' + attCls : '') + '">'
+     + esc(_peerDisplayId(p.id)) + '</span>';
   // The progress bar (with role tag + KG info baked in)
   h += '<div class="' + barCls + '" title="' + esc(tip) + '">';
   h +=   '<div class="pm-fill" style="width:' + kgPct + '%;background:' + kgColor + '"></div>';
@@ -4009,6 +4054,8 @@ function _peerMobileBlock(p, ctx) {
   h += '</div>';
   // ⋯ menu
   h += '<span class="pm-menu" onclick="event.stopPropagation()">' + peerActionsMenu(p, {isActive: ctx.isActive}) + '</span>';
+  // expander chevron — toggles .expanded on the outer .peer-card
+  h += '<span class="pm-expander" title="Show details" onclick="event.stopPropagation();this.closest(\'.peer-card\').classList.toggle(\'expanded\')">▸</span>';
   h += '</div>';
   return h;
 }
@@ -4193,38 +4240,13 @@ function renderDirector(d) {
     const border = isActive ? 'border-color:var(--blue);'
       : (isOwner ? 'border-color:var(--yellow);' : '');
 
-    // Mobile-only marker class on the outer card.
-    let pmCls = '';
-    if (isActive) pmCls = ' pm-active';
-    else if (isOwner) pmCls = ' pm-owner';
-    else if (!isRunning) pmCls = ' pm-idle';
-    if (isInactive) {
-      // Collapsed card — single line with expand toggle
-      html += '<div class="' + pmCls.trim() + '" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;opacity:0.7;' + border + '">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="this.parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">';
-      html += '<span style="font-size:12px;font-weight:600;color:var(--dim)">' + esc(p.id) + roleBadge(p) + canaryBadge(p);
-      html += ' <span class="' + stCls + '" style="font-size:10px">' + stLabel + '</span>';
-      html += ' · ' + (p.completed||0) + ' done';
-      if (isScheduled && p.not_before) {
-        const rel = fmtRelFuture(p.not_before);
-        html += ' · <span style="color:var(--yellow)" title="' + esc(p.not_before) + '">⏳ ' + esc(rel) + '</span>';
-      }
-      const rtInline = regionTag(p);
-      if (rtInline) html += ' · ' + rtInline;
-      const vtInline = versionTag(p);
-      if (vtInline) html += ' · ' + vtInline;
-      html += '</span>';
-      html += '<span style="display:flex;align-items:center;gap:4px" onclick="event.stopPropagation()">';
-      html += peerActionsMenu(p, {isActive: isActive});
-      html += '<span style="font-size:10px;color:var(--dim);cursor:pointer" onclick="this.closest(\'div[onclick]\').parentElement.querySelector(\'.peer-detail\').toggleAttribute(\'hidden\')">▼</span>';
-      html += '</span>';
-      html += '</div>';
-      // Hidden detail section
-      html += '<div class="peer-detail" hidden style="margin-top:6px">';
-    } else {
-      // Expanded card (active or running)
-      html += '<div class="' + pmCls.trim() + '" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;' + border + '">';
-    }
+    // Outer card: unified compact strip (collapsed by default, click to expand).
+    let pmCls = 'peer-card';
+    if (isActive) pmCls += ' pm-active';
+    else if (isOwner) pmCls += ' pm-owner';
+    else if (!isRunning) pmCls += ' pm-idle';
+    html += '<div class="' + pmCls + '" data-peer-id="' + esc(p.id) + '">';
+    html += '<div class="peer-detail-body">';
 
     const isCacheOnly = !!p.cache_only_run;
     if (!isInactive) {
@@ -4314,7 +4336,7 @@ function renderDirector(d) {
       // Auto-retry in progress (1 attempt done, may try again)
       html += '<div style="font-size:10px;color:var(--dim);margin-top:4px" title="Director auto-retried update; waiting for commit to change">↻ auto-retrying update (' + (_us.attempts) + '/2)</div>';
     }
-    if (isInactive) html += '</div>'; // close .peer-detail
+    html += '</div>'; // close .peer-detail-body
     // ── Mobile compact view (≤600px) ───────────────────────────────
     html += _peerMobileBlock(p, {
       isActive, isOwner, isInactive, isRunning,

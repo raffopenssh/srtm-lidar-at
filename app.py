@@ -6529,6 +6529,96 @@ def admin_heal_peers_json():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/admin/combined_log/evict', methods=['POST'])
+def admin_combined_log_evict():
+    """Evict entries from the persistent merged 24h log.
+
+    The merged log is written to ``data/combined_log_24h.jsonl`` and
+    pruned only by age (24h) / hard-cap. After we fix a noisy bug, the
+    pre-fix warnings stick around in the dashboard until they age out.
+    This endpoint lets us drop them deterministically.
+
+    Filters (all optional, AND'd together):
+      ``peer``  substring match on the entry's peer id
+      ``q``     substring match on the message body
+      ``level`` exact match (e.g. ``error``); also accepts list ``error,warning``
+      ``before`` ISO timestamp; only entries with ts < before are evicted
+      ``kg``    substring match on entry kg_code
+
+    Returns ``{evicted: N, kept: M, before_bytes, after_bytes}``.
+    Refuses to run unfiltered (would nuke the whole log).
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    args = request.args
+    def _g(k):
+        v = body.get(k)
+        if v is None:
+            v = args.get(k)
+        return v
+    peer_q = (_g('peer') or '').strip().lower()
+    msg_q = (_g('q') or '').strip().lower()
+    kg_q = (_g('kg') or '').strip().lower()
+    before = (_g('before') or '').strip()
+    levels_raw = (_g('level') or '').strip().lower()
+    levels = {x.strip() for x in levels_raw.split(',') if x.strip()}
+    if not (peer_q or msg_q or kg_q or before or levels):
+        return jsonify({'error': 'at least one filter required '
+                        '(peer, q, kg, level, before)'}), 400
+    path = _COMBINED_LOG_PATH
+    if not path.exists():
+        return jsonify({'evicted': 0, 'kept': 0,
+                        'before_bytes': 0, 'after_bytes': 0})
+    with _COMBINED_LOG_LOCK:
+        try:
+            before_bytes = path.stat().st_size
+            evicted = 0
+            kept = 0
+            tmp = path.with_suffix('.jsonl.evict.tmp')
+            with open(path, 'r', encoding='utf-8') as src, \
+                 open(tmp, 'w', encoding='utf-8') as dst:
+                for line in src:
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        dst.write(line)
+                        kept += 1
+                        continue
+                    pid = (e.get('peer') or e.get('peer_id') or '').lower()
+                    msg = (e.get('msg') or e.get('message') or '').lower()
+                    kgc = (e.get('kg_code') or '').lower()
+                    lvl = (e.get('level') or '').lower()
+                    ts = e.get('ts') or ''
+                    match = True
+                    if peer_q and peer_q not in pid:
+                        match = False
+                    if match and msg_q and msg_q not in msg:
+                        match = False
+                    if match and kg_q and kg_q not in kgc:
+                        match = False
+                    if match and levels and lvl not in levels:
+                        match = False
+                    if match and before and not (ts < before):
+                        match = False
+                    if match:
+                        evicted += 1
+                    else:
+                        dst.write(line)
+                        kept += 1
+            _os_log.replace(tmp, path)
+            after_bytes = path.stat().st_size
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    log.info('combined_log evict: peer=%r q=%r kg=%r level=%r before=%r '
+             '→ evicted=%d kept=%d',
+             peer_q, msg_q, kg_q, levels_raw, before, evicted, kept)
+    return jsonify({'evicted': evicted, 'kept': kept,
+                    'before_bytes': before_bytes,
+                    'after_bytes': after_bytes})
+
+
 @app.route('/api/v1/admin/clear_stepped_down', methods=['POST'])
 def admin_clear_stepped_down():
     """Clear the ``stepped_down`` flag so this peer is eligible to be

@@ -1130,7 +1130,15 @@ def _peer_status_push_loop():
             except Exception:
                 _alive = True  # fail-safe: don't lie about state
             if not _alive:
-                if status.get('state') in ('running', 'processing'):
+                # Any non-terminal state (running, processing, or any of
+                # the paused_* states) implies a live processor. If the
+                # processor is gone, the pause-probe loop is also gone —
+                # so the peer can never recover on its own. Flip to
+                # 'stopped' so the director knows the peer needs a kick.
+                _live_states = ('running', 'processing',
+                                'paused_zenodo', 'paused_copernicus',
+                                'paused_disk')
+                if status.get('state') in _live_states:
                     status['state'] = 'stopped'
                 # Blank rates so the director's fleet-max stops
                 # counting a dead processor.
@@ -1139,6 +1147,24 @@ def _peer_status_push_loop():
                     'zenodo': {'1m': 0.0, '5m': 0.0, '10m': 0.0},
                     'copernicus': {'1m': 0.0, '5m': 0.0, '10m': 0.0},
                 }
+            # Enrich the pushed status so the director gets fields that
+            # /api/v1/processing/status normally synthesises but which are
+            # never written into progress.json by the processor.
+            #   - git_commit: required for the dashboard versions: line
+            #     and rollout tracking; without it the director only
+            #     recovers commits via the merged-log fallback (which
+            #     misses peers that haven't received a graceful/hard
+            #     update event in the last 24h).
+            #   - region / instance: handy for at-a-glance peer
+            #     identification on the fleet view.
+            try:
+                if not (status.get('git_commit') or '').strip():
+                    status['git_commit'] = _GIT_COMMIT
+                status.setdefault('region', _REGION)
+                status.setdefault('instance',
+                                  os.environ.get('INSTANCE_ID', peer_id))
+            except Exception:
+                pass
             try:
                 bw = _pd.get_local_bandwidth()
             except Exception:
@@ -2240,8 +2266,15 @@ def processing_status():
                     data['system']['proc_ram_mb'] = rss_kb // 1024
                 except Exception:
                     pass
-            elif data.get('state') in ('running', 'processing'):
-                # No processor PID found but progress.json says running → stale
+            elif data.get('state') in ('running', 'processing',
+                                        'paused_zenodo', 'paused_copernicus',
+                                        'paused_disk'):
+                # No processor PID found but progress.json says running
+                # / paused → stale. paused_* states must be flipped too:
+                # those resume-probe loops only run inside a live
+                # processor, so a dead processor in paused_zenodo never
+                # recovers on its own. Reporting 'stopped' lets the
+                # director kick it.
                 data['state'] = 'stopped'
             # Tile caches
             try:

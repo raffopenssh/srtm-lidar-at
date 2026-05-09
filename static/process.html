@@ -825,10 +825,10 @@
                    user-select:none">
         <span id="logFilterCount">0 warn / 0 err</span>
       </span>
-      <span id="logRange24h" title="Toggle: live (last poll) vs merged 24h ring across all peers"
+      <span id="logRange" title="Cycle log range: live (last poll) → 4h → 24h merged across all peers. Lower = faster load."
             style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
                    padding:2px 7px;border:1px solid var(--border);border-radius:10px;
-                   user-select:none">24h</span>
+                   user-select:none">4h</span>
       <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
         <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
       </label>
@@ -1723,25 +1723,40 @@ function clearKgTimer() {
 
 // ── Log ─────────────────────────────────────────────────────────
 let _logFilterIssues = false;
-// Default to the merged 24h ring — fleet operators almost always want
-// the full picture, not just the last 5s of one peer's recent_log.
-let _logRange24h = (function(){
+// Log range mode: 'live' (single-poll recent_log), '4h', '24h'.
+// Default: 4h — fleet operators almost always want the recent
+// fleet-wide picture, but a full 24h is heavy (5000 entries / ~1 MB)
+// so we use the cheaper 4h slice unless explicitly widened.
+let _logRangeMode = (function(){
   try {
-    const v = localStorage.getItem('srtm_log_24h');
-    return v === null ? true : v === '1';
-  } catch(_) { return true; }
+    // Migration: old key 'srtm_log_24h' (true → '24h', false → 'live')
+    const v = localStorage.getItem('srtm_log_range');
+    if (v === '4h' || v === '24h' || v === 'live') return v;
+    const old = localStorage.getItem('srtm_log_24h');
+    if (old === '0') return 'live';
+  } catch(_) {}
+  return '4h';
 })();
+const _LOG_RANGE_ORDER = ['live', '4h', '24h'];
+const _LOG_RANGE_LABEL = {live: 'live', '4h': '4h', '24h': '24h'};
 let _logSearchQuery = '';
 let _logSearchTimer = null;
 let _lastLogPayload = null;       // last d passed to updateLog (for instant re-render)
-let _log24hPayload = null;        // last 24h history payload
-let _log24hFetchInflight = false;
-let _log24hFetchLast = 0;
+let _logHistPayload = null;       // last historical (4h/24h) payload
+let _logHistPayloadMode = null;   // mode the cached payload was fetched for
+let _logHistFetchInflight = false;
+let _logHistFetchLast = 0;
 function _styleLogChip(el, on, color) {
   if (!el) return;
   el.style.background = on ? 'rgba(210,153,34,0.13)' : '';
   el.style.borderColor = on ? color : 'var(--border)';
   el.style.color = on ? color : 'var(--dim)';
+}
+function _renderLogRangeChip() {
+  const r = document.getElementById('logRange');
+  if (!r) return;
+  r.textContent = _LOG_RANGE_LABEL[_logRangeMode] || '4h';
+  _styleLogChip(r, _logRangeMode !== 'live', 'var(--blue)');
 }
 (function(){
   const f = document.getElementById('logFilter');
@@ -1752,24 +1767,22 @@ function _styleLogChip(el, on, color) {
     // Render immediately from cached log — don't wait for next poll.
     if (_lastLogPayload) updateLog(_lastLogPayload);
   });
-  const r = document.getElementById('logRange24h');
+  const r = document.getElementById('logRange');
   if (r) {
-    // Reflect the persisted default state on first paint.
-    _styleLogChip(r, _logRange24h, 'var(--blue)');
-    if (_logRange24h) {
-      // Kick off a fetch so the area populates before the next poll.
-      fetchLog24h(true);
-    }
+    _renderLogRangeChip();
+    if (_logRangeMode !== 'live') fetchLogHistory(true);
     r.addEventListener('click', () => {
-      _logRange24h = !_logRange24h;
-      try { localStorage.setItem('srtm_log_24h', _logRange24h ? '1' : '0'); }
-      catch(_) {}
-      _styleLogChip(r, _logRange24h, 'var(--blue)');
+      const i = _LOG_RANGE_ORDER.indexOf(_logRangeMode);
+      _logRangeMode = _LOG_RANGE_ORDER[(i + 1) % _LOG_RANGE_ORDER.length];
+      try { localStorage.setItem('srtm_log_range', _logRangeMode); } catch(_) {}
+      _renderLogRangeChip();
       prevLogHash = '';
-      if (_logRange24h) {
-        fetchLog24h(true);
+      if (_logRangeMode !== 'live') {
+        // Invalidate cache when range widens/narrows.
+        if (_logHistPayloadMode !== _logRangeMode) _logHistPayload = null;
+        fetchLogHistory(true);
       } else if (_lastLogPayload) {
-        _log24hPayload = null;
+        _logHistPayload = null;
         updateLog(_lastLogPayload);
       }
     });
@@ -1782,24 +1795,30 @@ function _styleLogChip(el, on, color) {
       _logSearchTimer = setTimeout(() => {
         _logSearchQuery = s.value.trim().toLowerCase();
         prevLogHash = '';
-        if (_logRange24h && _log24hPayload) updateLog(_log24hPayload);
+        if (_logRangeMode !== 'live' && _logHistPayload) updateLog(_logHistPayload);
         else if (_lastLogPayload) updateLog(_lastLogPayload);
       }, 120);
     });
   }
 })();
 
-async function fetchLog24h(force) {
-  if (_log24hFetchInflight) return;
-  // Refresh every 30s while the 24h view is open.
-  if (!force && Date.now() - _log24hFetchLast < 30000) return;
-  _log24hFetchInflight = true;
+async function fetchLogHistory(force) {
+  if (_logRangeMode === 'live') return;
+  if (_logHistFetchInflight) return;
+  // Refresh every 30s while a historical view is open.
+  if (!force && Date.now() - _logHistFetchLast < 30000) return;
+  _logHistFetchInflight = true;
+  const mode = _logRangeMode;
+  const hours = mode === '24h' ? 24 : 4;
+  // Cap limit to keep the payload small in 4h mode.
+  const limit = mode === '24h' ? 5000 : 2000;
   try {
-    const r = await fetch('/api/v1/director/log/history?limit=5000');
+    const r = await fetch('/api/v1/director/log/history?hours=' + hours + '&limit=' + limit);
     if (!r.ok) return;
     const j = await r.json();
-    _log24hPayload = {recent_log: j.entries || [], _multi_peer: true, _is_24h: true};
-    _log24hFetchLast = Date.now();
+    _logHistPayload = {recent_log: j.entries || [], _multi_peer: true, _is_hist: true, _range: mode};
+    _logHistPayloadMode = mode;
+    _logHistFetchLast = Date.now();
     // Token-cheap commit recovery: the director emits
     //   "<graceful|hard> update → <commit> (peer on <prev>; attempt N)"
     // every time it nudges a peer onto a new commit. Mine those events
@@ -1817,22 +1836,22 @@ async function fetchLog24h(force) {
       }
     } catch (_) {}
     prevLogHash = '';
-    if (_logRange24h) updateLog(_log24hPayload);
+    if (_logRangeMode !== 'live') updateLog(_logHistPayload);
   } catch (_) {} finally {
-    _log24hFetchInflight = false;
+    _logHistFetchInflight = false;
   }
 }
 
 function updateLog(d) {
-  // If 24h mode is active, render the cached 24h payload regardless of
-  // what the live poller passes in. Schedule a refresh so the view
+  // If a historical mode is active, render the cached payload regardless
+  // of what the live poller passes in. Schedule a refresh so the view
   // stays current.
-  if (_logRange24h) {
-    if (!d || !d._is_24h) {
-      if (_log24hPayload) d = _log24hPayload;
-      else d = {recent_log: [], _multi_peer: true, _is_24h: true};
+  if (_logRangeMode !== 'live') {
+    if (!d || !d._is_hist || d._range !== _logRangeMode) {
+      if (_logHistPayload && _logHistPayload._range === _logRangeMode) d = _logHistPayload;
+      else d = {recent_log: [], _multi_peer: true, _is_hist: true, _range: _logRangeMode};
     }
-    fetchLog24h(false);
+    fetchLogHistory(false);
   } else {
     _lastLogPayload = d;
   }
@@ -1847,7 +1866,7 @@ function updateLog(d) {
   if (cnt) cnt.innerHTML = '<span style="color:' + (nWarn?'var(--yellow)':'var(--dim)') + '">' + nWarn + ' warn</span> / ' +
                            '<span style="color:' + (nErr?'var(--red)':'var(--dim)') + '">' + nErr + ' err</span>';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + (_logRange24h ? '|24' : '') + '|q=' + _logSearchQuery;
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + '|r=' + _logRangeMode + '|q=' + _logSearchQuery;
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 

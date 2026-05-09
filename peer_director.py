@@ -6197,6 +6197,31 @@ class PeerDirector:
             if shadow_changed:
                 log.info('director shadow set to %s (score=%.3f, push=%s)',
                          s_peer['id'], s_score, 'ok' if ok else res)
+            # Replicate the long-term log archive too. Separate throttle
+            # (hourly today-only steady state, full sweep on shadow
+            # change) so the archive doesn't inflate the 30s snapshot
+            # traffic. Best-effort: failures are logged but do NOT
+            # affect the small-state snapshot path above.
+            try:
+                if not hasattr(self, '_log_arch_sha'):
+                    self._log_arch_sha = {}
+                if not hasattr(self, '_log_arch_last_push'):
+                    self._log_arch_last_push = 0.0
+                arch_due = (now - self._log_arch_last_push
+                            >= dha.LOG_ARCHIVE_PUSH_INTERVAL)
+                if shadow_changed:
+                    # New shadow — wipe per-shadow sha cache and do a
+                    # full sweep so the new shadow gets every day.
+                    self._log_arch_sha = {}
+                if shadow_changed or arch_due:
+                    res_a = dha.push_log_archive_to_shadow(
+                        s_peer['url'], full=shadow_changed,
+                        cache=self._log_arch_sha)
+                    self._log_arch_last_push = now
+                    self.state['shadow_log_archive_last'] = res_a
+            except Exception as e:
+                log.warning('shadow log_archive push to %s failed: %s',
+                            s_peer.get('id'), e)
         except Exception as e:
             log.warning('shadow snapshot push to %s failed: %s',
                         s_peer.get('id'), e)

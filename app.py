@@ -125,6 +125,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/director/step_down',
     '/api/v1/director/announce',
     '/api/v1/director/snapshot',
+    '/api/v1/director/log_archive',
     '/api/v1/processing/start',
     '/api/v1/processing/stop',
     '/api/v1/processing/pause',
@@ -5275,8 +5276,81 @@ def director_event(msg: str, *, peer: str = '', kg: str = '',
             pass
 
 
+_COMBINED_LOG_ARCHIVE_DIR = _Path_log('data/log_archive')
+
+
+def _archive_lines(lines):
+    """Append already-serialised JSONL lines to per-UTC-day gzipped
+    archive files in ``data/log_archive/YYYY-MM-DD.jsonl.gz``. Used on
+    prune to keep a long-term forensic record over the full 200-day
+    processing run without exploding the live ring."""
+    if not lines:
+        return 0
+    import gzip as _gz
+    by_day: dict[str, list[str]] = {}
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        ts = e.get('ts', '')
+        # ISO ts → YYYY-MM-DD; fall back to today if unparseable.
+        day = ts[:10] if (len(ts) >= 10 and ts[4] == '-' and ts[7] == '-') \
+            else datetime.now(timezone.utc).date().isoformat()
+        by_day.setdefault(day, []).append(line if line.endswith('\n') else line + '\n')
+    written = 0
+    try:
+        _COMBINED_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as _e:
+        log.warning('combined_log archive mkdir failed: %s', _e)
+        return 0
+    for day, day_lines in by_day.items():
+        path = _COMBINED_LOG_ARCHIVE_DIR / f'{day}.jsonl.gz'
+        try:
+            with _gz.open(path, 'ab') as fh:
+                for ln in day_lines:
+                    fh.write(ln.encode('utf-8', errors='replace'))
+                    written += 1
+        except Exception as _e:
+            log.warning('combined_log archive %s failed: %s', day, _e)
+    return written
+
+
+def _read_archive_range(since_iso: str, until_iso: str):
+    """Yield raw JSONL lines from per-day archives that overlap
+    [since_iso, until_iso]. Reads files newest-day first so callers can
+    cap to a limit cheaply."""
+    import gzip as _gz
+    if not _COMBINED_LOG_ARCHIVE_DIR.exists():
+        return
+    since_day = since_iso[:10] if len(since_iso) >= 10 else ''
+    until_day = until_iso[:10] if (until_iso and len(until_iso) >= 10) else '9999-99-99'
+    try:
+        files = sorted([p for p in _COMBINED_LOG_ARCHIVE_DIR.iterdir()
+                        if p.name.endswith('.jsonl.gz')])
+    except Exception:
+        return
+    for p in files:
+        day = p.name[:-len('.jsonl.gz')]
+        if since_day and day < since_day:
+            continue
+        if day > until_day:
+            continue
+        try:
+            with _gz.open(p, 'rb') as fh:
+                for line in fh:
+                    try:
+                        yield line.decode('utf-8', errors='replace')
+                    except Exception:
+                        continue
+        except Exception as _e:
+            log.debug('archive read %s failed: %s', p, _e)
+
+
 def _combined_log_maybe_prune() -> None:
-    """Drop entries older than 24h (+ enforce hard size cap) periodically."""
+    """Drop entries older than 24h from the live ring (after archiving
+    them to per-day gzipped files for the long-term forensic record).
+    Also enforces a hard size cap. Runs ~every 10 min."""
     global _COMBINED_LOG_LAST_PRUNE
     import time as _t_log
     now = _t_log.time()
@@ -5295,12 +5369,15 @@ def _combined_log_maybe_prune() -> None:
                           ).isoformat()
             tmp = _COMBINED_LOG_PATH.with_suffix('.jsonl.tmp')
             kept = 0
+            evicted: list[str] = []
             with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as src, \
                  open(tmp, 'w', encoding='utf-8') as dst:
                 lines = src.readlines()
                 # Hard size cap: drop oldest half if file got huge
-                # (e.g. log spam during an incident).
+                # (e.g. log spam during an incident). Those go to archive too.
+                cap_evict: list[str] = []
                 if size > _COMBINED_LOG_HARD_CAP_BYTES:
+                    cap_evict = lines[: len(lines) // 2]
                     lines = lines[len(lines) // 2:]
                 for line in lines:
                     try:
@@ -5310,9 +5387,13 @@ def _combined_log_maybe_prune() -> None:
                     if e.get('ts', '') >= cutoff_iso:
                         dst.write(line)
                         kept += 1
+                    else:
+                        evicted.append(line)
+                evicted = cap_evict + evicted
             _os_log.replace(tmp, _COMBINED_LOG_PATH)
-            log.info('combined_log pruned: kept %d entries (was %.1f MB)',
-                     kept, size / 1e6)
+            archived = _archive_lines(evicted)
+            log.info('combined_log pruned: kept %d, archived %d (was %.1f MB)',
+                     kept, archived, size / 1e6)
         except Exception as _e:
             log.warning('combined_log prune failed: %s', _e)
 
@@ -5454,10 +5535,11 @@ def _combined_log_compute():
 
 @app.route('/api/v1/director/log/history')
 def director_log_history():
-    """Query the persistent 24h merged log.
+    """Query the persistent merged log (live 24h ring + per-day archive).
 
     Query params (all optional):
-      ``since`` ISO-8601 (default: 24h ago)
+      ``hours`` int   shorthand for ``since = now - hours`` (default 24)
+      ``since`` ISO-8601 (overrides ``hours``)
       ``until`` ISO-8601 (default: now)
       ``peer``  comma-separated peer ids (e.g. ``at3,at7``)
       ``kg``    KG code or substring match against ``msg``+``kg``
@@ -5465,7 +5547,10 @@ def director_log_history():
       ``q``     free-text substring filter on ``msg``
       ``limit`` int, default 5000, hard cap 50000
 
-    Returns ``{count, entries: [...]}`` ordered chronologically.
+    Returns ``{count, entries: [...]}`` ordered chronologically (oldest
+    first), capped to the most recent ``limit`` matches in range. When
+    ``since`` predates the live 24h ring, per-day gzipped archives in
+    ``data/log_archive/`` are consulted transparently.
     """
     since = request.args.get('since', '')
     until = request.args.get('until', '')
@@ -5478,42 +5563,80 @@ def director_log_history():
         limit = max(1, min(50000, int(request.args.get('limit', '5000'))))
     except ValueError:
         limit = 5000
-    if not since:
-        since = (datetime.now(timezone.utc)
-                 - timedelta(hours=24)).isoformat()
-    out: list[dict] = []
-    if not _COMBINED_LOG_PATH.exists():
-        return jsonify({'count': 0, 'entries': []})
     try:
-        with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
-            for line in fh:
+        hours = float(request.args.get('hours', '0') or '0')
+    except ValueError:
+        hours = 0.0
+    if not since:
+        h = hours if hours > 0 else 24.0
+        since = (datetime.now(timezone.utc)
+                 - timedelta(hours=h)).isoformat()
+
+    def _match(e: dict) -> bool:
+        ts = e.get('ts', '')
+        if ts < since:
+            return False
+        if until and ts > until:
+            return False
+        if peer_filter and e.get('peer') not in peer_filter:
+            return False
+        if level_filter and (e.get('level', '').lower() != level_filter):
+            return False
+        if kg_filter:
+            hay = str(e.get('kg', '')) + ' ' + str(e.get('msg', ''))
+            if kg_filter not in hay:
+                return False
+        if qstr and qstr not in (e.get('msg', '').lower()):
+            return False
+        return True
+
+    # Collect ALL matches in range, sort by ts, then return the last
+    # ``limit`` — i.e. the MOST RECENT matches. The prior implementation
+    # broke at limit while iterating the file from the start, which
+    # truncated the tail of the day (the “log stops at 1pm” bug).
+    matches: list[dict] = []
+
+    # Decide whether we need to dip into archives.
+    need_archive = False
+    try:
+        if _COMBINED_LOG_PATH.exists():
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                first = fh.readline()
+            try:
+                first_ts = json.loads(first).get('ts', '') if first else ''
+            except Exception:
+                first_ts = ''
+            if first_ts and since < first_ts:
+                need_archive = True
+        else:
+            need_archive = True
+    except Exception:
+        need_archive = True
+
+    try:
+        if need_archive:
+            for line in _read_archive_range(since, until or '9999'):
                 try:
                     e = json.loads(line)
                 except Exception:
                     continue
-                ts = e.get('ts', '')
-                if ts < since:
-                    continue
-                if until and ts > until:
-                    continue
-                if peer_filter and e.get('peer') not in peer_filter:
-                    continue
-                if level_filter and (e.get('level', '').lower()
-                                     != level_filter):
-                    continue
-                if kg_filter:
-                    hay = (str(e.get('kg', '')) + ' '
-                           + str(e.get('msg', '')))
-                    if kg_filter not in hay:
+                if _match(e):
+                    matches.append(e)
+        if _COMBINED_LOG_PATH.exists():
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                for line in fh:
+                    try:
+                        e = json.loads(line)
+                    except Exception:
                         continue
-                if qstr and qstr not in (e.get('msg', '').lower()):
-                    continue
-                out.append(e)
-                if len(out) >= limit:
-                    break
+                    if _match(e):
+                        matches.append(e)
     except Exception as ex:
         return jsonify({'error': str(ex)}), 500
-    return jsonify({'count': len(out), 'entries': out})
+    matches.sort(key=lambda e: e.get('ts', ''))
+    entries = matches[-limit:]
+    return jsonify({'count': len(entries), 'entries': entries,
+                    'truncated': len(matches) > len(entries)})
 
 
 @app.route('/api/v1/director/proxy/combined_log')
@@ -6712,6 +6835,52 @@ def director_snapshot():
         return jsonify({'error': 'invalid_snapshot'}), 400
     dha.stage_snapshot(body)
     return jsonify({'status': 'staged', 'self': dha.load_self()})
+
+
+@app.route('/api/v1/director/log_archive', methods=['PUT'])
+def director_log_archive_put():
+    """Shadow-only: stage a per-day gzipped log archive blob from the
+    director. Body: ``{day:'YYYY-MM-DD', gz_b64, size, sha256}``.
+
+    The shadow keeps a copy in ``data/log_archive/`` directly (NOT under
+    ``shadow/``) so when this peer is later promoted to director the
+    long-term forensic record is already in place. Idempotent: skips
+    write if the local file already matches ``size`` and ``sha256``
+    (so the hourly heartbeat is essentially free in steady state).
+
+    Best-effort and bounded — callers MUST cap blob size; the endpoint
+    rejects payloads >32 MB to keep traffic tame.
+    """
+    import base64 as _b64, hashlib as _hl
+    body = request.get_json(silent=True) or {}
+    day = (body.get('day') or '').strip()
+    if not (len(day) == 10 and day[4] == '-' and day[7] == '-'):
+        return jsonify({'error': 'bad day'}), 400
+    blob_b64 = body.get('gz_b64') or ''
+    if not isinstance(blob_b64, str) or len(blob_b64) > 45 * 1024 * 1024:
+        return jsonify({'error': 'too_large'}), 413
+    try:
+        blob = _b64.b64decode(blob_b64)
+    except Exception as e:
+        return jsonify({'error': f'b64: {e}'}), 400
+    sha = _hl.sha256(blob).hexdigest()
+    if body.get('sha256') and body['sha256'] != sha:
+        return jsonify({'error': 'sha mismatch'}), 400
+    arch_dir = Path('data/log_archive')
+    arch_dir.mkdir(parents=True, exist_ok=True)
+    out = arch_dir / f'{day}.jsonl.gz'
+    # Idempotent skip: same size + sha as the on-disk file.
+    try:
+        if out.exists() and out.stat().st_size == len(blob):
+            existing = _hl.sha256(out.read_bytes()).hexdigest()
+            if existing == sha:
+                return jsonify({'status': 'unchanged', 'size': len(blob)})
+    except Exception:
+        pass
+    tmp = out.with_suffix('.gz.tmp')
+    tmp.write_bytes(blob)
+    os.replace(tmp, out)
+    return jsonify({'status': 'staged', 'size': len(blob), 'sha256': sha})
 
 
 @app.route('/api/v1/director/announce', methods=['POST'])
@@ -13794,6 +13963,10 @@ def process_txt():
                  default; attention-state peers are always shown).
       ``peer``   substring filter on peer id (applies to roster + log).
       ``q``      free-text substring filter on log msg.
+      ``hours``  float, look back this many hours into the persistent
+                 log (live 24h ring + per-day gzipped archive in
+                 ``data/log_archive/``). Default 24. Use e.g. ``hours=168``
+                 (7d) to mine the long-term forensic record.
     """
     import time as _t
     try:
@@ -13804,6 +13977,12 @@ def process_txt():
     show_hidden = request.args.get('hidden') in ('1', 'true', 'yes')
     peer_q = (request.args.get('peer') or '').strip().lower()
     msg_q = (request.args.get('q') or '').strip().lower()
+    try:
+        hours_back = float(request.args.get('hours', '24') or '24')
+    except ValueError:
+        hours_back = 24.0
+    if hours_back <= 0:
+        hours_back = 24.0
 
     def _short(s, n):
         s = '' if s is None else str(s)
@@ -14302,21 +14481,59 @@ def process_txt():
         out.append(f'priority queue ({len(pq)}): {codes}'
                    + (' …' if len(pq) > len(head) else ''))
 
-    # --- Merged 24h log ------------------------------------------
+    # --- Merged log (live 24h ring + per-day archive) -----------
     out.append('')
     out.append(f'merged log (last {nlog}'
+               + (f', {hours_back:g}h back' if hours_back != 24.0 else '')
                + (' warn+err' if warn_only else '')
                + (', peer~' + peer_q if peer_q else '')
                + (', q~' + msg_q if msg_q else '')
                + ', newest first):')
     log_lines = []
+    since_iso = (datetime.now(timezone.utc)
+                 - timedelta(hours=hours_back)).isoformat()
+
+    def _accept(e):
+        if e.get('ts', '') < since_iso:
+            return False
+        lvl = (e.get('level') or 'info').lower()
+        if warn_only and lvl not in ('warning', 'error'):
+            return False
+        if peer_q and peer_q not in str(e.get('peer', '')).lower():
+            return False
+        if msg_q and msg_q not in str(e.get('msg', '')).lower():
+            return False
+        return True
+
     try:
+        # Pull from per-day archive when the requested window predates
+        # the live ring (or when the ring's first ts is later than
+        # ``since_iso``). Cheap: archives are gzipped and we only iterate
+        # files for days that overlap the window.
+        ring_first = ''
         if _COMBINED_LOG_PATH.exists():
             with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
-                # Read tail directly to avoid loading large files.
+                first = fh.readline()
+            try:
+                ring_first = json.loads(first).get('ts', '') if first else ''
+            except Exception:
+                ring_first = ''
+        if (not ring_first) or since_iso < ring_first:
+            for line in _read_archive_range(since_iso, ''):
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if _accept(e):
+                    log_lines.append(e)
+        if _COMBINED_LOG_PATH.exists():
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                # Read tail directly to avoid loading large files when
+                # the window is short (default 24h fits in <2 MB).
                 fh.seek(0, 2)
                 size = fh.tell()
-                fh.seek(max(0, size - 1024 * 1024))
+                tail_bytes = 1024 * 1024 if hours_back <= 24 else size
+                fh.seek(max(0, size - tail_bytes))
                 tail = fh.read()
             for line in tail.split('\n'):
                 if not line.strip():
@@ -14325,14 +14542,8 @@ def process_txt():
                     e = json.loads(line)
                 except Exception:
                     continue
-                lvl = (e.get('level') or 'info').lower()
-                if warn_only and lvl not in ('warning', 'error'):
-                    continue
-                if peer_q and peer_q not in str(e.get('peer', '')).lower():
-                    continue
-                if msg_q and msg_q not in str(e.get('msg', '')).lower():
-                    continue
-                log_lines.append(e)
+                if _accept(e):
+                    log_lines.append(e)
     except Exception as _e:
         out.append(f'  (log read error: {_e})')
     log_lines.sort(key=lambda e: e.get('ts', ''), reverse=True)
@@ -14348,7 +14559,9 @@ def process_txt():
     out.append(
         '# query: ?log=N (default 60, max 500), ?warn=1 (errors+warnings only),\n'
         '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
-        '#        ?q=substring (msg filter). Pair with /api/v1/director/log/history\n'
+        '#        ?q=substring (msg filter), ?hours=H (default 24; uses\n'
+        '#        per-day gzipped archive in data/log_archive/ when H>24).\n'
+        '#        Pair with /api/v1/director/log/history (also accepts hours=)\n'
         '#        for full structured access. New sections (May 2026):\n'
         '#          versions:/rollout: — fleet update progress\n'
         '#          copernicus credentials — per-cred 7d usage/health/holder\n'

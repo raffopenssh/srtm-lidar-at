@@ -595,6 +595,108 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 # ── Director ↔ shadow plumbing ───────────────────────────────────
 
+# ── Log archive shadow sync ────────────────────────────────────
+#
+# The persistent merged log lives in two places:
+#   data/combined_log_24h.jsonl       — live ring (rebuilt from peers
+#                                       on takeover via the existing
+#                                       _combined_log_bootstrap_once)
+#   data/log_archive/YYYY-MM-DD.jsonl.gz — long-term forensic record
+#
+# Only the archive needs replication: the live ring is regenerated
+# automatically from peers' own ``recent_log`` ring buffers after
+# takeover. We piggyback on the shadow loop but with our own throttle
+# so as not to inflate director→shadow traffic. In steady state we push
+# only TODAY's file once an hour (older days are immutable on disk and
+# already replicated). A full sweep runs once when the shadow changes.
+
+LOG_ARCHIVE_DIR = Path('data/log_archive')
+LOG_ARCHIVE_PUSH_INTERVAL = 3600     # seconds between today-only pushes
+LOG_ARCHIVE_MAX_BLOB = 32 * 1024 * 1024  # hard per-day blob cap
+
+
+def _list_archive_days() -> list[Path]:
+    if not LOG_ARCHIVE_DIR.exists():
+        return []
+    try:
+        return sorted([p for p in LOG_ARCHIVE_DIR.iterdir()
+                       if p.name.endswith('.jsonl.gz')])
+    except Exception:
+        return []
+
+
+def _push_one_archive_day(shadow_url: str, path: Path,
+                          known_sha: dict[str, str]) -> dict:
+    """Push a single day's archive file. Returns response dict.
+
+    Skips the network round-trip entirely if we already have an SHA for
+    this file (same path + size cached) — typical for older days that
+    don't change. Today's file is checked size-first to dodge re-hashing
+    a large gzip on every tick.
+    """
+    import base64 as _b64, hashlib as _hl, requests as _rq
+    try:
+        size = path.stat().st_size
+    except Exception as e:
+        return {'error': f'stat: {e}'}
+    if size == 0 or size > LOG_ARCHIVE_MAX_BLOB:
+        return {'skipped': True, 'reason': f'size={size}'}
+    cache_key = f'{path.name}:{size}'
+    blob = path.read_bytes()
+    sha = _hl.sha256(blob).hexdigest()
+    if known_sha.get(cache_key) == sha:
+        return {'status': 'cached', 'size': size}
+    payload = {
+        'day': path.name[:-len('.jsonl.gz')],
+        'gz_b64': _b64.b64encode(blob).decode('ascii'),
+        'size': size,
+        'sha256': sha,
+    }
+    headers = {}
+    try:
+        tok = ADMIN_TOKEN_PATH.read_text().strip()
+        if tok:
+            headers['X-Admin-Token'] = tok
+    except Exception:
+        pass
+    try:
+        r = _rq.put(shadow_url.rstrip('/') + '/api/v1/director/log_archive',
+                    json=payload, headers=headers, timeout=30)
+        if r.ok:
+            try:
+                jr = r.json()
+            except Exception:
+                jr = {'status': 'ok'}
+            known_sha[cache_key] = sha
+            return jr
+        return {'error': f'http {r.status_code}: {r.text[:200]}'}
+    except Exception as e:
+        return {'error': str(e)[:200]}
+
+
+def push_log_archive_to_shadow(shadow_url: str, *, full: bool,
+                               cache: dict[str, str]) -> dict:
+    """Send today's archive (and on ``full=True`` every other day too)
+    to the shadow. ``cache`` is a per-director dict that memoises
+    ``{filename:size: sha256}`` so we skip already-pushed bytes."""
+    days = _list_archive_days()
+    if not days:
+        return {'pushed': 0, 'reason': 'no archive'}
+    today_name = (datetime.now(timezone.utc).date().isoformat()
+                  + '.jsonl.gz')
+    targets = days if full else [p for p in days if p.name == today_name]
+    if not targets:
+        return {'pushed': 0, 'reason': 'no targets'}
+    results: dict[str, dict] = {}
+    pushed = 0
+    for p in targets:
+        res = _push_one_archive_day(shadow_url, p, cache)
+        results[p.name] = res
+        if res.get('status') == 'staged':
+            pushed += 1
+    return {'pushed': pushed, 'targets': len(targets), 'detail': results}
+
+
 def push_snapshot_to_shadow(shadow_url: str, snap: dict | None = None,
                             timeout: tuple = (5, 20)) -> dict:
     """PUT a snapshot to shadow. Returns the peer's response or error dict."""

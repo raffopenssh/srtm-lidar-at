@@ -10,11 +10,12 @@ text-only mirror of `/process.html` — full director / peer / log / Zenodo
 snapshot in <2 KB. Add to your context with one curl:
 
 ```bash
-curl -s https://srtm-lidar-at.exe.xyz:8000/process.txt          # default 60 log lines
+curl -s https://srtm-lidar-at.exe.xyz:8000/process.txt          # default 60 log lines, last 24h
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?warn=1' # warnings + errors only
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?peer=at3&log=200'
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?q=cred&log=300'
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hidden=1' # also list stopped/idle peers
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hours=168&log=500&q=Diendorf' # 7d back, archive
 ```
 
 Query params:
@@ -24,9 +25,19 @@ Query params:
 - `q=<substr>` — substring filter on log message body
 - `hidden=1` — also include stopped/idle/complete peers in roster
   (default: hidden; attention-state peers are always shown)
+- **`hours=H`** — look back H hours into the merged log. Default 24
+  (live ring only). Higher values transparently dip into the
+  **long-term archive** at `data/log_archive/YYYY-MM-DD.jsonl.gz`
+  (per-UTC-day gzipped JSONL, written when the live ring prunes).
+  Use this to mine the full ~200-day forensic record — e.g.
+  `?hours=2400&q=cred` for credential-rotation history.
 
 For structured access, pair with `/api/v1/director/status` and
-`/api/v1/director/log/history` (both documented in `/api/v1/docs/llm.txt`).
+`/api/v1/director/log/history?hours=H` (both documented in
+`/api/v1/docs/llm.txt`). The history endpoint also reads from the
+per-day archive when `hours` exceeds the live ring — returns the
+*most-recent* `limit` matches in range (sets `truncated:true` if more
+exist), avoiding the prior bug that truncated the tail of the day.
 Director orchestration events — peer auto-updates, Copernicus credential
 revalidation/add/remove, frontier credential & cache-cell plan changes —
 are emitted via `app.director_event(…)` and appear inline in the merged
@@ -90,7 +101,7 @@ tail -f /tmp/rf_train_4000kg.log
 | `object_segmentation.py` | 2200 | Felzenszwalb+RAG → per-object classify (44 features) |
 | `learned_classifier.py` | 560 | RF classifier (`FEATURE_KEYS`, cadastre-trained) |
 | `static/index.html` | 3100 | Single-file Leaflet UI |
-| `static/process.html` | 2100 | Processor + director dashboard. Peer Director list uses unified compact strip (`.peer-card` + `.pm-card`) on desktop+mobile: donut · id (color-coded for attention) · role-tagged bar (FRONTIER/CACHE/PRIMARY/STOPPED/INTERRUPTED…) with KG inside · ⋯ menu · ▸ chevron expands legacy detail. `primary` aliased to `at1`. Sort: elapsed-on-current-KG (oldest first), running peers only. Live Log has `24h` chip → `/api/v1/director/log/history`; warning filter re-renders from cache. |
+| `static/process.html` | 2100 | Processor + director dashboard. Peer Director list uses unified compact strip (`.peer-card` + `.pm-card`) on desktop+mobile: donut · id (color-coded for attention) · role-tagged bar (FRONTIER/CACHE/PRIMARY/STOPPED/INTERRUPTED…) with KG inside · ⋯ menu · ▸ chevron expands legacy detail. `primary` aliased to `at1`. Sort: elapsed-on-current-KG (oldest first), running peers only. Live Log has range chip cycling `live`/`4h`/`24h` (default `4h` to keep payload small) → `/api/v1/director/log/history?hours=N`; warning filter re-renders from cache. |
 | `static/query.html` | 600 | Query Explorer over `/api/v1/query*`, `/feedback` |
 | `static/flag.js` | 620 | Flag widget (text-selection chip → `/api/v1/flags/match`) |
 
@@ -262,6 +273,8 @@ More in `docs/cross-cutting-concerns.md`.
 | `zenodo_lock_url.txt` | Peer→broker pointer |
 | `kg_strikes.json` / `cache_miss_kgs.json` | Reliability tracking |
 | `data/search_index.db` | SQLite FTS5+R-tree (~5 MB, auto-rebuild) |
+| `data/combined_log_24h.jsonl` | Live 24h merged log ring (pruned every ~10 min). NOT replicated to shadow — rebuilt from peers' own `recent_log` after takeover via `_combined_log_bootstrap_once`. |
+| `data/log_archive/YYYY-MM-DD.jsonl.gz` | Long-term per-day archive (full 200-day run). Replicated to shadow via `PUT /api/v1/director/log_archive` on the shadow loop — today-only every hour, full sweep on shadow change, sha256-cached so steady-state traffic is ~0. |
 | `data/shares/` | Share storage (1 GB cap, LRU) |
 
 ## Conventions for editing

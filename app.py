@@ -13789,6 +13789,110 @@ def process_txt():
     except Exception:
         pass
 
+    # --- Rollout / version distribution -------------------------
+    # Cheap one-line summary so an agent can immediately see whether a
+    # fleet-wide update has actually landed everywhere. Format:
+    #   versions: c705b81=42 1213f67=15 29fa0f1=2  (target=c705b81)
+    try:
+        from collections import Counter as _Ctr
+        target = (d.get('director_commit') or d.get('local_git_commit')
+                  or d.get('self_commit') or '')
+        if not target:
+            try:
+                import peer_director as _pd_mod
+                target = getattr(_pd_mod, '_LOCAL_GIT_COMMIT', '') or ''
+            except Exception:
+                target = ''
+        target = (target or '')[:7]
+        ver_ct = _Ctr()
+        for p in (d.get('peers') or []):
+            v = (p.get('git_commit') or '-')[:7] or '-'
+            ver_ct[v] += 1
+        top = ver_ct.most_common()
+        ver_s = ' '.join(f'{v}={n}' for v, n in top)
+        out.append(f'versions: {ver_s}'
+                   + (f'  (target={target})' if target else ''))
+        # Peers stuck on a stale commit while idle — these are the
+        # candidates auto-update should be rolling. Surface count + a
+        # few ids so we can spot stuck rollouts at a glance.
+        stale_idle = []
+        stale_running = []
+        manual_needed = []
+        for p in (d.get('peers') or []):
+            v = (p.get('git_commit') or '')[:7]
+            if not v or (target and v == target):
+                continue
+            us = p.get('update_state') or {}
+            if us.get('needs_manual_update'):
+                manual_needed.append(p['id'])
+                continue
+            ps = (p.get('processor_state') or '').lower()
+            if ps in ('running', 'processing', 'paused_zenodo'):
+                stale_running.append(p['id'])
+            else:
+                stale_idle.append(p['id'])
+        if stale_idle or stale_running or manual_needed:
+            parts = []
+            if stale_idle:
+                parts.append(f'idle={len(stale_idle)} ('
+                             + ','.join(sorted(stale_idle)[:6])
+                             + (',…' if len(stale_idle) > 6 else '') + ')')
+            if stale_running:
+                parts.append(f'mid-KG={len(stale_running)} ('
+                             + ','.join(sorted(stale_running)[:6])
+                             + (',…' if len(stale_running) > 6 else '') + ')')
+            if manual_needed:
+                parts.append('NEEDS-MANUAL=' + ','.join(sorted(manual_needed)))
+            out.append('rollout:  ' + '  '.join(parts))
+    except Exception as _e:
+        out.append(f'versions: (error: {_e})')
+
+    # --- Copernicus credential snapshot --------------------------
+    # Includes recent usage so we can spot creds that aren't being
+    # touched (often the symptom of a frontier-cred-plan that's only
+    # using a subset). One line per cred:
+    #   #i id--health  hold=peer  s/e/r=12/0/0(7d)  last=2h
+    try:
+        cred_pool = d.get('credentials') or []
+        # which peer currently holds each index (per frontier_cred_plan)?
+        held_by_idx = {}
+        for pid, idxs in (d.get('frontier_cred_plan') or {}).items():
+            for i in (idxs or []):
+                held_by_idx[int(i)] = pid
+        out.append('')
+        out.append(f'copernicus credentials ({len(cred_pool)}):')
+        out.append('  # id              health  held_by  s/e/r 7d   last_use   last_err')
+        now_ts = _t.time()
+        for c in cred_pool:
+            i = c.get('index')
+            cid_short = (c.get('client_id_short') or '')[:14].ljust(14)
+            health = (c.get('health', {}).get('label') or '-')[:7].ljust(7)
+            held = (held_by_idx.get(i) or '-')[:7].ljust(7)
+            u = c.get('usage') or {}
+            s7 = u.get('success_7d') or 0
+            e7 = u.get('error_7d') or 0
+            r7 = u.get('rotated_7d') or 0
+            ser = (f'{s7}/{e7}/{r7}').ljust(11)
+            def _ago(ts):
+                if not ts:
+                    return '   never'
+                age = max(0, int(now_ts - float(ts)))
+                return _hms(age).rjust(8)
+            lu = _ago(u.get('last_use'))
+            le = _ago(u.get('last_error'))
+            out.append(f'  {i} {cid_short} {health} {held} {ser} {lu}  {le}')
+        # Frontier plan: cred[i] -> peer[id]
+        plan = d.get('frontier_cred_plan') or {}
+        if plan:
+            pp = ' '.join(f'{pid}={",".join(map(str, idxs))}'
+                          for pid, idxs in sorted(plan.items()))
+            par = ','.join(d.get('parallel_frontiers_active') or [])
+            out.append(f'frontier plan: {pp}')
+            out.append(f'parallel frontiers active ({len(d.get("parallel_frontiers_active") or [])}):'
+                       f' {par or "-"}')
+    except Exception as _e:
+        out.append(f'(credentials snapshot error: {_e})')
+
     # --- Peer roster --------------------------------------------
     peers = list(d.get('peers') or [])
     if peer_q:
@@ -13902,6 +14006,73 @@ def process_txt():
             f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct}  {ver} {last}{flags}'
         )
 
+    # --- Active Zenodo uploads (peers in *upload* steps) ---------
+    upl = []
+    disk_warn = []
+    for p in (d.get('peers') or []):
+        ps = (p.get('processor_state') or '').lower()
+        step = (p.get('current_kg_step') or '').lower()
+        if ps in ('running', 'processing') and ('upload' in step
+                                                 or step in ('zenodo',)):
+            cs = p.get('current_kg_step_detail') or '-'
+            upl.append((p.get('id'), p.get('current_kg'),
+                        p.get('current_kg_name'), step, cs))
+        # Disk pressure (some statuses include `disk_free_gb`).
+        df = p.get('disk_free_gb')
+        if df is None:
+            df = (p.get('system') or {}).get('disk_free_gb')
+        if isinstance(df, (int, float)) and df < 5:
+            disk_warn.append((p.get('id'), df))
+    if upl:
+        out.append('')
+        out.append(f'active zenodo uploads ({len(upl)}):')
+        for pid, kg, name, step, detail in upl:
+            out.append(f'  {(pid or "?")[:6].ljust(6)} kg={kg or "-":<8} '
+                       f'{(name or "")[:20].ljust(20)} {step:<14} '
+                       f'{(detail or "")[:80]}')
+    if disk_warn:
+        out.append('')
+        out.append('disk pressure (<5 GB free):')
+        for pid, df in sorted(disk_warn, key=lambda x: x[1]):
+            out.append(f'  {pid:<6} {df:.1f} GB')
+
+    # --- Recent stale-peer / rollout events ----------------------
+    # Pull the last few "director" peer events (graceful update,
+    # hard update, queue sync of newly added peers, capacity drift)
+    # so the agent can see whether the auto-update wave is making
+    # progress without grepping the full 24h log.
+    try:
+        if _COMBINED_LOG_PATH.exists():
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 256 * 1024))
+                tail2 = fh.read()
+            evs = []
+            for line in tail2.split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get('peer') != 'director':
+                    continue
+                msg = (e.get('msg') or '').lower()
+                if not any(kw in msg for kw in (
+                        'graceful update', 'hard update', 'auto-retry',
+                        'rollout', 'cred ', 'capacity', 'park', 'plan drift')):
+                    continue
+                evs.append(e)
+            if evs:
+                out.append('')
+                out.append('recent director events (rollout/creds, last 12):')
+                for e in evs[-12:]:
+                    ts = (e.get('ts') or '')[5:19].replace('T', ' ')
+                    out.append(f'  {ts} {(e.get("msg") or "")[:120]}')
+    except Exception:
+        pass
+
     # --- Failed KGs ---------------------------------------------
     fk = (prog.get('failed_kgs') or [])[:8]
     if fk:
@@ -13975,7 +14146,13 @@ def process_txt():
         '# query: ?log=N (default 60, max 500), ?warn=1 (errors+warnings only),\n'
         '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
         '#        ?q=substring (msg filter). Pair with /api/v1/director/log/history\n'
-        '#        for full structured access.'
+        '#        for full structured access. New sections (May 2026):\n'
+        '#          versions:/rollout: — fleet update progress\n'
+        '#          copernicus credentials — per-cred 7d usage/health/holder\n'
+        '#          frontier plan / parallel frontiers active — cred slicing\n'
+        '#          active zenodo uploads — peers mid-upload + progress\n'
+        '#          disk pressure — peers <5 GB free\n'
+        '#          recent director events — rollout / cred-rotation events.'
     )
     return Response('\n'.join(out) + '\n',
                     mimetype='text/plain; charset=utf-8')

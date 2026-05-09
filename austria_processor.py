@@ -312,6 +312,68 @@ def check_disk_space(current_kg_code: str = "") -> bool:
         rf_cop_cache = Path("rf_training_data/copernicus_cache")
         _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
 
+    # 4b. Stale tile_checkpoints/<kg> subdirs.
+    #     Tile checkpoints accelerate same-KG retries, but on cache-only /
+    #     demoted peers (or after a KG was reclaimed by a peer) they become
+    #     pure dead weight — and previously the only big disk consumer left
+    #     once role-data eviction purged json/+index. We preserve checkpoints
+    #     only for KGs we are currently working on, plus those queued for our
+    #     own retry, and only those that are recent enough to plausibly be
+    #     retried before tier-2 expensive caches would be evicted.
+    if not _enough_freed():
+        ckpt_root = DATA_DIR / "tile_checkpoints"
+        if ckpt_root.exists():
+            try:
+                in_prog = IN_PROGRESS_FILE.read_text().strip() if IN_PROGRESS_FILE.exists() else ""
+            except Exception:
+                in_prog = ""
+            keep_codes: set[str] = {in_prog} if in_prog else set()
+            try:
+                if RETRY_QUEUE_FILE.exists():
+                    keep_codes.update(json.loads(RETRY_QUEUE_FILE.read_text() or "[]"))
+            except Exception:
+                pass
+            try:
+                if DEFERRED_FILE.exists():
+                    for entry in json.loads(DEFERRED_FILE.read_text() or "[]"):
+                        # entries are [idx, kg_dict, attempt]
+                        try:
+                            keep_codes.add(entry[1].get("kg_code", ""))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            now = time.time()
+            # Sort subdirs by mtime, oldest first; purge until enough freed.
+            subdirs = []
+            for d in ckpt_root.iterdir():
+                if not d.is_dir():
+                    continue
+                if d.name in keep_codes:
+                    continue
+                try:
+                    age_s = now - d.stat().st_mtime
+                    sz = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                    subdirs.append((d, age_s, sz))
+                except OSError:
+                    continue
+            subdirs.sort(key=lambda x: -x[1])  # oldest first
+            n_purged = 0
+            ckpt_freed = 0
+            for d, age_s, sz in subdirs:
+                if _enough_freed():
+                    break
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    ckpt_freed += sz
+                    freed_bytes += sz
+                    n_purged += 1
+                except Exception:
+                    continue
+            if n_purged:
+                _log.info("  tile_checkpoints: freed %.1f MB (%d stale KG dirs)",
+                          ckpt_freed / 1e6, n_purged)
+
     # --- Tier 2: expensive to re-fetch (openEO batch jobs, ~15-45 min) ---
     # Only evict these if tier 1 wasn't enough.
 

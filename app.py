@@ -5230,13 +5230,26 @@ def _combined_log_maybe_prune() -> None:
 
 def _combined_log_bootstrap_once() -> None:
     """On first call after startup, fetch ``recent_log`` from EVERY
-    reachable peer (running or not) and seed the persistent file. Idle
-    peers won't be probed by ``_combined_log_compute`` (it only hits
-    active+cache-only-running), so without this their last 200 lines
-    of history evaporate on the next peer restart."""
+    reachable peer and seed the persistent file. The hot path uses the
+    in-memory push cache only — but that cache is empty for ~30s after
+    a srv restart, so without this bootstrap idle peers' last 200 lines
+    of history evaporate on every restart.
+
+    Runs in a background thread so the first dashboard request after
+    restart returns instantly from cached/empty data while the seed
+    fills in. Idempotent via the ``_done`` flag."""
     if getattr(_combined_log_bootstrap_once, '_done', False):
         return
     _combined_log_bootstrap_once._done = True
+    import threading as _th_b
+    _th_b.Thread(target=_combined_log_bootstrap_once_blocking,
+                 daemon=True, name='combined-log-bootstrap').start()
+
+
+def _combined_log_bootstrap_once_blocking() -> None:
+    """Synchronous worker for the once-per-process bootstrap. Issues
+    one HTTP probe per peer (parallel, capped 20) — a single 5–10s
+    burst on the director at startup, never repeated."""
     try:
         cfg = pd.load_peers_config()
         targets = [(p.get('id'), p.get('url'))

@@ -4767,10 +4767,15 @@ class PeerDirector:
             local = sp.run(['git', 'rev-parse', 'main'],
                            capture_output=True, text=True, timeout=5,
                            cwd=repo).stdout.strip()
-            if not local or local != _LOCAL_GIT_COMMIT:
-                # Branch and HEAD diverged (detached HEAD?); skip — the
-                # human-driven /director/update_peers route handles that.
+            if not local:
                 return
+            # NOTE: do NOT gate on local == _LOCAL_GIT_COMMIT.
+            # _LOCAL_GIT_COMMIT is frozen at srv-import time; commits
+            # landed via shelley/git after srv started will make local
+            # main strictly ahead, and we still want them on origin so
+            # peers can pick them up. The previous gate caused a 12 h
+            # outage where 8 unpushed commits left peers stuck on the
+            # pre-multipart zenodo_client and frontier uploads failing.
             ahead = sp.run(['git', 'rev-list', '--count',
                             'origin/main..main'],
                            capture_output=True, text=True, timeout=5,

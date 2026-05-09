@@ -56,7 +56,39 @@ except Exception:
 # (gitignored). They are added/managed at runtime via /api/v1/credentials
 # and synced to peers via the HA snapshot mechanism (director_ha.py).
 # Nothing is hardcoded here — the repo is public.
-_BUILTIN_CREDENTIALS: list = []
+#
+# Optional bootstrap seed (env-only, never committed): set
+# ``COPERNICUS_BOOTSTRAP_CREDS`` to a JSON list of
+# ``[{"client_id":"sh-...","client_secret":"..."}, ...]`` (or just
+# ``[["sh-...","..."], ...]``). These are merged into the in-memory
+# credential list at module import so a freshly-bootstrapped peer with
+# an empty JSON store still has *something* to work with even if the
+# director’s fan-out is broken (as in the 2026-05-08 incident). Values
+# are NOT written to ``copernicus_credentials.json`` — the env var stays
+# the source of truth, so rotating it propagates on restart.
+def _bootstrap_creds_from_env() -> list:
+    raw = os.environ.get("COPERNICUS_BOOTSTRAP_CREDS", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    out: list = []
+    for entry in data or []:
+        if isinstance(entry, dict):
+            cid = (entry.get("client_id") or "").strip()
+            sec = (entry.get("client_secret") or "").strip()
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            cid = str(entry[0]).strip()
+            sec = str(entry[1]).strip()
+        else:
+            continue
+        if cid and sec:
+            out.append((cid, sec))
+    return out
+
+_BUILTIN_CREDENTIALS: list = _bootstrap_creds_from_env()
 
 # Credentials store path (instance-local; not in git)
 _CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")

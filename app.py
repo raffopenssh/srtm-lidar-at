@@ -5015,6 +5015,14 @@ _COMBINED_LOG_STALE = 60.0    # serve stale + bg refresh up to here
 #   {"ts": iso8601, "peer": "at3", "level": "info", "msg": "...",
 #    "kg": "61225"}
 # Append-only; pruned in-place every ~10 min to drop entries > 24h.
+#
+# IMPORTANT — EMA isolation: this ring is purely diagnostic. It is NOT
+# read by ``_capacity_factor`` / per-peer noise EMAs in peer_director.
+# Those are fed exclusively by peers’ self-reported ``warning_rates``
+# (pushed every 30s and tallied via ``austria_processor.add_log→
+# _classify_warning``). Adding more peers to the merged probe —
+# including idle/paused ones — cannot raise the fleet capacity factor.
+# Do not change this without re-checking peer_director._capacity_factor.
 import os as _os_log
 import threading as _th_log
 from datetime import datetime, timedelta, timezone
@@ -5099,12 +5107,18 @@ def _combined_log_persist(merged_with_peer: list[dict]) -> int:
                         ts = e.get('ts', '')
                         if not ts or ts <= last:
                             continue
+                        # Persist original level for forensics, but
+                        # also stamp ``ema_safe=True`` to make the
+                        # invariant machine-checkable: nothing in this
+                        # file feeds EMA / capacity_factor. See the
+                        # block comment near _COMBINED_LOG_PATH.
                         fh.write(json.dumps({
                             'ts': ts,
                             'peer': pid,
                             'level': e.get('level', ''),
                             'msg': e.get('msg', ''),
                             'kg': e.get('kg', ''),
+                            'ema_safe': True,
                         }, ensure_ascii=False))
                         fh.write('\n')
                         written += 1
@@ -5202,8 +5216,19 @@ def _combined_log_bootstrap_once() -> None:
 
 
 def _combined_log_compute():
-    """Probe every running peer in parallel, merge their recent_log.
-    Hot path: the dashboard polls this every 5s on every open browser."""
+    """Probe every reachable peer in parallel, merge their recent_log.
+    Hot path: the dashboard polls this every 5s on every open browser.
+
+    Probes ALL online peers (not just active/cache-running). Idle peers
+    still carry the tail of their last KG’s recent_log in progress.json,
+    and — more importantly — a peer that just hit auth/credential
+    failures or got SIGTERMed will only show those entries while idle.
+    The 2026-05-08 incident silently left half the fleet credential-less
+    because we only listened to peers that managed to *start* a KG.
+
+    All entries are tagged ``level='info'`` in the persistent ring — see
+    ``_combined_log_persist`` — so they don’t feed the EMA.
+    """
     from concurrent.futures import ThreadPoolExecutor
     import time as _time
     d = pd.get_director()
@@ -5214,13 +5239,11 @@ def _combined_log_compute():
         pid = p.get('id')
         if not pid:
             continue
-        is_active = p.get('is_active') or pid == status.get('active_peer')
-        is_cache_only = bool(p.get('cache_only_run'))
-        running = p.get('processor_state') in ('running', 'processing')
-        if not (is_active or (is_cache_only and running)):
-            continue
         # Skip peers the director already knows are offline — they hang
-        # the response while we wait for connect timeout.
+        # the response while we wait for connect timeout. Everything
+        # else (running, idle, paused, cache-only) is fair game: we want
+        # the merged ring to contain warnings from peers that never
+        # actually started a KG (e.g. auth failures, missing creds).
         if not p.get('online', True):
             continue
         peer_cfg = pd.get_peer_by_id(cfg, pid)

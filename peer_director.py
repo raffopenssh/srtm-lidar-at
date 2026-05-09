@@ -1808,6 +1808,24 @@ class PeerDirector:
         except Exception:
             pass
         log.info('PeerDirector started (lock acquired)')
+        # Smoke test: a director with zero Copernicus credentials cannot
+        # run frontiers. The 2026-05-08 incident silently disarmed the
+        # whole fleet because builtin creds were removed and the
+        # cred-fanout helper had a NameError. Surfacing this loud at
+        # startup makes the failure mode obvious in journalctl.
+        try:
+            import copernicus as _cop_smoke
+            n_creds = len(_cop_smoke.list_credentials() or [])
+            if n_creds == 0:
+                log.critical(
+                    'CRITICAL: director starting with 0 Copernicus '
+                    'credentials. Frontier KGs will fail. Add via '
+                    'POST /api/v1/credentials or set '
+                    'COPERNICUS_BOOTSTRAP_CREDS env on srv.service.')
+            else:
+                log.info('Director credential pool: %d entries', n_creds)
+        except Exception as _e:
+            log.warning('credential smoke test failed: %s', _e)
 
     def stop(self, *, join_timeout: float = 8.0):
         """Stop the director loop, join the thread, and release the file lock.
@@ -4542,6 +4560,16 @@ class PeerDirector:
     STALE_UPDATE_GRACE_S = 600          # 10 min idle before first auto-retry
     STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
     STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
+    # Graceful nudges to mid-KG peers also need a hard ceiling. Without
+    # this we re-fire SIGTERMs every 30 min indefinitely on a peer that
+    # never reaches a KG boundary in our gap window (long-tail upload,
+    # or a recurring failure mode — see 2026-05-08 incident where 12 h
+    # of graceful kicks SIGTERMed the same KGs over and over while the
+    # cred fan-out was broken). After this many attempts we give up
+    # nudging and let the next idle window be picked up by the hard
+    # path; this also stops needs_manual_update from being suppressed
+    # forever just because the peer is always busy.
+    STALE_GRACEFUL_MAX_ATTEMPTS = 3
     # Wave-based update rollout: cap how many peers we trigger per tick
     # so the cluster restarts in waves rather than a single thundering
     # herd. With 50 peers all triggered at once (the 2026-05-06
@@ -4663,6 +4691,11 @@ class PeerDirector:
             if not idle:
                 rec['waiting_for_idle'] = True
                 last_graceful = float(rec.get('last_graceful_attempt') or 0)
+                gattempts = int(rec.get('graceful_attempts') or 0)
+                if gattempts >= self.STALE_GRACEFUL_MAX_ATTEMPTS:
+                    rec['needs_manual_update'] = True
+                    tracked[pid] = rec
+                    continue
                 if (now - last_graceful) >= 1800:
                     graceful_candidates.append((peer, rec, commit))
                 else:
@@ -4703,15 +4736,19 @@ class PeerDirector:
             if graceful_budget <= 0:
                 tracked[pid] = rec  # try again next tick
                 continue
+            gattempts = int(rec.get('graceful_attempts') or 0)
             log.info('Stale peer %s mid-KG (%s on %s); sending '
-                     'graceful update to schedule restart at KG boundary',
-                     pid, rec.get('last_state'), commit)
+                     'graceful update to schedule restart at KG boundary '
+                     '(attempt %d/%d)',
+                     pid, rec.get('last_state'), commit,
+                     gattempts + 1, self.STALE_GRACEFUL_MAX_ATTEMPTS)
             try:
                 gres = trigger_peer_update(peer['url'], graceful=True)
             except Exception as e:
                 gres = {'error': str(e)}
             rec['last_graceful_attempt'] = now
             rec['last_graceful_result'] = gres
+            rec['graceful_attempts'] = gattempts + 1
             tracked[pid] = rec
             graceful_budget -= 1
             graceful_done.append(pid)

@@ -301,15 +301,16 @@ def _fanout_credentials(op: str, cid: str, csec: str | None = None,
         body.update({'client_secret': csec, 'label': label,
                       'notes': notes, 'validate': False})
 
+    import requests as _req
     def _push(url: str) -> tuple[str, dict | None, str | None]:
         u = url.rstrip('/')
         try:
             if op == 'add':
-                r = requests.post(u + '/api/v1/credentials',
+                r = _req.post(u + '/api/v1/credentials',
                                     json=body, headers=headers,
                                     timeout=timeout)
             else:
-                r = requests.delete(
+                r = _req.delete(
                     u + '/api/v1/credentials/' + cid,
                     headers=headers, timeout=timeout)
             if 200 <= r.status_code < 300:

@@ -13998,7 +13998,47 @@ def process_txt():
         + (', ' + str(len(hidden)) + ' hidden idle' if hidden and not show_hidden else '')
         + '):'
     )
-    out.append('  id     role     state     kg     name                 step          elapsed  bw%   ver     last')
+    # Token-cheap commit recovery: rather than fan out HTTPS probes to
+    # 60 peers (which is what causes the director to load up during
+    # diagnostic moments — exactly when we *least* want extra fan-out),
+    # mine the merged 24h log for the most recent
+    #     "<graceful|hard> update → <commit> (peer on <prev>; attempt N)"
+    # event per peer. The director emits one of these every time it
+    # decides a peer must move to a new commit, and the receiving peer's
+    # /admin/update is synchronous-ish (graceful waits for KG boundary).
+    # If we observe a graceful/hard update event on COMMIT_X for peer P,
+    # then either P already runs COMMIT_X (hard) or P will after the
+    # current KG (graceful). Either way it's a tighter signal than the
+    # peer_meta cache, which can be hours stale.
+    import re as _re
+    commit_from_log: dict[str, str] = {}
+    try:
+        log_path = Path('data') / 'combined_log_24h.jsonl'
+        if log_path.exists():
+            pat = _re.compile(r'(graceful|hard) update → (\w+)')
+            with log_path.open() as _lf:
+                for line in _lf:
+                    try:
+                        ent = json.loads(line)
+                    except Exception:
+                        continue
+                    pid = ent.get('peer') or ent.get('peer_id')
+                    msg = ent.get('msg') or ent.get('message') or ''
+                    if not pid or not msg:
+                        continue
+                    m = pat.search(msg)
+                    if m:
+                        # Last write wins (events are appended chronologically).
+                        commit_from_log[pid] = m.group(2)[:7]
+    except Exception:
+        pass
+    if commit_from_log:
+        for p in visible:
+            if not (p.get('git_commit') or '').strip():
+                v = commit_from_log.get(p.get('id'))
+                if v:
+                    p['git_commit'] = v
+    out.append('  id     role     state     kg     name                 step          elapsed  bw%   ver     creds  last')
     for p in visible:
         pid = _short(p.get('id', '?'), 6).ljust(6)
         role = _short(_peer_role(p), 8).ljust(8)
@@ -14022,6 +14062,15 @@ def process_txt():
         bw_pct = ('%3d%%' % min(99, int(100 * used_gb / max(0.01, budget_gb)))).rjust(4) \
             if budget_gb else ' -  '
         ver = (_short(p.get('git_commit') or '-', 7)).ljust(7)
+        # Surface assigned credential indices so we can verify each
+        # frontier peer is actually on its slice (the recent index-
+        # mismatch incident was diagnosed by spotting blank creds here).
+        ci = p.get('cred_indices')
+        if isinstance(ci, list):
+            ci_s = ','.join(str(int(x)) for x in ci)
+        else:
+            ci_s = '-'
+        ci_col = _short(ci_s, 6).ljust(6)
         last = _short(p.get('last_kg_name') or p.get('last_kg_code') or '-', 14)
         flags = ''
         us = p.get('update_state') or {}
@@ -14032,7 +14081,7 @@ def process_txt():
         if not p.get('online'):
             flags += ' ⚠off'
         out.append(
-            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct}  {ver} {last}{flags}'
+            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct}  {ver} {ci_col} {last}{flags}'
         )
 
     # --- Active Zenodo uploads (peers in *upload* steps) ---------

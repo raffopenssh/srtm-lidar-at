@@ -1796,6 +1796,22 @@ async function fetchLog24h(force) {
     const j = await r.json();
     _log24hPayload = {recent_log: j.entries || [], _multi_peer: true, _is_24h: true};
     _log24hFetchLast = Date.now();
+    // Token-cheap commit recovery: the director emits
+    //   "<graceful|hard> update → <commit> (peer on <prev>; attempt N)"
+    // every time it nudges a peer onto a new commit. Mine those events
+    // so per-peer version tags stay accurate even when peer_meta is
+    // stale (e.g. right after a hard-stop → respawn cycle), without
+    // fan-out probes from the dashboard.
+    try {
+      const _re = /(?:graceful|hard) update → (\w{6,40})/;
+      for (const ent of (j.entries || [])) {
+        const pid = ent.peer || ent.peer_id;
+        const msg = ent.msg || ent.message || '';
+        if (!pid || !msg) continue;
+        const m = msg.match(_re);
+        if (m) _rememberPeerCommit(pid, m[1].slice(0, 7));
+      }
+    } catch (_) {}
     prevLogHash = '';
     if (_logRange24h) updateLog(_log24hPayload);
   } catch (_) {} finally {

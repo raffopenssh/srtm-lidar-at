@@ -4905,6 +4905,23 @@ class PeerDirector:
                 continue
             live_ids.add(pid)
             rec = dict(tracked.get(pid) or {})
+            prev_commit = rec.get('commit')
+            # Peer's commit advanced since last tick (manual update or
+            # an out-of-band pull): wipe the auto-retry counters and
+            # clear the manual-update flag. Stays stale (still != local)
+            # so we'll let the auto path fire a fresh round of retries
+            # if needed; but the operator no longer sees the scary
+            # "manual update needed" tag for a peer that has clearly
+            # been touched.
+            if prev_commit and commit and prev_commit != commit:
+                log.info('Peer %s commit advanced %s -> %s; resetting '
+                         'auto-retry state', pid, prev_commit[:8], commit[:8])
+                rec['attempts'] = 0
+                rec['graceful_attempts'] = 0
+                rec['first_seen_stale'] = now
+                rec.pop('needs_manual_update', None)
+                rec.pop('last_attempt', None)
+                rec.pop('last_result', None)
             rec.setdefault('first_seen_stale', now)
             rec.setdefault('attempts', 0)
             rec['commit'] = commit

@@ -4515,10 +4515,59 @@ def director_add_peer():
         current_urls.add(peer_url)
         peer_urls_path.write_text('\n'.join(sorted(current_urls)) + '\n')
 
+    # Bootstrap Copernicus credentials to the new peer. Without this a
+    # freshly-added peer comes up with an empty store and cannot run
+    # frontier work — director's regular fan-out only fires when a cred
+    # is *added/deleted*, never on peer-join. Reads the director's own
+    # store (no hardcoding) and pushes each entry with X-Cred-Fanout=1
+    # so the receiving peer skips re-validation and re-broadcast.
+    creds_pushed = 0
+    creds_failed = 0
+    if online:
+        try:
+            import copernicus as _cop
+            store = _cop.list_credentials_with_secrets()
+            tok = ''
+            try:
+                tok = Path('data/admin_token').read_text().strip()
+            except Exception:
+                pass
+            hdrs = {_CRED_FANOUT_HEADER: '1'}
+            if tok:
+                hdrs['X-Admin-Token'] = tok
+            for c in store or []:
+                cid = (c.get('client_id') or '').strip()
+                sec = (c.get('client_secret') or '').strip()
+                if not cid or not sec:
+                    continue
+                try:
+                    rr = requests.post(
+                        peer_url + '/api/v1/credentials',
+                        json={'client_id': cid, 'client_secret': sec,
+                              'label': c.get('label', ''),
+                              'notes': c.get('notes', ''),
+                              'validate': False},
+                        headers=hdrs, timeout=10,
+                    )
+                    if rr.ok:
+                        creds_pushed += 1
+                    else:
+                        creds_failed += 1
+                except Exception:
+                    creds_failed += 1
+            log.info('add_peer %s: bootstrapped %d/%d credentials',
+                     peer_id, creds_pushed,
+                     creds_pushed + creds_failed)
+        except Exception as _e:
+            log.warning('add_peer %s: credential bootstrap failed: %s',
+                        peer_id, _e)
+
     return jsonify({
         'status': 'added',
         'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
         'total_peers': len(cfg['peers']),
+        'creds_bootstrapped': creds_pushed,
+        'creds_failed': creds_failed,
     })
 
 
@@ -5002,8 +5051,12 @@ def director_proxy_all_status():
 
 
 _COMBINED_LOG_CACHE = {'ts': 0.0, 'data': None, 'refreshing': False}
-_COMBINED_LOG_TTL = 8.0       # serve cached if newer
-_COMBINED_LOG_STALE = 60.0    # serve stale + bg refresh up to here
+# TTL choice: peers push their progress.json (incl. recent_log) every
+# PEER_PUSH_INTERVAL_S = 30s, so refreshing the merged view more often
+# than that just rescans the same in-memory data. 15s gives the
+# dashboard a snappy feel without burning CPU on dict copies.
+_COMBINED_LOG_TTL = 15.0      # serve cached if newer
+_COMBINED_LOG_STALE = 90.0    # serve stale + bg refresh up to here
 
 # Persistent 24h merged-log ring (across all peers). Without this we
 # lose every recent_log entry the moment a peer's ring buffer wraps
@@ -5251,10 +5304,19 @@ def _combined_log_compute():
             continue
         targets.append((pid, peer_cfg.get('url')))
 
+    # IMPORTANT: read pushed status only — do NOT trigger synchronous
+    # HTTP probes here. Every peer pushes its full progress.json (incl.
+    # recent_log) to the director every 30s, so the in-memory push
+    # cache already has fresh data for every online peer. Calling
+    # ``pd.get_peer_status(url)`` would fall back to a per-peer HTTP
+    # request when a push is stale; with N=60 peers and a 5s dashboard
+    # poll that means up to ~12 outbound requests/s on the director
+    # just for the live-log widget. Push-only keeps this O(memory).
     def _probe(t):
-        pid, url = t
+        pid, _url = t
         try:
-            ps = pd.get_peer_status(url) or {}
+            ent = pd.get_pushed_status(pid)
+            ps = (ent or {}).get('status') or {}
         except Exception:
             ps = {}
         return pid, ps.get('recent_log') or []

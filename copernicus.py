@@ -644,6 +644,26 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
     }
 
 
+def list_credentials_with_secrets() -> list:
+    """Return full credential records including ``client_secret``.
+
+    For director-internal use only (peer bootstrap on /peers/add). The
+    public ``list_credentials()`` strips secrets; this one is gated
+    behind admin-token-only routes that already have access to the
+    on-disk store.
+    """
+    with _cred_lock:
+        _reload_credentials_from_disk()
+        creds = list(_CREDENTIALS)
+    out = []
+    for cid, csec in creds:
+        meta = dict(_cred_meta.get(cid, {}))
+        meta['client_id'] = cid
+        meta['client_secret'] = csec
+        out.append(meta)
+    return out
+
+
 def list_credentials() -> list:
     """Return public credential metadata (client_id, source, last_validated_at,
     last_status, exhausted, label). Never returns secrets.

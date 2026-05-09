@@ -398,6 +398,8 @@ class ProgressTracker:
             "buildings_total": 0,
             "started_at": None,
             "last_kg_code": None,
+            "last_kg_name": None,
+            "last_kg_uploaded_at": None,
             "last_kg_seconds": 0,
             "n_new_buildings_total": 0,
             "n_infrastructure_total": 0,
@@ -624,7 +626,8 @@ class ProgressTracker:
 
     def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0,
                         last_kg_code: str = None, last_kg_seconds: float = 0,
-                        n_new_buildings: int = 0, n_infrastructure: int = 0):
+                        n_new_buildings: int = 0, n_infrastructure: int = 0,
+                        last_kg_name: str = None):
         with self._lock:
             from kg_splitter import is_block_code, parent_kg_code
             _parent = parent_kg_code(last_kg_code) if last_kg_code and is_block_code(last_kg_code) else last_kg_code
@@ -643,6 +646,11 @@ class ProgressTracker:
             self._state["buildings_total"] += buildings
             if last_kg_code is not None:
                 self._state["last_kg_code"] = last_kg_code
+                # Record finish time so the dashboard can render "X ago"
+                # for idle/completed peers without joining the manifest.
+                self._state["last_kg_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+            if last_kg_name is not None:
+                self._state["last_kg_name"] = last_kg_name
             self._state["last_kg_seconds"] = last_kg_seconds
             self._state["n_new_buildings_total"] += n_new_buildings
             self._state["n_infrastructure_total"] += n_infrastructure
@@ -9200,6 +9208,7 @@ def main():
                         buildings=result.get("n_buildings", 0),
                         upload_bytes=upload_stats["total_bytes"],
                         last_kg_code=kg_code,
+                        last_kg_name=kg_name,
                         last_kg_seconds=elapsed_kg,
                         n_new_buildings=result.get("n_new_buildings", 0),
                         n_infrastructure=result.get("n_infrastructure", 0),

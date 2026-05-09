@@ -406,22 +406,56 @@
     min-width: 0;
     transition: background 0.15s, border-color 0.15s;
   }
+  #directorPeers > .peer-card { cursor: pointer; }
   #directorPeers > .peer-card.pm-active { border-color: var(--blue);
                                           background: rgba(88,166,255,0.06); }
   #directorPeers > .peer-card.pm-owner  { border-color: var(--yellow); }
   #directorPeers > .peer-card.pm-idle   { opacity: 0.55; }
-  /* Details collapsed by default; click expands. Expanded card spans the full
-     row so the legacy detail content has room to breathe. */
+  /* Selected (= peer currently shown in the KG detail card above) */
+  #directorPeers > .peer-card.pm-selected {
+    border-color: var(--green) !important;
+    box-shadow: 0 0 0 1px rgba(63,185,80,0.55) inset;
+    opacity: 1 !important;
+  }
+  /* Version badge inside the compact strip */
+  .pm-ver { font-family: monospace; font-size: 9px; color: var(--dim);
+            flex-shrink: 0; opacity: 0.75; }
+  .pm-ver.stale { color: var(--yellow); opacity: 1; }
+  /* Expanded action bar — surfaces ⋯ menu items as buttons */
+  .peer-actions-row {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    margin-top: 8px;
+  }
+  .peer-actions-row .pmenu-item {
+    position: static; display: inline-flex !important; width: auto !important;
+    align-items: center; text-align: left;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 3px 8px;
+    font-size: 11px; line-height: 1.3; color: var(--text);
+    cursor: pointer; font-family: inherit; white-space: nowrap;
+  }
+  .peer-actions-row .pmenu-item:hover { background: var(--card); border-color: var(--blue); }
+  .peer-actions-row .pmenu-item.warn   { border-color: rgba(210,153,34,0.55); color: var(--yellow); }
+  .peer-actions-row .pmenu-item.danger { border-color: rgba(248,81,73,0.55); color: var(--red); }
+  /* Details collapsed by default; chevron expands inline. Expanded card
+     stays in its grid cell (acts like a card, not a full row), gets a
+     gentle elevation, and shows its detail body below the strip. */
   #directorPeers > .peer-card .peer-detail-body { display: none; }
   #directorPeers > .peer-card.expanded {
-    grid-column: 1 / -1;
-    padding: 6px 8px;
+    padding: 8px 10px;
     opacity: 1 !important;
     background: var(--card);
+    border-color: var(--border);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    z-index: 2;
+    cursor: default;
+  }
+  #directorPeers > .peer-card.expanded.pm-selected {
+    border-color: var(--green) !important;
   }
   #directorPeers > .peer-card.expanded .peer-detail-body {
-    display: block; margin-top: 6px;
-    padding-top: 6px; border-top: 1px solid var(--border);
+    display: block; margin-top: 8px;
+    padding-top: 8px; border-top: 1px solid var(--border);
   }
   @media (max-width: 600px) {
     #directorPeers { grid-template-columns: 1fr !important; gap: 2px !important; }
@@ -1911,6 +1945,22 @@ function _currentPeerCardMeta() {
 // peer-status-shaped object (id, url, processor_state, online, enabled,
 // scheduled, reserved_kg, cache_only_run, current_kg) plus optional
 // flags (isActive, hideRemove).
+// Flat action row — same items as peerActionsMenu but rendered as a
+// horizontal strip of buttons for the expanded peer card.
+function peerActionsRow(p, opts) {
+  // Reuse the menu HTML, then strip the wrapper / pop / button so we
+  // get just the .pmenu-item buttons. Keep stopPropagation guards.
+  const html = peerActionsMenu(p, opts);
+  // Extract everything between the outer popover div
+  const m = html.match(/<div class="pmenu-pop">([\s\S]*?)<\/div><\/span>$/);
+  if (!m) return '';
+  // Drop separators and the empty placeholder.
+  const body = m[1]
+    .replace(/<div class="pmenu-sep"><\/div>/g, '')
+    .replace(/<div class="pmenu-empty">[^<]*<\/div>/g, '');
+  if (!body.trim()) return '';
+  return '<div class="peer-actions-row" onclick="event.stopPropagation()">' + body + '</div>';
+}
 function peerActionsMenu(p, opts) {
   opts = opts || {};
   const id = p.id || '';
@@ -2703,6 +2753,7 @@ async function fetchAllPeerStatuses() {
       _peerCardIdx = 0;
     }
     _renderPeerCard();
+    _highlightSelectedPeerCard();
   } catch (e) {
     // ignore
   } finally {
@@ -2731,6 +2782,45 @@ function _navKgPeer(delta) {
   _peerCardPinned = true;
   _peerCardIdx = Math.max(0, Math.min(_peerCards.length - 1, _peerCardIdx + delta));
   _renderPeerCard();
+  _highlightSelectedPeerCard();
+}
+// Public hook for clicking a peer card in the Director list — moves the
+// per-peer KG detail view to that peer, pins it so the carousel won't
+// auto-resort, and visually marks the chosen peer card. Falls back to a
+// no-op if the carousel hasn't loaded yet (next poll will catch up).
+// Tracks the user's chosen peer id even when it isn't in the live
+// carousel (e.g. stopped peers aren't returned by proxy/all_status).
+// The highlight is sticky across re-renders.
+let _selectedPeerId = null;
+function selectPeerCard(peerId, opts) {
+  opts = opts || {};
+  _selectedPeerId = peerId;
+  if (_peerCards && _peerCards.length) {
+    const idx = _peerCards.findIndex(p => p.id === peerId);
+    if (idx >= 0) {
+      _peerCardPinned = true;
+      _peerCardIdx = idx;
+      _renderPeerCard();
+    }
+  }
+  _highlightSelectedPeerCard();
+  if (opts.scroll) {
+    try {
+      document.getElementById('kgCard').scrollIntoView({
+        behavior: 'smooth', block: 'nearest'});
+    } catch(_) {}
+  }
+}
+function _highlightSelectedPeerCard() {
+  // Prefer the explicitly clicked peer; fall back to whatever the
+  // carousel is currently showing so the user always sees a marker.
+  const carouselId = (_peerCards && _peerCards[_peerCardIdx])
+    ? _peerCards[_peerCardIdx].id : null;
+  const sel = _selectedPeerId || carouselId;
+  document.querySelectorAll('#directorPeers > .peer-card').forEach(c => {
+    if (sel && c.dataset.peerId === sel) c.classList.add('pm-selected');
+    else c.classList.remove('pm-selected');
+  });
 }
 
 async function _refreshCompletedKgs() {
@@ -3919,16 +4009,22 @@ function renderCapacityHistory() {
 // peer_director.get_status(). Mirrors _peerProgressKey but returns
 // a positive 0..1 number for use in a progress bar.
 function _peerKgFrac(p) {
+  // Unified with the tile-progress bar in updateKgCard so the peer card
+  // and the per-peer KG detail view always show the same percentage.
+  // Tile progress dominates when tile info is available (it's what
+  // every long-running step actually iterates over); otherwise we fall
+  // back to step-pipeline position.
+  const ct = p.current_kg_tile || 0, nt = p.current_kg_n_tiles || 0;
+  if (nt > 0 && ct > 0) {
+    return Math.min(1, Math.max(0, (ct - 1) / nt));
+  }
   let step = p.current_kg_step || '';
   if (/^tile_\d+$/.test(step)) step = 'segment';
   if (step.startsWith('upload')) step = 'upload';
   if (step === 'json_summary') step = 'json';
   let stepIdx = step ? STEPS.indexOf(step) : -1;
   if (stepIdx < 0) stepIdx = 0;
-  const stepFrac = stepIdx / Math.max(1, STEPS.length - 1);
-  const ct = p.current_kg_tile || 0, nt = p.current_kg_n_tiles || 0;
-  const tileFrac = (nt > 0) ? Math.min(1, Math.max(0, (ct - 1) / nt)) : 0;
-  return Math.min(1, stepFrac + (tileFrac * 1.0 / Math.max(1, STEPS.length - 1)));
+  return stepIdx / Math.max(1, STEPS.length - 1);
 }
 function _fmtElapsedShort(iso) {
   if (!iso) return '';
@@ -4022,8 +4118,18 @@ function _peerMobileBlock(p, ctx) {
     kgMeta = 'reserved';
   } else {
     kgCode = '';
-    kgName = '<span style="color:var(--dim)">' + esc(ctx.stLabel) + '</span>';
-    kgMeta = '';
+    // Show the last completed KG name+ago time when idle, so a stopped
+    // peer card still tells you what it last did.
+    if (p.last_kg_code) {
+      const ago = fmtRelPast(p.last_kg_uploaded_at);
+      kgName = '<span style="color:var(--dim)">' + esc(ctx.stLabel) + '</span>'
+        + ' · last: <span style="color:#b5b9bd">'
+        + esc(p.last_kg_name || p.last_kg_code) + '</span>';
+      kgMeta = ago || '';
+    } else {
+      kgName = '<span style="color:var(--dim)">' + esc(ctx.stLabel) + '</span>';
+      kgMeta = '';
+    }
   }
   const interruptedNote = (!ctx.isRunning && p.current_kg)
     ? '\n(interrupted — last KG before stop)' : '';
@@ -4034,7 +4140,11 @@ function _peerMobileBlock(p, ctx) {
     + interruptedNote;
   const barCls = 'pm-bar' + (ctx.isRunning ? ' run' : '');
   // Click anywhere on the strip (except menu/expander) toggles details.
-  let h = '<div class="peer-mobile pm-card" onclick="this.closest(\'.peer-card\').classList.toggle(\'expanded\')">';
+  // Click strip → select this peer in the KG detail carousel above.
+  // Expansion lives on the chevron (and on the ⋯ button) so the strip
+  // click never accidentally opens detail — selection is the primary
+  // gesture; expanding for legacy detail is secondary.
+  let h = '<div class="peer-mobile pm-card" onclick="selectPeerCard(\'' + esc(p.id) + '\', {scroll:true})">';
   // Donut (remaining bandwidth)
   h += '<span title="bw: ' + ctx.usedGb.toFixed(1) + ' / ' + ctx.budgetGb
      + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
@@ -4043,6 +4153,15 @@ function _peerMobileBlock(p, ctx) {
   const attCls = _peerAttClass(p, ctx);
   h += '<span class="pm-id' + (attCls ? ' ' + attCls : '') + '">'
      + esc(_peerDisplayId(p.id)) + '</span>';
+  // Version tag — last-known commit (sticky via director peer_meta)
+  // even when the peer is offline / cache-stale.
+  const _commit = (p.git_commit || '').slice(0, 7);
+  if (_commit) {
+    const _stale = _localCommit && _commit !== _localCommit.slice(0, 7);
+    h += '<span class="pm-ver' + (_stale ? ' stale' : '') + '"'
+       + ' title="git ' + esc(_commit) + (_stale ? ' (stale vs ' + esc(_localCommit) + ')' : '') + '">'
+       + esc(_commit) + '</span>';
+  }
   // The progress bar (with role tag + KG info baked in)
   h += '<div class="' + barCls + '" title="' + esc(tip) + '">';
   h +=   '<div class="pm-fill" style="width:' + kgPct + '%;background:' + kgColor + '"></div>';
@@ -4255,42 +4374,35 @@ function renderDirector(d) {
     else if (isOwner) pmCls += ' pm-owner';
     else if (!isRunning) pmCls += ' pm-idle';
     html += '<div class="' + pmCls + '" data-peer-id="' + esc(p.id) + '">';
+    // Strip first (always visible) — detail body lives below it.
+    html += _peerMobileBlock(p, {
+      isActive, isOwner, isInactive, isRunning,
+      stCls, stLabel, usedGb, budgetGb, remainGb, bwPct, bwColor,
+    });
     html += '<div class="peer-detail-body">';
 
     const isCacheOnly = !!p.cache_only_run;
-    if (!isInactive) {
-      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      let badge = '';
-      if (isActive) badge = ' ◀ active';
-      else if (isCacheOnly && isRunning) badge = ' · <span style="color:var(--blue);font-weight:500" title="cache-only peer (no Copernicus/Hansen fetches)">cache-only</span>';
-      else if (isReady) badge = ' ⏯ holds KG ' + esc(p.reserved_kg);
-      else if (isOwner) badge = ' ⏸ holds KG ' + esc(p.reserved_kg);
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + canaryBadge(p) + badge + '</span>';
-      html += '<span style="display:flex;align-items:center;gap:4px">';
-      html += peerActionsMenu(p, {isActive: isActive});
-      html += '</span>';
-      html += '</div>';
-      html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
-      if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
-      html += '</div>';
-      html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done';
+    // Header: badges + completed counter + region + version. We do NOT
+    // repeat state/current-KG here — the per-peer KG detail card above
+    // already shows that, and clicking the strip selects this peer there.
+    {
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">';
+      html += '<span style="font-size:12px;font-weight:600;">'
+        + esc(p.id) + roleBadge(p) + canaryBadge(p) + '</span>';
+      html += '<span style="font-size:11px;color:var(--dim);">'
+        + (p.completed||0) + ' done';
+      if (p.last_kg_code) {
+        const ago = fmtRelPast(p.last_kg_uploaded_at);
+        html += ' · last: ' + esc(p.last_kg_name || p.last_kg_code)
+              + (ago ? ' <span title="' + esc(p.last_kg_uploaded_at||'') + '">'
+                       + esc(ago) + '</span>' : '');
+      }
       const rtExp = regionTag(p);
       if (rtExp) html += ' · ' + rtExp;
       const vtExp = versionTag(p);
       if (vtExp) html += ' · ' + vtExp;
+      html += '</span>';
       html += '</div>';
-    }
-
-    // Bandwidth bar (always shown in detail)
-    if (isInactive) {
-      // Show inside hidden detail
-      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<span style="font-size:12px;font-weight:600;">' + esc(p.id) + roleBadge(p) + canaryBadge(p) + '</span>';
-      html += '</div>';
-      html += '<div style="font-size:11px;"><span class="' + stCls + '">' + stLabel + '</span>';
-      if (p.current_kg) html += ' · KG ' + esc(p.current_kg) + ' ' + esc(p.current_kg_name || '');
-      html += '</div>';
-      html += '<div style="font-size:11px;color:var(--dim);">' + (p.completed||0) + ' done</div>';
     }
     html += '<div style="margin-top:4px;font-size:10px;color:var(--dim);">';
     html += '📡 ' + usedGb.toFixed(1) + ' / ' + budgetGb + ' GB (' + remainGb.toFixed(1) + ' GB left)';
@@ -4345,15 +4457,15 @@ function renderDirector(d) {
       // Auto-retry in progress (1 attempt done, may try again)
       html += '<div style="font-size:10px;color:var(--dim);margin-top:4px" title="Director auto-retried update; waiting for commit to change">↻ auto-retrying update (' + (_us.attempts) + '/2)</div>';
     }
+    // Flattened action row — surfaces the ⋯ menu as visible buttons
+    // when the card is expanded. (Strip still has the popover ⋯.)
+    html += peerActionsRow(p, {isActive: isActive});
     html += '</div>'; // close .peer-detail-body
-    // ── Mobile compact view (≤600px) ───────────────────────────────
-    html += _peerMobileBlock(p, {
-      isActive, isOwner, isInactive, isRunning,
-      stCls, stLabel, usedGb, budgetGb, remainGb, bwPct, bwColor,
-    });
     html += '</div>'; // close card
   }
   container.innerHTML = html;
+  // Re-apply selection highlight after re-render.
+  _highlightSelectedPeerCard();
 
   // --- Capacity line (above peer cards) ---
   const cap = document.getElementById('directorCapacity');

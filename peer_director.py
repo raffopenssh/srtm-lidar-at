@@ -1945,7 +1945,7 @@ class PeerDirector:
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
-                   'peer_last_live_ts',
+                   'peer_last_live_ts', 'peer_meta',
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
                    'parallel_unreachable_count',
@@ -2035,11 +2035,28 @@ class PeerDirector:
                         'returning cached peer statuses', _rte)
             _fallback_from_cache('interpreter_shutdown')
 
+        # Persistent per-peer metadata: remembers last-known git_commit,
+        # region, last_kg_code/name/uploaded_at across peer reboots and
+        # status timeouts. Mutated below when a peer reports fresh values.
+        meta_cache = state.setdefault('peer_meta', {})
         peers_status = []
         for peer in peers_list:
             pid = peer['id']
             url = peer.get('url')
             ps = statuses.get(pid, {'state': 'unreachable'})
+            # Refresh meta_cache from the live status (only when the peer
+            # actually reported a value — never overwrite a known value
+            # with an empty string from a stale/proxied response).
+            try:
+                _meta = meta_cache.setdefault(pid, {})
+                for _k in ('git_commit', 'region', 'last_kg_code',
+                           'last_kg_name', 'last_kg_uploaded_at',
+                           'last_kg_seconds'):
+                    _v = ps.get(_k)
+                    if _v not in (None, '', 0):
+                        _meta[_k] = _v
+            except Exception:
+                pass
             bw = dict(state.get('peer_bandwidth', {}).get(pid, {}))
             proc_status = ps.get('state', 'unknown')
             # Surface effective per-peer budget so dashboard / API
@@ -2084,8 +2101,19 @@ class PeerDirector:
                 'completed': ps.get('completed', 0),
                 'bandwidth': bw,
                 'online': proc_status != 'unreachable',
-                'git_commit': ps.get('git_commit', ''),
-                'region': ps.get('region', ''),
+                'git_commit': (ps.get('git_commit')
+                               or (meta_cache.get(pid) or {}).get('git_commit', '')),
+                'region': (ps.get('region')
+                           or (meta_cache.get(pid) or {}).get('region', '')),
+                # Last completed KG (sticky across status timeouts).
+                'last_kg_code': (ps.get('last_kg_code')
+                                 or (meta_cache.get(pid) or {}).get('last_kg_code')),
+                'last_kg_name': (ps.get('last_kg_name')
+                                 or (meta_cache.get(pid) or {}).get('last_kg_name')),
+                'last_kg_uploaded_at': (ps.get('last_kg_uploaded_at')
+                                        or (meta_cache.get(pid) or {}).get('last_kg_uploaded_at')),
+                'last_kg_seconds': (ps.get('last_kg_seconds')
+                                    or (meta_cache.get(pid) or {}).get('last_kg_seconds')),
                 # Authoritative cred_indices/lat_strips from the peer's own
                 # progress.json — what the running processor subprocess
                 # actually has in env. Used as fallback when the director's
@@ -2278,6 +2306,7 @@ class PeerDirector:
             'peer_warning_rates': state.get('peer_warning_rates') or {},
             'peer_noise_long_ema': state.get('peer_noise_long_ema') or {},
             'peer_last_live_ts': state.get('peer_last_live_ts') or {},
+            'peer_meta': state.get('peer_meta') or {},
             'shadow_peer': state.get('shadow_peer'),
             'shadow_url': state.get('shadow_url'),
             'shadow_last_push_ts': state.get('shadow_last_push_ts'),

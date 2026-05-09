@@ -13863,6 +13863,25 @@ def process_txt():
         out.append(f'copernicus credentials ({len(cred_pool)}):')
         out.append('  # id              health  held_by  s/e/r 7d   last_use   last_err')
         now_ts = _t.time()
+        # Pre-compute per-credential 7d daily aggregates (oldest → newest).
+        # Buckets are per-hour; we collapse to 7 daily slots aligned to the
+        # current local day boundary so the "today" slot is the right edge.
+        now_h = int(now_ts // 3600)
+        # Day index: hours since (now_h - 24*7 + 1) bucketed by 24.
+        def _daily_se(buckets) -> list[tuple[int, int]]:
+            days = [[0, 0] for _ in range(7)]  # [s, e]
+            for b in (buckets or []):
+                try:
+                    h = int(b.get('h', 0))
+                except Exception:
+                    continue
+                d_back = (now_h - h) // 24  # 0 = today, 6 = oldest
+                if d_back < 0 or d_back >= 7:
+                    continue
+                slot = 6 - d_back  # right-most slot is today
+                days[slot][0] += int(b.get('s', 0) or 0)
+                days[slot][1] += int(b.get('e', 0) or 0)
+            return [(s, e) for s, e in days]
         for c in cred_pool:
             i = c.get('index')
             cid_short = (c.get('client_id_short') or '')[:14].ljust(14)
@@ -13881,6 +13900,16 @@ def process_txt():
             lu = _ago(u.get('last_use'))
             le = _ago(u.get('last_error'))
             out.append(f'  {i} {cid_short} {health} {held} {ser} {lu}  {le}')
+            # Per-cred daily 7d sparkline (oldest .. today). Compact:
+            #   D-6..D0 success / error counts.
+            try:
+                daily = _daily_se(u.get('buckets'))
+                # Bypass when entirely empty (cred unused).
+                if any(s or e for s, e in daily):
+                    cells = ' '.join(f'{s}/{e}' for s, e in daily)
+                    out.append(f'      7d s/e per day (D-6→D0): {cells}')
+            except Exception:
+                pass
         # Frontier plan: cred[i] -> peer[id]
         plan = d.get('frontier_cred_plan') or {}
         if plan:

@@ -90,6 +90,18 @@ def _bootstrap_creds_from_env() -> list:
 
 _BUILTIN_CREDENTIALS: list = _bootstrap_creds_from_env()
 
+# === Canonical credential ordering ===
+# Across the fleet, credentials may be added in different orders on
+# different peers (env-bootstrap order, fan-out arrival race, restarts).
+# The director addresses credentials by *index* (e.g. ``cred_indices=[3]``),
+# so peers MUST agree on the index→client_id mapping. We enforce a
+# deterministic order by sorting on ``client_id`` (lexicographic) at
+# every load / reload / add / remove. Index 0 is therefore always the
+# alphabetically-smallest client_id on every peer.
+def _canonical_sort(creds: list) -> list:
+    return sorted(creds, key=lambda c: c[0])
+
+
 # Credentials store path (instance-local; not in git)
 _CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")
 # Per-credential usage stats (success/error counts + per-minute buckets).
@@ -134,6 +146,7 @@ def _load_credentials_from_disk() -> list:
                 _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
         except Exception as e:
             logger.warning("Failed to load credentials store %s: %s", _CRED_STORE, e)
+    creds = _canonical_sort(creds)
     # Apply persisted exhaustion to in-memory set.
     for i, (cid, _) in enumerate(creds):
         meta = _cred_meta.get(cid) or {}
@@ -194,9 +207,17 @@ def _reload_credentials_from_disk():
         if cid not in seen:
             _CREDENTIALS.append((cid, csec))
             seen.add(cid)
-            # Honor persisted exhaustion
-            if entry.get("exhausted"):
-                _exhausted_cred_indices.add(len(_CREDENTIALS) - 1)
+    # Re-canonicalise (sort by client_id) so the index→cred mapping
+    # matches every other peer regardless of arrival order. Re-derive
+    # the exhausted set from persisted meta after the sort.
+    new_creds = _canonical_sort(_CREDENTIALS)
+    if new_creds != _CREDENTIALS:
+        _CREDENTIALS = new_creds
+    _exhausted_cred_indices.clear()
+    for i, (cid, _) in enumerate(_CREDENTIALS):
+        m = _cred_meta.get(cid) or {}
+        if m.get("exhausted"):
+            _exhausted_cred_indices.add(i)
 
 def _save_credentials_to_disk():
     """Persist non-builtin credentials + meta for all creds to disk.
@@ -748,7 +769,20 @@ def add_credential(client_id: str, client_secret: str, label: str = "",
                 break
         if existing_idx is None:
             _CREDENTIALS.append((client_id, client_secret))
-            existing_idx = len(_CREDENTIALS) - 1
+            # Re-canonicalise so the new cred lands at its lex-sorted
+            # position; otherwise peers would disagree on the index of
+            # this client_id (director addresses by index).
+            new_creds = _canonical_sort(_CREDENTIALS)
+            # Reindex exhausted set across the permutation.
+            old_to_new = {old_i: new_creds.index((cid, sec))
+                          for old_i, (cid, sec) in enumerate(_CREDENTIALS)}
+            _CREDENTIALS = new_creds  # type: ignore[name-defined]
+            new_exh = {old_to_new[i] for i in _exhausted_cred_indices
+                       if i in old_to_new}
+            _exhausted_cred_indices.clear()
+            _exhausted_cred_indices.update(new_exh)
+            existing_idx = next(i for i, (cid, _) in enumerate(_CREDENTIALS)
+                                if cid == client_id)
         meta = _cred_meta.setdefault(client_id, {})
         if label:
             meta["label"] = label

@@ -394,9 +394,10 @@
   .pm-tag.t-offline  { color: var(--dim); opacity: 0.6; }
   .pm-tag.t-int      { color: var(--yellow); }   /* interrupted KG (was running, now isn't) */
   /* Default: single-line compact strip; details collapsed.
-     Desktop packs multiple peers per row via auto-fill; mobile is 1-up. */
-  #directorPeers { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)) !important;
-                   gap: 4px 8px !important; }
+     Desktop packs multiple peers per row via auto-fill; mobile is 1-up.
+     Min strip width chosen so KG name + step + elapsed are readable. */
+  #directorPeers { grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)) !important;
+                   gap: 4px 10px !important; }
   #directorPeers > .peer-card {
     background: transparent;
     border: 1px solid transparent;
@@ -4194,16 +4195,20 @@ function renderDirector(d) {
     }
     return '';
   }
-  // Sort peers by elapsed runtime on current KG (oldest first), so peers
-  // that have been stuck the longest bubble to the top. Peers without a
-  // current_kg fall to the bottom, ordered by activity rank then id.
+  // Sort peers by elapsed runtime on the current KG (oldest first), so
+  // peers that have been stuck the longest bubble to the top. Only counts
+  // ACTIVELY running peers — stopped peers keep a stale current_kg_started_at
+  // from their last run, which would otherwise mask the live frontiers.
   peers.sort((a, b) => {
-    const ta = a.current_kg_started_at ? Date.parse(a.current_kg_started_at) : NaN;
-    const tb = b.current_kg_started_at ? Date.parse(b.current_kg_started_at) : NaN;
+    const aRun = a.online && (a.processor_state === 'running' || a.processor_state === 'processing');
+    const bRun = b.online && (b.processor_state === 'running' || b.processor_state === 'processing');
+    const ta = (aRun && a.current_kg_started_at) ? Date.parse(a.current_kg_started_at) : NaN;
+    const tb = (bRun && b.current_kg_started_at) ? Date.parse(b.current_kg_started_at) : NaN;
     const aHas = !isNaN(ta), bHas = !isNaN(tb);
     if (aHas && bHas) return ta - tb;        // older start ts first
     if (aHas) return -1;
     if (bHas) return 1;
+    // Non-running peers — fall to the bottom by activity rank then id.
     const ra = _peerActivityRank(a, active), rb = _peerActivityRank(b, active);
     if (ra !== rb) return ra - rb;
     return String(a.id).localeCompare(String(b.id));

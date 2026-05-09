@@ -60,7 +60,7 @@ tail -f /tmp/rf_train_4000kg.log
 | `object_segmentation.py` | 2200 | Felzenszwalb+RAG → per-object classify (44 features) |
 | `learned_classifier.py` | 560 | RF classifier (`FEATURE_KEYS`, cadastre-trained) |
 | `static/index.html` | 3100 | Single-file Leaflet UI |
-| `static/process.html` | 2100 | Processor + director dashboard |
+| `static/process.html` | 2100 | Processor + director dashboard. Peer Director list uses unified compact strip (`.peer-card` + `.pm-card`) on desktop+mobile: donut · id (color-coded for attention) · role-tagged bar (FRONTIER/CACHE/PRIMARY/STOPPED/INTERRUPTED…) with KG inside · ⋯ menu · ▸ chevron expands legacy detail. `primary` aliased to `at1`. Sort: elapsed-on-current-KG (oldest first), running peers only. Live Log has `24h` chip → `/api/v1/director/log/history`; warning filter re-renders from cache. |
 | `static/query.html` | 600 | Query Explorer over `/api/v1/query*`, `/feedback` |
 | `static/flag.js` | 620 | Flag widget (text-selection chip → `/api/v1/flags/match`) |
 

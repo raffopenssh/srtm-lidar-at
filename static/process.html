@@ -578,7 +578,7 @@
 <div id="directorSection" style="margin-bottom:14px;">
   <div class="card">
     <div class="lb" style="display:flex;align-items:center;justify-content:space-between">
-      <span style="cursor:pointer" id="directorHead" class="coll-h" onclick="toggle('director')">
+      <span style="cursor:pointer" id="directorHead" class="coll-h open" onclick="toggle('director')">
         <span class="arr">▶</span> 🌐 Peer Director
         <span id="directorSummary" style="color:var(--text);font-weight:600;margin-left:6px"></span>
         <a id="directorLink" style="display:none;margin-left:8px;font-size:11px;font-weight:600;padding:1px 6px;border:1px solid var(--blue);border-radius:8px;color:var(--blue);text-decoration:none"
@@ -592,7 +592,7 @@
         <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
       </span>
     </div>
-    <div id="directorBody" class="coll-b" style="margin-top:6px;">
+    <div id="directorBody" class="coll-b open" style="margin-top:6px;">
       <div id="directorCapacity" style="font-size:11px;color:var(--dim);margin-bottom:6px;"></div>
       <div id="directorPeers" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;"></div>
       <div id="directorCredsBox" style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px;position:relative">

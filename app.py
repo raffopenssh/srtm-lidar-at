@@ -393,6 +393,13 @@ def credentials_add():
                 notes=(data.get('notes') or '').strip())
         except Exception as e:
             res['fanout'] = {'error': str(e)[:200]}
+        try:
+            director_event('cred added: '
+                           + (data.get('label') or cid[:12]) + '…'
+                           + ' (validated=' + ('y' if do_validate else 'n')
+                           + ')')
+        except Exception:
+            pass
     return jsonify(res)
 
 
@@ -407,6 +414,10 @@ def credentials_remove(client_id):
             res['fanout'] = _fanout_credentials('delete', client_id)
         except Exception as e:
             res['fanout'] = {'error': str(e)[:200]}
+        try:
+            director_event('cred removed: ' + client_id[:12] + '…')
+        except Exception:
+            pass
     return jsonify(res)
 
 
@@ -5186,6 +5197,51 @@ def _combined_log_persist(merged_with_peer: list[dict]) -> int:
     return written
 
 
+def director_event(msg: str, *, peer: str = '', kg: str = '',
+                   level: str = 'info') -> None:
+    """Append a director-side operational event to the persistent 24h
+    merged log so it shows up in the dashboard's Live Log alongside
+    peer-sourced messages.
+
+    Use for orchestration events that have no natural peer-side log
+    line: credential / cache-cell plan changes, fleet update rollouts,
+    director takeover, etc. Tagged ``ema_safe=True`` like everything
+    else in this ring — NEVER feeds EMA / capacity_factor.
+    """
+    if not msg:
+        return
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        pid = peer or 'director'
+        entry = {
+            'ts': ts, 'peer': pid, 'level': level,
+            'msg': str(msg), 'kg': str(kg or ''),
+            'ema_safe': True,
+        }
+        with _COMBINED_LOG_LOCK:
+            _COMBINED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_COMBINED_LOG_PATH, 'a', encoding='utf-8') as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            # Bump per-peer watermark so a subsequent push from this
+            # peer at the same ts isn't double-persisted.
+            if ts > _COMBINED_LOG_LAST_TS.get(pid, ''):
+                _COMBINED_LOG_LAST_TS[pid] = ts
+        # Also surface in the live cache so the dashboard's 5s poll
+        # picks it up before the next merged refresh.
+        try:
+            cached = _COMBINED_LOG_CACHE.get('data')
+            if cached and isinstance(cached.get('log'), list):
+                cached['log'].insert(0, dict(entry))
+                cached['log'] = cached['log'][:300]
+        except Exception:
+            pass
+    except Exception as _e:
+        try:
+            log.debug('director_event(%s) failed: %s', msg[:80], _e)
+        except Exception:
+            pass
+
+
 def _combined_log_maybe_prune() -> None:
     """Drop entries older than 24h (+ enforce hard size cap) periodically."""
     global _COMBINED_LOG_LAST_PRUNE
@@ -5611,6 +5667,19 @@ def director_update_peers():
                         results[pid] = {'error': str(e)}
             if i + WAVE < len(targets):
                 _t.sleep(GAP_S)
+    # Surface a single high-level event in the merged 24h log so the
+    # dashboard shows the rollout. Per-peer results would be too noisy
+    # for a fleet-wide "Update Peers" wave — the per-peer update events
+    # in the stale-peer orchestrator already cover the auto path.
+    try:
+        _scope = ('peer ' + target_id) if target_id else \
+                 (str(len(targets)) + ' peers')
+        director_event(
+            'update wave: ' + _scope
+            + (' (graceful)' if graceful else ' (immediate)')
+            + ' → ' + str(_GIT_COMMIT))
+    except Exception:
+        pass
     return jsonify({
         'results': results,
         'token_install': token_results,
@@ -13580,6 +13649,336 @@ def share_rename(old_id):
     except Exception as e:
         log.error("share rename: %s", traceback.format_exc())
         return _error(str(e))
+
+
+@app.route('/process.txt')
+@app.route('/api/v1/dashboard.txt')
+def process_txt():
+    """Token-cheap, text-only dashboard for agents (and quick eyeballs).
+
+    Renders the *same* live state as ``/process.html`` — director
+    summary, peer roster (one peer per line, fixed-width columns), the
+    merged 24h log filtered to the most useful slice, current Zenodo
+    upload state, recent failures, top of priority queue — in a
+    monospace ASCII layout that costs <10x fewer tokens to ingest than
+    the JS-rendered HTML page.
+
+    Query params:
+      ``log``    int, number of merged-log lines to include (default 60,
+                 max 500). Newest first.
+      ``warn``   ``1`` to filter the log to warnings + errors only.
+      ``hidden`` ``1`` to include stopped/idle/complete peers (off by
+                 default; attention-state peers are always shown).
+      ``peer``   substring filter on peer id (applies to roster + log).
+      ``q``      free-text substring filter on log msg.
+    """
+    import time as _t
+    try:
+        nlog = max(1, min(500, int(request.args.get('log', '60'))))
+    except ValueError:
+        nlog = 60
+    warn_only = request.args.get('warn') in ('1', 'true', 'yes')
+    show_hidden = request.args.get('hidden') in ('1', 'true', 'yes')
+    peer_q = (request.args.get('peer') or '').strip().lower()
+    msg_q = (request.args.get('q') or '').strip().lower()
+
+    def _short(s, n):
+        s = '' if s is None else str(s)
+        return s if len(s) <= n else (s[:n - 1] + '…')
+
+    def _hms(seconds):
+        try:
+            seconds = int(seconds)
+        except Exception:
+            return '-'
+        if seconds < 0:
+            return '-'
+        d, rem = divmod(seconds, 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        if d:
+            return f'{d}d{h:02d}h'
+        if h:
+            return f'{h}h{m:02d}m'
+        return f'{m}m'
+
+    out = []
+    now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    out.append(f'# srtm-lidar process dashboard (text) — {now_iso}')
+
+    # --- Director status -----------------------------------------
+    try:
+        d = pd.get_director().get_status()
+    except Exception as e:
+        d = {'_error': str(e), 'peers': []}
+    mode = d.get('mode', '?')
+    active = d.get('active_peer') or '-'
+    cap = d.get('capacity_factor')
+    cap_s = f'{cap:.2f}' if isinstance(cap, (int, float)) else '?'
+    is_dir = 'yes' if d.get('is_director_local') else 'no'
+    self_id = d.get('self_id') or '?'
+    valid_creds = len(d.get('valid_credentials') or [])
+    total_creds = len(d.get('credentials') or [])
+    max_par = d.get('max_parallel_frontiers', 0)
+    par_active = (d.get('parallel_frontiers_active') or [])
+    strips = (d.get('cached_lat_strips') or [])
+    aus_strips = (d.get('austria_lat_strips') or [])
+    out.append(
+        f'director: self={self_id} is_director={is_dir} mode={mode} '
+        f'active={active} cap={cap_s} '
+        f'creds={valid_creds}/{total_creds} '
+        f'parallel={len(par_active)}/{max_par} '
+        f'cache_strips={len(strips)}/{len(aus_strips)}'
+    )
+    sh = d.get('shadow_peer')
+    if sh:
+        out.append(
+            f'shadow:   {sh} ok={d.get("shadow_last_push_ok")} '
+            f'last_push={d.get("shadow_last_push_ts") or "-"}'
+        )
+
+    # --- Processing summary --------------------------------------
+    try:
+        prog_path = Path('data/austria_processor/progress.json')
+        prog = json.loads(prog_path.read_text()) if prog_path.exists() else {}
+    except Exception:
+        prog = {}
+    try:
+        db_done = len(_get_completed_kgs())
+    except Exception:
+        db_done = prog.get('completed') or 0
+    total_kgs = prog.get('total_kgs') or 0
+    state_p = prog.get('state', '?')
+    rate_h = prog.get('rate_kgs_per_hour') or 0
+    eta_s = prog.get('eta_seconds') or 0
+    out.append(
+        f'progress: state={state_p} done={db_done}/{total_kgs} '
+        f'rate={rate_h:.1f}/h eta={_hms(eta_s)} '
+        f'failed={len(prog.get("failed_kgs") or [])}'
+    )
+
+    # --- Zenodo manifest summary ---------------------------------
+    try:
+        mf_path = Path('data/austria_processor/zenodo_manifest.json')
+        mf = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+    except Exception:
+        mf = {}
+    n_kgs = len(mf.get('kgs') or {}) if isinstance(mf, dict) else 0
+    total_b = 0
+    for kg in (mf.get('kgs') or {}).values() if isinstance(mf, dict) else ():
+        for f in (kg.get('files') or []):
+            try:
+                total_b += int(f.get('size') or 0)
+            except Exception:
+                pass
+    out.append(
+        f'zenodo:   kgs_uploaded={n_kgs} bytes={total_b/1e9:.2f}GB '
+        f'depo={mf.get("deposition_id") or "-"}'
+    )
+    # Cache deposit
+    try:
+        cmf_path = Path('data/austria_processor/cache_manifest.json')
+        cmf = json.loads(cmf_path.read_text()) if cmf_path.exists() else {}
+        cache_n = sum(len(v.get('tiles') or [])
+                      for v in (cmf.get('strips') or {}).values()) \
+            if isinstance(cmf, dict) else 0
+        out.append(
+            f'zen_cache: depo={cmf.get("deposition_id") or "-"} '
+            f'tiles={cache_n}'
+        )
+    except Exception:
+        pass
+
+    # --- Peer roster --------------------------------------------
+    peers = list(d.get('peers') or [])
+    if peer_q:
+        peers = [p for p in peers if peer_q in str(p.get('id', '')).lower()]
+
+    def _peer_role(p):
+        st = (p.get('processor_state') or '').lower()
+        running = (p.get('online') and st in ('running', 'processing'))
+        if not p.get('online'):
+            return 'OFFLINE'
+        if p.get('is_active') and running:
+            return 'FRONTIER'
+        if running and p.get('cache_only_run'):
+            return 'CACHE'
+        if running:
+            return 'RUN'
+        if st == 'paused':
+            return 'PAUSED'
+        if p.get('reserved_kg'):
+            return 'OWNER'
+        if st == 'stopped':
+            return 'STOPPED'
+        return st.upper() or '-'
+
+    def _is_attn(p):
+        if not p.get('online'):
+            return True
+        us = p.get('update_state') or {}
+        if us.get('needs_manual_update'):
+            return True
+        if p.get('stale_status'):
+            return True
+        if p.get('processor_state') == 'paused':
+            return True
+        running = (p.get('processor_state') in ('running', 'processing'))
+        if not running and p.get('current_kg'):
+            return True
+        return False
+
+    def _is_quiet(p):
+        if p.get('is_active') or p.get('reserved_kg'):
+            return False
+        running = (p.get('online') and
+                   p.get('processor_state') in ('running', 'processing'))
+        if running:
+            return False
+        if _is_attn(p):
+            return False
+        return True
+
+    hidden = [p for p in peers if _is_quiet(p)]
+    visible = peers if show_hidden else [p for p in peers if not _is_quiet(p)]
+
+    # Sort: running peers (oldest current_kg first) > owners > rest by id.
+    def _peer_sort_key(p):
+        running = (p.get('online') and
+                   p.get('processor_state') in ('running', 'processing'))
+        if running and p.get('current_kg_started_at'):
+            try:
+                ts = datetime.fromisoformat(p['current_kg_started_at']).timestamp()
+                return (0, ts, p.get('id', ''))
+            except Exception:
+                pass
+        if running:
+            return (1, 0, p.get('id', ''))
+        if p.get('reserved_kg'):
+            return (2, 0, p.get('id', ''))
+        return (3, 0, p.get('id', ''))
+    visible.sort(key=_peer_sort_key)
+
+    out.append('')
+    out.append(
+        'peers (' + str(len(visible)) + ' shown'
+        + (', ' + str(len(hidden)) + ' hidden idle' if hidden and not show_hidden else '')
+        + '):'
+    )
+    out.append('  id     role     state     kg     name                 step          elapsed  bw%   ver     last')
+    for p in visible:
+        pid = _short(p.get('id', '?'), 6).ljust(6)
+        role = _short(_peer_role(p), 8).ljust(8)
+        st = _short(p.get('processor_state', '-'), 9).ljust(9)
+        kg = _short(p.get('current_kg') or p.get('reserved_kg') or '-', 6).ljust(6)
+        name = _short(p.get('current_kg_name') or '', 20).ljust(20)
+        step = _short(p.get('current_kg_step') or '-', 13).ljust(13)
+        try:
+            if p.get('current_kg_started_at'):
+                el = int(_t.time() -
+                         datetime.fromisoformat(p['current_kg_started_at']).timestamp())
+                el_s = _hms(el)
+            else:
+                el_s = '-'
+        except Exception:
+            el_s = '-'
+        el_col = el_s.ljust(7)
+        bw = p.get('bandwidth') or {}
+        used_gb = bw.get('used_gb') or 0
+        budget_gb = bw.get('effective_budget_gb') or bw.get('budget_gb') or 0
+        bw_pct = ('%3d%%' % min(99, int(100 * used_gb / max(0.01, budget_gb)))).rjust(4) \
+            if budget_gb else ' -  '
+        ver = (_short(p.get('git_commit') or '-', 7)).ljust(7)
+        last = _short(p.get('last_kg_name') or p.get('last_kg_code') or '-', 14)
+        flags = ''
+        us = p.get('update_state') or {}
+        if us.get('needs_manual_update'):
+            flags += ' ⚠upd'
+        if p.get('stale_status'):
+            flags += ' ⚠cached'
+        if not p.get('online'):
+            flags += ' ⚠off'
+        out.append(
+            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct}  {ver} {last}{flags}'
+        )
+
+    # --- Failed KGs ---------------------------------------------
+    fk = (prog.get('failed_kgs') or [])[:8]
+    if fk:
+        out.append('')
+        out.append('recent failures:')
+        for f in fk:
+            out.append(
+                '  ' + _short(f.get('code', ''), 6).ljust(6) + '  '
+                + _short(f.get('step', '-'), 12).ljust(12) + '  '
+                + _short(f.get('error', '-'), 90)
+            )
+
+    # --- Priority queue head ------------------------------------
+    try:
+        pq_path = Path('data/austria_processor/priority_queue.json')
+        pq = json.loads(pq_path.read_text()) if pq_path.exists() else []
+    except Exception:
+        pq = []
+    if pq:
+        out.append('')
+        head = pq[:6]
+        codes = ', '.join(str(x.get('code') if isinstance(x, dict) else x)
+                          for x in head)
+        out.append(f'priority queue ({len(pq)}): {codes}'
+                   + (' …' if len(pq) > len(head) else ''))
+
+    # --- Merged 24h log ------------------------------------------
+    out.append('')
+    out.append(f'merged log (last {nlog}'
+               + (' warn+err' if warn_only else '')
+               + (', peer~' + peer_q if peer_q else '')
+               + (', q~' + msg_q if msg_q else '')
+               + ', newest first):')
+    log_lines = []
+    try:
+        if _COMBINED_LOG_PATH.exists():
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                # Read tail directly to avoid loading large files.
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 1024 * 1024))
+                tail = fh.read()
+            for line in tail.split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                lvl = (e.get('level') or 'info').lower()
+                if warn_only and lvl not in ('warning', 'error'):
+                    continue
+                if peer_q and peer_q not in str(e.get('peer', '')).lower():
+                    continue
+                if msg_q and msg_q not in str(e.get('msg', '')).lower():
+                    continue
+                log_lines.append(e)
+    except Exception as _e:
+        out.append(f'  (log read error: {_e})')
+    log_lines.sort(key=lambda e: e.get('ts', ''), reverse=True)
+    for e in log_lines[:nlog]:
+        ts = (e.get('ts') or '')[5:19].replace('T', ' ')
+        peer = _short(e.get('peer', '-'), 8).ljust(8)
+        lvl = (e.get('level') or 'info')[0].upper()
+        kg = e.get('kg') or ''
+        kg_s = f' [{kg}]' if kg else ''
+        out.append(f'  {ts} {lvl} {peer}{kg_s} {e.get("msg", "")}')
+
+    out.append('')
+    out.append(
+        '# query: ?log=N (default 60, max 500), ?warn=1 (errors+warnings only),\n'
+        '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
+        '#        ?q=substring (msg filter). Pair with /api/v1/director/log/history\n'
+        '#        for full structured access.'
+    )
+    return Response('\n'.join(out) + '\n',
+                    mimetype='text/plain; charset=utf-8')
 
 
 @app.route('/process.html')

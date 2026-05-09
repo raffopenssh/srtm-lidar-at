@@ -3,6 +3,36 @@
 > **Token discipline**: this file is a navigation hub. Deep docs live in `docs/`.
 > Don't load a `docs/*.md` unless your task touches that subsystem.
 
+## ⚡ Fast read for agents: `/process.txt`
+
+**Always start here when investigating cluster state.** Token-cheap,
+text-only mirror of `/process.html` — full director / peer / log / Zenodo
+snapshot in <2 KB. Add to your context with one curl:
+
+```bash
+curl -s https://srtm-lidar-at.exe.xyz:8000/process.txt          # default 60 log lines
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?warn=1' # warnings + errors only
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?peer=at3&log=200'
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?q=cred&log=300'
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hidden=1' # also list stopped/idle peers
+```
+
+Query params:
+- `log=N` (default 60, max 500) — merged-log line count, newest first
+- `warn=1` — restrict log to warnings + errors
+- `peer=<substr>` — filter peer roster + log lines by id substring
+- `q=<substr>` — substring filter on log message body
+- `hidden=1` — also include stopped/idle/complete peers in roster
+  (default: hidden; attention-state peers are always shown)
+
+For structured access, pair with `/api/v1/director/status` and
+`/api/v1/director/log/history` (both documented in `/api/v1/docs/llm.txt`).
+Director orchestration events — peer auto-updates, Copernicus credential
+revalidation/add/remove, frontier credential & cache-cell plan changes —
+are emitted via `app.director_event(…)` and appear inline in the merged
+24h log (`peer=director` for fleet-wide events, otherwise the affected
+peer id).
+
 ## TL;DR
 
 Flask + Leaflet app that segments Austrian landscape from BEV LiDAR + BEV ortho

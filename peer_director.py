@@ -26,6 +26,20 @@ import requests
 
 log = logging.getLogger(__name__)
 
+
+def _emit_director_event(msg: str, *, peer: str = '', kg: str = '',
+                         level: str = 'info') -> None:
+    """Lazy bridge into ``app.director_event`` so orchestration events
+    (credential / cache-cell plan changes, peer updates) show up in the
+    dashboard's 24h merged log alongside peer-sourced lines. Safe to
+    call from any thread; never raises.
+    """
+    try:
+        from app import director_event as _de
+        _de(msg, peer=peer, kg=kg, level=level)
+    except Exception:
+        pass
+
 # Git commit hash (read once at import)
 try:
     _LOCAL_GIT_COMMIT = subprocess.check_output(
@@ -3468,7 +3482,28 @@ class PeerDirector:
             _REVALIDATE_OWNER_THREAD = threading.get_ident()
             try:
                 import copernicus as _cop
+                _before = list(_cop.list_credentials() or [])
                 _cop.revalidate_all_credentials()
+                _after = list(_cop.list_credentials() or [])
+                # Surface a one-line summary: valid/total + any
+                # transitions (ok→bad, bad→ok). Keeps the merged log
+                # quiet on no-op revalidations — only logs deltas.
+                def _key(c):
+                    return (c.get('client_id') or '')[:12]
+                def _ok(c):
+                    return (c.get('last_status') or '').lower() in ('ok', 'valid')
+                _b = {_key(c): _ok(c) for c in _before}
+                _a = {_key(c): _ok(c) for c in _after}
+                _flips = []
+                for k, ok_after in _a.items():
+                    if k in _b and _b[k] != ok_after:
+                        _flips.append(k + (':→ok' if ok_after else ':→bad'))
+                _valid = sum(1 for v in _a.values() if v)
+                _total = len(_a)
+                if _flips:
+                    _emit_director_event(
+                        'creds revalidated: ' + str(_valid) + '/' + str(_total)
+                        + ' valid (' + ', '.join(_flips) + ')')
             except Exception as e:
                 log.debug('revalidate_all_credentials failed: %s', e)
                 return
@@ -4568,6 +4603,46 @@ class PeerDirector:
                     pid, (res or {}).get('error') or res)
                 continue
             started.append(pid)
+            # Surface the start — with its cred/strip assignment — in the
+            # 24h merged log so operators see when a peer was promoted
+            # and what slice it owns. (log.info above is logs/srv only.)
+            try:
+                _strips_txt = ','.join(
+                    '%.1f-%.1f' % (s[0], s[1]) for s in strips_for) \
+                    if strips_for else '-'
+            except Exception:
+                _strips_txt = '-'
+            _emit_director_event(
+                'frontier start → creds=' + ','.join(str(c) for c in creds)
+                + ' strips=' + _strips_txt,
+                peer=pid)
+
+        # Diff against prior plans — emit per-peer events for any
+        # cred / strip assignment that actually changed. Quiet when the
+        # plan is a no-op tick (the common case).
+        try:
+            _all = sorted(set(cred_plan) | set(old_cred_plan)
+                          | set(strip_plan) | set(old_strip_plan))
+            for _pid in _all:
+                _bc = sorted(old_cred_plan.get(_pid) or [])
+                _ac = sorted(cred_plan.get(_pid) or [])
+                _bs = [tuple(s) for s in (old_strip_plan.get(_pid) or [])]
+                _as_ = [tuple(s) for s in (strip_plan.get(_pid) or [])]
+                _cred_changed = _bc != _ac
+                _strip_changed = sorted(_bs) != sorted(_as_)
+                if not (_cred_changed or _strip_changed):
+                    continue
+                _parts = []
+                if _cred_changed:
+                    _parts.append('creds ' + (','.join(str(c) for c in _bc) or '-')
+                                  + ' → ' + (','.join(str(c) for c in _ac) or '-'))
+                if _strip_changed:
+                    def _stxt(ss):
+                        return ','.join('%.1f-%.1f' % (a, b) for a, b in ss) or '-'
+                    _parts.append('strips ' + _stxt(_bs) + ' → ' + _stxt(_as_))
+                _emit_director_event('plan: ' + '; '.join(_parts), peer=_pid)
+        except Exception:
+            pass
 
         with self._lock:
             # Union running + started + retained_unreachable. The
@@ -4766,11 +4841,18 @@ class PeerDirector:
                 tracked[pid] = rec  # try again next tick
                 continue
             gattempts = int(rec.get('graceful_attempts') or 0)
+            _msg = (
+                'graceful update → ' + str(_LOCAL_GIT_COMMIT)
+                + ' (peer on ' + str(commit)
+                + '; attempt ' + str(gattempts + 1) + '/'
+                + str(self.STALE_GRACEFUL_MAX_ATTEMPTS) + ')'
+            )
             log.info('Stale peer %s mid-KG (%s on %s); sending '
                      'graceful update to schedule restart at KG boundary '
                      '(attempt %d/%d)',
                      pid, rec.get('last_state'), commit,
                      gattempts + 1, self.STALE_GRACEFUL_MAX_ATTEMPTS)
+            _emit_director_event(_msg, peer=pid)
             try:
                 gres = trigger_peer_update(peer['url'], graceful=True)
             except Exception as e:
@@ -4789,6 +4871,11 @@ class PeerDirector:
             log.info('Auto-retry update on stale peer %s '
                      '(commit=%s, attempt=%d)',
                      pid, commit, attempts + 1)
+            _emit_director_event(
+                'hard update → ' + str(_LOCAL_GIT_COMMIT)
+                + ' (peer on ' + str(commit)
+                + '; attempt ' + str(attempts + 1) + ')',
+                peer=pid)
             try:
                 res = trigger_peer_update(peer['url'], graceful=False)
             except Exception as e:

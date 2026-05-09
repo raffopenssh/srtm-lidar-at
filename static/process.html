@@ -322,9 +322,9 @@
     .cards { grid-template-columns: 1fr 1fr; }
   }
 
-  /* Director peer cards — unified compact strip (mobile + desktop). */
-  .peer-mobile { display: none; }
-  .peer-mobile.pm-card { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  /* Director peer cards — unified compact strip (mobile + desktop).
+     Single source of truth for both viewport widths (no duplication). */
+  .peer-strip { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .pm-donut { width: 20px; height: 20px; flex-shrink: 0; display: block; }
   .pm-donut .bg { stroke: var(--border); }
   .pm-id { font-weight: 700; font-size: 11px; color: var(--text);
@@ -621,6 +621,7 @@
            title="Open the active director's dashboard">⇗ director: <span id="directorLinkLabel"></span></a>
       </span>
       <span id="directorControls" style="display:flex;gap:4px;">
+        <button class="btn" id="btnDirShowIdle" onclick="event.stopPropagation();toggleShowIdlePeers()" style="font-size:10px;padding:1px 6px;" title="Show stopped/idle/complete peers (hidden by default; peers needing attention are always shown)">Show idle</button>
         <button class="btn" id="btnDirAuto" onclick="setDirectorMode('auto')" style="font-size:10px;padding:1px 6px;" title="Auto-select peer by bandwidth">Auto</button>
         <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
         <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
@@ -808,14 +809,19 @@
 <div class="sec">
   <div class="sec-t">
     <span>Live Log</span>
-    <span style="display:flex;gap:10px;align-items:center">
+    <span style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input id="logSearch" type="search" placeholder="search… (peer / kg / msg)"
+             title="Filter the log by free-text substring (peer id, KG code, or message body)."
+             style="font-size:10px;padding:2px 7px;border:1px solid var(--border);
+                    border-radius:10px;background:var(--bg);color:var(--text);
+                    min-width:160px;max-width:240px">
       <span id="logFilter" title="Click to show only warnings and errors"
             style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
                    padding:2px 7px;border:1px solid var(--border);border-radius:10px;
                    user-select:none">
         <span id="logFilterCount">0 warn / 0 err</span>
       </span>
-      <span id="logRange24h" title="Click to show the merged 24-hour log across all peers"
+      <span id="logRange24h" title="Toggle: live (last poll) vs merged 24h ring across all peers"
             style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
                    padding:2px 7px;border:1px solid var(--border);border-radius:10px;
                    user-select:none">24h</span>
@@ -1713,7 +1719,16 @@ function clearKgTimer() {
 
 // ── Log ─────────────────────────────────────────────────────────
 let _logFilterIssues = false;
-let _logRange24h = false;
+// Default to the merged 24h ring — fleet operators almost always want
+// the full picture, not just the last 5s of one peer's recent_log.
+let _logRange24h = (function(){
+  try {
+    const v = localStorage.getItem('srtm_log_24h');
+    return v === null ? true : v === '1';
+  } catch(_) { return true; }
+})();
+let _logSearchQuery = '';
+let _logSearchTimer = null;
 let _lastLogPayload = null;       // last d passed to updateLog (for instant re-render)
 let _log24hPayload = null;        // last 24h history payload
 let _log24hFetchInflight = false;
@@ -1734,18 +1749,40 @@ function _styleLogChip(el, on, color) {
     if (_lastLogPayload) updateLog(_lastLogPayload);
   });
   const r = document.getElementById('logRange24h');
-  if (r) r.addEventListener('click', () => {
-    _logRange24h = !_logRange24h;
+  if (r) {
+    // Reflect the persisted default state on first paint.
     _styleLogChip(r, _logRange24h, 'var(--blue)');
-    prevLogHash = '';
     if (_logRange24h) {
+      // Kick off a fetch so the area populates before the next poll.
       fetchLog24h(true);
-    } else if (_lastLogPayload) {
-      // back to live log — flush 24h cache & re-render the live one
-      _log24hPayload = null;
-      updateLog(_lastLogPayload);
     }
-  });
+    r.addEventListener('click', () => {
+      _logRange24h = !_logRange24h;
+      try { localStorage.setItem('srtm_log_24h', _logRange24h ? '1' : '0'); }
+      catch(_) {}
+      _styleLogChip(r, _logRange24h, 'var(--blue)');
+      prevLogHash = '';
+      if (_logRange24h) {
+        fetchLog24h(true);
+      } else if (_lastLogPayload) {
+        _log24hPayload = null;
+        updateLog(_lastLogPayload);
+      }
+    });
+  }
+  const s = document.getElementById('logSearch');
+  if (s) {
+    s.addEventListener('input', () => {
+      // Debounce so we don't re-render on every keystroke.
+      clearTimeout(_logSearchTimer);
+      _logSearchTimer = setTimeout(() => {
+        _logSearchQuery = s.value.trim().toLowerCase();
+        prevLogHash = '';
+        if (_logRange24h && _log24hPayload) updateLog(_log24hPayload);
+        else if (_lastLogPayload) updateLog(_lastLogPayload);
+      }, 120);
+    });
+  }
 })();
 
 async function fetchLog24h(force) {
@@ -1790,7 +1827,7 @@ function updateLog(d) {
   if (cnt) cnt.innerHTML = '<span style="color:' + (nWarn?'var(--yellow)':'var(--dim)') + '">' + nWarn + ' warn</span> / ' +
                            '<span style="color:' + (nErr?'var(--red)':'var(--dim)') + '">' + nErr + ' err</span>';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + (_logRange24h ? '|24' : '');
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + (_logRange24h ? '|24' : '') + '|q=' + _logSearchQuery;
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -1800,9 +1837,17 @@ function updateLog(d) {
     return;
   }
 
-  // Newest first; optionally filter to warnings + errors
+  // Newest first; optionally filter to warnings + errors and free-text query.
   let sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
   if (_logFilterIssues) sorted = sorted.filter(e => (e.level||'') === 'warning' || (e.level||'') === 'error');
+  if (_logSearchQuery) {
+    const q = _logSearchQuery;
+    sorted = sorted.filter(e =>
+      (e.peer || '').toLowerCase().includes(q) ||
+      (e.kg || '').toLowerCase().includes(q) ||
+      (e.msg || '').toLowerCase().includes(q) ||
+      (e.level || '').toLowerCase().includes(q));
+  }
   if (sorted.length === 0) {
     area.innerHTML = '<div class="log-row log-info"><span class="log-msg" style="color:var(--dim)">No warnings or errors ✓</span></div>';
     return;
@@ -2806,8 +2851,8 @@ function selectPeerCard(peerId, opts) {
   _highlightSelectedPeerCard();
   if (opts.scroll) {
     try {
-      document.getElementById('kgCard').scrollIntoView({
-        behavior: 'smooth', block: 'nearest'});
+      // (auto-scroll on click intentionally removed —
+      // it disorients on long peer lists.)
     } catch(_) {}
   }
 }
@@ -3788,6 +3833,37 @@ async function savePrioQueue() {
 // ── Peer Status ─────────────────────────────────────────────────
 let _peerData = null;
 let _directorData = null;
+// Hide stopped/idle/complete peers by default; toggle via the "Show idle"
+// button. Peers in an attention state (offline, paused, interrupted,
+// stale, manual-update-needed) are ALWAYS shown regardless. Persisted
+// in localStorage so the operator's preference survives refreshes.
+let _directorShowIdle = (function(){
+  try { return localStorage.getItem('srtm_show_idle_peers') === '1'; }
+  catch(_) { return false; }
+})();
+function toggleShowIdlePeers() {
+  _directorShowIdle = !_directorShowIdle;
+  try { localStorage.setItem('srtm_show_idle_peers', _directorShowIdle ? '1' : '0'); }
+  catch(_) {}
+  if (_directorData) renderDirector(_directorData);
+}
+function _syncShowIdleBtn(hiddenN) {
+  const b = document.getElementById('btnDirShowIdle');
+  if (!b) return;
+  if (_directorShowIdle) {
+    b.textContent = 'Hide idle';
+    b.style.borderColor = 'var(--green)';
+    b.style.color = 'var(--green)';
+    b.title = 'Currently showing stopped/idle/complete peers — click to hide';
+  } else {
+    const n = hiddenN || 0;
+    b.textContent = 'Show idle' + (n ? ' (' + n + ')' : '');
+    b.style.borderColor = '';
+    b.style.color = '';
+    b.title = 'Stopped/idle/complete peers are hidden ('
+            + n + ' hidden). Peers needing attention are always shown. Click to show all.';
+  }
+}
 let _localCommit = '';  // local git commit from polling status
 let _lastStatus = null;  // last /api/v1/processing/status response
 
@@ -4079,6 +4155,25 @@ function _peerRoleTag(p, ctx) {
   return {cls: 't-idle', txt: 'IDLE'};
 }
 // Attention class for the peer-id text — bubbles up problems for at-a-glance scanning.
+// Sticky per-peer commit cache. The director's peer_meta loses entries
+// when director_state.json is wiped (e.g. fleet reset, fresh shadow
+// promotion). We additionally pin every commit we *ever* observed in
+// this dashboard session so version tags don't disappear on fleet-side
+// state churn. Persisted in localStorage so refreshes are stable too.
+let _peerCommitCache = (function(){
+  try { return JSON.parse(localStorage.getItem('srtm_peer_commits') || '{}') || {}; }
+  catch(_) { return {}; }
+})();
+function _rememberPeerCommit(pid, commit) {
+  if (!pid || !commit) return;
+  if (_peerCommitCache[pid] === commit) return;
+  _peerCommitCache[pid] = commit;
+  try { localStorage.setItem('srtm_peer_commits', JSON.stringify(_peerCommitCache)); }
+  catch(_) {}
+}
+function _peerCommitFor(p) {
+  return (p && p.git_commit) || (p && _peerCommitCache[p.id]) || '';
+}
 function _peerAttClass(p, ctx) {
   if (!p.online) return 'att-offline';
   const us = p.update_state || {};
@@ -4144,7 +4239,7 @@ function _peerMobileBlock(p, ctx) {
   // Expansion lives on the chevron (and on the ⋯ button) so the strip
   // click never accidentally opens detail — selection is the primary
   // gesture; expanding for legacy detail is secondary.
-  let h = '<div class="peer-mobile pm-card" onclick="selectPeerCard(\'' + esc(p.id) + '\', {scroll:true})">';
+  let h = '<div class="peer-strip pm-card" onclick="selectPeerCard(\'' + esc(p.id) + '\')">';
   // Donut (remaining bandwidth)
   h += '<span title="bw: ' + ctx.usedGb.toFixed(1) + ' / ' + ctx.budgetGb
      + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
@@ -4153,9 +4248,11 @@ function _peerMobileBlock(p, ctx) {
   const attCls = _peerAttClass(p, ctx);
   h += '<span class="pm-id' + (attCls ? ' ' + attCls : '') + '">'
      + esc(_peerDisplayId(p.id)) + '</span>';
-  // Version tag — last-known commit (sticky via director peer_meta)
-  // even when the peer is offline / cache-stale.
-  const _commit = (p.git_commit || '').slice(0, 7);
+  // Version tag — last-known commit. Sticky via director peer_meta
+  // *and* a client-side cache that survives state.json wipes by
+  // remembering the most recent non-empty commit we ever saw for
+  // each peer in this dashboard session.
+  const _commit = (_peerCommitFor(p) || '').slice(0, 7);
   if (_commit) {
     const _stale = _localCommit && _commit !== _localCommit.slice(0, 7);
     h += '<span class="pm-ver' + (_stale ? ' stale' : '') + '"'
@@ -4190,7 +4287,7 @@ function renderDirector(d) {
   for (const _p of _peersRaw) {
     if (_p && _p.id) _peerById[_p.id] = _p;
   }
-  const peers = Object.values(_peerById);
+  let peers = Object.values(_peerById);
   // Prefer DB-sourced count (from _lastStatus); fall back to summing peer counters
   const totalCompleted = (_lastStatus && _lastStatus.db_processed != null)
     ? _lastStatus.db_processed
@@ -4252,7 +4349,7 @@ function renderDirector(d) {
     return '<span style="font-size:9px;color:var(--dim);font-family:monospace">' + esc(r) + '</span>';
   }
   function versionTag(p) {
-    const commit = p.git_commit || '';
+    const commit = _peerCommitFor(p);
     if (!commit) return '';
     const stale = _localCommit && commit !== _localCommit;
     const color = stale ? 'var(--yellow)' : 'var(--dim)';
@@ -4314,24 +4411,60 @@ function renderDirector(d) {
     }
     return '';
   }
-  // Sort peers by elapsed runtime on the current KG (oldest first), so
-  // peers that have been stuck the longest bubble to the top. Only counts
-  // ACTIVELY running peers — stopped peers keep a stale current_kg_started_at
-  // from their last run, which would otherwise mask the live frontiers.
+  // Remember commit for sticky version tag (survives state.json wipes).
+  for (const _p of peers) _rememberPeerCommit(_p.id, _p.git_commit);
+
+  // Sort peers by ACTUAL pipeline progress on the current KG (closest to
+  // completion first) — same scoring the per-peer KG carousel uses, so
+  // the list and the carousel agree on "who's furthest along".
+  // Non-running peers fall to the bottom by activity rank then id.
+  function _dirPeerProgressKey(p) {
+    const isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
+    if (!isRun) return 999;  // non-running goes last
+    const card = (_peerCards || []).find(c => c.id === p.id);
+    if (card) {
+      // _peerProgressKey is negative-score-based; preserve sign so the
+      // smallest (most-progressed) sorts first.
+      return _peerProgressKey(card);
+    }
+    // Fallback when proxy/all_status hasn't returned this peer yet.
+    return 1;
+  }
   peers.sort((a, b) => {
-    const aRun = a.online && (a.processor_state === 'running' || a.processor_state === 'processing');
-    const bRun = b.online && (b.processor_state === 'running' || b.processor_state === 'processing');
-    const ta = (aRun && a.current_kg_started_at) ? Date.parse(a.current_kg_started_at) : NaN;
-    const tb = (bRun && b.current_kg_started_at) ? Date.parse(b.current_kg_started_at) : NaN;
-    const aHas = !isNaN(ta), bHas = !isNaN(tb);
-    if (aHas && bHas) return ta - tb;        // older start ts first
-    if (aHas) return -1;
-    if (bHas) return 1;
-    // Non-running peers — fall to the bottom by activity rank then id.
+    const ka = _dirPeerProgressKey(a), kb = _dirPeerProgressKey(b);
+    if (ka !== kb) return ka - kb;
     const ra = _peerActivityRank(a, active), rb = _peerActivityRank(b, active);
     if (ra !== rb) return ra - rb;
     return String(a.id).localeCompare(String(b.id));
   });
+
+  // Hide "quiet" peers by default (idle/complete/stopped without
+  // current work AND no attention state). User can flip the toggle.
+  // Anything in an attention state (offline/update/stale/paused/
+  // interrupted) is ALWAYS shown so users don't miss problems.
+  const showIdle = !!_directorShowIdle;
+  function _peerNeedsAttention(p) {
+    if (!p.online) return true;
+    const us = p.update_state || {};
+    if (us.needs_manual_update) return true;
+    if (p.stale_status) return true;
+    if (p.processor_state === 'paused') return true;
+    const _isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
+    if (!_isRun && p.current_kg) return true;  // interrupted
+    return false;
+  }
+  // Helper: is this a "quiet" peer worth hiding when toggle is off?
+  function _isQuietPeer(p) {
+    const isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
+    const isOwner = !!p.reserved_kg;
+    const isAct = p.id === active;
+    if (isRun || isOwner || isAct) return false;
+    if (_peerNeedsAttention(p)) return false;
+    return true;
+  }
+  const _allPeerCount = peers.length;
+  const _hiddenPeers = showIdle ? [] : peers.filter(_isQuietPeer);
+  if (!showIdle) peers = peers.filter(p => !_isQuietPeer(p));
   let html = '';
   for (const p of peers) {
     const isActive = p.id === active;
@@ -4463,7 +4596,18 @@ function renderDirector(d) {
     html += '</div>'; // close .peer-detail-body
     html += '</div>'; // close card
   }
+  // Footer line summarising the current filter state.
+  if (!showIdle && _hiddenPeers.length) {
+    const _hidIds = _hiddenPeers.map(x => x.id).join(', ');
+    html += '<div style="grid-column:1/-1;font-size:10px;color:var(--dim);'
+         + 'padding:4px 6px;cursor:pointer" onclick="toggleShowIdlePeers()" '
+         + 'title="Click to show: ' + esc(_hidIds) + '">'
+         + '… ' + _hiddenPeers.length + ' idle/stopped peers hidden · '
+         + '<span style="text-decoration:underline">show all ('
+         + _allPeerCount + ')</span></div>';
+  }
   container.innerHTML = html;
+  _syncShowIdleBtn(_hiddenPeers.length);
   // Re-apply selection highlight after re-render.
   _highlightSelectedPeerCard();
 

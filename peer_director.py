@@ -4757,6 +4757,15 @@ class PeerDirector:
     STALE_UPDATE_GRACE_S = 600          # 10 min idle before first auto-retry
     STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
     STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
+    # Hard ceiling on how long a "manual update needed" verdict
+    # sticks. After this many seconds since the last failed attempt,
+    # we wipe the attempt counters and let the auto-retry path try
+    # again from scratch — covers the case where the peer was
+    # transiently wedged (long upload, network hiccup) and is now
+    # reachable + idle but still flagged as needing a human. Tracked
+    # commit must of course still be stale; if the peer has caught
+    # up the rec is removed in the per-peer loop above.
+    STALE_UPDATE_RESET_AFTER_S = 12 * 3600  # 12 h
     # Graceful nudges to mid-KG peers also need a hard ceiling. Without
     # this we re-fire SIGTERMs every 30 min indefinitely on a peer that
     # never reaches a KG boundary in our gap window (long-tail upload,
@@ -4939,6 +4948,27 @@ class PeerDirector:
             rec.pop('waiting_for_idle', None)
             attempts = int(rec.get('attempts') or 0)
             last_attempt = float(rec.get('last_attempt') or 0)
+            # 12-hour amnesty: if the peer has been flagged as
+            # "manual update needed" for too long (still stale, still
+            # idle, but reachable), reset counters and try again. A
+            # successful auto-update meanwhile clears the rec entirely
+            # in the per-peer loop above, so this branch only fires
+            # when the peer remained genuinely stuck.
+            if (attempts >= self.STALE_UPDATE_MAX_ATTEMPTS and
+                    last_attempt > 0 and
+                    (now - last_attempt) >= self.STALE_UPDATE_RESET_AFTER_S):
+                log.info('Resetting stale-update counters for %s after %.1fh '
+                         '(was needs_manual_update=%s, attempts=%d)',
+                         pid, (now - last_attempt) / 3600.0,
+                         rec.get('needs_manual_update'), attempts)
+                rec['attempts'] = 0
+                rec.pop('needs_manual_update', None)
+                rec.pop('last_attempt', None)
+                rec.pop('last_result', None)
+                rec['graceful_attempts'] = 0
+                rec['first_seen_stale'] = now
+                attempts = 0
+                last_attempt = 0.0
             if attempts >= self.STALE_UPDATE_MAX_ATTEMPTS:
                 if (now - last_attempt) >= self.STALE_UPDATE_RETRY_GAP_S:
                     rec['needs_manual_update'] = True

@@ -4194,14 +4194,18 @@ function renderDirector(d) {
     }
     return '';
   }
-  // Sort peers by activity for compact mobile-first display: frontier,
-  // running cache-only, owners-waiting, scheduled, paused, idle, offline.
-  // Ties are broken by KG progress (closer to done first), then by id.
+  // Sort peers by elapsed runtime on current KG (oldest first), so peers
+  // that have been stuck the longest bubble to the top. Peers without a
+  // current_kg fall to the bottom, ordered by activity rank then id.
   peers.sort((a, b) => {
+    const ta = a.current_kg_started_at ? Date.parse(a.current_kg_started_at) : NaN;
+    const tb = b.current_kg_started_at ? Date.parse(b.current_kg_started_at) : NaN;
+    const aHas = !isNaN(ta), bHas = !isNaN(tb);
+    if (aHas && bHas) return ta - tb;        // older start ts first
+    if (aHas) return -1;
+    if (bHas) return 1;
     const ra = _peerActivityRank(a, active), rb = _peerActivityRank(b, active);
     if (ra !== rb) return ra - rb;
-    const pa = _peerKgFrac(a), pb = _peerKgFrac(b);
-    if (pa !== pb) return pb - pa;
     return String(a.id).localeCompare(String(b.id));
   });
   let html = '';

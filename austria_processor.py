@@ -654,8 +654,43 @@ class ProgressTracker:
         "preflight process graph validation raised",
     )
 
+    # Per-(level, msg) throttle window. When a repeating condition
+    # (e.g. paused_disk every KG iteration after a director respawn)
+    # would otherwise produce N identical log entries with N different
+    # timestamps, suppress all but the first within this window. The
+    # entries fan out to the persistent 24h merged log via the peer
+    # status push, so unthrottled spam shows up across the fleet
+    # dashboard for hours after the underlying issue resolved.
+    _LOG_DEDUP_WINDOW_S = 600  # 10 min
+
     def add_log(self, level: str, msg: str, kg: str = ""):
         with self._lock:
+            now_ts = time.time()
+            # Cross-restart dedup: scan tail of recent_log for the
+            # same (level, msg, kg) within the window. recent_log is
+            # persisted in progress.json and reloaded on processor
+            # restart, so this also suppresses duplicates across
+            # SIGTERM-respawn cycles (the original at2 disk-pause
+            # storm was 33 identical entries from ~30 director-driven
+            # respawns, each one a fresh log emission).
+            try:
+                tail = self._state["recent_log"][-50:]
+                for prev in reversed(tail):
+                    if (prev.get("level") == level
+                            and prev.get("msg") == msg
+                            and (prev.get("kg") or "") == (kg or "")):
+                        prev_ts = prev.get("ts", "")
+                        try:
+                            from datetime import datetime as _dt
+                            prev_t = _dt.fromisoformat(
+                                prev_ts.replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            prev_t = 0
+                        if now_ts - prev_t < self._LOG_DEDUP_WINDOW_S:
+                            return
+                        break
+            except Exception:
+                pass
             entry = {"ts": datetime.now(timezone.utc).isoformat(),
                      "level": level, "msg": msg, "kg": kg}
             self._state["recent_log"].append(entry)

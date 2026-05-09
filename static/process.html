@@ -338,6 +338,10 @@
   .pm-id.att-active  { color: var(--blue); }
   .pm-id.att-cache   { color: #79b8ff; }
   .pm-id.att-int     { color: var(--yellow); }
+  .pm-role-mark { font-weight: 700; margin-right: 4px; font-size: 14px;
+    line-height: 1; vertical-align: -1px; display: inline-block; }
+  .pm-role-mark.dir    { color: #f0c674; text-shadow: 0 0 5px rgba(240,198,116,0.75); }
+  .pm-role-mark.shadow { color: #c9d1d9; text-shadow: 0 0 4px rgba(201,209,217,0.45); }
   .pm-region { font-family: monospace; font-size: 9px; color: var(--dim); flex-shrink: 0; }
   .pm-menu { flex-shrink: 0; }
   .pm-expander {
@@ -4260,10 +4264,32 @@ function _peerMobileBlock(p, ctx) {
   h += '<span title="bw: ' + ctx.usedGb.toFixed(1) + ' / ' + ctx.budgetGb
      + ' GB used — ' + ctx.remainGb.toFixed(1) + ' GB left">'
      + _pmDonut(usedFrac, ctx.bwColor) + '</span>';
-  // Peer id (compact, coloured by attention state)
+  // Peer id (compact, coloured by attention state). Prefix two
+  // role markers so the director / shadow are spotted at a glance:
+  //   ♚  (king)  → the live director
+  //   ♛  (queen) → the shadow (HA standby)
+  // _directorData carries director_url + shadow_peer; we resolve
+  // the director's peer id by URL match (works on proxied views).
+  let _roleMark = '';
+  try {
+    const _dd = (typeof _directorData === 'object' && _directorData) ? _directorData : {};
+    const _norm = u => (u || '').replace(/\/$/, '');
+    const _dirUrl = _norm(_dd.director_url || '');
+    let _dirId = null;
+    if (_dirUrl) {
+      const _hit = (_dd.peers || []).find(_pp => _norm(_pp.url || '') === _dirUrl);
+      if (_hit) _dirId = _hit.id;
+    }
+    if (!_dirId && _dd.is_director_local) _dirId = _dd.self_id || 'primary';
+    if (p.id === _dirId) {
+      _roleMark = '<span class="pm-role-mark dir" title="Director">\u265a</span>';
+    } else if (_dd.shadow_peer && p.id === _dd.shadow_peer) {
+      _roleMark = '<span class="pm-role-mark shadow" title="Shadow (HA standby)">\u265b</span>';
+    }
+  } catch(_) {}
   const attCls = _peerAttClass(p, ctx);
   h += '<span class="pm-id' + (attCls ? ' ' + attCls : '') + '">'
-     + esc(_peerDisplayId(p.id)) + '</span>';
+     + _roleMark + esc(_peerDisplayId(p.id)) + '</span>';
   // Version tag — last-known commit. Sticky via director peer_meta
   // *and* a client-side cache that survives state.json wipes by
   // remembering the most recent non-empty commit we ever saw for
@@ -4465,16 +4491,36 @@ function renderDirector(d) {
     if (us.needs_manual_update) return true;
     if (p.stale_status) return true;
     if (p.processor_state === 'paused') return true;
+    // Cleanly STOPPED peers (director parked them) are NOT attention
+    // even if they still have a current_kg leftover from before stop.
+    // Only flag interruption when state is something other than
+    // 'stopped' — e.g. 'idle' or 'crashed' with a current_kg.
     const _isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
-    if (!_isRun && p.current_kg) return true;  // interrupted
+    if (!_isRun && p.processor_state !== 'stopped' && p.current_kg) return true;
     return false;
   }
+  // Resolve director peer-id (URL-match preferred, falls back to
+  // self_id when this dashboard is the live director). Used both
+  // for the ♚ marker and to keep the director card visible even
+  // when its processor is stopped (primary doesn't run KGs).
+  const _normUrl = u => (u || '').replace(/\/$/, '');
+  const _dirUrl = _normUrl(d.director_url || '');
+  let _directorPeerId = null;
+  if (_dirUrl) {
+    const _hit = (d.peers || []).find(_pp => _normUrl(_pp.url || '') === _dirUrl);
+    if (_hit) _directorPeerId = _hit.id;
+  }
+  if (!_directorPeerId && d.is_director_local) _directorPeerId = d.self_id || 'primary';
+  const _shadowPeerId = d.shadow_peer || null;
   // Helper: is this a "quiet" peer worth hiding when toggle is off?
   function _isQuietPeer(p) {
     const isRun = p.online && (p.processor_state === 'running' || p.processor_state === 'processing');
     const isOwner = !!p.reserved_kg;
     const isAct = p.id === active;
     if (isRun || isOwner || isAct) return false;
+    // Director and shadow always visible — they carry HA semantics
+    // even when not actively processing KGs.
+    if (p.id === _directorPeerId || p.id === _shadowPeerId) return false;
     if (_peerNeedsAttention(p)) return false;
     return true;
   }

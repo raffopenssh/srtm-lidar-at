@@ -14095,33 +14095,10 @@ def process_txt():
             return False
         return True
 
-    def _is_stopped_clean(p):
-        # Hide STOPPED peers unless something is *actually* wrong. A
-        # peer that the director has parked mid-KG (so current_kg
-        # is set but processor_state is stopped) would otherwise
-        # trigger _is_attn() forever — burying the actively-running
-        # peers under a wall of historical state. Real attention
-        # signals (offline, needs-manual-update, stale_status,
-        # paused) keep STOPPED peers visible.
-        if _peer_role(p) != 'STOPPED':
-            return False
-        if not p.get('online'):
-            return False  # OFFLINE — keep visible
-        us = p.get('update_state') or {}
-        if us.get('needs_manual_update'):
-            return False
-        if p.get('stale_status'):
-            return False
-        if p.get('processor_state') == 'paused':
-            return False
-        return True
 
-    def _hide(p):
-        return _is_quiet(p) or _is_stopped_clean(p)
-    hidden_idle = [p for p in peers if _is_quiet(p)]
-    hidden_stopped = [p for p in peers if not _is_quiet(p) and _is_stopped_clean(p)]
-    hidden = hidden_idle + hidden_stopped
-    visible = peers if show_hidden else [p for p in peers if not _hide(p)]
+
+    hidden = [p for p in peers if _is_quiet(p)]
+    visible = peers if show_hidden else [p for p in peers if not _is_quiet(p)]
 
     # Sort: running peers (oldest current_kg first) > owners > rest by id.
     def _peer_sort_key(p):
@@ -14141,16 +14118,11 @@ def process_txt():
     visible.sort(key=_peer_sort_key)
 
     out.append('')
-    if hidden and not show_hidden:
-        bits = []
-        if hidden_idle:
-            bits.append(f'{len(hidden_idle)} idle')
-        if hidden_stopped:
-            bits.append(f'{len(hidden_stopped)} stopped')
-        suffix = ', ' + ' + '.join(bits) + ' hidden'
-    else:
-        suffix = ''
-    out.append('peers (' + str(len(visible)) + ' shown' + suffix + '):')
+    out.append(
+        'peers (' + str(len(visible)) + ' shown'
+        + (', ' + str(len(hidden)) + ' hidden idle' if hidden and not show_hidden else '')
+        + '):'
+    )
     # Token-cheap commit recovery: rather than fan out HTTPS probes to
     # 60 peers (which is what causes the director to load up during
     # diagnostic moments — exactly when we *least* want extra fan-out),

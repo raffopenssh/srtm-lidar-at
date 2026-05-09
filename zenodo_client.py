@@ -970,15 +970,21 @@ class Client:
             self._seen_full_gpkg.add(filename)
         log.info("upload_stream:%s %s  size=%.1f MB  md5=%s",
                  attempt_tag, filename, file_size / 1e6, md5_hex)
-        # Files >1 GB go through the InvenioRDM multipart bucket API
-        # when supported. Single-PUT streaming worked for ages but
-        # Zenodo's edge has been timing out long-lived TLS streams on
-        # multi-GB PUTs (`('Connection aborted.', TimeoutError('The
-        # write operation timed out'))`). Multipart caps each PUT at a
-        # few hundred MB so a single timeout only loses one part, not
-        # the whole upload. Falls back to single-PUT on any error.
-        _MULTIPART_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
-        use_multipart = file_size >= _MULTIPART_THRESHOLD
+        # NOTE 2026-05-09: multipart bucket uploads disabled.
+        # zenodo.org (production) returns HTTP 405 on the InvenioRDM
+        # multipart init endpoint (`POST {bucket}/{key}?uploads=`).
+        # The fallback path then re-uploads the entire multi-GB file
+        # via single PUT — but the multipart attempt has already
+        # consumed connect/handshake budget and the 405 retry chain
+        # left _full.gpkg files dangling on peer disks, eventually
+        # triggering ``Disk critically low`` pauses. Until we have
+        # a Zenodo deployment that actually supports multipart we
+        # stick with single-PUT streaming (which worked for months).
+        # The session-reset on ReadTimeout (above) and the
+        # WARNING-from-attempt-2 throttle escalation are kept —
+        # those addressed the *symptom* (timeout retry storm),
+        # multipart was a separate, broken mitigation.
+        use_multipart = False
 
         existing = manifest.get(key)
 

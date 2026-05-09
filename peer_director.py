@@ -4734,13 +4734,28 @@ class PeerDirector:
             cfg = self.cfg.copy()
             tracked = dict(self.state.get('peer_update_state') or {})
             last_director_commit = self.state.get('peer_update_director_commit')
-        # If the director's commit advanced since last tick, reset retry
+        # If the director's commit advanced since last tick, reset *attempt*
         # counters so peers get a fresh round (a new push effectively
-        # invalidates the previous "manual required" verdict).
+        # invalidates the previous "manual required" verdict). But preserve
+        # the graceful-update timing fields (``last_graceful_attempt``,
+        # ``graceful_attempts``, ``first_seen_stale``) — wiping these caused
+        # the 2026-05-09 incident where the active frontier was graceful-
+        # kicked every 8 min mid-upload, with each rollout commit truncating
+        # its own KG's Zenodo upload before the previous one finished. Hard
+        # rollouts only act on idle peers, so resetting *their* attempt
+        # counters is fine; graceful kicks already have their own per-peer
+        # ``STALE_GRACEFUL_MAX_ATTEMPTS`` ceiling that should not reset on
+        # every push.
         if last_director_commit and last_director_commit != _LOCAL_GIT_COMMIT:
-            log.info('Director commit advanced %s -> %s; resetting peer update retry state',
+            log.info('Director commit advanced %s -> %s; resetting peer update '
+                     'attempt counters (preserving graceful timing)',
                      last_director_commit[:8], _LOCAL_GIT_COMMIT[:8])
-            tracked = {}
+            for _pid, _rec in list(tracked.items()):
+                _rec['attempts'] = 0
+                _rec.pop('last_attempt', None)
+                _rec.pop('last_result', None)
+                _rec.pop('needs_manual_update', None)
+                tracked[_pid] = _rec
         # Make sure origin/main matches our local HEAD before we ask peers
         # to fetch+reset. Without this, peers reset to a stale origin and
         # silently stay behind.
@@ -4798,6 +4813,29 @@ class PeerDirector:
                 gattempts = int(rec.get('graceful_attempts') or 0)
                 if gattempts >= self.STALE_GRACEFUL_MAX_ATTEMPTS:
                     rec['needs_manual_update'] = True
+                    tracked[pid] = rec
+                    continue
+                # Don't graceful-kick a peer that is mid-finalization for
+                # the current KG — GPKG build / validation / Zenodo
+                # uploads can each take many minutes for large KGs and a
+                # SIGTERM here forces the next run to redo all of them
+                # (see 2026-05-09 incident: at43 90107-west truncated
+                # 5 times in 8 h, manifest stalled). The processor checks
+                # ``_shutdown_requested`` only between KGs, so once it
+                # has finished the heavy raster steps it will exit
+                # naturally at the next KG boundary anyway. Letting the
+                # current KG complete its full upload chain (full_gpkg,
+                # light_gpkg, json) is always cheaper than re-running.
+                step = ((ps.get('current_kg') or {}).get('step') or '').lower()
+                FINALIZE_STEPS = (
+                    'gpkg_full', 'validate_full_gpkg', 'upload_full_gpkg',
+                    'gpkg_light', 'validate_light_gpkg', 'upload_light_gpkg',
+                    'json', 'upload_json', 'upload', 'disk_cleanup',
+                )
+                if any(step.startswith(s) for s in FINALIZE_STEPS):
+                    log.info('Skip graceful kick on %s: mid-finalization '
+                             '(step=%s) — letting current KG upload chain '
+                             'finish before restart', pid, step)
                     tracked[pid] = rec
                     continue
                 if (now - last_graceful) >= 1800:

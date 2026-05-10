@@ -91,7 +91,12 @@ Thresholds (peer_director.py):
   is suppressed in `fleet_bw` until ≥5 distinct quality obs across
   the fleet. Until then `process.txt` shows `wall=? (gathering, N
   quality obs)` instead of inventing a confident wall.
-* `CANARY_PARK_COOLDOWN_S = 6h` — used by slowdown park.
+* `CANARY_PARK_COOLDOWN_S = 6h` — quality-grade parks (real shaping).
+* `CANARY_PARK_COOLDOWN_SOFT_S = 1h` — soft parks (defensive, not
+  network-grade or not persistent). Almost always upstream blips
+  (Zenodo / openEO / transient internet); the short cooldown lets the
+  peer rejoin quickly. If the issue is real, the peer will soft-park
+  again next tick and eventually graduate to quality-grade.
 * Park-until-renewal cooldown = peer's effective `renew_day` next
   occurrence (no need to track per-peer budgets separately; the existing
   `_peer_is_scheduled` gate makes the scheduler skip the peer).

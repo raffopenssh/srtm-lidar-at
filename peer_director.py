@@ -455,7 +455,16 @@ CANARY_BASELINE_WINDOW_S = 1800   # 30-min trailing baseline
 CANARY_RECENT_WINDOW_S = 600      # 10-min recent throughput
 CANARY_SLOWDOWN_RATIO = 0.30      # park if recent < 30% of baseline
 CANARY_NOISE_PARK_THRESHOLD = 1.5 # park if noise_score >= this
-CANARY_PARK_COOLDOWN_S = 6 * 3600 # 6 h not_before
+CANARY_PARK_COOLDOWN_S = 6 * 3600 # 6 h not_before (quality-grade parks)
+# Soft parks (defensive, not network-grade or not persistent) are
+# almost always upstream blips (Zenodo upload stall, openEO 502,
+# transient internet hiccup) rather than exe.dev shaping. A 6 h
+# cooldown is wasteful here — the blip resolves in minutes and we
+# burn hours of peer capacity. Use a shorter cooldown so soft-parked
+# peers cycle back into rotation; if the underlying issue is real
+# they’ll soft-park again on the next tick (and eventually graduate
+# to quality-grade once persistence + network-grade both fire).
+CANARY_PARK_COOLDOWN_SOFT_S = 60 * 60   # 1 h
 # Don't trip the slowdown check until the canary has actually moved
 # enough bytes for the average to be meaningful (otherwise a peer that
 # happens to be idle between KGs reads as 'shaped').
@@ -3295,7 +3304,13 @@ class PeerDirector:
             if not reasons:
                 continue
             # Park: write not_before, persist, send graceful stop.
-            cooldown = _dt.now(_tz.utc) + _td(seconds=CANARY_PARK_COOLDOWN_S)
+            # Quality-grade parks (real shaping observation) earn the
+            # full 6 h cooldown; soft parks get the shorter window so
+            # peers don't sit idle for hours after a transient blip.
+            cooldown_s = (CANARY_PARK_COOLDOWN_S
+                          if quality_obs
+                          else CANARY_PARK_COOLDOWN_SOFT_S)
+            cooldown = _dt.now(_tz.utc) + _td(seconds=cooldown_s)
             # Used-GB at park time — the observed wall for this peer.
             bw_now = (state.get('peer_bandwidth') or {}).get(pid) or {}
             used_gb_at_park = bw_now.get('used_gb')

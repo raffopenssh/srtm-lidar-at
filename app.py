@@ -13216,6 +13216,92 @@ def api_flags_list():
     """
     a = request.args
     try:
+        # Split-KG handling: when caller asks for a parent KG (e.g. '63304')
+        # but only block JSONs exist on disk ('63304-south.json'), compute
+        # flags on-the-fly from the merged JSON. Persisted block flags use
+        # block-keyed obj_refs ('63304-south:top_obj:5') AND block-relative
+        # indices, neither of which match what the dashboard renders from
+        # the merged record. Re-scanning the merged dict produces parent-
+        # keyed obj_refs with indices aligned to the merged top_10 / top_by_type.
+        kg_arg = a.get('kg')
+        if kg_arg:
+            jdir = Path('data/austria_processor/json')
+            plain = jdir / f'{kg_arg}.json'
+            blocks = sorted(jdir.glob(f'{kg_arg}-*.json'))
+            if (not plain.exists()) and blocks:
+                try:
+                    idx = si.get_index()
+                    merged = idx.merged_kg_json(kg_arg)
+                except Exception:
+                    merged = None
+                if merged is not None:
+                    res = quality_flags.scan_kg_data(merged, kg_arg)
+                    flags = res['flags']
+                    # Apply same filters list_flags supports
+                    sev = a.get('severity'); code = a.get('code')
+                    typ = a.get('type'); kind = a.get('kind')
+                    bbox = _bbox_arg(a.get('bbox'))
+                    obj_ref = a.get('obj_ref')
+                    min_value = float(a['min_value']) if a.get('min_value') else None
+                    obj_by_ref = {o['obj_ref']: o for o in res['objects']}
+                    out = []
+                    for f in flags:
+                        if obj_ref and f['obj_ref'] != obj_ref: continue
+                        if sev and f.get('severity') != sev: continue
+                        if code and f.get('flag_code') != code: continue
+                        o = obj_by_ref.get(f['obj_ref']) or {}
+                        if typ and o.get('obj_type') != typ: continue
+                        if kind and o.get('kind') != kind: continue
+                        if bbox:
+                            w,s,e,n = bbox
+                            lon = f.get('centroid_lon'); lat = f.get('centroid_lat')
+                            if lon is None or lat is None or not (w<=lon<=e and s<=lat<=n):
+                                continue
+                        if min_value is not None:
+                            v = (f.get('attrs') or {}).get('value')
+                            try:
+                                if v is None or float(v) < min_value: continue
+                            except Exception:
+                                continue
+                        # Decorate with object fields for parity with /flags rows
+                        f = dict(f)
+                        f['obj_type'] = o.get('obj_type')
+                        f['kind'] = o.get('kind')
+                        f['height_max_m'] = o.get('height_max_m')
+                        f['area_sqm'] = o.get('area_sqm')
+                        f['rf_confidence'] = o.get('rf_confidence')
+                        f['confidence'] = o.get('confidence')
+                        out.append(f)
+                    # Sort + paginate
+                    order = a.get('order', 'severity')
+                    sev_rank = {'critical':0,'high':1,'medium':2,'low':3}
+                    if order == 'severity':
+                        out.sort(key=lambda r: (sev_rank.get(r.get('severity'), 9),
+                                                -(r.get('height_max_m') or 0)))
+                    elif order == 'value':
+                        out.sort(key=lambda r: -((r.get('attrs') or {}).get('value') or 0))
+                    elif order == 'recent':
+                        out.sort(key=lambda r: -(r.get('computed_at') or 0))
+                    limit = min(int(a.get('limit', 200)), 1000)
+                    offset = int(a.get('offset', 0))
+                    out = out[offset:offset+limit]
+                    # Aggregates per obj_ref (within this on-the-fly set)
+                    agg = {}
+                    for f in flags:
+                        a_ = agg.setdefault(f['obj_ref'], {'total_weight':0.0,'n_flags':0,'codes':set(),'sevs':[]})
+                        a_['total_weight'] += float(f.get('weight') or 0)
+                        a_['n_flags'] += 1
+                        a_['codes'].add(f.get('flag_code'))
+                        a_['sevs'].append(f.get('severity'))
+                    sev_order = {'low':0,'medium':1,'high':2,'critical':3}
+                    for k,v in agg.items():
+                        rank = max((sev_order.get(s,-1) for s in v['sevs']), default=-1)
+                        v['max_severity'] = next((s for s,r in sev_order.items() if r==rank), None)
+                        v['codes'] = sorted(v['codes'])
+                        v.pop('sevs', None)
+                    for r in out:
+                        r['aggregate'] = agg.get(r['obj_ref'])
+                    return jsonify({'count': len(out), 'flags': out, 'split': True})
         rows = feedback_db.list_flags(
             kg_code=a.get('kg'), severity=a.get('severity'),
             flag_code=a.get('code'), obj_type=a.get('type'),

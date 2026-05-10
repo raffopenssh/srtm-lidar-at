@@ -1077,12 +1077,25 @@ threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
 
 PEER_PUSH_INTERVAL_S = 30
 PEER_PUSH_TIMEOUT_S = 5
+# When the peer's processing state is steady (idle/stopped/parked) and
+# the previous push succeeded, slow pushes down to this interval.
+# Saves ~80 % of inbound bytes on the director from a fleet that's
+# mostly parked (e.g. during a bandwidth-wall renewal week). Director
+# treats a push as fresh for PEER_PUSH_FRESH_S=75s, so an idle peer
+# pushing every 240s will be flagged stale — we override that
+# locally by sending a tiny heartbeat every PEER_PUSH_INTERVAL_S as
+# well (see ``mini`` below).
+PEER_PUSH_INTERVAL_IDLE_S = 240
+_PEER_PUSH_LAST_FULL_TS = 0.0
+_PEER_PUSH_LAST_STATE = ''
 
 
 def _peer_status_push_loop():
     import requests as _req
     import director_ha as _dha
     import peer_director as _pd
+    import gzip as _gz
+    global _PEER_PUSH_LAST_FULL_TS, _PEER_PUSH_LAST_STATE
     while True:
         try:
             time.sleep(PEER_PUSH_INTERVAL_S)
@@ -1181,13 +1194,59 @@ def _peer_status_push_loop():
                 hdrs = {'X-Admin-Token': tok} if tok else {}
             except Exception:
                 hdrs = {}
+            # Bandwidth-saver: if the peer is steady-state idle and
+            # we sent a full push recently, skip this tick. A peer in
+            # active processing always pushes (state churns every few
+            # seconds via current_kg.step_detail).
+            _state_now = (status.get('state') or '').strip().lower()
+            _idle_states = (
+                'idle', 'stopped', 'parked',
+                'paused_zenodo', 'paused_copernicus', 'paused_disk',
+            )
+            _now = time.time()
+            _force_full = (
+                _state_now != _PEER_PUSH_LAST_STATE
+                or (_now - _PEER_PUSH_LAST_FULL_TS)
+                >= PEER_PUSH_INTERVAL_IDLE_S
+                or _state_now not in _idle_states
+            )
+            if not _force_full and _state_now in _idle_states:
+                # Send a tiny heartbeat-only payload (no recent_log,
+                # no manifest fields) so the director's freshness
+                # window doesn't mark us stale. This keeps us under
+                # ~400 bytes per tick instead of ~3.6 KB.
+                _slim = {
+                    'state': status.get('state'),
+                    'cache_only': status.get('cache_only'),
+                    'git_commit': status.get('git_commit'),
+                    'region': status.get('region'),
+                    'instance': status.get('instance'),
+                    'warning_rates': status.get('warning_rates'),
+                    '_heartbeat': True,
+                }
+                payload = {'peer_id': peer_id, 'status': _slim,
+                           'bandwidth': bw}
+            else:
+                payload = {'peer_id': peer_id, 'status': status,
+                           'bandwidth': bw}
+                _PEER_PUSH_LAST_FULL_TS = _now
+                _PEER_PUSH_LAST_STATE = _state_now
+            # Gzip the body unconditionally — status payloads
+            # compress to ~25 % of source. Director endpoint
+            # transparently handles Content-Encoding: gzip
+            # (Flask/Werkzeug auto-decompress when content-encoding
+            # header set).
             try:
+                raw = json.dumps(payload).encode('utf-8')
+                body = _gz.compress(raw)
+                hdrs2 = dict(hdrs)
+                hdrs2['Content-Encoding'] = 'gzip'
+                hdrs2['Content-Type'] = 'application/json'
                 _req.post(
                     director_url.rstrip('/') + '/api/v1/director/peer_status',
-                    json={'peer_id': peer_id, 'status': status,
-                          'bandwidth': bw},
+                    data=body,
                     timeout=PEER_PUSH_TIMEOUT_S,
-                    headers=hdrs,
+                    headers=hdrs2,
                 )
             except Exception as e:
                 log.debug('peer status push failed: %s', e)
@@ -4886,8 +4945,23 @@ def director_peer_status():
       * bandwidth: optional bandwidth dict to avoid a separate poll
 
     No body validation — we trust admin-token auth.
+
+    Accepts ``Content-Encoding: gzip`` to halve inbound bandwidth on
+    the director (~3.6 KB/peer/30 s × 64 peers → ~600 MB/day raw,
+    ~150 MB/day gzipped). Older peers POST uncompressed JSON; both
+    work.
     """
-    body = request.get_json(silent=True) or {}
+    body = None
+    try:
+        if (request.headers.get('Content-Encoding') or '').lower() == 'gzip':
+            import gzip as _gz
+            raw = _gz.decompress(request.get_data(cache=False))
+            body = json.loads(raw.decode('utf-8'))
+    except Exception as _e:
+        log.warning('peer_status: gzip decode failed: %s', _e)
+        body = None
+    if body is None:
+        body = request.get_json(silent=True) or {}
     peer_id = (body.get('peer_id') or body.get('peer') or '').strip()
     if not peer_id:
         return jsonify({'error': 'peer_id required'}), 400

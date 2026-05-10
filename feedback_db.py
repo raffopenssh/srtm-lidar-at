@@ -356,7 +356,11 @@ def resolve_point(lon: float, lat: float, hint: dict = None,
     args = [lon-dlon, lon+dlon, lat-dlat, lat+dlat]
     sql = f'''SELECT o.* FROM objects_rtree r JOIN objects o ON o.rowid=r.rowid
               WHERE {' AND '.join(where)}'''
-    if kg_code:   sql += ' AND o.kg_code=?'; args.append(kg_code)
+    if kg_code:
+        # Accept parent KG code even when objects were ingested under a
+        # split-block code like '63304-south'.
+        sql += " AND (o.kg_code=? OR o.kg_code LIKE ?)"
+        args.extend([kg_code, kg_code + '-%'])
     if obj_type:  sql += ' AND o.obj_type=?'; args.append(obj_type)
     if kind:      sql += ' AND o.kind=?'; args.append(kind)
     c = _conn()
@@ -508,7 +512,9 @@ def match_text(text: str, kg_code: str = None, lon: float = None, lat: float = N
         # spatial path — widen radius for typed text
         return resolve_point(lon, lat, hint=hint, radius_m=radius_m, kg_code=kg_code)
     where = []; args = []
-    if kg_code: where.append('kg_code=?'); args.append(kg_code)
+    if kg_code:
+        where.append("(kg_code=? OR kg_code LIKE ?)")
+        args.extend([kg_code, kg_code + '-%'])
     if hint.get('predicted_type'):
         where.append('LOWER(obj_type)=?'); args.append(hint['predicted_type'])
     h = hint.get('height_max_m')
@@ -525,7 +531,9 @@ def match_text(text: str, kg_code: str = None, lon: float = None, lat: float = N
         # We re-do args properly:
     # rebuild sanely
     where = []; args = []
-    if kg_code: where.append('kg_code=?'); args.append(kg_code)
+    if kg_code:
+        where.append("(kg_code=? OR kg_code LIKE ?)")
+        args.extend([kg_code, kg_code + '-%'])
     if hint.get('predicted_type'):
         where.append('LOWER(obj_type)=?'); args.append(hint['predicted_type'])
     if h is not None:

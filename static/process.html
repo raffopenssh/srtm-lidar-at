@@ -1439,34 +1439,45 @@ function updateCards(d) {
       zenDet += '<br><span style="color:var(--dim)">Last: ' + esc(last.product + ' — ' + (last.reason||'')) + ' (' + ago + ')</span>';
     }
   }
-  // Fleet-bandwidth bar: total remaining GB across enabled peers until
-  // the next cycle renew (renew_day = 17th).
+  // Fleet-bandwidth summary. We don't trust the aggregate "GB left of
+  // N GB" any more (each VM lives in a different exe.dev account with
+  // its own cycle anchor and unknown real cap). Instead show what we
+  // actually measure: cumulative used GB, parked-peer count,
+  // observed shaping wall (median of peers that have hit it), and the
+  // soonest per-peer cycle reset.
   try {
     const dd = (typeof _directorData !== 'undefined' && _directorData) ? _directorData : null;
-    if (dd && Array.isArray(dd.peers)) {
-      let totRem = 0, totBudget = 0, totUsed = 0, n = 0;
-      const defBudget = dd.budget_gb || 95;
-      for (const p of dd.peers) {
-        if (!p.enabled) continue;
-        const bw = p.bandwidth || {};
-        if (!Object.keys(bw).length) continue;
-        n++;
-        const budget = bw.effective_budget_gb || bw.budget_gb || defBudget;
-        const used = bw.used_gb || 0;
-        const rem = (bw.remaining_gb != null) ? bw.remaining_gb : Math.max(0, budget - used);
-        totRem += rem; totBudget += budget; totUsed += used;
-      }
-      // Days until renew (renew_day or 17), assume monthly cycle.
-      const renewDay = dd.renew_day || 17;
-      const now = new Date();
-      let renew = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), renewDay));
-      if (renew <= now) renew = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, renewDay));
-      const daysLeft = Math.max(0, Math.round((renew - now) / 86400000));
-      const pctRem = totBudget > 0 ? (totRem / totBudget * 100) : 0;
-      const barColor = pctRem > 50 ? 'var(--green)' : pctRem > 20 ? 'var(--yellow)' : 'var(--red)';
-      zenDet += '<div style="margin-top:6px;font-size:11px;color:var(--dim)" title="Sum of remaining bandwidth across all ' + n + ' enabled peers (cycle resets day ' + renewDay + ' of month)">' +
-        'Fleet BW: <b style="color:var(--text)">' + Math.round(totRem) + ' GB</b> left of ' + Math.round(totBudget) + ' GB · ' + n + ' peers · resets in ' + daysLeft + 'd' +
-        '<div class="bar" style="margin-top:3px;height:5px"><div class="bar-fill" style="width:' + pctRem.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
+    const fb = dd && dd.fleet_bw;
+    if (fb) {
+      const used = Math.round(fb.used_gb || 0);
+      const nominal = Math.round(fb.budget_gb_nominal || 0);
+      const parked = fb.peers_parked || 0;
+      const total = fb.peers_enabled || 0;
+      const days = (fb.next_renew_in_days != null) ? fb.next_renew_in_days : '?';
+      const capMed = fb.observed_cap_gb_median;
+      const capN = fb.observed_cap_gb_count || 0;
+      // Bar fills relative to observed cap (if known) else nominal,
+      // capped at 100. Color by parked-fraction so a quiet shaped
+      // fleet looks healthy and a loud one alarms.
+      const refTotal = (capMed != null) ? capMed * total : nominal;
+      const pctUsed = refTotal > 0 ? Math.min(100, used / refTotal * 100) : 0;
+      const parkFrac = total > 0 ? (parked / total) : 0;
+      const barColor = parkFrac > 0.25 ? 'var(--red)' : parkFrac > 0.05 ? 'var(--yellow)' : 'var(--green)';
+      const capStr = (capMed != null)
+        ? ' · wall ~' + Math.round(capMed) + ' GB (' + capN + ' peers)'
+        : '';
+      const tip = 'Fleet bandwidth (canary-by-default).\n'
+        + 'used_gb: cumulative bytes consumed this cycle across all enabled peers.\n'
+        + 'budget_gb_nominal: sum of per-peer budgets (informational; real walls per-account).\n'
+        + 'wall: median observed cap from peers that auto-parked on throughput collapse.\n'
+        + 'next reset: soonest per-peer renew_day (derived from first_seen day-of-month).\n'
+        + 'Parked peers cool down ' + Math.round(((dd.canary_cooldown_s)||21600)/3600) + 'h after auto-park.';
+      zenDet += '<div style="margin-top:6px;font-size:11px;color:var(--dim)" title="' + esc(tip) + '">' +
+        'Fleet BW: <b style="color:var(--text)">' + used + ' GB</b> used · ' + total + ' peers' +
+        (parked ? ' · <b style="color:var(--yellow)">' + parked + ' parked</b>' : '') +
+        capStr +
+        ' · next reset in ' + days + 'd' +
+        '<div class="bar" style="margin-top:3px;height:5px"><div class="bar-fill" style="width:' + pctUsed.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
         '</div>';
     }
   } catch(_e) {}
@@ -4434,8 +4445,17 @@ function renderDirector(d) {
     const th = c.park_thresholds || {};
     const slowR = th.slowdown_ratio || 0.3;
     const noiseR = th.noise_score || 1.5;
+    const override = !!c.override;
+    // Every peer is sampled now (canary-by-default). To keep the peer
+    // strip uncluttered, show the badge only when:
+    //   - this peer is an explicit override canary (🐤 always), OR
+    //   - the throughput ratio is dipping (yellow/red), OR
+    //   - the peer has an observed_cap_gb persisted (it hit the wall).
+    const dipping = (samples >= 2 && ratio != null && ratio < 0.7);
+    const hasCap = c.observed_cap_gb != null;
+    if (!override && !dipping && !hasCap) return '';
     let color = 'var(--dim)';
-    let label = '🐤';
+    let label = override ? '🐤' : '📉';
     if (samples < 2 || ratio == null) {
       color = 'var(--dim)';
       label += ' …';
@@ -4452,10 +4472,16 @@ function renderDirector(d) {
     const baseM = (c.baseline_mbps != null) ? c.baseline_mbps.toFixed(2) : '?';
     const recM = (c.recent_mbps != null) ? c.recent_mbps.toFixed(2) : '?';
     const reason = (c.notes && c.notes.length) ? c.notes[c.notes.length-1].reason : '';
-    const tip = 'Canary peer (budget ' + (c.budget_gb||'?') + ' GB)' +
+    const head = override
+      ? 'Canary peer (override budget ' + (c.budget_gb||'?') + ' GB)'
+      : 'Bandwidth watch (canary-by-default)';
+    const capLine = (c.observed_cap_gb != null)
+      ? '\nobserved wall: ~' + c.observed_cap_gb + ' GB'
+      : '';
+    const tip = head + capLine +
       '\nbaseline: ' + baseM + ' Mbps · recent: ' + recM + ' Mbps · ratio: ' + (ratio!=null?ratio.toFixed(2):'?') +
-      '\nnoise: ' + noise.toFixed(2) + ' (park ≥' + noiseR + ')' +
-      '\nslowdown park: <' + slowR + 'x' +
+      (override ? ('\nnoise: ' + noise.toFixed(2) + ' (park ≥' + noiseR + ')') : '') +
+      '\nslowdown park: <' + slowR + 'x (all peers)' +
       '\nsamples: ' + samples +
       (reason ? '\nnote: ' + reason : '');
     return ' <span title="' + esc(tip) + '" style="font-size:9px;padding:1px 5px;border:1px solid ' + color + ';border-radius:8px;color:' + color + ';font-weight:600">' + label + '</span>';

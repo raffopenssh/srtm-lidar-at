@@ -394,15 +394,23 @@ FRONTIER_RESTART_COOLDOWN_S = 180
 
 # Canary bandwidth history & auto-park.
 #
-# Peers with a per-peer ``budget_gb`` override are canaries running past
-# the global 95 GB cap to probe what exe.dev actually enforces. We sample
-# their cumulative ``used_bytes`` on every bandwidth poll and, if the
-# observed throughput collapses (exe.dev started shaping) or the peer
-# starts spewing warnings (failed BEV / Zenodo / Copernicus calls — i.e.
-# the network is hurting the cluster), park the canary by sending its
-# processor a graceful stop and writing ``not_before = now + cooldown``
-# so the director leaves it alone until exe.dev has presumably released
-# the throttle.
+# As of 2026-05 every enabled peer is treated as a canary: exe.dev's
+# real per-account billing-cycle limits are unknown (each VM was created
+# in a different account at a different date) so we don't trust the
+# global 95 GB / 17th-of-month assumption. Instead we sample every
+# peer's cumulative ``used_bytes`` on every bandwidth poll and, if the
+# observed throughput collapses (exe.dev started shaping), park that
+# peer with ``not_before = now + cooldown`` and persist
+# ``observed_cap_gb = used_gb-at-park`` in peers.json so we learn each
+# peer's wall organically. Slowdown park applies to ALL peers; the
+# stricter noise-based park (warning-rate spike) stays canary-only —
+# generic noisy peers are already handled by load-shifting in the
+# scheduler and we don't want to remove them from rotation just for
+# being upstream-grumpy.
+#
+# A peer with a per-peer ``budget_gb`` override is still called a canary
+# because its budget is intentionally raised above the conservative
+# global cap to probe further; the dashboard surfaces this distinctly.
 #
 # Sampling cadence is whatever ``BANDWIDTH_POLL_INTERVAL`` is doing
 # (every ~minute on the active poll loop, less for backed-off peers).
@@ -2180,6 +2188,22 @@ class PeerDirector:
                     / (1024 ** 3), 2)
                 bw['budget_gb'] = _eff_budget_gb
 
+            # Per-peer renew_day: explicit override > day-of-month of
+            # first_seen > global cfg renew_day. This is informational
+            # only — vnstat cycle math still uses the global anchor (no
+            # peer rollout required to change behaviour) — but it lets
+            # the dashboard show realistic per-peer reset estimates.
+            _renew_day = peer.get('renew_day')
+            if not _renew_day:
+                _fs = peer.get('first_seen')
+                if isinstance(_fs, str) and len(_fs) >= 10:
+                    try:
+                        _renew_day = int(_fs[8:10])
+                    except (ValueError, TypeError):
+                        _renew_day = None
+            if not _renew_day:
+                _renew_day = cfg.get('renew_day', BANDWIDTH_RENEW_DAY)
+
             peers_status.append({
                 'id': pid,
                 'url': url,
@@ -2187,6 +2211,10 @@ class PeerDirector:
                 'not_before': peer.get('not_before'),
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
+                'renew_day': _renew_day,
+                'observed_cap_gb': peer.get('observed_cap_gb'),
+                'observed_cap_at': peer.get('observed_cap_at'),
+                'first_seen': peer.get('first_seen'),
                 'stale_status': bool(ps.get('_stale')),
                 'stale_age_s': ps.get('_stale_age_s'),
                 'zenodo_cooldown_history': peer.get('zenodo_cooldown_history') or [],
@@ -2387,6 +2415,7 @@ class PeerDirector:
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
+            'fleet_bw': self._fleet_bw_summary(peers_status),
             'capacity_factor': state.get(
                 'capacity_factor', self._capacity_ema),
             'capacity_ema': state.get(
@@ -2666,21 +2695,25 @@ class PeerDirector:
     # Canary bandwidth history
     # ------------------------------------------------------------------
     def _sample_canary_history(self) -> None:
-        """Append a (ts, used_bytes) sample for every canary peer.
+        """Append a (ts, used_bytes) sample for every enabled peer.
 
-        A canary is any peer with a ``budget_gb`` override set in
-        peers.json. Non-canaries are not sampled (we only need history
-        on the peers we're probing).
+        Since 2026-05 every peer is sampled (canary-by-default) so we
+        can detect bandwidth-wall shaping anywhere in the fleet without
+        rolling out new code. Disabled peers are pruned to keep the
+        ring small.
         """
         with self._lock:
             cfg = self.cfg
             bw_map = self.state.get('peer_bandwidth') or {}
             hist = self.state.setdefault('canary_history', {})
             now = int(time.time())
+            keep_ids = {p['id'] for p in cfg.get('peers', [])
+                        if p.get('enabled', True)}
+            for stale_pid in list(hist.keys()):
+                if stale_pid not in keep_ids:
+                    hist.pop(stale_pid, None)
             for p in cfg.get('peers', []):
-                if p.get('budget_gb') is None:
-                    # Drop history for peers no longer on canary status
-                    # so we don't confuse a future canary run.
+                if not p.get('enabled', True):
                     hist.pop(p['id'], None)
                     continue
                 bw = bw_map.get(p['id']) or {}
@@ -2733,12 +2766,16 @@ class PeerDirector:
     def _canary_summary(self, peer: dict, state: dict) -> dict | None:
         """Compact summary for the status payload.
 
-        Returns None for non-canary peers so the dashboard can use
-        ``peer.canary`` as both a presence check and a data source.
+        Every enabled peer is sampled (canary-by-default). ``budget_gb``
+        on the peer flags the *override* canaries probing past the
+        global cap, surfaced to the dashboard as ``override:true``.
+        Returns None only for peers with no samples yet so the
+        dashboard can keep using ``peer.canary`` as both a presence
+        check and a data source for the badge.
         """
-        if peer.get('budget_gb') is None:
-            return None
         pid = peer['id']
+        if not (state.get('canary_history') or {}).get(pid):
+            return None
         series = (state.get('canary_history') or {}).get(pid) or []
         base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
         recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
@@ -2749,6 +2786,8 @@ class PeerDirector:
         ]
         return {
             'budget_gb': peer.get('budget_gb'),
+            'override': peer.get('budget_gb') is not None,
+            'observed_cap_gb': peer.get('observed_cap_gb'),
             'samples': len(series),
             'baseline_mbps': round(base['rate_bps'] / 1e6, 3) if base else None,
             'recent_mbps': round(recent['rate_bps'] / 1e6, 3) if recent else None,
@@ -2764,13 +2803,99 @@ class PeerDirector:
             'notes': (peer.get('canary_notes') or [])[-5:],
         }
 
-    def _check_canary_health(self) -> None:
-        """Park canaries that look shaped or noisy.
+    @staticmethod
+    def _fleet_bw_summary(peers_status: list[dict]) -> dict:
+        """Aggregate bandwidth view that doesn't lie about the wall.
 
-        Only acts on peers with a ``budget_gb`` override. Sets
-        ``not_before`` so the director's normal scheduling logic stops
-        sending it work; the existing graceful-stop / not_before paths
-        in ``_check_and_switch`` handle the cleanup.
+        Replaces the old "GB left of N\u00a0GB" aggregate (which assumed
+        all peers share one cycle anchor and one budget). Reports:
+
+          * ``used_gb``: actual bytes consumed across enabled peers
+            this cycle (the only number we measure, not guess).
+          * ``budget_gb``: nominal sum of effective per-peer budgets,
+            for context only — NOT a reliable wall.
+          * ``parked``: peers currently in not_before cooldown.
+          * ``observed_cap_gb_min/median``: distilled from
+            ``observed_cap_gb`` across peers that have hit the wall.
+          * ``next_renew_in_days``: minimum days-to-renew across peers
+            (per-peer renew_day) so the dashboard shows the soonest
+            upcoming reset rather than averaging.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        used = 0.0
+        budget = 0.0
+        n_total = 0
+        n_parked = 0
+        n_with_cap = 0
+        caps: list[float] = []
+        soonest_days = None
+        for p in peers_status:
+            if not p.get('enabled'):
+                continue
+            n_total += 1
+            bw = p.get('bandwidth') or {}
+            if isinstance(bw.get('used_gb'), (int, float)):
+                used += float(bw['used_gb'])
+            eb = bw.get('effective_budget_gb') or bw.get('budget_gb')
+            if isinstance(eb, (int, float)):
+                budget += float(eb)
+            if p.get('scheduled'):
+                n_parked += 1
+            cap = p.get('observed_cap_gb')
+            if isinstance(cap, (int, float)):
+                n_with_cap += 1
+                caps.append(float(cap))
+            rd = p.get('renew_day')
+            if isinstance(rd, int) and 1 <= rd <= 28:
+                # next occurrence of rd this/next month
+                try:
+                    nxt = now.replace(day=rd, hour=0, minute=0,
+                                      second=0, microsecond=0)
+                    if nxt <= now:
+                        m = now.month + 1
+                        y = now.year + (1 if m > 12 else 0)
+                        m = ((m - 1) % 12) + 1
+                        nxt = nxt.replace(year=y, month=m)
+                    days = max(0, int((nxt - now).total_seconds() // 86400))
+                    if soonest_days is None or days < soonest_days:
+                        soonest_days = days
+                except ValueError:
+                    pass
+        cap_min = min(caps) if caps else None
+        if caps:
+            scaps = sorted(caps)
+            cap_med = scaps[len(scaps) // 2]
+        else:
+            cap_med = None
+        return {
+            'peers_enabled': n_total,
+            'peers_parked': n_parked,
+            'used_gb': round(used, 2),
+            'budget_gb_nominal': round(budget, 2),
+            'observed_cap_gb_count': n_with_cap,
+            'observed_cap_gb_min': round(cap_min, 2) if cap_min is not None else None,
+            'observed_cap_gb_median': round(cap_med, 2) if cap_med is not None else None,
+            'next_renew_in_days': soonest_days,
+        }
+
+    def _check_canary_health(self) -> None:
+        """Park peers whose throughput collapsed (whole fleet) or whose
+        warning noise spiked (canary-override peers only).
+
+        Slowdown park: applies to every enabled peer — the canonical
+        signal for exe.dev shaping. We persist ``observed_cap_gb`` on
+        the peer the moment we trip, so we learn each peer's wall.
+
+        Noise park: applies only to peers with an explicit
+        ``budget_gb`` override (intentional canaries). Generic peers
+        get a noisy score for transient upstream issues that the
+        load-shifter already handles — yanking them out of rotation
+        for 6 h would be too aggressive.
+
+        Sets ``not_before`` so the director's normal scheduling logic
+        stops sending the peer work; existing graceful-stop /
+        not_before paths in ``_check_and_switch`` handle the cleanup.
         """
         with self._lock:
             cfg = self.cfg
@@ -2779,13 +2904,14 @@ class PeerDirector:
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         cfg_changed = False
         for p in peers:
-            if p.get('budget_gb') is None:
+            if not p.get('enabled', True):
                 continue
             pid = p['id']
             # Already parked? skip.
             if _peer_is_scheduled(p):
                 continue
             reasons: list[str] = []
+            slowdown_tripped = False
             base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
             recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
             if (base and recent
@@ -2794,43 +2920,71 @@ class PeerDirector:
                     and base['rate_bps'] > 0):
                 ratio = recent['rate_bps'] / base['rate_bps']
                 if ratio < CANARY_SLOWDOWN_RATIO:
+                    slowdown_tripped = True
                     reasons.append(
                         f'throughput collapsed: '
                         f'recent={recent["rate_bps"]/1e6:.2f} MB/s '
                         f'vs baseline {base["rate_bps"]/1e6:.2f} MB/s '
                         f'(ratio={ratio:.2f})'
                     )
-            noise = _peer_noise_score(pid, state)
-            if noise >= CANARY_NOISE_PARK_THRESHOLD:
-                reasons.append(f'noise_score={noise:.2f}')
+            # Noise-park: stricter, canary-override peers only.
+            is_override_canary = p.get('budget_gb') is not None
+            if is_override_canary:
+                noise = _peer_noise_score(pid, state)
+                if noise >= CANARY_NOISE_PARK_THRESHOLD:
+                    reasons.append(f'noise_score={noise:.2f}')
             if not reasons:
                 continue
             # Park: write not_before, persist, send graceful stop.
             cooldown = _dt.now(_tz.utc) + _td(seconds=CANARY_PARK_COOLDOWN_S)
+            # Used-GB at park time — the observed wall for this peer.
+            bw_now = (state.get('peer_bandwidth') or {}).get(pid) or {}
+            used_gb_at_park = bw_now.get('used_gb')
             with self._lock:
                 # Re-resolve under lock in case cfg was reloaded.
                 live = get_peer_by_id(self.cfg, pid)
-                if not live or live.get('budget_gb') is None:
+                if not live or not live.get('enabled', True):
                     continue
                 if _peer_is_scheduled(live):
                     continue
                 live['not_before'] = cooldown.isoformat()
+                # Persist the observed shaping wall: keep the *minimum*
+                # across cycles so repeated probing tightens the
+                # estimate but a single one-off doesn't loosen it.
+                if slowdown_tripped and isinstance(used_gb_at_park, (int, float)):
+                    prev = live.get('observed_cap_gb')
+                    if prev is None or used_gb_at_park < float(prev):
+                        live['observed_cap_gb'] = round(float(used_gb_at_park), 2)
+                    live['observed_cap_at'] = _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 notes = live.setdefault('canary_notes', [])
-                notes.append({
+                note: dict = {
                     'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                     'event': 'auto_park',
                     'reasons': reasons,
                     'cooldown_until': cooldown.isoformat(),
-                })
+                }
+                if slowdown_tripped and isinstance(used_gb_at_park, (int, float)):
+                    note['used_gb_at_park'] = round(float(used_gb_at_park), 2)
+                notes.append(note)
+                # Cap notes ring so peers.json doesn't grow unbounded.
+                if len(notes) > 32:
+                    del notes[: len(notes) - 32]
                 cfg_changed = True
                 peer_url = live.get('url')
-            log.warning('canary park %s: %s — not_before=%s',
-                        pid, '; '.join(reasons), cooldown.isoformat())
+            tag = 'canary park' if is_override_canary else 'auto-park'
+            log.warning('%s %s: %s — not_before=%s',
+                        tag, pid, '; '.join(reasons), cooldown.isoformat())
+            try:
+                _emit_director_event(
+                    f'{tag} {pid}: {"; ".join(reasons)} (cooldown until {cooldown.isoformat()})',
+                    peer=pid, level='warning')
+            except Exception:
+                pass
             try:
                 if peer_url:
                     stop_peer_processor(peer_url, graceful=True)
             except Exception as e:
-                log.warning('canary park %s: graceful stop failed: %s', pid, e)
+                log.warning('%s %s: graceful stop failed: %s', tag, pid, e)
         if cfg_changed:
             try:
                 save_peers_config(self.cfg)

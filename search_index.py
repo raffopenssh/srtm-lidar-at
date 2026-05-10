@@ -1328,6 +1328,9 @@ class SearchIndex:
             all_parcel_details.extend(d.get('parcels', {}).get('details', []))
         merged['parcels'] = {
             'count': len(all_parcel_details),
+            'total_area_sqm': round(
+                sum((d.get('parcels', {}) or {}).get('total_area_sqm', 0) or 0
+                    for _, d in block_list), 1),
             'details': all_parcel_details,
         }
 
@@ -1350,12 +1353,33 @@ class SearchIndex:
         }
 
         # ── infrastructure ───────────────────────────────────────
-        all_infra = []
+        # Source per-block format is {total, by_type:{<typ>:{count,total_area_sqm,features}}}.
+        # Concatenate features per type, sum counts/areas; recompute total.
+        merged_inf_by_type = {}
         for _, d in block_list:
-            all_infra.extend(d.get('infrastructure', {}).get('features', []))
+            inf = d.get('infrastructure', {}) or {}
+            for typ, info in (inf.get('by_type') or {}).items():
+                if typ not in merged_inf_by_type:
+                    merged_inf_by_type[typ] = {
+                        'count': 0, 'total_area_sqm': 0.0, 'features': [],
+                    }
+                m = merged_inf_by_type[typ]
+                m['count'] += info.get('count', 0) or 0
+                m['total_area_sqm'] += info.get('total_area_sqm', 0) or 0
+                m['features'].extend(info.get('features', []) or [])
+            # Older block JSONs may have flat features only — keep them too.
+            for f in (inf.get('features') or []):
+                typ = f.get('type', 'unknown')
+                if typ not in merged_inf_by_type:
+                    merged_inf_by_type[typ] = {'count': 0, 'total_area_sqm': 0.0, 'features': []}
+                merged_inf_by_type[typ]['features'].append(f)
+                merged_inf_by_type[typ]['count'] += 1
+                merged_inf_by_type[typ]['total_area_sqm'] += f.get('area_sqm', 0) or 0
+        for typ, m in merged_inf_by_type.items():
+            m['total_area_sqm'] = round(m['total_area_sqm'], 1)
         merged['infrastructure'] = {
-            'total': len(all_infra),
-            'features': all_infra,
+            'total': sum(m['count'] for m in merged_inf_by_type.values()),
+            'by_type': merged_inf_by_type,
         }
 
         # ── landscape ────────────────────────────────────────────
@@ -1364,47 +1388,80 @@ class SearchIndex:
             'vegetated_fraction': _wavg(['landscape', 'vegetated_fraction']),
             'shannon_diversity': _wavg(['landscape', 'shannon_diversity']),
             'n_segments': _sum(['landscape', 'n_segments']),
+            'edge_density': _wavg(['landscape', 'edge_density']),
+            'mean_segment_area_sqm': _wavg(['landscape', 'mean_segment_area_sqm']),
+            'is_vegetated': _any_val(['landscape', 'is_vegetated']),
         }
+        # Pass-through landscape.terrain (if blocks include it) — use freshest.
+        _lt = _any_val(['landscape', 'terrain'])
+        if _lt is not None:
+            merged['landscape']['terrain'] = _lt
 
         # ── area_summary (merge by type) ─────────────────────────
         merged_area_sum = {}
         merged_height_dist = {}
+        # Track count-weighted means for height_distribution
         for _, d in block_list:
             for otype, info in d.get('area_summary', {}).items():
                 if otype not in merged_area_sum:
-                    merged_area_sum[otype] = {'area_sqm': 0, 'n_objects': 0}
-                merged_area_sum[otype]['area_sqm'] += info.get('area_sqm', 0)
-                merged_area_sum[otype]['n_objects'] += info.get('n_objects', 0)
+                    merged_area_sum[otype] = {'pixels': 0, 'area_sqm': 0,
+                                              'n_objects': 0,
+                                              'observation_period': info.get('observation_period')}
+                merged_area_sum[otype]['pixels'] += info.get('pixels', 0) or 0
+                merged_area_sum[otype]['area_sqm'] += info.get('area_sqm', 0) or 0
+                merged_area_sum[otype]['n_objects'] += info.get('n_objects', 0) or 0
+                if info.get('observation_period') and not merged_area_sum[otype].get('observation_period'):
+                    merged_area_sum[otype]['observation_period'] = info['observation_period']
             for otype, hd in d.get('height_distribution', {}).items():
                 if otype not in merged_height_dist:
                     merged_height_dist[otype] = {
                         'min': None, 'max': None, 'p90': None,
-                        '_means': [], '_p90s': [],
+                        '_mean_wsum': 0.0, '_count': 0,
+                        '_p90_wsum': 0.0,
                     }
                 mhd = merged_height_dist[otype]
+                cnt = hd.get('count', 0) or 0
+                mhd['_count'] += cnt
                 if hd.get('min') is not None:
                     mhd['min'] = hd['min'] if mhd['min'] is None else min(mhd['min'], hd['min'])
                 if hd.get('max') is not None:
                     mhd['max'] = hd['max'] if mhd['max'] is None else max(mhd['max'], hd['max'])
-                if hd.get('mean') is not None:
-                    mhd['_means'].append(hd['mean'])
-                if hd.get('p90') is not None:
-                    mhd['_p90s'].append(hd['p90'])
+                if hd.get('mean') is not None and cnt > 0:
+                    mhd['_mean_wsum'] += hd['mean'] * cnt
+                if hd.get('p90') is not None and cnt > 0:
+                    mhd['_p90_wsum'] += hd['p90'] * cnt
         if total_area > 0:
             for otype in merged_area_sum:
                 merged_area_sum[otype]['fraction'] = round(
                     merged_area_sum[otype]['area_sqm'] / total_area, 4)
         merged['area_summary'] = merged_area_sum
         for otype, hd in merged_height_dist.items():
-            if hd['_means']:
-                hd['mean'] = round(sum(hd['_means']) / len(hd['_means']), 2)
-            if hd['_p90s']:
-                hd['p90'] = round(max(hd['_p90s']), 2)  # conservative
-            del hd['_means']
-            del hd['_p90s']
+            cnt = hd['_count']
+            hd['count'] = cnt
+            if cnt > 0:
+                hd['mean'] = round(hd['_mean_wsum'] / cnt, 2)
+                hd['p90'] = round(hd['_p90_wsum'] / cnt, 2)
+            del hd['_mean_wsum']; del hd['_p90_wsum']; del hd['_count']
         merged['height_distribution'] = merged_height_dist
 
         # ── terrain (weighted averages + min/max extremes) ───────
+        # Area-weighted aspect_distribution_pct + slope_classes_pct.
+        _aspect_acc = {}
+        _slope_acc = {}
+        _aspect_w = 0.0
+        _slope_w = 0.0
+        for _, d in block_list:
+            tw = d.get('total_area_sqm', 0) or 0
+            ad = (d.get('terrain', {}) or {}).get('aspect_distribution_pct') or {}
+            if ad and tw > 0:
+                for k, v in ad.items():
+                    _aspect_acc[k] = _aspect_acc.get(k, 0.0) + (v or 0) * tw
+                _aspect_w += tw
+            sd = (d.get('terrain', {}) or {}).get('slope_classes_pct') or {}
+            if sd and tw > 0:
+                for k, v in sd.items():
+                    _slope_acc[k] = _slope_acc.get(k, 0.0) + (v or 0) * tw
+                _slope_w += tw
         merged['terrain'] = {
             'elevation_min_m': _min_val(['terrain', 'elevation_min_m']),
             'elevation_max_m': _max_val(['terrain', 'elevation_max_m']),
@@ -1414,8 +1471,16 @@ class SearchIndex:
             'steepness_max_deg': _max_val(['terrain', 'steepness_max_deg']),
             'aspect_dominant': _any_val(['terrain', 'aspect_dominant']),
             'roughness_mean': _wavg(['terrain', 'roughness_mean']),
+            'curvature_mean': _wavg(['terrain', 'curvature_mean']),
             'terrain_class': _any_val(['terrain', 'terrain_class']),
+            'method': _any_val(['terrain', 'method']),
         }
+        if _aspect_w > 0:
+            merged['terrain']['aspect_distribution_pct'] = {
+                k: round(v / _aspect_w, 2) for k, v in _aspect_acc.items()}
+        if _slope_w > 0:
+            merged['terrain']['slope_classes_pct'] = {
+                k: round(v / _slope_w, 2) for k, v in _slope_acc.items()}
         e_min = merged['terrain']['elevation_min_m']
         e_max = merged['terrain']['elevation_max_m']
         if e_min is not None and e_max is not None:
@@ -1434,12 +1499,18 @@ class SearchIndex:
         merged['ndvi'] = {
             'copernicus_mean': _wavg(['ndvi', 'copernicus_mean']),
             'bev_nir_mean': _wavg(['ndvi', 'bev_nir_mean']),
+            'bev_nir_std': _wavg(['ndvi', 'bev_nir_std']),
+            'method_bev': _any_val(['ndvi', 'method_bev']),
+            'method_copernicus': _any_val(['ndvi', 'method_copernicus']),
         }
 
         # ── SAR ──────────────────────────────────────────────────
         merged['sar'] = {
             'vv_mean_db': _wavg(['sar', 'vv_mean_db']),
             'vh_mean_db': _wavg(['sar', 'vh_mean_db']),
+            'vv_std_db': _wavg(['sar', 'vv_std_db']),
+            'vh_std_db': _wavg(['sar', 'vh_std_db']),
+            'method': _any_val(['sar', 'method']),
         }
 
         # ── NDVI harmonics ───────────────────────────────────────
@@ -1447,6 +1518,8 @@ class SearchIndex:
             'mean_mean': _wavg(['ndvi_harmonics', 'mean_mean']),
             'amplitude_mean': _wavg(['ndvi_harmonics', 'amplitude_mean']),
             'phase_mean': _wavg(['ndvi_harmonics', 'phase_mean']),
+            'rmse_mean': _wavg(['ndvi_harmonics', 'rmse_mean']),
+            'method': _any_val(['ndvi_harmonics', 'method']),
         }
 
         # ── temporal change ──────────────────────────────────────
@@ -1523,20 +1596,26 @@ class SearchIndex:
                 if otype not in merged_ptc:
                     merged_ptc[otype] = {'count': 0, 'diverged_count': 0,
                                          'area_sqm': 0, '_conf_sum': 0,
+                                         '_p10_sum': 0, '_p10_w': 0,
                                          '_min': None}
                 m = merged_ptc[otype]
-                cnt = info.get('count', 0)
+                cnt = info.get('count', 0) or 0
                 m['count'] += cnt
-                m['diverged_count'] += info.get('diverged_count', 0)
-                m['area_sqm'] += info.get('area_sqm', 0)
-                if info.get('mean') is not None:
-                    m['_conf_sum'] += (info['mean'] or 0) * cnt
+                m['diverged_count'] += info.get('diverged_count', 0) or 0
+                m['area_sqm'] += info.get('area_sqm', 0) or 0
+                if info.get('mean') is not None and cnt:
+                    m['_conf_sum'] += info['mean'] * cnt
+                if info.get('p10') is not None and cnt:
+                    m['_p10_sum'] += info['p10'] * cnt
+                    m['_p10_w'] += cnt
                 if info.get('min') is not None:
                     m['_min'] = info['min'] if m['_min'] is None else min(m['_min'], info['min'])
         for otype, m in merged_ptc.items():
             m['mean'] = round(m['_conf_sum'] / m['count'], 4) if m['count'] else None
+            if m['_p10_w']:
+                m['p10'] = round(m['_p10_sum'] / m['_p10_w'], 4)
             m['min'] = m.pop('_min')
-            del m['_conf_sum']
+            del m['_conf_sum']; del m['_p10_sum']; del m['_p10_w']
 
         # Top divergences: concatenate, sort by count desc, take top 10
         all_top_div = []
@@ -1552,12 +1631,22 @@ class SearchIndex:
              for k, v in div_map.items()],
             key=lambda x: -x['count'])[:10]
 
+        _total_segs = _sum(['classification', 'total_segments'])
+        _div_count = _sum(['classification', 'diverged_count'])
         merged['classification'] = {
+            'total_segments': _total_segs,
+            'rf_classified': _sum(['classification', 'rf_classified']),
+            'rules_classified': _sum(['classification', 'rules_classified']),
+            'infra_classified': _sum(['classification', 'infra_classified']),
             'mean_confidence': _wavg(['classification', 'mean_confidence']),
-            'rf_classified_pct': _wavg(['classification', 'rf_classified_pct']),
             'rf_mean_confidence': _wavg(['classification', 'rf_mean_confidence']),
-            'diverged_count': _sum(['classification', 'diverged_count']),
-            'diverged_pct': _wavg(['classification', 'diverged_pct']),
+            'rf_classified_pct': _wavg(['classification', 'rf_classified_pct']),
+            'confidence_p10': _min_val(['classification', 'confidence_p10']),
+            'confidence_p25': _wavg(['classification', 'confidence_p25']),
+            'confidence_p50': _wavg(['classification', 'confidence_p50']),
+            'diverged_count': _div_count,
+            'diverged_pct': (round(100.0 * _div_count / _total_segs, 2)
+                             if _total_segs else _wavg(['classification', 'diverged_pct'])),
             'per_type_confidence': merged_ptc,
             'top_divergences': merged_top_div,
         }
@@ -1589,16 +1678,78 @@ class SearchIndex:
         # ── coverage ─────────────────────────────────────────────
         merged['coverage'] = {
             'n_tiles': _sum(['coverage', 'n_tiles']),
+            'tile_km': _any_val(['coverage', 'tile_km']),
+            'total_segmented_area_sqm': _sum(['coverage', 'total_segmented_area_sqm']),
+            'parcel_elevation_coverage_pct': _wavg(['coverage', 'parcel_elevation_coverage_pct']),
+            'parcel_segmentation_coverage_pct': _wavg(['coverage', 'parcel_segmentation_coverage_pct']),
             'building_height_coverage_pct': _wavg(['coverage', 'building_height_coverage_pct']),
+            'note': _any_val(['coverage', 'note']),
         }
 
         # ── data quality (weighted average) ──────────────────────
+        _avail_in_all = None
+        _all_layers = set(); _partial = set()
+        for _, d in block_list:
+            cur = set((d.get('data_quality', {}) or {}).get('available_layers', []) or [])
+            _avail_in_all = cur if _avail_in_all is None else (_avail_in_all & cur)
+            _all_layers |= cur
+            for k in (d.get('data_quality', {}) or {}).get('missing_layers', []) or []:
+                _all_layers.add(k)
+            for k in (d.get('data_quality', {}) or {}).get('partial_layers', []) or []:
+                _partial.add(k); _all_layers.add(k)
+        _avail_in_all = _avail_in_all or set()
+        merged_dq_tiles = []
+        for _, d in block_list:
+            merged_dq_tiles.extend((d.get('data_quality', {}) or {}).get('tiles', []) or [])
+        _layers_acc = {}; _layers_w = {}
+        for _, d in block_list:
+            tw = d.get('total_area_sqm', 0) or 0
+            for k, v in ((d.get('data_quality', {}) or {}).get('layers_summary') or {}).items():
+                if v is None:
+                    continue
+                _layers_acc[k] = _layers_acc.get(k, 0.0) + v * tw
+                _layers_w[k] = _layers_w.get(k, 0.0) + tw
+        layers_summary = {k: round(_layers_acc[k] / _layers_w[k], 4)
+                          for k in _layers_acc if _layers_w.get(k)}
         merged['data_quality'] = {
             'quality_score': _wavg(['data_quality', 'quality_score']),
             'quality_grade': _any_val(['data_quality', 'quality_grade']),
-            'available_layers': _any_val(['data_quality', 'available_layers']) or [],
-            'missing_layers': _any_val(['data_quality', 'missing_layers']) or [],
+            'quality_weights': _any_val(['data_quality', 'quality_weights']) or {},
+            'layers_summary': layers_summary,
+            'tiles': merged_dq_tiles,
+            'n_active_tiles': _sum(['data_quality', 'n_active_tiles']),
+            'n_total_tiles': _sum(['data_quality', 'n_total_tiles']),
+            'available_layers': sorted(_avail_in_all),
+            'missing_layers': sorted(_all_layers - _avail_in_all - _partial),
+            'partial_layers': sorted(_partial),
         }
+
+        # ── segments (sum counts per type) ─────────────────────────
+        seg_by_type = {}
+        seg_total = 0
+        for _, d in block_list:
+            s = d.get('segments', {}) or {}
+            seg_total += s.get('total', 0) or 0
+            for typ, n in (s.get('by_type') or {}).items():
+                seg_by_type[typ] = seg_by_type.get(typ, 0) + (n or 0)
+        if seg_total or seg_by_type:
+            merged['segments'] = {
+                'total': seg_total or sum(seg_by_type.values()),
+                'by_type': seg_by_type,
+            }
+
+        # ── phenology method ────────────────────────────────────
+        _phen_method = _any_val(['phenology', 'method'])
+        if _phen_method:
+            merged.setdefault('phenology', {})['method'] = _phen_method
+
+        # ── methods + version (carry through, all blocks share these) ──
+        _methods = _any_val(['methods'])
+        if _methods is not None:
+            merged['methods'] = _methods
+        _version = _any_val(['version'])
+        if _version is not None:
+            merged['version'] = _version
 
         # Block metadata for reference
         merged['_blocks'] = [

@@ -528,6 +528,61 @@ def save_director_state(state: dict):
         raise
 
 
+def _peer_renew_day(peer: dict, cfg: dict) -> int:
+    """Effective renew day for a peer.
+
+    Override > day-of-month of first_seen > global cfg renew_day.
+    Day is clamped to 1..28 so it always resolves on every month.
+    """
+    rd = peer.get('renew_day')
+    if not rd:
+        fs = peer.get('first_seen')
+        if isinstance(fs, str) and len(fs) >= 10:
+            try:
+                rd = int(fs[8:10])
+            except (ValueError, TypeError):
+                rd = None
+    if not rd:
+        rd = cfg.get('renew_day', BANDWIDTH_RENEW_DAY)
+    try:
+        rd = max(1, min(28, int(rd)))
+    except (TypeError, ValueError):
+        rd = BANDWIDTH_RENEW_DAY
+    return rd
+
+
+def _peer_next_renew(peer: dict, cfg: dict,
+                    *, now: datetime | None = None) -> datetime:
+    """Return the next billing-cycle renewal datetime for a peer (UTC).
+
+    Uses the peer's effective renew_day. If today's renew day hasn't
+    passed yet this month, returns this month's anchor at 00:00 UTC;
+    otherwise next month's. Day is clamped to 1..28.
+    """
+    rd = _peer_renew_day(peer, cfg)
+    n = now or datetime.now(timezone.utc)
+    candidate = n.replace(day=rd, hour=0, minute=0, second=0, microsecond=0)
+    if candidate <= n:
+        m = n.month + 1
+        y = n.year + (1 if m > 12 else 0)
+        m = ((m - 1) % 12) + 1
+        candidate = candidate.replace(year=y, month=m)
+    return candidate
+
+
+# Bandwidth thresholds for the active frontier peer.
+#
+# When the active peer is below LOW_WATER_GRACEFUL_GB remaining and it
+# is currently mid-KG, we send a *graceful* stop (finish-then-exit) so
+# the in-flight KG gets uploaded instead of being killed and retried.
+# When it drops below HARD_DEPLETED_GB we treat it as depleted and
+# rotate even mid-KG (credential safety > 1 KG of work). Park the peer
+# until its next renewal so the director's normal scheduler skips it
+# without us having to track per-peer budget state separately.
+BANDWIDTH_LOW_WATER_GB = 4.0
+BANDWIDTH_HARD_DEPLETED_GB = 1.0
+
+
 def get_billing_cycle_start() -> datetime:
     """Return the start of the current billing cycle (17th of this/previous month)."""
     now = datetime.now(timezone.utc)
@@ -2879,6 +2934,82 @@ class PeerDirector:
             'next_renew_in_days': soonest_days,
         }
 
+    def _park_peer_until_renewal(self, peer: dict, next_renew,
+                                 *, remaining_gb: float,
+                                 mid_kg: bool, hard: bool) -> None:
+        """Park a peer until its next billing-cycle renewal.
+
+        ``hard``: depleted, rotate now — verified hard stop.
+        ``mid_kg`` (and not hard): low-water graceful — ask the peer
+        to finish the current KG then exit; park record is written
+        immediately so the director's idle/stopped branch demotes
+        cleanly when the KG completes.
+        ``mid_kg=False`` and not hard: idle near low-water — park now
+        (no work to finish).
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        pid = peer['id']
+        peer_url = peer.get('url')
+        # 1) write not_before + audit note under the cfg lock.
+        with self._lock:
+            live = get_peer_by_id(self.cfg, pid)
+            if not live:
+                return
+            nb = next_renew.isoformat()
+            existing = live.get('not_before')
+            # Don't shrink an existing later cooldown.
+            try:
+                if existing:
+                    cur = _dt.fromisoformat(existing)
+                    if cur.tzinfo is None:
+                        cur = cur.replace(tzinfo=_tz.utc)
+                    if cur >= next_renew:
+                        nb = existing
+            except (TypeError, ValueError):
+                pass
+            live['not_before'] = nb
+            notes = live.setdefault('canary_notes', [])
+            notes.append({
+                'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'event': 'park_until_renewal',
+                'remaining_gb': round(float(remaining_gb), 2),
+                'mid_kg': bool(mid_kg),
+                'hard': bool(hard),
+                'cooldown_until': nb,
+            })
+            if len(notes) > 32:
+                del notes[: len(notes) - 32]
+        try:
+            save_peers_config(self.cfg)
+        except Exception:
+            log.exception('park_peer_until_renewal: save_peers_config failed')
+
+        tag = 'depleted' if hard else ('low-water graceful' if mid_kg else 'low-water park')
+        log.warning('Peer %s %s (%.2f GB remaining) — not_before=%s%s',
+                    pid, tag, remaining_gb, next_renew.isoformat(),
+                    ' (mid-KG; sending graceful stop)' if (mid_kg and not hard) else '')
+        try:
+            _emit_director_event(
+                f'park-until-renewal {pid}: {tag}, '
+                f'{remaining_gb:.2f} GB remaining, resumes {next_renew.isoformat()}',
+                peer=pid, level='warning')
+        except Exception:
+            pass
+
+        # 2) issue stop. Hard stop = verified; graceful = fire-and-keep-running.
+        if peer_url is None:
+            return
+        try:
+            if hard:
+                res = safely_stop_peer(peer_url, pid)
+                if 'error' in res:
+                    log.error('park_peer_until_renewal %s: hard stop failed: %s',
+                              pid, res['error'])
+            else:
+                stop_peer_processor(peer_url, graceful=True)
+        except Exception:
+            log.exception('park_peer_until_renewal %s: stop failed', pid)
+
     def _check_canary_health(self) -> None:
         """Park peers whose throughput collapsed (whole fleet) or whose
         warning noise spiked (canary-override peers only).
@@ -3072,7 +3203,18 @@ class PeerDirector:
                     self.state['active_peer'] = None
                     active_id = None
 
-        # Check if active peer is over budget
+        # Check if active peer is near / over its budget.
+        #
+        # Three regimes (mirror the canary-park flow so peers waiting
+        # for renewal land back in rotation automatically):
+        #
+        #   remaining < HARD_DEPLETED_GB — rotate even mid-KG; park
+        #     until next renewal so the scheduler skips the peer.
+        #   remaining < LOW_WATER_GB & mid-KG — send graceful stop so
+        #     the in-flight KG finishes and uploads, then the peer
+        #     auto-parks on idle (handled in the idle/stopped branch
+        #     further down via _peer_is_scheduled).
+        #   remaining < LOW_WATER_GB & idle — park (no work to finish).
         if active_id:
             bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
             used = bw.get('used_bytes', 0)
@@ -3080,20 +3222,36 @@ class PeerDirector:
             active_budget_bytes = _peer_budget_bytes(active_peer_cfg, cfg)
             remaining_gb = (active_budget_bytes - used) / (1024 ** 3)
 
-            if remaining_gb < 2:  # less than 2 GB remaining
-                log.info('Peer %s near bandwidth limit (%.1f GB remaining), switching',
-                         active_id, remaining_gb)
+            if remaining_gb < BANDWIDTH_LOW_WATER_GB:
                 peer = get_peer_by_id(cfg, active_id)
                 if peer:
-                    res = safely_stop_peer(peer.get('url'), active_id)
-                    if 'error' in res:
-                        log.error('Cannot deactivate %s (over-budget): %s — '
-                                  'holding off switch (credential safety)',
-                                  active_id, res['error'])
-                        return  # don't activate next peer until this one is verified stopped
-                with self._lock:
-                    self.state['active_peer'] = None
-                    active_id = None
+                    next_renew = _peer_next_renew(peer, cfg)
+                    proc_state_now = (state_copy.get('peer_status_cache') or {}).get(active_id, {}).get('state')
+                    if not proc_state_now:
+                        try:
+                            proc_state_now = get_peer_status(peer.get('url'), active_id).get('state', 'unknown')
+                        except Exception:
+                            proc_state_now = 'unknown'
+                    mid_kg = proc_state_now == 'running'
+                    hard = remaining_gb < BANDWIDTH_HARD_DEPLETED_GB
+                    self._park_peer_until_renewal(
+                        peer, next_renew, remaining_gb=remaining_gb,
+                        mid_kg=mid_kg, hard=hard,
+                    )
+                    if hard or not mid_kg:
+                        # Rotate now: stop verified, park written.
+                        with self._lock:
+                            if self.state.get('active_peer') == active_id:
+                                self.state['active_peer'] = None
+                            active_id = None
+                    else:
+                        # Mid-KG with low-water: graceful stop has
+                        # been sent; let the peer keep ticking until
+                        # it finishes the KG and reports idle. The
+                        # not_before park is already written, so when
+                        # the idle/stopped branch fires it'll see
+                        # _peer_is_scheduled and demote cleanly.
+                        return
 
         # Check if active peer's processor has stopped unexpectedly
         if active_id:
@@ -3227,7 +3385,7 @@ class PeerDirector:
                         with self._lock:
                             self.state['active_peer'] = None
                             active_id = None
-                    elif remaining_gb >= 2:
+                    elif remaining_gb >= BANDWIDTH_HARD_DEPLETED_GB:
                         excl = _excluded_kgs(cfg, exclude_peer_id=active_id)
                         # Re-issue with the current cred/strip plan so
                         # the active peer stays pinned to its slice.

@@ -47,10 +47,43 @@ For split KGs (e.g. `49006-south`, `49006-north`): JSONs land per-block.
 - weighted-average for area-weighted scalars
 - sum for additive counts
 - min/max for extrema
-- union of nested arrays (top_objs, type_top)
+- union of nested arrays (top_10_*, top_by_type)
 
 The parent code (`49006`) is the only thing visible to the API. Block codes
 appear only in JSON filenames + Zenodo entries.
+
+### File selection (`_select_kg_files_for_parent`)
+
+Handles the messy reality of split + maybe-split retries. For each
+parent KG it picks the freshest set of on-disk files using the
+**Zenodo manifest's `uploaded_at`** as the source of truth (falls back
+to `generated_at`, then mtime). Rules:
+
+1. Files whose `<code>_error` manifest entry is newer than `<code>_json`
+   are discarded (failed runs leave stale JSONs on disk).
+2. If only the **plain** side has a committed `_json` upload, use the
+   plain file.
+3. If only the **block** side has committed uploads, use the blocks.
+4. Otherwise pick whichever side has the most recent timestamp; the
+   other side is dropped wholesale to avoid double-counting the same
+   spatial region.
+
+`/api/v1/kg/<code>` calls `merged_kg_json(...)` which uses the same
+selector. For split KGs (no plain `<code>.json`) it returns the merged
+JSON-shape dict so the dashboard sees `parcels.count`, `landscape.n_segments`,
+`tree_stats`, `top_10_objects`, etc. — not just the flat index row.
+
+### Surgical reindex / backfill endpoints
+
+```
+POST /api/v1/admin/reindex_split_kgs           # re-enrich every parent
+                                                # with split / maybe-split
+                                                # block files on disk
+POST /api/v1/admin/backfill_jsons_from_manifest # download missing _json
+                                                # uploads from Zenodo (skips
+                                                # tombstoned + errored)
+   body: {limit?: 200, codes?: [...], dry_run?: false}
+```
 
 ## Auto-classification (per parcel, at index build)
 

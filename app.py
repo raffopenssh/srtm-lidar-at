@@ -6477,6 +6477,158 @@ def admin_backfill_status():
     return jsonify({'running': running, 'pid': pid, 'log_tail': tail})
 
 
+@app.route('/api/v1/admin/backfill_jsons_from_manifest', methods=['POST'])
+def admin_backfill_jsons_from_manifest():
+    """Download any KG JSON listed in the local Zenodo manifest that is
+    missing from `data/austria_processor/json/` and not tombstoned.
+
+    Useful when the primary's local JSON dir was lost / never populated
+    for KGs that completed on peers — the manifest already records the
+    Zenodo deposit, so we can backfill from there directly without
+    waiting for peer-sync.
+
+    Body JSON (optional):
+      * limit         : cap the number of downloads this call (default 200)
+      * codes         : explicit list of KG codes (parent or block) to fetch
+      * dry_run       : don't download, just return the list
+    """
+    import requests as _req
+    from zenodo_client import DEFAULT_TOKEN
+    body = request.get_json(silent=True) or {}
+    limit = int(body.get('limit') or 200)
+    explicit = set(body.get('codes') or [])
+    dry_run = bool(body.get('dry_run'))
+
+    json_dir = Path('data/austria_processor/json')
+    json_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    if not manifest_path.exists():
+        return jsonify({'error': 'manifest missing'}), 404
+    try:
+        md = json.loads(manifest_path.read_text())
+        manifest = md.get('entries', md)
+    except Exception as e:
+        return jsonify({'error': f'manifest parse: {e}'}), 500
+
+    local = {p.stem for p in json_dir.glob('*.json')}
+    candidates = []   # (code, entry)
+    for key, entry in manifest.items():
+        if not key.endswith('_json'):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if 'error' in (entry.get('status') or ''):
+            continue
+        code = key[:-5]
+        if explicit and code not in explicit:
+            continue
+        if code in local:
+            continue
+        if _MANIFEST_TOMBSTONES.get(key):
+            continue
+        candidates.append((code, entry))
+    candidates.sort(key=lambda x: x[1].get('uploaded_at', ''), reverse=True)
+
+    if dry_run:
+        return jsonify({
+            'missing': [c for c, _ in candidates],
+            'count': len(candidates),
+            'dry_run': True,
+        })
+
+    downloaded, failed = [], []
+    for code, entry in candidates[:limit]:
+        link = entry.get('link', '')
+        if not link and entry.get('depo_id') and entry.get('filename'):
+            link = (f"https://zenodo.org/api/records/{entry['depo_id']}"
+                    f"/draft/files/{entry['filename']}/content?"
+                    f"access_token={DEFAULT_TOKEN}")
+        if not link and entry.get('bucket_url') and entry.get('filename'):
+            link = f"{entry['bucket_url']}/{entry['filename']}"
+        if not link:
+            failed.append({'code': code, 'reason': 'no link'})
+            continue
+        target = json_dir / f'{code}.json'
+        tmp = target.with_suffix('.tmp')
+        try:
+            with _req.get(link, timeout=120, stream=True) as r:
+                r.raise_for_status()
+                with open(tmp, 'wb') as f:
+                    for chunk in r.iter_content(65536):
+                        f.write(chunk)
+            tmp.rename(target)
+            downloaded.append({'code': code, 'size': target.stat().st_size})
+            log.info('backfill_jsons_from_manifest: downloaded %s.json (%s bytes)',
+                     code, target.stat().st_size)
+        except Exception as e:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+            failed.append({'code': code, 'reason': str(e)})
+            log.warning('backfill_jsons_from_manifest: %s failed: %s', code, e)
+
+    # Trigger search-index refresh for newly arrived parents.
+    try:
+        if downloaded:
+            from kg_splitter import parent_kg_code
+            idx = si.get_index()
+            seen = set()
+            for d in downloaded:
+                p = parent_kg_code(d['code'])
+                if p in seen: continue
+                seen.add(p)
+                jp = json_dir / f"{d['code']}.json"
+                idx.update_kg(d['code'], json_path=str(jp), manifest=manifest)
+    except Exception as e:
+        log.warning('backfill_jsons_from_manifest: index refresh failed: %s', e)
+
+    return jsonify({
+        'downloaded': downloaded,
+        'failed': failed,
+        'remaining': max(0, len(candidates) - limit),
+        'total_missing': len(candidates),
+    })
+
+
+@app.route('/api/v1/admin/reindex_split_kgs', methods=['POST'])
+def admin_reindex_split_kgs():
+    """Re-enrich every parent KG that has split / maybe-split block files
+    on disk. Surgical — does not rebuild the whole index, only refreshes
+    rows whose JSONs span multiple files.
+    """
+    json_dir = Path('data/austria_processor/json')
+    if not json_dir.exists():
+        return jsonify({'error': 'json dir missing'}), 404
+    manifest = {}
+    mp = Path('data/austria_processor/zenodo_manifest.json')
+    if mp.exists():
+        try:
+            md = json.loads(mp.read_text())
+            manifest = md.get('entries', md)
+        except Exception:
+            pass
+    parents = set()
+    for jf in json_dir.glob('*.json'):
+        s = jf.stem
+        if '-' in s and s.split('-', 1)[0].isdigit():
+            parents.add(s.split('-', 1)[0])
+    refreshed, failed = [], []
+    try:
+        idx = si.get_index()
+    except Exception as e:
+        return jsonify({'error': f'index unavailable: {e}'}), 500
+    for parent in sorted(parents):
+        try:
+            idx.update_kg(parent, manifest=manifest)
+            refreshed.append(parent)
+        except Exception as e:
+            failed.append({'code': parent, 'reason': str(e)})
+    return jsonify({
+        'refreshed': refreshed,
+        'failed': failed,
+        'count': len(refreshed),
+    })
+
+
 @app.route('/api/v1/admin/proc_env', methods=['GET'])
 def admin_proc_env():
     """Diagnostic: dump environ + cmdline for the running processor.
@@ -7113,18 +7265,45 @@ def index_rebuild():
 def api_kg(kg_code):
     """Return KG info from index. If JSON exists locally, serves the full JSON.
     Otherwise returns index data with Zenodo download links."""
-    # If full JSON exists locally, serve it directly (backwards-compatible)
+    # If full JSON exists locally, serve it directly (backwards-compatible).
+    # For split / maybe-split KGs we synthesize a merged JSON-shape view so
+    # callers see complete parcels/buildings/landscape stats instead of the
+    # flat index row that only carries one block's data.
     json_path = Path(f'data/austria_processor/json/{kg_code}.json')
-    if json_path.exists() and not request.args.get('index_only'):
-        return send_file(str(json_path), mimetype='application/json')
-    # Fall back to search index
+    use_idx = bool(request.args.get('index_only'))
     try:
         idx = si.get_index()
-        result = idx.query_kg(kg_code)
-        if result:
-            return jsonify(result)
     except Exception as e:
-        log.warning('index query_kg %s: %s', kg_code, e)
+        log.warning('index get %s: %s', kg_code, e)
+        idx = None
+    # Plain file fast-path: skip merge work when the parent JSON exists.
+    if json_path.exists() and not use_idx:
+        return send_file(str(json_path), mimetype='application/json')
+    if not use_idx and idx is not None:
+        try:
+            merged = idx.merged_kg_json(kg_code)
+            if merged is not None:
+                # Annotate Zenodo links on the merged dict so the dashboard
+                # can surface freshest URLs without a second round-trip.
+                row = idx.query_kg(kg_code)
+                if row:
+                    for k in ('zenodo_json_url', 'zenodo_json_size',
+                              'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size',
+                              'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'):
+                        if row.get(k) is not None:
+                            merged[k] = row[k]
+                    if row.get('_links'):
+                        merged.setdefault('_links', row['_links'])
+                return jsonify(merged)
+        except Exception as e:
+            log.warning('merged_kg_json %s: %s', kg_code, e)
+    if idx is not None:
+        try:
+            result = idx.query_kg(kg_code)
+            if result:
+                return jsonify(result)
+        except Exception as e:
+            log.warning('index query_kg %s: %s', kg_code, e)
     return jsonify({'error': f'KG {kg_code} not found'}), 404
 
 

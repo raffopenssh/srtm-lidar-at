@@ -543,6 +543,9 @@ class SearchIndex:
                     manifest = md.get('entries', md)
                 except Exception:
                     pass
+            # Group changed files by parent KG so split-KG retries refresh
+            # the parent row exactly once — not once per block.
+            _changed_parents = {}  # parent_code -> changed_block_code
             for jf in json_dir_p.glob('*.json'):
                 try:
                     mt = jf.stat().st_mtime
@@ -553,8 +556,15 @@ class SearchIndex:
                 if mt <= last_sweep:
                     continue
                 code = jf.stem
+                base = code.split('-', 1)[0] if '-' in code else code
+                if not base.isdigit():
+                    continue
+                # Remember the most-specific code for manifest URL writing.
+                _changed_parents[base] = code
+            for base, code in _changed_parents.items():
                 try:
-                    self.update_kg(code, json_path=str(jf), manifest=manifest)
+                    jp = json_dir_p / f'{code}.json'
+                    self.update_kg(code, json_path=str(jp), manifest=manifest)
                     n_changed += 1
                 except Exception as e:
                     log.warning('incremental update %s: %s', code, e)
@@ -670,39 +680,50 @@ class SearchIndex:
             json_dir_p = Path(json_dir)
             n_processed = 0
             if json_dir_p.exists():
-                # Collect block JSONs grouped by parent KG for aggregation
-                _block_jsons = {}  # parent_code -> [(block_code, data)]
-                _plain_jsons = {}  # code -> data
+                # Group all on-disk JSONs by parent KG so split / maybe-split
+                # KGs (plain + blocks coexisting) get a single coherent row.
+                _by_parent = {}  # parent_code -> True
                 for jf in json_dir_p.glob('*.json'):
                     code = jf.stem
                     _base = code.split('-', 1)[0] if '-' in code else code
                     if not _base.isdigit():
                         continue
+                    _by_parent[_base] = True
+                for parent_code in _by_parent:
                     try:
-                        data = json.loads(jf.read_text())
-                        if '-' in code and _base != code:
-                            # Block code — group under parent
-                            _block_jsons.setdefault(_base, []).append((code, data))
+                        plain_path, block_list = self._select_kg_files_for_parent(
+                            parent_code, json_dir_p, manifest=manifest)
+                        if not block_list and plain_path is None:
+                            continue
+                        if len(block_list) == 1 and plain_path is not None:
+                            # Single plain file — fast path, avoid aggregator.
+                            self._enrich_kg(c, parent_code, block_list[0][1])
                         else:
-                            _plain_jsons[code] = data
-                    except Exception as e:
-                        log.warning('enrich %s: %s', code, e)
-
-                # Enrich plain (non-block) KGs
-                for code, data in _plain_jsons.items():
-                    try:
-                        self._enrich_kg(c, code, data)
+                            self._enrich_kg_from_blocks(
+                                c, parent_code, block_list)
+                        # Write freshest Zenodo URLs across plain + blocks.
+                        _codes = [parent_code] + [bc for bc, _ in block_list
+                                                   if bc != parent_code]
+                        for suffix, col_url, col_size in [
+                            ('_json', 'zenodo_json_url', 'zenodo_json_size'),
+                            ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
+                            ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
+                        ]:
+                            best = None; best_ts = ''
+                            for cc in _codes:
+                                e = manifest.get(f'{cc}{suffix}')
+                                if not isinstance(e, dict):
+                                    continue
+                                ts = e.get('uploaded_at') or ''
+                                if best is None or ts > best_ts:
+                                    best, best_ts = e, ts
+                            if best:
+                                c.execute(
+                                    f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
+                                    (_zenodo_url(best), best.get('size'), parent_code))
                         n_processed += 1
                     except Exception as e:
-                        log.warning('enrich %s: %s', code, e)
-
-                # Enrich block KGs — aggregate into parent row
-                for parent_code, block_list in _block_jsons.items():
-                    try:
-                        self._enrich_kg_from_blocks(c, parent_code, block_list)
-                        n_processed += 1
-                    except Exception as e:
-                        log.warning('enrich blocks for %s: %s', parent_code, e)
+                        log.warning('enrich %s: %s', parent_code, e)
 
             elapsed = time.time() - t0
             c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
@@ -1104,18 +1125,138 @@ class SearchIndex:
                     'INSERT INTO kg_parcels VALUES (' + ','.join(['?'] * 34) + ')',
                     prc_rows)
 
-    def _enrich_kg_from_blocks(self, c, parent_code, block_list):
-        """Aggregate multiple block JSONs into the parent KG row.
+    @staticmethod
+    def _select_kg_files_for_parent(parent_code, json_dir, manifest=None):
+        """Choose the freshest set of JSON files representing this KG.
 
-        Each block_list entry is (block_code, data_dict).
-        Merges ALL data — area summaries, terrain, NDVI, SAR, Hansen,
-        buildings, parcels, classification, phenology, etc. — so the
-        parent row looks exactly as if processed in one pass.
+        Split / maybe-split KGs can have any combination on disk:
+          * `<code>.json`              → single-pass run
+          * `<code>-east.json`, ...    → size-based split
+          * both, when a maybe-split retry replaces only some blocks
+
+        Source of truth for freshness is the **Zenodo manifest's**
+        ``uploaded_at`` for ``<code>_json``, since `generated_at` is
+        only the in-process timestamp and can be older than a later
+        re-upload that fixed something. We fall back to the file's
+        own `generated_at` and finally to mtime.
+
+        Strategy: greedy by timestamp desc — accept a file only when
+        its bbox is not already covered by an accepted, fresher file.
+        Returns ``(plain_path_or_None, [(block_code, data_dict), ...])``
+        with the second list ordered by block code for deterministic
+        aggregation. Either result may be empty.
         """
+        from pathlib import Path as _P
+        jdir = _P(json_dir)
+        manifest = manifest or {}
+
+        def _ts_for(code, path, data):
+            entry = manifest.get(f'{code}_json') if manifest else None
+            if isinstance(entry, dict):
+                ua = entry.get('uploaded_at') or ''
+                if ua:
+                    return ua
+            ga = data.get('generated_at') or ''
+            if ga:
+                return ga
+            try:
+                # mtime as ISO8601 so it sorts lexicographically
+                import datetime as _dt
+                return _dt.datetime.utcfromtimestamp(
+                    path.stat().st_mtime).isoformat()
+            except Exception:
+                return ''
+
+        # Manifest evidence — a successful Zenodo upload is the only
+        # signal that a JSON file represents a *committed* result. We use
+        # it both to pick freshness (uploaded_at) and to discard files
+        # whose corresponding manifest entry is missing or marked as an
+        # error (`<code>_error`).
+        def _has_good_json_entry(code):
+            e = manifest.get(f'{code}_json') if manifest else None
+            if not isinstance(e, dict):
+                return False
+            if 'error' in (e.get('status') or ''):
+                return False
+            return bool(e.get('uploaded_at'))
+
+        def _is_errored(code):
+            err = manifest.get(f'{code}_error') if manifest else None
+            if not isinstance(err, dict):
+                return False
+            err_ts = err.get('uploaded_at') or ''
+            ok = manifest.get(f'{code}_json') if manifest else None
+            ok_ts = ok.get('uploaded_at', '') if isinstance(ok, dict) else ''
+            # An error marker counts only when no successful upload
+            # superseded it.
+            return bool(err_ts) and err_ts > ok_ts
+
+        plain_path = jdir / f'{parent_code}.json'
+        plain_data = None; plain_ts = ''
+        if plain_path.exists() and not _is_errored(parent_code):
+            try:
+                plain_data = json.loads(plain_path.read_text())
+                plain_ts = _ts_for(parent_code, plain_path, plain_data)
+            except Exception:
+                plain_data = None
+        try:
+            blocks_iter = sorted(jdir.glob(f'{parent_code}-*.json'))
+        except Exception:
+            blocks_iter = []
+        block_entries = []   # (ts, path, code, data)
+        for bp in blocks_iter:
+            stem = bp.stem
+            if not stem.startswith(f'{parent_code}-'):
+                continue
+            if _is_errored(stem):
+                continue
+            try:
+                d = json.loads(bp.read_text())
+                block_entries.append((_ts_for(stem, bp, d), bp, stem, d))
+            except Exception:
+                continue
+
+        # If the manifest has *_json evidence on only one side, that side
+        # wins outright — the other side's local files are stale leftovers
+        # from an attempt that never completed (no Zenodo upload).
+        plain_committed = _has_good_json_entry(parent_code)
+        block_committed = any(_has_good_json_entry(b[2]) for b in block_entries)
+        if plain_committed and not block_committed:
+            if plain_data is not None:
+                return (plain_path, [(parent_code, plain_data)])
+        elif block_committed and not plain_committed:
+            plain_data = None
+
+        # Otherwise pick the side with the freshest timestamp.
+        newest_block_ts = max((b[0] for b in block_entries), default='')
+        if plain_data is not None and (plain_ts >= newest_block_ts or not block_entries):
+            return (plain_path, [(parent_code, plain_data)])
+        if block_entries:
+            block_list = sorted([(c, d) for _, _, c, d in block_entries],
+                                 key=lambda x: x[0])
+            return (None, block_list)
+        return (None, [])
+
+    def _enrich_kg_from_blocks(self, c, parent_code, block_list):
+        """Aggregate multiple block JSONs into the parent KG row."""
         if not block_list:
             return
+        merged = self._merge_block_data(parent_code, block_list)
+        self._enrich_kg(c, parent_code, merged)
 
-        block_list.sort(key=lambda x: x[0])
+    def _merge_block_data(self, parent_code, block_list):
+        """Aggregate multiple block JSONs into a JSON-shape dict.
+
+        Each block_list entry is (block_code, data_dict). Merges ALL
+        data — area summaries, terrain, NDVI, SAR, Hansen, buildings,
+        parcels, classification, phenology, etc. — so the result looks
+        exactly as if processed in one pass. Used both for indexing
+        and for serving `/api/v1/kg/<code>` on split KGs.
+        """
+        if not block_list:
+            return {}
+
+        block_list = sorted(block_list, key=lambda x: x[0])
 
         # ── helpers ──────────────────────────────────────────────
         def _wavg(key_path):
@@ -1386,6 +1527,17 @@ class SearchIndex:
             'top_divergences': merged_top_div,
         }
 
+        # ── top_10_objects / top_10_trees (concat → sort → take 10) ──
+        all_top_objs = []
+        all_top_trees = []
+        for _, d in block_list:
+            all_top_objs.extend(d.get('top_10_objects', []) or [])
+            all_top_trees.extend(d.get('top_10_trees', []) or [])
+        all_top_objs.sort(key=lambda o: -(o.get('height_max_m') or o.get('height_m') or 0))
+        all_top_trees.sort(key=lambda o: -(o.get('height_max_m') or o.get('height_m') or 0))
+        merged['top_10_objects'] = all_top_objs[:10]
+        merged['top_10_trees'] = all_top_trees[:10]
+
         # ── top_by_type (concatenate, sort, take top per type) ───
         merged_top_by_type = {}
         for _, d in block_list:
@@ -1418,53 +1570,70 @@ class SearchIndex:
             {'code': bc, 'label': bc.split('-', 1)[1] if '-' in bc else bc}
             for bc, _ in block_list
         ]
-
-        # ── enrich the parent row ────────────────────────────────
-        self._enrich_kg(c, parent_code, merged)
+        # Mirror parent identity from the freshest block.
+        merged['kg_code'] = parent_code
+        for k in ('kg_name', 'gemeinde', 'state', 'district', 'bbox'):
+            v = next((d.get(k) for _, d in reversed(block_list) if d.get(k)), None)
+            if v is not None:
+                merged[k] = v
+        return merged
 
     def update_kg(self, kg_code, json_path=None, manifest=None):
         """Incremental update for a single KG after processing.
 
-        Handles block codes (e.g. '49006-north') by enriching the parent
-        KG row and storing Zenodo URLs under the parent code.
+        Handles block codes (e.g. '49006-north') and maybe-split parents
+        (plain + blocks coexisting) by aggregating the freshest set of
+        on-disk files via ``_select_kg_files_for_parent``. Zenodo URLs
+        are written under the parent code.
         """
-        from kg_splitter import is_block_code, parent_kg_code as _parent_code
-        _is_block = is_block_code(kg_code)
-        _target_code = _parent_code(kg_code) if _is_block else kg_code
+        from kg_splitter import parent_kg_code as _parent_code
+        _target_code = _parent_code(kg_code)
 
         with self._write_lock:
             c = self._conn()
-            if json_path and Path(json_path).exists():
-                data = json.loads(Path(json_path).read_text())
-                if _is_block:
-                    # For blocks, aggregate all available block JSONs
-                    _json_dir = Path(json_path).parent
-                    _prefix = _target_code + '-'
-                    _blocks = []
-                    for jf in _json_dir.glob(f'{_prefix}*.json'):
-                        try:
-                            _blocks.append((jf.stem, json.loads(jf.read_text())))
-                        except Exception:
-                            pass
-                    if _blocks:
-                        self._enrich_kg_from_blocks(c, _target_code, _blocks)
-                    else:
-                        self._enrich_kg(c, _target_code, data)
-                else:
+            _json_dir = (Path(json_path).parent
+                         if json_path else Path('data/austria_processor/json'))
+            plain_path, block_list = self._select_kg_files_for_parent(
+                _target_code, _json_dir, manifest=manifest)
+            if not block_list and json_path and Path(json_path).exists():
+                # Fallback: file just landed and selector saw nothing.
+                try:
+                    data = json.loads(Path(json_path).read_text())
                     self._enrich_kg(c, _target_code, data)
+                except Exception as e:
+                    log.warning('update_kg %s fallback: %s', kg_code, e)
+            elif len(block_list) == 1 and plain_path is not None:
+                # Single plain file — fast path.
+                self._enrich_kg(c, _target_code, block_list[0][1])
+            elif block_list:
+                self._enrich_kg_from_blocks(c, _target_code, block_list)
             if manifest:
-                # For blocks, store Zenodo URLs under parent code
-                # but use the block's manifest keys
+                # Candidate codes for manifest lookup: parent + every
+                # accepted block. We pick the freshest entry per kind so a
+                # split parent's row consistently links to the most
+                # recently uploaded artefact.
+                _codes = [_target_code] + [bc for bc, _ in (block_list or [])
+                                            if bc != _target_code]
+                if not _codes:
+                    _codes = [kg_code]
                 for suffix, col_url, col_size in [
                     ('_json', 'zenodo_json_url', 'zenodo_json_size'),
                     ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
                     ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
                 ]:
-                    entry = manifest.get(f'{kg_code}{suffix}', {})
-                    if entry:
-                        url = _zenodo_url(entry)
+                    best = None
+                    best_ts = ''
+                    for cc in _codes:
+                        e = manifest.get(f'{cc}{suffix}')
+                        if not isinstance(e, dict):
+                            continue
+                        ts = e.get('uploaded_at') or ''
+                        if best is None or ts > best_ts:
+                            best, best_ts = e, ts
+                    if best:
+                        url = _zenodo_url(best)
                         c.execute(f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
-                                  (url, entry.get('size'), _target_code))
+                                  (url, best.get('size'), _target_code))
             c.commit()
 
     # ════════════════════════════════════════════════════════════════
@@ -1506,6 +1675,35 @@ class SearchIndex:
     # ════════════════════════════════════════════════════════════════
     # Query: single KG
     # ════════════════════════════════════════════════════════════════
+
+    def merged_kg_json(self, kg_code, manifest=None):
+        """Return a JSON-shape dict for a KG, merging plain + block files.
+
+        Returns ``None`` when no on-disk JSON exists for this parent.
+        Suitable for ``/api/v1/kg/<code>`` to serve split-KG callers a
+        single, complete record (parcels.count, landscape.n_segments,
+        tree_stats, etc.) rather than the flat index row.
+        """
+        from kg_splitter import parent_kg_code as _parent_code
+        parent = _parent_code(kg_code)
+        json_dir = Path('data/austria_processor/json')
+        if manifest is None:
+            try:
+                mp = Path('data/austria_processor/zenodo_manifest.json')
+                if mp.exists():
+                    md = json.loads(mp.read_text())
+                    manifest = md.get('entries', md)
+            except Exception:
+                manifest = {}
+        plain_path, block_list = self._select_kg_files_for_parent(
+            parent, json_dir, manifest=manifest)
+        if not block_list:
+            return None
+        if len(block_list) == 1 and plain_path is not None:
+            data = block_list[0][1]
+            data.setdefault('kg_code', parent)
+            return data
+        return self._merge_block_data(parent, block_list)
 
     def query_kg(self, kg_code):
         """Full KG record with landcover, hansen, and links."""

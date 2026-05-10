@@ -14348,9 +14348,21 @@ def process_txt():
         stale_idle = []
         stale_running = []
         manual_needed = []
+        # Treat peers whose commit is ahead-of (or equal to) the
+        # director target as caught up: pulling them would be a
+        # downgrade. peer_director._peer_commit_is_ahead_or_equal()
+        # is cached + cheap (git merge-base).
+        try:
+            import peer_director as _pd_mod_r
+            _is_ahead = _pd_mod_r._peer_commit_is_ahead_or_equal
+        except Exception:
+            _is_ahead = lambda _c: False  # noqa: E731
         for p in (d.get('peers') or []):
             v = (p.get('git_commit') or '')[:7]
+            full_v = (p.get('git_commit') or '')
             if not v or (target and v == target):
+                continue
+            if full_v and _is_ahead(full_v):
                 continue
             us = p.get('update_state') or {}
             if us.get('needs_manual_update'):

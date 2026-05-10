@@ -3169,6 +3169,115 @@ class PeerDirector:
             except Exception:
                 log.exception('Primary park enforce: save_peers_config failed')
 
+    def _enforce_director_self_park(self) -> None:
+        """Keep the active director out of the processing pool.
+
+        Whichever peer currently holds ``is_director`` already pays a
+        recurring bandwidth cost (60-peer status fanout, peer log
+        merge, credential probes). Stacking frontier or cache-only
+        work on top of that is exactly how a director burns through
+        its monthly budget faster than its peers — the failure mode
+        we just hit on the primary.
+
+        Per tick:
+          * If we're not director, do nothing (the director itself
+            owns this enforcement).
+          * Find our own peer entry in cfg; pin it to ``idle`` and
+            extend ``not_before`` to +30d if not already past now.
+          * If a local processor is running, stop it gracefully
+            (loopback ``/processing/stop?graceful=1``).
+          * If the scheduler somehow re-elected us as ``active_peer``
+            (race during a takeover), demote.
+
+        Cheap: no I/O unless cfg actually changes or processor is up.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        try:
+            import director_ha as _dha  # local import to avoid cycle
+            if not _dha.IS_DIRECTOR_FLAG.exists():
+                return
+            me = _dha.self_id()
+        except Exception:
+            return
+        if not me:
+            return
+        # Primary is handled by _enforce_primary_park (different
+        # not_before floor: 2027 vs +30d). Don't double-stamp.
+        if me == 'primary':
+            return
+        with self._lock:
+            cfg = self.cfg
+            mine = None
+            for p in cfg.get('peers', []):
+                if p.get('id') == me:
+                    mine = p
+                    break
+            changed = False
+            if mine is not None:
+                cur_role = (mine.get('pinned_role') or '').strip().lower()
+                if cur_role not in ('idle', 'off', 'pause', 'paused', 'parked'):
+                    mine['pinned_role'] = 'idle'
+                    changed = True
+                target = _dt.now(_tz.utc) + _td(days=30)
+                nb = mine.get('not_before')
+                extend = False
+                if not nb:
+                    extend = True
+                else:
+                    try:
+                        cur = _dt.fromisoformat(nb)
+                        if cur.tzinfo is None:
+                            cur = cur.replace(tzinfo=_tz.utc)
+                        if cur < target:
+                            extend = True
+                    except (TypeError, ValueError):
+                        extend = True
+                if extend:
+                    mine['not_before'] = target.isoformat()
+                    changed = True
+            if self.state.get('active_peer') == me:
+                log.warning(
+                    'Director %s set as active_peer — demoting (director '
+                    'must not process)', me,
+                )
+                self.state['active_peer'] = None
+        if changed:
+            try:
+                save_peers_config(self.cfg)
+                log.info(
+                    'Director self-park enforced: id=%s pinned_role=idle '
+                    'not_before=+30d', me,
+                )
+            except Exception:
+                log.exception(
+                    'Director self-park: save_peers_config failed')
+        # Stop any local processor that's running. Use the loopback
+        # graceful-stop path so an in-flight KG finishes + uploads
+        # before exit (avoids wasted CPU + half-uploaded products).
+        try:
+            r = requests.get(
+                'http://127.0.0.1:8000/api/v1/processing/status',
+                timeout=5,
+            )
+            running = bool(r.ok and (r.json() or {}).get('running'))
+        except Exception:
+            running = False
+        if running:
+            log.warning(
+                'Director %s has local processor running — issuing '
+                'graceful stop (director must not process)', me,
+            )
+            try:
+                stop_peer_processor(None, graceful=True)
+                _emit_director_event(
+                    f'director self-park: {me} stopping local '
+                    'processor (director must not carry processing '
+                    'load)',
+                    peer=me, level='warning',
+                )
+            except Exception:
+                log.exception('director self-park: local stop failed')
+
     def _park_peer_until_renewal(self, peer: dict, next_renew,
                                  *, remaining_gb: float,
                                  mid_kg: bool, hard: bool) -> None:
@@ -6457,6 +6566,14 @@ class PeerDirector:
                     self._enforce_primary_park()
                 except Exception:
                     log.exception('primary park enforce failed')
+                # Belt-and-braces: the *active director* must also not
+                # carry processing load. Director duty already costs
+                # 60-peer fanout bandwidth; layering frontier work on
+                # top is what burned the primary on 2026-05.
+                try:
+                    self._enforce_director_self_park()
+                except Exception:
+                    log.exception('director self-park enforce failed')
                 self._check_and_switch()
                 # Canary health: park peers running past the global
                 # budget if exe.dev visibly throttles them or they

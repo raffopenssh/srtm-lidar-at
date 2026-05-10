@@ -72,11 +72,42 @@ Thresholds (peer_director.py):
   park-until-renewal so the in-flight KG finishes & uploads.
 * `BANDWIDTH_HARD_DEPLETED_GB = 1` — hard stop, even mid-KG.
 * `CANARY_SLOWDOWN_RATIO = 0.30`, baseline 30 min, 500 MB minimum bytes
-  before a peer can be parked for throughput collapse.
+  before a peer can be parked for throughput collapse ("soft" park).
+* `CANARY_BASELINE_NETWORK_MBPS = 5.0` and `CANARY_RECENT_PARKED_MBPS
+  = 0.5` — a soft park is upgraded to a **quality observation**
+  (sets `observed_cap_gb` + counts toward fleet wall) only when the
+  pre-collapse baseline was network-grade AND the peer truly stalled.
+  Otherwise the peer was probably just Zenodo-upload-bound.
+* `CANARY_QUALITY_PERSIST_S = 15 min` — the slowdown must be
+  continuously observed for 15 min (streak resets above ratio 0.60)
+  before counting as quality. Defends against transient network
+  blips and short upstream outages.
+* `FLEET_CONCURRENT_SLOWDOWN_FRAC = 0.30` — if ≥0.30 of canary-eligible
+  peers are simultaneously in slowdown, treat as a fleet-wide upstream
+  event (BEV/Zenodo/internet hiccup); soft park still fires defensively
+  but no quality observation is recorded for any peer that tick.
+  Surfaces in `/process.txt` as `slowdown N/M [FLEET-WIDE]`.
+* `FLEET_WALL_MIN_QUALITY_OBS = 5` — fleet wall (`observed_cap_gb_min/median`)
+  is suppressed in `fleet_bw` until ≥5 distinct quality obs across
+  the fleet. Until then `process.txt` shows `wall=? (gathering, N
+  quality obs)` instead of inventing a confident wall.
 * `CANARY_PARK_COOLDOWN_S = 6h` — used by slowdown park.
 * Park-until-renewal cooldown = peer's effective `renew_day` next
   occurrence (no need to track per-peer budgets separately; the existing
   `_peer_is_scheduled` gate makes the scheduler skip the peer).
+
+### Primary park (belt-and-braces)
+
+The primary VM (`srtm-lidar-at.exe.xyz`) is the public dashboard host
+and must NEVER carry processing load. `_enforce_primary_park` runs
+every director tick and:
+* sets `pinned_role='idle'` if missing,
+* extends `not_before` to **2027-01-01** if shorter or absent,
+* demotes the primary if a race ever made it `active_peer`.
+
+Manual reset of `not_before` won't survive: the next tick re-extends
+it. To temporarily un-park the primary, edit `_enforce_primary_park`
+and restart `srv` — expected only during emergency manual recovery.
 
 ## TL;DR
 

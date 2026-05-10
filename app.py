@@ -14278,10 +14278,23 @@ def process_txt():
             cap_med = fb.get('observed_cap_gb_median')
             cap_min = fb.get('observed_cap_gb_min')
             cap_n = fb.get('observed_cap_gb_count') or 0
-            cap_s = (
-                f'wall~{cap_med}GB(min={cap_min},n={cap_n})'
-                if isinstance(cap_med, (int, float)) else 'wall=?'
-            )
+            if isinstance(cap_med, (int, float)):
+                cap_s = f'wall~{cap_med}GB(min={cap_min},n={cap_n})'
+            elif cap_n > 0:
+                cap_s = f'wall=? (gathering, {cap_n} quality obs)'
+            else:
+                cap_s = 'wall=? (no quality obs yet)'
+            # Fleet-wide slowdown indicator (DNS-ping equivalent: cheap
+            # cross-peer correlation that distinguishes a Zenodo/BEV
+            # outage from real per-account shaping).
+            try:
+                fs = ((d.get('canary_fleet_slowdown') or {}))
+                if fs.get('with_canary'):
+                    cap_s += (f' · slowdown {fs.get("in_slowdown", 0)}/'
+                              f'{fs.get("with_canary", 0)}'
+                              + (' [FLEET-WIDE]' if fs.get('fleet_wide') else ''))
+            except Exception:
+                pass
             out.append(
                 f'fleet_bw: used={fb.get("used_gb", 0):.1f}GB '
                 f'budget_nominal={fb.get("budget_gb_nominal", 0):.0f}GB '

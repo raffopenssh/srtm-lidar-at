@@ -426,6 +426,38 @@ CANARY_PARK_COOLDOWN_S = 6 * 3600 # 6 h not_before
 # enough bytes for the average to be meaningful (otherwise a peer that
 # happens to be idle between KGs reads as 'shaped').
 CANARY_MIN_BYTES_FOR_PARK = 500 * 1024 * 1024  # 500 MB in baseline window
+# Tightened thresholds to avoid false positives from peers that are
+# Zenodo-upload-bound (their cumulative byte counter advances slowly
+# even when the network is healthy).
+#
+# Park only when the peer was actually moving NETWORK-GRADE bytes
+# before the collapse — baseline >= CANARY_BASELINE_NETWORK_MBPS —
+# AND it has truly stalled — recent <= CANARY_RECENT_PARKED_MBPS.
+# This keeps the watchdog active for real shaping events while not
+# tripping when a peer happens to be uploading a 4 GB GPKG to Zenodo.
+#
+# Even tighter: only persist ``observed_cap_gb`` when the trigger
+# meets these thresholds (so we don't pollute the fleet wall estimate
+# with park events caused by upload-bound idleness).
+CANARY_BASELINE_NETWORK_MBPS = 5.0   # was implicit, now explicit (BEV reads sustain >>5 MB/s)
+CANARY_RECENT_PARKED_MBPS = 0.5      # really stalled, not just 'a bit slow'
+# Fleet wall estimate is only published once we've gathered this many
+# *quality* observations across distinct peers — so the dashboard
+# doesn't claim a confident wall from 3 noisy datapoints.
+FLEET_WALL_MIN_QUALITY_OBS = 5
+# Time persistence: a peer's slowdown must be continuously observed for
+# this many seconds before we count the park as a quality observation.
+# 15 min eats roughly through any general internet hiccup or BEV/Zenodo
+# blip without delaying real shaping detection meaningfully.
+CANARY_QUALITY_PERSIST_S = 15 * 60
+# A peer's slowdown streak resets when its ratio recovers ABOVE this
+# value (sticky hysteresis around the park threshold of 0.30).
+CANARY_SLOWDOWN_RECOVERY_RATIO = 0.60
+# Cross-peer correlation: if a fraction ≥ this of peers with usable
+# canary samples are currently in slowdown, treat as a fleet-wide
+# upstream event — NO peer parked during this window earns a quality
+# observation. Soft-park (defensive removal) still fires.
+FLEET_CONCURRENT_SLOWDOWN_FRAC = 0.30
 
 # Warmup hold for fresh peers. A brand-new peer has no tile cache and
 # zero history; throwing it straight at frontier work means it starts
@@ -2112,6 +2144,7 @@ class PeerDirector:
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
                    'peer_history', 'canary_history',
+                   'canary_slowdown_streaks', 'canary_fleet_slowdown',
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
@@ -2471,6 +2504,7 @@ class PeerDirector:
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
             'fleet_bw': self._fleet_bw_summary(peers_status),
+            'canary_fleet_slowdown': state.get('canary_fleet_slowdown'),
             'capacity_factor': state.get(
                 'capacity_factor', self._capacity_ema),
             'capacity_ema': state.get(
@@ -2898,7 +2932,8 @@ class PeerDirector:
             if p.get('scheduled'):
                 n_parked += 1
             cap = p.get('observed_cap_gb')
-            if isinstance(cap, (int, float)):
+            cap_quality = bool(p.get('observed_cap_quality'))
+            if isinstance(cap, (int, float)) and cap_quality:
                 n_with_cap += 1
                 caps.append(float(cap))
             rd = p.get('renew_day')
@@ -2917,12 +2952,15 @@ class PeerDirector:
                         soonest_days = days
                 except ValueError:
                     pass
-        cap_min = min(caps) if caps else None
-        if caps:
+        # Only publish a fleet wall once we have enough QUALITY
+        # datapoints to mean something. Until then the dashboard sees
+        # ``observed_cap_gb_count`` so it can show 'wall=? (gathering)'.
+        cap_min = None
+        cap_med = None
+        if caps and len(caps) >= FLEET_WALL_MIN_QUALITY_OBS:
+            cap_min = min(caps)
             scaps = sorted(caps)
             cap_med = scaps[len(scaps) // 2]
-        else:
-            cap_med = None
         return {
             'peers_enabled': n_total,
             'peers_parked': n_parked,
@@ -2933,6 +2971,73 @@ class PeerDirector:
             'observed_cap_gb_median': round(cap_med, 2) if cap_med is not None else None,
             'next_renew_in_days': soonest_days,
         }
+
+    def _enforce_primary_park(self) -> None:
+        """Belt-and-braces: keep the primary peer parked.
+
+        The primary VM is the public-facing dashboard host (DNS, search
+        index, share storage, Zenodo lock broker). It must NEVER carry
+        frontier or cache-only processing load — even briefly during a
+        rotation — because that would steal CPU/IO from request
+        handling. Operationally we keep it pinned ``idle`` and
+        ``not_before`` far in the future.
+
+        This enforcer runs every director tick and:
+          * sets ``pinned_role='idle'`` if missing
+          * extends ``not_before`` to >= 30 days from now if shorter or
+            absent
+          * if the primary somehow ended up the active_peer (race),
+            demotes it.
+
+        Cheap: O(1), no I/O unless cfg actually changed.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        with self._lock:
+            cfg = self.cfg
+            primary = None
+            for p in cfg.get('peers', []):
+                if p.get('id') == 'primary':
+                    primary = p
+                    break
+            if primary is None:
+                return
+            changed = False
+            cur_role = (primary.get('pinned_role') or '').strip().lower()
+            if cur_role not in ('idle', 'off', 'pause', 'paused', 'parked'):
+                primary['pinned_role'] = 'idle'
+                changed = True
+            # Primary is intentionally pinned far into the future:
+            # the public dashboard host must never carry processing
+            # load. Floor at 2027-01-01 (well past any conceivable
+            # exe.dev billing cycle) and extend if we ever drift
+            # below.
+            target = _dt(2027, 1, 1, tzinfo=_tz.utc)
+            nb = primary.get('not_before')
+            extend = False
+            if not nb:
+                extend = True
+            else:
+                try:
+                    cur = _dt.fromisoformat(nb)
+                    if cur.tzinfo is None:
+                        cur = cur.replace(tzinfo=_tz.utc)
+                    if cur < target:
+                        extend = True
+                except (TypeError, ValueError):
+                    extend = True
+            if extend:
+                primary['not_before'] = target.isoformat()
+                changed = True
+            if self.state.get('active_peer') == 'primary':
+                log.warning('Primary somehow set as active_peer — demoting')
+                self.state['active_peer'] = None
+        if changed:
+            try:
+                save_peers_config(self.cfg)
+                log.info('Primary park enforced: pinned_role=%s not_before=%s',
+                         primary.get('pinned_role'), primary.get('not_before'))
+            except Exception:
+                log.exception('Primary park enforce: save_peers_config failed')
 
     def _park_peer_until_renewal(self, peer: dict, next_renew,
                                  *, remaining_gb: float,
@@ -3032,31 +3137,120 @@ class PeerDirector:
             cfg = self.cfg
             state = self.state
             peers = list(cfg.get('peers', []))
+            # Streaks: peer_id -> {since: epoch, last_ratio: float}
+            streaks = state.setdefault('canary_slowdown_streaks', {})
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         cfg_changed = False
+        now_ts = time.time()
+
+        # First pass: classify each peer's current state without acting,
+        # update streaks, and tally fleet-wide concurrent slowdown so
+        # the second pass can suppress quality flags during fleet-wide
+        # upstream events (Zenodo / BEV outages).
+        per_peer: list[dict] = []
+        n_with_canary = 0
+        n_in_slowdown = 0
         for p in peers:
             if not p.get('enabled', True):
                 continue
             pid = p['id']
+            base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
+            recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
+            usable = (base and recent
+                      and base['samples'] >= CANARY_BASELINE_MIN_SAMPLES
+                      and base['delta_bytes'] >= CANARY_MIN_BYTES_FOR_PARK
+                      and base['rate_bps'] > 0)
+            ratio = base_mbps = recent_mbps = None
+            if usable:
+                ratio = recent['rate_bps'] / base['rate_bps']
+                base_mbps = base['rate_bps'] / 1e6
+                recent_mbps = recent['rate_bps'] / 1e6
+                n_with_canary += 1
+                if ratio < CANARY_SLOWDOWN_RATIO:
+                    n_in_slowdown += 1
+                    # Start / continue streak.
+                    s = streaks.setdefault(pid, {'since': now_ts})
+                    s['last_ratio'] = ratio
+                    s['last_ts'] = now_ts
+                elif ratio >= CANARY_SLOWDOWN_RECOVERY_RATIO:
+                    streaks.pop(pid, None)
+            per_peer.append({
+                'peer': p,
+                'pid': pid,
+                'usable': usable,
+                'ratio': ratio,
+                'base_mbps': base_mbps,
+                'recent_mbps': recent_mbps,
+            })
+        # Trim streaks for peers no longer enabled.
+        live_ids = {pp['pid'] for pp in per_peer}
+        for stale_id in list(streaks.keys()):
+            if stale_id not in live_ids:
+                streaks.pop(stale_id, None)
+
+        # Cross-peer correlation: are we in a fleet-wide upstream event?
+        # If so, no peer parked this tick can earn a quality observation.
+        fleet_wide = False
+        if n_with_canary >= 4:
+            frac = n_in_slowdown / n_with_canary
+            if frac >= FLEET_CONCURRENT_SLOWDOWN_FRAC:
+                fleet_wide = True
+                log.info('Canary: fleet-wide slowdown detected '
+                         '(%d/%d peers ≥ %.0f%%) — suppressing quality '
+                         'observations this tick',
+                         n_in_slowdown, n_with_canary,
+                         FLEET_CONCURRENT_SLOWDOWN_FRAC * 100)
+        # Stash for status payload.
+        state['canary_fleet_slowdown'] = {
+            'with_canary': n_with_canary,
+            'in_slowdown': n_in_slowdown,
+            'fleet_wide': fleet_wide,
+            'ts': now_ts,
+        }
+
+        # Second pass: act.
+        for entry in per_peer:
+            p = entry['peer']
+            pid = entry['pid']
             # Already parked? skip.
             if _peer_is_scheduled(p):
                 continue
             reasons: list[str] = []
             slowdown_tripped = False
-            base = self._canary_throughput(pid, CANARY_BASELINE_WINDOW_S)
-            recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
-            if (base and recent
-                    and base['samples'] >= CANARY_BASELINE_MIN_SAMPLES
-                    and base['delta_bytes'] >= CANARY_MIN_BYTES_FOR_PARK
-                    and base['rate_bps'] > 0):
-                ratio = recent['rate_bps'] / base['rate_bps']
+            quality_obs = False
+            if entry['usable']:
+                ratio = entry['ratio']
+                base_mbps = entry['base_mbps']
+                recent_mbps = entry['recent_mbps']
                 if ratio < CANARY_SLOWDOWN_RATIO:
                     slowdown_tripped = True
+                    streak = streaks.get(pid) or {}
+                    streak_age = max(0.0, now_ts - float(streak.get('since') or now_ts))
+                    network_grade = (
+                        base_mbps is not None
+                        and recent_mbps is not None
+                        and base_mbps >= CANARY_BASELINE_NETWORK_MBPS
+                        and recent_mbps <= CANARY_RECENT_PARKED_MBPS
+                    )
+                    persistent = streak_age >= CANARY_QUALITY_PERSIST_S
+                    quality_obs = (
+                        network_grade and persistent and not fleet_wide
+                    )
+                    qtag = ' [QUALITY]' if quality_obs else ' [soft'
+                    if not quality_obs:
+                        why = []
+                        if not network_grade:
+                            why.append('not network-grade')
+                        if not persistent:
+                            why.append(f'streak {int(streak_age)}s<{CANARY_QUALITY_PERSIST_S}s')
+                        if fleet_wide:
+                            why.append('fleet-wide event')
+                        qtag = ' [soft: ' + ', '.join(why) + ']'
                     reasons.append(
                         f'throughput collapsed: '
-                        f'recent={recent["rate_bps"]/1e6:.2f} MB/s '
-                        f'vs baseline {base["rate_bps"]/1e6:.2f} MB/s '
-                        f'(ratio={ratio:.2f})'
+                        f'recent={recent_mbps:.2f} MB/s '
+                        f'vs baseline {base_mbps:.2f} MB/s '
+                        f'(ratio={ratio:.2f})' + qtag
                     )
             # Noise-park: stricter, canary-override peers only.
             is_override_canary = p.get('budget_gb') is not None
@@ -3079,14 +3273,17 @@ class PeerDirector:
                 if _peer_is_scheduled(live):
                     continue
                 live['not_before'] = cooldown.isoformat()
-                # Persist the observed shaping wall: keep the *minimum*
-                # across cycles so repeated probing tightens the
-                # estimate but a single one-off doesn't loosen it.
-                if slowdown_tripped and isinstance(used_gb_at_park, (int, float)):
+                # Persist the observed shaping wall ONLY when the
+                # trigger met the stricter network-grade gate. Soft
+                # parks (low baseline, plausibly Zenodo-bound peers)
+                # don't pollute the fleet wall estimate.
+                if (quality_obs and slowdown_tripped
+                        and isinstance(used_gb_at_park, (int, float))):
                     prev = live.get('observed_cap_gb')
                     if prev is None or used_gb_at_park < float(prev):
                         live['observed_cap_gb'] = round(float(used_gb_at_park), 2)
                     live['observed_cap_at'] = _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    live['observed_cap_quality'] = True
                 notes = live.setdefault('canary_notes', [])
                 note: dict = {
                     'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -3096,6 +3293,7 @@ class PeerDirector:
                 }
                 if slowdown_tripped and isinstance(used_gb_at_park, (int, float)):
                     note['used_gb_at_park'] = round(float(used_gb_at_park), 2)
+                    note['quality'] = bool(quality_obs)
                 notes.append(note)
                 # Cap notes ring so peers.json doesn't grow unbounded.
                 if len(notes) > 32:
@@ -6074,6 +6272,12 @@ class PeerDirector:
                 with self._lock:
                     if _clear_completed_reservations(self.cfg, self.state):
                         save_peers_config(self.cfg)
+                # Belt-and-braces: ensure primary stays parked every
+                # tick, before any peer scheduling decisions.
+                try:
+                    self._enforce_primary_park()
+                except Exception:
+                    log.exception('primary park enforce failed')
                 self._check_and_switch()
                 # Canary health: park peers running past the global
                 # budget if exe.dev visibly throttles them or they

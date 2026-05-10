@@ -6216,6 +6216,40 @@ class PeerDirector:
         time.sleep(5)  # startup delay
         sync_counter = 0
         while self._running:
+            # Cross-worker stop guard. ``stop()`` on the singleton only
+            # affects the worker that called it; another worker that
+            # had `_director` constructed (e.g. via ``get_director()``
+            # for status reads) keeps its own loop running. Disk flags
+            # are the source of truth: if the operator / takeover /
+            # handover removed ``is_director`` (or wrote
+            # ``stepped_down``) we must self-terminate. Without this,
+            # a stepped-down primary kept hammering peers with
+            # whitelist PUTs / identity broadcasts while the new
+            # director (at63) was already running, producing the very
+            # split-brain the file flag is supposed to prevent
+            # (2026-05-10 incident).
+            try:
+                is_dir = (DATA_DIR / 'is_director').exists()
+                stepped = (DATA_DIR / 'stepped_down').exists()
+            except Exception:
+                is_dir, stepped = True, False  # don't kill loop on stat error
+            if not is_dir or stepped:
+                log.warning('director loop self-stopping: is_director=%s '
+                            'stepped_down=%s (cross-worker step_down or '
+                            'operator demotion)', is_dir, stepped)
+                self._running = False
+                # Release fcntl lock so a future takeover in this same
+                # process can acquire it cleanly.
+                fd = getattr(self, '_lock_fd', None)
+                if fd is not None:
+                    try:
+                        import fcntl as _fcntl
+                        _fcntl.flock(fd, _fcntl.LOCK_UN)
+                        fd.close()
+                    except Exception:
+                        pass
+                    self._lock_fd = None
+                return
             try:
                 # Re-read config + state from disk each tick so cross-worker
                 # changes (e.g. /director/activate from another gunicorn worker)

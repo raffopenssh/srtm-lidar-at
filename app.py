@@ -5970,14 +5970,45 @@ def director_update_peers():
             if i + WAVE < len(targets):
                 _t.sleep(GAP_S)
 
-    # Tail: update the (former) director box + the new director, in
-    # that order, with extra delay. This runs *after* the bulk wave so
-    # the cluster is already on the new code when these last two
-    # restart.
+    # Tail: update the new director FIRST (cross-process HTTP — survives
+    # our restart) and the (former) director box LAST. The previous order
+    # bounced ourselves before the cross-thread call to update the new
+    # director ran, killing the daemon thread mid-flight and leaving the
+    # new director stuck on the old commit (results[]'s placeholder is
+    # all that ever shipped). Bulk wave has already finished by now, so
+    # the cluster is on the new code; only these two boxes remain.
+    if deferred_new_dir_id:
+        new_dir_peer = pd.get_peer_by_id(cfg, deferred_new_dir_id)
+        if new_dir_peer and new_dir_peer.get('url'):
+            import threading as _th_nd, time as _t_nd
+            def _tail_new_dir_update():
+                # Short delay so the freshly-promoted director has a
+                # chance to take a tick and refresh director_state.json
+                # before its srv bounces. trigger_peer_update is a
+                # one-shot outbound POST to the peer; the peer schedules
+                # its own restart and returns immediately, so this call
+                # is unaffected by our subsequent self-restart.
+                _t_nd.sleep(DIR_TAIL_DELAY_S)
+                try:
+                    res = pd.trigger_peer_update(
+                        new_dir_peer['url'], graceful)
+                    results[deferred_new_dir_id] = res
+                except Exception as _e:
+                    results[deferred_new_dir_id] = {'error': str(_e)[:200]}
+            _th_nd.Thread(target=_tail_new_dir_update, daemon=True).start()
+            results[deferred_new_dir_id] = {
+                'status': 'scheduled_new_director_update',
+                'graceful': graceful,
+                'deferred_s': DIR_TAIL_DELAY_S,
+            }
     if deferred_self_id and local_entry is not None:
         import threading as _th_tail, time as _t_tail
         def _tail_self_update():
-            _t_tail.sleep(DIR_TAIL_DELAY_S)
+            # Sleep long enough that the new-director update kick has
+            # already left the building. DIR_TAIL_DELAY_S * 2 keeps a
+            # comfortable gap between the new director's HTTP call
+            # firing and our own loopback /admin/update bouncing srv.
+            _t_tail.sleep(DIR_TAIL_DELAY_S * 2)
             try:
                 import requests as _rq_tail
                 _rq_tail.post(
@@ -5991,33 +6022,9 @@ def director_update_peers():
         results[local_entry['id']] = {
             'status': 'scheduled_local_update',
             'graceful': graceful,
-            'deferred_s': DIR_TAIL_DELAY_S,
+            'deferred_s': DIR_TAIL_DELAY_S * 2,
             'after_handover_to': deferred_new_dir_id,
         }
-    if deferred_new_dir_id:
-        new_dir_peer = pd.get_peer_by_id(cfg, deferred_new_dir_id)
-        if new_dir_peer and new_dir_peer.get('url'):
-            import threading as _th_nd, time as _t_nd
-            def _tail_new_dir_update():
-                # Update the new director LAST, after the former
-                # director restart has had a chance to settle. The
-                # peer's /admin/update?graceful=1 will defer until
-                # any in-flight KG completes — but for the new
-                # director that just took over, no processor is
-                # running locally, so it'll restart promptly.
-                _t_nd.sleep(DIR_TAIL_DELAY_S * 2)
-                try:
-                    res = pd.trigger_peer_update(
-                        new_dir_peer['url'], graceful)
-                    results[deferred_new_dir_id] = res
-                except Exception as _e:
-                    results[deferred_new_dir_id] = {'error': str(_e)[:200]}
-            _th_nd.Thread(target=_tail_new_dir_update, daemon=True).start()
-            results[deferred_new_dir_id] = {
-                'status': 'scheduled_new_director_update',
-                'graceful': graceful,
-                'deferred_s': DIR_TAIL_DELAY_S * 2,
-            }
     # Surface a single high-level event in the merged 24h log so the
     # dashboard shows the rollout. Per-peer results would be too noisy
     # for a fleet-wide "Update Peers" wave — the per-peer update events

@@ -1450,25 +1450,60 @@ class SearchIndex:
         }
 
         # ── temporal change ──────────────────────────────────────
+        # Union datasets_compared across blocks (set-merge, not weighted avg).
+        _ds_union = set()
+        for _, d in block_list:
+            for ds in (d.get('temporal_change', {}) or {}).get('datasets_compared', []) or []:
+                _ds_union.add(ds)
+        _height_change_mean = _wavg(['temporal_change', 'height_change_mean_m'])
+        _dtm_change_max = _max_val(['temporal_change', 'dtm_change_max_abs_m'])
         merged['temporal_change'] = {
             'net_volume_change_m3': _sum(['temporal_change', 'net_volume_change_m3']),
             'mean_stability': _wavg(['temporal_change', 'mean_stability']),
             'dtm_change_mean_m': _wavg(['temporal_change', 'dtm_change_mean_m']),
+            'dtm_change_max_abs_m': _dtm_change_max,
+            'height_change_mean_m': _height_change_mean,
             'n_changed_segments': _sum(['temporal_change', 'n_changed_segments']),
             'total_disturbed_volume_m3': _sum(['temporal_change', 'total_disturbed_volume_m3']),
+            'datasets_compared': sorted(_ds_union) if _ds_union else None,
+            'method': _any_val(['temporal_change', 'method']),
         }
 
-        # ── hansen (merge loss_by_year) ──────────────────────────
-        merged_hansen = {}
+        # ── hansen (merge loss_by_year + headline aggregates) ────
+        merged_hansen_loss = {}
+        merged_hansen_area = {}
         for _, d in block_list:
             for yr, val in d.get('hansen', {}).get('loss_by_year', {}).items():
-                px = val.get('pixels', val) if isinstance(val, dict) else val
+                if isinstance(val, dict):
+                    px = val.get('pixels', 0)
+                    ar = val.get('area_sqm', 0)
+                else:
+                    px = val
+                    ar = 0
                 try:
-                    merged_hansen[yr] = merged_hansen.get(yr, 0) + int(px)
+                    merged_hansen_loss[yr] = merged_hansen_loss.get(yr, 0) + int(px)
+                    merged_hansen_area[yr] = merged_hansen_area.get(yr, 0) + int(ar or 0)
                 except (ValueError, TypeError):
                     pass
-        merged['hansen'] = {'loss_by_year': {yr: {'pixels': px}
-                            for yr, px in merged_hansen.items()}}
+        _hansen = {}
+        if merged_hansen_loss:
+            _hansen['loss_by_year'] = {
+                yr: {'pixels': merged_hansen_loss[yr],
+                     'area_sqm': merged_hansen_area.get(yr, 0)}
+                for yr in merged_hansen_loss
+            }
+            _hansen['total_loss_pixels'] = sum(merged_hansen_loss.values())
+        # Weighted treecover2000 + summed current forest pixels
+        _tc = _wavg(['hansen', 'mean_treecover2000_pct'])
+        if _tc is not None:
+            _hansen['mean_treecover2000_pct'] = _tc
+        _cf = _sum(['hansen', 'current_forest_pixels'])
+        if _cf:
+            _hansen['current_forest_pixels'] = _cf
+        _hmethod = _any_val(['hansen', 'method'])
+        if _hmethod:
+            _hansen['method'] = _hmethod
+        merged['hansen'] = _hansen
 
         # ── phenology ────────────────────────────────────────────
         merged_phen = {}

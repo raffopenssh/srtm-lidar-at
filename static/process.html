@@ -3319,9 +3319,22 @@ function renderLastKg(js) {
     return null;
   }
   function _cascadeTopTree() {
-    if (top10t[0]) return top10t[0];
+    // Always consider both top_10_trees AND top_by_type.tree and pick
+    // the taller surviving exemplar. Keeps Tallest / Tallest Tree
+    // consistent: when the level-1 filter wipes out top_10_trees but
+    // _cascadeTop falls back to top_by_type (which can hold a taller
+    // tree), the per-tree figure mustn't lag behind the all-objects one.
     const trees = (js.top_by_type || {}).tree || [];
-    if (trees[0]) return Object.assign({height_m: trees[0].height_max_m}, trees[0]);
+    let best = null, bestH = -1;
+    if (top10t[0]) {
+      const h = top10t[0].height_m || top10t[0].height_max_m || 0;
+      if (h > bestH) { bestH = h; best = top10t[0]; }
+    }
+    if (trees[0]) {
+      const h = trees[0].height_max_m || 0;
+      if (h > bestH) { bestH = h; best = Object.assign({height_m: trees[0].height_max_m}, trees[0]); }
+    }
+    if (best) return best;
     for (const p of (parcels.details || [])) {
       const arr = p.top_trees || p.top_10_trees || [];
       if (arr[0]) return _decTree(arr[0]);

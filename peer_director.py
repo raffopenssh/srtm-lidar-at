@@ -2041,6 +2041,10 @@ class PeerDirector:
     # errors silently.
     _STATUS_CACHE_FILE = Path('/tmp/srtm_director_status_cache.json')
     _STATUS_CACHE_TTL = 30.0
+    # Path of the director-role flag. Mirrors director_ha.IS_DIRECTOR_FLAG
+    # but kept as a module constant to avoid the import cycle on the hot
+    # path. Both module references must agree (asserted in tests).
+    _IS_DIRECTOR_FLAG = DATA_DIR / 'is_director'
     # Stale window: if a recompute is in flight, callers that arrive
     # with a cached value at most this old are served the stale copy
     # immediately instead of blocking. Keeps /process.txt and
@@ -2049,6 +2053,34 @@ class PeerDirector:
     # within STALE, so the next caller sees fresh data without any
     # request having had to wait.
     _STATUS_CACHE_STALE = 180.0
+
+    def _is_director_signature(self) -> tuple[bool, int]:
+        """Cheap fingerprint of the ``is_director`` flag file.
+
+        Returned tuple is (exists, mtime_ns). Used by ``get_status`` to
+        detect a director flip that happened in *another* gunicorn
+        worker (or via direct disk write — handover, HA promotion,
+        manual recovery) and invalidate this worker's status cache.
+
+        Without this guard, a 2-worker gunicorn that flipped role in
+        only one worker would have the other worker keep returning a
+        cached status reflecting the old role for up to
+        ``_STATUS_CACHE_STALE`` (3 min). On a primary that just got
+        demoted (e.g. bandwidth-walled, manual park, takeover by a
+        peer) that stale worker would also keep running director
+        side-effects driven from cached state — including the 60-peer
+        fanout that burns external bandwidth. Cheap stat() per call is
+        well worth it.
+        """
+        try:
+            st = self._IS_DIRECTOR_FLAG.stat()
+            return (True, int(st.st_mtime_ns))
+        except FileNotFoundError:
+            return (False, 0)
+        except Exception:
+            # Be conservative: on stat error treat as "changed" so we
+            # recompute rather than serve a possibly-stale cache.
+            return (False, -1)
 
     def get_status(self) -> dict:
         """Full director status for the dashboard.
@@ -2070,8 +2102,35 @@ class PeerDirector:
             self._status_cache_value: dict | None = None
             self._status_cache_ts: float = 0.0
         now = _t.time()
+        # Snapshot the director-flag fingerprint *before* we read the
+        # cache. If it differs from the fingerprint stamped on the
+        # cache, drop both the in-memory and on-disk copies and force
+        # a recompute. This catches the cross-worker drift case where
+        # one gunicorn worker flipped role (writing/removing
+        # ``is_director``) but the other worker's cache still reflects
+        # the old role. See ``_is_director_signature`` for rationale.
+        flag_sig = self._is_director_signature()
         with self._status_cache_lock:
             cached = self._status_cache_value
+            cached_sig = getattr(self, '_status_cache_flag_sig', None)
+            if cached is not None and cached_sig != flag_sig:
+                log.info(
+                    'director-flag flip detected (cache_sig=%s '
+                    'disk_sig=%s) — invalidating get_status cache',
+                    cached_sig, flag_sig,
+                )
+                self._status_cache_value = None
+                self._status_cache_ts = 0.0
+                cached = None
+                # Also nuke the cross-worker disk cache so the *other*
+                # worker doesn't immediately re-promote a stale value
+                # we just rejected.
+                try:
+                    self._STATUS_CACHE_FILE.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception as _e:  # noqa: BLE001
+                    log.debug('status cache disk unlink failed: %s', _e)
             age = now - self._status_cache_ts if cached is not None else None
         # Cross-worker promotion: if our in-memory copy is stale (or
         # missing) but the disk file is fresher, adopt it. This is
@@ -2081,11 +2140,26 @@ class PeerDirector:
             disk = self._status_cache_load_disk()
             if disk is not None:
                 disk_ts = float(disk.get('_cached_at', 0) or 0)
+                disk_sig = (
+                    bool(disk.get('_flag_exists', False)),
+                    int(disk.get('_flag_mtime_ns', 0) or 0),
+                )
                 disk_age = now - disk_ts
-                if disk_age >= 0 and (age is None or disk_age < age):
+                # Reject the disk cache too if it was written by a
+                # worker that saw a different director-flag state.
+                # Prevents a stale cross-worker promotion from
+                # resurrecting the cache we just invalidated.
+                if disk_sig != flag_sig:
+                    log.debug(
+                        'disk status cache flag mismatch '
+                        '(disk_sig=%s live_sig=%s) — ignoring',
+                        disk_sig, flag_sig,
+                    )
+                elif disk_age >= 0 and (age is None or disk_age < age):
                     with self._status_cache_lock:
                         self._status_cache_value = disk
                         self._status_cache_ts = disk_ts
+                        self._status_cache_flag_sig = disk_sig
                     cached = disk
                     age = disk_age
         if cached is not None and age is not None and age < self._STATUS_CACHE_TTL:
@@ -2095,11 +2169,16 @@ class PeerDirector:
             if self._status_cache_inflight.acquire(blocking=False):
                 def _bg_refresh():
                     try:
+                        # Re-snapshot the flag fingerprint at the
+                        # moment of compute, not at the time the
+                        # request came in.
+                        sig = self._is_director_signature()
                         result = self._compute_status()
                         with self._status_cache_lock:
                             self._status_cache_value = result
                             self._status_cache_ts = _t.time()
-                        self._status_cache_save_disk(result)
+                            self._status_cache_flag_sig = sig
+                        self._status_cache_save_disk(result, sig)
                     except Exception as _e:  # noqa: BLE001
                         log.warning('get_status background refresh: %s', _e)
                     finally:
@@ -2130,11 +2209,13 @@ class PeerDirector:
                 if (self._status_cache_value is not None and
                         (_t.time() - self._status_cache_ts) < self._STATUS_CACHE_TTL):
                     return self._status_cache_value
+            sig = self._is_director_signature()
             result = self._compute_status()
             with self._status_cache_lock:
                 self._status_cache_value = result
                 self._status_cache_ts = _t.time()
-            self._status_cache_save_disk(result)
+                self._status_cache_flag_sig = sig
+            self._status_cache_save_disk(result, sig)
             return result
         finally:
             try:
@@ -2151,10 +2232,16 @@ class PeerDirector:
             return None
         return None
 
-    def _status_cache_save_disk(self, payload: dict) -> None:
+    def _status_cache_save_disk(
+        self, payload: dict, flag_sig: tuple[bool, int] | None = None,
+    ) -> None:
         try:
             d = dict(payload)
             d['_cached_at'] = time.time()
+            if flag_sig is None:
+                flag_sig = self._is_director_signature()
+            d['_flag_exists'] = bool(flag_sig[0])
+            d['_flag_mtime_ns'] = int(flag_sig[1])
             tmp = self._STATUS_CACHE_FILE.with_suffix('.tmp')
             tmp.write_text(json.dumps(d, default=str))
             tmp.replace(self._STATUS_CACHE_FILE)

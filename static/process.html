@@ -4207,7 +4207,11 @@ function _pmDonut(usedFrac, color) {
 function _peerDisplayId(id) { return id === 'primary' ? 'at1' : id; }
 // Determine the role tag shown inside the progress bar.
 function _peerRoleTag(p, ctx) {
-  if (p.url == null) return {cls: 't-primary', txt: 'PRIMARY'};
+  // Only the actual primary peer wears the PRIMARY badge. A null url
+  // also means "this very VM" in the local peers.json view, so on a
+  // peer's own dashboard its own row has url=null — without the id
+  // check we'd mislabel that peer as PRIMARY (split-brain look-alike).
+  if (p.id === 'primary') return {cls: 't-primary', txt: 'PRIMARY'};
   if (ctx.isActive)  return {cls: 't-frontier', txt: 'FRONTIER'};
   if (ctx.isRunning && p.cache_only_run) return {cls: 't-cache', txt: 'CACHE'};
   if (ctx.isRunning) return {cls: 't-frontier', txt: 'FRONTIER'};

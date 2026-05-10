@@ -5859,7 +5859,74 @@ def director_update_peers():
         if _self_id and p['id'] == _self_id:
             local_entry = p
             break
-    if local_entry is not None:
+
+    # --- Director-aware ordering -------------------------------------
+    # If we are the running director, bouncing srv on the director box
+    # during a fleet-wide wave drops director_state.json freshness,
+    # peer watchdogs trip a takeover, and the cluster cascades (the
+    # 2026-05-10 incident). Two-phase recovery:
+    #   1. Hand over to the current healthy shadow BEFORE any update
+    #      kicks off, so the director box can be restarted safely.
+    #   2. Defer the (former) director's own self-update and the new
+    #      director's update to the tail of the wave with extra gap,
+    #      so the freshly-promoted director is stable while the rest
+    #      of the fleet is restarted.
+    # Skip both when this is a single-peer update (target_id set) and
+    # we're not the target.
+    handover_info: dict = {'attempted': False}
+    deferred_self_id = None      # was-director, update last via loopback
+    deferred_new_dir_id = None   # new director, update at very end
+    try:
+        is_director_local = _dha.IS_DIRECTOR_FLAG.exists()
+    except Exception:
+        is_director_local = False
+    if is_director_local and not target_id:
+        try:
+            d_state = pd.load_director_state()
+            shadow_id = d_state.get('shadow_peer')
+            last_push = d_state.get('shadow_last_push_ts') or 0.0
+            last_ok = d_state.get('shadow_last_push_ok')
+            shadow_peer = pd.get_peer_by_id(cfg, shadow_id) if shadow_id else None
+            shadow_age = (time.time() - float(last_push)) if last_push else 1e9
+        except Exception as _e:
+            shadow_peer = None
+            handover_info['error'] = f'shadow_lookup: {_e}'
+            shadow_age = 1e9
+            last_ok = None
+            shadow_id = None
+        # Only hand over if shadow is reachable, recently fresh, and
+        # not us. shadow_last_push_ok==True + push within 5 min ≈ healthy.
+        if (shadow_peer and shadow_peer.get('url')
+                and shadow_id != _self_id
+                and last_ok is True and shadow_age < 300):
+            handover_info = {
+                'attempted': True, 'target': shadow_id,
+                'shadow_age_s': round(shadow_age, 1),
+            }
+            try:
+                hres = _dha.do_handover(shadow_id, shadow_peer['url'])
+                handover_info['result'] = hres
+                if hres.get('status') == 'handed_over':
+                    # We are no longer the director. Defer our self-update
+                    # AND the new director's update to the tail.
+                    deferred_self_id = _self_id
+                    deferred_new_dir_id = shadow_id
+                    # Remove the new director from the main wave; we'll
+                    # update it at the very end with extra gap.
+                    targets = [p for p in targets
+                               if p['id'] != shadow_id]
+            except Exception as _e:
+                handover_info['error'] = str(_e)[:200]
+        else:
+            handover_info = {
+                'attempted': False,
+                'reason': ('no_healthy_shadow'
+                           if not shadow_peer
+                           else f'shadow_stale (age={int(shadow_age)}s ok={last_ok})'),
+                'shadow_id': shadow_id,
+            }
+
+    if local_entry is not None and deferred_self_id is None:
         # Schedule the local update in a daemon thread so we can return
         # a response before srv bounces. The thread calls /admin/update
         # over loopback (auth-exempt) so we reuse the exact same code
@@ -5881,6 +5948,11 @@ def director_update_peers():
                                       'graceful': graceful}
     WAVE = int(body.get('wave_size') or 5)
     GAP_S = float(body.get('wave_gap_s') or 6.0)
+    # Extra delay before touching the new-director and old-director
+    # boxes. Lets the freshly-promoted director stabilise (heartbeat,
+    # shadow election, identity broadcast) and the bulk of the fleet
+    # finish restarting before the director box bounces.
+    DIR_TAIL_DELAY_S = float(body.get('director_tail_delay_s') or 30.0)
     if targets:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import time as _t
@@ -5897,6 +5969,55 @@ def director_update_peers():
                         results[pid] = {'error': str(e)}
             if i + WAVE < len(targets):
                 _t.sleep(GAP_S)
+
+    # Tail: update the (former) director box + the new director, in
+    # that order, with extra delay. This runs *after* the bulk wave so
+    # the cluster is already on the new code when these last two
+    # restart.
+    if deferred_self_id and local_entry is not None:
+        import threading as _th_tail, time as _t_tail
+        def _tail_self_update():
+            _t_tail.sleep(DIR_TAIL_DELAY_S)
+            try:
+                import requests as _rq_tail
+                _rq_tail.post(
+                    'http://127.0.0.1:8000/api/v1/admin/update',
+                    json={'graceful': graceful},
+                    timeout=120,
+                )
+            except Exception as _e:
+                log.warning('tail self-update via loopback failed: %s', _e)
+        _th_tail.Thread(target=_tail_self_update, daemon=True).start()
+        results[local_entry['id']] = {
+            'status': 'scheduled_local_update',
+            'graceful': graceful,
+            'deferred_s': DIR_TAIL_DELAY_S,
+            'after_handover_to': deferred_new_dir_id,
+        }
+    if deferred_new_dir_id:
+        new_dir_peer = pd.get_peer_by_id(cfg, deferred_new_dir_id)
+        if new_dir_peer and new_dir_peer.get('url'):
+            import threading as _th_nd, time as _t_nd
+            def _tail_new_dir_update():
+                # Update the new director LAST, after the former
+                # director restart has had a chance to settle. The
+                # peer's /admin/update?graceful=1 will defer until
+                # any in-flight KG completes — but for the new
+                # director that just took over, no processor is
+                # running locally, so it'll restart promptly.
+                _t_nd.sleep(DIR_TAIL_DELAY_S * 2)
+                try:
+                    res = pd.trigger_peer_update(
+                        new_dir_peer['url'], graceful)
+                    results[deferred_new_dir_id] = res
+                except Exception as _e:
+                    results[deferred_new_dir_id] = {'error': str(_e)[:200]}
+            _th_nd.Thread(target=_tail_new_dir_update, daemon=True).start()
+            results[deferred_new_dir_id] = {
+                'status': 'scheduled_new_director_update',
+                'graceful': graceful,
+                'deferred_s': DIR_TAIL_DELAY_S * 2,
+            }
     # Surface a single high-level event in the merged 24h log so the
     # dashboard shows the rollout. Per-peer results would be too noisy
     # for a fleet-wide "Update Peers" wave — the per-peer update events
@@ -5904,9 +6025,14 @@ def director_update_peers():
     try:
         _scope = ('peer ' + target_id) if target_id else \
                  (str(len(targets)) + ' peers')
+        _ho = ''
+        if handover_info.get('attempted') and \
+           (handover_info.get('result') or {}).get('status') == 'handed_over':
+            _ho = f' [handover→{handover_info.get("target")}]'
         director_event(
             'update wave: ' + _scope
             + (' (graceful)' if graceful else ' (immediate)')
+            + _ho
             + ' → ' + str(_GIT_COMMIT))
     except Exception:
         pass
@@ -5915,6 +6041,7 @@ def director_update_peers():
         'token_install': token_results,
         'push': push_info,
         'graceful': graceful,
+        'handover': handover_info,
     })
 
 

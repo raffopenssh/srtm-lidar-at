@@ -49,6 +49,40 @@ try:
 except Exception:
     _LOCAL_GIT_COMMIT = 'unknown'
 
+# Cache of {peer_commit: bool} — True iff peer_commit is a descendant of
+# (or equal to) _LOCAL_GIT_COMMIT, i.e. the peer is at or *ahead* of the
+# director's frozen-at-import target. We must not flag such peers as
+# "stale / needs_manual_update": pulling on them would *downgrade* them.
+# Happens routinely when the director was started before a fresh git
+# push to origin/main and peers already auto-pulled past us.
+_PEER_COMMIT_AHEAD_CACHE: dict[str, bool] = {}
+
+def _peer_commit_is_ahead_or_equal(peer_commit: str) -> bool:
+    """True iff *peer_commit* contains _LOCAL_GIT_COMMIT in its history.
+
+    Cached; resolved via ``git merge-base --is-ancestor LOCAL PEER``.
+    Returns False on any git error (peer commit unknown locally, etc.).
+    """
+    if not peer_commit or _LOCAL_GIT_COMMIT in ('', 'unknown'):
+        return False
+    if peer_commit == _LOCAL_GIT_COMMIT:
+        return True
+    cached = _PEER_COMMIT_AHEAD_CACHE.get(peer_commit)
+    if cached is not None:
+        return cached
+    try:
+        rc = subprocess.call(
+            ['git', 'merge-base', '--is-ancestor',
+             _LOCAL_GIT_COMMIT, peer_commit],
+            cwd=str(Path(__file__).parent),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        result = (rc == 0)
+    except Exception:
+        result = False
+    _PEER_COMMIT_AHEAD_CACHE[peer_commit] = result
+    return result
+
 DATA_DIR = Path('data/austria_processor')
 PEERS_CONFIG = DATA_DIR / 'peers.json'
 DIRECTOR_STATE = DATA_DIR / 'director_state.json'
@@ -5393,7 +5427,13 @@ class PeerDirector:
             # Idle = no active KG processing. 'running'/'processing'
             # means the peer is mid-work; we never interrupt that.
             idle = proc_state in ('stopped', 'idle', 'complete', 'paused')
-            stale = bool(commit) and commit != _LOCAL_GIT_COMMIT
+            # "Ahead or equal" peers are NOT stale: their commit
+            # contains _LOCAL_GIT_COMMIT in its history (e.g. operator
+            # pushed a new commit to origin/main and the peer pulled
+            # before this director restarted). Forcing them back would
+            # be a downgrade.
+            ahead = bool(commit) and _peer_commit_is_ahead_or_equal(commit)
+            stale = bool(commit) and commit != _LOCAL_GIT_COMMIT and not ahead
             # Only drop the tracked record when we've *confirmed* the
             # peer landed on the local commit. If the peer is briefly
             # offline (e.g. during the graceful-restart window) or its
@@ -5405,7 +5445,10 @@ class PeerDirector:
             # commit (the in-flight `_deferred_update` thread can't
             # see ``pgrep austria_processor.py`` go empty because the
             # cache-only orchestrator respawns the processor first).
-            if commit and commit == _LOCAL_GIT_COMMIT:
+            if commit and (commit == _LOCAL_GIT_COMMIT or ahead):
+                # Ahead-or-equal: drop tracking + clear any leftover
+                # ``needs_manual_update`` flag from before the director
+                # noticed the peer was actually ahead.
                 tracked.pop(pid, None)
                 continue
             if not (online and stale):

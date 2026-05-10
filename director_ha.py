@@ -71,12 +71,15 @@ SNAPSHOT_FILES: tuple[str, ...] = (
 SNAPSHOT_TEXT_FILES: tuple[str, ...] = ('peer_urls.txt',)
 
 WATCHDOG_INTERVAL = 30           # seconds between heartbeat probes
-# 6 misses × 30s = 3 minutes before a shadow promotes itself. Tighter
-# values (we used 3 = 90s) caused spurious takeovers during code pushes,
-# long uploads, and any tick where the director worker briefly stalled.
-# A genuinely-dead director will still fail over within 3 minutes; a
-# transiently-loaded one will recover with no fleet impact.
-WATCHDOG_MISS_THRESHOLD = 6      # consecutive misses → shadow takes over
+# 12 misses × 30s = 6 minutes before a shadow promotes itself. Bumped
+# from 6 (3 min) on 2026-05-10 after two cascading takeovers driven by
+# exe.dev cross-region proxy flaps (LAX→FRA): primary remained healthy
+# locally throughout, but its public proxy dropped HTTPS for ~3 min,
+# tripping a shadow's watchdog. Each takeover cost minutes of
+# orchestration outage and exposed cross-worker step_down bugs. Real
+# director failures (process crash, host down, kernel panic) still
+# fail over within 6 min — acceptable.
+WATCHDOG_MISS_THRESHOLD = 12     # consecutive misses → shadow takes over
 WATCHDOG_TIMEOUT = (3, 5)        # (connect, read)
 SHADOW_SYNC_INTERVAL = 30        # seconds between snapshot pushes
 HEARTBEAT_GRACE = 90             # seconds before director is considered dead

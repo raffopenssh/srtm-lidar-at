@@ -14163,6 +14163,21 @@ def process_txt():
     if hours_back <= 0:
         hours_back = 24.0
 
+    # Render cache: per-worker, keyed on the (effective) query, TTL 10 s.
+    # Multiple gunicorn workers each maintain their own cache; the
+    # underlying director status is already cross-worker cached so the
+    # work avoided here is pure Python text formatting + log scanning.
+    _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back)
+    _now_t = _t.time()
+    cache = getattr(process_txt, '_render_cache', None)
+    if cache is None:
+        cache = {}
+        process_txt._render_cache = cache
+    cached = cache.get(_cache_key)
+    if cached and (_now_t - cached[0]) < 10.0:
+        return Response(cached[1], mimetype='text/plain; charset=utf-8',
+                        headers={'X-Cache': 'hit'})
+
     def _short(s, n):
         s = '' if s is None else str(s)
         return s if len(s) <= n else (s[:n - 1] + '…')
@@ -14256,6 +14271,27 @@ def process_txt():
         f'zenodo:   kgs_uploaded={n_kgs} bytes={total_b/1e9:.2f}GB '
         f'depo={mf.get("deposition_id") or "-"}'
     )
+    # Fleet bandwidth summary (canary-by-default).
+    try:
+        fb = d.get('fleet_bw') or {}
+        if fb:
+            cap_med = fb.get('observed_cap_gb_median')
+            cap_min = fb.get('observed_cap_gb_min')
+            cap_n = fb.get('observed_cap_gb_count') or 0
+            cap_s = (
+                f'wall~{cap_med}GB(min={cap_min},n={cap_n})'
+                if isinstance(cap_med, (int, float)) else 'wall=?'
+            )
+            out.append(
+                f'fleet_bw: used={fb.get("used_gb", 0):.1f}GB '
+                f'budget_nominal={fb.get("budget_gb_nominal", 0):.0f}GB '
+                f'peers={fb.get("peers_enabled", 0)} '
+                f'parked={fb.get("peers_parked", 0)} '
+                f'next_renew={fb.get("next_renew_in_days", "?")}d '
+                f'{cap_s}'
+            )
+    except Exception:
+        pass
     # Cache deposit
     try:
         cmf_path = Path('data/austria_processor/cache_manifest.json')
@@ -14521,7 +14557,7 @@ def process_txt():
                 v = commit_from_log.get(p.get('id'))
                 if v:
                     p['git_commit'] = v
-    out.append('  id     role     state     kg     name                 step          elapsed  bw%   ver     creds  last')
+    out.append('  id     role     state     kg     name                 step          elapsed  bw%   used/bud   ver     creds  last  bw_extras')
     for p in visible:
         pid = _short(p.get('id', '?'), 6).ljust(6)
         role = _short(_peer_role(p), 8).ljust(8)
@@ -14544,6 +14580,38 @@ def process_txt():
         budget_gb = bw.get('effective_budget_gb') or bw.get('budget_gb') or 0
         bw_pct = ('%3d%%' % min(99, int(100 * used_gb / max(0.01, budget_gb)))).rjust(4) \
             if budget_gb else ' -  '
+        bw_ub = (f'{used_gb:.1f}/{budget_gb:.0f}G').rjust(10)
+        # bw_extras: canary ratio + observed cap + park / renewal info.
+        extras = []
+        c = p.get('canary') or {}
+        if c:
+            ratio = c.get('ratio')
+            if isinstance(ratio, (int, float)):
+                extras.append(f'r={ratio:.2f}')
+            if c.get('override'):
+                extras.append('CANARY')
+        cap = p.get('observed_cap_gb')
+        if isinstance(cap, (int, float)):
+            extras.append(f'cap={cap:.0f}G')
+        # not_before / days-to-renewal
+        nb = p.get('not_before')
+        if nb and p.get('scheduled'):
+            try:
+                nbt = datetime.fromisoformat(nb)
+                if nbt.tzinfo is None:
+                    nbt = nbt.replace(tzinfo=timezone.utc)
+                dleft = (nbt - datetime.now(timezone.utc)).total_seconds()
+                if dleft > 0:
+                    if dleft >= 86400:
+                        extras.append(f'parked→{dleft/86400:.1f}d')
+                    else:
+                        extras.append(f'parked→{dleft/3600:.1f}h')
+            except Exception:
+                extras.append('parked')
+        rd = p.get('renew_day')
+        if rd:
+            extras.append(f'rd={rd}')
+        bw_extra_s = ' '.join(extras) if extras else ''
         ver = (_short(p.get('git_commit') or '-', 7)).ljust(7)
         # Surface assigned credential indices so we can verify each
         # frontier peer is actually on its slice (the recent index-
@@ -14564,7 +14632,9 @@ def process_txt():
         if not p.get('online'):
             flags += ' ⚠off'
         out.append(
-            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct}  {ver} {ci_col} {last}{flags}'
+            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct} {bw_ub} {ver} {ci_col} {last}'
+            + (f'  {bw_extra_s}' if bw_extra_s else '')
+            + flags
         )
 
     # --- Active Zenodo uploads (peers in *upload* steps) ---------
@@ -14749,8 +14819,17 @@ def process_txt():
         '#          disk pressure — peers <5 GB free\n'
         '#          recent director events — rollout / cred-rotation events.'
     )
-    return Response('\n'.join(out) + '\n',
-                    mimetype='text/plain; charset=utf-8')
+    body = '\n'.join(out) + '\n'
+    try:
+        cache[_cache_key] = (_now_t, body)
+        # Bound cache size so unique query strings can't blow it up.
+        if len(cache) > 64:
+            for _k in list(cache.keys())[: len(cache) - 64]:
+                cache.pop(_k, None)
+    except Exception:
+        pass
+    return Response(body, mimetype='text/plain; charset=utf-8',
+                    headers={'X-Cache': 'miss'})
 
 
 @app.route('/process.html')

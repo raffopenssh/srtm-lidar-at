@@ -6,8 +6,11 @@
 ## ⚡ Fast read for agents: `/process.txt`
 
 **Always start here when investigating cluster state.** Token-cheap,
-text-only mirror of `/process.html` — full director / peer / log / Zenodo
-snapshot in <2 KB. Add to your context with one curl:
+text-only mirror of `/process.html` — full director / peer / log / Zenodo /
+bandwidth snapshot. Per-worker render cache (10 s TTL, X-Cache header) +
+director status cache (30 s, cross-worker via disk) so even concurrent
+agent polls cost almost nothing on gunicorn. Add to your context with one
+curl:
 
 ```bash
 curl -s https://srtm-lidar-at.exe.xyz:8000/process.txt          # default 60 log lines, last 24h
@@ -39,10 +42,41 @@ per-day archive when `hours` exceeds the live ring — returns the
 *most-recent* `limit` matches in range (sets `truncated:true` if more
 exist), avoiding the prior bug that truncated the tail of the day.
 Director orchestration events — peer auto-updates, Copernicus credential
-revalidation/add/remove, frontier credential & cache-cell plan changes —
-are emitted via `app.director_event(…)` and appear inline in the merged
-24h log (`peer=director` for fleet-wide events, otherwise the affected
-peer id).
+revalidation/add/remove, frontier credential & cache-cell plan changes,
+**bandwidth-wall auto-park / park-until-renewal** events — are emitted via
+`app.director_event(…)` and appear inline in the merged 24h log
+(`peer=director` for fleet-wide events, otherwise the affected peer id).
+
+### Bandwidth fields in `/process.txt`
+
+The text dashboard surfaces all the bandwidth telemetry needed to debug a
+fleet that's canary-by-default (every peer sampled, slowdown auto-park
+on throughput collapse, park-until-renewal on near/over budget):
+
+* **Top-line `fleet_bw`** — `used_gb`, `budget_nominal_gb`, peers,
+  parked, soonest `next_renew_in_days`, plus `wall~Xgb(min=Y,n=Z)`
+  distilled from peers that auto-parked on throughput collapse.
+* **Per-peer columns** — `bw%` (used/effective_budget), `used/bud`
+  absolute GB, plus a free-form `bw_extras` tail with optional tokens:
+  - `r=0.42` — canary recent/baseline throughput ratio (red <0.30)
+  - `CANARY` — has an explicit `budget_gb` override
+  - `cap=80G` — peer's persisted `observed_cap_gb` (it has hit a wall)
+  - `parked→3.1d` / `parked→4.5h` — active `not_before` cooldown
+  - `rd=15` — effective renew_day (override > first_seen day-of-month)
+* **`fleet_bw` JSON block** in `/api/v1/director/status` for structured
+  consumers — fields above plus `observed_cap_gb_min/median`,
+  `peers_enabled`, `peers_parked`.
+
+Thresholds (peer_director.py):
+* `BANDWIDTH_LOW_WATER_GB = 4` — mid-KG triggers graceful stop +
+  park-until-renewal so the in-flight KG finishes & uploads.
+* `BANDWIDTH_HARD_DEPLETED_GB = 1` — hard stop, even mid-KG.
+* `CANARY_SLOWDOWN_RATIO = 0.30`, baseline 30 min, 500 MB minimum bytes
+  before a peer can be parked for throughput collapse.
+* `CANARY_PARK_COOLDOWN_S = 6h` — used by slowdown park.
+* Park-until-renewal cooldown = peer's effective `renew_day` next
+  occurrence (no need to track per-peer budgets separately; the existing
+  `_peer_is_scheduled` gate makes the scheduler skip the peer).
 
 ## TL;DR
 

@@ -5031,49 +5031,66 @@ class PeerDirector:
         except Exception:
             return []
         files = d.get('files') or {}
-        per_product: dict[str, set[tuple[float, float, float, float]]] = {}
+        per_product_cells: dict[str, set[tuple[float, float, float, float]]] = {}
+        # Collect legacy strip lat-ranges per product so we can stitch
+        # 0.5° strips into 1° lat bands for the austria_cells expansion.
+        per_product_strip_ranges: dict[str, list[tuple[float, float]]] = {}
         for name in files:
             base_n = name.replace('.zip', '')
             try:
                 if '_cell_' in base_n:
                     head, coords = base_n.split('_cell_', 1)
                     s, n, w, e = (float(x) for x in coords.split('_'))
-                    cell = (round(s, 4), round(n, 4),
-                            round(w, 4), round(e, 4))
+                    product = head
+                    if product.startswith('copernicus_'):
+                        product = product[len('copernicus_'):]
+                    per_product_cells.setdefault(product, set()).add(
+                        (round(s, 4), round(n, 4),
+                         round(w, 4), round(e, 4)))
                 elif '_strip_' in base_n:
-                    # Legacy 0.5° strips cover the full lon range —
-                    # treat them as covering every austria cell whose
-                    # lat band overlaps. We expand to the canonical
-                    # 1° cells so the cell-strict filter behaves the
-                    # same as before for legacy manifests.
                     head, coords = base_n.split('_strip_', 1)
                     s, n = (float(x) for x in coords.split('_'))
-                    cell = None
-                else:
-                    continue
+                    product = head
+                    if product.startswith('copernicus_'):
+                        product = product[len('copernicus_'):]
+                    per_product_strip_ranges.setdefault(
+                        product, []).append((s, n))
             except Exception:
                 continue
-            product = head
-            if product.startswith('copernicus_'):
-                product = product[len('copernicus_'):]
-            bucket = per_product.setdefault(product, set())
-            if cell is not None:
-                bucket.add(cell)
-            else:
-                # Legacy strip: cover every austria cell that falls
-                # within this strip's lat band.
-                try:
-                    for c in self._austria_cells():
-                        cs, cn, cw, ce = c
-                        if cs >= s - 1e-9 and cn <= n + 1e-9:
-                            bucket.add((round(cs, 4), round(cn, 4),
-                                        round(cw, 4), round(ce, 4)))
-                except Exception:
-                    pass
+        # Expand legacy strips into cell coverage: a cell (cs,cn,cw,ce)
+        # is covered by legacy strips for product P iff every sub-band
+        # within [cs,cn] is covered by the union of P's strips. Cheap
+        # check via interval merging.
+        def _merge(ranges: list[tuple[float, float]]
+                   ) -> list[tuple[float, float]]:
+            if not ranges:
+                return []
+            r = sorted(ranges)
+            out = [list(r[0])]
+            for s, n in r[1:]:
+                if s <= out[-1][1] + 1e-9:
+                    out[-1][1] = max(out[-1][1], n)
+                else:
+                    out.append([s, n])
+            return [(a, b) for a, b in out]
+        try:
+            all_cells = self._austria_cells()
+        except Exception:
+            all_cells = []
+        for product, ranges in per_product_strip_ranges.items():
+            merged = _merge(ranges)
+            bucket = per_product_cells.setdefault(product, set())
+            for cs, cn, cw, ce in all_cells:
+                for ms, mn in merged:
+                    if cs >= ms - 1e-9 and cn <= mn + 1e-9:
+                        bucket.add((round(cs, 4), round(cn, 4),
+                                    round(cw, 4), round(ce, 4)))
+                        break
         required = ['ndvi', 'sar', 'harmonics', 'worldcover', 'hansen']
-        if not all(p in per_product for p in required):
+        if not all(p in per_product_cells for p in required):
             return []
-        common = set.intersection(*[per_product[p] for p in required])
+        common = set.intersection(
+            *[per_product_cells[p] for p in required])
         return sorted(common)
 
     def _cell_for_bbox(self, bb: dict) -> tuple[float, float, float, float] | None:
@@ -7026,7 +7043,12 @@ class PeerDirector:
 
         All logged at INFO/WARNING so journals always show the reason.
         """
-        HANDBACK_RETRY_S = 60
+        # Short retry on transient/expected paths (primary still
+        # restarting, stepped_down flag clear just landed) so we hand
+        # the role back within one director tick of primary becoming
+        # ready. Was 60s — too conservative; meant operators saw
+        # ~90-120s of at-X-acting-director after every update_peers.
+        HANDBACK_RETRY_S = 15
         HANDBACK_BACKOFF_S = 300
         try:
             import director_ha as dha
@@ -7101,11 +7123,10 @@ class PeerDirector:
                 if cr.ok:
                     cleared_ok = True
                     log.info('Auto-handback: cleared stepped_down on primary '
-                             '(was %s) — will retry handover in %ds',
+                             '(was %s) — proceeding with handover this tick',
                              cr.json().get('cleared') if cr.headers.get(
                                  'content-type', '').startswith('application/json')
-                             else 'unknown',
-                             HANDBACK_RETRY_S)
+                             else 'unknown')
                 else:
                     log.warning('Auto-handback: clear_stepped_down on primary '
                                 'returned HTTP %d — retry in %ds',
@@ -7115,7 +7136,13 @@ class PeerDirector:
                             'retry in %ds', str(e)[:80], HANDBACK_RETRY_S)
             self.state['_handback_last_reason'] = (
                 'cleared_stepped_down' if cleared_ok else 'clear_failed')
-            return
+            if not cleared_ok:
+                return
+            # Fall through and attempt handover in the same tick —
+            # do_handover targets primary via URL and primary will
+            # accept now that its stepped_down flag is gone. Saves a
+            # full HANDBACK_RETRY_S window.
+            d['stepped_down'] = False
         # Same git commit?
         try:
             info = requests.get(url.rstrip('/') + '/api/v1/info',

@@ -2283,6 +2283,7 @@ class PeerDirector:
                    'frontier_strip_plan', 'cache_only_active',
                    'parallel_unreachable_count',
                    '_creds_revalidated_at',
+                   '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
@@ -2487,6 +2488,39 @@ class PeerDirector:
             if p['cache_only_run']
             and p.get('processor_state') in ('running', 'processing')
         )
+        # Theoretical max cache-only peers: enabled, online, not
+        # scheduled-out (BW park / not_before), not the active frontier,
+        # not authorised for parallel-frontier work, not reserved, and
+        # with >2 GB headroom on their budget. Matches the gates in
+        # ``_orchestrate_cache_only`` so the dashboard chip can show a
+        # realistic denominator instead of the static hard cap.
+        _parallel_authorised = set(
+            state.get('parallel_frontiers_active') or [])
+        _parallel_authorised |= set(
+            (state.get('frontier_cred_plan') or {}).keys())
+        _active_id = state.get('active_peer')
+        _bw_map = state.get('peer_bandwidth') or {}
+        cache_only_eligible = 0
+        for _p in cfg.get('peers', []):
+            _pid = _p.get('id')
+            if not _pid or not _p.get('enabled', True):
+                continue
+            if _peer_is_scheduled(_p):
+                continue
+            if _pid == _active_id:
+                continue
+            if _pid in _parallel_authorised:
+                continue
+            if _p.get('reserved_kg'):
+                continue
+            _used = (_bw_map.get(_pid) or {}).get('used_bytes', 0)
+            if (_peer_budget_bytes(_p, cfg) - _used) < 2 * (1024 ** 3):
+                continue
+            # Online check via peers_status (which already polled).
+            _row = next((r for r in peers_status if r['id'] == _pid), None)
+            if _row is None or not _row.get('online', False):
+                continue
+            cache_only_eligible += 1
 
         # --- Credential pool & assignment plan ----------------------
         try:
@@ -2615,6 +2649,7 @@ class PeerDirector:
             'renew_day': cfg.get('renew_day', BANDWIDTH_RENEW_DAY),
             'min_reserve_peers': cfg.get('min_reserve_peers', MIN_RESERVE_PEERS),
             'max_cache_only_peers': cfg.get('max_cache_only_peers', MAX_CACHE_ONLY_PEERS),
+            'cache_only_eligible': cache_only_eligible,
             'cache_only_running': cache_only_running,
             'cache_ready_kgs': len(cache_ready.get('codes') or []),
             'cache_ready_at': cache_ready.get('at'),

@@ -4018,14 +4018,25 @@ function renderFleetHistory() {
   svg.style.visibility = 'visible';
   det.style.visibility = 'visible';
   const _frMax = (d.max_parallel_frontiers != null) ? d.max_parallel_frontiers : '';
-  const _coMax = (d.max_cache_only_peers != null) ? d.max_cache_only_peers : '';
+  // Prefer the live theoretical-eligible count (peers that could be
+  // started as cache-only right now: enabled, online, not BW-parked,
+  // not the active frontier, not parallel-authorised) over the static
+  // hard cap. Falls back to the cap if the field is missing.
+  let _coDenom = '';
+  if (d.cache_only_eligible != null) _coDenom = d.cache_only_eligible;
+  else if (d.max_cache_only_peers != null) _coDenom = d.max_cache_only_peers;
+  // Cross-worker safety: dashboard requests may be served by a
+  // gunicorn worker that hasn't run the director loop. Use the
+  // server-reported ready_kgs (read from disk in _compute_status)
+  // as the authoritative number; fall back to history if absent.
+  const _crNow = (d && d.cache_ready_kgs != null) ? d.cache_ready_kgs : (last.cr||0);
   det.innerHTML =
     '<span style="color:#3fc26b" title="Active parallel frontiers / max"><b>' +
       (last.fr||0) + '</b>' + (_frMax!==''?'/'+_frMax:'') + ' frontier' + ((last.fr===1)?'':'s') + '</span> · ' +
-    '<span style="color:#3fb6c2" title="Cache-only peers running / max"><b>' +
-      (last.co||0) + '</b>' + (_coMax!==''?'/'+_coMax:'') + ' cache</span> · ' +
-    '<span style="color:#9b6df0" title="KGs whose tiles are fully cached on Zenodo"><b>' +
-      (last.cr||0) + '</b> ready</span>';
+    '<span style="color:#3fb6c2" title="Cache-only peers running / eligible (enabled, online, not BW-parked, not frontier)"><b>' +
+      (last.co||0) + '</b>' + (_coDenom!==''?'/'+_coDenom:'') + ' cache</span> · ' +
+    '<span style="color:#9b6df0" title="KGs whose tiles are fully cached on Zenodo and ready for cache-only processing"><b>' +
+      _crNow + '</b> ready</span>';
 }
 
 // Render the rolling capacity-factor sparkline + tooltip in the Service

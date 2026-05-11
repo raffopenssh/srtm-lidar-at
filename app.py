@@ -481,13 +481,26 @@ def _safe_git_sync(repo: str, sp):
                 idx_lock.unlink()
         except Exception:
             pass
-        # Determine current branch (default main).
-        branch = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                        capture_output=True, text=True, timeout=10,
-                        cwd=repo).stdout.strip() or 'main'
+        # Production invariant: every peer tracks origin/main. If a peer
+        # drifted onto a side-branch (e.g. an operator checked out
+        # `untested` for a one-off test), it would otherwise keep
+        # pulling that branch and the director would mark it
+        # NEEDS-MANUAL forever. Force-snap back to main first.
+        branch = 'main'
         # Reset any tracked file modifications.
         sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
                timeout=30, cwd=repo)
+        # Switch to main if we're on another branch. -B re-creates the
+        # local main branch from origin/main, discarding any divergence.
+        cur = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                     capture_output=True, text=True, timeout=10,
+                     cwd=repo).stdout.strip()
+        if cur and cur != branch:
+            # Need origin/main present locally before -B can use it.
+            sp.run(['git', 'fetch', 'origin', branch],
+                   capture_output=True, text=True, timeout=60, cwd=repo)
+            sp.run(['git', 'checkout', '-B', branch, f'origin/{branch}'],
+                   capture_output=True, text=True, timeout=30, cwd=repo)
         # Fetch + hard-reset (robust against divergence; deterministic).
         fetch = sp.run(['git', 'fetch', 'origin', branch],
                        capture_output=True, text=True, timeout=60, cwd=repo)

@@ -6533,6 +6533,39 @@ def zenodo_lock_status():
         })
 
 
+@app.route('/api/v1/admin/clear_tile_checkpoints', methods=['POST'])
+def admin_clear_tile_checkpoints():
+    """Delete ``data/austria_processor/tile_checkpoints/<kg>`` for one KG.
+
+    Needed when a KG ran far enough to persist tile-level pickles but
+    its copernicus_accum is tainted (e.g. peer had empty cred store and
+    silently cached 401-driven empty features). Without this, a retry
+    would resume from the broken pickle and bake bad data into the
+    final JSON.
+
+    POST body or query: ``kg=<code>``. 404 if no dir exists.
+    """
+    kg = (request.args.get('kg') or '').strip()
+    if not kg and request.is_json:
+        kg = ((request.get_json(silent=True) or {}).get('kg') or '').strip()
+    if not kg:
+        return jsonify({'error': 'kg parameter required'}), 400
+    # Defend against traversal — kg codes are alnum + dash.
+    import re as _re
+    if not _re.match(r'^[0-9A-Za-z_-]+$', kg):
+        return jsonify({'error': 'invalid kg code'}), 400
+    ckpt_dir = Path('data/austria_processor/tile_checkpoints') / kg
+    if not ckpt_dir.exists():
+        return jsonify({'kg': kg, 'cleared': False, 'reason': 'no checkpoint dir'}), 404
+    import shutil as _sh
+    try:
+        n_files = sum(1 for _ in ckpt_dir.rglob('*') if _.is_file())
+        _sh.rmtree(ckpt_dir, ignore_errors=False)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'kg': kg, 'cleared': True, 'files_removed': n_files})
+
+
 @app.route('/api/v1/admin/flush_tiles', methods=['POST'])
 def admin_flush_tiles():
     """Force-upload local Copernicus + Hansen tiles to Zenodo.

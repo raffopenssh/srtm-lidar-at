@@ -4412,17 +4412,92 @@ class PeerDirector:
                 # legacy peers that expose it). 4 is the legacy default.
                 try:
                     cr = requests.get(url.rstrip('/') + '/api/v1/credentials',
-                                      timeout=PEER_TIMEOUT_PROBE)
+                                      timeout=PEER_TIMEOUT_PROBE,
+                                      headers=_admin_headers())
                     if cr.ok:
                         cred_count = len((cr.json() or {}).get('credentials') or [])
                 except Exception:
                     pass
+                # Self-heal: a peer with 0 creds can't run frontier work
+                # and burns CPU on 401 invalid_client storms. This happens
+                # when add_peer() ran while the peer was still booting
+                # (online=False at the time, so the credential bootstrap
+                # in app.py:director_add_peer was skipped). Push from the
+                # director's own store now that it's responding.
+                if cred_count == 0:
+                    try:
+                        self._bootstrap_peer_credentials(url, pid)
+                        # Re-probe so the cache reflects the new count.
+                        cr = requests.get(url.rstrip('/') + '/api/v1/credentials',
+                                          timeout=PEER_TIMEOUT_PROBE,
+                                          headers=_admin_headers())
+                        if cr.ok:
+                            cred_count = len((cr.json() or {}).get('credentials') or [])
+                    except Exception as _be:
+                        log.debug('bootstrap creds to %s failed: %s', pid, _be)
         except Exception as e:
             log.debug('cap probe %s failed: %s', pid, e)
             return set(entry.get('caps') or [])
         cache[pid] = {'caps': sorted(caps), 'at': time.time(),
                       'cred_count': cred_count}
         return caps
+
+    def _bootstrap_peer_credentials(self, url: str, pid: str) -> int:
+        """Push every credential from the director's local pool to *peer*.
+
+        Idempotent at the peer side (re-adding an existing client_id is a
+        meta-update). Throttled per-peer to once every 5 min via
+        ``state['_cred_bootstrap_at']`` so a transiently-flapping peer
+        doesn't spin us. Marked X-Cred-Fanout=1 so the receiving peer
+        does NOT re-broadcast (we're addressing it directly).
+        """
+        if not url:
+            return 0
+        now = time.time()
+        with self._lock:
+            book = self.state.setdefault('_cred_bootstrap_at', {})
+            last = float(book.get(pid) or 0)
+            if now - last < 300:
+                return 0
+            book[pid] = now
+        try:
+            import copernicus as _cop
+            store = _cop.list_credentials_with_secrets() or []
+        except Exception as e:
+            log.debug('list_credentials_with_secrets failed: %s', e)
+            return 0
+        if not store:
+            return 0
+        hdrs = dict(_admin_headers())
+        hdrs['X-Cred-Fanout'] = '1'
+        ok = 0
+        for c in store:
+            cid = (c.get('client_id') or '').strip()
+            sec = (c.get('client_secret') or '').strip()
+            if not cid or not sec:
+                continue
+            try:
+                rr = requests.post(
+                    url.rstrip('/') + '/api/v1/credentials',
+                    json={'client_id': cid, 'client_secret': sec,
+                          'label': c.get('label', ''),
+                          'notes': c.get('notes', ''),
+                          'validate': False},
+                    headers=hdrs, timeout=10,
+                )
+                if rr.ok:
+                    ok += 1
+            except Exception:
+                pass
+        if ok:
+            try:
+                _emit_director_event(
+                    'creds bootstrapped to ' + pid + ': ' + str(ok)
+                    + '/' + str(len(store)) + ' (peer had empty store)',
+                    peer=pid)
+            except Exception:
+                pass
+        return ok
 
     def _effective_creds_per_frontier(self, cfg: dict) -> int:
         """Legacy hook — returns floor (per-peer cred count) for the

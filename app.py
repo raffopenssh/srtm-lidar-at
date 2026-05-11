@@ -4571,13 +4571,22 @@ def director_add_peer():
     if peer_url in existing_urls:
         return jsonify({'error': f'URL {peer_url} already registered'}), 409
 
-    # Test connectivity
+    # Test connectivity — retry briefly because a freshly-provisioned
+    # peer is often still booting (gunicorn warmup ~10-30s) when add_peer
+    # is invoked from the repl/deploy script. Without retry, online stays
+    # False and we silently skip credential bootstrap → peer comes up
+    # with empty cred store → frontier work fails with 401 invalid_client
+    # until the next director-loop self-heal pass.
     online = False
-    try:
-        r = requests.get(peer_url + '/api/v1/info', timeout=10)
-        online = r.ok
-    except Exception:
-        pass
+    for _attempt in range(6):  # 6 × 5s = 30s window
+        try:
+            r = requests.get(peer_url + '/api/v1/info', timeout=10)
+            if r.ok:
+                online = True
+                break
+        except Exception:
+            pass
+        time.sleep(5)
 
     # Push self-identity to the new peer so it knows its own id, URL and
     # who the current director is. This is the source-of-truth for

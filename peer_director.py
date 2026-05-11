@@ -2628,6 +2628,7 @@ class PeerDirector:
                 'adaptive_creds_per_frontier', True)),
             'max_parallel_frontiers': max_par,
             'cached_lat_strips': [[s, n] for s, n in cached_strips],
+            'cached_cells': [list(c) for c in self._cached_cells()],
             'austria_lat_strips': [[s, n] for s, n in austria_strips],
             'austria_cells': [[s, n, w, e] for s, n, w, e in austria_cells],
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
@@ -4893,77 +4894,247 @@ class PeerDirector:
     def record_cache_miss(self, kg_code: str, peer_id: str = '?',
                           bbox: dict | None = None,
                           tile_info: str = '') -> dict:
-        """Mark a KG as cache-miss. Future cache-only orchestration skips
-        it until its strip fingerprint changes (i.e. new tiles uploaded).
+        """Mark a KG as cache-miss.
+
+        Records the *cell* (1°×2°) the KG falls in and a fingerprint
+        of that cell's ZIPs. Future cache-only orchestration skips the
+        KG until either:
+          * the cell's fingerprint changes (its tiles were rewritten
+            — i.e. the frontier finished filling it), or
+          * 24h elapse (anti-snowball escape valve, in case the cell
+            never gets rewritten but the miss was transient).
+        Strip is kept for back-compat / dashboard but no longer drives
+        the clearing logic — the old strip-keyed approach kept whole
+        groups of KGs locked out while the frontier finished a single
+        neighbouring cell.
         """
         kg_code = str(kg_code)
         misses = self._load_cache_misses()
         strip = None
+        cell = None
         if bbox:
             strip = self._strip_for_bbox(bbox)
-        fp = self._strip_fingerprint(*strip) if strip else ''
+            try:
+                cell = self._cell_for_bbox(bbox)
+            except Exception:
+                cell = None
+        cell_fp = (self._cell_fingerprint(*cell) if cell else '')
         entry = {
-            'fingerprint': fp,
+            'fingerprint': cell_fp,  # cell-level (preferred)
+            'cell': list(cell) if cell else None,
             'strip': list(strip) if strip else None,
+            'strip_fingerprint': (
+                self._strip_fingerprint(*strip) if strip else ''),
             'recorded_at': datetime.now(timezone.utc).isoformat(),
             'peer_id': peer_id,
             'tile_info': tile_info,
         }
         misses[kg_code] = entry
         self._save_cache_misses(misses)
-        log.info('cache_miss recorded: KG %s (strip=%s fp=%s peer=%s)',
-                 kg_code, strip, fp, peer_id)
+        log.info('cache_miss recorded: KG %s (cell=%s fp=%s peer=%s)',
+                 kg_code, cell, cell_fp, peer_id)
         # Invalidate the cache-ready KG cache so next tick excludes this KG
         with self._lock:
             self.state.pop('_cache_ready_cache', None)
         return entry
 
     def _cache_miss_excluded(self) -> set:
-        """Return the set of KG codes that should currently be excluded
-        from cache-only whitelist because of an unresolved cache miss.
-        Entries whose fingerprint differs from the current manifest are
-        cleared (cache has updated since the miss).
+        """Return the set of KG codes currently excluded from the
+        cache-only whitelist due to unresolved cache misses.
+
+        Clearing rules (any one triggers):
+          1. The cell's fingerprint changed since the miss (its tiles
+             were rewritten).
+          2. Legacy entries with only a strip fingerprint: clear if
+             that strip fingerprint changed (back-compat path).
+          3. Anti-snowball: any entry older than 24h is dropped
+             unconditionally so transient misses can't pin a KG
+             forever when the cell happens not to be rewritten.
         """
         misses = self._load_cache_misses()
         if not misses:
             return set()
-        # Compute current fingerprint per strip lazily.
-        fp_cache: dict[tuple, str] = {}
+        cell_fp_cache: dict[tuple, str] = {}
+        strip_fp_cache: dict[tuple, str] = {}
         excluded = set()
         changed = False
         for kg, ent in list(misses.items()):
-            strip = ent.get('strip')
-            old_fp = ent.get('fingerprint') or ''
-            if not strip:
-                # Unknown strip — keep excluded for 24 h, then drop.
+            # Anti-snowball: hard 24h ceiling.
+            try:
+                age = (datetime.now(timezone.utc) -
+                       datetime.fromisoformat(ent['recorded_at'])
+                       ).total_seconds()
+            except Exception:
                 age = 0
-                try:
-                    age = (datetime.now(timezone.utc) -
-                           datetime.fromisoformat(ent['recorded_at'])).total_seconds()
-                except Exception:
-                    pass
-                if age > 86400:
-                    misses.pop(kg, None)
-                    changed = True
-                    continue
-                excluded.add(kg)
-                continue
-            key = (round(strip[0], 1), round(strip[1], 1))
-            cur_fp = fp_cache.get(key)
-            if cur_fp is None:
-                cur_fp = self._strip_fingerprint(strip[0], strip[1])
-                fp_cache[key] = cur_fp
-            if cur_fp and cur_fp != old_fp:
-                # Strip updated since miss — clear.
+            if age > 86400:
                 misses.pop(kg, None)
                 changed = True
-                log.info('cache_miss cleared: KG %s (strip %s fp %s→%s)',
-                         kg, key, old_fp, cur_fp)
+                log.info('cache_miss cleared: KG %s (age %.0fh > 24h)',
+                         kg, age / 3600)
+                continue
+
+            cleared = False
+            cell = ent.get('cell')
+            old_cell_fp = ent.get('fingerprint') or ''
+            if cell:
+                key = (round(cell[0], 4), round(cell[1], 4),
+                       round(cell[2], 4), round(cell[3], 4))
+                cur = cell_fp_cache.get(key)
+                if cur is None:
+                    cur = self._cell_fingerprint(*key)
+                    cell_fp_cache[key] = cur
+                if cur and cur != old_cell_fp:
+                    misses.pop(kg, None)
+                    changed = True
+                    cleared = True
+                    log.info('cache_miss cleared: KG %s (cell %s fp %s→%s)',
+                             kg, key, old_cell_fp, cur)
             else:
+                # Legacy strip-only entry. Clear on strip churn so old
+                # records eventually drain.
+                strip = ent.get('strip')
+                if strip:
+                    sk = (round(strip[0], 1), round(strip[1], 1))
+                    cur = strip_fp_cache.get(sk)
+                    if cur is None:
+                        cur = self._strip_fingerprint(strip[0], strip[1])
+                        strip_fp_cache[sk] = cur
+                    old_strip_fp = (ent.get('strip_fingerprint')
+                                    or old_cell_fp)
+                    if cur and cur != old_strip_fp:
+                        misses.pop(kg, None)
+                        changed = True
+                        cleared = True
+                        log.info('cache_miss cleared: KG %s (legacy strip %s fp %s→%s)',
+                                 kg, sk, old_strip_fp, cur)
+            if not cleared:
                 excluded.add(kg)
         if changed:
             self._save_cache_misses(misses)
         return excluded
+
+    def _cached_cells(self) -> list[tuple[float, float, float, float]]:
+        """Cells (s,n,w,e) fully cached for ALL required products.
+
+        Stricter than :py:meth:`_cached_lat_ranges` — that one only
+        checks lat coverage and lets a KG sneak past the pre-filter
+        when its specific cell isn't yet uploaded. Used by the
+        cache-ready whitelist so cache-only peers never get a KG
+        whose cell is mid-fill on the frontier (which would abort
+        with a cache miss and snowball into ``cache_miss_kgs.json``).
+        """
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        if not manifest_path.exists():
+            return []
+        try:
+            d = json.loads(manifest_path.read_text())
+        except Exception:
+            return []
+        files = d.get('files') or {}
+        per_product: dict[str, set[tuple[float, float, float, float]]] = {}
+        for name in files:
+            base_n = name.replace('.zip', '')
+            try:
+                if '_cell_' in base_n:
+                    head, coords = base_n.split('_cell_', 1)
+                    s, n, w, e = (float(x) for x in coords.split('_'))
+                    cell = (round(s, 4), round(n, 4),
+                            round(w, 4), round(e, 4))
+                elif '_strip_' in base_n:
+                    # Legacy 0.5° strips cover the full lon range —
+                    # treat them as covering every austria cell whose
+                    # lat band overlaps. We expand to the canonical
+                    # 1° cells so the cell-strict filter behaves the
+                    # same as before for legacy manifests.
+                    head, coords = base_n.split('_strip_', 1)
+                    s, n = (float(x) for x in coords.split('_'))
+                    cell = None
+                else:
+                    continue
+            except Exception:
+                continue
+            product = head
+            if product.startswith('copernicus_'):
+                product = product[len('copernicus_'):]
+            bucket = per_product.setdefault(product, set())
+            if cell is not None:
+                bucket.add(cell)
+            else:
+                # Legacy strip: cover every austria cell that falls
+                # within this strip's lat band.
+                try:
+                    for c in self._austria_cells():
+                        cs, cn, cw, ce = c
+                        if cs >= s - 1e-9 and cn <= n + 1e-9:
+                            bucket.add((round(cs, 4), round(cn, 4),
+                                        round(cw, 4), round(ce, 4)))
+                except Exception:
+                    pass
+        required = ['ndvi', 'sar', 'harmonics', 'worldcover', 'hansen']
+        if not all(p in per_product for p in required):
+            return []
+        common = set.intersection(*[per_product[p] for p in required])
+        return sorted(common)
+
+    def _cell_for_bbox(self, bb: dict) -> tuple[float, float, float, float] | None:
+        """Return the cached cell that fully contains *bb*, or None."""
+        s = bb.get('min_lat') or bb.get('south')
+        n = bb.get('max_lat') or bb.get('north')
+        w = bb.get('min_lon') or bb.get('west')
+        e = bb.get('max_lon') or bb.get('east')
+        if None in (s, n, w, e):
+            return None
+        for cs, cn, cw, ce in self._cached_cells():
+            if (s >= cs - 1e-9 and n <= cn + 1e-9
+                    and w >= cw - 1e-9 and e <= ce + 1e-9):
+                return (cs, cn, cw, ce)
+        return None
+
+    def _cell_fingerprint(self, cs: float, cn: float,
+                          cw: float, ce: float) -> str:
+        """Fingerprint of all required-product ZIPs for one cell.
+
+        Tighter than :py:meth:`_strip_fingerprint`: a miss recorded
+        against cell (s,n,w,e) clears as soon as THAT cell's ZIPs are
+        rewritten, instead of waiting for any tile anywhere in the
+        strip.
+        """
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        if not manifest_path.exists():
+            return ''
+        try:
+            d = json.loads(manifest_path.read_text())
+        except Exception:
+            return ''
+        files = d.get('files') or {}
+        parts = []
+        for product in ('ndvi', 'sar', 'harmonics', 'worldcover', 'hansen'):
+            prefix = ('hansen_' if product == 'hansen'
+                      else f'copernicus_{product}_')
+            for name, ent in sorted(files.items()):
+                if not name.startswith(prefix):
+                    continue
+                base_n = name.replace('.zip', '')
+                try:
+                    if '_cell_' in base_n:
+                        coords = base_n.split('_cell_', 1)[1].split('_')
+                        s_val = float(coords[0])
+                        w_val = float(coords[2])
+                        if (abs(s_val - cs) > 1e-6
+                                or abs(w_val - cw) > 1e-6):
+                            continue
+                    elif '_strip_' in base_n:
+                        coords = base_n.split('_strip_', 1)[1].split('_')
+                        s_val = float(coords[0])
+                        if not (cs - 1e-9 <= s_val < cn - 1e-9):
+                            continue
+                    else:
+                        continue
+                except Exception:
+                    continue
+                parts.append(name + '@' + str(ent.get('updated_at') or '-'))
+        import hashlib
+        return hashlib.md5('|'.join(parts).encode()).hexdigest()[:12]
 
     def _cached_lat_ranges(self) -> list[tuple[float, float]]:
         """Lat strips covered by ALL required products in the Zenodo cache.
@@ -5036,9 +5207,14 @@ class PeerDirector:
             cop_cache = CopernicusTileCache()
             hansen_cache = HansenTileCache()
 
-            lat_ranges = self._cached_lat_ranges()
-            if not lat_ranges:
-                log.info('Cache-ready scan: no fully-cached lat strip yet')
+            # Use cell-strict filter so we never whitelist a KG
+            # whose specific cell is mid-fill on the frontier —
+            # the strip-level pre-filter let those through and they
+            # would abort with a cache miss, snowballing into
+            # cache_miss_kgs.json.
+            cached_cells = self._cached_cells()
+            if not cached_cells:
+                log.info('Cache-ready scan: no fully-cached cell yet')
                 with self._lock:
                     self.state['_cache_ready_cache'] = {'codes': [], 'at': now}
                 return []
@@ -5067,9 +5243,11 @@ class PeerDirector:
             except Exception:
                 year = 2024
 
-            def _within_strips(s: float, n: float) -> bool:
-                for ls, ln in lat_ranges:
-                    if s >= ls - 1e-9 and n <= ln + 1e-9:
+            def _within_cells(s: float, n: float,
+                              w: float, e: float) -> bool:
+                for cs, cn, cw, ce in cached_cells:
+                    if (s >= cs - 1e-9 and n <= cn + 1e-9
+                            and w >= cw - 1e-9 and e <= ce + 1e-9):
                         return True
                 return False
 
@@ -5090,7 +5268,7 @@ class PeerDirector:
                 e, n = bb.get('max_lon'), bb.get('max_lat')
                 if None in (w, s, e, n):
                     continue
-                if not _within_strips(s, n):
+                if not _within_cells(s, n, w, e):
                     continue
                 prefiltered += 1
                 bbox = {'west': w, 'south': s, 'east': e, 'north': n}
@@ -5105,8 +5283,10 @@ class PeerDirector:
                             break
                 except Exception:
                     continue
-            log.info('Cache-ready scan: %d/%d KGs in covered strips, %d fully cached (max %d)',
-                     prefiltered, len(kgs), len(codes), max_kgs)
+            log.info('Cache-ready scan: %d/%d KGs in covered cells (%d), '
+                     '%d fully cached (max %d)',
+                     prefiltered, len(kgs), len(cached_cells),
+                     len(codes), max_kgs)
         except Exception as e:
             log.warning('Cache-ready scan failed: %s', e)
 

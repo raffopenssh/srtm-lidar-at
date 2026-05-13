@@ -3105,8 +3105,8 @@ class PeerDirector:
         recent = self._canary_throughput(pid, CANARY_RECENT_WINDOW_S)
         # Last ~30 sample points for sparkline rendering.
         spark = [
-            {'t': int(t), 'used_bytes': int(b)}
-            for (t, b) in series[-60:]
+            {'t': int(s[0]), 'used_bytes': int(s[1])}
+            for s in series[-60:]
         ]
         return {
             'budget_gb': peer.get('budget_gb'),

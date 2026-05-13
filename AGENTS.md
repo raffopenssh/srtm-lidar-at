@@ -101,18 +101,36 @@ Thresholds (peer_director.py):
   occurrence (no need to track per-peer budgets separately; the existing
   `_peer_is_scheduled` gate makes the scheduler skip the peer).
 
-### Primary park (belt-and-braces)
+### Role-based parks (who is parked, and why)
 
-The primary VM (`srtm-lidar-at.exe.xyz`) is the public dashboard host
-and must NEVER carry processing load. `_enforce_primary_park` runs
-every director tick and:
-* sets `pinned_role='idle'` if missing,
-* extends `not_before` to **2027-01-01** if shorter or absent,
-* demotes the primary if a race ever made it `active_peer`.
+Only three reasons a peer is parked (`not_before` in the future):
 
-Manual reset of `not_before` won't survive: the next tick re-extends
-it. To temporarily un-park the primary, edit `_enforce_primary_park`
-and restart `srv` — expected only during emergency manual recovery.
+1. **Primary** — `_enforce_primary_park`, every tick. Floor
+   `not_before=2027-01-01`, `pinned_role=idle`. Manual reset won't
+   survive (next tick re-extends). Primary hosts the public
+   dashboard and director state; it must never process.
+2. **Active director + shadow** — `_enforce_director_self_park`,
+   every tick. **Rolling 2 h cooldown**, refreshed while the role
+   is held. As soon as the peer stops being director/shadow, the
+   stamp expires within 2 h and the peer rejoins rotation — no
+   explicit release needed. (Primary is exempt; covered by #1.)
+3. **Canary-evidenced BW wall** — `_park_peer_until_renewal`,
+   only when the peer has an `observed_cap_gb` set by a quality-
+   grade canary slowdown AND used_gb has reached that cap. We do
+   NOT park on the nominal 95 GB budget; exe.dev's real limits and
+   billing anchors are unknown. Soft canary auto-parks use a short
+   1 h cooldown (`auto_park` event); quality parks 6 h.
+
+The one-shot `_release_unverified_bw_parks` rescues peers that got
+parked-until-renewal *without* an `observed_cap_gb` (legacy budget-
+guess parks). It looks for our own `park_until_renewal` note tag,
+so primary's 2027 stamp and canary `auto_park` cooldowns are
+preserved.
+
+**Operator note**: if you see an unexpected long `parked→Xd` on a
+peer, check `peers.json` → `canary_notes` for the most recent
+`event`. `role_park`/`park_until_renewal` are director-written;
+`auto_park` is canary-written; anything else is manual.
 
 ## TL;DR
 

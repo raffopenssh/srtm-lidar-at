@@ -3344,27 +3344,33 @@ class PeerDirector:
             except Exception:
                 pass
 
+    # Short rolling cooldown for role-based parks (director, shadow).
+    # Refreshed every director tick while the role is held, so the
+    # peer naturally rejoins rotation within this window after a
+    # handover. Long enough to survive HA flapping and the next tick.
+    _ROLE_PARK_REFRESH_S = 2 * 3600
+
     def _enforce_director_self_park(self) -> None:
-        """Keep the active director out of the processing pool.
+        """Keep current director + shadow out of the processing pool.
 
-        Whichever peer currently holds ``is_director`` already pays a
-        recurring bandwidth cost (60-peer status fanout, peer log
-        merge, credential probes). Stacking frontier or cache-only
-        work on top of that is exactly how a director burns through
-        its monthly budget faster than its peers — the failure mode
-        we just hit on the primary.
+        Why park them:
+          * Director pays a recurring fleet-fanout BW cost (status
+            polls, log merge, credential probes). Stacking frontier
+            or cache-only work on top is exactly how a director
+            burns through bandwidth faster than peers.
+          * Shadow must be ready to take over instantly; an in-flight
+            KG would have to be aborted on promotion.
 
-        Per tick:
-          * If we're not director, do nothing (the director itself
-            owns this enforcement).
-          * Find our own peer entry in cfg; pin it to ``idle`` and
-            extend ``not_before`` to +30d if not already past now.
-          * If a local processor is running, stop it gracefully
-            (loopback ``/processing/stop?graceful=1``).
-          * If the scheduler somehow re-elected us as ``active_peer``
-            (race during a takeover), demote.
+        Implementation: a short ROLLING cooldown (2 h, refreshed every
+        tick) instead of a long +30 d stamp. As soon as a peer stops
+        being director / shadow, its ``not_before`` naturally expires
+        within 2 h with NO explicit release — fixes the bug where
+        ex-directors (at55, at52, at66) remained parked for 30 d
+        because the self-park ran only when the peer was still
+        director.
 
-        Cheap: no I/O unless cfg actually changes or processor is up.
+        Primary is exempt (handled by ``_enforce_primary_park``
+        with the 2027 floor).
         """
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         try:
@@ -3376,25 +3382,28 @@ class PeerDirector:
             return
         if not me:
             return
-        # Primary is handled by _enforce_primary_park (different
-        # not_before floor: 2027 vs +30d). Don't double-stamp.
-        if me == 'primary':
+        shadow = (self.state.get('shadow_peer') or '').strip()
+        target = _dt.now(_tz.utc) + _td(seconds=self._ROLE_PARK_REFRESH_S)
+        targets = {}
+        if me != 'primary':
+            targets[me] = 'director'
+        if shadow and shadow != 'primary' and shadow != me:
+            targets[shadow] = 'shadow'
+        if not targets:
             return
         with self._lock:
             cfg = self.cfg
-            mine = None
-            for p in cfg.get('peers', []):
-                if p.get('id') == me:
-                    mine = p
-                    break
             changed = False
-            if mine is not None:
-                cur_role = (mine.get('pinned_role') or '').strip().lower()
+            for p in cfg.get('peers', []):
+                pid = p.get('id')
+                if pid not in targets:
+                    continue
+                role_tag = targets[pid]
+                cur_role = (p.get('pinned_role') or '').strip().lower()
                 if cur_role not in ('idle', 'off', 'pause', 'paused', 'parked'):
-                    mine['pinned_role'] = 'idle'
+                    p['pinned_role'] = 'idle'
                     changed = True
-                target = _dt.now(_tz.utc) + _td(days=30)
-                nb = mine.get('not_before')
+                nb = p.get('not_before')
                 extend = False
                 if not nb:
                     extend = True
@@ -3403,55 +3412,59 @@ class PeerDirector:
                         cur = _dt.fromisoformat(nb)
                         if cur.tzinfo is None:
                             cur = cur.replace(tzinfo=_tz.utc)
+                        # Don't shrink a longer (canary / manual) park.
+                        # Only refresh if our rolling target is later.
                         if cur < target:
                             extend = True
                     except (TypeError, ValueError):
                         extend = True
                 if extend:
-                    mine['not_before'] = target.isoformat()
+                    p['not_before'] = target.isoformat()
+                    notes = p.setdefault('canary_notes', [])
+                    notes.append({
+                        'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'event': 'role_park',
+                        'role': role_tag,
+                        'cooldown_until': p['not_before'],
+                    })
+                    if len(notes) > 32:
+                        del notes[: len(notes) - 32]
                     changed = True
-            if self.state.get('active_peer') == me:
+            if self.state.get('active_peer') in targets:
                 log.warning(
-                    'Director %s set as active_peer — demoting (director '
-                    'must not process)', me,
+                    'Role-parked peer %s set as active_peer — demoting',
+                    self.state.get('active_peer'),
                 )
                 self.state['active_peer'] = None
         if changed:
             try:
                 save_peers_config(self.cfg)
-                log.info(
-                    'Director self-park enforced: id=%s pinned_role=idle '
-                    'not_before=+30d', me,
-                )
             except Exception:
-                log.exception(
-                    'Director self-park: save_peers_config failed')
-        # Stop any local processor that's running. Use the loopback
-        # graceful-stop path so an in-flight KG finishes + uploads
-        # before exit (avoids wasted CPU + half-uploaded products).
-        try:
-            r = requests.get(
-                'http://127.0.0.1:8000/api/v1/processing/status',
-                timeout=5,
-            )
-            running = bool(r.ok and (r.json() or {}).get('running'))
-        except Exception:
-            running = False
-        if running:
-            log.warning(
-                'Director %s has local processor running — issuing '
-                'graceful stop (director must not process)', me,
-            )
+                log.exception('role-park: save_peers_config failed')
+        # Stop any local processor running on the director itself.
+        if me in targets:
             try:
-                stop_peer_processor(None, graceful=True)
-                _emit_director_event(
-                    f'director self-park: {me} stopping local '
-                    'processor (director must not carry processing '
-                    'load)',
-                    peer=me, level='warning',
+                r = requests.get(
+                    'http://127.0.0.1:8000/api/v1/processing/status',
+                    timeout=5,
                 )
+                running = bool(r.ok and (r.json() or {}).get('running'))
             except Exception:
-                log.exception('director self-park: local stop failed')
+                running = False
+            if running:
+                log.warning(
+                    'Director %s has local processor running — issuing '
+                    'graceful stop', me,
+                )
+                try:
+                    stop_peer_processor(None, graceful=True)
+                    _emit_director_event(
+                        f'director self-park: {me} stopping local '
+                        'processor (director must not carry load)',
+                        peer=me, level='warning',
+                    )
+                except Exception:
+                    log.exception('director self-park: local stop failed')
 
     def _park_peer_until_renewal(self, peer: dict, next_renew,
                                  *, remaining_gb: float,

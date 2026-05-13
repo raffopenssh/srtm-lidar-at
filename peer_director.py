@@ -827,9 +827,23 @@ def get_peer_status(peer_url: str | None, peer_id: str = '') -> dict:
     # Prefer pushed status if fresh — avoids polling the peer entirely.
     pushed = get_pushed_status(pid)
     if pushed is not None:
+        age = time.time() - pushed['ts']
+        # Short-circuit: a push <60 s old is the fastest possible
+        # answer and there's no value in re-deriving it. Skip even
+        # the pull-cache write so concurrent callers from get_status()
+        # / capacity-tick fanouts don't all serialise on the dict
+        # under GIL contention. Anything older than 60 s falls
+        # through to the slower path that also refreshes the pull
+        # cache as a fallback for circuit-open scenarios.
+        if age < 60.0:
+            d = dict(pushed.get('status') or {})
+            d['_pushed'] = True
+            d['_push_age_s'] = round(age, 1)
+            d['_push_fresh'] = True
+            return d
         d = dict(pushed.get('status') or {})
         d['_pushed'] = True
-        d['_push_age_s'] = round(time.time() - pushed['ts'], 1)
+        d['_push_age_s'] = round(age, 1)
         # Still cache for fallback / proxy reads.
         _PEER_STATUS_CACHE[peer_url] = (time.time(), d)
         return d
@@ -1669,6 +1683,14 @@ class PeerDirector:
         self._running = False
         self._thread = None
         self._lock_fd = None
+        # Dedicated oidc-reval daemon thread, owned by THIS Director
+        # instance. Started in start(), stopped in stop() so it cleanly
+        # joins on step_down / HA handover (singleton swap). Lifecycle
+        # is intentionally tied to the instance, NOT a module global,
+        # so a demoted director never keeps probing OIDC in the
+        # background after relinquishing the role.
+        self._oidc_thread: threading.Thread | None = None
+        self._oidc_stop = threading.Event()
         # EMA capacity factor (0..1). Persisted to director_state.json so
         # restart of the director (or a gunicorn worker swap) doesn't
         # erase recent fleet-wide warning history. We also restore a
@@ -1959,6 +1981,13 @@ class PeerDirector:
             DIRECTOR_STATE.touch(exist_ok=True)
         except Exception:
             pass
+        # Spin up the dedicated oidc-reval daemon. Must come after the
+        # file-lock acquisition so we never have a non-director thread
+        # probing OIDC. Stopped in self.stop() on step_down/handover.
+        self._oidc_stop.clear()
+        self._oidc_thread = threading.Thread(
+            target=self._oidc_reval_loop, name='oidc-reval', daemon=True)
+        self._oidc_thread.start()
         log.info('PeerDirector started (lock acquired)')
         # Smoke test: a director with zero Copernicus credentials cannot
         # run frontiers. The 2026-05-08 incident silently disarmed the
@@ -1991,6 +2020,21 @@ class PeerDirector:
         actually unmanaged.
         """
         self._running = False
+        # Stop the oidc-reval daemon first so it can't fire a long
+        # OIDC sweep right after we release the director lock. join
+        # under the same budget as the loop thread.
+        try:
+            self._oidc_stop.set()
+        except Exception:
+            pass
+        oidc_thr = self._oidc_thread
+        if (oidc_thr and oidc_thr.is_alive()
+                and oidc_thr is not threading.current_thread()):
+            try:
+                oidc_thr.join(timeout=max(1.0, join_timeout))
+            except Exception as e:
+                log.warning('PeerDirector.stop: oidc-reval join failed: %s', e)
+        self._oidc_thread = None
         thr = self._thread
         if thr and thr.is_alive() and thr is not threading.current_thread():
             try:
@@ -4332,6 +4376,38 @@ class PeerDirector:
                 continue
             valid.append(int(c.get('index')))
         return valid
+
+    def _oidc_reval_loop(self) -> None:
+        """Dedicated daemon: probes OIDC credentials on its own cadence
+        so the director loop never blocks on a 6-worker parallel sweep
+        (which still takes a few seconds wall-clock when CDSE is slow).
+
+        Lifecycle is bound to the owning Director instance: started in
+        ``start()``, stopped in ``stop()`` via ``self._oidc_stop``.
+        Critically NOT a module-global thread — on step_down or HA
+        handover, the demoted instance is destroyed and its event is
+        set, so a stale director can't keep poking OIDC after losing
+        the role. The new Director will spawn its own loop.
+        """
+        # Stagger the first probe slightly so a srv restart doesn't fire
+        # an OIDC sweep simultaneously with the director's first tick.
+        if self._oidc_stop.wait(timeout=5.0):
+            return
+        log.info('oidc-reval daemon started (interval=%ds)',
+                 _REVALIDATE_INTERVAL_S)
+        try:
+            while self._running and not self._oidc_stop.is_set():
+                try:
+                    self._refresh_credentials_if_due()
+                except Exception:
+                    log.debug('oidc-reval iteration failed', exc_info=True)
+                # Re-check cadence on a tight wake schedule so stop()
+                # joins quickly; the interval check inside
+                # _refresh_credentials_if_due() is the real throttle.
+                if self._oidc_stop.wait(timeout=30.0):
+                    break
+        finally:
+            log.info('oidc-reval daemon stopped')
 
     def _refresh_credentials_if_due(self) -> None:
         """Director-loop hook: re-run OIDC probes at most once every
@@ -6781,13 +6857,9 @@ class PeerDirector:
                 except Exception:
                     pass
                 self._update_bandwidth()
-                # Refresh credential health on the director thread only.
-                # Hot request paths (dashboard get_status) read cached
-                # last_status; only the loop is permitted to probe.
-                try:
-                    self._refresh_credentials_if_due()
-                except Exception:
-                    log.debug('_refresh_credentials_if_due failed', exc_info=True)
+                # Credential revalidation moved off the director loop
+                # into a dedicated daemon thread (see _oidc_reval_loop)
+                # so a 30 s parallel sweep can't stall this tick.
                 # Capacity factor: poll each peer's processing status once
                 # per tick (cheap; we already do it implicitly inside the
                 # orchestrators) and use the warning_rates field to derive

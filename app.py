@@ -4977,7 +4977,19 @@ def director_peer_status():
     try:
         if (request.headers.get('Content-Encoding') or '').lower() == 'gzip':
             import gzip as _gz
-            raw = _gz.decompress(request.get_data(cache=False))
+            raw_bytes = request.get_data(cache=False)
+            # Empty gzip body = peer keep-alive ping. Old peers sometimes
+            # POST a zero-byte body during a graceful shutdown or right
+            # after a srv restart before the ticker has a real status to
+            # ship. Treat as a 204 No Content and don't warn — these
+            # were eating worker slots logging spurious 'gzip decode
+            # failed: not a gzipped file' warnings during the 21:00–22:30
+            # storm.
+            if not raw_bytes:
+                return ('', 204)
+            raw = _gz.decompress(raw_bytes)
+            if not raw:
+                return ('', 204)
             body = json.loads(raw.decode('utf-8'))
     except Exception as _e:
         log.warning('peer_status: gzip decode failed: %s', _e)

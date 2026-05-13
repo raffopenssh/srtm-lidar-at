@@ -833,14 +833,29 @@ def remove_credential(client_id: str) -> dict:
     return {"ok": True, "removed": client_id}
 
 
-def revalidate_all_credentials() -> list:
-    """Probe every credential, update meta. Returns a list parallel to
-    list_credentials() but with fresh probe results."""
-    out = []
+def revalidate_all_credentials(max_workers: int = 6) -> list:
+    """Probe every credential in parallel, update meta. Returns a list
+    parallel to list_credentials() but with fresh probe results.
+
+    Parallelised 2026-05-?? after the 21:00–22:30 UTC director storm:
+    a serial 12-credential OIDC sweep stalled the director loop ~30 s
+    every 10 min. Probes are I/O bound on the OIDC endpoint, so a 6-
+    worker pool collapses wall-clock to ~one probe's worth (~2–5 s).
+    ``_cred_lock`` semantics are preserved: each worker only takes the
+    lock for the brief meta-update around its own probe result, the
+    snapshot of ``_CREDENTIALS`` is taken once up front, and the final
+    disk save is single-shot under the lock.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    out: list = []
     now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
     with _cred_lock:
         creds = list(_CREDENTIALS)
-    for i, (cid, csec) in enumerate(creds):
+    if not creds:
+        return out
+
+    def _probe(item):
+        i, (cid, csec) = item
         val = validate_credential(cid, csec)
         with _cred_lock:
             meta = _cred_meta.setdefault(cid, {})
@@ -848,13 +863,20 @@ def revalidate_all_credentials() -> list:
             meta["last_status"] = val.get("status", "unchecked")
             if val.get("ok"):
                 meta.pop("last_error", None)
-                # If we previously thought it was exhausted, reset.
                 _exhausted_cred_indices.discard(i)
             else:
                 meta["last_error"] = val.get("error", "")
                 if val.get("status") == "exhausted":
                     _exhausted_cred_indices.add(i)
-        out.append({"index": i, "client_id": cid, **val})
+        return {"index": i, "client_id": cid, **val}
+
+    workers = max(1, min(int(max_workers or 1), len(creds)))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix='cop-reval') as ex:
+        results = list(ex.map(_probe, list(enumerate(creds))))
+    # Preserve index order in the returned list.
+    results.sort(key=lambda r: r["index"])
+    out.extend(results)
     with _cred_lock:
         _save_credentials_to_disk()
     return out

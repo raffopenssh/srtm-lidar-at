@@ -2994,12 +2994,17 @@ class PeerDirector:
     # Canary bandwidth history
     # ------------------------------------------------------------------
     def _sample_canary_history(self) -> None:
-        """Append a (ts, used_bytes) sample for every enabled peer.
+        """Append a (ts, used_bytes, mode) sample for every enabled peer.
 
-        Since 2026-05 every peer is sampled (canary-by-default) so we
-        can detect bandwidth-wall shaping anywhere in the fleet without
-        rolling out new code. Disabled peers are pruned to keep the
-        ring small.
+        ``mode`` is 1 when the peer is in frontier mode at sample time
+        (active frontier or one of the parallel frontiers), 0 otherwise.
+        Tagging samples lets the quality-gate restrict its baseline to
+        ticks when the peer was network-bound (BEV reads sustain >>5
+        MB/s); pure cache-only / Zenodo-upload baselines are <0.5 MB/s
+        and can never satisfy the network-grade gate, so without
+        tagging the quality observation never fires.
+
+        Legacy 2-element samples are upgraded in-place on read.
         """
         with self._lock:
             cfg = self.cfg
@@ -3011,33 +3016,47 @@ class PeerDirector:
             for stale_pid in list(hist.keys()):
                 if stale_pid not in keep_ids:
                     hist.pop(stale_pid, None)
+            # Frontier-mode set: active + parallel frontiers as last
+            # planned by the director loop. Cheap O(N).
+            frontier_ids = set()
+            ap = self.state.get('active_peer')
+            if ap:
+                frontier_ids.add(ap)
+            frontier_ids |= set(
+                self.state.get('parallel_frontiers_active') or [])
+            frontier_ids |= set(
+                (self.state.get('frontier_cred_plan') or {}).keys())
             for p in cfg.get('peers', []):
                 if not p.get('enabled', True):
                     hist.pop(p['id'], None)
                     continue
-                bw = bw_map.get(p['id']) or {}
+                pid = p['id']
+                bw = bw_map.get(pid) or {}
                 used = bw.get('used_bytes')
                 if used is None or bw.get('error'):
                     continue
-                series = hist.setdefault(p['id'], [])
+                series = hist.setdefault(pid, [])
+                mode = 1 if pid in frontier_ids else 0
                 # Skip duplicate samples (peer cached, no fresh data).
                 if series and series[-1][0] == now:
                     continue
-                if series and series[-1][1] == used:
-                    # Same byte count as last sample — still record
-                    # so the time axis advances; the throughput
-                    # calculation correctly reads zero.
-                    pass
-                series.append([now, int(used)])
+                series.append([now, int(used), mode])
                 # Trim to ring size.
                 if len(series) > CANARY_HISTORY_MAX:
                     del series[: len(series) - CANARY_HISTORY_MAX]
 
-    def _canary_throughput(self, pid: str, window_s: int) -> dict | None:
+    def _canary_throughput(self, pid: str, window_s: int,
+                           *, frontier_only: bool = False) -> dict | None:
         """Return mean throughput (bytes/s) over the trailing window.
 
         Returns dict with ``samples``, ``span_s``, ``delta_bytes``,
         ``rate_bps``, or None if not enough data.
+
+        ``frontier_only=True`` restricts the trailing window to samples
+        captured while the peer was in frontier mode. Used by the
+        quality gate so the fleet wall isn't polluted by Zenodo-bound
+        cache-only baselines. Returns None if fewer than 2 such samples
+        in the window.
         """
         series = (self.state.get('canary_history') or {}).get(pid) or []
         if len(series) < 2:
@@ -3049,6 +3068,12 @@ class PeerDirector:
             if series[i][0] >= cutoff:
                 break
         window = series[i:]
+        if frontier_only:
+            # Sample is [ts, used, mode]; legacy 2-tuples treated as
+            # cache-mode (mode=0) so legacy data can never falsely
+            # satisfy the quality gate.
+            window = [s for s in window
+                      if len(s) >= 3 and s[2] == 1]
         if len(window) < 2:
             return None
         span = window[-1][0] - window[0][0]
@@ -3434,6 +3459,83 @@ class PeerDirector:
         except Exception:
             log.exception('park_peer_until_renewal %s: stop failed', pid)
 
+    def _enforce_peer_bandwidth_walls(self) -> None:
+        """Park-until-renewal for ANY peer near/over its monthly budget.
+
+        ``_check_and_switch`` already handles the active frontier. This
+        sweep extends the same logic to every other enabled peer:
+        parallel-frontier peers (heavy network use) and cache-only
+        peers. Without it, peers that burn past 95 GB during cache-only
+        runs never get a ``not_before`` audit record — they just keep
+        getting reselected next tick once the 2 GB ineligibility gate
+        flips them out and a new KG drains a slot.
+
+        Behaviour:
+          * remaining < HARD_DEPLETED_GB → park-until-renewal, hard stop.
+          * remaining < LOW_WATER_GB & running → park-until-renewal,
+            send graceful stop. Peer finishes current KG, uploads,
+            then exits idle into the cooldown.
+          * remaining < LOW_WATER_GB & idle → park-until-renewal
+            (writes the not_before record so the dashboard shows
+            parked→Xd, even though no peer-side action is needed).
+
+        Cheap: O(N) over peers, no extra HTTP fanout (uses cached
+        peer_bandwidth + peer_status_cache populated by the loop).
+        """
+        with self._lock:
+            cfg = self.cfg.copy()
+            state_copy = self.state.copy()
+        active_id = state_copy.get('active_peer')
+        bw_map = state_copy.get('peer_bandwidth') or {}
+        for p in list(cfg.get('peers', [])):
+            if not p.get('enabled', True):
+                continue
+            pid = p['id']
+            if pid == active_id:
+                continue  # handled by _check_and_switch
+            if _peer_is_scheduled(p):
+                continue  # already parked
+            bw = bw_map.get(pid) or {}
+            used = bw.get('used_bytes')
+            if used is None:
+                continue
+            remaining = (_peer_budget_bytes(p, cfg) - used) / (1024 ** 3)
+            if remaining >= BANDWIDTH_LOW_WATER_GB:
+                continue
+            # Determine mid-KG via cached peer status (no extra HTTP).
+            proc_state_now = 'unknown'
+            url = p.get('url')
+            if url is None:
+                # Local peer; read progress directly via get_peer_status.
+                try:
+                    proc_state_now = get_peer_status(None, pid).get(
+                        'state', 'unknown')
+                except Exception:
+                    proc_state_now = 'unknown'
+            else:
+                cached = _PEER_STATUS_CACHE.get(url)
+                if cached and (time.time() - cached[0]) < _PEER_STATUS_CACHE_TTL:
+                    proc_state_now = cached[1].get('state', 'unknown')
+                else:
+                    pushed = get_pushed_status(pid)
+                    if pushed is not None:
+                        proc_state_now = (pushed.get('status') or {}
+                                          ).get('state', 'unknown')
+            mid_kg = proc_state_now in ('running', 'processing')
+            hard = remaining < BANDWIDTH_HARD_DEPLETED_GB
+            try:
+                next_renew = _peer_next_renew(p, cfg)
+            except Exception:
+                log.exception('peer-bw-wall %s: next_renew failed', pid)
+                continue
+            try:
+                self._park_peer_until_renewal(
+                    p, next_renew, remaining_gb=remaining,
+                    mid_kg=mid_kg, hard=hard,
+                )
+            except Exception:
+                log.exception('peer-bw-wall %s: park failed', pid)
+
     def _check_canary_health(self) -> None:
         """Park peers whose throughput collapsed (whole fleet) or whose
         warning noise spiked (canary-override peers only).
@@ -3545,11 +3647,23 @@ class PeerDirector:
                     slowdown_tripped = True
                     streak = streaks.get(pid) or {}
                     streak_age = max(0.0, now_ts - float(streak.get('since') or now_ts))
+                    # Network-grade gate must look at FRONTIER-mode
+                    # samples only — cache-only baselines are
+                    # Zenodo-bound (<0.5 MB/s) and can never satisfy
+                    # the ≥5 MB/s threshold. Without this, the quality
+                    # path is dead for the steady-state fleet workload
+                    # mix and the fleet wall never converges.
+                    fb = self._canary_throughput(
+                        pid, CANARY_BASELINE_WINDOW_S, frontier_only=True)
+                    fr = self._canary_throughput(
+                        pid, CANARY_RECENT_WINDOW_S, frontier_only=True)
+                    fbase_mbps = (fb['rate_bps'] / 1e6) if fb else None
+                    frecent_mbps = (fr['rate_bps'] / 1e6) if fr else None
                     network_grade = (
-                        base_mbps is not None
-                        and recent_mbps is not None
-                        and base_mbps >= CANARY_BASELINE_NETWORK_MBPS
-                        and recent_mbps <= CANARY_RECENT_PARKED_MBPS
+                        fbase_mbps is not None
+                        and frecent_mbps is not None
+                        and fbase_mbps >= CANARY_BASELINE_NETWORK_MBPS
+                        and frecent_mbps <= CANARY_RECENT_PARKED_MBPS
                     )
                     persistent = streak_age >= CANARY_QUALITY_PERSIST_S
                     quality_obs = (
@@ -6961,6 +7075,13 @@ class PeerDirector:
                     self._check_canary_health()
                 except Exception:
                     log.exception('Canary health check error')
+                # Per-peer bandwidth-wall enforcement (low-water /
+                # hard-depleted park-until-renewal) for non-active
+                # peers. _check_and_switch handles the active one.
+                try:
+                    self._enforce_peer_bandwidth_walls()
+                except Exception:
+                    log.exception('Peer bandwidth wall enforce error')
                 # Auto-retry stale peer updates: re-trigger update on
                 # peers that are idle on an old commit (graceful update
                 # didn't take). After 2 failed attempts surfaces a

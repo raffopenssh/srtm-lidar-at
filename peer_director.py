@@ -3274,6 +3274,76 @@ class PeerDirector:
             except Exception:
                 log.exception('Primary park enforce: save_peers_config failed')
 
+    def _release_unverified_bw_parks(self) -> None:
+        """One-shot cleanup: clear not_before from peers we parked on
+        a budget guess (no observed_cap_gb) so they rejoin the rotation.
+
+        Runs once per process under a state flag so we don't churn.
+        Only releases parks tagged by ``_park_peer_until_renewal``
+        (event=='park_until_renewal' in canary_notes) where the peer
+        never earned an ``observed_cap_gb``. Hand-set ``not_before``
+        values (e.g. primary 2027-01-01, manual cooldowns) are
+        preserved by looking for the matching note.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        with self._lock:
+            if self.state.get('_unverified_bw_parks_released'):
+                return
+            cfg = self.cfg
+            changed = False
+            released: list[str] = []
+            for p in cfg.get('peers', []):
+                pid = p.get('id')
+                if pid in ('primary',):
+                    continue  # primary is enforced separately
+                if not p.get('enabled', True):
+                    continue
+                if p.get('observed_cap_gb') is not None:
+                    continue  # genuine cap evidence; keep park
+                nb = p.get('not_before')
+                if not nb:
+                    continue
+                # Did *we* set this via park-until-renewal recently?
+                notes = p.get('canary_notes') or []
+                ours = False
+                for n in reversed(notes[-8:]):
+                    if not isinstance(n, dict):
+                        continue
+                    if n.get('event') == 'park_until_renewal' and \
+                            n.get('cooldown_until') == nb:
+                        ours = True
+                        break
+                if not ours:
+                    continue
+                p.pop('not_before', None)
+                notes.append({
+                    'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'event': 'park_released',
+                    'reason': 'no observed_cap_gb evidence; '
+                              'canary-by-default policy',
+                })
+                if len(notes) > 32:
+                    del notes[: len(notes) - 32]
+                changed = True
+                released.append(pid)
+            if changed:
+                try:
+                    save_peers_config(self.cfg)
+                except Exception:
+                    log.exception('release_unverified_bw_parks: save failed')
+            self.state['_unverified_bw_parks_released'] = True
+        if released:
+            log.warning('Released unverified BW parks on %d peers '
+                        '(no observed_cap_gb evidence): %s',
+                        len(released), ','.join(released))
+            try:
+                _emit_director_event(
+                    f'released {len(released)} unverified BW parks '
+                    f'(canary-by-default): {",".join(released)}',
+                    peer='director', level='warning')
+            except Exception:
+                pass
+
     def _enforce_director_self_park(self) -> None:
         """Keep the active director out of the processing pool.
 
@@ -3460,27 +3530,28 @@ class PeerDirector:
             log.exception('park_peer_until_renewal %s: stop failed', pid)
 
     def _enforce_peer_bandwidth_walls(self) -> None:
-        """Park-until-renewal for ANY peer near/over its monthly budget.
+        """Park-until-renewal for ANY peer that has hit *its own* wall.
 
-        ``_check_and_switch`` already handles the active frontier. This
-        sweep extends the same logic to every other enabled peer:
-        parallel-frontier peers (heavy network use) and cache-only
-        peers. Without it, peers that burn past 95 GB during cache-only
-        runs never get a ``not_before`` audit record — they just keep
-        getting reselected next tick once the 2 GB ineligibility gate
-        flips them out and a new KG drains a slot.
+        Canary-by-default philosophy: we do NOT know exe.dev's real
+        per-account limits, billing-cycle anchors, or whether 200 GB
+        is even the right number. Every peer probes its individual
+        ceiling by running until throughput actually collapses. The
+        canary slowdown detector then stamps ``observed_cap_gb`` on
+        the peer — that's the *only* evidence-based wall.
 
-        Behaviour:
-          * remaining < HARD_DEPLETED_GB → park-until-renewal, hard stop.
-          * remaining < LOW_WATER_GB & running → park-until-renewal,
-            send graceful stop. Peer finishes current KG, uploads,
-            then exits idle into the cooldown.
-          * remaining < LOW_WATER_GB & idle → park-until-renewal
-            (writes the not_before record so the dashboard shows
-            parked→Xd, even though no peer-side action is needed).
+        This sweep extends ``_park_peer_until_renewal`` to non-active
+        peers, but ONLY when we have measured evidence:
 
-        Cheap: O(N) over peers, no extra HTTP fanout (uses cached
-        peer_bandwidth + peer_status_cache populated by the loop).
+          * ``observed_cap_gb`` set AND peer's used_gb ≥ cap → the
+            peer has revisited its known wall → park.
+          * remaining < HARD_DEPLETED_GB AND cap evidence → hard
+            stop (depleted by its own observation).
+
+        Peers without an ``observed_cap_gb`` are explicitly NOT
+        parked, no matter how far past the 95 GB nominal budget they
+        run. The 95 GB number is a guess; the canary slowdown gate
+        is the real authority. This avoids stranding the fleet on
+        an incorrect billing-cycle assumption.
         """
         with self._lock:
             cfg = self.cfg.copy()
@@ -3499,9 +3570,18 @@ class PeerDirector:
             used = bw.get('used_bytes')
             if used is None:
                 continue
-            remaining = (_peer_budget_bytes(p, cfg) - used) / (1024 ** 3)
-            if remaining >= BANDWIDTH_LOW_WATER_GB:
+            used_gb = used / (1024 ** 3)
+            # Evidence requirement: peer must have a quality
+            # observed_cap_gb (from a network-grade slowdown) AND
+            # its current used must be at/past that cap.
+            cap = p.get('observed_cap_gb')
+            if not isinstance(cap, (int, float)):
                 continue
+            if used_gb < float(cap):
+                continue
+            # Compute remaining vs *cap* (the observed wall), not the
+            # nominal 95 GB budget.
+            remaining = float(cap) - used_gb  # ≤ 0 by gate above
             # Determine mid-KG via cached peer status (no extra HTTP).
             proc_state_now = 'unknown'
             url = p.get('url')
@@ -7059,6 +7139,15 @@ class PeerDirector:
                     self._enforce_primary_park()
                 except Exception:
                     log.exception('primary park enforce failed')
+                # One-shot: release park-until-renewal records we wrote
+                # on a *guessed* 95 GB budget without canary-shaping
+                # evidence. exe.dev's real per-account limits and
+                # billing anchors are unknown; canary-by-default means
+                # we only park on observed throughput collapse.
+                try:
+                    self._release_unverified_bw_parks()
+                except Exception:
+                    log.exception('release_unverified_bw_parks failed')
                 # Belt-and-braces: the *active director* must also not
                 # carry processing load. Director duty already costs
                 # 60-peer fanout bandwidth; layering frontier work on

@@ -567,9 +567,133 @@ def load_peers_config() -> dict:
     return cfg
 
 
-def save_peers_config(cfg: dict):
+# Sidecar fcntl lockfile for peers.json. We hold an exclusive flock
+# here for the duration of every save_peers_config() call, so that
+# concurrent writers (e.g. a gunicorn worker handling /peers/add and
+# the director loop adding ``first_seen`` or a canary park) cannot
+# race and silently clobber each other's roster changes. See
+# ``save_peers_config`` for the merge-with-disk semantics that build
+# on top of this lock.
+PEERS_CONFIG_LOCK = PEERS_CONFIG.with_suffix(PEERS_CONFIG.suffix + '.lock')
+
+
+def _merge_peers_with_disk(mem_cfg: dict,
+                           disk_cfg: dict | None,
+                           removed_ids: set | None = None) -> dict:
+    """Reconcile ``mem_cfg`` with the freshly-read ``disk_cfg``.
+
+    Goal: prevent two concurrent writers from silently dropping each
+    other's peer-roster changes. Specifically the historical bug where
+    ``/api/v1/director/peers/add`` (gunicorn worker) appended ``atNN``
+    to its load-time snapshot, while the director loop (different
+    worker) was simultaneously stamping ``first_seen`` on its own
+    snapshot — whichever finished last clobbered the other.
+
+    Rules:
+    * Top-level fields (budget_gb, renew_day, frontier_plan, …) come
+      from ``mem_cfg`` — the caller is the latest thinker.
+    * Peer list is the union by ``id``. For an id present in both,
+      ``mem_cfg`` wins (the caller is mutating that peer's fields).
+      For a disk-only id (added by another worker since we loaded),
+      the disk row is preserved. For a mem-only id (we just added
+      it), it's appended.
+    * ``removed_ids`` is the explicit channel for deletions — those
+      ids are filtered out of the merged roster regardless of which
+      side they appear on. ``remove_peer`` uses this so a removal
+      can't be "undone" by a disk-only entry.
+    * Order: disk order first (stable for operators reading the file),
+      mem-only peers appended at the end.
+    """
+    if not isinstance(disk_cfg, dict):
+        disk_cfg = {}
+    removed = set(removed_ids or ())
+    out = dict(mem_cfg)
+    mem_peers = list(mem_cfg.get('peers') or [])
+    disk_peers = list(disk_cfg.get('peers') or [])
+    mem_by_id = {p.get('id'): p for p in mem_peers if isinstance(p, dict) and p.get('id')}
+    disk_by_id = {p.get('id'): p for p in disk_peers if isinstance(p, dict) and p.get('id')}
+    seen: set = set()
+    merged: list = []
+    for pid, dp in disk_by_id.items():
+        if pid in removed:
+            seen.add(pid)
+            continue
+        if pid in mem_by_id:
+            merged.append(mem_by_id[pid])
+        else:
+            merged.append(dp)
+        seen.add(pid)
+    for mp in mem_peers:
+        pid = mp.get('id') if isinstance(mp, dict) else None
+        if not pid or pid in seen or pid in removed:
+            continue
+        merged.append(mp)
+        seen.add(pid)
+    out['peers'] = merged
+    return out
+
+
+def save_peers_config(cfg: dict, removed_ids: set | None = None):
+    """Atomically persist ``cfg`` to ``peers.json`` under fcntl lock.
+
+    Concurrent writers (other gunicorn workers, director loop ticks,
+    HA shadow snapshots) all funnel through the same lockfile, so a
+    given save is serialised against every other save. Within the
+    locked region we re-read the on-disk cfg and ``_merge_peers_with_disk``
+    it with the caller's ``cfg`` so disk-only peers (added by some
+    other worker since this caller loaded) are preserved.
+
+    Deletions: pass ``removed_ids={'atNN', ...}`` — the merge will
+    filter those ids out of the union regardless of which side they
+    were on. A plain ``save_peers_config(cfg)`` will NOT delete a peer
+    that's also on disk; this prevents stale snapshots from quietly
+    dropping peers.
+    """
     PEERS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    PEERS_CONFIG.write_text(json.dumps(cfg, indent=2))
+    import fcntl as _fcntl
+    import tempfile as _tempfile
+    # Open lockfile (create if missing). Keep open for the whole
+    # critical section; flock is per-fd and released on close.
+    with open(PEERS_CONFIG_LOCK, 'a+') as _lf:
+        try:
+            _fcntl.flock(_lf.fileno(), _fcntl.LOCK_EX)
+        except OSError:
+            # Filesystem doesn't support flock — fall back to a
+            # best-effort unlocked write. Better than crashing.
+            disk = None
+            try:
+                if PEERS_CONFIG.exists():
+                    disk = json.loads(PEERS_CONFIG.read_text())
+            except Exception:
+                disk = None
+            merged = _merge_peers_with_disk(cfg, disk, removed_ids)
+            PEERS_CONFIG.write_text(json.dumps(merged, indent=2, default=str))
+            return
+        try:
+            disk = None
+            try:
+                if PEERS_CONFIG.exists():
+                    disk = json.loads(PEERS_CONFIG.read_text())
+            except Exception:
+                disk = None
+            merged = _merge_peers_with_disk(cfg, disk, removed_ids)
+            fd, tmp = _tempfile.mkstemp(
+                dir=str(PEERS_CONFIG.parent), suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(merged, f, indent=2, default=str)
+                os.replace(tmp, PEERS_CONFIG)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                raise
+        finally:
+            try:
+                _fcntl.flock(_lf.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
 
 
 def load_director_state() -> dict:
@@ -2865,7 +2989,10 @@ class PeerDirector:
         # Remove from config
         with self._lock:
             cfg['peers'] = [p for p in cfg.get('peers', []) if p['id'] != peer_id]
-            save_peers_config(cfg)
+            # Pass removed_ids so the merge-with-disk in save_peers_config
+            # can't resurrect this peer from a stale on-disk snapshot
+            # written by a different worker between our load and save.
+            save_peers_config(cfg, removed_ids={peer_id})
             # Clear from state
             self.state.get('peer_bandwidth', {}).pop(peer_id, None)
             if self.state.get('active_peer') == peer_id:

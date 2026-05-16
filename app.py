@@ -2267,9 +2267,61 @@ try:
 except Exception:
     _REGION = '???'
 
+# Tiny TTL cache so concurrent dashboard polls (2-3 fetches per tick,
+# plus director loop probes) share a single computation. The route is
+# read-heavy and rebuilds ~1 MB of JSON every call (manifest scan twice,
+# search-index aggregate, tile-history file, /proc lookups). Under heavy
+# load — e.g. two threads competing on the GIL while the director
+# loop holds it for a long manifest read — the dashboard would freeze
+# on "Connecting…" for the *first* fetch even though the worker was
+# fine. A 3 s shared cache eliminates the cliff without changing
+# refresh feel (UI polls every 5 s).
+_STATUS_CACHE = {'ts': 0.0, 'payload': None, 'lock': None}
+_STATUS_TTL_S = 3.0
+
+def _status_cache_lock():
+    if _STATUS_CACHE['lock'] is None:
+        import threading as _th
+        _STATUS_CACHE['lock'] = _th.Lock()
+    return _STATUS_CACHE['lock']
+
 @app.route('/api/v1/processing/status')
 def processing_status():
     """Return Austria processor progress (read from progress.json)."""
+    # Fast path: serve recent cached payload to all callers.
+    _now = time.time()
+    _cached = _STATUS_CACHE.get('payload')
+    if _cached is not None and (_now - _STATUS_CACHE.get('ts', 0)) < _STATUS_TTL_S:
+        return jsonify(_cached)
+    # Single-flight: first thread computes, others wait briefly then
+    # serve whatever it produced (or fall through if it took too long).
+    _lk = _status_cache_lock()
+    if not _lk.acquire(timeout=0.05):
+        _cached = _STATUS_CACHE.get('payload')
+        if _cached is not None:
+            return jsonify(_cached)
+        _lk.acquire()
+    try:
+        _now2 = time.time()
+        _cached2 = _STATUS_CACHE.get('payload')
+        if _cached2 is not None and (_now2 - _STATUS_CACHE.get('ts', 0)) < _STATUS_TTL_S:
+            return jsonify(_cached2)
+        resp = _processing_status_compute()
+        try:
+            payload = resp.get_json() if hasattr(resp, 'get_json') else None
+        except Exception:
+            payload = None
+        if payload is not None:
+            _STATUS_CACHE['payload'] = payload
+            _STATUS_CACHE['ts'] = time.time()
+        return resp
+    finally:
+        try:
+            _lk.release()
+        except Exception:
+            pass
+
+def _processing_status_compute():
     progress_file = Path('data/austria_processor/progress.json')
     if not progress_file.exists():
         return jsonify({

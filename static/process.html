@@ -2876,6 +2876,18 @@ function _renderZenRateSpark(entries) {
   });
 })();
 
+// AbortController-wrapped fetch with timeout.  Without this, a single
+// slow request on a saturated primary keeps the page on "Connecting…"
+// indefinitely because the next setInterval tick (also fetch()) just
+// queues behind it.  We bail at 8 s and let the next interval retry.
+function _fetchTimeout(url, opts, ms) {
+  ms = ms || 8000;
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), ms);
+  const o = Object.assign({}, opts || {}, {signal: ac.signal});
+  return fetch(url, o).finally(() => clearTimeout(tid));
+}
+
 // ── Main Poll ───────────────────────────────────────────────────
 async function poll() {
   const dot = document.getElementById('pollDot');
@@ -2887,10 +2899,11 @@ async function poll() {
       const ap = (_directorData.peers || []).find(p => p.id === _directorData.active_peer);
       if (ap && ap.url) apiUrl = '/api/v1/director/proxy/status';
     }
-    const r = await fetch(apiUrl);
+    const r = await _fetchTimeout(apiUrl, {}, 8000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     _lastStatus = d;
+    try { localStorage.setItem('srtm_last_status', JSON.stringify(d)); } catch(_) {}
     updateSubtitle(d);
     updateCards(d);
     // Fallback (single-instance / before peer fetch returns): seed active set
@@ -4106,9 +4119,10 @@ let _lastStatus = null;  // last /api/v1/processing/status response
 
 async function fetchDirectorStatus() {
   try {
-    const r = await fetch('/api/v1/director/status');
+    const r = await _fetchTimeout('/api/v1/director/status', {}, 8000);
     if (!r.ok) return;
     _directorData = await r.json();
+    try { localStorage.setItem('srtm_last_director', JSON.stringify(_directorData)); } catch(_) {}
     renderDirector(_directorData);
     renderCapacityHistory();
     renderFleetHistory();
@@ -5506,9 +5520,29 @@ async function fetchPeerStatus() {
 
 // ── Init ────────────────────────────────────────────────────────
 initMap();
-poll();
-fetchPrioQueue();
-fetchDirectorStatus();
+// Seed cards from the last successful poll (cached in localStorage) so
+// the UI never sits on "Connecting…" while the primary's gunicorn is
+// saturated. The real fetches still fire in parallel below; whichever
+// returns first refreshes the visible cards.
+try {
+  const _seedStatus = JSON.parse(localStorage.getItem('srtm_last_status') || 'null');
+  if (_seedStatus) {
+    _lastStatus = _seedStatus;
+    try { updateSubtitle(_seedStatus); } catch(_) {}
+    try { updateCards(_seedStatus); } catch(_) {}
+    try { updateKgCard(_seedStatus); } catch(_) {}
+    try { updateControls(_seedStatus); } catch(_) {}
+  }
+  const _seedDir = JSON.parse(localStorage.getItem('srtm_last_director') || 'null');
+  if (_seedDir) {
+    _directorData = _seedDir;
+    try { renderDirector(_seedDir); } catch(_) {}
+  }
+} catch(_) {}
+// Fire status + director + prio queue together; each is independent
+// and they used to be issued sequentially via setTimeout chains that
+// could keep the page "Connecting…" if the primary was on heavy load.
+Promise.all([poll(), fetchDirectorStatus(), fetchPrioQueue()]).catch(()=>{});
 setInterval(poll, POLL * 1000);
 setInterval(fetchPrioQueue, 15000);
 setInterval(fetchDirectorStatus, 15000);

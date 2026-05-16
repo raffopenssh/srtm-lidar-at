@@ -6861,9 +6861,30 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # --- 5. Build full GPKG ---
         result["step"] = "gpkg_full"
         _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
+        # Reuse the full GPKG from a previous attempt if it survived
+        # on disk (subprocess restart between gpkg_full and upload).
+        # The boundary remap is only used to renumber light-GPKG /
+        # JSON labels so they match the full-GPKG raster; if we skip
+        # the rebuild we also skip remap and tile labels stay as-is
+        # — acceptable since the canonical labels live in the full
+        # GPKG that we reuse verbatim.
+        _existing_full = str(GPKG_DIR / f"{kg_code}_full.gpkg")
+        _reuse_full = False
         try:
-            full_gpkg, _boundary_remap = build_full_gpkg_tiled(
-                kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+            if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
+                _reuse_full = True
+                full_gpkg = _existing_full
+                _boundary_remap = {}
+                log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
+                        kg_code, os.path.getsize(_existing_full) / 1e6)
+                _report_step("gpkg_full",
+                             f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
+        except Exception:
+            _reuse_full = False
+        try:
+            if not _reuse_full:
+                full_gpkg, _boundary_remap = build_full_gpkg_tiled(
+                    kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         except Exception as _bge:
             from tile_cache import CacheMissError as _CacheMissError
             if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
@@ -6957,16 +6978,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # data from the tile results.  Deleting checkpoints here lets the
         # retry path skip all tiles if it only timed out during the GPKG
         # build phase.
-        try:
-            import shutil as _shutil_ckpt
-            _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
-            if _ckpt_dir.exists():
-                _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
-                _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
-                log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
-                         _ckpt_sz / 1e6)
-        except Exception as _ckpt_e:
-            log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
+        #
+        # SKIP this cleanup if the early full-GPKG upload failed:
+        # the parent will re-queue the KG and a fresh subprocess will
+        # then need the tile checkpoints to skip the tile loop (and
+        # the rebuilt full GPKG step is skipped via our reuse path).
+        if result.get("zenodo_failed"):
+            log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
+                     kg_code)
+        else:
+            try:
+                import shutil as _shutil_ckpt
+                _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+                if _ckpt_dir.exists():
+                    _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
+                    _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
+                    log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
+                             _ckpt_sz / 1e6)
+            except Exception as _ckpt_e:
+                log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
 
         # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"

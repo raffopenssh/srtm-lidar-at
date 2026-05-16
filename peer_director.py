@@ -7088,6 +7088,106 @@ class PeerDirector:
             self.state['cache_only_assigned'] = new_assigned
             save_director_state(self.state)
 
+    def _prune_priority_queue(self) -> int:
+        """Drop stale codes from the local retry_queue.json.
+
+        The primary VM is disabled (never runs the processor), so the
+        in-processor remover (`_remove_from_retry_queue` in
+        ``austria_processor.py``) never fires there — leaving the
+        file append-only.  Manifest entries / local JSONs from peers
+        do get synced back to the primary, but the queue keeps the
+        stale codes around forever and re-pushes them to peers next
+        tick.  Even with ``skip_processed=True`` on the peer side that
+        creates rare races where a peer slightly behind on manifest
+        sync re-processes a finished KG.
+
+        We prune codes that are either:
+          * present in `_get_completed_kgs()` (locally finished),
+          * a parent KG whose blocks all have ``_json`` in the manifest
+            (block expansion is implicit at processor startup).
+
+        Tombstoned codes (force-requeue) are exempt — they survive in
+        the queue by design.
+        """
+        queue_path = DATA_DIR / 'retry_queue.json'
+        try:
+            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        except Exception:
+            return 0
+        if not queue:
+            return 0
+        try:
+            from app import _get_completed_kgs, _tombstone_path  # type: ignore
+            completed = _get_completed_kgs()
+        except Exception:
+            completed = set()
+            _tombstone_path = None  # type: ignore
+        tombstoned: set = set()
+        try:
+            if _tombstone_path and _tombstone_path.exists():  # type: ignore
+                import re as _re
+                tdata = json.loads(_tombstone_path.read_text())  # type: ignore
+                if isinstance(tdata, dict):
+                    for tk in tdata.keys():
+                        m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', tk)
+                        if m:
+                            tombstoned.add(m.group(1))
+        except Exception:
+            pass
+        # Parent→done check via kg_splitter, mirroring app.py's GET
+        # handler so on-disk pruning is consistent with what the
+        # dashboard already does at view time.
+        _parent_done = None
+        try:
+            import search_index as _si
+            from kg_splitter import (maybe_split_kg, all_block_codes_for_parent,
+                                     is_block_code)
+            _conn = _si.get_index()._conn()
+
+            def _parent_done(code: str) -> bool:
+                if is_block_code(code):
+                    return False
+                row = _conn.execute(
+                    'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
+                    'FROM kg WHERE kg_code=?', (code,)).fetchone()
+                if not row or row['min_lon'] is None:
+                    return False
+                fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
+                           'bbox': {'min_lon': row['min_lon'],
+                                    'min_lat': row['min_lat'],
+                                    'max_lon': row['max_lon'],
+                                    'max_lat': row['max_lat']}}
+                blocks = maybe_split_kg(fake_kg)
+                if len(blocks) <= 1:
+                    return False
+                done = all_block_codes_for_parent(code, completed)
+                return len(done) >= len(blocks)
+        except Exception:
+            _parent_done = None
+
+        def _is_stale(c: str) -> bool:
+            if c in tombstoned:
+                return False
+            if c in completed:
+                return True
+            if _parent_done and _parent_done(c):
+                return True
+            return False
+        kept = [c for c in queue if not _is_stale(c)]
+        dropped = len(queue) - len(kept)
+        if dropped <= 0:
+            return 0
+        try:
+            tmp = queue_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(kept))
+            tmp.replace(queue_path)
+            log.info('prune retry_queue: dropped %d stale code(s); %d remain',
+                     dropped, len(kept))
+        except Exception as _e:
+            log.warning('prune retry_queue write failed: %s', _e)
+            return 0
+        return dropped
+
     def _sync_queue_to_active(self):
         """Push the director's local priority queue to the active remote peer.
 
@@ -7368,6 +7468,10 @@ class PeerDirector:
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)
                 sync_counter += 1
                 if sync_counter >= 5:
+                    try:
+                        self._prune_priority_queue()
+                    except Exception:
+                        log.exception('priority queue prune failed')
                     self._sync_queue_to_active()
                     sync_counter = 0
                 # Elect / refresh shadow & push snapshot every tick.

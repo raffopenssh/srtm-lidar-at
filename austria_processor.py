@@ -70,8 +70,12 @@ THROTTLE_FILE = DATA_DIR / "upload_throttle"
 DEFERRED_FILE = DATA_DIR / "deferred_kgs.json"
 
 MAX_KG_PIXELS = 4_000_000
-KG_TIMEOUT_SECONDS = 12 * 60 * 60       # 12 hours — first attempt
-KG_RETRY_TIMEOUT_SECONDS = 9 * 60 * 60  # 9 hours — retry attempt (checkpoints restore completed tiles)
+# Reduced-CPU peer cohort (May 2026): observed Gaissau (16k objects) ~7h
+# end-to-end, Mitteregg (113k objects, 16 tiles) silent on gpkg_full+upload
+# well past 6h. Flat bump to 16h/12h gives large KGs headroom while CPUs
+# are constrained; revert to 12/9 when peer CPU allocation recovers.
+KG_TIMEOUT_SECONDS = 16 * 60 * 60        # 16 hours — first attempt
+KG_RETRY_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — retry attempt (checkpoints restore completed tiles)
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup

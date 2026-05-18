@@ -6920,19 +6920,33 @@ class PeerDirector:
             _mark(ckg.get('code') if isinstance(ckg, dict) else None)
             _mark(ps2.get('in_progress'))
             del ps_pid  # silence linter
-        # Frontier's KG
+        # Frontier's KG — both the primary active frontier AND every
+        # parallel-authorised frontier. Earlier we excluded those peers
+        # from ``candidates`` (they're owned by the parallel orch), so
+        # their current_kg never reached _mark — meaning the cache-only
+        # whitelist filter couldn't see them, and a cache-only peer
+        # could be assigned the same KG a parallel frontier was already
+        # processing (observed: at60 on 72321 Mitteregg for 20h42m, then
+        # at17 handed 72321 as its cache-only slice). Iterate both sets,
+        # de-duplicated, to close that hole.
+        frontier_ids = set()
         if active_frontier:
-            fp = get_peer_by_id(cfg, active_frontier)
-            if fp:
-                try:
-                    fps = get_peer_status(fp.get('url'))
-                    fst = fps.get('state')
-                    if fst in ('running', 'processing', 'paused',
-                                'paused_zenodo'):
-                        fkg = (fps.get('current_kg') or {})
-                        _mark(fkg.get('code') if isinstance(fkg, dict) else None)
-                except Exception:
-                    pass
+            frontier_ids.add(active_frontier)
+        frontier_ids |= parallel_authorised
+        for fid in frontier_ids:
+            fp = get_peer_by_id(cfg, fid)
+            if not fp:
+                continue
+            try:
+                fps = get_peer_status(fp.get('url'))
+                fst = fps.get('state')
+                if fst in ('running', 'processing', 'paused',
+                            'paused_zenodo'):
+                    fkg = (fps.get('current_kg') or {})
+                    _mark(fkg.get('code') if isinstance(fkg, dict) else None)
+                    _mark(fps.get('in_progress'))
+            except Exception:
+                pass
         # Filter the whitelist before partitioning.
         whitelist = [k for k in whitelist if k not in in_progress]
         if not whitelist:

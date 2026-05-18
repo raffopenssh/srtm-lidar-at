@@ -1192,6 +1192,35 @@ def _peer_status_push_loop():
                                   os.environ.get('INSTANCE_ID', peer_id))
             except Exception:
                 pass
+            # Fresh host CPU/steal/iowait telemetry on every push. The
+            # processor only writes system.* while it's running; idle
+            # peers would otherwise show stale or no perf signal at
+            # all. This costs ~200 bytes per push and gives the
+            # director a continuous fleet-wide view of which exe.dev
+            # resource pool each peer landed on. See host_telemetry.py.
+            try:
+                import host_telemetry as _ht
+                _snap = _ht.cpu_snapshot('push')
+                _summ = _ht.perf_summary('push')
+                _host = _ht.host_profile()
+                _sysd = dict(status.get('system') or {})
+                if _snap:
+                    _sysd.setdefault('cpu_user', _snap['user'])
+                    _sysd.setdefault('cpu_system', _snap['system'])
+                    _sysd.setdefault('cpu_iowait', _snap['iowait'])
+                    _sysd.setdefault('cpu_steal', _snap['steal'])
+                    _sysd.setdefault('cpu_total', _snap['total_pct'])
+                if _summ:
+                    # Push-channel perf summary is *always* fresher than
+                    # the processor-channel one (push runs every 30 s
+                    # regardless of KG state). Prefer it.
+                    _sysd['perf'] = _summ
+                if _host:
+                    _sysd.setdefault('host', _host)
+                if _sysd:
+                    status['system'] = _sysd
+            except Exception:
+                pass
             try:
                 bw = _pd.get_local_bandwidth()
             except Exception:
@@ -1236,6 +1265,16 @@ def _peer_status_push_loop():
                     'instance': status.get('instance'),
                     'warning_rates': status.get('warning_rates'),
                     '_heartbeat': True,
+                    # Always include host perf so idle peers don't
+                    # drop off the resource-pool profile. Adds ~250 B.
+                    'system': {
+                        k: (status.get('system') or {}).get(k)
+                        for k in ('cpu_user', 'cpu_system', 'cpu_iowait',
+                                  'cpu_steal', 'cpu_total', 'perf', 'host',
+                                  'load_1m', 'cpu_pct', 'ram_pct',
+                                  'disk_free_gb')
+                        if (status.get('system') or {}).get(k) is not None
+                    },
                 }
                 payload = {'peer_id': peer_id, 'status': _slim,
                            'bandwidth': bw}
@@ -14718,6 +14757,53 @@ def process_txt():
             )
     except Exception:
         pass
+
+    # Fleet vCPU-steal summary (resource-pool profiling).
+    # exe.dev runs peers on multiple shared hypervisor pools; steal %
+    # is the cheapest signal that distinguishes them. Aggregate over
+    # all running peers that supplied a perf sample in the last push.
+    try:
+        running_perf = []
+        for _p in (d.get('peers') or []):
+            if (_p.get('processor_state') or '') not in ('running', 'processing'):
+                continue
+            _sys = _p.get('system') or {}
+            _perf = _sys.get('perf') or {}
+            _steal = _perf.get('cpu_steal_ewma')
+            if _steal is None:
+                _steal = _sys.get('cpu_steal')
+            _iow = _perf.get('cpu_iowait_ewma')
+            if _iow is None:
+                _iow = _sys.get('cpu_iowait')
+            if isinstance(_steal, (int, float)):
+                running_perf.append({
+                    'id': _p.get('id'),
+                    'steal': float(_steal),
+                    'iowait': float(_iow) if isinstance(_iow, (int, float)) else 0.0,
+                    'busy': float(_perf.get('cpu_total_ewma',
+                                            _sys.get('cpu_total', 0)) or 0),
+                })
+        if running_perf:
+            steals = sorted(p['steal'] for p in running_perf)
+            iows = sorted(p['iowait'] for p in running_perf)
+            busies = sorted(p['busy'] for p in running_perf)
+            n = len(steals)
+            _med = lambda xs: xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+            n_throttled = sum(1 for s in steals if s >= 15)
+            n_warm = sum(1 for s in steals if 5 <= s < 15)
+            worst = sorted(running_perf, key=lambda p: -p['steal'])[:3]
+            worst_s = ' '.join(f'{p["id"]}:{p["steal"]:.0f}%' for p in worst)
+            out.append(
+                f'fleet_cpu: peers_running={n} '
+                f'steal_med={_med(steals):.1f}% (max={steals[-1]:.0f}%) '
+                f'iowait_med={_med(iows):.1f}% '
+                f'busy_med={_med(busies):.0f}% '
+                f'throttled(≥15%)={n_throttled} '
+                f'warm(5-15%)={n_warm}'
+                + (f' · worst: {worst_s}' if n_throttled or n_warm else '')
+            )
+    except Exception:
+        pass
     # Cache deposit
     try:
         cmf_path = Path('data/austria_processor/cache_manifest.json')
@@ -15049,6 +15135,22 @@ def process_txt():
         rd = p.get('renew_day')
         if rd:
             extras.append(f'rd={rd}')
+        # CPU steal / iowait chips — only flag when material so the
+        # line stays readable. steal≥5% = noisy neighbour; iowait≥5%
+        # = slow disk pool.
+        _sysd = p.get('system') or {}
+        _perfd = _sysd.get('perf') or {}
+        _stl = _perfd.get('cpu_steal_ewma')
+        if _stl is None:
+            _stl = _sysd.get('cpu_steal')
+        if isinstance(_stl, (int, float)) and _stl >= 5:
+            tag = 'STEAL' if _stl >= 15 else 'steal'
+            extras.append(f'{tag}={_stl:.0f}%')
+        _iow = _perfd.get('cpu_iowait_ewma')
+        if _iow is None:
+            _iow = _sysd.get('cpu_iowait')
+        if isinstance(_iow, (int, float)) and _iow >= 5:
+            extras.append(f'iow={_iow:.0f}%')
         bw_extra_s = ' '.join(extras) if extras else ''
         ver = (_short(p.get('git_commit') or '-', 7)).ljust(7)
         # Surface assigned credential indices so we can verify each

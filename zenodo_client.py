@@ -345,6 +345,18 @@ class ReadOnlyError(ZenodoError):
 _UPLOAD_CHUNK = 4 * 1024 * 1024  # 4 MB
 
 
+def _md5_of_file(local_path: "Path") -> str:
+    """Stream-MD5 a local file in 4 MB chunks."""
+    h = hashlib.md5()
+    with open(local_path, "rb") as fh:
+        while True:
+            chunk = fh.read(_UPLOAD_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class ProgressFileWrapper:
     """Wrap a file object to track read progress during uploads.
 
@@ -458,6 +470,7 @@ class Client:
         json_body: Any = None,
         content_type: Optional[str] = None,
         stream: bool = False,
+        max_retries: Optional[int] = None,
     ) -> requests.Response:
         """Execute an HTTP request with retry + exponential backoff on 5xx/429.
 
@@ -494,11 +507,12 @@ class Client:
 
         last_exc: Optional[BaseException] = None
         attempt = 0
+        _max_retries = self.max_retries if max_retries is None else max_retries
 
         while True:
             attempt += 1
             try:
-                log.debug("%s %s (attempt %d/%d)", method, url, attempt, self.max_retries + 1)
+                log.debug("%s %s (attempt %d/%d)", method, url, attempt, _max_retries + 1)
                 resp = self._session.request(
                     method,
                     url,
@@ -506,7 +520,16 @@ class Client:
                     json=json_body,
                     headers=headers,
                     stream=stream,
-                    timeout=(30, 7200),  # 30s connect, 2h read/upload
+                    # 30 s connect, 10 min read/upload. The previous 2 h
+                    # read timeout meant a half-closed TLS stream wedged
+                    # us for 2 h before retrying — catastrophic for
+                    # large GPKG PUTs that already burned bandwidth
+                    # uploading the body. 10 min is generous: Zenodo
+                    # acks within ~30 s once the body is on disk, and
+                    # the post-upload bucket verification below recovers
+                    # the common case where the body landed but the
+                    # response was dropped (SSLEOFError / write timeout).
+                    timeout=(30, 600),
                 )
 
                 # Success
@@ -530,7 +553,7 @@ class Client:
                     (log.warning if is_repeated else log.info)(
                         "%s %s returned %d (attempt %d/%d): %s",
                         method, url, resp.status_code, attempt,
-                        self.max_retries + 1, body_preview,
+                        _max_retries + 1, body_preview,
                     )
                     # Parse Retry-After once and stash it on the exception
                     # so callers can size their own cooldowns from it.
@@ -547,7 +570,7 @@ class Client:
                         body=body_preview,
                         retry_after=retry_after_secs,
                     )
-                    if attempt <= self.max_retries:
+                    if attempt <= _max_retries:
                         wait = self.retry_base_wait * (2 ** (attempt - 1))
                         if retry_after_secs > 0:
                             wait = max(wait, retry_after_secs)
@@ -575,7 +598,7 @@ class Client:
                 is_repeated = attempt >= 2
                 (log.warning if is_repeated else log.info)(
                     "%s %s network error (attempt %d/%d): %s",
-                    method, url, attempt, self.max_retries + 1, exc,
+                    method, url, attempt, _max_retries + 1, exc,
                 )
                 last_exc = exc
                 # SSL/connection-reset failures often leave the keep-alive
@@ -595,7 +618,7 @@ class Client:
                                     requests.exceptions.ReadTimeout,
                                     requests.exceptions.Timeout)):
                     self._reset_session()
-                if attempt <= self.max_retries:
+                if attempt <= _max_retries:
                     wait = self.retry_base_wait * (2 ** (attempt - 1))
                     # Cap at 5 minutes — long enough for Zenodo to recover
                     # from a transient outage, short enough to keep the
@@ -619,6 +642,72 @@ class Client:
     # Sandbox/old Zenodo may not support multipart — we fall back to
     # a single PUT on any 4xx other than 404.
     _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
+
+    def _verify_bucket_file(
+        self,
+        put_url: str,
+        expected_size: int,
+        expected_md5: Optional[str],
+    ) -> tuple[bool, str]:
+        """Check whether the file at ``put_url`` matches our expectations.
+
+        Returns ``(ok, reason)``. Reason is a short human-readable
+        token explaining the verdict (used in log lines).
+
+        Zenodo's bucket API responds to HEAD on a file URL with:
+          * ``Content-Length`` — always present.
+          * ``ETag`` (or ``X-Checksum``) — MD5 of the stored object
+            on most InvenioRDM versions. Format is either a quoted
+            32-hex hash or ``md5:<hex>``.
+        We accept the upload as good when size matches AND we can
+        confirm md5 (or, if Zenodo doesn't return a checksum header,
+        when size matches and we never had a local md5 to compare).
+
+        This helper is the cornerstone of the post-failure recovery
+        path: it lets us treat "SSL EOF after the last byte was
+        written" as a success and skip a multi-GB re-upload.
+        """
+        try:
+            resp = self._session.head(
+                put_url,
+                timeout=(10, 30),
+                allow_redirects=True,
+            )
+        except requests.exceptions.RequestException as exc:
+            return False, f"head_error:{type(exc).__name__}"
+        if resp.status_code == 404:
+            return False, "absent"
+        if resp.status_code >= 400:
+            return False, f"head_status:{resp.status_code}"
+        try:
+            got_size = int(resp.headers.get("Content-Length", "-1"))
+        except ValueError:
+            got_size = -1
+        if got_size != expected_size:
+            return False, f"size_mismatch:{got_size}!={expected_size}"
+        # Try every header that might carry the checksum.
+        got_md5 = ""
+        for hk in ("ETag", "X-Checksum", "Content-MD5", "Digest"):
+            v = resp.headers.get(hk)
+            if not v:
+                continue
+            v = v.strip().strip('"')
+            # InvenioRDM emits 'md5:<hex>'; S3-style emits a raw 32-hex.
+            if v.lower().startswith("md5:") or v.lower().startswith("md5="):
+                v = v.split(":", 1)[-1].split("=", 1)[-1].strip()
+            if len(v) == 32 and all(c in "0123456789abcdefABCDEF" for c in v):
+                got_md5 = v.lower()
+                break
+        if expected_md5 and got_md5:
+            if got_md5 == expected_md5.lower():
+                return True, f"size+md5 ok ({got_size}B)"
+            return False, f"md5_mismatch:{got_md5}!={expected_md5}"
+        # Size-only confirmation. This is what we get on Zenodo
+        # deployments that don't echo a checksum header on HEAD.
+        # Still good enough: a partial PUT shows up as size_mismatch.
+        return True, (f"size ok ({got_size}B, no md5 hdr)"
+                      if not expected_md5
+                      else f"size ok ({got_size}B, hdr lacked md5)")
 
     def _put_file_to_bucket(
         self,
@@ -656,16 +745,119 @@ class Client:
                 )
 
         # Single-PUT fallback / small-file path.
-        with open(local_path, "rb") as fh:
-            data = (ProgressFileWrapper(fh, file_size, progress_callback)
-                    if progress_callback else fh)
-            self._do_request(
-                "PUT", put_url,
-                data=data,
-                content_type="application/octet-stream",
+        #
+        # Reliability: on multi-GB uploads, Zenodo's edge frequently
+        # finishes writing the body but never returns the JSON ack
+        # (manifests as SSLEOFError or 'write operation timed out').
+        # The session-level retry then re-uploads the *whole* file,
+        # which (a) wastes bandwidth, (b) racks up duplicate writes
+        # on the bucket, and (c) regularly fails again after 6
+        # attempts because each attempt is itself ~10 min long. The
+        # cure is to verify the bucket state after every network
+        # failure: if size + checksum match, the upload actually
+        # succeeded and we can return immediately. If size is wrong,
+        # delete the partial and let the outer retry re-PUT cleanly.
+        # See zenodo_client.py:_verify_bucket_file for the HEAD/GET
+        # logic. This is robust even without multipart, because the
+        # vast majority of "failed" >1 GB uploads in our logs were
+        # actually delivered — only the response was lost.
+        try:
+            md5_hex = _md5_of_file(local_path)
+        except Exception:
+            md5_hex = None
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with open(local_path, "rb") as fh:
+                    data = (ProgressFileWrapper(
+                        fh, file_size, progress_callback)
+                        if progress_callback else fh)
+                    # max_retries=0 — the outer loop in this method
+                    # owns retry policy. Without this we'd amplify
+                    # every transient hiccup into 6 × 6 = 36 re-PUTs
+                    # of the same multi-GB body.
+                    self._do_request(
+                        "PUT", put_url,
+                        data=data,
+                        content_type="application/octet-stream",
+                        max_retries=0,
+                    )
+                if progress_callback:
+                    progress_callback(file_size, file_size)
+                # Defensive verification: Zenodo occasionally accepts
+                # a body and then garbles the JSON ack; we want every
+                # successful return to mean "file is in the bucket".
+                ok, why = self._verify_bucket_file(
+                    put_url, file_size, md5_hex)
+                if ok:
+                    return
+                log.warning(
+                    "PUT %s returned 2xx but bucket verify failed (%s) "
+                    "— will retry", filename, why,
+                )
+                last_exc = ZenodoError(f"bucket verify failed: {why}")
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                # The 'write timeout' / SSLEOFError class of failures
+                # almost always means the upload completed on Zenodo's
+                # side but the response got dropped. Verify before
+                # re-uploading; on a match we save a full file's worth
+                # of bandwidth + ~10 min of wall time.
+                ok, why = self._verify_bucket_file(
+                    put_url, file_size, md5_hex)
+                if ok:
+                    log.info(
+                        "PUT %s raised %s on attempt %d/%d but bucket "
+                        "already holds the correct file (%s) — "
+                        "treating as success",
+                        filename, type(exc).__name__, attempt,
+                        max_attempts, why,
+                    )
+                    if progress_callback:
+                        progress_callback(file_size, file_size)
+                    return
+                log.warning(
+                    "PUT %s failed (attempt %d/%d): %s; bucket verify: %s",
+                    filename, attempt, max_attempts, exc, why,
+                )
+                # Drop any partial upload before retrying so Zenodo
+                # doesn't keep a wrong-size file under the same name.
+                if why and why.startswith("size_mismatch"):
+                    try:
+                        self._do_request("DELETE", put_url)
+                    except Exception as _de:
+                        log.info("  partial-cleanup DELETE failed: %s", _de)
+            except ZenodoError as exc:
+                # Non-retryable Zenodo error — propagate immediately.
+                if exc.status_code and 400 <= exc.status_code < 500 \
+                        and exc.status_code not in (408, 409, 429):
+                    raise
+                last_exc = exc
+                log.warning(
+                    "PUT %s zenodo error (attempt %d/%d): %s",
+                    filename, attempt, max_attempts, exc,
+                )
+            # Refresh the TCP+TLS connection before retrying — the
+            # session-level reset in _do_request already does this on
+            # network failure, but a verify-fail success path skips
+            # that branch. Belt + braces.
+            self._reset_session()
+            if attempt < max_attempts:
+                wait = min(self.retry_base_wait * (2 ** (attempt - 1)), 300.0)
+                log.info("  retrying PUT %s in %.1fs …", filename, wait)
+                time.sleep(wait)
+        # Exhausted attempts. One final verify before giving up — the
+        # last PUT may have succeeded silently while we were sleeping.
+        ok, why = self._verify_bucket_file(put_url, file_size, md5_hex)
+        if ok:
+            log.info(
+                "PUT %s: bucket verify succeeded after %d attempts (%s)",
+                filename, max_attempts, why,
             )
-        if progress_callback:
-            progress_callback(file_size, file_size)
+            if progress_callback:
+                progress_callback(file_size, file_size)
+            return
+        raise last_exc
 
     def _multipart_upload(
         self,

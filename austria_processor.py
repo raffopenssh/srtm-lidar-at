@@ -797,6 +797,31 @@ class ProgressTracker:
         except Exception:
             pass
 
+        # Fine-grained CPU breakdown for peer profiling: distinguishes
+        # genuine compute load from hypervisor steal (overcommitted
+        # exe.dev resource pool) and disk iowait. Two channels:
+        # 'tick' = per-update delta (~30 s of subprocess wall time);
+        # 'summary' = rolling EWMA / p95 so chronic throttling stands
+        # out from single-tick spikes. See host_telemetry.py.
+        try:
+            import host_telemetry as _ht
+            snap = _ht.cpu_snapshot("processor")
+            if snap:
+                system["cpu_user"]   = snap["user"]
+                system["cpu_system"] = snap["system"]
+                system["cpu_iowait"] = snap["iowait"]
+                system["cpu_steal"]  = snap["steal"]
+                system["cpu_idle"]   = snap["idle"]
+                system["cpu_total"]  = snap["total_pct"]
+            summ = _ht.perf_summary("processor")
+            if summ:
+                system["perf"] = summ
+            hp = _ht.host_profile()
+            if hp:
+                system["host"] = hp
+        except Exception:
+            pass
+
         try:
             # Disk free
             st = os.statvfs("/")

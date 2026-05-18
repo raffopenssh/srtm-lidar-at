@@ -890,15 +890,41 @@ _PEER_PUSH: dict[str, dict] = {}  # peer_id -> {ts, status, bandwidth}
 _PEER_PUSH_LOCK = threading.Lock()
 
 
+# Status-fields that are bandwidth-shipped only once per process
+# lifetime (constants until the peer restarts). The director merges
+# them from the previous push so heartbeats don't lose them.
+_STICKY_SYSTEM_FIELDS = ('host',)
+
+
 def record_peer_push(peer_id: str, status: dict,
                      bandwidth: dict | None = None) -> None:
-    """Record a peer-pushed status payload. Called from the HTTP handler."""
+    """Record a peer-pushed status payload. Called from the HTTP handler.
+
+    Merges 'sticky' fields (currently ``system.host``) from the
+    previous push so idle heartbeats — which intentionally omit
+    constants to save bandwidth — don't erase them. Without this the
+    fleet-profile view would lose cpu_model / sys_vendor as soon as a
+    peer went idle.
+    """
     if not peer_id:
         return
+    status = status or {}
     with _PEER_PUSH_LOCK:
+        prev = _PEER_PUSH.get(peer_id) or {}
+        prev_status = prev.get('status') or {}
+        prev_sys = prev_status.get('system') or {}
+        new_sys = status.get('system') or {}
+        # Pull sticky fields forward when the new payload lacks them.
+        merged_sys = dict(new_sys)
+        for k in _STICKY_SYSTEM_FIELDS:
+            if k not in merged_sys and k in prev_sys:
+                merged_sys[k] = prev_sys[k]
+        if merged_sys:
+            status = dict(status)
+            status['system'] = merged_sys
         _PEER_PUSH[peer_id] = {
             'ts': time.time(),
-            'status': status or {},
+            'status': status,
             'bandwidth': bandwidth,
         }
 

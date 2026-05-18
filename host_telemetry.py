@@ -206,14 +206,23 @@ def bw_throughput_mbps(channel: str = "default") -> Optional[float]:
     return round(((nb[0] - prx) + (nb[1] - ptx)) / 1e6 / dt, 2)
 
 
+_HOST_PROFILE_CACHE: dict | None = None
+
+
 def host_profile() -> dict:
     """One-shot host fingerprint for the peer-profile section.
 
-    Pairs cpu_model + n_cpu + ram_total with the rolling perf summary
-    so the director can group peers into resource-pool buckets without
-    needing to maintain a static peers.json field. Cheap; called from
-    the status-push loop every ~5 min via a callsite-side throttle.
+    Cached for the process lifetime: cpu_model / sys_vendor /
+    product_name / ram_total / boot_ts don't change while the
+    processor is alive, and re-reading /proc/cpuinfo + /sys/class/dmi
+    on every status push is pure waste. The push loop now uses
+    ``host_profile_if_changed()`` so the payload only carries the
+    field on the first push of each process — saves ~110 bytes per
+    subsequent push.
     """
+    global _HOST_PROFILE_CACHE
+    if _HOST_PROFILE_CACHE is not None:
+        return _HOST_PROFILE_CACHE
     info: dict = {}
     try:
         info["n_cpu"] = os.cpu_count() or 0
@@ -257,4 +266,29 @@ def host_profile() -> dict:
         info["boot_ts"] = int(time.time() - float(open("/proc/uptime").read().split()[0]))
     except (OSError, ValueError):
         pass
+    _HOST_PROFILE_CACHE = info
     return info
+
+
+_HOST_PROFILE_PUSHED = False
+
+
+def host_profile_if_unsent() -> dict | None:
+    """Return ``host_profile()`` the first time it's called, ``None``
+    thereafter. The push loop uses this so each peer ships its host
+    fingerprint exactly once per process lifetime — the director
+    keeps the latest value in its push cache.
+
+    Call ``mark_host_profile_unsent()`` after a forced re-send is
+    needed (e.g. director failover wiped its push cache).
+    """
+    global _HOST_PROFILE_PUSHED
+    if _HOST_PROFILE_PUSHED:
+        return None
+    _HOST_PROFILE_PUSHED = True
+    return host_profile()
+
+
+def mark_host_profile_unsent() -> None:
+    global _HOST_PROFILE_PUSHED
+    _HOST_PROFILE_PUSHED = False

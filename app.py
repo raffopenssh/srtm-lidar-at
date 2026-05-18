@@ -1202,7 +1202,10 @@ def _peer_status_push_loop():
                 import host_telemetry as _ht
                 _snap = _ht.cpu_snapshot('push')
                 _summ = _ht.perf_summary('push')
-                _host = _ht.host_profile()
+                # host_profile is static — only ship on first push of
+                # this process. Director keeps it in the cache; this
+                # saves ~110 B/peer/push at fleet steady state.
+                _host = _ht.host_profile_if_unsent()
                 _sysd = dict(status.get('system') or {})
                 if _snap:
                     _sysd.setdefault('cpu_user', _snap['user'])
@@ -1216,7 +1219,7 @@ def _peer_status_push_loop():
                     # regardless of KG state). Prefer it.
                     _sysd['perf'] = _summ
                 if _host:
-                    _sysd.setdefault('host', _host)
+                    _sysd['host'] = _host
                 if _sysd:
                     status['system'] = _sysd
             except Exception:
@@ -1257,6 +1260,12 @@ def _peer_status_push_loop():
                 # no manifest fields) so the director's freshness
                 # window doesn't mark us stale. This keeps us under
                 # ~400 bytes per tick instead of ~3.6 KB.
+                # Slim heartbeat: keep only the perf fields that are
+                # *cheap* and *useful* for the resource-pool view, drop
+                # the rest. ~300 B vs ~3.6 KB for a full status.
+                # 'host' is excluded — sent once per process via the
+                # host_profile_if_unsent() gate above; resending it on
+                # every idle heartbeat would defeat the gate.
                 _slim = {
                     'state': status.get('state'),
                     'cache_only': status.get('cache_only'),
@@ -1265,13 +1274,10 @@ def _peer_status_push_loop():
                     'instance': status.get('instance'),
                     'warning_rates': status.get('warning_rates'),
                     '_heartbeat': True,
-                    # Always include host perf so idle peers don't
-                    # drop off the resource-pool profile. Adds ~250 B.
                     'system': {
                         k: (status.get('system') or {}).get(k)
-                        for k in ('cpu_user', 'cpu_system', 'cpu_iowait',
-                                  'cpu_steal', 'cpu_total', 'perf', 'host',
-                                  'load_1m', 'cpu_pct', 'ram_pct',
+                        for k in ('cpu_steal', 'cpu_iowait', 'cpu_total',
+                                  'perf', 'load_1m', 'cpu_pct', 'ram_pct',
                                   'disk_free_gb')
                         if (status.get('system') or {}).get(k) is not None
                     },
@@ -7495,11 +7501,23 @@ def director_identity():
         for k in ('id', 'url'):
             if k in body and body[k] is not None:
                 cur[k] = body[k]
+    prev_dir_url = (cur.get('director_url') or '').strip()
     if 'director_url' in body:
         cur['director_url'] = body['director_url']
     dha.save_self(cur)
     if 'director_url' in body:
         dha.set_director_url(body['director_url'])
+        # On director failover, the new director's push cache starts
+        # empty. Sticky fields (host fingerprint) are only shipped once
+        # per process — force a re-send on the next push so the new
+        # director sees them too.
+        try:
+            new_url = (body.get('director_url') or '').strip()
+            if new_url and new_url != prev_dir_url:
+                import host_telemetry as _ht
+                _ht.mark_host_profile_unsent()
+        except Exception:
+            pass
     out = dict(cur)
     if rejected:
         out['_rejected'] = rejected

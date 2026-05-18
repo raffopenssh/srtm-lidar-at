@@ -1732,6 +1732,159 @@ def _peer_in_warmup(peer: dict) -> bool:
     return _peer_age_seconds(peer) < WARMUP_HOLD_SECONDS
 
 
+# --- KG complexity weights (used by complexity-weighted LPT partition
+# in _orchestrate_cache_only). Cached at module level so we don't
+# re-read kg_list.json + re-derive tile counts on every director tick.
+_KG_WEIGHT_CACHE: dict[str, float] = {}
+_KG_WEIGHT_CACHE_BUILT_AT: float = 0.0
+_KG_WEIGHT_CACHE_TTL = 3600.0   # 1 h — KG geometry is static, this is
+                                # just defensive against config edits.
+
+
+def _kg_weights(codes: list) -> dict:
+    """Return {kg_code: weight} for the requested codes.
+
+    Weight ≈ expected processing cost relative to a tiny KG. Built
+    from tile count (the dominant cost driver — each tile runs
+    Felzenszwalb + RAG + RF inference) plus a small term for parcel
+    count (vectorise + per-parcel features). Block codes inherit their
+    parent's geometry; ``maybe_split_kg`` is invoked lazily so this
+    works correctly for both parent and block codes.
+
+    Unknown codes get weight=1.0 (one tile's worth) so the partition
+    falls back gracefully if kg_list.json is missing entries.
+    """
+    global _KG_WEIGHT_CACHE_BUILT_AT
+    now = time.time()
+    if (now - _KG_WEIGHT_CACHE_BUILT_AT) > _KG_WEIGHT_CACHE_TTL:
+        _KG_WEIGHT_CACHE.clear()
+        _KG_WEIGHT_CACHE_BUILT_AT = now
+    out: dict[str, float] = {}
+    missing: list[str] = []
+    for c in codes:
+        w = _KG_WEIGHT_CACHE.get(c)
+        if w is not None:
+            out[c] = w
+        else:
+            missing.append(c)
+    if not missing:
+        return out
+    # Lazy import — avoid pulling kg_splitter on module load.
+    try:
+        from kg_splitter import (maybe_split_kg, is_block_code,
+                                   parent_kg_code, _compute_n_tiles)
+    except Exception:
+        # No splitter available — fall back to unit weights.
+        for c in missing:
+            _KG_WEIGHT_CACHE[c] = 1.0
+            out[c] = 1.0
+        return out
+    kg_by_code = {}
+    try:
+        kg_list_path = DATA_DIR / 'kg_list.json'
+        if kg_list_path.exists():
+            for kg in json.loads(kg_list_path.read_text()):
+                cc = kg.get('kg_code')
+                if cc:
+                    kg_by_code[cc] = kg
+    except Exception:
+        kg_by_code = {}
+    for c in missing:
+        try:
+            parent = parent_kg_code(c) if is_block_code(c) else c
+            kg = kg_by_code.get(parent)
+            if not kg:
+                _KG_WEIGHT_CACHE[c] = 1.0
+                out[c] = 1.0
+                continue
+            if is_block_code(c):
+                blocks = maybe_split_kg(kg)
+                # Find this block by code; if mismatch, average the
+                # parent uniformly.
+                tgt = next((b for b in blocks
+                            if b.get('kg_code') == c), None)
+                if tgt and 'bbox' in tgt:
+                    bb = tgt['bbox']
+                    n_tiles = _compute_n_tiles(
+                        bb['min_lon'], bb['min_lat'],
+                        bb['max_lon'], bb['max_lat'])
+                    # Per-parcel cost — parent's count divided
+                    # across blocks (cheap & good enough).
+                    parcels = kg.get('parcel_count', 0) / max(
+                        len(blocks), 1)
+                else:
+                    bb = kg.get('bbox') or {}
+                    n_tiles = _compute_n_tiles(
+                        bb.get('min_lon', 0), bb.get('min_lat', 0),
+                        bb.get('max_lon', 0), bb.get('max_lat', 0)
+                    ) / max(len(blocks) if blocks else 1, 1)
+                    parcels = kg.get('parcel_count', 0) / max(
+                        len(blocks) if blocks else 1, 1)
+            else:
+                bb = kg.get('bbox') or {}
+                n_tiles = _compute_n_tiles(
+                    bb.get('min_lon', 0), bb.get('min_lat', 0),
+                    bb.get('max_lon', 0), bb.get('max_lat', 0))
+                parcels = kg.get('parcel_count', 0)
+            # Weight: tile count dominates; tiny parcel-count nudge so
+            # a 1-tile KG with 5000 parcels still ranks above a
+            # 1-tile KG with 50.
+            w = max(1.0, float(n_tiles) + 0.0005 * float(parcels))
+        except Exception:
+            w = 1.0
+        _KG_WEIGHT_CACHE[c] = w
+        out[c] = w
+    return out
+
+
+def _peer_cpu_steal(peer_id: str) -> float | None:
+    """Return EWMA CPU steal %% for *peer_id*, or None if unknown.
+
+    Reads the freshest value we have: peer-pushed status
+    (``system.perf.cpu_steal_ewma`` > ``system.cpu_steal``). Returns
+    None when the peer hasn't pushed telemetry yet (e.g. old build,
+    first 30 s after start) so callers can treat it as "no signal"
+    rather than "0 %% steal".
+    """
+    pushed = get_pushed_status(peer_id)
+    if not pushed:
+        return None
+    sysd = pushed.get('status', {}).get('system') or {}
+    perf = sysd.get('perf') or {}
+    v = perf.get('cpu_steal_ewma')
+    if v is None:
+        v = sysd.get('cpu_steal')
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _peer_cpu_capacity(peer_id: str, default: float = 1.0) -> float:
+    """Effective CPU capacity for *peer_id* in [0.10, 1.0].
+
+    capacity = max(0.10, 1 - steal_ewma / 100). Floor at 0.10 so a
+    pathological 95 %% steal peer still gets *some* work assigned (LPT
+    becomes degenerate at exactly 0). Returns ``default`` when the
+    peer hasn't pushed telemetry yet.
+    """
+    s = _peer_cpu_steal(peer_id)
+    if s is None:
+        return default
+    return max(0.10, 1.0 - s / 100.0)
+
+
+def _fleet_steal_median(peer_ids: list) -> float | None:
+    """Median CPU steal across *peer_ids*; None when nobody reported."""
+    vals = [v for v in (_peer_cpu_steal(pid) for pid in peer_ids)
+            if v is not None]
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
 def _peer_noise_score(peer_id: str, state: dict) -> float:
     """Return a [0, +inf) noise score for a peer.
 
@@ -1799,9 +1952,19 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         if remaining < 2 * (1024 ** 3):
             continue  # not enough headroom
         noise = _peer_noise_score(pid, state)
-        # Sort key: low noise first, then high remaining bandwidth.
+        # CPU-steal penalty: prefer peers with real CPU. A frontier
+        # peer burns scarce Copernicus credentials, so running it on a
+        # hypervisor-starved box (60-80%% steal is common on exe.dev's
+        # over-subscribed pools) wastes credit per unit of progress.
+        # 1.0 / capacity ∈ [1.0, 10.0]; a 50 %% steal peer is twice as
+        # costly as a 0 %% peer, a 90 %% peer ten times. Cubed so the
+        # penalty dominates a small noise difference but not a 5-x bw
+        # gap.
+        cap = _peer_cpu_capacity(pid)
+        steal_pen = (1.0 / cap) - 1.0    # 0.0 at 100%% capacity
+        # Sort key: low noise+steal first, then high remaining bandwidth.
         # Negate remaining so larger sorts earlier under ascending sort.
-        candidates.append((noise, -remaining, pid))
+        candidates.append((noise + steal_pen, -remaining, pid))
 
     if not candidates:
         return None
@@ -2671,6 +2834,22 @@ class PeerDirector:
                 '_reported_cells': ps.get('cell_filter'),
                 # Stale-update tracking (auto-retry status)
                 'update_state': (state.get('peer_update_state') or {}).get(pid),
+                # Host telemetry (CPU steal / iowait / busy ewma + perf
+                # summary + static host_profile). Peers push these via
+                # /api/v1/director/peer_status; without forwarding them
+                # here the fleet_cpu line in /process.txt and the
+                # steal=/iow= bw_extras chips silently render empty.
+                # Trimmed to the fields actually consumed downstream so
+                # /director/status doesn't bloat by ~3 KB/peer.
+                'system': {
+                    k: v for k, v in (ps.get('system') or {}).items()
+                    if k in ('cpu_steal', 'cpu_iowait', 'cpu_total',
+                             'cpu_user', 'cpu_system',
+                             'perf', 'host',
+                             'load_1m', 'cpu_pct', 'ram_pct',
+                             'disk_free_gb')
+                    and v is not None
+                },
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
@@ -5962,9 +6141,14 @@ class PeerDirector:
         # peer available.
         # Order: don't preempt running cache-only peers; among the rest,
         # quiet peers first (so fresh peers absorb new frontier slots).
+        # Steal-aware ordering: a fresh frontier slot is far more
+        # valuable on a low-steal peer (cred efficiency). Add
+        # (1/capacity - 1) so a 50%% steal peer ranks +1.0 worse than
+        # a 0%% peer, ahead of the typical noise spread (<0.5).
         candidates.sort(key=lambda c: (
             1 if c.get('needs_stop_cache_only') else 0,
-            _peer_noise_score(c['peer']['id'], state_copy),
+            _peer_noise_score(c['peer']['id'], state_copy)
+            + ((1.0 / _peer_cpu_capacity(c['peer']['id'])) - 1.0),
             c['peer']['id'],
         ))
         # Include retained_unreachable peers up front so their cred /
@@ -6670,6 +6854,7 @@ class PeerDirector:
                 _factor, _max_cache_only_full, max_cache_only,
             )
 
+
         active_frontier = state_copy.get('active_peer')
         # Peers the parallel-frontier orchestrator has authorised /
         # plans to run as additional frontiers. Cache-only must NOT
@@ -6732,6 +6917,35 @@ class PeerDirector:
         # finish the current KG; we keep the count unchanged so we
         # don't start a fresh peer in the same tick to replace one
         # we just told to drain.
+        # CPU-steal damping. exe.dev steal is almost entirely from
+        # other tenants on the shared hypervisor pool, not from us —
+        # so reducing peer count rarely recovers cycles 1:1. We still
+        # damp the ramp *slightly* at very-high steal so:
+        #   (a) we don't pile new starts on top of a wedged pool, and
+        #   (b) the LPT partition has a chance to drain the heaviest
+        #       KGs from the worst peers before more land.
+        # The damping curve is intentionally gentle: 0.85 at steal=40%,
+        # 0.70 at steal=60%, 0.55 floor. The LPT partition itself does
+        # the *real* load-balancing per-peer; this is just a fleet-wide
+        # ramp brake.
+        try:
+            _med_steal = _fleet_steal_median(list(running_cache_only))
+            if _med_steal is not None and _med_steal >= 40.0:
+                _cpu_cap_factor = max(0.55,
+                                       1.0 - (_med_steal - 30.0) / 200.0)
+                _prev_cap = max_cache_only
+                max_cache_only = max(0, int(round(
+                    max_cache_only * _cpu_cap_factor)))
+                if max_cache_only < _prev_cap:
+                    log.info(
+                        'fleet steal median %.0f%% (n=%d) → cpu_factor '
+                        '%.2f → max_cache_only_peers %d → %d',
+                        _med_steal, len(running_cache_only),
+                        _cpu_cap_factor, _prev_cap, max_cache_only,
+                    )
+        except Exception:
+            pass
+
         excess = len(running_cache_only) - max_cache_only
         if excess > 0:
             # Rank running peers by noise score (highest first), then by
@@ -7032,18 +7246,66 @@ class PeerDirector:
         except Exception as e:
             log.warning('Block expansion failed (continuing with parent codes): %s', e)
 
-        # --- Stable, non-overlapping partition by sorted peer id.
-        # Stride assignment guarantees disjoint chunks and is stable
-        # across whitelist size changes (peer X always gets the same
-        # relative position).  Each peer gets every Nth KG starting at
-        # its sorted index.
+        # --- Complexity-weighted, capacity-aware LPT partition.
+        #
+        # Old behaviour (kept here for context): stride by sorted peer
+        # id (``whitelist[i::n]``). Disjoint and stable, but blind to
+        # KG size *and* peer strength — so a 28-tile KG and a 1-tile KG
+        # were equally likely to land on a 80 %-steal peer as a 0 %-
+        # steal one. With exe.dev pools regularly delivering 30+ peers
+        # at ≥15 %% steal, that asymmetry costs hours of wall time per
+        # day.
+        #
+        # New behaviour: Longest-Processing-Time (LPT) bin-packing.
+        # Sort the whitelist by weight (≈ tile count) descending, then
+        # for each KG pick the worker minimising ``load[p] / capacity[p]``
+        # where capacity = max(0.10, 1 - steal_ewma/100). Stable across
+        # ticks because weights + capacities change slowly; sticky-
+        # ownership pass below still wins for in-flight KGs.
         all_workers = sorted((set(running_cache_only) |
                               {p['id'] for p in to_start})
                              - _draining_cache_only)
         if not all_workers:
             return
-        n = len(all_workers)
-        slices = {pid: whitelist[i::n] for i, pid in enumerate(all_workers)}
+        weights = _kg_weights(whitelist)
+        capacities = {pid: _peer_cpu_capacity(pid) for pid in all_workers}
+        load: dict[str, float] = {pid: 0.0 for pid in all_workers}
+        slices: dict[str, list] = {pid: [] for pid in all_workers}
+        # Sort by weight desc, then code for determinism. Codes with
+        # equal weight then land round-robin which preserves the
+        # diversification property.
+        ordered_codes = sorted(whitelist,
+                                key=lambda c: (-weights.get(c, 1.0), c))
+        for code in ordered_codes:
+            w = weights.get(code, 1.0)
+            # Pick the worker with smallest projected normalised load.
+            # Tiebreak on raw load, then peer id, for determinism.
+            chosen = min(
+                all_workers,
+                key=lambda pid: (
+                    (load[pid] + w) / max(capacities[pid], 0.01),
+                    load[pid],
+                    pid,
+                ),
+            )
+            slices[chosen].append(code)
+            load[chosen] += w
+        # Log a summary so we can verify diversification in journalctl.
+        try:
+            nonzero = [v for v in load.values() if v > 0]
+            mx = max(load.values()) if load else 0.0
+            mn_nz = min(nonzero) if nonzero else 0.0
+            n_used = len(nonzero)
+            log.info(
+                'cache-only LPT partition: workers=%d (used=%d) kgs=%d '
+                'weight_total=%.0f per_used min=%.0f max=%.0f '
+                'imbalance=%.2f',
+                len(all_workers), n_used, len(whitelist),
+                sum(load.values()), mn_nz, mx,
+                (mx / max(mn_nz, 0.01)) if mn_nz else 1.0,
+            )
+        except Exception:
+            pass
 
         # --- Sticky ownership: honor prior-tick assignments so a KG
         # that's already in flight on peer P doesn't get reassigned to
@@ -7089,9 +7351,10 @@ class PeerDirector:
             chunk = slices.get(p['id'], [])
             if not chunk:
                 continue
-            log.info('Starting cache-only peer %s with %d KGs (stride %d/%d, '
+            log.info('Starting cache-only peer %s with %d KGs (LPT %d/%d, '
                      '%d total ready)', p['id'], len(chunk),
-                     all_workers.index(p['id']) + 1, n, len(whitelist))
+                     all_workers.index(p['id']) + 1, len(all_workers),
+                     len(whitelist))
             try:
                 start_peer_processor(p.get('url'), cache_only=True,
                                      queue_whitelist=chunk)
@@ -7885,7 +8148,11 @@ class PeerDirector:
             if rem_gb is not None and rem_gb < SHADOW_MIN_BANDWIDTH_GB:
                 rejected.append((p['id'], f'low_bw({rem_gb}GB)'))
                 continue
-            score = _peer_noise_score(p['id'], self.state)
+            # Shadow must be able to *act* as director if it gets
+            # promoted (run frontiers, build GPKGs). A peer on a 75%%
+            # steal pool is a poor failover target; weight it down.
+            score = (_peer_noise_score(p['id'], self.state)
+                     + ((1.0 / _peer_cpu_capacity(p['id'])) - 1.0))
             candidates.append((score, p))
         if not candidates:
             # Log only when set changes to avoid spam.

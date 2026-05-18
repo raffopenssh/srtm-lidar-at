@@ -1202,10 +1202,19 @@ def _peer_status_push_loop():
                 import host_telemetry as _ht
                 _snap = _ht.cpu_snapshot('push')
                 _summ = _ht.perf_summary('push')
-                # host_profile is static — only ship on first push of
-                # this process. Director keeps it in the cache; this
-                # saves ~110 B/peer/push at fleet steady state.
-                _host = _ht.host_profile_if_unsent()
+                # host_profile is static, but cheap (~110 B) — we now
+                # ship it on every *full* push (heartbeats still omit it
+                # via the slim payload path below). The previous
+                # send-once-per-process gate broke the director
+                # resource-pool view whenever the primary restarted: its
+                # push cache was empty but peers thought they'd already
+                # sent, so the fleet_cpu pool histogram rendered '?'
+                # until each peer's gunicorn was bounced. Sending every
+                # full push (≤ every PEER_PUSH_INTERVAL_IDLE_S for idle
+                # peers, every 30 s for busy peers) costs ~250 B/peer/min
+                # at steady state and self-heals after any director
+                # failover.
+                _host = _ht.host_profile()
                 _sysd = dict(status.get('system') or {})
                 if _snap:
                     _sysd.setdefault('cpu_user', _snap['user'])
@@ -14819,6 +14828,93 @@ def process_txt():
                 f'throttled(≥15%)={n_throttled} '
                 f'warm(5-15%)={n_warm}'
                 + (f' · worst: {worst_s}' if n_throttled or n_warm else '')
+            )
+            # Pool histogram: bucket peers by host_profile fingerprint
+            # so we can see at a glance whether exe.dev landed us on
+            # one congested pool or several. Peers with no host_profile
+            # (telemetry not yet pushed, e.g. fresh srv restart) land
+            # in the '?' bucket.
+            try:
+                from collections import defaultdict as _dd
+                pools = _dd(list)
+                for _p in (d.get('peers') or []):
+                    if (_p.get('processor_state') or '') not in (
+                            'running', 'processing'):
+                        continue
+                    _s = _p.get('system') or {}
+                    _perf = _s.get('perf') or {}
+                    _stl = _perf.get('cpu_steal_ewma')
+                    if _stl is None:
+                        _stl = _s.get('cpu_steal')
+                    if not isinstance(_stl, (int, float)):
+                        continue
+                    _host = _s.get('host') or {}
+                    # Compact pool key: vendor + cpu_model_short. Fits
+                    # ~30 chars on the dashboard line.
+                    _model = (_host.get('cpu_model') or '?')
+                    # Strip frequency tail / vendor prefix noise.
+                    for _kill in ('Intel(R) ', 'Xeon(R) ', 'CPU ',
+                                  ' @ 2.00GHz', ' @ 2.20GHz',
+                                  ' @ 2.30GHz', ' @ 2.50GHz',
+                                  ' @ 2.60GHz', ' @ 2.80GHz',
+                                  ' @ 3.00GHz', 'Processor '):
+                        _model = _model.replace(_kill, '')
+                    _model = _model.strip()[:30] or '?'
+                    pools[_model].append(float(_stl))
+                if pools and len(pools) > 1 or (
+                        len(pools) == 1 and '?' not in pools):
+                    bits = []
+                    for _k, _vs in sorted(pools.items(),
+                                          key=lambda kv: -len(kv[1])):
+                        _vs_s = sorted(_vs)
+                        _n = len(_vs_s)
+                        _m = (_vs_s[_n // 2] if _n % 2
+                              else (_vs_s[_n // 2 - 1]
+                                    + _vs_s[_n // 2]) / 2)
+                        bits.append(f'{_k}:n={_n} steal_med={_m:.0f}%')
+                    out.append('fleet_pools: ' + ' · '.join(bits[:6]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Cache-only LPT partition load summary: surfaces how well-
+    # diversified the current weighted KG assignment is. Reads the
+    # peers' current_kg_n_tiles (when available) as a proxy for
+    # in-flight load.
+    try:
+        cache_loads = []
+        for _p in (d.get('peers') or []):
+            if not _p.get('cache_only_run'):
+                continue
+            if (_p.get('processor_state') or '') not in (
+                    'running', 'processing'):
+                continue
+            _nt = _p.get('current_kg_n_tiles') or 0
+            _stl = (_p.get('system') or {}).get('perf', {}).get(
+                'cpu_steal_ewma')
+            if _stl is None:
+                _stl = (_p.get('system') or {}).get('cpu_steal')
+            cap = 1.0
+            if isinstance(_stl, (int, float)):
+                cap = max(0.10, 1.0 - float(_stl) / 100.0)
+            cache_loads.append({'id': _p.get('id'), 'n_tiles': _nt,
+                                'cap': cap, 'eff': _nt / cap})
+        if cache_loads:
+            _eff_total = sum(c['eff'] for c in cache_loads)
+            _cap_sum = sum(c['cap'] for c in cache_loads)
+            _tile_sum = sum(c['n_tiles'] for c in cache_loads)
+            _heavy = sorted(cache_loads,
+                            key=lambda c: -c['eff'])[:3]
+            _heavy_s = ' '.join(
+                f'{h["id"]}={h["n_tiles"]}t/cap{h["cap"]:.2f}'
+                for h in _heavy if h['n_tiles'] > 0)
+            out.append(
+                f'fleet_load: cache_peers={len(cache_loads)} '
+                f'tiles_in_flight={_tile_sum} '
+                f'eff_cpu={_cap_sum:.1f} '
+                f'cpu_weighted_load={_eff_total:.0f}'
+                + (f' · heaviest: {_heavy_s}' if _heavy_s else '')
             )
     except Exception:
         pass

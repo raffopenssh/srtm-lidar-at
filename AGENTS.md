@@ -101,6 +101,37 @@ Thresholds (peer_director.py):
   occurrence (no need to track per-peer budgets separately; the existing
   `_peer_is_scheduled` gate makes the scheduler skip the peer).
 
+### Throttle / director-efficiency sparkline
+
+The Service-card sparkline (`/process.html` → `renderCapacityHistory`)
+plots the rolling `capacity_history` ring (240 ticks ≈ 2h). Each tick
+carries:
+
+* `f`   — EMA-smoothed capacity factor in `[THROTTLE_MIN_FACTOR, 1.0]`
+* `bev` / `zen` / `cop` — fleet warnings/min per upstream
+* `stl` — **fleet CPU-steal median** across *running* peers (same
+  population the cache-only ramp brake uses)
+* `cpu` — derived `cpu_factor` ramp brake: `1.0` below 30% steal,
+  gentle linear ramp, floor `0.55` at 60%+ steal. Mirrors the damping
+  curve in `_max_cache_only_peers` so the chart shows *why* the
+  director may be running fewer cache-only peers than the warning-rate
+  ceiling alone would allow.
+
+Low capacity_factor with steal high → hypervisor pool congested
+(reducing peers won't recover cycles; LPT partition does the real
+balancing). Low capacity_factor with steal low → a real upstream
+is pushing back — check `B / Z / C` chips for which one.
+
+History persists to `director_state.json` every tick so it survives
+HA handover and gunicorn's two-worker swap (just like the BEV / Zen /
+Cop sub-EMAs). Schema is a 7-tuple; the load path tolerates legacy
+5-tuples written by pre-2026-05-19 directors.
+
+`/process.txt` carries a `throttle:` block (window / cap_factor /
+steal_med / cpu_factor / per-upstream warns-per-min, min/med/max over
+the window) so forensic mining over the long-term archive can
+correlate director efficiency with steal trends without parsing JSON.
+
 ### Role-based parks (who is parked, and why)
 
 Only three reasons a peer is parked (`not_before` in the future):
@@ -379,3 +410,12 @@ More in `docs/cross-cutting-concerns.md`.
   restart at the next KG boundary (or kill it). Changes to `app.py` /
   `peer_director.py` need `sudo systemctl restart srv` (the director thread
   reloads automatically — singleton replaced).
+- **Push → restart → rollout ordering**. `_LOCAL_GIT_COMMIT` is frozen
+  at `srv` import time and is what the director sends to peers as the
+  rollout target (see `versions:` / `(target=...)` line in `/process.txt`).
+  Commit *before* restarting srv, then `git push origin main`, then
+  `sudo systemctl restart srv`. If you restart first and commit after,
+  the director keeps pushing the old commit as target until the next
+  restart and the fleet never picks up your change. (`_ensure_origin_synced`
+  pushes local main to origin every tick — so a forgotten `git push` is
+  recoverable, but a forgotten restart is not.)

@@ -413,21 +413,32 @@ def install_snapshot_from_shadow() -> dict:
                     local_d = json.loads(dst.read_bytes()) or {}
                     snap_creds = snap_d.get('credentials', []) if isinstance(snap_d, dict) else []
                     local_creds = local_d.get('credentials', []) if isinstance(local_d, dict) else []
+                    # Tombstones: union of both sides. A delete on
+                    # either side must survive an HA fan-out, otherwise
+                    # a stale director's snapshot would resurrect the
+                    # cred (the deletion-resurrection bug fixed in
+                    # copernicus.py).
+                    snap_tombs = snap_d.get('tombstones') or [] if isinstance(snap_d, dict) else []
+                    local_tombs = local_d.get('tombstones') or [] if isinstance(local_d, dict) else []
+                    tombs = sorted({(t or '').strip() for t in list(snap_tombs) + list(local_tombs) if (t or '').strip()})
+                    tombs_set = set(tombs)
                     if isinstance(snap_creds, list) and isinstance(local_creds, list):
                         by_id: dict = {}
                         order: list = []
                         # snapshot wins on conflict — but we still want
-                        # local-only entries to survive.
+                        # local-only entries to survive. Tombstoned ids
+                        # are dropped (deletion-survives-snapshot).
                         for c in list(snap_creds) + list(local_creds):
                             if not isinstance(c, dict):
                                 continue
                             cid = (c.get('client_id') or '').strip()
-                            if not cid:
+                            if not cid or cid in tombs_set:
                                 continue
                             if cid not in by_id:
                                 by_id[cid] = c
                                 order.append(cid)
                         merged_creds = [by_id[cid] for cid in order]
+                        snap_d['tombstones'] = tombs
                         added_back = [
                             cid for cid in by_id
                             if cid not in {(c.get('client_id') or '').strip()

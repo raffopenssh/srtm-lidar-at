@@ -115,6 +115,19 @@ _cred_meta: Dict[str, Dict[str, Any]] = {}
 # canonical declaration (with comment) appears below.
 _exhausted_cred_indices: set = set()
 
+# Tombstones: client_ids that have been explicitly removed. Persisted to
+# the credentials JSON store so a deletion survives:
+#   * sibling gunicorn workers that still have the cred in their
+#     in-memory ``_CREDENTIALS`` list and would otherwise resurrect it on
+#     their next ``_save_credentials_to_disk()`` via the union-merge in
+#     ``_reload_credentials_from_disk()``;
+#   * HA snapshot fan-out from a stale director that hasn't seen the
+#     delete yet (``director_ha.install_snapshot`` unions creds, so
+#     without tombstones a stale snapshot would re-add the deleted cred).
+# A subsequent ``add_credential(cid, ...)`` clears the tombstone, so
+# deletion-then-re-add works as expected.
+_cred_tombstones: set = set()
+
 def _load_credentials_from_disk() -> list:
     """Merge built-ins with persisted credentials. Built-ins always come first.
 
@@ -126,11 +139,21 @@ def _load_credentials_from_disk() -> list:
     creds = list(_BUILTIN_CREDENTIALS)
     seen = {c[0] for c in creds}
     _cred_meta = {}
+    _cred_tombstones.clear()
     for cid, _csec in _BUILTIN_CREDENTIALS:
         _cred_meta[cid] = {"source": "builtin"}
     if _CRED_STORE.exists():
         try:
             data = json.loads(_CRED_STORE.read_text())
+            for t in (data.get("tombstones") or []):
+                t = (t or "").strip()
+                if t:
+                    _cred_tombstones.add(t)
+            # Builtins cannot be tombstoned (env-supplied; would reappear).
+            for cid, _csec in _BUILTIN_CREDENTIALS:
+                _cred_tombstones.discard(cid)
+            # Drop any builtins that are tombstoned via a side channel —
+            # actually we already kept builtins above; ensure they survive.
             for entry in data.get("credentials", []):
                 cid = entry.get("client_id")
                 csec = entry.get("client_secret")
@@ -141,6 +164,8 @@ def _load_credentials_from_disk() -> list:
                             if k not in ("client_secret",):
                                 _cred_meta[cid][k] = v
                     continue
+                if cid in _cred_tombstones:
+                    continue  # explicitly deleted; do not resurrect
                 creds.append((cid, csec))
                 seen.add(cid)
                 _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
@@ -185,11 +210,28 @@ def _reload_credentials_from_disk():
     except Exception as e:
         logger.warning("Failed to re-read credentials store: %s", e)
         return
+    # Refresh tombstones first — deletions made by sibling workers
+    # propagate via this set. Builtins are immune (env-supplied).
+    builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
+    for t in (data.get("tombstones") or []):
+        t = (t or "").strip()
+        if t and t not in builtin_ids:
+            _cred_tombstones.add(t)
+    # Evict any in-memory creds that are now tombstoned (another worker
+    # just deleted them). Without this we'd resurrect them on our next
+    # _save_credentials_to_disk().
+    if _cred_tombstones:
+        _CREDENTIALS = [(cid, sec) for (cid, sec) in _CREDENTIALS
+                        if cid not in _cred_tombstones or cid in builtin_ids]
+        for t in list(_cred_tombstones):
+            _cred_meta.pop(t, None)
     seen = {c[0] for c in _CREDENTIALS}
     for entry in data.get("credentials", []):
         cid = entry.get("client_id")
         csec = entry.get("client_secret")
         if not cid or not csec:
+            continue
+        if cid in _cred_tombstones and cid not in builtin_ids:
             continue
         # Pull latest non-volatile meta (label, source, notes, added_at,
         # usage, ...). For volatile keys (last_status etc.) trust the
@@ -228,9 +270,13 @@ def _save_credentials_to_disk():
     # Refresh from disk first so we don't drop creds another worker added.
     _reload_credentials_from_disk()
     builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
-    out = {"credentials": []}
+    out = {"credentials": [],
+           "tombstones": sorted(t for t in _cred_tombstones
+                                if t not in builtin_ids)}
     now_iso = __import__('datetime').datetime.utcnow().isoformat() + "Z"
     for i, (cid, csec) in enumerate(_CREDENTIALS):
+        if cid in _cred_tombstones and cid not in builtin_ids:
+            continue  # belt-and-braces: never persist a tombstoned cred
         meta = dict(_cred_meta.get(cid, {}))
         meta["client_id"] = cid
         meta["client_secret"] = csec
@@ -761,6 +807,10 @@ def add_credential(client_id: str, client_secret: str, label: str = "",
 
     now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
     with _cred_lock:
+        # Re-adding a previously-deleted cred clears its tombstone so it
+        # actually sticks (otherwise _reload_credentials_from_disk would
+        # evict it on the next save).
+        _cred_tombstones.discard(client_id)
         # If the credential is already known, just update meta
         existing_idx = None
         for i, (cid, _) in enumerate(_CREDENTIALS):
@@ -812,10 +862,20 @@ def remove_credential(client_id: str) -> dict:
             if cid == client_id:
                 idx = i
                 break
+        builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
         if idx is None:
+            # Even if we don't currently have it in-memory, record a
+            # tombstone so a stale sibling worker / HA snapshot can't
+            # resurrect it. (No-op for builtins — they'd reappear on
+            # restart anyway.)
+            if client_id and client_id not in builtin_ids:
+                _cred_tombstones.add(client_id)
+                _save_credentials_to_disk()
             return {"ok": False, "error": "not found"}
         _CREDENTIALS.pop(idx)
         _exhausted_cred_indices.discard(idx)
+        if client_id not in builtin_ids:
+            _cred_tombstones.add(client_id)
         # Reindex exhausted set to account for shift
         _exhausted_cred_indices_old = set(_exhausted_cred_indices)
         _exhausted_cred_indices.clear()

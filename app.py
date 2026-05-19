@@ -14747,7 +14747,7 @@ def process_txt():
                                 - int(hist[0].get('t') or 0)) // 60)
             f_s = _stats('f')
             stl_s = _stats('stl')
-            cpu_s = _stats('cpu', 1.0)
+            cpu_s = _stats('cpu')
             b_s = _stats('bev')
             z_s = _stats('zen')
             c_s = _stats('cop')
@@ -14783,7 +14783,7 @@ def process_txt():
             if len(parts) > 3:
                 out.append('          ' + ' · '.join(parts[3:]))
     except Exception:
-        pass
+        log.exception('process.txt throttle block failed')
 
     # --- Processing summary --------------------------------------
     try:

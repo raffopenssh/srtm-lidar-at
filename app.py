@@ -14727,10 +14727,15 @@ def process_txt():
                 # Only consider entries that actually carry the key —
                 # pre-2026-05-19 history written before the steal/cpu
                 # fields existed must not contaminate the min/med with
-                # 0.0 placeholders.
+                # 0.0 placeholders. The director emits a per-entry
+                # `v>=1` marker for records that carry real stl/cpu;
+                # for the steal/cpu keys we require it. Other keys
+                # (f / bev / zen / cop) are present in every entry.
+                _gated = key in ('stl', 'cpu')
                 vals = [float(e[key]) for e in hist
                         if isinstance(e, dict) and key in e
-                        and isinstance(e[key], (int, float))]
+                        and isinstance(e[key], (int, float))
+                        and (not _gated or (e.get('v') or 0) >= 1)]
                 if not vals:
                     return None
                 vals_s = sorted(vals)

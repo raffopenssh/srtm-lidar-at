@@ -14723,16 +14723,21 @@ def process_txt():
         hist = d.get('capacity_history') or []
         comp = d.get('capacity_components') or {}
         if hist:
-            def _stats(key, default=0.0):
-                vals = [float(e.get(key) or default) for e in hist
-                        if isinstance(e, dict)]
+            def _stats(key):
+                # Only consider entries that actually carry the key —
+                # pre-2026-05-19 history written before the steal/cpu
+                # fields existed must not contaminate the min/med with
+                # 0.0 placeholders.
+                vals = [float(e[key]) for e in hist
+                        if isinstance(e, dict) and key in e
+                        and isinstance(e[key], (int, float))]
                 if not vals:
                     return None
                 vals_s = sorted(vals)
                 n = len(vals_s)
                 med = (vals_s[n // 2] if n % 2
                         else (vals_s[n // 2 - 1] + vals_s[n // 2]) / 2)
-                return (vals_s[0], med, vals_s[-1], vals[-1])
+                return (vals_s[0], med, vals_s[-1], vals[-1], len(vals))
             span_min = max(1, (int(hist[-1].get('t') or 0)
                                 - int(hist[0].get('t') or 0)) // 60)
             f_s = _stats('f')
@@ -14754,9 +14759,11 @@ def process_txt():
                     f'min/med/max={f_s[0]:.2f}/{f_s[1]:.2f}/{f_s[2]:.2f}')
             if stl_s:
                 _sn = f'{steal_now:.0f}%' if isinstance(steal_now, (int, float)) else '?'
+                _cov = '' if stl_s[4] == len(hist) else f'/{stl_s[4]}'
                 parts.append(
                     f'steal_med: now={_sn}(n={steal_n}) '
-                    f'min/med/max={stl_s[0]:.0f}/{stl_s[1]:.0f}/{stl_s[2]:.0f}%')
+                    f'min/med/max={stl_s[0]:.0f}/{stl_s[1]:.0f}/{stl_s[2]:.0f}%'
+                    f'{_cov}')
             if cpu_s:
                 parts.append(
                     f'cpu_factor: now={cpu_now:.2f} '

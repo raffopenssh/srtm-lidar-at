@@ -2038,14 +2038,20 @@ class PeerDirector:
         # gunicorn workers see the same data via load_director_state).
         try:
             for entry in (self.state.get('capacity_history') or []):
+                # stl/cpu use None for legacy entries (pre-2026-05-19)
+                # so /process.txt min/med/max stats don't get
+                # contaminated by 0.0 placeholders. Live ticks always
+                # write real values.
+                _stl = entry.get('stl')
+                _cpu = entry.get('cpu')
                 self._capacity_history.append((
                     int(entry.get('t') or 0),
                     float(entry.get('f') or 0.0),
                     float(entry.get('bev') or 0.0),
                     float(entry.get('zen') or 0.0),
                     float(entry.get('cop') or 0.0),
-                    float(entry.get('stl') or 0.0),
-                    float(entry.get('cpu') or 1.0),
+                    float(_stl) if isinstance(_stl, (int, float)) else None,
+                    float(_cpu) if isinstance(_cpu, (int, float)) else None,
                 ))
         except Exception:
             pass
@@ -3098,8 +3104,9 @@ class PeerDirector:
             # otherwise fall back to the persisted snapshot so workers
             # that never tick still serve a populated chart.
             'capacity_history': (
-                [{'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c,
-                  'stl': s, 'cpu': cf}
+                [({'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+                  | ({'stl': s} if s is not None else {})
+                  | ({'cpu': cf} if cf is not None else {}))
                  for (t, f, b, z, c, s, cf) in list(self._capacity_history)]
                 if self._capacity_history
                 else (state.get('capacity_history') or [])
@@ -7753,8 +7760,9 @@ class PeerDirector:
                         # gunicorn workers + a fresh director after restart
                         # all see the same chart immediately.
                         self.state['capacity_history'] = [
-                            {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c,
-                             'stl': s, 'cpu': cf}
+                            ({'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+                              | ({'stl': s} if s is not None else {})
+                              | ({'cpu': cf} if cf is not None else {}))
                             for (t, f, b, z, c, s, cf) in list(self._capacity_history)
                         ]
                         self.state['peer_warning_rates'] = _peer_wr

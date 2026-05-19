@@ -134,7 +134,7 @@ correlate director efficiency with steal trends without parsing JSON.
 
 ### Role-based parks (who is parked, and why)
 
-Only three reasons a peer is parked (`not_before` in the future):
+Only four reasons a peer is parked (`not_before` in the future):
 
 1. **Primary** — `_enforce_primary_park`, every tick. Floor
    `not_before=2027-01-01`, `pinned_role=idle`. Manual reset won't
@@ -151,6 +151,17 @@ Only three reasons a peer is parked (`not_before` in the future):
    NOT park on the nominal 95 GB budget; exe.dev's real limits and
    billing anchors are unknown. Soft canary auto-parks use a short
    1 h cooldown (`auto_park` event); quality parks 6 h.
+4. **Rolling-steal park** — `_check_steal_health`, every tick.
+   30 min cooldown (`steal_park` event) when the per-peer
+   `peer_steal_ema` (~15 min half-life) sits ≥ `STEAL_PARK_THRESHOLD_PCT`
+   (70 %%) for ≥ `STEAL_PARK_PERSIST_S` (10 min). Streak resets when
+   the EMA falls below `STEAL_PARK_RECOVERY_PCT` (50 %%). Goal: stop
+   burning Copernicus credits / KG wall-time on peers stuck on a
+   structurally over-subscribed hypervisor host. exe.dev sometimes
+   re-places idle VMs onto quieter hosts; either way, 30 min off
+   is cheap. Frontier scheduling additionally biases against
+   high-steal peers via `FRONTIER_HIGH_STEAL_BIAS_PCT` (50 %%) so
+   credentials always land on the lowest-steal eligible peer.
 
 The one-shot `_release_unverified_bw_parks` rescues peers that got
 parked-until-renewal *without* an `observed_cap_gb` (legacy budget-

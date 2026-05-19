@@ -399,6 +399,29 @@ THROTTLE_EMA_ALPHA = 0.30
 # 30 s tick cadence, alpha=0.006 gives ~58 min half-life — a peer that
 # upset Zenodo at 06:00 still scores noisy at 09:00.
 PEER_NOISE_LONG_EMA_ALPHA = 0.006
+# Per-peer CPU-steal EWMA (tick cadence ~30 s). alpha=0.033 gives a
+# ~15 min half-life — slow enough to ride out brief hypervisor blips,
+# fast enough that a peer that lands on a quiet host after a park is
+# eligible for frontier work again within ~30 min. Stored on
+# ``state['peer_steal_ema']`` so it survives director restart and is
+# visible to all gunicorn workers via director_state.json.
+PEER_STEAL_EMA_ALPHA = 0.033
+# Rolling-steal auto-park: when a peer's steal EMA sits at or above
+# this for STEAL_PARK_PERSIST_S, park it for STEAL_PARK_COOLDOWN_S.
+# exe.dev doesn't re-place VMs on idle, but a 30 min idle window often
+# coincides with a noisy neighbour finishing its workload, and either
+# way we stop burning Copernicus credits / KG wall-time on a peer that
+# is effectively running at ~15-25 %% of a core.
+STEAL_PARK_THRESHOLD_PCT = 70.0
+STEAL_PARK_RECOVERY_PCT = 50.0       # streak reset hysteresis
+STEAL_PARK_PERSIST_S = 10 * 60
+STEAL_PARK_COOLDOWN_S = 30 * 60
+# Hard tier for frontier scheduling: peers at or above this rolling
+# steal % are demoted to the high-steal tier when picking active /
+# parallel frontier peers. A low-steal peer always outranks a
+# high-steal one when available; the continuous noise + capacity
+# penalty still orders peers *within* a tier.
+FRONTIER_HIGH_STEAL_BIAS_PCT = 50.0
 # Sinusoidal drift: period and amplitude (fraction of total range).
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
 # Sinusoidal drift amplitude. Reduced 2026-04-23 from 0.10 to 0.04 —
@@ -1860,6 +1883,23 @@ def _peer_cpu_steal(peer_id: str) -> float | None:
         return None
 
 
+def _peer_cpu_steal_ema(peer_id: str, state: dict) -> float | None:
+    """Return the rolling director-side steal EMA for *peer_id*.
+
+    Updated in the director tick from the per-peer status stream
+    (``state['peer_steal_ema']``). Falls back to the instantaneous
+    ``_peer_cpu_steal`` so we don't return None just because the
+    director hasn't ticked since the peer reported in.
+    """
+    try:
+        v = ((state.get('peer_steal_ema') or {}) or {}).get(peer_id)
+        if isinstance(v, (int, float)):
+            return float(v)
+    except Exception:
+        pass
+    return _peer_cpu_steal(peer_id)
+
+
 def _peer_cpu_capacity(peer_id: str, default: float = 1.0) -> float:
     """Effective CPU capacity for *peer_id* in [0.10, 1.0].
 
@@ -1952,24 +1992,31 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         if remaining < 2 * (1024 ** 3):
             continue  # not enough headroom
         noise = _peer_noise_score(pid, state)
-        # CPU-steal penalty: prefer peers with real CPU. A frontier
-        # peer burns scarce Copernicus credentials, so running it on a
-        # hypervisor-starved box (60-80%% steal is common on exe.dev's
-        # over-subscribed pools) wastes credit per unit of progress.
-        # 1.0 / capacity ∈ [1.0, 10.0]; a 50 %% steal peer is twice as
-        # costly as a 0 %% peer, a 90 %% peer ten times. Cubed so the
-        # penalty dominates a small noise difference but not a 5-x bw
-        # gap.
-        cap = _peer_cpu_capacity(pid)
+        # CPU-steal penalty + hard tier. Frontier work burns scarce
+        # Copernicus credentials, so we never want to land it on a
+        # heavily-contended host when a quieter peer is available.
+        # The rolling EMA is more stable than the instantaneous
+        # ``_peer_cpu_steal`` (which jitters with every tick) and
+        # better reflects whether the peer's host is structurally
+        # over-subscribed vs briefly noisy.
+        s_ema = _peer_cpu_steal_ema(pid, state)
+        if s_ema is None:
+            s_ema = _peer_cpu_steal(pid) or 0.0
+        cap = max(0.10, 1.0 - float(s_ema) / 100.0)
         steal_pen = (1.0 / cap) - 1.0    # 0.0 at 100%% capacity
-        # Sort key: low noise+steal first, then high remaining bandwidth.
-        # Negate remaining so larger sorts earlier under ascending sort.
-        candidates.append((noise + steal_pen, -remaining, pid))
+        # Hard tier: peers >= FRONTIER_HIGH_STEAL_BIAS_PCT are demoted.
+        # Low-steal peers (Platinum 8259CL pool in May 2026) outrank
+        # any high-steal peer (AMD EPYC pool at ~60 %% steal), even if
+        # the high-steal peer is otherwise quieter or has more bw.
+        steal_tier = 1 if float(s_ema) >= FRONTIER_HIGH_STEAL_BIAS_PCT else 0
+        # Sort key: low-steal tier first, then low noise+steal, then
+        # high remaining bandwidth.
+        candidates.append((steal_tier, noise + steal_pen, -remaining, pid))
 
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][2]
+    return candidates[0][3]
 
 
 def get_peer_by_id(cfg: dict, peer_id: str) -> dict | None:
@@ -2688,6 +2735,7 @@ class PeerDirector:
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
                    'peer_warning_rates', 'peer_noise_long_ema',
+                   'peer_steal_ema', 'peer_steal_streak',
                    'peer_last_live_ts', 'peer_meta',
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
@@ -3132,6 +3180,7 @@ class PeerDirector:
             # by the dashboard noise pill and by load-shifting logic.
             'peer_warning_rates': state.get('peer_warning_rates') or {},
             'peer_noise_long_ema': state.get('peer_noise_long_ema') or {},
+            'peer_steal_ema': state.get('peer_steal_ema') or {},
             'peer_last_live_ts': state.get('peer_last_live_ts') or {},
             'peer_meta': state.get('peer_meta') or {},
             'shadow_peer': state.get('shadow_peer'),
@@ -4287,6 +4336,118 @@ class PeerDirector:
                 save_peers_config(self.cfg)
             except Exception:
                 log.exception('canary park: save_peers_config failed')
+
+    def _check_steal_health(self) -> None:
+        """Auto-park peers whose rolling CPU-steal EMA stays >=
+        :data:`STEAL_PARK_THRESHOLD_PCT` for :data:`STEAL_PARK_PERSIST_S`.
+
+        Motivation: exe.dev's pools are bimodally contended (May 2026:
+        AMD EPYC pool ~60 %% steal_med, Platinum 8259CL ~0 %%). A peer
+        running at 80-95 %% steal burns Copernicus credits and KG
+        wall-time for ~15-25 %% of a core. A short cooldown stops the
+        bleeding and — since exe.dev can re-place idle VMs onto less
+        contended hosts when they next ask for cycles — sometimes
+        rescues the peer outright.
+
+        Rules:
+          * EMA threshold + recovery hysteresis (50 %%) prevents flap.
+          * Streak must last ``STEAL_PARK_PERSIST_S`` (10 min) so a
+            transient noisy-neighbour spike doesn't trip the park.
+          * Cooldown is short (30 min) compared to the bandwidth-wall
+            park (renewal day) — we want the peer back in rotation
+            quickly if the host clears.
+          * Skip peers that already have a future ``not_before`` set
+            (primary park, bw-wall park, canary park), so we don't
+            stomp on longer cooldowns.
+          * Skip peers without a fleet ``peer_steal_ema`` sample yet.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        with self._lock:
+            cfg = self.cfg
+            state = self.state
+            peers = list(cfg.get('peers', []))
+            streaks = state.setdefault('peer_steal_streak', {})
+            stl_ema = dict(state.get('peer_steal_ema') or {})
+        now_ts = time.time()
+        cfg_changed = False
+        live_ids: set[str] = set()
+        for p in peers:
+            if not p.get('enabled', True):
+                continue
+            pid = p['id']
+            live_ids.add(pid)
+            s = stl_ema.get(pid)
+            if not isinstance(s, (int, float)):
+                streaks.pop(pid, None)
+                continue
+            # Update streak.
+            if s >= STEAL_PARK_THRESHOLD_PCT:
+                st = streaks.setdefault(pid, {'since': now_ts})
+                st['last_steal'] = round(float(s), 2)
+                st['last_ts'] = now_ts
+            elif s <= STEAL_PARK_RECOVERY_PCT:
+                streaks.pop(pid, None)
+                continue
+            else:
+                # In the hysteresis band: hold streak but don't extend.
+                continue
+            # Streak alive — long enough?
+            streak_age = max(0.0, now_ts - float(
+                (streaks.get(pid) or {}).get('since') or now_ts))
+            if streak_age < STEAL_PARK_PERSIST_S:
+                continue
+            # Don't stomp on a longer cooldown already in effect.
+            if _peer_is_scheduled(p):
+                continue
+            cooldown = _dt.now(_tz.utc) + _td(seconds=STEAL_PARK_COOLDOWN_S)
+            with self._lock:
+                live = get_peer_by_id(self.cfg, pid)
+                if not live or not live.get('enabled', True):
+                    continue
+                if _peer_is_scheduled(live):
+                    continue
+                live['not_before'] = cooldown.isoformat()
+                notes = live.setdefault('canary_notes', [])
+                reason = (f'rolling steal {s:.0f}% >= '
+                          f'{STEAL_PARK_THRESHOLD_PCT:.0f}% for '
+                          f'{int(streak_age)}s')
+                notes.append({
+                    'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'event': 'steal_park',
+                    'reasons': [reason],
+                    'cooldown_until': cooldown.isoformat(),
+                    'steal_ema': round(float(s), 2),
+                })
+                if len(notes) > 32:
+                    del notes[: len(notes) - 32]
+                cfg_changed = True
+                peer_url = live.get('url')
+            log.warning('steal-park %s: %s — not_before=%s',
+                        pid, reason, cooldown.isoformat())
+            try:
+                _emit_director_event(
+                    f'steal-park {pid}: {reason} (cooldown until '
+                    f'{cooldown.isoformat()})',
+                    peer=pid, level='warning')
+            except Exception:
+                pass
+            try:
+                if peer_url:
+                    stop_peer_processor(peer_url, graceful=True)
+            except Exception as e:
+                log.warning('steal-park %s: graceful stop failed: %s',
+                            pid, e)
+            # Reset streak so the next admission cycle starts clean.
+            streaks.pop(pid, None)
+        # Trim streaks for peers no longer in the fleet.
+        for stale_id in list(streaks.keys()):
+            if stale_id not in live_ids:
+                streaks.pop(stale_id, None)
+        if cfg_changed:
+            try:
+                save_peers_config(self.cfg)
+            except Exception:
+                log.exception('steal-park: save_peers_config failed')
 
     def _check_and_switch(self):
         """Check if we need to switch the active peer."""
@@ -6249,12 +6410,21 @@ class PeerDirector:
         # valuable on a low-steal peer (cred efficiency). Add
         # (1/capacity - 1) so a 50%% steal peer ranks +1.0 worse than
         # a 0%% peer, ahead of the typical noise spread (<0.5).
-        candidates.sort(key=lambda c: (
-            1 if c.get('needs_stop_cache_only') else 0,
-            _peer_noise_score(c['peer']['id'], state_copy)
-            + ((1.0 / _peer_cpu_capacity(c['peer']['id'])) - 1.0),
-            c['peer']['id'],
-        ))
+        def _frontier_sort_key(c):
+            _pid = c['peer']['id']
+            _s = _peer_cpu_steal_ema(_pid, state_copy)
+            if _s is None:
+                _s = _peer_cpu_steal(_pid) or 0.0
+            _cap = max(0.10, 1.0 - float(_s) / 100.0)
+            _tier = 1 if float(_s) >= FRONTIER_HIGH_STEAL_BIAS_PCT else 0
+            return (
+                1 if c.get('needs_stop_cache_only') else 0,
+                _tier,
+                _peer_noise_score(_pid, state_copy)
+                + ((1.0 / _cap) - 1.0),
+                _pid,
+            )
+        candidates.sort(key=_frontier_sort_key)
         # Include retained_unreachable peers up front so their cred /
         # strip plan is reissued (preserving their prior slice) instead
         # of being treated as a fresh candidate and triggering a
@@ -7777,6 +7947,35 @@ class PeerDirector:
                             for (t, f, b, z, c, s, cf) in list(self._capacity_history)
                         ]
                         self.state['peer_warning_rates'] = _peer_wr
+                        # Per-peer CPU-steal EMA. Tick cadence ~30 s,
+                        # alpha=0.033 → ~15 min half-life. Only update
+                        # when the peer reported a fresh sample this
+                        # tick — unreachable peers keep their previous
+                        # value (they'll either come back and resume
+                        # smoothing, or get dropped below when no
+                        # longer in the fleet config).
+                        _stl_ema = dict(
+                            self.state.get('peer_steal_ema') or {})
+                        _stl_a = PEER_STEAL_EMA_ALPHA
+                        for _pid, _ps in (_statuses or {}).items():
+                            _sys = (_ps or {}).get('system') or {}
+                            _perf = _sys.get('perf') or {}
+                            _v = _perf.get('cpu_steal_ewma')
+                            if _v is None:
+                                _v = _sys.get('cpu_steal')
+                            if not isinstance(_v, (int, float)):
+                                continue
+                            _prev_s = _stl_ema.get(_pid)
+                            if isinstance(_prev_s, (int, float)):
+                                _new_s = (_stl_a * float(_v)
+                                          + (1.0 - _stl_a) * float(_prev_s))
+                            else:
+                                _new_s = float(_v)
+                            _stl_ema[_pid] = round(_new_s, 2)
+                        for _pid in list(_stl_ema.keys()):
+                            if _pid not in _live:
+                                _stl_ema.pop(_pid, None)
+                        self.state['peer_steal_ema'] = _stl_ema
                 except Exception:
                     log.exception('capacity factor computation failed')
                 with self._lock:
@@ -7813,6 +8012,13 @@ class PeerDirector:
                     self._check_canary_health()
                 except Exception:
                     log.exception('Canary health check error')
+                # Rolling-steal auto-park: peers stuck on a contended
+                # hypervisor host get a 30 min cooldown so we stop
+                # burning Copernicus credits / wall-time on them.
+                try:
+                    self._check_steal_health()
+                except Exception:
+                    log.exception('Steal health check error')
                 # Per-peer bandwidth-wall enforcement (low-water /
                 # hard-depleted park-until-renewal) for non-active
                 # peers. _check_and_switch handles the active one.

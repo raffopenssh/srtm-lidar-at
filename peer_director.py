@@ -3106,12 +3106,20 @@ class PeerDirector:
             # Use in-memory history if this worker runs the loop;
             # otherwise fall back to the persisted snapshot so workers
             # that never tick still serve a populated chart.
+            # Prefer disk-backed history when *this* worker is not the
+            # one running the director loop (its in-memory deque was
+            # snapshotted at import time and never updates). The
+            # loop-running worker persists on every tick, so disk is
+            # at most ~30s behind live deque and identical at steady
+            # state. Two-worker race ('with_v: 0' vs 'with_v: 1' on
+            # alternating polls) is what made the /process.txt steal
+            # stats look empty for ~30 min after a srv restart.
             'capacity_history': (
                 [({'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
                   | ({'stl': s, 'cpu': cf, 'v': 1}
                      if (s is not None and cf is not None) else {}))
                  for (t, f, b, z, c, s, cf) in list(self._capacity_history)]
-                if self._capacity_history
+                if getattr(self, '_lock_fd', None) is not None
                 else (state.get('capacity_history') or [])
             ),
             'peer_history': (

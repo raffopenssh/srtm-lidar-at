@@ -2044,6 +2044,8 @@ class PeerDirector:
                     float(entry.get('bev') or 0.0),
                     float(entry.get('zen') or 0.0),
                     float(entry.get('cop') or 0.0),
+                    float(entry.get('stl') or 0.0),
+                    float(entry.get('cpu') or 1.0),
                 ))
         except Exception:
             pass
@@ -2195,6 +2197,43 @@ class PeerDirector:
         wobble so we don't sit pinned at the cap.
         """
         rates = self._fleet_warning_rates(statuses)
+        # Fleet CPU-steal median across *running* peers — same population
+        # the cache-only ramp brake uses (see _max_cache_only_peers).
+        # Snapshot it here so /api/v1/director/status carries it on
+        # every tick (cheap; we already have ``statuses``) and the
+        # sparkline can plot the rolling history.
+        try:
+            _steal_vals = []
+            for _pid, _ps in (statuses or {}).items():
+                _st = (_ps or {}).get('state')
+                if _st not in ('running', 'processing'):
+                    continue
+                _sys = (_ps or {}).get('system') or {}
+                _perf = _sys.get('perf') or {}
+                _v = _perf.get('cpu_steal_ewma')
+                if _v is None:
+                    _v = _sys.get('cpu_steal')
+                if isinstance(_v, (int, float)):
+                    _steal_vals.append(float(_v))
+            _steal_vals.sort()
+            if _steal_vals:
+                _n = len(_steal_vals)
+                _steal_med = (_steal_vals[_n // 2] if _n % 2
+                               else (_steal_vals[_n // 2 - 1]
+                                     + _steal_vals[_n // 2]) / 2)
+            else:
+                _steal_med = 0.0
+        except Exception:
+            _steal_vals = []
+            _steal_med = 0.0
+        # cpu_factor curve mirrors the damping in _max_cache_only_peers:
+        # gentle ramp-brake that floors at 0.55. Surfaces *why* the
+        # director may be running fewer cache-only peers than the
+        # warning-rate ceiling alone would allow.
+        if _steal_med >= 40.0:
+            _cpu_factor = max(0.55, 1.0 - (_steal_med - 30.0) / 200.0)
+        else:
+            _cpu_factor = 1.0
         sub = {}
         for kind, sat in THROTTLE_SATURATION_RATE.items():
             r = float(rates.get(kind, 0.0))
@@ -2236,6 +2275,9 @@ class PeerDirector:
         self._capacity_components = {
             'rates': {k: rates.get(k, 0.0)
                        for k in ('bev', 'zenodo', 'copernicus', 'auth')},
+            'steal_median': round(float(_steal_med), 1),
+            'steal_n': len(_steal_vals),
+            'cpu_factor': round(float(_cpu_factor), 3),
             'sub_factors': {k: round(v, 3) for k, v in sub.items()},
             'sub_factor_emas': {k: round(float(v), 3)
                                  for k, v in self._sub_factor_ema.items()},
@@ -2261,6 +2303,8 @@ class PeerDirector:
             round(float(rates.get('bev', 0.0)), 3),
             round(float(rates.get('zenodo', 0.0)), 3),
             round(float(rates.get('copernicus', 0.0)), 3),
+            round(float(_steal_med), 1),
+            round(float(_cpu_factor), 3),
         ))
         return final
 
@@ -3054,8 +3098,9 @@ class PeerDirector:
             # otherwise fall back to the persisted snapshot so workers
             # that never tick still serve a populated chart.
             'capacity_history': (
-                [{'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
-                 for (t, f, b, z, c) in list(self._capacity_history)]
+                [{'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c,
+                  'stl': s, 'cpu': cf}
+                 for (t, f, b, z, c, s, cf) in list(self._capacity_history)]
                 if self._capacity_history
                 else (state.get('capacity_history') or [])
             ),
@@ -7708,8 +7753,9 @@ class PeerDirector:
                         # gunicorn workers + a fresh director after restart
                         # all see the same chart immediately.
                         self.state['capacity_history'] = [
-                            {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
-                            for (t, f, b, z, c) in list(self._capacity_history)
+                            {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c,
+                             'stl': s, 'cpu': cf}
+                            for (t, f, b, z, c, s, cf) in list(self._capacity_history)
                         ]
                         self.state['peer_warning_rates'] = _peer_wr
                 except Exception:

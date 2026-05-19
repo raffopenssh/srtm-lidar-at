@@ -4262,6 +4262,10 @@ function renderCapacityHistory() {
   // Saturation rates from peer_director.THROTTLE_SATURATION_RATE.
   // Keep in sync with backend (re-tuned 2026-04-23 for ~50-peer fleet).
   const sat = {bev: 5.0, zen: 1.5, cop: 0.4};
+  // Steal % → normalised onto the same 0..1 axis.  The director's
+  // cpu_factor damping kicks in at 30%% steal and floors the cache-only
+  // ramp by 60%% steal, so we anchor the visible range to 60.
+  const STEAL_FULL = 60.0;
   // Determine y-range. Factor stays in [0.30, 1.00]; rates are
   // normalised by saturation so they share the same axis as factor.
   let dataMin = 1.0, dataMax = 0.30;
@@ -4270,7 +4274,8 @@ function renderCapacityHistory() {
     dataMax = Math.max(dataMax, e.f);
     dataMax = Math.max(dataMax, (e.bev || 0) / sat.bev,
                                  (e.zen || 0) / sat.zen,
-                                 (e.cop || 0) / sat.cop);
+                                 (e.cop || 0) / sat.cop,
+                                 (e.stl || 0) / STEAL_FULL);
   }
   // Pad and snap. Floor at 0.30 (THROTTLE_MIN_FACTOR) when factor never
   // climbed above ~0.5; otherwise floor at 0.
@@ -4314,13 +4319,19 @@ function renderCapacityHistory() {
   // Build tooltip from current rates.
   const elapsedMin = Math.round((tN - t0) / 60);
   const agg = (comp && comp.aggregation) || 'max';
+  const stealMed = (comp && typeof comp.steal_median === 'number') ? comp.steal_median : null;
+  const stealN = (comp && typeof comp.steal_n === 'number') ? comp.steal_n : 0;
+  const cpuFactor = (comp && typeof comp.cpu_factor === 'number') ? comp.cpu_factor : 1.0;
   const tip = 'Capacity factor over last ' + elapsedMin + 'm.\n' +
     'Pulls peer parallelism down when upstreams emit warnings.\n' +
     'Aggregation: ' + agg.toUpperCase() +
     (agg === 'p90' ? ' (ignores top 10% outliers)' : '') + '\n' +
     'Now: BEV ' + (r.bev||0) + '/min · Zen ' + (r.zenodo||0) +
     '/min · Cop ' + (r.copernicus||0) + '/min' +
-    ((r.auth||0) ? ' · Auth ' + (r.auth||0) + '/min (diag)' : '');
+    ((r.auth||0) ? ' · Auth ' + (r.auth||0) + '/min (diag)' : '') +
+    '\nFleet CPU steal: ' + (stealMed != null ? stealMed.toFixed(1) + '% median (n=' + stealN + ')' : 'n/a') +
+    ' → ramp-brake cpu_factor=' + cpuFactor.toFixed(2) +
+    (cpuFactor < 1.0 ? ' (active, throttling cache-only count)' : ' (idle, <30% steal)');
   // y-range label so a zoomed view doesn't lie about absolute values.
   const rangeLbl = '<text x="1" y="7" font-size="7" fill="#888">' +
     Math.round(yHi*100) + '%</text>' +
@@ -4333,15 +4344,32 @@ function renderCapacityHistory() {
     '<path d="' + normPath('bev','bev') + '" fill="none" stroke="#e05656" stroke-width="0.8" opacity="0.55"/>' +
     '<path d="' + normPath('zen','zen') + '" fill="none" stroke="#d6b94b" stroke-width="0.8" opacity="0.55"/>' +
     '<path d="' + normPath('cop','cop') + '" fill="none" stroke="#9b6df0" stroke-width="0.8" opacity="0.55"/>' +
+    // Fleet CPU-steal median (orange) — director efficiency proxy.
+    // High steal means exe.dev's shared hypervisor pool is congested
+    // and the LPT partition is paying for cycles we don't have.
+    '<path d="' + (function(){
+      let p = ''; for (let i=0; i<n; i++) {
+        const e = hist[i];
+        const x = ((e.t - t0) / span) * W;
+        const y = ny((e.stl || 0) / STEAL_FULL);
+        p += (i===0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+      } return p; })() + '" fill="none" stroke="#f08c3a" stroke-width="0.8" opacity="0.65" stroke-dasharray="2,1"/>' +
     // capacity factor (bold)
     '<path d="' + pathFor('f') + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' +
     rangeLbl;
   svg.style.visibility = 'visible';
   det.style.visibility = 'visible';
+  const stealTxt = (stealMed != null)
+    ? ('<span style="color:#f08c3a" title="Fleet CPU-steal median across running peers (n='
+        + stealN + '). >=30% triggers director ramp-brake (cpu_factor=' + cpuFactor.toFixed(2)
+        + '). >=15% per peer flags as throttled in /process.txt fleet_cpu line.">S '
+        + stealMed.toFixed(0) + '%</span>')
+    : '';
   det.innerHTML = '<span style="color:' + color + '"><b>' + pct + '%</b></span> capacity · ' +
     '<span style="color:#e05656" title="BEV warnings/min (5m)">B ' + (r.bev||0).toFixed(1) + '</span> · ' +
     '<span style="color:#d6b94b" title="Zenodo warnings/min (5m)">Z ' + (r.zenodo||0).toFixed(1) + '</span> · ' +
-    '<span style="color:#9b6df0" title="Copernicus warnings/min (5m)">C ' + (r.copernicus||0).toFixed(1) + '</span>';
+    '<span style="color:#9b6df0" title="Copernicus warnings/min (5m)">C ' + (r.copernicus||0).toFixed(1) + '</span>' +
+    (stealTxt ? ' · ' + stealTxt : '');
 }
 
 // Compute KG progress fraction (0..1) from peer fields shaped by

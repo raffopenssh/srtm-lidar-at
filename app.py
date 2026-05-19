@@ -14712,6 +14712,67 @@ def process_txt():
             f'last_push={d.get("shadow_last_push_ts") or "-"}'
         )
 
+    # --- Throttle / director efficiency history ------------------
+    # capacity_history is a ~2h ring (240 × 30s ticks) persisted via
+    # director_state.json so it survives handover + both gunicorn
+    # workers. Surface a compact summary here so an offline forensic
+    # read (process.txt mining) tells you *why* the director ran at
+    # whatever capacity it did: which upstream was loud (BEV/Zen/Cop)
+    # AND how much CPU the host actually had (steal).
+    try:
+        hist = d.get('capacity_history') or []
+        comp = d.get('capacity_components') or {}
+        if hist:
+            def _stats(key, default=0.0):
+                vals = [float(e.get(key) or default) for e in hist
+                        if isinstance(e, dict)]
+                if not vals:
+                    return None
+                vals_s = sorted(vals)
+                n = len(vals_s)
+                med = (vals_s[n // 2] if n % 2
+                        else (vals_s[n // 2 - 1] + vals_s[n // 2]) / 2)
+                return (vals_s[0], med, vals_s[-1], vals[-1])
+            span_min = max(1, (int(hist[-1].get('t') or 0)
+                                - int(hist[0].get('t') or 0)) // 60)
+            f_s = _stats('f')
+            stl_s = _stats('stl')
+            cpu_s = _stats('cpu', 1.0)
+            b_s = _stats('bev')
+            z_s = _stats('zen')
+            c_s = _stats('cop')
+            # cur values come from comp where available (more recent
+            # than the last history sample).
+            r_now = comp.get('rates') or {}
+            steal_now = comp.get('steal_median')
+            steal_n = comp.get('steal_n') or 0
+            cpu_now = comp.get('cpu_factor', 1.0)
+            parts = [f'throttle: window={span_min}m n={len(hist)}']
+            if f_s:
+                parts.append(
+                    f'cap_factor: now={f_s[3]:.2f} '
+                    f'min/med/max={f_s[0]:.2f}/{f_s[1]:.2f}/{f_s[2]:.2f}')
+            if stl_s:
+                _sn = f'{steal_now:.0f}%' if isinstance(steal_now, (int, float)) else '?'
+                parts.append(
+                    f'steal_med: now={_sn}(n={steal_n}) '
+                    f'min/med/max={stl_s[0]:.0f}/{stl_s[1]:.0f}/{stl_s[2]:.0f}%')
+            if cpu_s:
+                parts.append(
+                    f'cpu_factor: now={cpu_now:.2f} '
+                    f'min/med={cpu_s[0]:.2f}/{cpu_s[1]:.2f}')
+            if b_s:
+                parts.append(
+                    f'warns/min B={float(r_now.get("bev", 0) or 0):.1f}(max={b_s[2]:.1f}) '
+                    f'Z={float(r_now.get("zenodo", 0) or 0):.1f}(max={z_s[2]:.1f}) '
+                    f'C={float(r_now.get("copernicus", 0) or 0):.1f}(max={c_s[2]:.1f})')
+            # Render as two lines so the dashboard text wraps cleanly.
+            out.append(parts[0] + ' · ' + ' · '.join(parts[1:3] if len(parts) >= 3 else parts[1:]))
+            if len(parts) > 3:
+                out.append('          ' + ' · '.join(parts[3:]))
+    except Exception:
+        pass
+
     # --- Processing summary --------------------------------------
     try:
         prog_path = Path('data/austria_processor/progress.json')

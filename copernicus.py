@@ -871,6 +871,8 @@ def remove_credential(client_id: str) -> dict:
             if client_id and client_id not in builtin_ids:
                 _cred_tombstones.add(client_id)
                 _save_credentials_to_disk()
+                return {"ok": True, "removed": client_id,
+                        "note": "not in local pool; tombstone recorded"}
             return {"ok": False, "error": "not found"}
         _CREDENTIALS.pop(idx)
         _exhausted_cred_indices.discard(idx)

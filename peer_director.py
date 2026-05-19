@@ -3721,11 +3721,52 @@ class PeerDirector:
             targets[me] = 'director'
         if shadow and shadow != 'primary' and shadow != me:
             targets[shadow] = 'shadow'
-        if not targets:
-            return
+        # Note: empty targets is fine and falls through to the cleanup
+        # loop below — we still want to release ex-directors / ex-shadows
+        # whose pinned_role was set by a previous tick but never cleared.
         with self._lock:
             cfg = self.cfg
             changed = False
+            # First pass: clear stale role-parks on peers that are no
+            # longer director/shadow. Bug fix: previously this method
+            # only stamped roles; pinned_role='idle' accumulated forever
+            # on every ex-shadow, leaving them permanently excluded
+            # from rotation even after not_before rolled off.
+            for p in cfg.get('peers', []):
+                pid = p.get('id')
+                if pid in targets or pid == 'primary':
+                    continue
+                notes = p.get('canary_notes') or []
+                last_rp = next((n for n in reversed(notes[-12:])
+                                if isinstance(n, dict)
+                                and n.get('event') == 'role_park'), None)
+                if not last_rp:
+                    continue  # role wasn't set by us — leave it alone
+                # Was this peer parked by us, but is no longer in the
+                # active director/shadow set? Clear our stamp.
+                cur_role = (p.get('pinned_role') or '').strip().lower()
+                if cur_role != 'idle':
+                    continue
+                p['pinned_role'] = None
+                # Only drop not_before if it matches a role_park stamp
+                # (don't shrink canary/manual cooldowns).
+                nb = p.get('not_before')
+                if nb and last_rp.get('cooldown_until') == nb:
+                    p.pop('not_before', None)
+                notes.append({
+                    'at': _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'event': 'park_released',
+                    'reason': 'role_park auto-clear: peer no longer '
+                              f'{last_rp.get("role", "director/shadow")}',
+                })
+                if len(notes) > 32:
+                    del notes[: len(notes) - 32]
+                p['canary_notes'] = notes
+                changed = True
+            if not targets:
+                # No-op fast path — the outer save block below handles
+                # persistence if the cleanup pass made any changes.
+                pass
             for p in cfg.get('peers', []):
                 pid = p.get('id')
                 if pid not in targets:

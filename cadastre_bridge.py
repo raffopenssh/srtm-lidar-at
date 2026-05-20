@@ -1757,12 +1757,13 @@ def habitat_processed_count(
             break
         offset += PAGE
 
+    filters_out = {k: v for k, v in {
+        'habitat': habitat, 'sitetype': sitetype, 'sitecode': sitecode,
+        'state': state, 'district': district, 'gemeinde': gemeinde,
+        'landuse': landuse, 'has_buildings': has_buildings,
+    }.items() if v is not None}
     out: dict[str, Any] = {
-        'filters': {
-            'habitat': habitat, 'sitetype': sitetype, 'sitecode': sitecode,
-            'state': state, 'district': district, 'gemeinde': gemeinde,
-            'landuse': landuse, 'has_buildings': has_buildings,
-        },
+        'filters': filters_out,
         'cadastre_total': cadastre_total,
         'processed_total': processed_total,
         'unprocessed_total': max(cadastre_total - processed_total, 0),

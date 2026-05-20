@@ -197,3 +197,63 @@ grep -rn '# ===' *.py | sed 's/# === SECTION: //' | sed 's/ ===//' | column -t -
 ---
 
 *See `AGENTS.md` for the project map.*
+
+
+## Natura 2000 bridge (cadastre-process-api)
+
+The cadastre API carries an indexed per-parcel Natura 2000 cache (353 AT
+sites, ~896k parcels). We forward the `query` dict verbatim in
+`/api/v1/parcels/batch` Mode 2 and `/api/v1/query/nature`, so **no SRTM
+code change is needed** to bridge these.
+
+**Filters on cadastre `/query` (passthrough via our Mode 2 `query`):**
+- `has_natura2000=true|false` — parcel centroid in any N2K site
+- `natura2000_site=<sitecode>` — restrict to one site (e.g. `AT1205A00` Wachau)
+- Site types: `A`=Birds Directive (SPA), `B`=Habitats (pSCI/SCI/SAC), `C`=both
+
+**Enrichment automatically present on returned parcels:**
+- `in_natura2000` (bool), `natura2000_sites[]` of `{sitecode, sitename, sitetype, site_type_label, area_ha}`
+
+**Direct cadastre endpoints** (use `https://cadastre-process-api.exe.xyz`):
+`/api/v1/natura2000/{stats,search,site/<code>,site_parcels/<code>,point,parcel/<kg>/<gnr>,kg/<kg>}`
+
+### Power-query examples (landscape × Natura 2000)
+
+```bash
+# Forested N2K parcels in Tirol, no buildings, ranked by conservation score
+curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
+  -H 'Content-Type: application/json' -d '{
+    "query": {"has_natura2000":"true","state":"Tirol","landuse":"W",
+              "has_buildings":"false","min_area":5000},
+    "landscape_filters": {"min_tree_canopy_sqm":2000,"min_ndvi":0.5,
+                          "sort":"conservation_score"},
+    "limit": 50}'
+
+# All parcels in one Habitats site enriched with our landscape index
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_site=AT1205A00&limit=200'
+
+# Steep south-facing alpine N2K grassland candidates (compound → parcels)
+curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
+  -H 'Content-Type: application/json' -d '{
+    "compound": {"min_slope":20,"aspect":["S","SW","SE"],"min_elevation":1500,
+      "type_filters":[{"type":"grass","min_confidence":0.7,"min_area_sqm":500}]},
+    "parcel_filters": {"cadastre_has_buildings":false,"sort":"conservation_score"},
+    "query": {"has_natura2000":"true"}, "cadastre_enrich": true, "limit": 100}'
+
+# Edge cases: legally named in law but OUTSIDE polygon (RIS only)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?has_natura2000=false&has_legal_refs=true&legal_context=nature_protection&limit=50'
+```
+
+**Performance**: cadastre's N2K filter is an indexed SQLite cache — typically
+<100 ms even for hundreds of thousands of matches. Aggregate stats are
+skipped by default when an N2K filter is active; pass `with_stats=true` to force.
+
+## KG runtime limits (current state, May 2026)
+
+`KG_TIMEOUT_SECONDS = 16 h` (first attempt) / `KG_RETRY_TIMEOUT_SECONDS = 12 h`
+(retry). No timeout-induced failures in the warning archive. Long-running
+KGs (e.g. `gpkg_full` at 11h) finish well inside the wall. Dominant warning
+pattern is **openEO 503 / NDVI read-timeout** (transient upstream issues,
+already handled with month-skip). **No need to extend KG runtime limits.**
+Revisit only if `Maximum processing time ... exceeded` warnings appear in
+`process.txt?warn=1`.

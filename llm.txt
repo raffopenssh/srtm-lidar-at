@@ -1736,6 +1736,54 @@ Example: /api/v1/query/nature?protected_area=Kalkalpen&limit=10
 Example: /api/v1/query/nature?state=Steiermark&legal_context=nature_protection&min_area_sqm=10000
 Example: /api/v1/query/nature?gemeinde=61630&landuse=W&has_buildings=false
 
+### Natura 2000 bridge (via cadastre-process-api)
+Cadastre-process-api carries 353 AT Natura 2000 sites and a per-parcel cache
+(~896k parcels). All filters are pass-through from /api/v1/parcels/batch Mode 2
+("query":{...}) and /api/v1/query/nature — no SRTM-lidar code change needed,
+the `query` dict is forwarded verbatim. Per-parcel cadastre rows returned by
+Mode 2 carry `in_natura2000` (bool) and `natura2000_sites[]` ({sitecode,
+sitename, sitetype A=Birds/B=Habitats/C=both, area_ha}).
+
+New filters on Mode 2 / /api/v1/query/nature `query`:
+  has_natura2000=true|false      parcel centroid in any N2K site
+  natura2000_site=<sitecode>     restrict to one site, e.g. AT1205A00 (Wachau)
+
+Direct cadastre passthroughs (just curl, no bridge wrapper yet):
+  /api/v1/cadastre/proxy → /api/v1/natura2000/{stats,search,site/{code},
+    site_parcels/{code},point?lon=&lat=,parcel/{kg}/{gnr},kg/{kg}}
+
+Cross-API examples (landscape × Natura 2000):
+```bash
+# Forested N2K parcels in Tirol with high tree canopy and no buildings, ranked by conservation score
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "query": {"has_natura2000": "true", "state": "Tirol", "landuse": "W", "has_buildings": "false", "min_area": 5000},
+  "landscape_filters": {"min_tree_canopy_sqm": 2000, "min_ndvi": 0.5, "sort": "conservation_score"},
+  "limit": 50}'
+
+# All parcels in one Habitats Directive site (Wachau) enriched with our landscape index
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_site=AT1205A00&limit=200'
+
+# Steep south-facing N2K grassland (alpine meadow candidates) via compound→parcels
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "compound": {"min_slope": 20, "aspect": ["S","SW","SE"], "min_elevation": 1500,
+               "type_filters": [{"type":"grass","min_confidence":0.7,"min_area_sqm":500}]},
+  "parcel_filters": {"cadastre_has_buildings": false, "sort": "conservation_score"},
+  "cadastre_enrich": true, "limit": 100,
+  "query": {"has_natura2000": "true"}}'   # filter post-hoc on enriched in_natura2000
+
+# Outside any N2K but legally protected (RIS-named but not in any polygon)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?has_natura2000=false&has_legal_refs=true&legal_context=nature_protection&limit=50'
+
+# What % of a Gemeinde is covered by Natura 2000?
+curl 'https://cadastre-process-api.exe.xyz/api/v1/natura2000/kg/12358'
+
+# Point lookup — which sites cover this coordinate?
+curl 'https://cadastre-process-api.exe.xyz/api/v1/natura2000/point?lon=15.45&lat=48.36'
+```
+
+Note: when `has_natura2000` or `natura2000_site` is set, cadastre defaults to
+`with_stats=false` for speed; pass `with_stats=true` if you need totals.
+
 ### GET /api/v1/parcel/<parcel_id>/detail
 Full combined detail for one parcel from both APIs.
 Includes: cadastre data, legal refs, protected area containment check,

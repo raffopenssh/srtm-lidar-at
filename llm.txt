@@ -1665,6 +1665,10 @@ parcel_filters (per-parcel from our KG JSONs):
   min_hansen_recent_5yr, max_hansen_recent_5yr (int, Hansen 2020–2024 loss pixels),
   min_hansen_total, max_hansen_total (int, Hansen all-time loss pixels),
   cadastre_has_buildings, cadastre_landuse, cadastre_min_area, cadastre_max_area,
+  cadastre_in_natura2000 (bool), cadastre_natura2000_site (sitecode),
+  cadastre_natura2000_type (A|B|C — Birds/Habitats/both),
+  cadastre_natura2000_habitat (moor|floodplain|river|lake|wetland|forest|alpine|
+    meadow|pasture|valley|hill|steppe|orchard|park|cave),
   sort (conservation_score|vegetated_fraction|forested_fraction|elevation|ndsm_max|parcel_area|hansen_recent|hansen_total),
   sort_dir (asc|desc)
 
@@ -1695,6 +1699,13 @@ GET syntax for Mode 3 (compound → parcels):
   pf_sort=conservation_score  pf_sort_dir=desc
   pf_cadastre_in_natura2000=true|false   parcel centroid in any N2K site
   pf_cadastre_natura2000_site=AT1205A00  parcel in this specific N2K site
+  pf_cadastre_natura2000_type=A|B|C       directive type:
+                                          A=Birds/SPA, B=Habitats/SCI-SAC, C=both
+                                          (C also matches A-only & B-only sites)
+  pf_cadastre_natura2000_habitat=<tag>    habitat tag inferred from sitename:
+                                          moor|floodplain|river|lake|wetland|
+                                          forest|alpine|meadow|pasture|valley|
+                                          hill|steppe|orchard|park|cave
   cadastre_enrich=true|false (default true; needed for cadastre_* pf filters)
 
 Per-parcel terrain query examples:
@@ -1749,6 +1760,13 @@ sitename, sitetype A=Birds/B=Habitats/C=both, area_ha}).
 New filters on Mode 2 / /api/v1/query/nature `query`:
   has_natura2000=true|false      parcel centroid in any N2K site
   natura2000_site=<sitecode>     restrict to one site, e.g. AT1205A00 (Wachau)
+  natura2000_type=A|B|C          directive type: A=Birds/SPA, B=Habitats/SCI-SAC,
+                                 C=both. Indexed (natura2000_parcel_index).
+  natura2000_habitat=<tag>       habitat class inferred from sitename
+                                 (natura2000_parcel_habitats table). Tags:
+                                 moor|floodplain|river|lake|wetland|forest|
+                                 alpine|meadow|pasture|valley|hill|steppe|
+                                 orchard|park|cave.
 
 Direct cadastre passthroughs (just curl, no bridge wrapper yet):
   /api/v1/cadastre/proxy → /api/v1/natura2000/{stats,search,site/{code},
@@ -1789,6 +1807,42 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type:
 
 # All parcels in one Habitats Directive site (Wachau) enriched with our landscape index
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_site=AT1205A00&limit=200'
+
+# All Birds Directive (SPA, type=A) parcels in Burgenland, observed-grass
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "compound": {"state":"Burgenland",
+               "type_filters":[{"type":"grass","min_confidence":0.7,"min_area_sqm":500}]},
+  "parcel_filters": {"types":["grass"], "min_type_fraction":0.4,
+                     "cadastre_natura2000_type":"A",
+                     "sort":"conservation_score"},
+  "cadastre_enrich": true, "limit": 50}'
+
+# Habitat-class index: ALL MOOR parcels (peatlands) we have processed,
+# observed wet (low NDSM, vegetated). Backed by natura2000_parcel_habitats
+# in cadastre-process-api — millisecond-fast indexed join.
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "compound": {"min_vegetated_fraction":0.5},
+  "parcel_filters": {"cadastre_natura2000_habitat":"moor",
+                     "max_ndsm_max":2,
+                     "sort":"conservation_score"},
+  "cadastre_enrich": true, "limit": 100}'
+
+# Floodplain forests (Auwald): N2K habitat=floodplain × OUR observed trees
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "compound": {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
+  "parcel_filters": {"types":["tree"], "min_type_fraction":0.5,
+                     "min_ndsm_max":8,
+                     "cadastre_natura2000_habitat":"floodplain",
+                     "sort":"conservation_score"},
+  "cadastre_enrich": true, "limit": 100}'
+
+# Cadastre-only habitat lookup (bypass landscape index, fast)
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_habitat=alpine&state=Tirol&limit=200'
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_type=B&state=K%C3%A4rnten&landuse=W&limit=200'
+
+# Site-type stats: how many type-A vs type-B parcels in our index?
+curl 'https://cadastre-process-api.exe.xyz/api/v1/natura2000/stats' | jq '.by_type_parcel_count'
+curl 'https://cadastre-process-api.exe.xyz/api/v1/natura2000/stats' | jq '.by_habitat_parcel_count'
 
 # Steep south-facing N2K grassland (alpine meadow candidates) via compound→parcels
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{

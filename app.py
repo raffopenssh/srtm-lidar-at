@@ -7996,7 +7996,8 @@ def _parse_parcel_filters_from_args(args):
 
     # String params
     for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse',
-              'cadastre_natura2000_site', 'roof_type', 'dominant_type'):
+              'cadastre_natura2000_site', 'cadastre_natura2000_type',
+              'cadastre_natura2000_habitat', 'roof_type', 'dominant_type'):
         pk = f'pf_{k}'
         if pk in args:
             pf[k] = args[pk]

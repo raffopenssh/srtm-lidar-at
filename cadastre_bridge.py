@@ -1119,6 +1119,25 @@ def landscape_parcel_query(compound_filters: dict,
                     if not any((s.get('sitecode') == target) for s in sites):
                         continue
 
+                if pf.get('cadastre_natura2000_type'):
+                    sites = cad.get('natura2000_sites') or []
+                    target = str(pf['cadastre_natura2000_type']).upper()
+                    # A=Birds/SPA, B=Habitats/SCI-SAC, C=both. 'C' satisfies A or B.
+                    def _type_match(s):
+                        st = (s.get('sitetype') or '').upper()
+                        if target == 'C':
+                            return st in ('A', 'B', 'C')
+                        return st == target or st == 'C'
+                    if not any(_type_match(s) for s in sites):
+                        continue
+
+                if pf.get('cadastre_natura2000_habitat'):
+                    sites = cad.get('natura2000_sites') or []
+                    target = str(pf['cadastre_natura2000_habitat']).lower()
+                    if not any(target in [h.lower() for h in (s.get('habitats') or [])]
+                               for s in sites):
+                        continue
+
                 if pf.get('cadastre_landuse'):
                     codes = cad.get('landuse_codes', '') or ''
                     summary = cad.get('landuse_summary', {}) or {}

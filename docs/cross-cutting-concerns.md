@@ -219,15 +219,27 @@ code change is needed** to bridge these.
 
 ### Power-query examples (landscape × Natura 2000)
 
+**Rule of thumb:** when expressing "what kind of land is this?", prefer
+OUR observed land cover (`compound.type_filters`, `parcel_filters.types`,
+`landscape_filters.min_tree_canopy_sqm`, NDVI, `dominant_type`) over the
+cadastre's legal landuse code (`landuse=W`, `=LN`, ...). The cadastre tells
+you what the parcel is *registered as*; our index tells you what's
+*actually growing there* (BEV LiDAR + Sentinel-2 + ortho RGB-I, per-segment
+RF confidence). Use cadastre landuse only as a coarse pre-filter or when
+the legal designation itself is the thing you're querying for.
+
 ```bash
-# Forested N2K parcels in Tirol, no buildings, ranked by conservation score
+# Actually-forested N2K parcels in Tirol (RF tree conf ≥0.8, canopy ≥2000 m²),
+# no buildings, ranked by conservation score. Mode 3 = landscape-first.
 curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
   -H 'Content-Type: application/json' -d '{
-    "query": {"has_natura2000":"true","state":"Tirol","landuse":"W",
-              "has_buildings":"false","min_area":5000},
-    "landscape_filters": {"min_tree_canopy_sqm":2000,"min_ndvi":0.5,
-                          "sort":"conservation_score"},
-    "limit": 50}'
+    "compound": {"state":"Tirol",
+      "type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
+    "parcel_filters": {"types":["tree"],"min_type_fraction":0.5,
+      "min_ndvi":0.5,"cadastre_has_buildings":false,
+      "sort":"conservation_score"},
+    "query": {"has_natura2000":"true"},
+    "cadastre_enrich": true, "limit": 50}'
 
 # All parcels in one Habitats site enriched with our landscape index
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?natura2000_site=AT1205A00&limit=200'
@@ -239,6 +251,13 @@ curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
       "type_filters":[{"type":"grass","min_confidence":0.7,"min_area_sqm":500}]},
     "parcel_filters": {"cadastre_has_buildings":false,"sort":"conservation_score"},
     "query": {"has_natura2000":"true"}, "cadastre_enrich": true, "limit": 100}'
+
+# Cadastre says forest (W) but we DON'T see trees — deforestation / mis-class hunt
+curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
+  -H 'Content-Type: application/json' -d '{
+    "query": {"has_natura2000":"true","landuse":"W"},
+    "landscape_filters": {"max_tree_canopy_sqm":100,"sort":"conservation_score"},
+    "limit": 50}'
 
 # Edge cases: legally named in law but OUTSIDE polygon (RIS only)
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?has_natura2000=false&has_legal_refs=true&legal_context=nature_protection&limit=50'

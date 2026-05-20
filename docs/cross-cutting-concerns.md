@@ -229,10 +229,11 @@ RF confidence). Use cadastre landuse only as a coarse pre-filter or when
 the legal designation itself is the thing you're querying for.
 
 ```bash
-# ALL N2K parcels we have ALREADY PROCESSED. Mode 3 only scans KG JSONs that
-# exist on disk — implicit "is processed" constraint. Per-parcel N2K
-# membership comes from cadastre enrichment.
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
+# N2K parcels we have ALREADY PROCESSED, per state. Mode 3 only scans KG
+# JSONs that exist on disk — implicit "is processed" constraint. Per-parcel
+# N2K membership comes from cadastre enrichment. Mode 3 requires at least
+# one compound filter (state= here) so it doesn't sweep all processed KGs.
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?state=Nieder%C3%B6sterreich&pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
 
 # Same, but ACTUALLY FORESTED per OUR observed cover (RF tree conf ≥0.8,
 # parcel tree fraction ≥0.5, ndsm_max ≥6 m — real trees, not just legal Wald),

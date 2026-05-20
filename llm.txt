@@ -1759,11 +1759,12 @@ Cross-API examples (landscape × Natura 2000) — **prefer OUR land cover
 cadastre `landuse=W`**; the cadastre code is the legal designation, ours is
 the observed cover from BEV LiDAR + Sentinel-2 + ortho RGB-I:
 ```bash
-# ALL N2K parcels we have ALREADY PROCESSED. Mode 3 only scans KG JSONs that
-# exist, so this implicitly constrains to processed KGs. Per-parcel N2K
-# membership comes from cadastre enrichment (in_natura2000), filtered via
-# pf_cadastre_in_natura2000.
-curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
+# N2K parcels we have ALREADY PROCESSED, per state. Mode 3 only scans KG
+# JSONs that exist on disk — implicit "is processed" constraint. Per-parcel
+# N2K membership comes from cadastre enrichment, filtered via
+# pf_cadastre_in_natura2000. Mode 3 requires at least one compound filter
+# (here state=) so it doesn't sweep all 8440 processed KGs.
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?state=Nieder%C3%B6sterreich&pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
 
 # Same, but ACTUALLY FORESTED according to OUR observed land cover
 # (RF tree confidence ≥0.8, parcel tree fraction ≥0.5, ndsm_max ≥6 m —

@@ -1619,3 +1619,165 @@ def kg_combined_profile(kg_code: str) -> dict:
     if warnings:
         result['_warnings'] = warnings
     return result
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Processed-set intersection helpers (no per-KG enrichment, fast cross-API stats)
+# ═════════════════════════════════════════════════════════════════════════
+
+_PROCESSED_KGS_CACHE: dict[str, Any] = {'set': None, 'ts': 0.0}
+_PROCESSED_KGS_TTL_S = 60.0
+
+def _processed_kg_codes() -> set[str]:
+    """Set of KG codes we have already processed (processed=1 in search_index).
+
+    Cached 60s; cheap to refresh.
+    """
+    now = time.time()
+    cached = _PROCESSED_KGS_CACHE.get('set')
+    if cached is not None and (now - _PROCESSED_KGS_CACHE['ts']) < _PROCESSED_KGS_TTL_S:
+        return cached
+    codes: set[str] = set()
+    try:
+        rows = si.get_index()._conn().execute(
+            'SELECT kg_code FROM kg WHERE processed=1'
+        ).fetchall()
+        codes = {r[0] for r in rows}
+    except Exception as e:
+        log.warning('processed_kg_codes lookup failed: %s', e)
+    _PROCESSED_KGS_CACHE['set'] = codes
+    _PROCESSED_KGS_CACHE['ts'] = now
+    return codes
+
+
+def habitat_processed_count(
+    habitat: str | None = None,
+    sitetype: str | None = None,
+    sitecode: str | None = None,
+    state: str | None = None,
+    district: str | None = None,
+    gemeinde: str | None = None,
+    landuse: str | None = None,
+    has_buildings: bool | None = None,
+    breakdown: bool = False,
+    limit: int = 0,
+) -> dict:
+    """Count Natura 2000 parcels (filtered by habitat / type / site / admin /
+    landuse) that fall in a KG we have already processed.
+
+    Single cadastre round-trip (indexed natura2000_parcel_index +
+    natura2000_parcel_habitats join), then in-memory set intersection against
+    our processed_kgs. No per-KG enrichment loop.
+
+    Args:
+      habitat: moor|floodplain|river|lake|wetland|forest|alpine|meadow|
+               pasture|valley|hill|steppe|orchard|park|cave
+      sitetype: A=Birds/SPA, B=Habitats/SCI-SAC, C=both (C matches A or B too)
+      sitecode: restrict to a specific Natura 2000 sitecode (e.g. AT1205A00)
+      state / district / gemeinde / landuse / has_buildings: cadastre filters
+      breakdown: also return per-KG and per-state counts
+      limit: if >0, also return up to `limit` parcel_ids (intersected)
+
+    Returns:
+      {
+        filters: {...},
+        cadastre_total: int           # matches in cadastre across all AT
+        processed_total: int          # of those, in our processed set
+        processed_fraction: 0..1
+        unique_kgs_total: int
+        unique_kgs_processed: int
+        unprocessed_total: int        # cadastre_total - processed_total
+        by_kg: {kg_code: count}       # only if breakdown=true
+        by_state: {state: count}      # only if breakdown=true
+        parcel_ids: [...]             # only if limit>0
+        query_time_ms: float
+      }
+    """
+    if not any([habitat, sitetype, sitecode]):
+        raise ValueError('habitat_processed_count needs at least one of habitat/sitetype/sitecode')
+
+    PAGE = 100000  # cadastre hard cap
+    params: dict[str, Any] = {
+        'limit': PAGE,
+        'fields': 'parcel_id,kg_code,state_name',
+        'with_stats': 'false',
+    }
+    if habitat:    params['natura2000_habitat'] = habitat
+    if sitetype:   params['natura2000_type'] = sitetype
+    if sitecode:   params['natura2000_site'] = sitecode
+    elif not (habitat or sitetype):
+        params['has_natura2000'] = 'true'
+    if state:      params['state'] = state
+    if district:   params['district'] = district
+    if gemeinde:   params['gemeinde'] = gemeinde
+    if landuse:    params['landuse'] = landuse
+    if has_buildings is not None:
+        params['has_buildings'] = 'true' if has_buildings else 'false'
+
+    t0 = time.time()
+    processed_set = _processed_kg_codes()
+
+    by_kg_all: dict[str, int] = {}
+    by_kg_proc: dict[str, int] = {}
+    by_state_proc: dict[str, int] = {}
+    processed_ids: list[str] = []
+    processed_total = 0
+    rows_seen = 0
+    cadastre_total = 0
+
+    # Auto-paginate through cadastre so big habitats (forest=~214k) aren't
+    # truncated. ~10 pages max for the biggest tag; each page ~1.5s.
+    offset = 0
+    pages = 0
+    MAX_PAGES = 25  # safety: 2.5M parcels worst case
+    while True:
+        params['offset'] = offset
+        resp = cadastre_proxy('/query', params=params)
+        rows = resp.get('data') or []
+        if pages == 0:
+            cadastre_total = int((resp.get('meta') or {}).get('total') or len(rows))
+        rows_seen += len(rows)
+        for r in rows:
+            kg = r.get('kg_code')
+            if not kg:
+                continue
+            by_kg_all[kg] = by_kg_all.get(kg, 0) + 1
+            if kg in processed_set:
+                processed_total += 1
+                by_kg_proc[kg] = by_kg_proc.get(kg, 0) + 1
+                st = r.get('state_name') or ''
+                if st:
+                    by_state_proc[st] = by_state_proc.get(st, 0) + 1
+                if limit > 0 and len(processed_ids) < limit:
+                    pid = r.get('parcel_id')
+                    if pid:
+                        processed_ids.append(pid)
+        pages += 1
+        if len(rows) < PAGE or rows_seen >= cadastre_total or pages >= MAX_PAGES:
+            break
+        offset += PAGE
+
+    out: dict[str, Any] = {
+        'filters': {
+            'habitat': habitat, 'sitetype': sitetype, 'sitecode': sitecode,
+            'state': state, 'district': district, 'gemeinde': gemeinde,
+            'landuse': landuse, 'has_buildings': has_buildings,
+        },
+        'cadastre_total': cadastre_total,
+        'processed_total': processed_total,
+        'unprocessed_total': max(cadastre_total - processed_total, 0),
+        'processed_fraction': round(processed_total / cadastre_total, 4) if cadastre_total else 0.0,
+        'unique_kgs_total': len(by_kg_all),
+        'unique_kgs_processed': len(by_kg_proc),
+        'query_time_ms': round((time.time() - t0) * 1000, 1),
+    }
+    if rows_seen < cadastre_total:
+        out['truncated'] = True
+        out['rows_scanned'] = rows_seen
+        out['pages_scanned'] = pages
+    if breakdown:
+        out['by_kg'] = dict(sorted(by_kg_proc.items(), key=lambda x: -x[1]))
+        out['by_state'] = dict(sorted(by_state_proc.items(), key=lambda x: -x[1]))
+    if limit > 0:
+        out['parcel_ids'] = processed_ids
+    return out

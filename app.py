@@ -9009,6 +9009,53 @@ def api_query_nature():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/v1/query/habitat_count')
+def api_query_habitat_count():
+    """Count Natura 2000 parcels (by habitat/type/site) that lie in a KG we
+    have already processed.
+
+    Single cadastre round-trip (indexed N2K join) + in-memory set
+    intersection against processed_kgs. No per-KG enrichment loop.
+
+    Query params:
+      habitat=moor|floodplain|river|lake|wetland|forest|alpine|meadow|
+               pasture|valley|hill|steppe|orchard|park|cave
+      sitetype=A|B|C   (Birds / Habitats / both)
+      sitecode=AT...   (specific Natura 2000 site)
+      state, district, gemeinde, landuse, has_buildings
+      breakdown=true   include per-kg and per-state counts
+      sample=N         also return up to N parcel_ids (default 0)
+
+    At least one of habitat/sitetype/sitecode is required.
+    """
+    args = request.args
+    try:
+        sample = int(args.get('sample', '0'))
+    except Exception:
+        sample = 0
+    try:
+        result = cb.habitat_processed_count(
+            habitat=args.get('habitat'),
+            sitetype=args.get('sitetype'),
+            sitecode=args.get('sitecode'),
+            state=args.get('state'),
+            district=args.get('district'),
+            gemeinde=args.get('gemeinde'),
+            landuse=args.get('landuse'),
+            has_buildings=_bool_or_none(args.get('has_buildings')),
+            breakdown=args.get('breakdown', '').lower() in ('1', 'true', 'yes'),
+            limit=max(0, min(sample, 5000)),
+        )
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except cb.CadastreError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log.exception('api_query_habitat_count error')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/parcel/<path:parcel_id>/detail')
 def api_parcel_detail(parcel_id):
     """Full combined detail for a single parcel (both APIs).

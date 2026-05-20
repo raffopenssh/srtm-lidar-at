@@ -1874,6 +1874,42 @@ curl 'https://cadastre-process-api.exe.xyz/api/v1/natura2000/point?lon=15.45&lat
 Note: when `has_natura2000` or `natura2000_site` is set, cadastre defaults to
 `with_stats=false` for speed; pass `with_stats=true` if you need totals.
 
+### GET /api/v1/query/habitat_count ← FAST CROSS-API COUNT
+How many Natura 2000 parcels of a given habitat/type/site lie inside KGs we
+have already processed? Single cadastre round-trip (indexed N2K join) +
+in-memory set intersection against `kg.processed=1` — no per-KG enrichment
+loop, no schema bloat. Designed for instant dashboard / forecasting answers.
+
+Params (at least one of habitat/sitetype/sitecode required):
+  habitat=moor|floodplain|river|lake|wetland|forest|alpine|meadow|
+          pasture|valley|hill|steppe|orchard|park|cave
+  sitetype=A|B|C       Birds / Habitats / both (C also matches A or B)
+  sitecode=AT1205A00   specific Natura 2000 sitecode
+  state, district, gemeinde, landuse, has_buildings   optional cadastre filters
+  breakdown=true       include by_kg{} and by_state{} maps
+  sample=N             also return up to N matching parcel_ids (max 5000)
+
+Response:
+  cadastre_total       all matching parcels across AT
+  processed_total      … of those, in a KG we have processed
+  processed_fraction   processed_total / cadastre_total
+  unique_kgs_total / unique_kgs_processed
+  unprocessed_total    cadastre_total - processed_total (work remaining)
+  query_time_ms
+  by_kg / by_state     only when breakdown=true
+  parcel_ids           only when sample>0
+  truncated            true if cadastre had >25 pages of results (unlikely)
+
+Auto-paginates cadastre (100k/page) so big habitats (forest ≈ 214k) return
+complete; small ones (moor ≈ 30k) finish in ~1s.
+
+Example:
+  /api/v1/query/habitat_count?habitat=moor
+  /api/v1/query/habitat_count?habitat=alpine&state=Tirol&breakdown=true
+  /api/v1/query/habitat_count?sitetype=A&breakdown=true
+  /api/v1/query/habitat_count?sitecode=AT1205A00&sample=100
+  /api/v1/query/habitat_count?habitat=floodplain&landuse=W   # forested wetlands
+
 ### GET /api/v1/parcel/<parcel_id>/detail
 Full combined detail for one parcel from both APIs.
 Includes: cadastre data, legal refs, protected area containment check,

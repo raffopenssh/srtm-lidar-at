@@ -7995,13 +7995,14 @@ def _parse_parcel_filters_from_args(args):
     pf = {}
 
     # String params
-    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse', 'roof_type', 'dominant_type'):
+    for k in ('terrain_class', 'sort', 'sort_dir', 'cadastre_landuse',
+              'cadastre_natura2000_site', 'roof_type', 'dominant_type'):
         pk = f'pf_{k}'
         if pk in args:
             pf[k] = args[pk]
 
     # Bool params
-    for k in ('is_vegetated', 'cadastre_has_buildings'):
+    for k in ('is_vegetated', 'cadastre_has_buildings', 'cadastre_in_natura2000'):
         pk = f'pf_{k}'
         if pk in args:
             pf[k] = args[pk].lower() in ('true', '1', 'yes')

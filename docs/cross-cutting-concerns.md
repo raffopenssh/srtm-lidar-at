@@ -229,16 +229,32 @@ RF confidence). Use cadastre landuse only as a coarse pre-filter or when
 the legal designation itself is the thing you're querying for.
 
 ```bash
-# Actually-forested N2K parcels in Tirol (RF tree conf ≥0.8, canopy ≥2000 m²),
-# no buildings, ranked by conservation score. Mode 3 = landscape-first.
+# ALL N2K parcels we have ALREADY PROCESSED. Mode 3 only scans KG JSONs that
+# exist on disk — implicit "is processed" constraint. Per-parcel N2K
+# membership comes from cadastre enrichment.
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
+
+# Same, but ACTUALLY FORESTED per OUR observed cover (RF tree conf ≥0.8,
+# parcel tree fraction ≥0.5, ndsm_max ≥6 m — real trees, not just legal Wald),
+# no buildings, in Tirol, ranked by conservation score.
 curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
   -H 'Content-Type: application/json' -d '{
     "compound": {"state":"Tirol",
       "type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
     "parcel_filters": {"types":["tree"],"min_type_fraction":0.5,
-      "min_ndvi":0.5,"cadastre_has_buildings":false,
+      "min_ndsm_max":6,"min_ndvi":0.5,
+      "cadastre_has_buildings":false,
+      "cadastre_in_natura2000":true,
       "sort":"conservation_score"},
-    "query": {"has_natura2000":"true"},
+    "cadastre_enrich": true, "limit": 50}'
+
+# Restrict to one specific Habitats Directive site (Wachau AT1205A00):
+curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
+  -H 'Content-Type: application/json' -d '{
+    "compound": {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
+    "parcel_filters": {"types":["tree"],"min_type_fraction":0.5,
+      "cadastre_natura2000_site":"AT1205A00",
+      "sort":"conservation_score"},
     "cadastre_enrich": true, "limit": 50}'
 
 # All parcels in one Habitats site enriched with our landscape index
@@ -252,11 +268,13 @@ curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
     "parcel_filters": {"cadastre_has_buildings":false,"sort":"conservation_score"},
     "query": {"has_natura2000":"true"}, "cadastre_enrich": true, "limit": 100}'
 
-# Cadastre says forest (W) but we DON'T see trees — deforestation / mis-class hunt
+# Cadastre says forest (W) inside N2K but we DON'T see trees —
+# deforestation / mis-class hunt; rank by recent Hansen loss.
 curl https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch \
   -H 'Content-Type: application/json' -d '{
     "query": {"has_natura2000":"true","landuse":"W"},
-    "landscape_filters": {"max_tree_canopy_sqm":100,"sort":"conservation_score"},
+    "landscape_filters": {"max_tree_canopy_sqm":100,
+      "sort":"hansen_recent","sort_dir":"desc"},
     "limit": 50}'
 
 # Edge cases: legally named in law but OUTSIDE polygon (RIS only)

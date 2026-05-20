@@ -1077,6 +1077,8 @@ def landscape_parcel_query(compound_filters: dict,
                             'building_count': cad.get('building_count'),
                             'legal_refs': cad.get('legal_refs'),
                             'legal_contexts': cad.get('legal_contexts'),
+                            'in_natura2000': cad.get('in_natura2000'),
+                            'natura2000_sites': cad.get('natura2000_sites'),
                         }
             except CadastreError as e:
                 warnings.append(f'Cadastre enrichment failed for KG {kg_code}: {e}')
@@ -1102,6 +1104,19 @@ def landscape_parcel_query(compound_filters: dict,
                 if pf.get('cadastre_max_area') is not None:
                     ca = cad.get('area_sqm', 0) or 0
                     if ca > pf['cadastre_max_area']:
+                        continue
+
+                if pf.get('cadastre_in_natura2000') is not None:
+                    in_n2k = bool(cad.get('in_natura2000'))
+                    if pf['cadastre_in_natura2000'] and not in_n2k:
+                        continue
+                    if not pf['cadastre_in_natura2000'] and in_n2k:
+                        continue
+
+                if pf.get('cadastre_natura2000_site'):
+                    sites = cad.get('natura2000_sites') or []
+                    target = pf['cadastre_natura2000_site']
+                    if not any((s.get('sitecode') == target) for s in sites):
                         continue
 
                 if pf.get('cadastre_landuse'):

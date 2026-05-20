@@ -1693,7 +1693,9 @@ GET syntax for Mode 3 (compound → parcels):
   pf_type_confidence=tree:0.7:500 (repeatable, type:min_confidence:min_area_sqm)
   pf_is_vegetated=true  pf_cadastre_has_buildings=false
   pf_sort=conservation_score  pf_sort_dir=desc
-  cadastre_enrich=true|false (default true)
+  pf_cadastre_in_natura2000=true|false   parcel centroid in any N2K site
+  pf_cadastre_natura2000_site=AT1205A00  parcel in this specific N2K site
+  cadastre_enrich=true|false (default true; needed for cadastre_* pf filters)
 
 Per-parcel terrain query examples:
   # All east-facing level parcels in Vorarlberg
@@ -1757,15 +1759,31 @@ Cross-API examples (landscape × Natura 2000) — **prefer OUR land cover
 cadastre `landuse=W`**; the cadastre code is the legal designation, ours is
 the observed cover from BEV LiDAR + Sentinel-2 + ortho RGB-I:
 ```bash
-# Actually-forested N2K parcels in Tirol (RF tree confidence ≥0.8, canopy ≥2000 m²),
-# no buildings, ranked by conservation score. Mode 3 = landscape-first.
+# ALL N2K parcels we have ALREADY PROCESSED. Mode 3 only scans KG JSONs that
+# exist, so this implicitly constrains to processed KGs. Per-parcel N2K
+# membership comes from cadastre enrichment (in_natura2000), filtered via
+# pf_cadastre_in_natura2000.
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch?pf_cadastre_in_natura2000=true&kg_limit=500&limit=200'
+
+# Same, but ACTUALLY FORESTED according to OUR observed land cover
+# (RF tree confidence ≥0.8, parcel tree fraction ≥0.5, ndsm_max ≥6 m —
+# real trees, not just legal Wald), no buildings, in Tirol.
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
   "compound": {"state":"Tirol",
                "type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
   "parcel_filters": {"types":["tree"], "min_type_fraction":0.5,
-                     "min_ndvi":0.5, "cadastre_has_buildings":false,
+                     "min_ndsm_max":6, "min_ndvi":0.5,
+                     "cadastre_has_buildings":false,
+                     "cadastre_in_natura2000":true,
                      "sort":"conservation_score"},
-  "query": {"has_natura2000":"true"},
+  "cadastre_enrich": true, "limit": 50}'
+
+# Same, restricted to a single Habitats Directive site (Wachau AT1205A00):
+curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
+  "compound": {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800}]},
+  "parcel_filters": {"types":["tree"], "min_type_fraction":0.5,
+                     "cadastre_natura2000_site":"AT1205A00",
+                     "sort":"conservation_score"},
   "cadastre_enrich": true, "limit": 50}'
 
 # All parcels in one Habitats Directive site (Wachau) enriched with our landscape index
@@ -1779,10 +1797,13 @@ curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type:
   "cadastre_enrich": true, "limit": 100,
   "query": {"has_natura2000": "true"}}'
 
-# Cadastre says forest (W) but we DON'T observe trees — deforestation / mis-class hunt
+# Cadastre says forest (W) but WE observe no trees — deforestation /
+# mis-class hunt. Use OUR landscape signal (max_tree_canopy_sqm) as the truth,
+# cadastre landuse=W only as the prior expectation.
 curl 'https://srtm-lidar-at.exe.xyz:8000/api/v1/parcels/batch' -H 'Content-Type: application/json' -d '{
   "query": {"has_natura2000":"true","landuse":"W"},
-  "landscape_filters": {"max_tree_canopy_sqm":100, "sort":"conservation_score"},
+  "landscape_filters": {"max_tree_canopy_sqm":100, "sort":"hansen_recent",
+                        "sort_dir":"desc"},
   "limit": 50}'
 
 # Outside any N2K but legally protected (RIS-named but not in any polygon)

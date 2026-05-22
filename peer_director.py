@@ -7414,10 +7414,27 @@ class PeerDirector:
             m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
             if m:
                 in_progress.add(m.group(1))
-        for c in candidates:
-            ps_pid = c['peer']['id']
+        # Scan ALL enabled peers (not just ``candidates``) for in-progress
+        # KGs. ``candidates`` excludes peers that are filtered out by
+        # eligibility — recently parked (``_peer_is_scheduled``), low
+        # bandwidth, holding a ``reserved_kg``, parallel-authorised, or
+        # the active frontier. Those peers can still be mid-KG: a peer
+        # parked at 95%% bandwidth keeps running its current KG until
+        # the next director graceful-stop / KG boundary; a peer just
+        # un-parked typically hasn't picked work yet but its prior KG
+        # may still be in progress; a recently-parked peer might be
+        # parked-with-graceful-stop and still finishing. Missing any
+        # of these from the in_progress set let another cache-only peer
+        # be assigned the same KG (observed: at35+at50 on 73517 ≈23 h,
+        # at61+at65 on 01614 ≈21 h, at25+at75 on 56551 ≈16 min apart).
+        # Sticky ownership (10 min TTL) doesn't save us for long-
+        # running KGs.
+        active_states = ('running', 'processing', 'paused', 'paused_zenodo')
+        for p_all in peers:
+            if not p_all.get('enabled', True):
+                continue
             try:
-                ps2 = get_peer_status(c['peer'].get('url'))
+                ps2 = get_peer_status(p_all.get('url'))
             except Exception:
                 ps2 = {}
             # Only mark KGs from peers whose processor is actually
@@ -7427,13 +7444,11 @@ class PeerDirector:
             # codes drains the whitelist (``30 in-progress KGs > 15
             # ready`` -> empty after filter -> 0/60 cache-only running).
             st2 = ps2.get('state')
-            if st2 not in ('running', 'processing', 'paused',
-                            'paused_zenodo'):
+            if st2 not in active_states:
                 continue
             ckg = (ps2.get('current_kg') or {})
             _mark(ckg.get('code') if isinstance(ckg, dict) else None)
             _mark(ps2.get('in_progress'))
-            del ps_pid  # silence linter
         # Frontier's KG — both the primary active frontier AND every
         # parallel-authorised frontier. Earlier we excluded those peers
         # from ``candidates`` (they're owned by the parallel orch), so

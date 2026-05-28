@@ -1600,7 +1600,7 @@ function renderBwRecovery() {
   const buckets = new Array(HORIZON + 1).fill(0);
   const bucketsParked = new Array(HORIZON + 1).fill(0);  // among the recovering peers, how many are parked NOW
   let parkedNow = 0;
-  const parkedBy = {pool: 0, steal: 0, auto: 0, renewal: 0, role: 0, other: 0};
+  const parkedBy = {pool: 0, ippool: 0, steal: 0, auto: 0, renewal: 0, role: 0, other: 0};
   let nearWallN = 0;
   let idleRunnable = 0;  // enabled, not parked, not running
   const usedRecent = [];  // GB used per peer over last ~10 days (heuristic)
@@ -1619,6 +1619,7 @@ function renderBwRecovery() {
       // Classify by latest canary_note event (surfaced as p.park_reason).
       const r = p.park_reason || '';
       if      (r === 'bev_pool_park')        parkedBy.pool++;
+      else if (r === 'ip_pool_park')         parkedBy.ippool++;
       else if (r === 'steal_park')           parkedBy.steal++;
       else if (r === 'auto_park')            parkedBy.auto++;
       else if (r === 'park_until_renewal')   parkedBy.renewal++;
@@ -1734,6 +1735,7 @@ function renderBwRecovery() {
   // Compact breakdown: only show non-zero categories so the line stays tight.
   const _brkParts = [];
   if (parkedBy.pool)    _brkParts.push('<span style="color:#d24c4c" title="bev_pool_park: /24 egress to BEV is bad; canary probes auto-clear when route recovers">' + parkedBy.pool + ' pool</span>');
+  if (parkedBy.ippool)  _brkParts.push('<span style="color:#d24c4c" title="ip_pool_park: /24 egress shows disproportionate BEV warn rate vs fleet">' + parkedBy.ippool + ' ip-pool</span>');
   if (parkedBy.steal)   _brkParts.push('<span style="color:var(--yellow)" title="steal_park: hypervisor host oversubscribed (30 min cooldown)">' + parkedBy.steal + ' steal</span>');
   if (parkedBy.auto)    _brkParts.push('<span style="color:var(--yellow)" title="auto_park: canary throughput collapse (1h soft / 6h quality)">' + parkedBy.auto + ' canary</span>');
   if (parkedBy.renewal) _brkParts.push('<span title="park_until_renewal: hit observed BW cap, waits for cycle reset">' + parkedBy.renewal + ' bw</span>');
@@ -4747,6 +4749,9 @@ function _peerRoleTag(p, ctx) {
   const isPoolParked = (p.park_reason === 'bev_pool_park'
                         && p.not_before && new Date(p.not_before) > new Date());
   if (isPoolParked) return {cls: 't-pool', txt: 'POOL-PARK'};
+  const isIpPoolParked = (p.park_reason === 'ip_pool_park'
+                          && p.not_before && new Date(p.not_before) > new Date());
+  if (isIpPoolParked) return {cls: 't-pool', txt: 'IP-POOL'};
   if (!p.online)     return {cls: 't-offline', txt: 'OFFLINE'};
   if (p.processor_state === 'paused')  return {cls: 't-paused',  txt: 'PAUSED'};
   if (p.processor_state === 'stopped') return {cls: 't-stopped', txt: 'STOPPED'};
@@ -4782,7 +4787,7 @@ function _peerAttClass(p, ctx) {
   if (ctx.isActive) return 'att-active';
   if (ctx.isRunning && p.cache_only_run) return 'att-cache';
   if (!ctx.isRunning && p.current_kg) return 'att-int';
-  if (p.park_reason === 'bev_pool_park'
+  if ((p.park_reason === 'bev_pool_park' || p.park_reason === 'ip_pool_park')
       && p.not_before && new Date(p.not_before) > new Date()) return 'att-pool';
   if (p.processor_state === 'stopped') return 'att-stopped';
   return '';

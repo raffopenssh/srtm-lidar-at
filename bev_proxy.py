@@ -30,11 +30,31 @@ log = logging.getLogger(__name__)
 # Free proxy list sources (GitHub-hosted, updated periodically)
 # ---------------------------------------------------------------------------
 _PROXY_SOURCES = [
+    # Original five (2026-05-XX)
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    # Added 2026-05-28 to widen the funnel: BEV validation yields ~0
+    # passes from the original five, so the pool sits at 0 proxies and
+    # peers thrash on "All proxies on cooldown" + direct-only retries.
+    # The phase-1 HTTPS probe and phase-2 two-tile BigTIFF-magic check
+    # still gate everything, so a broader funnel only helps.
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/master/http.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/master/https.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=https&timeout=10000&country=all",
 ]
 
 # URLs used to validate that a proxy can actually fetch BEV TIFF bytes.
@@ -219,13 +239,16 @@ def _fetch_candidates() -> set[str]:
                     line = line[7:]
                 elif line.startswith("https://"):
                     line = line[8:]
-                # Must be ip:port
+                # Must start with ip:port. Some sources append a
+                # third ':country' / ':Anonymous' field (e.g.
+                # hideip.me "ip:port:Country") which we tolerate by
+                # taking just the first two colon-separated fields.
                 if ":" in line and "/" not in line and " " not in line:
                     parts = line.split(":")
-                    if len(parts) == 2:
+                    if len(parts) >= 2:
                         try:
                             int(parts[1])
-                            candidates.add(line)
+                            candidates.add(f"{parts[0]}:{parts[1]}")
                         except ValueError:
                             pass
         except Exception as e:
@@ -294,7 +317,12 @@ def _refresh_pool():
     to_test = [p for p in candidates if p not in skip]
     # Shuffle and cap to avoid testing thousands
     random.shuffle(to_test)
-    to_test = to_test[:2000]
+    # Cap validation budget. 2026-05-28: bumped 2000→5000 alongside the
+    # ~20x wider source funnel (~100k unique candidates) so the random
+    # subsample stays representative — at 60 parallel workers + 8s phase-1
+    # budget this is ~12 min wall time, comfortably under the 30 min
+    # REFRESH_INTERVAL.
+    to_test = to_test[:5000]
 
     log.info("Validating %d proxy candidates (%d skipped on cooldown)...",
              len(to_test), len(skip))

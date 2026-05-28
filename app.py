@@ -15247,17 +15247,28 @@ def process_txt():
         mf = json.loads(mf_path.read_text()) if mf_path.exists() else {}
     except Exception:
         mf = {}
-    n_kgs = len(mf.get('kgs') or {}) if isinstance(mf, dict) else 0
+    # Manifest schema: {entries: {key: {depo_id, size, ...}}}.
+    # `*_error` keys are retry markers — exclude from totals (matches
+    # /api/v1/processing/manifest + the process.html badge logic).
+    entries = mf.get('entries') or {} if isinstance(mf, dict) else {}
+    real = {k: v for k, v in entries.items() if not k.endswith('_error')}
+    n_files = len(real)
     total_b = 0
-    for kg in (mf.get('kgs') or {}).values() if isinstance(mf, dict) else ():
-        for f in (kg.get('files') or []):
-            try:
-                total_b += int(f.get('size') or 0)
-            except Exception:
-                pass
+    kg_codes = set()
+    depos = set()
+    for k, e in real.items():
+        try:
+            total_b += int(e.get('size') or 0)
+        except Exception:
+            pass
+        kg_codes.add(k.split('_')[0].split('-')[0])
+        if e.get('depo_id'):
+            depos.add(e['depo_id'])
+    depo_s = (str(next(iter(depos))) if len(depos) == 1
+              else (f'{len(depos)} depos' if depos else '-'))
     out.append(
-        f'zenodo:   kgs_uploaded={n_kgs} bytes={total_b/1e9:.2f}GB '
-        f'depo={mf.get("deposition_id") or "-"}'
+        f'zenodo:   kgs_uploaded={len(kg_codes)} files={n_files} '
+        f'bytes={total_b/1e9:.2f}GB depo={depo_s}'
     )
     # Fleet bandwidth summary (canary-by-default).
     try:
@@ -15448,12 +15459,17 @@ def process_txt():
     try:
         cmf_path = Path('data/austria_processor/cache_manifest.json')
         cmf = json.loads(cmf_path.read_text()) if cmf_path.exists() else {}
-        cache_n = sum(len(v.get('tiles') or [])
-                      for v in (cmf.get('strips') or {}).values()) \
-            if isinstance(cmf, dict) else 0
+        # Schema: {depo_id, files: {fname: {tile_count, size, ...}}}.
+        files_d = (cmf.get('files') or {}) if isinstance(cmf, dict) else {}
+        cache_tiles = sum(int(v.get('tile_count') or 0)
+                          for v in files_d.values())
+        cache_bytes = sum(int(v.get('size') or 0) for v in files_d.values())
+        depo = (cmf.get('depo_id') or cmf.get('deposition_id')
+                if isinstance(cmf, dict) else None)
         out.append(
-            f'zen_cache: depo={cmf.get("deposition_id") or "-"} '
-            f'tiles={cache_n}'
+            f'zen_cache: depo={depo or "-"} '
+            f'files={len(files_d)} tiles={cache_tiles} '
+            f'bytes={cache_bytes/1e9:.2f}GB'
         )
     except Exception:
         pass

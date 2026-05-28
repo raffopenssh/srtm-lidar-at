@@ -597,6 +597,41 @@ SYNC_BACKOFF_THRESHOLD = 3
 SYNC_BACKOFF_SECONDS = 600        # 10 min
 
 
+def _capacity_history_entry(e: tuple) -> dict:
+    """Serialise a capacity_history ring tuple to a compact dict.
+
+    Schema versions (carried in ``v``):
+      v=1: legacy (added stl/cpu)
+      v=2: + cumulative failed-KG and partial-KG counters (``fk``/``pk``).
+           Cumulative (not delta) so a rate-per-hour can be derived over
+           any sub-window of the 2 h ring; also makes HA handover &
+           gunicorn-worker swaps consistent (cumulative is monotonic and
+           survives a re-load from disk + the on-disk failed/partial JSON).
+
+    Supports legacy 7-tuples for in-memory back-compat.
+    """
+    if len(e) == 7:
+        t, f, b, z, c, s, cf = e
+        fk = pk = None
+    else:
+        t, f, b, z, c, s, cf, fk, pk = e
+    out: dict = {'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
+    if s is not None and cf is not None:
+        out['stl'] = s
+        out['cpu'] = cf
+        # v is bumped to 2 once we also have fk/pk; otherwise stay at 1
+        # so the legacy 7-field loader keeps working on older state.
+        if fk is not None or pk is not None:
+            out['v'] = 2
+            if fk is not None:
+                out['fk'] = int(fk)
+            if pk is not None:
+                out['pk'] = int(pk)
+        else:
+            out['v'] = 1
+    return out
+
+
 def _default_peers_config() -> dict:
     """Return default peers.json structure."""
     return {
@@ -2147,6 +2182,13 @@ class PeerDirector:
                 _v = entry.get('v') or 0
                 _stl = entry.get('stl') if _v >= 1 else None
                 _cpu = entry.get('cpu') if _v >= 1 else None
+                # v>=2: cumulative failed/partial KG counters. We persist
+                # cumulative counts (rather than per-tick deltas) so the
+                # rate-per-hour can be computed by the renderer over any
+                # sub-window of the ring and so HA handover / gunicorn
+                # restarts don't lose history-aware accounting.
+                _fk = entry.get('fk') if _v >= 2 else None
+                _pk = entry.get('pk') if _v >= 2 else None
                 self._capacity_history.append((
                     int(entry.get('t') or 0),
                     float(entry.get('f') or 0.0),
@@ -2155,6 +2197,8 @@ class PeerDirector:
                     float(entry.get('cop') or 0.0),
                     float(_stl) if isinstance(_stl, (int, float)) else None,
                     float(_cpu) if isinstance(_cpu, (int, float)) else None,
+                    int(_fk) if isinstance(_fk, (int, float)) else None,
+                    int(_pk) if isinstance(_pk, (int, float)) else None,
                 ))
         except Exception:
             pass
@@ -2404,6 +2448,34 @@ class PeerDirector:
             'aggregation': rates.get('_aggregation', 'max'),
             'top_peer': rates.get('_top_peer') or {},
         }
+        # Cumulative failed/partial KG counters. We read the on-disk
+        # registries (already replicated to shadow via SNAPSHOT_FILES,
+        # so the counter is durable across HA handover) and persist the
+        # cumulative value into each history sample. The renderer (and
+        # /process.txt) derive the rate as a (newest-oldest)/window
+        # delta over any sub-window of the 2h ring.
+        _fk_n: int | None = None
+        _pk_n: int | None = None
+        try:
+            _fp = DATA_DIR / 'failed_kgs.json'
+            if _fp.exists():
+                _d = json.loads(_fp.read_text() or '[]')
+                if isinstance(_d, list):
+                    _fk_n = len(_d)
+                elif isinstance(_d, dict):
+                    _fk_n = len(_d)
+        except Exception:
+            pass
+        try:
+            _pp = DATA_DIR / 'partial_kgs.json'
+            if _pp.exists():
+                _d = json.loads(_pp.read_text() or '{}')
+                if isinstance(_d, dict):
+                    _pk_n = len(_d)
+                elif isinstance(_d, list):
+                    _pk_n = len(_d)
+        except Exception:
+            pass
         # Append to ring buffer. Compact tuple (no dict) to keep the
         # JSON payload small even when serialised in get_status().
         self._capacity_history.append((
@@ -2414,6 +2486,8 @@ class PeerDirector:
             round(float(rates.get('copernicus', 0.0)), 3),
             round(float(_steal_med), 1),
             round(float(_cpu_factor), 3),
+            _fk_n,
+            _pk_n,
         ))
         return final
 
@@ -3219,10 +3293,8 @@ class PeerDirector:
             # alternating polls) is what made the /process.txt steal
             # stats look empty for ~30 min after a srv restart.
             'capacity_history': (
-                [({'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
-                  | ({'stl': s, 'cpu': cf, 'v': 1}
-                     if (s is not None and cf is not None) else {}))
-                 for (t, f, b, z, c, s, cf) in list(self._capacity_history)]
+                [(_capacity_history_entry(_e))
+                 for _e in list(self._capacity_history)]
                 if getattr(self, '_lock_fd', None) is not None
                 else (state.get('capacity_history') or [])
             ),
@@ -8578,10 +8650,8 @@ class PeerDirector:
                         # gunicorn workers + a fresh director after restart
                         # all see the same chart immediately.
                         self.state['capacity_history'] = [
-                            ({'t': t, 'f': f, 'bev': b, 'zen': z, 'cop': c}
-                              | ({'stl': s, 'cpu': cf, 'v': 1}
-                                 if (s is not None and cf is not None) else {}))
-                            for (t, f, b, z, c, s, cf) in list(self._capacity_history)
+                            _capacity_history_entry(_e)
+                            for _e in list(self._capacity_history)
                         ]
                         self.state['peer_warning_rates'] = _peer_wr
                         # Per-peer CPU-steal EMA. Tick cadence ~30 s,

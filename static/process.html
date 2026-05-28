@@ -4482,6 +4482,23 @@ function renderCapacityHistory() {
     '\nFleet CPU steal: ' + (stealMed != null ? stealMed.toFixed(1) + '% median (n=' + stealN + ')' : 'n/a') +
     ' → ramp-brake cpu_factor=' + cpuFactor.toFixed(2) +
     (cpuFactor < 1.0 ? ' (active, throttling cache-only count)' : ' (idle, <30% steal)');
+  // KG outcome rate over the window (v>=2 entries: cumulative
+  // failed-KG + partial-KG counters). We derive per-hour throughput
+  // and a per-tick *event* series for the sparkline so the chart
+  // shows downstream impact of an outage right alongside the
+  // upstream warning lines that caused it.
+  let failedPerH = null, partialPerH = null;
+  let dFailed = 0, dPartial = 0, winMin = 0;
+  const v2 = hist.filter(e => (e.v|0) >= 2 && (e.fk != null || e.pk != null));
+  if (v2.length >= 2) {
+    const a = v2[0], b = v2[v2.length-1];
+    const winS = Math.max(1, b.t - a.t);
+    winMin = Math.round(winS / 60);
+    dFailed  = Math.max(0, (b.fk|0) - (a.fk|0));
+    dPartial = Math.max(0, (b.pk|0) - (a.pk|0));
+    failedPerH  = dFailed  * 3600 / winS;
+    partialPerH = dPartial * 3600 / winS;
+  }
   // y-range label so a zoomed view doesn't lie about absolute values.
   const rangeLbl = '<text x="1" y="7" font-size="7" fill="#888">' +
     Math.round(yHi*100) + '%</text>' +
@@ -4533,6 +4550,31 @@ function renderCapacityHistory() {
       } return p; })() + '" fill="none" stroke="#f08c3a" stroke-width="0.8" opacity="0.65" stroke-dasharray="2,1"/>' +
     // capacity factor (bold)
     '<path d="' + pathFor('f') + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' +
+    // Failed/partial KG event markers — emit a vertical tick at every
+    // tick where the cumulative counter increased. Red = permanent
+    // failure, orange = partial completion. Drawn AFTER the capacity
+    // line so they stay visible on top of the orange pause shade.
+    (function(){
+      let m = '';
+      for (let i = 1; i < n; i++) {
+        const e = hist[i], p = hist[i-1];
+        if ((e.v|0) < 2) continue;
+        const x = ((e.t - t0) / span) * W;
+        const dF = ((e.fk|0) - (p.fk|0));
+        const dP = ((e.pk|0) - (p.pk|0));
+        if (dF > 0) {
+          m += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) +
+               '" y1="' + (H-6) + '" y2="' + H + '" stroke="#f85149" ' +
+               'stroke-width="1.2"><title>+' + dF + ' KG failed</title></line>';
+        }
+        if (dP > 0) {
+          m += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) +
+               '" y1="' + (H-3) + '" y2="' + H + '" stroke="#d6b94b" ' +
+               'stroke-width="1.2"><title>+' + dP + ' KG partial</title></line>';
+        }
+      }
+      return m;
+    })() +
     rangeLbl;
   svg.style.visibility = 'visible';
   det.style.visibility = 'visible';
@@ -4542,11 +4584,33 @@ function renderCapacityHistory() {
         + '). >=15% per peer flags as throttled in /process.txt fleet_cpu line.">S '
         + stealMed.toFixed(0) + '%</span>')
     : '';
+  // Failed/partial chips — only render when we have v>=2 history
+  // (i.e. the director has been emitting KG-outcome counters for at
+  // least 2 ticks). Per-hour rate over the visible window plus the
+  // raw delta so the operator can tell "a steady drip" from "a burst
+  // in this window".
+  let outcomeTxt = '';
+  if (failedPerH != null) {
+    const fTip = 'KG permanent-failures over last ' + winMin + 'm: +'
+      + dFailed + ' (' + failedPerH.toFixed(2) + '/h). '
+      + 'Source: data/austria_processor/failed_kgs.json (replicated to shadow). '
+      + 'Per-tick ticks shown on the bottom edge of the sparkline.';
+    outcomeTxt += ' · <span style="color:#f85149" title="' + esc(fTip) + '">F '
+      + failedPerH.toFixed(2) + '/h</span>';
+  }
+  if (partialPerH != null) {
+    const pTip = 'KG partial-completions over last ' + winMin + 'm: +'
+      + dPartial + ' (' + partialPerH.toFixed(2) + '/h). '
+      + 'Source: data/austria_processor/partial_kgs.json (replicated to shadow).';
+    outcomeTxt += ' · <span style="color:#d6b94b" title="' + esc(pTip) + '">P '
+      + partialPerH.toFixed(2) + '/h</span>';
+  }
   det.innerHTML = '<span style="color:' + color + '"><b>' + pct + '%</b></span> capacity · ' +
     '<span style="color:#e05656" title="BEV warnings/min (5m)">B ' + (r.bev||0).toFixed(1) + '</span> · ' +
     '<span style="color:#d6b94b" title="Zenodo warnings/min (5m)">Z ' + (r.zenodo||0).toFixed(1) + '</span> · ' +
     '<span style="color:#9b6df0" title="Copernicus warnings/min (5m)">C ' + (r.copernicus||0).toFixed(1) + '</span>' +
-    (stealTxt ? ' · ' + stealTxt : '');
+    (stealTxt ? ' · ' + stealTxt : '') +
+    outcomeTxt;
 }
 
 // Compute KG progress fraction (0..1) from peer fields shaped by

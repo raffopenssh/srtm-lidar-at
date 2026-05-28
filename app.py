@@ -14913,6 +14913,30 @@ def process_txt():
                     f'warns/min B={float(r_now.get("bev", 0) or 0):.1f}(max={b_s[2]:.1f}) '
                     f'Z={float(r_now.get("zenodo", 0) or 0):.1f}(max={z_s[2]:.1f}) '
                     f'C={float(r_now.get("copernicus", 0) or 0):.1f}(max={c_s[2]:.1f})')
+            # KG-outcome rate (v>=2 entries only). Cumulative
+            # counters → delta/window → per-hour rate. Surfaces the
+            # KG-permanent-failure and partial-completion throughput
+            # so a future BEV outage's downstream impact is visible
+            # right next to the upstream warning rates that caused it.
+            try:
+                v2 = [e for e in hist
+                      if isinstance(e, dict) and (e.get('v') or 0) >= 2]
+                if len(v2) >= 2:
+                    t0 = int(v2[0].get('t') or 0)
+                    tN = int(v2[-1].get('t') or 0)
+                    win_h = max(1e-6, (tN - t0) / 3600.0)
+                    fk0 = int(v2[0].get('fk') or 0)
+                    fkN = int(v2[-1].get('fk') or 0)
+                    pk0 = int(v2[0].get('pk') or 0)
+                    pkN = int(v2[-1].get('pk') or 0)
+                    d_fk = max(0, fkN - fk0)
+                    d_pk = max(0, pkN - pk0)
+                    parts.append(
+                        f'kg_outcome: failed={fkN}(+{d_fk}, '
+                        f'{d_fk/win_h:.2f}/h) partial={pkN}(+{d_pk}, '
+                        f'{d_pk/win_h:.2f}/h) over {win_h*60:.0f}m')
+            except Exception:
+                pass
             # Render as two lines so the dashboard text wraps cleanly.
             out.append(parts[0] + ' · ' + ' · '.join(parts[1:3] if len(parts) >= 3 else parts[1:]))
             if len(parts) > 3:

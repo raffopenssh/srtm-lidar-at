@@ -124,13 +124,25 @@ is pushing back — check `B / Z / C` chips for which one.
 
 History persists to `director_state.json` every tick so it survives
 HA handover and gunicorn's two-worker swap (just like the BEV / Zen /
-Cop sub-EMAs). Schema is a 7-tuple; the load path tolerates legacy
-5-tuples written by pre-2026-05-19 directors.
+Cop sub-EMAs). Schema is a 9-tuple (`t,f,bev,zen,cop,stl,cpu,fk,pk`);
+the load path tolerates legacy 7-tuples (no `fk`/`pk`) and the
+v1-marker 5-tuples written by pre-2026-05-19 directors. `fk`/`pk`
+are **cumulative** KG-failure / partial-completion counters read
+from `failed_kgs.json` and `partial_kgs.json` (both already
+replicated to shadow via `director_ha.SNAPSHOT_FILES`), so the rate
+per hour is derived as `(newest - oldest)/window` over any
+sub-window of the 2 h ring.
 
 `/process.txt` carries a `throttle:` block (window / cap_factor /
 steal_med / cpu_factor / per-upstream warns-per-min, min/med/max over
 the window) so forensic mining over the long-term archive can
 correlate director efficiency with steal trends without parsing JSON.
+Line 2 of the throttle block adds a `kg_outcome:` field with
+cumulative + per-hour failed/partial KG rates so a future BEV
+outage's downstream impact is visible inline. The Service-card
+sparkline shows the same data: `F x.xx/h` / `P x.xx/h` chips and
+red/yellow vertical tick marks on the chart at every tick where the
+cumulative counter increased.
 
 ### Role-based parks (who is parked, and why)
 

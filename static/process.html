@@ -1315,9 +1315,12 @@ function updateCards(d) {
       const tip = (bp.reason || ('BEV outage, ' + scope + ' pause'))
         + '\nLevel ' + lvl + '/4 · ' + totTxt + ' total cooldown'
         + (bp.since ? ('\nSince ' + bp.since.replace('T',' ').slice(0,19)) : '')
-        + (bp.until ? ('\nUntil ' + bp.until.replace('T',' ').slice(0,19)) : '');
-      sdet += ' <span class="badge badge-paused lvl' + lvl + '" title="'
-           + esc(tip) + '">' + esc(label) + '</span>';
+        + (bp.until ? ('\nUntil ' + bp.until.replace('T',' ').slice(0,19)) : '')
+        + '\n\nClick to clear (admin token required).';
+      sdet += ' <span class="badge badge-paused lvl' + lvl + '"'
+           + ' role="button" tabindex="0" data-bev-clear="1"'
+           + ' style="cursor:pointer"'
+           + ' title="' + esc(tip) + '">' + esc(label) + '</span>';
     }
   } catch(e) {}
   document.getElementById('cServiceDet').innerHTML = sdet || '—';
@@ -2376,6 +2379,36 @@ function _pmenuRun(btn, fn) {
   try { fn(); } catch(e) { console.error(e); }
 }
 document.addEventListener('click', _pmenuClose);
+
+// BEV pause chip → manual clear. Delegated so the chip can be re-rendered
+// on every status tick without re-wiring the listener.
+async function clearBevPause(){
+  try {
+    const reason = prompt('Manually clear BEV pause?\n\nOptional reason (logged in director events):', 'operator clear via dashboard');
+    if (reason === null) return;  // cancel
+    const r = await fetch('/api/v1/director/bev_pause/clear', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({reason: (reason || 'operator clear via dashboard')}),
+    });
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { alert('Clear failed: ' + (j.error || r.status)); return; }
+    if (j.cleared) {
+      console.log('bev_pause cleared:', j);
+      // Force an immediate director-status refresh to drop the chip.
+      try { if (typeof fetchDirectorStatus === 'function') fetchDirectorStatus(); } catch(e){}
+    } else {
+      alert('No active BEV pause to clear.');
+    }
+  } catch(e) { alert('Clear failed: ' + e); }
+}
+document.addEventListener('click', (ev) => {
+  const el = ev.target && ev.target.closest && ev.target.closest('[data-bev-clear]');
+  if (!el) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  clearBevPause();
+});
 
 async function peerCmd(peerId, action) {
   // Send pause/resume/stop to a specific peer. Always go through the

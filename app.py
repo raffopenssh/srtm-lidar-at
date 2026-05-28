@@ -4719,6 +4719,31 @@ def director_activate_peer():
     return jsonify({'status': 'activated', 'peer': peer_id, 'start_result': result})
 
 
+@app.route('/api/v1/director/bev_pause/clear', methods=['POST'])
+def director_clear_bev_pause():
+    """Manually clear an active BEV outage pause.
+
+    Auth: admin-token gated via ``_PROTECTED_PREFIXES``. Surfaced in the
+    dashboard's Service-card ``BEV PAUSED`` chip (click → confirm → POST).
+    Records the event with ``end_reason='manual'`` so the 24h audit ring
+    distinguishes operator clears from cooldown / recovery clears.
+
+    Body (optional JSON): ``{reason: str}``. Defaults to ``'manual clear'``.
+    """
+    d = pd.get_director()
+    reason = ''
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = (body.get('reason') or request.args.get('reason') or '').strip()
+    except Exception:
+        reason = (request.args.get('reason') or '').strip()
+    res = d.clear_bev_pause(reason or 'manual clear')
+    if not res.get('was_active'):
+        return jsonify({'cleared': False, 'reason': 'no active BEV pause',
+                        **{k: v for k, v in res.items() if k != 'cleared'}}), 200
+    return jsonify(res)
+
+
 @app.route('/api/v1/director/stop', methods=['POST'])
 def director_stop_all():
     """Stop all peers and pause the director."""

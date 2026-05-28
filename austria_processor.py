@@ -572,7 +572,20 @@ class ProgressTracker:
         "http error code: 0",
         "http response code on",
         "retrying again in",
+        # bev_retry.py's per-attempt log lines: every CURL timeout on
+        # direct-first emits one of these before falling back to a proxy
+        # lane. Genuine BEV outage = wrapper gives up, which surfaces as
+        # "all N attempts exhausted" (handled by _WARN_BEV_EXHAUSTED_TOKEN
+        # below — that one DOES classify as 'bev'). The per-attempt
+        # chatter is proxy-lane noise and is filtered out here.
+        "retrying in ",   # 'retrying in 2s...', 'retrying in 4s...'
     )
+    # If the message contains this substring, classification falls
+    # through the GDAL-internal filter back to 'bev'. We special-case
+    # it so the wrapper's final-give-up log line keeps signalling a
+    # real outage even if a future bev_retry refactor reuses the
+    # 'retrying in' phrasing in the same line.
+    _WARN_BEV_EXHAUSTED_TOKEN = "attempts exhausted"
     _WARN_ZENODO_TOKENS = (
         "zenodo.org", "zenodo ", "deposit", "sandbox.zenodo",
     )
@@ -607,8 +620,16 @@ class ProgressTracker:
                 return "auth"
         for tok in cls._WARN_BEV_TOKENS:
             if tok in m:
-                # Filter out GDAL-internal retry chatter — not a fleet
-                # BEV-outage signal, just our own proxy lane churning.
+                # Final-give-up line ALWAYS counts as a real BEV signal,
+                # even though it may mention 'retrying' tokens. Check
+                # this first so the GDAL/wrapper-retry filter below
+                # doesn't accidentally swallow it.
+                if cls._WARN_BEV_EXHAUSTED_TOKEN in m:
+                    return "bev"
+                # Filter out GDAL-internal retry chatter and bev_retry
+                # per-attempt log lines — not a fleet BEV-outage signal,
+                # just our own proxy lane churning or a single direct
+                # timeout falling back to proxy.
                 if any(t in m for t in cls._WARN_BEV_GDAL_INTERNAL_TOKENS):
                     return None
                 return "bev"

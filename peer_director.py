@@ -4964,6 +4964,83 @@ class PeerDirector:
             bp = self.state.get('bev_pause') or {}
         return bool(bp.get('active'))
 
+    def clear_bev_pause(self, reason: str = 'manual clear') -> dict:
+        """Manually clear an active BEV pause (and persist to disk).
+
+        Records the event in ``bev_pause_history`` with
+        ``end_reason='manual'`` so the audit trail shows it was
+        operator-driven, not cooldown / recovery. Resets escalation
+        ledger for pool pauses too so the next trigger starts at L1.
+
+        Returns ``{cleared: bool, was_active: bool, scope, pool,
+        level, since}`` for the response.
+        """
+        now = time.time()
+        with self._lock:
+            bp = dict(self.state.get('bev_pause') or {})
+            pool_esc = dict(self.state.get('bev_pool_escalation') or {})
+            was_active = bool(bp.get('active'))
+            snap = {
+                'scope': bp.get('scope') or 'fleet',
+                'pool': bp.get('pool'),
+                'level': bp.get('level'),
+                'since': bp.get('since'),
+            }
+        if not was_active:
+            return {'cleared': False, 'was_active': False, **snap}
+        ended = _dt.now(_tz.utc).isoformat()
+        ev = {
+            'scope': snap['scope'],
+            'pool': snap['pool'],
+            'level': snap['level'],
+            'since': snap['since'],
+            'ended': ended,
+            'cooldown_s': bp.get('cooldown_s'),
+            'trigger_rate_wpm': bp.get('trigger_rate_wpm'),
+            'trigger_n_peers': bp.get('trigger_n_peers'),
+            'end_reason': 'manual',
+            'final_rate_wpm': None,
+            'manual_reason': reason,
+        }
+        self._record_bev_pause_event(ev)
+        # Drop pool escalation for the affected pool so we don't punish
+        # the next legitimate trigger with the prior level.
+        if snap['scope'] == 'pool' and snap['pool']:
+            pool_esc.pop(snap['pool'], None)
+        bp['active'] = False
+        bp['last_unpause_ts'] = now
+        bp['recovery_streak_since'] = 0.0
+        bp['trigger_streak_since'] = 0.0
+        bp['reason'] = f'manual clear: {reason}'
+        with self._lock:
+            self.state['bev_pause'] = bp
+            self.state['bev_pool_escalation'] = pool_esc
+            try:
+                save_director_state(self.state)
+            except Exception:
+                log.exception('clear_bev_pause: save_director_state failed')
+        log.warning('bev_pause MANUAL CLEAR (%s%s): %s',
+                    snap['scope'],
+                    (' ' + snap['pool']) if snap['pool'] else '',
+                    reason)
+        try:
+            _emit_director_event(
+                f'BEV pause manually cleared ({snap["scope"]}'
+                f'{(" " + snap["pool"]) if snap["pool"] else ""} '
+                f'L{snap["level"]}): {reason}',
+                peer='director', level='warning')
+        except Exception:
+            pass
+        # Bust the status cache so the dashboard reflects the clear
+        # on the very next poll rather than after the TTL.
+        try:
+            with self._status_cache_lock:
+                self._status_cache_value = None
+                self._status_cache_ts = 0.0
+        except Exception:
+            pass
+        return {'cleared': True, 'was_active': True, **snap}
+
     # ------------------------------------------------------------------
     # IP-pool egress block detection
     # ------------------------------------------------------------------

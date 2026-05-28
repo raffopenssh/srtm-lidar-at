@@ -5101,6 +5101,7 @@ class PeerDirector:
         return bool(bp.get('active'))
 
     def clear_bev_pause(self, reason: str = 'manual clear') -> dict:
+        from datetime import datetime as _dt, timezone as _tz
         """Manually clear an active BEV pause (and persist to disk).
 
         Records the event in ``bev_pause_history`` with

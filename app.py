@@ -15264,11 +15264,11 @@ def process_txt():
         kg_codes.add(k.split('_')[0].split('-')[0])
         if e.get('depo_id'):
             depos.add(e['depo_id'])
-    depo_s = (str(next(iter(depos))) if len(depos) == 1
-              else (f'{len(depos)} depos' if depos else '-'))
+    depo_s = (f'depo={next(iter(depos))}' if len(depos) == 1
+              else (f'depos={len(depos)}' if depos else 'depo=-'))
     out.append(
         f'zenodo:   kgs_uploaded={len(kg_codes)} files={n_files} '
-        f'bytes={total_b/1e9:.2f}GB depo={depo_s}'
+        f'bytes={total_b/1e9:.2f}GB {depo_s}'
     )
     # Fleet bandwidth summary (canary-by-default).
     try:

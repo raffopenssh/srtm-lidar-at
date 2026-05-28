@@ -422,6 +422,16 @@ STEAL_PARK_COOLDOWN_S = 30 * 60
 # high-steal one when available; the continuous noise + capacity
 # penalty still orders peers *within* a tier.
 FRONTIER_HIGH_STEAL_BIAS_PCT = 50.0
+# --- Frontier BEV-health bias ------------------------------------------
+# Pools whose recent BEV warn rate is markedly higher than the fleet
+# median get demoted in frontier selection so scarce Copernicus credits
+# don't land on a peer that's about to burn most of its KG wall-time
+# retrying BEV. Soft bias: a continuous penalty added to the sort key
+# (same shape as the steal capacity penalty). Hard tier: pools >= the
+# absolute floor (4 wpm, same as the park trigger) are demoted to a
+# worse tier so low-pool-pressure peers always outrank them.
+FRONTIER_POOL_BEV_HARD_WPM = 4.0    # >= this avg_wpm => tier-demoted
+FRONTIER_POOL_BEV_BIAS_FLOOR = 1.0  # avg_wpm below this contributes 0
 # --- BEV-outage detection (escalating fleet pause) ---------------------
 #
 # The smooth EMA throttle eases throughput when BEV is grumpy, but a
@@ -2056,6 +2066,44 @@ def _peer_noise_score(peer_id: str, state: dict) -> float:
     return score
 
 
+def _peer_pool_bev_wpm(peer_id: str, cfg: dict, state: dict) -> float:
+    """Return the peer's egress /24 BEV avg_wpm (0.0 if unknown).
+
+    Consumed by frontier selection: pools that are visibly upset with
+    BEV right now should not be assigned scarce Copernicus credits.
+    Uses the per-tick ``ip_pools`` snapshot already maintained by
+    ``_check_ip_pool_block`` so we don't recompute on the hot path.
+    """
+    peer = get_peer_by_id(cfg, peer_id)
+    if not peer:
+        return 0.0
+    host = ((state.get('peer_statuses') or {}).get(peer_id) or {})
+    sys = (host.get('system') or {}) if isinstance(host, dict) else {}
+    pool_key = ((sys.get('host') or {}).get('outbound_24')) or ''
+    if not pool_key:
+        return 0.0
+    pools = state.get('ip_pools') or {}
+    pinfo = pools.get(pool_key) or {}
+    return float(pinfo.get('avg_wpm') or 0.0)
+
+
+def _peer_pool_bev_score(peer_id: str, cfg: dict, state: dict
+                         ) -> tuple[int, float]:
+    """Frontier-sort contribution for the peer's egress pool BEV health.
+
+    Returns ``(hard_tier, soft_penalty)`` where ``hard_tier`` is 1 for
+    pools at/above ``FRONTIER_POOL_BEV_HARD_WPM`` (demoted), and
+    ``soft_penalty`` is a continuous penalty (avg_wpm - floor),
+    clamped to >= 0, in the same units as ``_peer_noise_score``.
+    """
+    wpm = _peer_pool_bev_wpm(peer_id, cfg, state)
+    if wpm <= 0:
+        return (0, 0.0)
+    hard = 1 if wpm >= FRONTIER_POOL_BEV_HARD_WPM else 0
+    soft = max(0.0, wpm - FRONTIER_POOL_BEV_BIAS_FLOOR)
+    return (hard, soft)
+
+
 def choose_active_peer(cfg: dict, state: dict) -> str | None:
     """Pick the best peer to run the processor on.
 
@@ -2109,9 +2157,17 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         # any high-steal peer (AMD EPYC pool at ~60 %% steal), even if
         # the high-steal peer is otherwise quieter or has more bw.
         steal_tier = 1 if float(s_ema) >= FRONTIER_HIGH_STEAL_BIAS_PCT else 0
-        # Sort key: low-steal tier first, then low noise+steal, then
-        # high remaining bandwidth.
-        candidates.append((steal_tier, noise + steal_pen, -remaining, pid))
+        # Pool BEV health: avoid landing fresh frontier work on a peer
+        # whose /24 is currently visibly upset with BEV (would burn most
+        # of its KG wall-time retrying).
+        pool_tier, pool_pen = _peer_pool_bev_score(pid, cfg, state)
+        # Sort key: combined hard tier first (any hard signal demotes),
+        # then low noise+steal+pool, then high remaining bandwidth.
+        candidates.append((
+            steal_tier + pool_tier,
+            noise + steal_pen + pool_pen,
+            -remaining, pid,
+        ))
 
     if not candidates:
         return None
@@ -5475,6 +5531,38 @@ class PeerDirector:
         used by ``_check_steal_health`` and ``fleet_cpu``.
         """
         steal_ema = self.state.get('peer_steal_ema') or {}
+        # Build peer→park_reason map so per-pool counters can attribute
+        # parks to their underlying cause (bev_pool / steal / cap /
+        # role / other). Single pass over cfg avoids O(N²) lookups.
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc)
+        peer_park = {}  # pid -> reason key or None
+        for _p in (self.cfg.get('peers') or []):
+            _nb = _p.get('not_before')
+            if not _nb:
+                continue
+            try:
+                _nb_dt = _dt.fromisoformat(str(_nb).replace('Z', '+00:00'))
+            except Exception:
+                continue
+            if _nb_dt <= _now:
+                continue
+            # Latest canary_note tells us why.
+            _reason = 'other'
+            _notes = _p.get('canary_notes') or []
+            if _notes and isinstance(_notes[-1], dict):
+                ev = (_notes[-1].get('event') or '').lower()
+                if ev in ('bev_pool_park', 'ip_pool_park'):
+                    _reason = 'bev_pool'
+                elif ev == 'steal_park':
+                    _reason = 'steal'
+                elif ev in ('auto_park', 'park_until_renewal'):
+                    _reason = 'cap'
+                elif ev == 'role_park':
+                    _reason = 'role'
+                else:
+                    _reason = ev or 'other'
+            peer_park[_p['id']] = _reason
         pools: dict = {}
         for pid, ps in (statuses or {}).items():
             if not isinstance(ps, dict):
@@ -5486,6 +5574,7 @@ class PeerDirector:
             r = float(wr.get('5m') or 0.0)
             pool = pools.setdefault(key, {
                 'peers': [], 'rates': [], 'sum_wpm': 0.0, 'steal': [],
+                'parked': 0, 'parked_by_reason': {},
             })
             pool['peers'].append(pid)
             pool['rates'].append(r)
@@ -5493,6 +5582,11 @@ class PeerDirector:
             _s = steal_ema.get(pid)
             if isinstance(_s, (int, float)):
                 pool['steal'].append(float(_s))
+            _pr = peer_park.get(pid)
+            if _pr:
+                pool['parked'] += 1
+                pool['parked_by_reason'][_pr] = (
+                    pool['parked_by_reason'].get(_pr, 0) + 1)
         # Finalize stats.
         def _med(xs):
             n = len(xs)
@@ -5505,6 +5599,7 @@ class PeerDirector:
             n = len(pool['peers'])
             avg = (pool['sum_wpm'] / n) if n else 0.0
             mx = max(pool['rates']) if pool['rates'] else 0.0
+            steal_max = max(pool['steal']) if pool['steal'] else None
             out[key] = {
                 'peers': pool['peers'],
                 'n': n,
@@ -5513,7 +5608,11 @@ class PeerDirector:
                 'max_wpm': round(mx, 3),
                 'steal_med': (round(_med(pool['steal']), 1)
                               if pool['steal'] else None),
+                'steal_max': (round(steal_max, 1)
+                              if steal_max is not None else None),
                 'steal_n': len(pool['steal']),
+                'parked': pool['parked'],
+                'parked_by_reason': pool['parked_by_reason'],
             }
         return out
 
@@ -5539,6 +5638,8 @@ class PeerDirector:
                     'max_wpm': v.get('max_wpm'),
                     'n': v.get('n'),
                     'steal_med': v.get('steal_med'),
+                    'steal_max': v.get('steal_max'),
+                    'parked': v.get('parked', 0),
                 }
             hist.append({'ts': int(now), 'pools': slim})
             if len(hist) > POOL_HISTORY_MAX:
@@ -7598,11 +7699,13 @@ class PeerDirector:
                 _s = _peer_cpu_steal(_pid) or 0.0
             _cap = max(0.10, 1.0 - float(_s) / 100.0)
             _tier = 1 if float(_s) >= FRONTIER_HIGH_STEAL_BIAS_PCT else 0
+            _pool_tier, _pool_pen = _peer_pool_bev_score(
+                _pid, self.cfg, state_copy)
             return (
                 1 if c.get('needs_stop_cache_only') else 0,
-                _tier,
+                _tier + _pool_tier,
                 _peer_noise_score(_pid, state_copy)
-                + ((1.0 / _cap) - 1.0),
+                + ((1.0 / _cap) - 1.0) + _pool_pen,
                 _pid,
             )
         candidates.sort(key=_frontier_sort_key)

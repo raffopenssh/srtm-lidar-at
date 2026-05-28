@@ -49,8 +49,13 @@ GDAL_ENV = {
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
     "GDAL_HTTP_MULTIPLEX": "YES",
     "GDAL_HTTP_VERSION": "2",
-    "GDAL_HTTP_TIMEOUT": "30",
-    "GDAL_HTTP_CONNECTTIMEOUT": "10",
+    # 2026-05-28: bumped from 30/10 → 60/30. Post-mortem showed BEV's
+    # response under contention was hitting the 10s connect ceiling
+    # while the server eventually returned 206 — we were declaring
+    # timeout before it had a chance to answer. Wider ceiling raises
+    # success rate; the bev_retry layer above still caps total wall.
+    "GDAL_HTTP_TIMEOUT": "60",
+    "GDAL_HTTP_CONNECTTIMEOUT": "30",
     "GDAL_HTTP_MAX_RETRY": "3",        # don't let GDAL retry forever internally
     "GDAL_HTTP_RETRY_DELAY": "2",       # 2s between GDAL-level retries
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",

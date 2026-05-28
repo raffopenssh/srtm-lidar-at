@@ -59,9 +59,32 @@ def _clear_vsicurl_cache(url: str) -> None:
 log = logging.getLogger(__name__)
 
 # Retry configuration
-MAX_RETRIES = 4          # up to 4 retries (5 total attempts)
-BASE_DELAY = 2.0         # seconds — doubles each retry: 2, 4, 8, 16
-MAX_DELAY = 20.0         # cap per-retry wait
+#
+# 2026-05-28: post-mortem on 3h slice showed BEV failures cluster by
+# /24 egress pool (per-NAT-IP throttling) + a small set of contended
+# server-side tiles, not random tcp flakiness. Burning 5 attempts in
+# 30s mostly hit the same throttled IP repeatedly. Widened backoff
+# (5/30/120s) gives the per-IP token bucket time to refill; cut to 3
+# retries (4 attempts total) so net wall-time on a true-fail tile is
+# bounded (~155s) and we surrender to the partial-KG path quickly.
+MAX_RETRIES = 3          # up to 3 retries (4 total attempts)
+# Explicit per-retry waits (index = attempt that just failed).
+# Length must be >= MAX_RETRIES; values past MAX_RETRIES are unused.
+_RETRY_SCHEDULE_S = (5.0, 30.0, 120.0)
+BASE_DELAY = _RETRY_SCHEDULE_S[0]  # back-compat alias (1st retry wait)
+MAX_DELAY = _RETRY_SCHEDULE_S[-1]  # back-compat alias
+
+
+def _retry_delay(attempt: int, base_delay: float = BASE_DELAY) -> float:
+    """Return wait seconds after *attempt* (0-indexed) has just failed.
+
+    When ``base_delay`` is the default we use the fixed schedule above.
+    Callers that override ``base_delay`` (e.g. tests) fall back to the
+    classic exponential curve so behaviour stays predictable.
+    """
+    if abs(base_delay - BASE_DELAY) < 1e-6 and attempt < len(_RETRY_SCHEDULE_S):
+        return _RETRY_SCHEDULE_S[attempt]
+    return min(base_delay * (2 ** attempt), MAX_DELAY)
 
 # Direct-first policy.  Our 24h post-mortem (2026-05-28) showed >87%
 # of "BEV warnings" were transport failures via the free-proxy lane,
@@ -190,7 +213,7 @@ def read_with_retry(
                 raise
             bev_proxy.report_failure(used_proxy, error_msg=str(exc))
             if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt), MAX_DELAY)
+                delay = _retry_delay(attempt, base_delay)
                 log.warning(
                     "%s: attempt %d/%d failed (%s), retrying in %.0fs...",
                     label, attempt + 1, max_retries + 1, exc, delay,
@@ -259,7 +282,7 @@ def open_with_retry(
                 raise
             bev_proxy.report_failure(used_proxy, error_msg=str(exc))
             if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt), MAX_DELAY)
+                delay = _retry_delay(attempt, base_delay)
                 log.warning(
                     "%s: attempt %d/%d open failed (%s), retrying in %.0fs...",
                     label, attempt + 1, max_retries + 1, exc, delay,
@@ -285,7 +308,7 @@ def open_with_retry(
                 raise
             bev_proxy.report_failure(used_proxy, error_msg=str(exc))
             if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt), MAX_DELAY)
+                delay = _retry_delay(attempt, base_delay)
                 log.warning(
                     "%s: attempt %d/%d read failed (%s), retrying in %.0fs...",
                     label, attempt + 1, max_retries + 1, exc, delay,

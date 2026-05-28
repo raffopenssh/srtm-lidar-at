@@ -15098,10 +15098,31 @@ def process_txt():
             for key, v in items[:6]:  # top 6 pools is plenty
                 _avg = float(v.get('avg_wpm') or 0)
                 _stl = v.get('steal_med')
-                _stl_tag = (f' stl={_stl:.0f}%'
-                            if isinstance(_stl, (int, float)) else '')
+                _stl_mx = v.get('steal_max')
+                _stl_tag = ''
+                if isinstance(_stl, (int, float)):
+                    if (isinstance(_stl_mx, (int, float))
+                            and float(_stl_mx) >= max(15.0, float(_stl) + 5)):
+                        _stl_tag = f' stl={_stl:.0f}%(mx={_stl_mx:.0f}%)'
+                    else:
+                        _stl_tag = f' stl={_stl:.0f}%'
+                _parked = int(v.get('parked') or 0)
+                _pk_tag = ''
+                if _parked:
+                    _by = v.get('parked_by_reason') or {}
+                    # Compact "3p(bev_pool=2,steal=1)" style. Skip the
+                    # breakdown if there's only one reason.
+                    if len(_by) == 1:
+                        _r = next(iter(_by.keys()))
+                        _pk_tag = f' parked={_parked}({_r})'
+                    elif _by:
+                        _breakdown = ','.join(
+                            f'{r}={c}' for r, c in sorted(_by.items()))
+                        _pk_tag = f' parked={_parked}({_breakdown})'
+                    else:
+                        _pk_tag = f' parked={_parked}'
                 parts.append(
-                    f'{key}:n={v.get("n")} avg={_avg:.1f}wpm{_stl_tag}'
+                    f'{key}:n={v.get("n")} avg={_avg:.1f}wpm{_stl_tag}{_pk_tag}'
                 )
             out.append('ip_pools: ' + ' · '.join(parts))
 
@@ -15116,7 +15137,7 @@ def process_txt():
                 for key, v in (sample.get('pools') or {}).items():
                     a = agg.setdefault(
                         key, {'wpm_max': 0.0, 'wpm_sum': 0.0,
-                              'stl_max': 0.0, 'n': 0})
+                              'stl_max': 0.0, 'pk_max': 0, 'n': 0})
                     _w = float(v.get('avg_wpm') or 0)
                     if _w > a['wpm_max']:
                         a['wpm_max'] = _w
@@ -15124,20 +15145,28 @@ def process_txt():
                     _s = v.get('steal_med')
                     if isinstance(_s, (int, float)) and _s > a['stl_max']:
                         a['stl_max'] = float(_s)
+                    _pk = int(v.get('parked') or 0)
+                    if _pk > a['pk_max']:
+                        a['pk_max'] = _pk
                     a['n'] += 1
             if agg:
                 items = sorted(
                     agg.items(),
-                    key=lambda kv: (-kv[1]['wpm_max'], -kv[1]['stl_max']),
+                    key=lambda kv: (-kv[1]['wpm_max'], -kv[1]['stl_max'],
+                                    -kv[1]['pk_max']),
                 )
                 pp = []
                 for key, a in items[:6]:
-                    if a['wpm_max'] < 1.0 and a['stl_max'] < 10:
+                    if (a['wpm_max'] < 1.0 and a['stl_max'] < 10
+                            and a['pk_max'] == 0):
                         continue
                     _avg = a['wpm_sum'] / max(1, a['n'])
+                    _pk_tag = (f' parked_peak={a["pk_max"]}'
+                               if a['pk_max'] else '')
                     pp.append(
                         f'{key}:peak={a["wpm_max"]:.1f}wpm '
                         f'avg={_avg:.1f}wpm stl_peak={a["stl_max"]:.0f}%'
+                        f'{_pk_tag}'
                     )
                 if pp:
                     _span_h = int((iph[-1]['ts'] - iph[0]['ts']) / 3600) \

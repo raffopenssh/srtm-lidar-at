@@ -6417,10 +6417,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # --- 3a. LiDAR (default date) ---
             # DTM+DSM are essential — segmentation fails without them.
             # Retry with escalating timeouts to handle BEV slowness.
+            # 2026-05-28: extended from 2→ 3 attempts (5/10/20m). The
+            # first two cover transient route flaps; the 20-min attempt
+            # gives the per-NAT-IP throttle bucket time to refill on
+            # busy pools. On final exhaustion we ABORT the KG for
+            # deferred retry rather than emit a partial — LiDAR is
+            # essential, so a tile-skip is never an acceptable outcome.
             _report_step("lidar", f"{tile_label} — reading DTM/DSM")
             tdata = None
             _lidar_last_exc = None
-            _LIDAR_TIMEOUTS = [300, 600]  # 5m, 10m
+            _LIDAR_TIMEOUTS = [300, 600, 1200]  # 5m, 10m, 20m
             for _lidar_attempt, _lidar_timeout in enumerate(_LIDAR_TIMEOUTS, 1):
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _lidar_ex:
@@ -6462,18 +6468,40 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     tile_avail["outside_austria"] = True
                     log.info("KG %s %s: tile outside BEV LiDAR coverage — boundary",
                              kg_code, tile_label)
-                else:
-                    tile_avail["upstream_fail"] = True
-                    tile_avail["upstream_fail_reason"] = (
-                        f"lidar: {type(_lidar_last_exc).__name__}: {_exc_str[:200]}"
-                        if _lidar_last_exc else "lidar: unknown"
-                    )
-                    log.warning("KG %s %s: LiDAR unavailable — skipping tile (upstream fail)",
-                                kg_code, tile_label)
+                    tile_data_availability.append(tile_avail)
+                    _tile_entry["status"] = "skip"
+                    _tile_entry["issues"]["lidar"] = "boundary"
+                    continue
+                # Real LiDAR fetch failure on an in-Austria tile. LiDAR
+                # is the foundation layer (segmentation depends on it),
+                # so a tile-skip would guarantee a partial KG and waste
+                # the wall-time already spent on the upstream layers.
+                # Abort the KG instead so it gets deferred for retry
+                # — the tile checkpoints already written are preserved,
+                # so on the next attempt only this (and later) tiles
+                # need re-fetching.
+                tile_avail["upstream_fail"] = True
+                tile_avail["upstream_fail_reason"] = (
+                    f"lidar: {type(_lidar_last_exc).__name__}: {_exc_str[:200]}"
+                    if _lidar_last_exc else "lidar: unknown"
+                )
+                log.error(
+                    "KG %s %s: LiDAR unavailable after %d attempts — "
+                    "aborting KG for deferred retry (would emit partial)",
+                    kg_code, tile_label, len(_LIDAR_TIMEOUTS),
+                )
                 tile_data_availability.append(tile_avail)
-                _tile_entry["status"] = "error" if not _outside else "skip"
-                _tile_entry["issues"]["lidar"] = "fail" if not _outside else "boundary"
-                continue
+                _tile_entry["status"] = "error"
+                _tile_entry["issues"]["lidar"] = "fail"
+                result["lidar_failed"] = True
+                result["success"] = False
+                result["error"] = (
+                    f"LiDAR unavailable for tile {tile_idx+1}/{len(tiles)} "
+                    f"after {len(_LIDAR_TIMEOUTS)} attempts: "
+                    f"{tile_avail['upstream_fail_reason']}"
+                )
+                result["step"] = f"lidar_failed_tile_{tile_idx+1}"
+                break  # abort tile loop — KG will be deferred
             th, tw_ = tdata["shape"]
             tvalid = int(tdata["mask"].sum())
             if tvalid < 100:
@@ -6946,6 +6974,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         "tile checkpoints preserved for deferred retry",
                         kg_code, tile_idx + 1, n_tiles)
             result["step"] = "aborted_copernicus_failed"
+            return result
+        if result.get("lidar_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to LiDAR fetch exhaustion — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_lidar_failed"
             return result
 
         # --- 4. Merge terrain stats ---
@@ -9670,6 +9704,7 @@ def main():
                                     or '402' in str(result.get("error", ""))
                                     or 'PaymentRequired' in str(result.get("error", "")))
                 is_cop_batch_failure = result.get("copernicus_failed", False)
+                is_lidar_failure = result.get("lidar_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
                 if is_cache_incomplete:
                     # Cache-only peer hit a missing tile.  The KG must be
@@ -9716,6 +9751,31 @@ def main():
                                       _r.status_code, _r.text[:200])
                     except Exception as _e:
                         log.debug('cache_miss POST failed: %s', _e)
+                elif is_lidar_failure:
+                    log.warning("KG %s: LiDAR fetch exhausted — deferring for retry", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: LiDAR upstream exhausted — "
+                                     f"deferred retry (tile checkpoints preserved)",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _remove_from_retry_queue(kg_code)
+                    _append_retry_queue(kg_code)
+                    _deferred: dict = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
+                    progress.add_log(
+                        "warning",
+                        f"KG {kg_code}: LiDAR upstream exhausted — "
+                        f"deferred retry in {DEFER_GAP} KGs",
+                        kg_code,
+                    )
                 elif is_cop_batch_failure:
                     log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
                     progress.add_log("warning",

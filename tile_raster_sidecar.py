@@ -50,7 +50,14 @@ _log = logging.getLogger("tile_raster_sidecar")
 
 # Skip persisting sidecars when free disk is below this threshold (GB).
 # Falls back to today's behavior (re-read BEV during gpkg_full).
-SIDECAR_MIN_FREE_GB = float(os.environ.get("SIDECAR_MIN_FREE_GB", "8"))
+#
+# Must be **below** ``austria_processor.DISK_MIN_FREE_GB + 2`` (the
+# post-cleanup target, currently 7 GB) so that disk_cleanup's target
+# headroom leaves enough room for sidecars to persist. Per-tile peak
+# is bounded by ~3 tiles × ~250 MB ≈ 750 MB (see ``release_tile``
+# semantics above), so 4 GB leaves a comfortable margin and still keeps
+# 2 GB above the system emergency floor.
+SIDECAR_MIN_FREE_GB = float(os.environ.get("SIDECAR_MIN_FREE_GB", "4"))
 
 
 def _enough_disk() -> bool:

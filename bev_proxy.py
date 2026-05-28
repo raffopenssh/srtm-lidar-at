@@ -72,8 +72,16 @@ _TIFF_MAGIC_LE = (b"II*\x00", b"II+\x00")
 # Pool configuration
 # ---------------------------------------------------------------------------
 MIN_POOL_SIZE = 5               # minimum proxies to keep in active pool
-MAX_POOL_SIZE = 30              # cap active pool
-VALIDATION_WORKERS = 60         # parallel validation threads
+# 2026-05-28: bumped 30 -> 80. Phase-2 yield is ~0.1-0.6 % of tested
+# candidates, so the wider funnel (5000-sample, ~100k unique) now
+# routinely surfaces 10-30 working proxies; the 30 cap was clipping
+# the long tail of slower-but-working ones that are still preferable
+# to thrashing on the same /24 egress.
+MAX_POOL_SIZE = 80              # cap active pool
+# 2026-05-28: bumped 60 -> 120 to match the 5000-sample phase-1 budget
+# (~42 candidates per worker at 8s budget -> ~6 min wall time per
+# refresh, comfortably under the 30 min REFRESH_INTERVAL).
+VALIDATION_WORKERS = 120        # parallel validation threads
 VALIDATION_TIMEOUT = 10         # seconds per proxy test
 REFRESH_INTERVAL = 1800         # re-fetch & validate every 30 min
 DIRECT_WEIGHT = 3               # how many "direct" slots in rotation
@@ -355,7 +363,9 @@ def _refresh_pool():
         return
 
     # Phase 2: validate against BEV specifically
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(30, len(https_capable))) as ex:
+    # 2026-05-28: phase-2 worker cap 30 -> 80 to match MAX_POOL_SIZE and
+    # the larger phase-1 survivor count (~30-90 at 5000-sample funnel).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(80, len(https_capable))) as ex:
         bev_results = list(ex.map(_validate_proxy, https_capable))
 
     # Sort by latency, take the best

@@ -2940,7 +2940,18 @@ class PeerDirector:
                    'active_peer', 'mode', 'last_switch',
                    'bev_pause', 'bev_pause_history',
                    'bev_pool_escalation', 'bev_pool_probes',
-                   'ip_pools', 'ip_pools_history'):
+                   'ip_pools', 'ip_pools_history',
+                   # Bandwidth map: only the director-loop worker
+                   # updates this in memory. Without pulling it from
+                   # disk, the other gunicorn worker's _bw_map is
+                   # empty/stale, so cache_only_eligible diverges
+                   # between workers and the dashboard flickers
+                   # (e.g. '16/28 cache' one tick, different the
+                   # next). _fleet_bw_summary indirectly suffers too
+                   # (effective_budget/remaining_gb decorated onto
+                   # peers_status come from this map).
+                   'peer_bandwidth',
+                   '_bandwidth_backoff', '_bandwidth_misses'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
         # Sync the per-process EMA caches from disk too. Workers that

@@ -67,6 +67,7 @@ SNAPSHOT_FILES: tuple[str, ...] = (
     'copernicus_credential_usage.json',
     'peers.json',
     'cache_manifest.json',
+    'checkpoint_registry.json',
 )
 # Plain-text peer URL list — handled separately because it isn't JSON.
 SNAPSHOT_TEXT_FILES: tuple[str, ...] = ('peer_urls.txt',)

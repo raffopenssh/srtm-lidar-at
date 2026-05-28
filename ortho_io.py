@@ -925,6 +925,33 @@ def _try_read_rgbi_for_bbox(
     return None, None
 
 
+def pick_rgbi_year_for_als(als_result: dict) -> int | None:
+    """Return the year (e.g. 2024) of the newest RGBI operate that would
+    be picked by :func:`read_ortho_for_als` with ``year=None``.
+
+    Returns ``None`` if no RGBI operate covers the bbox (the DOP fallback
+    has no per-year sidecar concept). Lets callers persist per-tile ortho
+    sidecars keyed by the year that actually got read, so the GPKG
+    stitch step (which iterates a fixed year set) can look them up.
+    """
+    tf = als_result["transform"]
+    h, w = als_result["shape"]
+    res = abs(tf.a)
+    min_e = tf.c; max_n = tf.f
+    max_e = min_e + w * res; min_n = max_n - h * res
+    import pyproj
+    tx = pyproj.Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
+    lon_min, lat_min = tx.transform(min_e, min_n)
+    lon_max, lat_max = tx.transform(max_e, max_n)
+    ops = find_rgbi_operates(lat_min, lon_min, lat_max, lon_max)
+    if not ops:
+        return None
+    try:
+        return int(ops[0][:4])
+    except Exception:
+        return None
+
+
 def read_ortho_for_als(
     als_result: dict,
     dataset: str = DEFAULT_ORTHO_DATASET,

@@ -2690,11 +2690,35 @@ def _find_tile_for_point(e3035, n3035, tile_seg_results):
     return None
 
 
-def _read_dtm_for_tile(tr):
-    """Re-read DTM/DSM for a tile (BEV cache makes this fast)."""
+def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = None):
+    """Re-read DTM/DSM for a tile.
+
+    If *kg_code* and *tile_idx* are supplied AND a local raster sidecar
+    exists (written by the per-tile loop), the sidecar is mmap'd from
+    disk — no BEV call. Otherwise we fall back to the live BEV read and
+    persist a sidecar for any subsequent same-tile read within this KG.
+    Disk-budget enforcement is delegated to ``tile_raster_sidecar``.
+    """
     import raster_io as _rio
     import tile_index as _ti
-    return _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+    if kg_code is not None and tile_idx is not None:
+        try:
+            import tile_raster_sidecar as _trs
+            ckpt_root = DATA_DIR / "tile_checkpoints"
+            cached = _trs.load_dtm_dsm(ckpt_root, kg_code, tile_idx, "default")
+            if cached is not None:
+                return cached
+        except Exception:
+            pass
+    tdata = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+    if kg_code is not None and tile_idx is not None:
+        try:
+            import tile_raster_sidecar as _trs
+            ckpt_root = DATA_DIR / "tile_checkpoints"
+            _trs.persist_dtm_dsm(ckpt_root, kg_code, tile_idx, tdata, "default")
+        except Exception:
+            pass
+    return tdata
 
 
 # === SECTION: Boundary segment merging (cross-tile stitching) ===
@@ -3319,7 +3343,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
         # DTM / DSM / nDSM — feather-blended
         try:
-            tdata = _read_dtm_for_tile(tr)
+            tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
             tile_dtm = tdata["dtm"][:th_eff, :tw_eff].astype(np.float32)
             tile_dsm = tdata["dsm"][:th_eff, :tw_eff].astype(np.float32)
             tile_ndsm = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
@@ -3432,7 +3456,24 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             if th_eff <= 0 or tw_eff <= 0:
                 continue
             try:
-                d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
+                # Sidecar-first: skip BEV if the per-tile loop already wrote
+                # this multi-date layer to disk.
+                d2 = None
+                try:
+                    import tile_raster_sidecar as _trs
+                    d2 = _trs.load_dtm_dsm(
+                        DATA_DIR / "tile_checkpoints", kg_code, ti_idx, date_key)
+                except Exception:
+                    d2 = None
+                if d2 is None:
+                    d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
+                    try:
+                        import tile_raster_sidecar as _trs
+                        _trs.persist_dtm_dsm(
+                            DATA_DIR / "tile_checkpoints", kg_code, ti_idx,
+                            d2, date_key)
+                    except Exception:
+                        pass
                 td = d2["dtm"][:th_eff, :tw_eff].astype(np.float32)
                 ts2 = d2["dsm"][:th_eff, :tw_eff].astype(np.float32)
                 del d2
@@ -3490,11 +3531,30 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             if th_eff <= 0 or tw_eff <= 0:
                 continue
             try:
-                tdata = _read_dtm_for_tile(tr)
-                with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                    fut = _ex.submit(_oio.read_ortho_for_als, tdata, year=o_year)
-                    rgb_t, nir_t = fut.result(timeout=600)  # 10m — GPKG ortho read
-                del tdata
+                # Sidecar-first: ortho RGB(+NIR) stashed per (tile, year)
+                # during the per-tile loop — skip BEV entirely if present.
+                rgb_t = nir_t = None
+                try:
+                    import tile_raster_sidecar as _trs
+                    _hit = _trs.load_ortho(
+                        DATA_DIR / "tile_checkpoints", kg_code, ti_idx, o_year)
+                    if _hit is not None:
+                        rgb_t, nir_t = _hit
+                except Exception:
+                    pass
+                if rgb_t is None:
+                    tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                        fut = _ex.submit(_oio.read_ortho_for_als, tdata, year=o_year)
+                        rgb_t, nir_t = fut.result(timeout=600)  # 10m — GPKG ortho read
+                    del tdata
+                    try:
+                        import tile_raster_sidecar as _trs
+                        _trs.persist_ortho(
+                            DATA_DIR / "tile_checkpoints", kg_code, ti_idx,
+                            rgb_t, nir_t, o_year)
+                    except Exception:
+                        pass
                 if rgb_t is not None:
                     got_rgb = True
                     fw = _feather_weight(th_eff, tw_eff, margin=100).astype(np.float64)
@@ -6008,6 +6068,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     _tile_ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
     _tile_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase 2: if this KG was aborted by another peer, pull its tile
+    # pickles from the shared Zenodo registry before the tile loop.
+    # Cheap (KB-MB) and the on-tile restore branch handles them.
+    try:
+        import tile_checkpoint_registry as _ckpt_reg
+        _restored = _ckpt_reg.download_kg(kg_code)
+        if _restored:
+            log.info("KG %s: restored %d tile pickle(s) from Zenodo checkpoint registry",
+                     kg_code, _restored)
+    except Exception as _reg_e:
+        log.debug("checkpoint_registry download skipped: %s", _reg_e)
+
     def _save_tile_checkpoint(tile_idx, seg_result_entry, core_objects,
                               new_buildings, infra_objects, tile_avail_entry,
                               terrain_entry, spectral_accum, cop_accum,
@@ -6519,6 +6591,17 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tile_avail["dsm"] = True
             tile_avail["valid_pixels"] = tvalid
 
+            # Phase 1: persist default-date DTM/DSM/ndsm as a per-tile
+            # raster sidecar. Lets gpkg_full skip the BEV re-read entirely.
+            # Fail-soft + disk-budget gated inside the helper.
+            try:
+                import tile_raster_sidecar as _trs
+                _trs.persist_dtm_dsm(
+                    DATA_DIR / "tile_checkpoints", kg_code, tile_idx,
+                    tdata, "default")
+            except Exception:
+                pass
+
             # --- 3b. Terrain stats for this tile ---
             _report_step("terrain", tile_label)
             _tile_terrain_entry = None
@@ -6546,6 +6629,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             mw = min(tw_, d2["shape"][1])
                             dtm_dates[date_key] = d2["dtm"][:mh, :mw]
                             dsm_dates[date_key] = d2["dsm"][:mh, :mw]
+                            # Phase 1: persist multi-date DTM/DSM sidecar
+                            try:
+                                import tile_raster_sidecar as _trs
+                                _trs.persist_dtm_dsm(
+                                    DATA_DIR / "tile_checkpoints",
+                                    kg_code, tile_idx, d2, date_key)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                     if dtm_dates:
@@ -6588,6 +6679,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                 spectral["blue"] = rgb[2].astype(np.float32)
                             if nir is not None:
                                 spectral["nir"] = nir.astype(np.float32)
+                            # Phase 1: persist ortho RGB(+NIR) sidecar for
+                            # the year actually read, so gpkg_full can
+                            # find it in ``_stitch_ortho_for_year``.
+                            try:
+                                _yr_used = ortho_io.pick_rgbi_year_for_als(tdata)
+                                if _yr_used is not None and rgb is not None:
+                                    import tile_raster_sidecar as _trs
+                                    _trs.persist_ortho(
+                                        DATA_DIR / "tile_checkpoints",
+                                        kg_code, tile_idx, rgb, nir, _yr_used)
+                            except Exception:
+                                pass
                             break  # success
                         except concurrent.futures.TimeoutError as e:
                             _ortho_last_exc = e
@@ -7218,6 +7321,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # then need the tile checkpoints to skip the tile loop (and
         # the rebuilt full GPKG step is skipped via our reuse path).
         if result.get("zenodo_failed"):
+            # Keep metadata pickles (needed for the next attempt's tile loop
+            # restore) but ALWAYS drop raster sidecars — they cost the most
+            # disk and the GPKG was rebuilt successfully or will be re-built
+            # by the same code path. If the rasters are missing on retry
+            # the GPKG step falls back to the existing BEV re-read.
+            try:
+                import tile_raster_sidecar as _trs
+                _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+            except Exception:
+                pass
             log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
                      kg_code)
         else:
@@ -8237,6 +8350,38 @@ def _append_retry_queue(kg_code: str):
         if kg_code not in existing:
             existing.append(kg_code)
         RETRY_QUEUE_FILE.write_text(json.dumps(existing))
+    except Exception:
+        pass
+
+
+def _publish_checkpoints_to_registry(kg_code: str) -> None:
+    """Upload this KG's tile pickles to the shared Zenodo registry.
+
+    Called when a KG is deferred / re-queued. Best-effort — if the
+    upload fails the local checkpoints still work for same-peer
+    retries; we only lose the cross-peer benefit. Skipped on the
+    primary (it is the lock broker and almost never processes), and
+    when the directory is empty.
+    """
+    try:
+        kg_dir = DATA_DIR / "tile_checkpoints" / kg_code
+        if not kg_dir.exists():
+            return
+        pkls = [p for p in kg_dir.iterdir()
+                if p.is_file() and p.name.startswith("tile_")
+                and p.name.endswith(".pkl")]
+        if not pkls:
+            return
+        import threading as _th
+        # Run in a background thread so the iteration loop isn't blocked
+        # on the fleet-wide lock + multi-second Zenodo PUT.
+        def _bg():
+            try:
+                import tile_checkpoint_registry as _ckpt_reg
+                _ckpt_reg.upload_kg(kg_code)
+            except Exception as _e:
+                log.debug("checkpoint_registry upload skipped: %s", _e)
+        _th.Thread(target=_bg, name=f"chkpt_pub_{kg_code}", daemon=True).start()
     except Exception:
         pass
 
@@ -9398,6 +9543,7 @@ def main():
                             # Remove first so it moves to the end of the file
                             _remove_from_retry_queue(kg_code)
                             _append_retry_queue(kg_code)
+                            _publish_checkpoints_to_registry(kg_code)
                             _deferred_kg: dict = dict(kg)
                             _deferred_kg["_defer_attempt"] = 0  # reset
                             _append_deferred(_deferred_retries, 
@@ -9433,6 +9579,7 @@ def main():
                                 failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
                                 _save_failure_counts(failure_counts)
                                 _append_retry_queue(kg_code)
+                                _publish_checkpoints_to_registry(kg_code)
                                 _deferred: dict = dict(kg)
                                 _deferred["_defer_attempt"] = _defer_n + 1
                                 _append_deferred(_deferred_retries, 
@@ -9678,6 +9825,15 @@ def main():
                         _ts = _ckg.get("tile_statuses", [])
                     _save_tile_history(kg_code, _ts, "completed")
 
+                    # Phase 2: KG done — evict its bundle from the shared
+                    # Zenodo checkpoint registry. Best-effort, parent-side
+                    # so the network round-trip never blocks the next KG.
+                    try:
+                        import tile_checkpoint_registry as _ckpt_reg
+                        _ckpt_reg.delete_kg(kg_code)
+                    except Exception:
+                        pass
+
                     # --- Persistent partial-KG marker ---
                     # If any tile failed upstream (BEV outage, ortho 5xx, etc.)
                     # the KG still completed with degraded coverage.  Record
@@ -9793,6 +9949,7 @@ def main():
                                      kg_code)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code)
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
                         _ts = _ckg.get("tile_statuses", [])
@@ -9817,6 +9974,7 @@ def main():
                                      kg_code)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code)
                     # Save tile history for dashboard
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
@@ -9837,6 +9995,7 @@ def main():
                     # Re-queue for retry after pause ends (tile checkpoints preserved)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code)
                 else:
                     _err = result.get("error", "unknown")
                     _stp = result.get("step", "unknown")

@@ -15294,6 +15294,23 @@ def process_txt():
     except Exception:
         pass
 
+    # Cross-peer tile checkpoint registry (Zenodo-backed metadata pickles
+    # uploaded by aborting peers, downloaded by the next peer to pick
+    # up the KG). Operational visibility for the "BEV-expensive aborts
+    # are not wasted" mechanism. Stats are dirt-cheap (one JSON read).
+    try:
+        import tile_checkpoint_registry as _ckpt_reg
+        cs = _ckpt_reg.stats() or {}
+        if cs.get('kgs'):
+            _age_h = cs.get('oldest_age_s', 0) / 3600.0
+            out.append(
+                f'chkpt_registry: kgs={cs["kgs"]} '
+                f'bytes={cs.get("bytes", 0) / 1e6:.1f}MB '
+                f'oldest={_age_h:.1f}h'
+            )
+    except Exception:
+        pass
+
     # Fleet vCPU-steal summary (resource-pool profiling).
     # exe.dev runs peers on multiple shared hypervisor pools; steal %
     # is the cheapest signal that distinguishes them. Aggregate over

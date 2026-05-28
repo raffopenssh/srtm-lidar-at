@@ -8777,6 +8777,17 @@ class PeerDirector:
                         for key in ('active_peer', 'mode', 'last_switch'):
                             if key in disk_state:
                                 self.state[key] = disk_state[key]
+                        # bev_pause is written by other workers via
+                        # clear_bev_pause() / the dashboard chip; the
+                        # director-loop worker must pick that up or it
+                        # keeps the in-mem 'active=True' and ignores the
+                        # operator clear. See 2026-05-28 cross-worker
+                        # desync incident.
+                        if 'bev_pause' in disk_state:
+                            self.state['bev_pause'] = disk_state['bev_pause']
+                        if 'bev_pool_escalation' in disk_state:
+                            self.state['bev_pool_escalation'] = (
+                                disk_state['bev_pool_escalation'])
                     # Stamp first_seen on legacy peers that lack it so
                     # the warmup hold doesn't retroactively block them.
                     # New peers added via the API already get a stamp.

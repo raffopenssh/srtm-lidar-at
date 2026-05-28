@@ -4165,6 +4165,76 @@ def processing_queue_add():
     })
 
 
+# ----------------------------------------------------------------------
+# Partial-KG registry — KGs that completed but had upstream-failed tiles.
+# Written by austria_processor._record_partial_kg() after each KG.
+# Lives at data/austria_processor/partial_kgs.json (replicated to shadow
+# via director_ha.SNAPSHOT_FILES so HA handover preserves it).
+# ----------------------------------------------------------------------
+PARTIAL_KGS_PATH = Path('data/austria_processor/partial_kgs.json')
+
+
+def _load_partial_kgs_dict():
+    try:
+        if PARTIAL_KGS_PATH.exists():
+            d = json.loads(PARTIAL_KGS_PATH.read_text())
+            if isinstance(d, dict):
+                return d
+    except Exception as e:
+        log.warning('partial_kgs.json read failed: %s', e)
+    return {}
+
+
+@app.route('/api/v1/processing/partial_kgs', methods=['GET'])
+def processing_partial_kgs_get():
+    """List KGs flagged as partial (upstream-failed tiles present)."""
+    d = _load_partial_kgs_dict()
+    items = list(d.values()) if isinstance(d, dict) else []
+    items.sort(key=lambda r: (-int(r.get('n_upstream_failed_tiles', 0) or 0),
+                              r.get('ts') or ''),
+               reverse=False)
+    items.sort(key=lambda r: r.get('ts') or '', reverse=True)
+    return jsonify({'partial_kgs': items, 'count': len(items)})
+
+
+@app.route('/api/v1/processing/partial_kgs', methods=['DELETE'])
+def processing_partial_kgs_delete():
+    """Drop a KG from the partial registry (after manual review or re-queue)."""
+    if not _check_admin_token():
+        return jsonify({'error': 'admin token required'}), 403
+    code = request.args.get('kg') or (request.get_json(silent=True) or {}).get('kg', '')
+    if not code:
+        return jsonify({'error': 'kg parameter required'}), 400
+    import fcntl, tempfile, os as _os
+    lock_path = PARTIAL_KGS_PATH.with_suffix('.lock')
+    PARTIAL_KGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, 'w') as _lk:
+        try:
+            fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+            cur = {}
+            if PARTIAL_KGS_PATH.exists():
+                try:
+                    cur = json.loads(PARTIAL_KGS_PATH.read_text()) or {}
+                except Exception:
+                    cur = {}
+            existed = code in cur
+            cur.pop(code, None)
+            fd, tmp = tempfile.mkstemp(dir=str(PARTIAL_KGS_PATH.parent),
+                                       prefix='.partial_', suffix='.tmp')
+            try:
+                with _os.fdopen(fd, 'w') as f:
+                    json.dump(cur, f, indent=2, sort_keys=True)
+                _os.replace(tmp, PARTIAL_KGS_PATH)
+            except BaseException:
+                try: _os.unlink(tmp)
+                except OSError: pass
+                raise
+        finally:
+            try: fcntl.flock(_lk.fileno(), fcntl.LOCK_UN)
+            except Exception: pass
+    return jsonify({'status': 'removed' if existed else 'not_found', 'kg': code})
+
+
 @app.route('/api/v1/processing/queue', methods=['PUT'])
 def processing_queue_put():
     """Replace the entire priority queue."""

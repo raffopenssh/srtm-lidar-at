@@ -59,6 +59,7 @@ LOG_DIR = DATA_DIR / "logs"
 PROGRESS_FILE = DATA_DIR / "progress.json"
 KG_LIST_FILE = DATA_DIR / "kg_list.json"
 FAILED_KGS_FILE = DATA_DIR / "failed_kgs.json"
+PARTIAL_KGS_FILE = DATA_DIR / "partial_kgs.json"
 FAILURE_COUNTS_FILE = DATA_DIR / "failure_counts.json"
 IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
@@ -4318,11 +4319,38 @@ def compute_data_quality(tile_data_availability: list[dict]) -> dict:
     weighted_score = 0.0
     layer_counts = {k: 0 for k in layer_keys}
     n_active_tiles = 0  # tiles that actually had data (valid_pixels > 0 or segmentation)
+    n_upstream_failed = 0  # tiles where an upstream fetch raised (not boundary)
+    upstream_failed_tiles = []  # idx + reason for partial-KG re-queue decisions
+
+    # Pixel count we'd EXPECT a failed tile to contribute if it had succeeded.
+    # Use the median of successful tiles so a few outliers don't dominate;
+    # falls back to mean if pixel-weighted scoring would assign zero weight
+    # to upstream-failed tiles (they have valid_pixels==0 by construction).
+    _success_px = [t.get("valid_pixels", 0) for t in tile_data_availability
+                   if t.get("valid_pixels", 0) > 0]
+    _imputed_px = (sorted(_success_px)[len(_success_px) // 2]
+                   if _success_px else 1)
 
     for t in tile_data_availability:
         px = t.get("valid_pixels", 0)
+        upstream_fail = bool(t.get("upstream_fail"))
+        outside = bool(t.get("outside_austria") or t.get("ortho_outside_austria"))
         if px == 0 and not t.get("segmentation"):
-            continue  # skip empty/skipped tiles for scoring
+            if upstream_fail and not outside:
+                # Score as a fully-missing tile so the grade reflects the gap.
+                n_upstream_failed += 1
+                upstream_failed_tiles.append({
+                    "tile_index": t.get("tile_index"),
+                    "bbox_wgs": t.get("bbox_wgs"),
+                    "reason": t.get("upstream_fail_reason", "unknown"),
+                })
+                n_active_tiles += 1
+                tile_weight = _imputed_px / max(total_pixels + _imputed_px * 1, 1)
+                # Score contribution = 0 (no layers succeeded); only pulls
+                # the weighted average down via the denominator below.
+                continue
+            else:
+                continue  # skip boundary / outside-Austria / genuinely-empty tiles
         n_active_tiles += 1
         tile_weight = px / total_pixels if total_pixels > 0 else 1.0 / len(tile_data_availability)
         tile_score = 0.0
@@ -4340,7 +4368,17 @@ def compute_data_quality(tile_data_availability: list[dict]) -> dict:
     available = [k for k, v in layers_summary.items() if v >= 1.0]
     partial = [k for k, v in layers_summary.items() if 0 < v < 1.0]
 
-    score = round(min(1.0, weighted_score), 3)
+    # Penalise the score by the fraction of upstream-failed tiles among
+    # all non-boundary tiles.  A 7/8 LiDAR-empty KG should NOT score A.
+    _n_non_boundary = sum(
+        1 for t in tile_data_availability
+        if not (t.get("outside_austria") or t.get("ortho_outside_austria"))
+    )
+    if _n_non_boundary > 0 and n_upstream_failed > 0:
+        _good_frac = max(0.0, 1.0 - n_upstream_failed / _n_non_boundary)
+        score = round(min(1.0, weighted_score) * _good_frac, 3)
+    else:
+        score = round(min(1.0, weighted_score), 3)
     if score >= 0.9:
         grade = "A"
     elif score >= 0.75:
@@ -4360,6 +4398,8 @@ def compute_data_quality(tile_data_availability: list[dict]) -> dict:
         "tiles": tile_data_availability,
         "n_active_tiles": n_active_tiles,
         "n_total_tiles": len(tile_data_availability),
+        "n_upstream_failed_tiles": n_upstream_failed,
+        "upstream_failed_tiles": upstream_failed_tiles,
         "missing_layers": missing,
         "available_layers": available,
         "partial_layers": partial,
@@ -6333,6 +6373,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # Retry with escalating timeouts to handle BEV slowness.
             _report_step("lidar", f"{tile_label} — reading DTM/DSM")
             tdata = None
+            _lidar_last_exc = None
             _LIDAR_TIMEOUTS = [300, 600]  # 5m, 10m
             for _lidar_attempt, _lidar_timeout in enumerate(_LIDAR_TIMEOUTS, 1):
                 try:
@@ -6342,7 +6383,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         )
                         tdata = _lidar_fut.result(timeout=_lidar_timeout)
                     break  # success
-                except concurrent.futures.TimeoutError:
+                except concurrent.futures.TimeoutError as e:
+                    _lidar_last_exc = e
                     if _lidar_attempt < len(_LIDAR_TIMEOUTS):
                         log.warning(
                             "KG %s %s: LiDAR read attempt %d/%d timed out after %ds, retrying...",
@@ -6355,13 +6397,36 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             kg_code, tile_label, _lidar_attempt, _lidar_timeout,
                         )
                 except Exception as e:
+                    _lidar_last_exc = e
                     log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
                     break  # non-timeout errors are not retried
             if tdata is None:
-                log.warning("KG %s %s: LiDAR unavailable — skipping tile", kg_code, tile_label)
+                # Distinguish (a) tile outside Austria / BEV tile-index coverage
+                # (raster_io raises ValueError 'No tiles cover bbox ...') —
+                # this is a benign boundary tile, NOT a failure; vs
+                # (b) any other exception (timeout, 5xx, connection reset)
+                # which IS an upstream-side failure we need to remember
+                # for partial-KG re-queue logic.
+                _exc_str = str(_lidar_last_exc) if _lidar_last_exc else ""
+                _outside = (
+                    isinstance(_lidar_last_exc, ValueError)
+                    and "No tiles cover bbox" in _exc_str
+                )
+                if _outside:
+                    tile_avail["outside_austria"] = True
+                    log.info("KG %s %s: tile outside BEV LiDAR coverage — boundary",
+                             kg_code, tile_label)
+                else:
+                    tile_avail["upstream_fail"] = True
+                    tile_avail["upstream_fail_reason"] = (
+                        f"lidar: {type(_lidar_last_exc).__name__}: {_exc_str[:200]}"
+                        if _lidar_last_exc else "lidar: unknown"
+                    )
+                    log.warning("KG %s %s: LiDAR unavailable — skipping tile (upstream fail)",
+                                kg_code, tile_label)
                 tile_data_availability.append(tile_avail)
-                _tile_entry["status"] = "error"
-                _tile_entry["issues"]["lidar"] = "fail"
+                _tile_entry["status"] = "error" if not _outside else "skip"
+                _tile_entry["issues"]["lidar"] = "fail" if not _outside else "boundary"
                 continue
             th, tw_ = tdata["shape"]
             tvalid = int(tdata["mask"].sum())
@@ -6433,6 +6498,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # per-attempt timeout here caps the total wall-clock per try.
             _report_step("ortho", tile_label)
             spectral = None
+            _ortho_last_exc = None
             import ortho_io  # noqa: lazy import (subprocess boundary)
             _ORTHO_TIMEOUTS = [300, 600, 900]  # 5m, 10m, 15m — escalating
             for _ortho_attempt, _ortho_timeout in enumerate(_ORTHO_TIMEOUTS, 1):
@@ -6449,7 +6515,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             if nir is not None:
                                 spectral["nir"] = nir.astype(np.float32)
                             break  # success
-                        except concurrent.futures.TimeoutError:
+                        except concurrent.futures.TimeoutError as e:
+                            _ortho_last_exc = e
                             if _ortho_attempt < len(_ORTHO_TIMEOUTS):
                                 log.warning(
                                     "KG %s %s: ortho attempt %d/%d timed out after %ds, retrying with %ds...",
@@ -6463,6 +6530,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                     kg_code, tile_label, _ortho_attempt, _ortho_timeout,
                                 )
                 except Exception as e:
+                    _ortho_last_exc = e
                     if _ortho_attempt < len(_ORTHO_TIMEOUTS):
                         log.warning(
                             "KG %s %s: ortho attempt %d/%d failed (%s), retrying...",
@@ -6475,6 +6543,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         )
             if spectral is not None:
                 tile_avail["ortho"] = True
+            else:
+                # Distinguish boundary (no DOP tile covers — outside Austria)
+                # from upstream failure (timeout, 5xx, connection reset).
+                # read_ortho_for_als raises ValueError("No DOP tiles cover bbox …")
+                # when bbox falls outside BEV's ortho tile index.
+                _exc_str = str(_ortho_last_exc) if _ortho_last_exc else ""
+                _outside = (
+                    isinstance(_ortho_last_exc, ValueError)
+                    and ("No DOP tiles cover bbox" in _exc_str
+                         or "No tiles cover bbox" in _exc_str)
+                )
+                if _outside:
+                    tile_avail["ortho_outside_austria"] = True
+                elif _ortho_last_exc is not None:
+                    tile_avail["upstream_fail"] = True
+                    tile_avail.setdefault(
+                        "upstream_fail_reason",
+                        f"ortho: {type(_ortho_last_exc).__name__}: {_exc_str[:200]}",
+                    )
 
             # Accumulate spectral info for JSON
             if spectral and spectral.get("ndvi") is not None:
@@ -6830,6 +6917,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
         _all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
         _all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
+        if not _all_rights:
+            # All tiles were skipped (boundary or upstream-fail) — nothing to
+            # segment.  Abort cleanly so the partial-KG path can record this.
+            raise RuntimeError(
+                f"KG {kg_code}: no usable tiles — "
+                f"all {n_tiles} tiles were skipped (boundary or upstream-fail)"
+            )
         _full_w = int(round((max(_all_rights) - min(_all_lefts))))
         _full_h = int(round((max(_all_tops) - min(_all_bottoms))))
         _n_pixels = _full_w * _full_h
@@ -7075,6 +7169,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["quality_grade"] = dq.get("quality_grade", "F")
         result["available_layers"] = dq.get("available_layers", [])
         result["missing_layers"] = dq.get("missing_layers", [])
+        result["n_upstream_failed_tiles"] = dq.get("n_upstream_failed_tiles", 0)
+        result["upstream_failed_tiles"] = dq.get("upstream_failed_tiles", [])
 
         json_path = str(JSON_DIR / f"{kg_code}.json")
         with open(json_path, 'w') as f:
@@ -8065,6 +8161,91 @@ def _save_failed_kgs(codes: set):
         FAILED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
     except Exception:
         pass
+
+
+def _load_partial_kgs() -> dict:
+    """Load per-KG partial-completion records.
+
+    Schema: {kg_code: {name, quality_score, quality_grade,
+                       n_upstream_failed_tiles, upstream_failed_tiles,
+                       missing_layers, elapsed_s, ts}}
+    """
+    try:
+        if PARTIAL_KGS_FILE.exists():
+            d = json.loads(PARTIAL_KGS_FILE.read_text())
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _partial_kgs_mutate(fn):
+    """Run ``fn(dict)`` under an fcntl lock; persist atomically.
+
+    Safe across the two gunicorn workers AND the austria_processor
+    subprocess (which all share the same filesystem). ``fn`` may mutate
+    the dict in place and/or return a replacement.
+    """
+    import fcntl, tempfile, os
+    PARTIAL_KGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = PARTIAL_KGS_FILE.with_suffix('.lock')
+    with open(lock_path, 'w') as _lk:
+        try:
+            fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+            cur = {}
+            if PARTIAL_KGS_FILE.exists():
+                try:
+                    cur = json.loads(PARTIAL_KGS_FILE.read_text()) or {}
+                except Exception:
+                    cur = {}
+            new = fn(cur)
+            if new is None:
+                new = cur
+            fd, tmp = tempfile.mkstemp(
+                dir=str(PARTIAL_KGS_FILE.parent),
+                prefix='.partial_', suffix='.tmp',
+            )
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(new, f, indent=2, sort_keys=True)
+                os.replace(tmp, PARTIAL_KGS_FILE)
+            except BaseException:
+                try: os.unlink(tmp)
+                except OSError: pass
+                raise
+        finally:
+            try:
+                fcntl.flock(_lk.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _record_partial_kg(kg_code, kg_name, *, quality_score, quality_grade,
+                       n_upstream_failed_tiles, upstream_failed_tiles,
+                       missing_layers, elapsed_s):
+    rec = {
+        "code": kg_code,
+        "name": kg_name or "",
+        "quality_score": round(float(quality_score or 0), 3),
+        "quality_grade": quality_grade or "",
+        "n_upstream_failed_tiles": int(n_upstream_failed_tiles or 0),
+        "upstream_failed_tiles": upstream_failed_tiles or [],
+        "missing_layers": missing_layers or [],
+        "elapsed_s": round(float(elapsed_s or 0), 1),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    def _upd(d):
+        d[kg_code] = rec
+        return d
+    _partial_kgs_mutate(_upd)
+
+
+def _clear_partial_kg(kg_code):
+    def _upd(d):
+        d.pop(kg_code, None)
+        return d
+    _partial_kgs_mutate(_upd)
 
 
 def _load_retried_kgs() -> set:
@@ -9385,6 +9566,38 @@ def main():
                         _ckg = progress._state.get("current_kg") or {}
                         _ts = _ckg.get("tile_statuses", [])
                     _save_tile_history(kg_code, _ts, "completed")
+
+                    # --- Persistent partial-KG marker ---
+                    # If any tile failed upstream (BEV outage, ortho 5xx, etc.)
+                    # the KG still completed with degraded coverage.  Record
+                    # this in partial_kgs.json so the dashboard can flag it
+                    # and the operator can re-queue with one click.
+                    _n_up = int(result.get("n_upstream_failed_tiles", 0) or 0)
+                    if _n_up > 0:
+                        try:
+                            _record_partial_kg(
+                                kg_code, kg_name,
+                                quality_score=_qs,
+                                quality_grade=_qg,
+                                n_upstream_failed_tiles=_n_up,
+                                upstream_failed_tiles=result.get("upstream_failed_tiles", []),
+                                missing_layers=result.get("missing_layers", []),
+                                elapsed_s=elapsed_kg,
+                            )
+                            progress.add_log(
+                                "warning",
+                                f"KG {kg_code}: PARTIAL ({_n_up} tile(s) upstream-failed; "
+                                f"quality={_qs:.0%} {_qg}) — logged to partial_kgs.json",
+                                kg_code,
+                            )
+                        except Exception as _e:
+                            log.warning("KG %s: failed to record partial: %s", kg_code, _e)
+                    else:
+                        # Clean prior partial marker if this run was clean.
+                        try:
+                            _clear_partial_kg(kg_code)
+                        except Exception:
+                            pass
 
                     # Remove from priority queue file now that it's done
                     _remove_from_retry_queue(kg_code)

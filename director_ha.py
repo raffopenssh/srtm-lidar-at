@@ -61,6 +61,7 @@ SNAPSHOT_FILES: tuple[str, ...] = (
     'deferred_kgs.json',
     'retry_queue.json',
     'failed_kgs.json',
+    'partial_kgs.json',
     'manifest_tombstones.json',
     'copernicus_credentials.json',
     'copernicus_credential_usage.json',

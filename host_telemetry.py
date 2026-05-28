@@ -266,6 +266,23 @@ def host_profile() -> dict:
         info["boot_ts"] = int(time.time() - float(open("/proc/uptime").read().split()[0]))
     except (OSError, ValueError):
         pass
+    # Outbound NAT IP (the IP BEV/Zenodo see). Used by the director to
+    # group peers into egress pools so it can detect a /24-level block
+    # (e.g. BEV starts returning HTTP 0 for one NAT pool while others
+    # are fine). Cheap: one HTTP HEAD-equivalent on first call, cached
+    # for process lifetime. Falls back silently if the probe fails.
+    try:
+        import urllib.request as _ur, socket as _sock
+        _sock.setdefaulttimeout(4.0)
+        # api.ipify.org is the standard; resolves through whatever
+        # NAT GW the VM uses, so it always reports the outbound IP.
+        _ip = _ur.urlopen('https://api.ipify.org', timeout=4).read().decode().strip()
+        if _ip and _ip.count('.') == 3 and all(p.isdigit() for p in _ip.split('.')):
+            info["outbound_ip"] = _ip
+            # /24 group key for pool aggregation.
+            info["outbound_24"] = '.'.join(_ip.split('.')[:3]) + '.0/24'
+    except Exception:
+        pass
     _HOST_PROFILE_CACHE = info
     return info
 

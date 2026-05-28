@@ -14920,6 +14920,52 @@ def process_txt():
     except Exception:
         log.exception('process.txt throttle block failed')
 
+    # --- BEV outage state + IP-pool egress ---------------------
+    # Surfaced compactly so an agent curl-ing process.txt can see at
+    # a glance whether the fleet is in a BEV-outage cooldown and which
+    # egress /24 (if any) is currently being shaped/blocked.
+    try:
+        bp = d.get('bev_pause') or {}
+        if bp.get('active'):
+            from datetime import datetime as _dt
+            try:
+                _u = _dt.fromisoformat(bp.get('until') or '')
+                _rem = max(0, int((_u - _dt.now(_u.tzinfo)).total_seconds()))
+            except Exception:
+                _rem = int(bp.get('cooldown_s') or 0)
+            out.append(
+                f'bev_pause: ACTIVE level={bp.get("level")}/4 '
+                f'remaining={_hms(_rem)} since={bp.get("since") or "?"} '
+                f'reason={bp.get("reason") or "?"}'
+            )
+        else:
+            _last_up = bp.get('last_unpause_ts')
+            _prev_level = bp.get('level')
+            if _last_up and _prev_level:
+                _age = int(max(0, time.time() - float(_last_up)))
+                out.append(
+                    f'bev_pause: clear (last unpause {_hms(_age)} ago, '
+                    f'prev level {_prev_level}/4 — next trigger would '
+                    f'escalate within 48h)'
+                )
+            else:
+                # No history — omit the line to keep top section tight.
+                pass
+        pools = d.get('ip_pools') or {}
+        if pools:
+            # Sort by avg_wpm desc so the noisiest pool shows first.
+            items = sorted(pools.items(),
+                           key=lambda kv: -float(kv[1].get('avg_wpm') or 0))
+            parts = []
+            for key, v in items[:6]:  # top 6 pools is plenty
+                parts.append(
+                    f'{key}:n={v.get("n")} '
+                    f'avg={float(v.get("avg_wpm") or 0):.1f}wpm'
+                )
+            out.append('ip_pools: ' + ' · '.join(parts))
+    except Exception:
+        log.exception('process.txt bev_pause / ip_pools block failed')
+
     # --- Processing summary --------------------------------------
     try:
         prog_path = Path('data/austria_processor/progress.json')

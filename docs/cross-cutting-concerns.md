@@ -166,6 +166,11 @@ incomplete in cache-only mode. Fingerprints are computed from
 1. `austria_processor.py` → `_compute_tile_grid()` (tile_km, overlap_km params)
 2. `tile_cache.py` → grid sizes per source (0.1° Copernicus, 0.5° Hansen)
 3. Invalidate tile checkpoints: `rm -rf data/austria_processor/tile_checkpoints/`
+   (drops metadata pickles + raster sidecars). If a `chkpt_*.tar.gz`
+   exists for the KG on the shared Zenodo deposit it will be downloaded
+   back at the top of `process_one_kg()` — evict that too via
+   `tile_checkpoint_registry.delete_kg(<kg>)` (or just bump
+   `MAX_REGISTRY_KGS=0` for one run) on schema bumps.
 
 ### Navigation Cheatsheet
 

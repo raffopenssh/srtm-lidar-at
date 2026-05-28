@@ -41,10 +41,39 @@ main()                           ← parent process, iterates KGs
    so edge objects aren't truncated. Dedup uses centroid-ownership (core zone =
    tile shrunk by 50m on overlap sides).
 
-3. **Tile checkpoints**: Each completed tile is pickled to
-   `data/austria_processor/tile_checkpoints/<kg>/tile_N.pkl`.
-   On crash/restart, completed tiles are restored — only the interrupted tile
-   is re-processed. Checkpoints are deleted after successful KG completion.
+3. **Tile checkpoints** (two tiers, deployed dd08d74):
+
+   **Metadata tier** — each completed tile is pickled to
+   `data/austria_processor/tile_checkpoints/<kg>/tile_N.pkl`. Carries the
+   full per-tile result (segmentation, classified objects, vector cadastre,
+   NDVI/SAR/Hansen extracts — *everything except raw rasters*). KB–MB per
+   tile. Restored on same-peer crash/restart.
+
+   **Cross-peer registry** — when a KG is aborted/deferred mid-flight
+   (BEV exhaustion, cred rotation, timeout, postpone, role eviction), the
+   parent gzip+tars all tile pickles and uploads to the shared Zenodo
+   cache deposit as `chkpt_<kg>.tar.gz`. The next peer that picks up the
+   KG downloads + unpacks them inside `process_one_kg()` before the tile
+   loop runs. So BEV-expensive aborts are not wasted across peers. See
+   `tile_checkpoint_registry.py`. Fleet visibility: cache_manifest.json
+   carries `chkpt_*` entries (size>0 = present, size=0 = tombstone
+   = deleted on completion) and propagates fleet-wide every 5 min via the
+   existing `_sync_peer_data` cycle — no new traffic.
+
+   **Raster sidecars (Phase 1)** — per-peer local only, never uploaded.
+   After each tile reads DTM/DSM/nDSM + multi-date DTM/DSM + ortho RGB+NIR,
+   `tile_raster_sidecar.persist_dtm_dsm/persist_ortho` writes `.npy` files
+   under `tile_checkpoints/<kg>/tile_N/raster/`. `build_full_gpkg_tiled`
+   mmaps these instead of re-reading BEV, eliminating 6+ BEV passes per
+   tile during the `gpkg_full` step (was the longest-running step
+   pre-deploy at 5–7 h/peer). Gated on free disk ≥ `SIDECAR_MIN_FREE_GB`
+   (env-overridable, default 8 GB) — silent no-op below that, with the
+   BEV re-read fallback. Bulk-released at the existing tile-checkpoint
+   free point after `gpkg_full` succeeds.
+
+   All three tiers are deleted after successful KG completion (raster
+   sidecars also released on Zenodo-upload-failure rebuild path). Audit
+   trail in the merged 24h log via `?q=chkpt`.
 
 4. **Parent-child communication**: The subprocess writes step progress to
    `data/austria_processor/current_step.json` (atomic temp+rename). A parent
@@ -141,7 +170,9 @@ cadastre API ──→ cadastre ──→ ground truth  features  labels
 | `current_step.json` | Child (`_report_step()`) | Parent (`_monitor_step_file` thread) | IPC: step name + detail + tile index |
 | `subprocess_warnings.jsonl` | Child (`_WarningRelayHandler`) | Parent (`_monitor_step_file`) | WARNING/ERROR log relay |
 | `in_progress_kg.txt` | Parent | Parent (on restart) | Crash recovery: re-process interrupted KG |
-| `tile_checkpoints/<kg>/tile_N.pkl` | Child | Child (on retry) | Resume from last completed tile |
+| `tile_checkpoints/<kg>/tile_N.pkl` | Child | Child (on retry); other peers (via Zenodo chkpt registry) | Resume from last completed tile |
+| `tile_checkpoints/<kg>/tile_N/raster/*.npy` | Child (per-tile loop) | Child (`gpkg_full` step, mmap) | Skip BEV DTM/DSM/ortho re-reads in `gpkg_full` (Phase 1, dd08d74) |
+| `checkpoint_registry.json` | Parent (uploading peer only) | Primary `/process.txt` (read via `cache_manifest.json` mirror) | LRU registry of tile-tars uploaded to Zenodo — `{kg: {ts, n_tiles, bytes, name}}`, cap `MAX_REGISTRY_KGS=200` |
 | `zenodo_manifest.json` | Parent (`Manifest`) | Parent + Dashboard | Upload tracking (success/error per KG) |
 | `failed_kgs.json` | Parent | Parent (on restart) | Permanently-failed KGs to skip |
 | `retry_queue.json` | API / transient handler | Parent (each iteration) | KG codes to insert next in queue (read + cleared) |
@@ -196,6 +227,12 @@ print('Queue now:', len(q), 'items, starts with', q[:3])
 
 # 4. (Optional) Remove tile checkpoints if the KG was mid-processing
 #    This forces a clean restart for that KG. Skip if the KG wasn't in progress.
+#    NOTE: this drops the metadata pickles AND the local raster sidecars
+#    (Phase 1). If the same KG has a chkpt_*.tar.gz on Zenodo it will be
+#    re-downloaded into the dir before the tile loop runs — if you want a
+#    truly clean restart, also evict the Zenodo bundle (single-peer admin
+#    op, normally only needed on schema bumps):
+#      python3 -c "import tile_checkpoint_registry as r; r.delete_kg('TARGET_CODE')"
 rm -rf data/austria_processor/tile_checkpoints/TARGET_CODE/
 
 # 5. Start the processor — it reads retry_queue.json first

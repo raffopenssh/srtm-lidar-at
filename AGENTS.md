@@ -47,6 +47,39 @@ revalidation/add/remove, frontier credential & cache-cell plan changes,
 `app.director_event(…)` and appear inline in the merged 24h log
 (`peer=director` for fleet-wide events, otherwise the affected peer id).
 
+### Tile-checkpoint registry fields in `/process.txt`
+
+The `chkpt_registry:` line (when present) summarises the cross-peer tile-
+tar registry used by the dd08d74 BEV-cost-recovery mechanism: when a
+peer aborts a KG mid-flight (BEV exhaustion / cred rotation / role
+eviction) it uploads its tile metadata pickles as a gzipped tarball to
+the shared Zenodo cache deposit; the next peer that picks up the KG
+pulls them and skips re-doing those tiles. Format:
+
+```
+chkpt_registry: kgs=N tiles=T bytes=X.XMB oldest=Yh
+```
+
+Fleet visibility piggybacks on the existing `cache_manifest.json` sync
+(`chkpt_*` filenames, size=0 = tombstone), so primary sees every peer's
+upload/delete within one 5-min sync tick — no new traffic or endpoints.
+Every upload / restore / delete also emits an INFO line into the merged
+log so the operator can audit eviction fleet-wide:
+
+```bash
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hours=24&log=500&q=chkpt'
+```
+
+Look for `chkpt: uploaded <kg>` (parent, post-defer), `chkpt: restored N
+tile pickle(s) for <kg>` (subprocess, init step), and `chkpt: deleted
+<kg>` (parent, post-completion). Warning variants surface on failure.
+
+Local raster sidecars (Phase 1, dd08d74) under `tile_checkpoints/<kg>/
+tile_N/raster/*.npy` are *not* part of the cross-peer registry — they're
+per-peer-disk only (gated on >= 8 GB free, see `tile_raster_sidecar.py`)
+and let the `gpkg_full` step mmap DTM/DSM/ortho instead of re-reading
+BEV. See `docs/austria-processor.md` for the full lifecycle.
+
 ### Bandwidth fields in `/process.txt`
 
 The text dashboard surfaces all the bandwidth telemetry needed to debug a
@@ -420,9 +453,11 @@ More in `docs/cross-cutting-concerns.md`.
 | `current_step.json` | Subprocess→parent IPC |
 | `subprocess_warnings.jsonl` | Warning relay |
 | `in_progress_kg.txt` | Crash-recovery marker |
-| `tile_checkpoints/<kg>/tile_N.pkl` | Per-tile checkpoints (resume-on-retry) |
-| `zenodo_manifest.json` | KG product uploads |
-| `cache_manifest.json` | Zenodo tile-cache deposit (shared across peers) |
+| `tile_checkpoints/<kg>/tile_N.pkl` | Per-tile metadata checkpoints (resume-on-retry; cross-peer via Zenodo chkpt registry — see `docs/austria-processor.md`) |
+| `tile_checkpoints/<kg>/tile_N/raster/*.npy` | Per-tile local raster sidecars (DTM/DSM/nDSM + multi-date + ortho RGB+NIR) so `gpkg_full` skips BEV re-reads (Phase 1, dd08d74) |
+| `checkpoint_registry.json` | Local view of *which* tile-tars this peer uploaded to Zenodo (only the uploading peer writes it; the fleet-wide view lives in `cache_manifest.json` under `chkpt_*` keys, synced primary↔peers every 5 min) |
+| `zenodo_manifest.json` | KG product uploads (schema: `{entries: {key: {depo_id, size, ...}}}` — *not* `{kgs: …}`. `*_error` keys are retry markers; exclude them from totals.) |
+| `cache_manifest.json` | Zenodo tile-cache deposit (schema: `{depo_id, files: {fname: {size, tile_count, updated_at, ...}}}`). Doubles as the fleet-wide transport for chkpt registry deltas (`chkpt_*` filenames, size=0 = tombstone). Synced via existing `_sync_peer_data` GET+PUT cycle — no new traffic. |
 | `zenodo_zip_index/*.json` | Cached central directories of remote ZIPs |
 | `failed_kgs.json` / `retry_queue.json` / `deferred_kgs.json` | Queue mgmt |
 | `peers.json` / `director_state.json` / `director.lock` / `is_director` | Director |

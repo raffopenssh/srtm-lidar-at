@@ -37,8 +37,16 @@ _PROXY_SOURCES = [
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
 ]
 
-# URL used to validate that a proxy supports HTTPS CONNECT to BEV
+# URLs used to validate that a proxy can actually fetch BEV TIFF bytes.
+# We probe TWO distinct tiles + check the TIFF magic byte on each so
+# proxies that return cached error pages or partial bodies are caught
+# before they enter the pool.  See 2026-05-28 post-mortem.
 _BEV_TEST_URL = "https://data.bev.gv.at/download/ALS/DTM/20220915/ALS_DTM_CRS3035RES50000mN2800000E4750000.tif"
+_BEV_TEST_URL_2 = "https://data.bev.gv.at/download/ALS/DTM/20240915/ALS_DTM_CRS3035RES50000mN2750000E4500000.tif"
+# BigTIFF magic: 'II' (little-endian) + 0x002B (BigTIFF version).
+# Classic TIFF would be 'II' + 0x002A.  BEV uses BigTIFF for these tiles
+# but accept either to be safe.
+_TIFF_MAGIC_LE = (b"II*\x00", b"II+\x00")
 
 # ---------------------------------------------------------------------------
 # Pool configuration
@@ -53,7 +61,13 @@ DIRECT_WEIGHT = 3               # how many "direct" slots in rotation
 # ---------------------------------------------------------------------------
 # Healing / cooldown configuration
 # ---------------------------------------------------------------------------
-BASE_COOLDOWN = 60              # initial cooldown (seconds)
+# 2026-05-28: bumped 60s→300s.  Most free-proxy failures we see are
+# slow CONNECT/timeout patterns where the proxy was *probably* healthy
+# in the validation phase 30 min ago but flaked under real load.  A
+# 60s cooldown lets such proxies rejoin the pool immediately and keep
+# producing transport failures; 300s = 5 min gives time for the next
+# refresh cycle to re-test them before they get another shot.
+BASE_COOLDOWN = 300             # initial cooldown (seconds)
 MAX_COOLDOWN = 3 * 86400        # cap at 3 days
 COOLDOWN_EXPONENT = 2.0         # cooldown = BASE * EXPONENT^(fail_score - 1)
 SUCCESS_DECAY = 0.5             # on success, fail_score *= this
@@ -222,24 +236,37 @@ def _fetch_candidates() -> set[str]:
 
 
 def _validate_proxy(proxy: str) -> tuple[str, bool, float]:
-    """Test if a proxy supports HTTPS CONNECT to BEV. Returns (proxy, ok, latency)."""
+    """Phase-2 validation: must fetch real BigTIFF bytes from two BEV tiles.
+
+    Returns ``(proxy, ok, latency)``.  ``ok=True`` only if BOTH tiles
+    returned 206 with valid TIFF magic bytes — catches proxies that
+    return error pages or partial bodies (the dominant failure mode we
+    saw in the 24h post-mortem 2026-05-28).
+    """
     t0 = time.time()
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-             "--proxy", f"http://{proxy}",
-             "--range", "0-1023",
-             "--connect-timeout", "5",
-             "--max-time", str(VALIDATION_TIMEOUT),
-             _BEV_TEST_URL],
-            capture_output=True, text=True,
-            timeout=VALIDATION_TIMEOUT + 5,
-        )
-        elapsed = time.time() - t0
-        code = r.stdout.strip()
-        return proxy, code in ("200", "206"), elapsed
-    except Exception:
-        return proxy, False, time.time() - t0
+    import tempfile
+    def _probe(url: str) -> bool:
+        try:
+            with tempfile.NamedTemporaryFile(delete=True) as tf:
+                r = subprocess.run(
+                    ["curl", "-s", "-o", tf.name, "-w", "%{http_code}",
+                     "--proxy", f"http://{proxy}",
+                     "--range", "0-1023",
+                     "--connect-timeout", "5",
+                     "--max-time", str(VALIDATION_TIMEOUT),
+                     url],
+                    capture_output=True, text=True,
+                    timeout=VALIDATION_TIMEOUT + 5,
+                )
+                code = r.stdout.strip()
+                if code not in ("200", "206"):
+                    return False
+                head = open(tf.name, "rb").read(4)
+                return any(head.startswith(m) for m in _TIFF_MAGIC_LE)
+        except Exception:
+            return False
+    ok = _probe(_BEV_TEST_URL) and _probe(_BEV_TEST_URL_2)
+    return proxy, ok, time.time() - t0
 
 
 def _refresh_pool():

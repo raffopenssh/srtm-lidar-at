@@ -548,9 +548,30 @@ class ProgressTracker:
     # Patterns are case-insensitive substring tests; first match wins. The
     # buckets are intentionally coarse: we only need to know whether the BEV
     # GeoTIFF servers or Zenodo are getting hammered, not why.
+    # Tokens that mean "BEV is actually pushing back" — i.e. our OUTER
+    # bev_retry wrapper gave up, the proxy pool is exhausted, or BEV
+    # itself returned a 429/503.  GDAL's own per-range internal retry
+    # chatter is NOT in here: it's filtered by _BEV_GDAL_INTERNAL_TOKENS
+    # below and tallied as proxy-lane noise so it doesn't pin the
+    # fleet-wide BEV pause heuristic.  (2026-05-28 post-mortem: 87% of
+    # last-24h "BEV warns" were GDAL-internal retry noise from the flaky
+    # free-proxy pool, while BEV itself returned 206 in <1.5s.)
     _WARN_BEV_TOKENS = (
-        "data.bev.gv.at", "rasterio._err", "cple_appdefined", "bev_retry",
-        "als_dtm", "als_dsm", "http error code: 0",
+        "data.bev.gv.at", "rasterio._err", "bev_retry",
+        "als_dtm", "als_dsm",
+    )
+    # GDAL-internal retry messages — these fire every time GDAL retries
+    # a single range request before our outer wrapper sees the result.
+    # If the read ultimately succeeds (or our outer bev_retry retries with
+    # a different proxy lane), this noise should NOT count as a BEV outage
+    # signal.  Still surfaces in the log for visibility.
+    _WARN_BEV_GDAL_INTERNAL_TOKENS = (
+        # Both phrasings rasterio emits for a transport-layer retry of an
+        # internal range request.  These ALWAYS appear together with the
+        # tile URL on data.bev.gv.at, never on a true HTTP error response.
+        "http error code: 0",
+        "http response code on",
+        "retrying again in",
     )
     _WARN_ZENODO_TOKENS = (
         "zenodo.org", "zenodo ", "deposit", "sandbox.zenodo",
@@ -586,6 +607,10 @@ class ProgressTracker:
                 return "auth"
         for tok in cls._WARN_BEV_TOKENS:
             if tok in m:
+                # Filter out GDAL-internal retry chatter — not a fleet
+                # BEV-outage signal, just our own proxy lane churning.
+                if any(t in m for t in cls._WARN_BEV_GDAL_INTERNAL_TOKENS):
+                    return None
                 return "bev"
         for tok in cls._WARN_ZENODO_TOKENS:
             if tok in m:

@@ -63,6 +63,15 @@ MAX_RETRIES = 4          # up to 4 retries (5 total attempts)
 BASE_DELAY = 2.0         # seconds — doubles each retry: 2, 4, 8, 16
 MAX_DELAY = 20.0         # cap per-retry wait
 
+# Direct-first policy.  Our 24h post-mortem (2026-05-28) showed >87%
+# of "BEV warnings" were transport failures via the free-proxy lane,
+# while the BEV server itself returns 206 in <1.5s under 30x concurrency
+# from our peer IPs.  We now prefer direct for the first TWO attempts
+# on every read; only flaky-IP peers fall back to the proxy pool.
+# Set BEV_DISABLE_PROXY=1 in the env to skip proxies entirely.
+DIRECT_RETRIES_DEFAULT = 2
+_PROXY_DISABLED = os.environ.get("BEV_DISABLE_PROXY", "").strip().lower() in ("1", "true", "yes")
+
 # Error substrings that indicate a transient / retryable failure.
 # GDAL/rasterio surface HTTP errors as CPLE_* messages or generic IOError.
 _RETRYABLE_PATTERNS = (
@@ -109,6 +118,10 @@ def _apply_proxy() -> str | None:
     Returns the proxy URL (or None for direct) so the caller can
     report success/failure back to bev_proxy.
     """
+    if _PROXY_DISABLED:
+        os.environ.pop("GDAL_HTTP_PROXY", None)
+        os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
+        return None
     proxy_url = bev_proxy.next_proxy()
     if proxy_url:
         os.environ["GDAL_HTTP_PROXY"] = proxy_url
@@ -126,7 +139,7 @@ def read_with_retry(
     base_delay: float = BASE_DELAY,
     caller: str = "",
     direct_first: bool = True,
-    direct_retries: int = 1,
+    direct_retries: int = DIRECT_RETRIES_DEFAULT,
 ):
     """Open + read in one shot with retry + proxy rotation.
 
@@ -230,8 +243,8 @@ def open_with_retry(
         if attempt > 0:
             # Drop any poisoned per-URL cache from the previous attempt.
             _clear_vsicurl_cache(url)
-        if attempt == 0:
-            # First attempt: direct (no proxy)
+        if attempt < DIRECT_RETRIES_DEFAULT or _PROXY_DISABLED:
+            # First N attempts: direct (no proxy).  See post-mortem 2026-05-28.
             os.environ.pop("GDAL_HTTP_PROXY", None)
             os.environ.pop("GDAL_HTTP_PROXYUSERPWD", None)
             used_proxy = None

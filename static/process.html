@@ -291,6 +291,11 @@
            letter-spacing: 0.3px; }
   .badge-closed { background: #0d2818; color: var(--green); border: 1px solid #23492e; }
   .badge-open { background: #1f0d0d; color: var(--red); border: 1px solid #3d1f1f; }
+  .badge-paused { background: #2a1208; color: #f08c3a; border: 1px solid #5a2a10;
+                  cursor: help; }
+  .badge-paused.lvl2 { color: #ff7a4a; border-color: #6e2a10; }
+  .badge-paused.lvl3 { color: #ff5a3a; border-color: #7e2a10; background: #2e0e08; }
+  .badge-paused.lvl4 { color: var(--red); border-color: #8a1f1f; background: #2e0808; }
 
   /* Disk bar */
   .disk-bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 3px; }
@@ -1288,6 +1293,33 @@ function updateCards(d) {
     const cc = sys.copernicus_circuit;
     sdet += ' <span class="badge badge-' + cc + '">cop ' + cc + '</span>';
   }
+  // BEV-outage fleet pause (director-level). Show a countdown badge
+  // whenever bev_pause.active so it's visible alongside the cop
+  // circuit badge — same card, same eye-line as the sparkline below.
+  try {
+    const dd = (typeof _directorData !== 'undefined') ? _directorData : null;
+    const bp = (dd && dd.bev_pause) || null;
+    if (bp && bp.active) {
+      const untilTs = bp.until ? Date.parse(bp.until) : 0;
+      const remMs = Math.max(0, untilTs - Date.now());
+      const remMin = Math.round(remMs / 60000);
+      const remTxt = remMin >= 60
+        ? (Math.floor(remMin/60) + 'h' + (remMin%60 ? (remMin%60) + 'm' : ''))
+        : (remMin + 'm');
+      const lvl = bp.level || 1;
+      const total = (bp.cooldown_s ? Math.round(bp.cooldown_s/60) : 0);
+      const totTxt = total >= 60 ? (Math.round(total/60) + 'h') : (total + 'm');
+      const scope = bp.scope || 'fleet';
+      const poolTag = (scope === 'pool' && bp.pool) ? (' ' + bp.pool) : '';
+      const label = 'BEV PAUSED' + poolTag + ' · ' + remTxt;
+      const tip = (bp.reason || ('BEV outage, ' + scope + ' pause'))
+        + '\nLevel ' + lvl + '/4 · ' + totTxt + ' total cooldown'
+        + (bp.since ? ('\nSince ' + bp.since.replace('T',' ').slice(0,19)) : '')
+        + (bp.until ? ('\nUntil ' + bp.until.replace('T',' ').slice(0,19)) : '');
+      sdet += ' <span class="badge badge-paused lvl' + lvl + '" title="'
+           + esc(tip) + '">' + esc(label) + '</span>';
+    }
+  } catch(e) {}
   document.getElementById('cServiceDet').innerHTML = sdet || '—';
   // NOTE: renderCapacityHistory() is intentionally NOT called here —
   // it depends on _directorData (from /api/v1/director/status) which
@@ -4455,8 +4487,35 @@ function renderCapacityHistory() {
     Math.round(yHi*100) + '%</text>' +
     '<text x="1" y="' + (H-1) + '" font-size="7" fill="#888">' +
     Math.round(yLo*100) + '%</text>';
+  // Active BEV-pause: shade the portion of the timeline covered by the
+  // pause (since…min(now, until), clamped to the visible window) so the
+  // cooldown is obvious on the sparkline, not just in the badge.
+  let pauseShade = '';
+  try {
+    const bp = d.bev_pause || null;
+    if (bp && bp.active && bp.since) {
+      const sinceSec = Date.parse(bp.since) / 1000;
+      const untilSec = bp.until ? (Date.parse(bp.until) / 1000) : (Date.now()/1000);
+      const nowSec = Date.now() / 1000;
+      const a = Math.max(t0, sinceSec);
+      const b = Math.min(tN, Math.min(untilSec, nowSec));
+      if (b > a) {
+        const x1 = ((a - t0) / span) * W;
+        const x2 = ((b - t0) / span) * W;
+        const lvl = bp.level || 1;
+        const fill = lvl >= 3 ? 'rgba(248,81,73,0.18)' : 'rgba(240,140,58,0.16)';
+        const stroke = lvl >= 3 ? '#f85149' : '#f08c3a';
+        pauseShade =
+          '<rect x="' + x1.toFixed(1) + '" y="0" width="' +
+          Math.max(0.5,(x2-x1)).toFixed(1) + '" height="' + H + '" fill="' +
+          fill + '" stroke="' + stroke + '" stroke-width="0.4" ' +
+          'stroke-dasharray="2,2" pointer-events="none"/>';
+      }
+    }
+  } catch(e) {}
   svg.innerHTML =
     '<title>' + tip + '</title>' +
+    pauseShade +
     grids.join('') +
     // warning-rate context (thin lines, normalised to saturation)
     '<path d="' + normPath('bev','bev') + '" fill="none" stroke="#e05656" stroke-width="0.8" opacity="0.55"/>' +

@@ -187,6 +187,12 @@ Only five reasons a peer is parked (`not_before` in the future):
    while other pools (and the primary itself) reach it in <1s.
    Fleet-scope pause is the fallback when attribution fails (>3
    bad pools or `known_frac < OUTAGE_POOL_KNOWN_FRAC = 0.60`).
+   **Canary unpark probes**: every 5 min the director polls one
+   peer in each parked /24 via its `/api/v1/bev_probe` endpoint
+   (single range request to `_BEV_TEST_URL` + TIFF magic check).
+   On success it clears `not_before` on every `bev_pool_park`-tagged
+   peer in that /24 early so a 20-min route flap doesn't waste the
+   full cooldown. Event: `bev_pool_unpark` in `canary_notes`.
    See `docs/peer-director.md → BEV outage handling` for details.
 
 The one-shot `_release_unverified_bw_parks` rescues peers that got

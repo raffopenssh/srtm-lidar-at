@@ -142,6 +142,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/processing/cache_misses',
     '/api/v1/manifest/push',
     '/api/v1/manifest/reconcile',
+    '/api/v1/bev_probe',
 )
 
 
@@ -4717,6 +4718,66 @@ def director_activate_peer():
     # Start new peer
     result = pd.start_peer_processor(peer.get('url'))
     return jsonify({'status': 'activated', 'peer': peer_id, 'start_result': result})
+
+
+@app.route('/api/v1/bev_probe', methods=['GET', 'POST'])
+def bev_probe_local():
+    """Single-shot BEV reachability probe from THIS peer's egress.
+
+    Issues one range request (bytes 0-1023) to ``bev_proxy._BEV_TEST_URL``
+    direct (no proxy), checks HTTP 206 + BigTIFF/TIFF magic on the body.
+    Used by the director's parked-pool canary loop
+    (``peer_director._canary_probe_parked_pools``) to quickly clear
+    `bev_pool_park` cooldowns when an egress /24's route to BEV has
+    recovered. See ``docs/peer-director.md`` → BEV outage handling.
+
+    Auth: admin-token (protected via ``_PROTECTED_PREFIXES``). Loopback
+    exempt as usual.
+
+    Response JSON: ``{ok, http_code, magic_ok, latency_s, url, error?}``.
+    Total wall budget: ~6 s (connect 3 s, max 5 s).
+    """
+    import subprocess as _sp
+    import tempfile as _tmp
+    import time as _time
+    try:
+        from bev_proxy import _BEV_TEST_URL, _TIFF_MAGIC_LE
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'bev_proxy import failed: {e}'}), 500
+    t0 = _time.time()
+    code = ''
+    magic_ok = False
+    err = None
+    try:
+        with _tmp.NamedTemporaryFile(delete=True) as tf:
+            r = _sp.run(
+                ['curl', '-s', '-o', tf.name, '-w', '%{http_code}',
+                 '--range', '0-1023',
+                 '--connect-timeout', '3',
+                 '--max-time', '5',
+                 _BEV_TEST_URL],
+                capture_output=True, text=True, timeout=8,
+            )
+            code = (r.stdout or '').strip()
+            if code in ('200', '206'):
+                try:
+                    head = open(tf.name, 'rb').read(4)
+                    magic_ok = any(head.startswith(m) for m in _TIFF_MAGIC_LE)
+                except Exception as _e:
+                    err = f'read body: {_e}'
+    except _sp.TimeoutExpired:
+        err = 'timeout'
+    except Exception as e:
+        err = str(e)
+    ok = (code in ('200', '206')) and magic_ok
+    return jsonify({
+        'ok': ok,
+        'http_code': code,
+        'magic_ok': magic_ok,
+        'latency_s': round(_time.time() - t0, 3),
+        'url': _BEV_TEST_URL,
+        'error': err,
+    })
 
 
 @app.route('/api/v1/director/bev_pause/clear', methods=['POST'])

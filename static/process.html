@@ -343,6 +343,7 @@
   .pm-id.att-active  { color: var(--blue); }
   .pm-id.att-cache   { color: #79b8ff; }
   .pm-id.att-int     { color: var(--yellow); }
+  .pm-id.att-pool    { color: #d24c4c; }
   .pm-role-mark { font-weight: 700; margin-right: 4px; font-size: 14px;
     line-height: 1; vertical-align: -1px; display: inline-block; }
   .pm-role-mark.dir    { color: #f0c674; text-shadow: 0 0 5px rgba(240,198,116,0.75); }
@@ -402,6 +403,7 @@
   .pm-tag.t-idle     { color: var(--dim); }
   .pm-tag.t-offline  { color: var(--dim); opacity: 0.6; }
   .pm-tag.t-int      { color: var(--yellow); }   /* interrupted KG (was running, now isn't) */
+  .pm-tag.t-pool     { color: #d24c4c; }          /* bev_pool_park / canary auto_park */
   /* Default: single-line compact strip; details collapsed.
      Desktop packs multiple peers per row via auto-fill; mobile is 1-up.
      Min strip width chosen so KG name + step + elapsed are readable. */
@@ -1598,6 +1600,7 @@ function renderBwRecovery() {
   const buckets = new Array(HORIZON + 1).fill(0);
   const bucketsParked = new Array(HORIZON + 1).fill(0);  // among the recovering peers, how many are parked NOW
   let parkedNow = 0;
+  const parkedBy = {pool: 0, steal: 0, auto: 0, renewal: 0, role: 0, other: 0};
   let nearWallN = 0;
   let idleRunnable = 0;  // enabled, not parked, not running
   const usedRecent = [];  // GB used per peer over last ~10 days (heuristic)
@@ -1611,7 +1614,17 @@ function renderBwRecovery() {
     const wall = cap > 0 ? cap : eff;
     const isParked = !!(p.not_before && new Date(p.not_before) > now);
     const nearWall = wall > 0 && used >= 0.80 * wall;
-    if (isParked) parkedNow++;
+    if (isParked) {
+      parkedNow++;
+      // Classify by latest canary_note event (surfaced as p.park_reason).
+      const r = p.park_reason || '';
+      if      (r === 'bev_pool_park')        parkedBy.pool++;
+      else if (r === 'steal_park')           parkedBy.steal++;
+      else if (r === 'auto_park')            parkedBy.auto++;
+      else if (r === 'park_until_renewal')   parkedBy.renewal++;
+      else if (r === 'role_park')            parkedBy.role++;
+      else                                    parkedBy.other++;
+    }
     if (nearWall) nearWallN++;
     const pstate = (p.processor_state || '').toLowerCase();
     const isRunning = (pstate === 'running' || pstate === 'processing');
@@ -1706,7 +1719,9 @@ function renderBwRecovery() {
     + 'right now and will be released by that renewal.\n'
     + 'Red=today, amber=1–7d, green=8–30d.\n\n'
     + 'Big number: soonest recovery event ("+N in Xd").\n'
-    + 'Detail: parked-now + idle-runnable count (enabled, not parked,\n'
+    + 'Detail: parked-now (broken down by reason: pool=bev_pool_park,\n'
+    + 'steal=steal_park, canary=auto_park, bw=park_until_renewal,\n'
+    + 'role=primary/director/shadow) + idle-runnable count (enabled, not parked,\n'
     + 'not currently processing) + median / p90 GB per peer used in the\n'
     + 'trailing 10 days (even-distribution estimate from used_gb scaled\n'
     + 'by days-since cycle_start).\n\n'
@@ -1716,8 +1731,17 @@ function renderBwRecovery() {
   detEl.title = tip;
   // Detail line: parked + idle + near-wall + median/p90.
   const recovAll = buckets.reduce((a, b) => a + b, 0);
+  // Compact breakdown: only show non-zero categories so the line stays tight.
+  const _brkParts = [];
+  if (parkedBy.pool)    _brkParts.push('<span style="color:#d24c4c" title="bev_pool_park: /24 egress to BEV is bad; canary probes auto-clear when route recovers">' + parkedBy.pool + ' pool</span>');
+  if (parkedBy.steal)   _brkParts.push('<span style="color:var(--yellow)" title="steal_park: hypervisor host oversubscribed (30 min cooldown)">' + parkedBy.steal + ' steal</span>');
+  if (parkedBy.auto)    _brkParts.push('<span style="color:var(--yellow)" title="auto_park: canary throughput collapse (1h soft / 6h quality)">' + parkedBy.auto + ' canary</span>');
+  if (parkedBy.renewal) _brkParts.push('<span title="park_until_renewal: hit observed BW cap, waits for cycle reset">' + parkedBy.renewal + ' bw</span>');
+  if (parkedBy.role)    _brkParts.push('<span style="color:var(--dim)" title="role_park: primary / director / shadow (host roles, not BW)">' + parkedBy.role + ' role</span>');
+  if (parkedBy.other)   _brkParts.push('<span style="color:var(--dim)">' + parkedBy.other + ' other</span>');
+  const _brk = _brkParts.length ? ' <span style="color:var(--dim);font-size:10px">(' + _brkParts.join(', ') + ')</span>' : '';
   detEl.innerHTML =
-    '<b>' + parkedNow + '</b> parked · <b>' + idleRunnable + '</b> idle'
+    '<b>' + parkedNow + '</b> parked' + _brk + ' · <b>' + idleRunnable + '</b> idle'
     + (nearWallN ? ' · <b style="color:var(--yellow)">' + nearWallN + '</b> ≥80% cap' : '')
     + ' · <b>' + recovAll + '</b>/30d'
     + '<br>med <b>' + med.toFixed(1) + '</b> · p90 <b>' + p90.toFixed(1)
@@ -4717,6 +4741,12 @@ function _peerRoleTag(p, ctx) {
   if (ctx.isActive)  return {cls: 't-frontier', txt: 'FRONTIER'};
   if (ctx.isRunning && p.cache_only_run) return {cls: 't-cache', txt: 'CACHE'};
   if (ctx.isRunning) return {cls: 't-frontier', txt: 'FRONTIER'};
+  // Parked-by-pool peers are visually distinct from clean STOPPED/IDLE.
+  // The peer is parked because its /24 egress route to BEV is bad;
+  // canary probes are clearing it as soon as the route recovers.
+  const isPoolParked = (p.park_reason === 'bev_pool_park'
+                        && p.not_before && new Date(p.not_before) > new Date());
+  if (isPoolParked) return {cls: 't-pool', txt: 'POOL-PARK'};
   if (!p.online)     return {cls: 't-offline', txt: 'OFFLINE'};
   if (p.processor_state === 'paused')  return {cls: 't-paused',  txt: 'PAUSED'};
   if (p.processor_state === 'stopped') return {cls: 't-stopped', txt: 'STOPPED'};
@@ -4752,6 +4782,8 @@ function _peerAttClass(p, ctx) {
   if (ctx.isActive) return 'att-active';
   if (ctx.isRunning && p.cache_only_run) return 'att-cache';
   if (!ctx.isRunning && p.current_kg) return 'att-int';
+  if (p.park_reason === 'bev_pool_park'
+      && p.not_before && new Date(p.not_before) > new Date()) return 'att-pool';
   if (p.processor_state === 'stopped') return 'att-stopped';
   return '';
 }

@@ -446,6 +446,17 @@ BEV_OUTAGE_RECOVERY_PERSIST_S = 5 * 60  # quiet streak required before unpause
 BEV_OUTAGE_MIN_PEERS = 4            # must affect this many distinct peers
 BEV_OUTAGE_LEVELS_S = (60 * 60, 4 * 3600, 12 * 3600, 24 * 3600)
 BEV_OUTAGE_RESET_S = 48 * 3600      # ≥ this since last unpause → level 1
+# --- Parked-pool canary probes -----------------------------------------
+# Pools parked via `bev_pool_park` may be stuck on a transient route
+# flap (20–60 min) that clears long before the 1h/4h/12h/24h cooldown
+# expires. We poll one peer per parked pool every BEV_POOL_PROBE_INTERVAL_S
+# (default 5 min) by calling its local /api/v1/bev_probe endpoint (single
+# HEAD-range to bev_proxy._BEV_TEST_URL with TIFF magic check). On a
+# successful probe (206 + TIFF magic) we clear `not_before` on every peer
+# in that /24 early and drop the pool's escalation entry. Probe cost:
+# ~5 s wall worst-case per parked pool; runs in parallel.
+BEV_POOL_PROBE_INTERVAL_S = 5 * 60      # min interval between probes per pool
+BEV_POOL_PROBE_REQ_TIMEOUT_S = 12       # outbound HTTP timeout (peer probe ≤ 8 s)
 # --- IP-pool blocked-egress detection ----------------------------------
 #
 # exe.dev VMs share egress NAT pools (typically a small set of /24s).
@@ -2872,7 +2883,7 @@ class PeerDirector:
                    '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch',
                    'bev_pause', 'bev_pause_history',
-                   'bev_pool_escalation',
+                   'bev_pool_escalation', 'bev_pool_probes',
                    'ip_pools', 'ip_pools_history'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
@@ -3012,11 +3023,26 @@ class PeerDirector:
             if not _renew_day:
                 _renew_day = cfg.get('renew_day', BANDWIDTH_RENEW_DAY)
 
+            # Park-reason surfaced from the latest canary_note so the
+            # dashboard can distinguish bev_pool_park (whole /24 stuck
+            # on a flaky route) from steal_park / auto_park /
+            # park_until_renewal / role_park. Used to render the
+            # POOL-PARKED tag + cooldown chip on the peer strip.
+            _park_reason = None
+            _park_pool = None
+            if peer.get('not_before'):
+                _notes = peer.get('canary_notes') or []
+                if _notes and isinstance(_notes[-1], dict):
+                    _last = _notes[-1]
+                    _park_reason = _last.get('event')
+                    _park_pool = _last.get('pool')
             peers_status.append({
                 'id': pid,
                 'url': url,
                 'enabled': peer.get('enabled', True),
                 'not_before': peer.get('not_before'),
+                'park_reason': _park_reason,
+                'park_pool': _park_pool,
                 'scheduled': _peer_is_scheduled(peer),
                 'reserved_kg': peer.get('reserved_kg'),
                 'renew_day': _renew_day,
@@ -3316,6 +3342,7 @@ class PeerDirector:
             'bev_pause': state.get('bev_pause') or {},
             'bev_pause_history': state.get('bev_pause_history') or [],
             'bev_pool_escalation': state.get('bev_pool_escalation') or {},
+            'bev_pool_probes': state.get('bev_pool_probes') or {},
             'ip_pools': state.get('ip_pools') or {},
             'ip_pools_history': state.get('ip_pools_history') or [],
             'shadow_peer': state.get('shadow_peer'),
@@ -5177,6 +5204,259 @@ class PeerDirector:
         except Exception:
             pass
         return {'cleared': True, 'was_active': True, **snap}
+
+    # ------------------------------------------------------------------
+    # Parked-pool BEV canary probes
+    # ------------------------------------------------------------------
+    def _parked_pools_from_peers(self, statuses: dict) -> dict:
+        """Discover currently-parked /24 pools via `bev_pool_park` notes.
+
+        Returns ``{pool_key: {peers: [pid, ...], cooldown_until: iso}}``
+        keyed by ``outbound_24``. A pool is "parked" iff at least one
+        enabled peer in it carries a `not_before` in the future AND its
+        most-recent `canary_notes` entry has `event == 'bev_pool_park'`
+        AND that note's `pool` matches the peer's current outbound_24.
+        We restrict to bev_pool_park parks so we don't probe peers that
+        are merely parked for steal / canary slowdown / role-eviction.
+        """
+        import datetime as _datetime
+        out: dict = {}
+        with self._lock:
+            peers = list(self.cfg.get('peers', []))
+        now = _datetime.datetime.now(_datetime.timezone.utc)
+        for p in peers:
+            pid = p.get('id')
+            if not pid or not p.get('enabled', True):
+                continue
+            nb = p.get('not_before')
+            if not nb:
+                continue
+            try:
+                nb_dt = _datetime.datetime.fromisoformat(nb)
+                if nb_dt <= now:
+                    continue
+            except Exception:
+                continue
+            notes = p.get('canary_notes') or []
+            if not notes:
+                continue
+            last = notes[-1] if isinstance(notes[-1], dict) else None
+            if not last or last.get('event') != 'bev_pool_park':
+                continue
+            pool = last.get('pool')
+            if not pool:
+                continue
+            # Sanity: peer's *current* outbound_24 should still match
+            # the parked pool (else we're chasing a stale park).
+            ps = (statuses or {}).get(pid) or {}
+            cur24 = (((ps.get('system') or {}).get('host') or {})
+                     .get('outbound_24') or '')
+            if cur24 and cur24 != pool:
+                continue
+            ent = out.setdefault(pool, {'peers': [], 'cooldown_until': nb})
+            ent['peers'].append(pid)
+            # Keep the latest cooldown_until for visibility.
+            try:
+                if _datetime.datetime.fromisoformat(
+                        ent['cooldown_until']) < nb_dt:
+                    ent['cooldown_until'] = nb
+            except Exception:
+                pass
+        return out
+
+    def _canary_probe_parked_pools(self, statuses: dict) -> None:
+        """Probe each parked /24 pool's reachability to BEV.
+
+        For every pool currently parked by `bev_pool_park`:
+          1. Skip if we probed it within ``BEV_POOL_PROBE_INTERVAL_S``.
+          2. Pick one peer in the pool (prefers a peer that is
+             reachable in the latest statuses snapshot).
+          3. Call ``GET /api/v1/bev_probe`` on that peer.
+          4. On success (ok=true): clear ``not_before`` on every peer
+             in the /24, drop ``bev_pool_escalation[pool]``, append a
+             ``bev_pool_unpark`` event to ``bev_pause_history`` for
+             the audit trail, emit a director event.
+          5. On failure: just record the probe time + reason; the
+             cooldown stays in place.
+
+        Probes run sequentially per tick (typically 0–3 parked pools,
+        each probe ≤ ~8 s peer-side) which keeps the director tick
+        bounded. State persisted under ``state['bev_pool_probes']``:
+        ``{pool_key: {last_ts, ok, http_code, peer_id, latency_s,
+        error}}``.
+        """
+        try:
+            parked = self._parked_pools_from_peers(statuses or {})
+        except Exception:
+            log.exception('bev_pool_probe: discover parked pools failed')
+            return
+        if not parked:
+            return
+        now = time.time()
+        with self._lock:
+            probes = dict(self.state.get('bev_pool_probes') or {})
+        for pool, info in parked.items():
+            last = probes.get(pool) or {}
+            last_ts = float(last.get('last_ts') or 0.0)
+            if now - last_ts < BEV_POOL_PROBE_INTERVAL_S:
+                continue
+            # Pick a target peer: prefer one we have a recent status
+            # for (it's at least answering admin polls); fall back to
+            # any peer in the pool.
+            candidates = list(info.get('peers') or [])
+            if not candidates:
+                continue
+            reachable = [pid for pid in candidates
+                         if isinstance((statuses or {}).get(pid), dict)
+                         and (statuses[pid].get('state') or '')
+                         not in ('', 'unreachable')]
+            target = (reachable or candidates)[0]
+            with self._lock:
+                live = get_peer_by_id(self.cfg, target)
+            url = (live or {}).get('url')
+            if not url:
+                # Primary is not parked under bev_pool_park (it's the
+                # director host), but be defensive.
+                probes[pool] = {
+                    'last_ts': now, 'ok': False, 'error': 'no_url',
+                    'peer_id': target,
+                }
+                continue
+            probe_url = url.rstrip('/') + '/api/v1/bev_probe'
+            try:
+                import requests as _req
+                r = _req.get(probe_url,
+                             timeout=BEV_POOL_PROBE_REQ_TIMEOUT_S,
+                             headers=_admin_headers())
+                if r.status_code != 200:
+                    probes[pool] = {
+                        'last_ts': now, 'ok': False,
+                        'http_code': r.status_code, 'peer_id': target,
+                        'error': f'HTTP {r.status_code}',
+                    }
+                    continue
+                pj = r.json() or {}
+            except Exception as e:
+                probes[pool] = {
+                    'last_ts': now, 'ok': False, 'peer_id': target,
+                    'error': f'request: {e}',
+                }
+                continue
+            probe_ok = bool(pj.get('ok'))
+            probes[pool] = {
+                'last_ts': now,
+                'ok': probe_ok,
+                'http_code': pj.get('http_code'),
+                'magic_ok': pj.get('magic_ok'),
+                'latency_s': pj.get('latency_s'),
+                'peer_id': target,
+                'error': pj.get('error'),
+            }
+            if not probe_ok:
+                log.info('bev_pool_probe: pool=%s peer=%s still bad '
+                         '(code=%s magic=%s err=%s)',
+                         pool, target, pj.get('http_code'),
+                         pj.get('magic_ok'), pj.get('error'))
+                continue
+            # Probe succeeded → unpark every peer in the /24.
+            self._unpark_pool_after_probe(pool, info, target, pj)
+        with self._lock:
+            # Prune entries for pools no longer parked so the dict
+            # doesn't grow unbounded across days.
+            still_parked = set(parked.keys())
+            keep = {k: v for k, v in probes.items() if k in still_parked}
+            self.state['bev_pool_probes'] = keep
+
+    def _unpark_pool_after_probe(self, pool: str, info: dict,
+                                 probed_peer: str, probe_resp: dict) -> None:
+        """Clear ``not_before`` on every peer in ``pool`` after a
+        successful canary probe.
+
+        Only clears not_before stamps tagged by a ``bev_pool_park``
+        canary_note (so we never accidentally release a primary stamp,
+        a steal_park, a role_park, an auto_park, or a manual park).
+        Drops the pool's escalation entry so the next legit trigger
+        starts at level 1, appends a ``bev_pool_unpark`` event to
+        ``bev_pause_history`` for the dashboard audit ring, emits a
+        director event, busts the status cache.
+        """
+        from datetime import datetime as _dt, timezone as _tz2
+        now = time.time()
+        cleared_ids: list[str] = []
+        with self._lock:
+            pool_esc = dict(self.state.get('bev_pool_escalation') or {})
+            cfg_changed = False
+            for p in list(self.cfg.get('peers', [])):
+                if (p.get('canary_notes') or []) == []:
+                    continue
+                last = p.get('canary_notes')[-1] if isinstance(
+                    p.get('canary_notes')[-1], dict) else None
+                if not last or last.get('event') != 'bev_pool_park':
+                    continue
+                if last.get('pool') != pool:
+                    continue
+                if not p.get('not_before'):
+                    continue
+                # Mark as released early.
+                p['not_before'] = None
+                cleared_ids.append(p.get('id'))
+                notes = p.setdefault('canary_notes', [])
+                notes.append({
+                    'at': _dt.now(_tz2.utc).strftime(
+                        '%Y-%m-%dT%H:%M:%SZ'),
+                    'event': 'bev_pool_unpark',
+                    'reasons': [
+                        f'canary probe ok via {probed_peer} '
+                        f'(code={probe_resp.get("http_code")} '
+                        f'lat={probe_resp.get("latency_s")}s)'
+                    ],
+                    'pool': pool,
+                })
+                if len(notes) > 32:
+                    del notes[: len(notes) - 32]
+                cfg_changed = True
+            popped = pool_esc.pop(pool, None)
+            self.state['bev_pool_escalation'] = pool_esc
+            if cfg_changed:
+                try:
+                    save_peers_config(self.cfg)
+                except Exception:
+                    log.exception('bev_pool_unpark: save_peers_config failed')
+        # Audit event.
+        try:
+            self._record_bev_pause_event({
+                'scope': 'pool',
+                'pool': pool,
+                'level': (popped or {}).get('level'),
+                'since': None,
+                'ended': _dt.now(_tz2.utc).isoformat(),
+                'cooldown_s': None,
+                'trigger_rate_wpm': None,
+                'trigger_n_peers': len(cleared_ids),
+                'end_reason': 'canary_probe',
+                'final_rate_wpm': None,
+                'probed_peer': probed_peer,
+                'probe_latency_s': probe_resp.get('latency_s'),
+            })
+        except Exception:
+            log.exception('bev_pool_unpark: history append failed')
+        try:
+            _emit_director_event(
+                f'BEV pool {pool} cleared early by canary probe '
+                f'(via {probed_peer}, {len(cleared_ids)} peers released)',
+                peer='director', level='warning')
+        except Exception:
+            pass
+        log.warning('bev_pool_unpark: pool=%s peers=%s via probe peer=%s',
+                    pool, cleared_ids, probed_peer)
+        # Bust the status cache so dashboard reflects the unpark
+        # without waiting for TTL.
+        try:
+            with self._status_cache_lock:
+                self._status_cache_value = None
+                self._status_cache_ts = 0.0
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # IP-pool egress block detection
@@ -8960,6 +9240,16 @@ class PeerDirector:
                         locals().get('_statuses') or {})
                 except Exception:
                     log.exception('BEV outage check error')
+                # Canary-probe parked /24 pools so a 20-min route flap
+                # doesn't waste the full 1h/4h/12h/24h cooldown. One
+                # peer per pool gets a single HEAD-range probe to
+                # _BEV_TEST_URL every ~5 min; on 206+TIFF magic we
+                # clear not_before on every peer in that /24 early.
+                try:
+                    self._canary_probe_parked_pools(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('BEV pool canary probe error')
                 # IP-pool block detection: park peers in an egress /24
                 # that shows a disproportionate BEV warn rate.
                 try:

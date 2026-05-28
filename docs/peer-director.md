@@ -417,6 +417,24 @@ branch):
   flag is reserved for the fallback fleet-scope path. Peers in
   healthy pools keep working.
 
+**Canary unpark probes** (since 2026-05-28): once a pool is parked,
+the director polls one peer in that /24 every
+`BEV_POOL_PROBE_INTERVAL_S` (5 min) via
+`GET /api/v1/bev_probe` on the peer. The peer issues a single
+range request to `bev_proxy._BEV_TEST_URL` direct (no proxy) and
+checks 206 + TIFF magic on the body. On success the director
+immediately clears `not_before` on every peer in that /24 (only
+those whose latest `canary_notes` entry is `bev_pool_park` so we
+never release a primary / steal / role / auto / manual park), drops
+`bev_pool_escalation[pool]` so the next legit trigger restarts at
+L1, appends a `bev_pool_unpark` event (`end_reason='canary_probe'`)
+to `bev_pause_history`, and emits a director event. State lives
+under `state['bev_pool_probes']` (`{pool: {last_ts, ok, http_code,
+magic_ok, latency_s, peer_id, error}}`) and is persisted via the
+standard snapshot path. The probe runs from the *parked peer's*
+egress, not the primary's — the whole point is to test whether the
+/24 specifically can reach BEV again.
+
 Escalation: 1h → 4h → 12h → 24h cooldowns (`BEV_OUTAGE_LEVELS_S`).
 A pool that re-triggers within `BEV_OUTAGE_RESET_S` (48 h) of its
 last unpause moves up one level. Across the prefix the director

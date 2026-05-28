@@ -461,6 +461,20 @@ IP_POOL_MIN_PEERS = 2               # need at least N peers in pool to count
 IP_POOL_BIAS = 3.0                  # pool rate vs fleet median multiplier
 IP_POOL_MIN_WPM = 4.0               # absolute floor (one-pool fleet still works)
 IP_POOL_PARK_COOLDOWN_S = 30 * 60   # 30 min off then re-eligible
+# --- Outage localization (pool-targeted vs fleet-wide) -----------------
+#
+# When a BEV outage triggers, we'd rather park just the affected /24
+# than stop the whole fleet. We classify the outage as 'pool' (one
+# /24 dominates) only when pool attribution is *reliable*: enough
+# peers have reported their outbound IP (else most of the fleet is in
+# the '?' bucket and we can't tell). Tunables:
+OUTAGE_POOL_KNOWN_FRAC = 0.60     # ≥ 60% of peers must have a known /24
+OUTAGE_POOL_DOMINANCE = 0.70      # one pool must contribute ≥ 70% of warns
+OUTAGE_POOL_AVG_MULT = 2.0        # AND top pool avg ≥ 2x second pool
+# History rings (persisted via director_state.json → survives restart + HA):
+BEV_PAUSE_HISTORY_MAX = 64        # last N pause events (~24h worth)
+POOL_HISTORY_MAX = 1440           # 24 h at one sample/min
+POOL_HISTORY_SAMPLE_INTERVAL_S = 60
 # Sinusoidal drift: period and amplitude (fraction of total range).
 THROTTLE_DRIFT_PERIOD_S = 2 * 3600    # 2 hours
 # Sinusoidal drift amplitude. Reduced 2026-04-23 from 0.10 to 0.04 —
@@ -2782,7 +2796,9 @@ class PeerDirector:
                    '_creds_revalidated_at',
                    '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch',
-                   'bev_pause', 'ip_pools'):
+                   'bev_pause', 'bev_pause_history',
+                   'bev_pool_escalation',
+                   'ip_pools', 'ip_pools_history'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
         # Sync the per-process EMA caches from disk too. Workers that
@@ -3225,7 +3241,10 @@ class PeerDirector:
             'peer_meta': state.get('peer_meta') or {},
             # BEV outage + IP-pool stats (surfaced in /process.txt).
             'bev_pause': state.get('bev_pause') or {},
+            'bev_pause_history': state.get('bev_pause_history') or [],
+            'bev_pool_escalation': state.get('bev_pool_escalation') or {},
             'ip_pools': state.get('ip_pools') or {},
+            'ip_pools_history': state.get('ip_pools_history') or [],
             'shadow_peer': state.get('shadow_peer'),
             'shadow_url': state.get('shadow_url'),
             'shadow_last_push_ts': state.get('shadow_last_push_ts'),
@@ -4517,25 +4536,126 @@ class PeerDirector:
                 n += 1
         return total, n
 
+    def _classify_outage_scope(
+        self, statuses: dict, pools: dict, fleet_rate: float,
+    ) -> tuple[str, str | None, float]:
+        """Decide whether an in-progress BEV outage is pool-localized.
+
+        Returns ``(scope, pool_key, attributable_rate)`` where:
+          * ``scope`` is ``'pool'`` if one /24 dominates the warns AND
+            we have enough pool coverage to trust the attribution.
+            Otherwise ``'fleet'``.
+          * ``pool_key`` is the offending /24 (only when scope=='pool').
+          * ``attributable_rate`` is the sum of 1m BEV wpm coming from
+            peers in the offending pool (for the event log / history).
+
+        Heuristic: pool attribution requires
+          * ≥ OUTAGE_POOL_KNOWN_FRAC of peers contributing warns have a
+            known outbound_24 (else most pressure is in the '?' bucket
+            and we can't tell which pool is to blame),
+          * the top pool's *summed* 1m BEV wpm is ≥ OUTAGE_POOL_DOMINANCE
+            of total known-pool warns,
+          * AND ≥ OUTAGE_POOL_AVG_MULT × the second pool's per-peer
+            avg (a single noisy peer in an otherwise-clean pool
+            shouldn't tag the whole pool).
+        """
+        # Sum 1m BEV wpm per pool (matches the trigger metric).
+        per_pool: dict[str, dict] = {}
+        known_total_1m = 0.0
+        unknown_total_1m = 0.0
+        for pid, ps in (statuses or {}).items():
+            if not isinstance(ps, dict):
+                continue
+            wr = ((ps.get('warning_rates') or {}).get('bev') or {})
+            r = float(wr.get('1m') or 0.0)
+            if r <= 0:
+                continue
+            sys = ps.get('system') or {}
+            host = sys.get('host') or {}
+            key = host.get('outbound_24') or '?'
+            if key == '?':
+                unknown_total_1m += r
+                continue
+            d = per_pool.setdefault(key, {'sum': 0.0, 'n': 0})
+            d['sum'] += r
+            d['n'] += 1
+            known_total_1m += r
+        denom = known_total_1m + unknown_total_1m
+        if denom <= 0 or not per_pool:
+            return 'fleet', None, fleet_rate
+        known_frac = known_total_1m / denom
+        if known_frac < OUTAGE_POOL_KNOWN_FRAC:
+            return 'fleet', None, fleet_rate
+        # Top-2 by summed 1m wpm.
+        ranked = sorted(per_pool.items(), key=lambda kv: -kv[1]['sum'])
+        top_key, top_d = ranked[0]
+        top_share = top_d['sum'] / known_total_1m
+        if top_share < OUTAGE_POOL_DOMINANCE:
+            return 'fleet', None, fleet_rate
+        if len(ranked) >= 2:
+            top_avg = top_d['sum'] / max(1, top_d['n'])
+            second = ranked[1][1]
+            second_avg = second['sum'] / max(1, second['n'])
+            if second_avg > 0 and top_avg < OUTAGE_POOL_AVG_MULT * second_avg:
+                return 'fleet', None, fleet_rate
+        return 'pool', top_key, round(top_d['sum'], 2)
+
+    def _peers_in_pool(self, pool_key: str, statuses: dict) -> list[str]:
+        out: list[str] = []
+        for pid, ps in (statuses or {}).items():
+            if not isinstance(ps, dict):
+                continue
+            host = (ps.get('system') or {}).get('host') or {}
+            if (host.get('outbound_24') or '') == pool_key:
+                out.append(pid)
+        return out
+
+    def _record_bev_pause_event(self, ev: dict) -> None:
+        """Append a pause event to the persistent 24h ring."""
+        with self._lock:
+            hist = list(self.state.get('bev_pause_history') or [])
+            hist.append(ev)
+            if len(hist) > BEV_PAUSE_HISTORY_MAX:
+                hist = hist[-BEV_PAUSE_HISTORY_MAX:]
+            self.state['bev_pause_history'] = hist
+
     def _check_bev_outage(self, statuses: dict) -> None:
-        """Detect a fleet-wide BEV outage and flip ``state['bev_pause']``.
+        """Detect a BEV outage and flip ``state['bev_pause']``.
+
+        Scope-aware:
+          * If one /24 attributable for >=70% of warns AND we know
+            outbound_24 for >=60% of warning peers, park just that
+            pool (level-escalated cooldown via not_before on each
+            affected peer). Other pools keep working.
+          * Else fleet-wide pause (cache-only + parallel orchestrators
+            short-circuit while active).
 
         State shape persisted on the director:
             state['bev_pause'] = {
                 'active': bool,
+                'scope': 'fleet' | 'pool',
+                'pool': str | None,
                 'level': 1..4,
-                'since': iso8601,           # when the pause started
-                'until': iso8601,           # when the pause ends
+                'since': iso8601,
+                'until': iso8601,
+                'cooldown_s': int,
                 'reason': str,
-                'trigger_streak_since': float,  # internal
-                'recovery_streak_since': float, # internal
-                'last_unpause_ts': float,       # for escalation reset
+                'trigger_rate_wpm': float,
+                'trigger_n_peers': int,
+                'last_unpause_ts': float,
+                'trigger_streak_since': float,
+                'recovery_streak_since': float,
             }
+        Per-pool independent escalation lives in
+        ``state['bev_pool_escalation']``: ``{pool_key: {level, last_unpause_ts}}``
+        so a flaky pool that bounces between healthy and shaped
+        accumulates escalation independently of the fleet level.
         """
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         now = time.time()
         with self._lock:
             bp = dict(self.state.get('bev_pause') or {})
+            pool_esc = dict(self.state.get('bev_pool_escalation') or {})
         rate, n_peers = self._fleet_bev_warn_rate(statuses)
         active = bool(bp.get('active'))
 
@@ -4549,7 +4669,6 @@ class PeerDirector:
             except Exception:
                 until_ts = 0.0
             cooldown_done = (until_ts and now >= until_ts)
-            # Early unpause: rate sat below RECOVERY_WPM for RECOVERY_PERSIST_S.
             if rate <= BEV_OUTAGE_RECOVERY_WPM:
                 rec_since = float(bp.get('recovery_streak_since') or 0.0)
                 if rec_since <= 0:
@@ -4561,6 +4680,30 @@ class PeerDirector:
                 quiet_age = 0.0
             quiet_unpause = (quiet_age >= BEV_OUTAGE_RECOVERY_PERSIST_S)
             if cooldown_done or quiet_unpause:
+                # Record this pause event before clearing.
+                ended = _dt.now(_tz.utc).isoformat()
+                ev = {
+                    'scope': bp.get('scope') or 'fleet',
+                    'pool': bp.get('pool'),
+                    'level': bp.get('level'),
+                    'since': bp.get('since'),
+                    'ended': ended,
+                    'cooldown_s': bp.get('cooldown_s'),
+                    'trigger_rate_wpm': bp.get('trigger_rate_wpm'),
+                    'trigger_n_peers': bp.get('trigger_n_peers'),
+                    'end_reason': ('cooldown' if cooldown_done
+                                   else 'recovered'),
+                    'final_rate_wpm': round(rate, 2),
+                }
+                self._record_bev_pause_event(ev)
+                # If this was a pool pause, update its escalation
+                # ledger so a re-trigger within 48 h escalates.
+                if bp.get('scope') == 'pool' and bp.get('pool'):
+                    pkey = bp['pool']
+                    pool_esc[pkey] = {
+                        'level': bp.get('level') or 1,
+                        'last_unpause_ts': now,
+                    }
                 bp['active'] = False
                 bp['last_unpause_ts'] = now
                 bp['recovery_streak_since'] = 0.0
@@ -4570,15 +4713,20 @@ class PeerDirector:
                                      f'{int(quiet_age)}s)')
                 with self._lock:
                     self.state['bev_pause'] = bp
-                log.warning('bev_pause UNPAUSE: %s', bp['reason'])
+                    self.state['bev_pool_escalation'] = pool_esc
+                log.warning('bev_pause UNPAUSE (%s%s): %s',
+                            bp.get('scope') or 'fleet',
+                            (' ' + bp.get('pool')) if bp.get('pool') else '',
+                            bp['reason'])
                 try:
                     _emit_director_event(
-                        f'BEV outage cleared: {bp["reason"]}',
+                        f'BEV outage cleared ({bp.get("scope") or "fleet"}'
+                        f'{(" " + bp.get("pool")) if bp.get("pool") else ""}): '
+                        f'{bp["reason"]}',
                         peer='director', level='warning')
                 except Exception:
                     pass
             else:
-                # Still active — just persist counters.
                 with self._lock:
                     self.state['bev_pause'] = bp
             return
@@ -4591,62 +4739,143 @@ class PeerDirector:
                 since = now
             streak = now - since
             if streak >= BEV_OUTAGE_TRIGGER_PERSIST_S:
-                # Decide level. If last unpause was recent, escalate.
-                last_up = float(bp.get('last_unpause_ts') or 0.0)
-                prev_level = int(bp.get('level') or 0)
+                # Classify scope (pool-localized vs fleet-wide).
+                pools_now = self.state.get('ip_pools') or {}
+                scope, pool_key, attr_rate = self._classify_outage_scope(
+                    statuses, pools_now, rate)
+                # Decide level. Independent escalation per scope.
+                if scope == 'pool':
+                    prev = pool_esc.get(pool_key) or {}
+                    last_up = float(prev.get('last_unpause_ts') or 0.0)
+                    prev_level = int(prev.get('level') or 0)
+                else:
+                    last_up = float(bp.get('last_unpause_ts') or 0.0)
+                    prev_level = int(bp.get('level') or 0)
                 if last_up > 0 and (now - last_up) <= BEV_OUTAGE_RESET_S:
                     level = min(prev_level + 1, len(BEV_OUTAGE_LEVELS_S))
                 else:
                     level = 1
                 cooldown_s = BEV_OUTAGE_LEVELS_S[level - 1]
-                until_dt = _dt.now(_tz.utc) + __import__('datetime').timedelta(seconds=cooldown_s)
-                reason = (f'fleet BEV rate {rate:.1f} wpm over '
-                          f'{n_peers} peers for {int(streak)}s '
-                          f'(level {level}/{len(BEV_OUTAGE_LEVELS_S)} → '
-                          f'{cooldown_s//3600}h cooldown)')
+                until_dt = _dt.now(_tz.utc) + _td(seconds=cooldown_s)
+                if scope == 'pool':
+                    pool_peers = self._peers_in_pool(pool_key, statuses)
+                    reason = (
+                        f'pool {pool_key} BEV rate {attr_rate:.1f} wpm '
+                        f'over {len(pool_peers)} peers '
+                        f'(fleet total {rate:.1f}) for {int(streak)}s '
+                        f'(level {level}/{len(BEV_OUTAGE_LEVELS_S)} → '
+                        f'{cooldown_s//3600}h cooldown)'
+                    )
+                else:
+                    reason = (
+                        f'fleet BEV rate {rate:.1f} wpm over '
+                        f'{n_peers} peers for {int(streak)}s '
+                        f'(level {level}/{len(BEV_OUTAGE_LEVELS_S)} → '
+                        f'{cooldown_s//3600}h cooldown)'
+                    )
                 bp = {
                     'active': True,
+                    'scope': scope,
+                    'pool': pool_key if scope == 'pool' else None,
                     'level': level,
                     'since': _dt.now(_tz.utc).isoformat(),
                     'until': until_dt.isoformat(),
                     'cooldown_s': cooldown_s,
                     'reason': reason,
-                    'trigger_rate_wpm': round(rate, 2),
+                    'trigger_rate_wpm': round(
+                        attr_rate if scope == 'pool' else rate, 2),
                     'trigger_n_peers': n_peers,
-                    'last_unpause_ts': last_up,
+                    'last_unpause_ts': float(bp.get('last_unpause_ts') or 0),
                     'trigger_streak_since': 0.0,
                     'recovery_streak_since': 0.0,
                 }
                 with self._lock:
                     self.state['bev_pause'] = bp
-                log.warning('bev_pause PAUSE: %s', reason)
+                log.warning('bev_pause PAUSE (%s%s): %s',
+                            scope,
+                            (' ' + (pool_key or '')) if scope == 'pool' else '',
+                            reason)
                 try:
                     _emit_director_event(
-                        f'BEV outage detected, pausing fleet ingest: {reason}',
+                        f'BEV outage detected ({scope}'
+                        f'{(" " + pool_key) if scope == "pool" else ""}): '
+                        f'{reason}',
                         peer='director', level='error')
                 except Exception:
                     pass
-                # Graceful-stop every non-frontier cache-only peer so
-                # we stop hammering BEV during cooldown. We don't kill
-                # the frontier (it may be deep in finalization /
-                # zenodo upload — those steps don't touch BEV).
+                # Stop the bleeding.
                 try:
                     active_id = self.state.get('active_peer')
-                    for p in list(self.cfg.get('peers', [])):
-                        if not p.get('enabled', True):
-                            continue
-                        if p['id'] == active_id:
-                            continue
-                        if _peer_is_scheduled(p):
-                            continue
-                        try:
-                            ps = (statuses or {}).get(p['id']) or {}
-                            if (ps.get('state') or '') in ('running', 'processing'):
-                                stop_peer_processor(p.get('url'), graceful=True)
-                        except Exception:
-                            pass
+                    if scope == 'pool':
+                        # Park each peer in the offending /24 for the
+                        # cooldown window. Reuses canary_park / steal_park
+                        # plumbing: not_before + canary_notes entry.
+                        cfg_changed = False
+                        targets = self._peers_in_pool(pool_key, statuses)
+                        cooldown_iso = until_dt.isoformat()
+                        for pid in targets:
+                            with self._lock:
+                                live = get_peer_by_id(self.cfg, pid)
+                                if not live or not live.get('enabled', True):
+                                    continue
+                                # Don't shorten an existing longer park.
+                                cur_nb = live.get('not_before')
+                                try:
+                                    if cur_nb and _dt.fromisoformat(
+                                            cur_nb) > until_dt:
+                                        continue
+                                except Exception:
+                                    pass
+                                live['not_before'] = cooldown_iso
+                                notes = live.setdefault('canary_notes', [])
+                                notes.append({
+                                    'at': _dt.now(_tz.utc).strftime(
+                                        '%Y-%m-%dT%H:%M:%SZ'),
+                                    'event': 'bev_pool_park',
+                                    'reasons': [reason],
+                                    'cooldown_until': cooldown_iso,
+                                    'pool': pool_key,
+                                    'level': level,
+                                })
+                                if len(notes) > 32:
+                                    del notes[: len(notes) - 32]
+                                cfg_changed = True
+                                peer_url = live.get('url')
+                            try:
+                                ps = (statuses or {}).get(pid) or {}
+                                if peer_url and (ps.get('state') or '') in (
+                                        'running', 'processing'):
+                                    stop_peer_processor(peer_url,
+                                                        graceful=True)
+                            except Exception:
+                                pass
+                        if cfg_changed:
+                            try:
+                                save_peers_config(self.cfg)
+                            except Exception:
+                                log.exception(
+                                    'bev_pool_park: save_peers_config failed')
+                    else:
+                        # Fleet scope: graceful-stop every non-frontier
+                        # cache-only peer. Active frontier may be
+                        # mid-finalization (Zenodo) — doesn't touch BEV.
+                        for p in list(self.cfg.get('peers', [])):
+                            if not p.get('enabled', True):
+                                continue
+                            if p['id'] == active_id:
+                                continue
+                            if _peer_is_scheduled(p):
+                                continue
+                            try:
+                                ps = (statuses or {}).get(p['id']) or {}
+                                if (ps.get('state') or '') in (
+                                        'running', 'processing'):
+                                    stop_peer_processor(p.get('url'),
+                                                        graceful=True)
+                            except Exception:
+                                pass
                 except Exception:
-                    log.exception('bev_pause: graceful stop fan-out failed')
+                    log.exception('bev_pause: stop fan-out failed')
             else:
                 with self._lock:
                     self.state['bev_pause'] = bp
@@ -4667,12 +4896,19 @@ class PeerDirector:
     # IP-pool egress block detection
     # ------------------------------------------------------------------
     def _compute_ip_pools(self, statuses: dict) -> dict:
-        """Aggregate per-peer 5m BEV warn rates by outbound /24.
+        """Aggregate per-peer 5m BEV warn rates + steal by outbound /24.
 
         Returns a dict keyed by ``outbound_24`` (e.g. ``'1.2.3.0/24'``)
-        with ``{peers: [ids], rate_wpm: avg, n: count}``. Peers without
-        a known outbound_ip land in pool ``'?'``.
+        with ``{peers, n, avg_wpm, median_wpm, max_wpm, steal_med}``.
+        Peers without a known outbound_ip land in pool ``'?'``.
+
+        We carry steal here too so the IP-pool view in /process.txt
+        gives one picture of "is this /24 shaped" *and* "is this /24
+        on a contended hypervisor pool". Steal is taken from the
+        fleet-wide ``peer_steal_ema`` so it matches the same source
+        used by ``_check_steal_health`` and ``fleet_cpu``.
         """
+        steal_ema = self.state.get('peer_steal_ema') or {}
         pools: dict = {}
         for pid, ps in (statuses or {}).items():
             if not isinstance(ps, dict):
@@ -4682,27 +4918,66 @@ class PeerDirector:
             key = host.get('outbound_24') or '?'
             wr = ((ps.get('warning_rates') or {}).get('bev') or {})
             r = float(wr.get('5m') or 0.0)
-            pool = pools.setdefault(key, {'peers': [], 'rates': [], 'sum_wpm': 0.0})
+            pool = pools.setdefault(key, {
+                'peers': [], 'rates': [], 'sum_wpm': 0.0, 'steal': [],
+            })
             pool['peers'].append(pid)
             pool['rates'].append(r)
             pool['sum_wpm'] += r
+            _s = steal_ema.get(pid)
+            if isinstance(_s, (int, float)):
+                pool['steal'].append(float(_s))
         # Finalize stats.
+        def _med(xs):
+            n = len(xs)
+            if not n:
+                return 0.0
+            s = sorted(xs)
+            return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
         out: dict = {}
         for key, pool in pools.items():
             n = len(pool['peers'])
             avg = (pool['sum_wpm'] / n) if n else 0.0
-            rates = sorted(pool['rates'])
-            med = (rates[n // 2] if n % 2
-                   else (rates[n // 2 - 1] + rates[n // 2]) / 2) if n else 0.0
             mx = max(pool['rates']) if pool['rates'] else 0.0
             out[key] = {
                 'peers': pool['peers'],
                 'n': n,
                 'avg_wpm': round(avg, 3),
-                'median_wpm': round(med, 3),
+                'median_wpm': round(_med(pool['rates']), 3),
                 'max_wpm': round(mx, 3),
+                'steal_med': (round(_med(pool['steal']), 1)
+                              if pool['steal'] else None),
+                'steal_n': len(pool['steal']),
             }
         return out
+
+    def _sample_ip_pool_history(self, pools: dict) -> None:
+        """Append a 24h-ring sample of per-pool BEV rates + steal.
+
+        Stored as state['ip_pools_history'] = list of
+        ``{ts, pools: {key: {avg_wpm, n, steal_med}}}``.
+        Throttled to once every POOL_HISTORY_SAMPLE_INTERVAL_S.
+        """
+        now = time.time()
+        with self._lock:
+            hist = list(self.state.get('ip_pools_history') or [])
+            last_ts = float(hist[-1]['ts']) if hist else 0.0
+            if (now - last_ts) < POOL_HISTORY_SAMPLE_INTERVAL_S:
+                return
+            slim = {}
+            for k, v in (pools or {}).items():
+                if k == '?':
+                    continue
+                slim[k] = {
+                    'avg_wpm': v.get('avg_wpm'),
+                    'max_wpm': v.get('max_wpm'),
+                    'n': v.get('n'),
+                    'steal_med': v.get('steal_med'),
+                }
+            hist.append({'ts': int(now), 'pools': slim})
+            if len(hist) > POOL_HISTORY_MAX:
+                hist = hist[-POOL_HISTORY_MAX:]
+            self.state['ip_pools_history'] = hist
 
     def _check_ip_pool_block(self, statuses: dict) -> None:
         """Park peers in an IP pool that shows a disproportionate BEV warn rate."""
@@ -4710,6 +4985,12 @@ class PeerDirector:
         pools = self._compute_ip_pools(statuses)
         with self._lock:
             self.state['ip_pools'] = pools
+        # Persistent 24h ring — sampled here so we get one consistent
+        # snapshot per director tick rather than racing two callers.
+        try:
+            self._sample_ip_pool_history(pools)
+        except Exception:
+            log.exception('ip_pools_history sample failed')
         # Drop the unknown bucket from the analysis — we can't park what
         # we can't identify, and the '?' pool mixes peers across actual
         # pools so its rate is meaningless.
@@ -6572,11 +6853,13 @@ class PeerDirector:
             state_copy = self.state.copy()
         if mode == 'paused':
             return
-        if (state_copy.get('bev_pause') or {}).get('active'):
-            # Don't spin up new parallel frontiers during a BEV outage
-            # pause. The active frontier may still be mid-finalization
-            # (zenodo upload) and we let it finish; new BEV-heavy work
-            # waits for the cooldown.
+        _bp_pf = state_copy.get('bev_pause') or {}
+        if _bp_pf.get('active') and (_bp_pf.get('scope') or 'fleet') == 'fleet':
+            # Don't spin up new parallel frontiers during a fleet-wide
+            # BEV outage pause. The active frontier may still be mid-
+            # finalization (zenodo upload) and we let it finish; new
+            # BEV-heavy work waits for the cooldown. Pool-scoped
+            # pauses are enforced via per-peer not_before.
             return
 
         active_id = state_copy.get('active_peer')
@@ -7442,9 +7725,11 @@ class PeerDirector:
         if mode == 'paused':
             return
         # BEV-outage pause: don't start new cache-only peers while the
-        # fleet is in the cooldown window. The check runs every tick in
-        # _check_bev_outage; we just respect the flag here.
-        if (state_copy.get('bev_pause') or {}).get('active'):
+        # fleet is in the cooldown window. Pool-scoped pauses are
+        # enforced via per-peer not_before, so this short-circuit
+        # only fires for fleet-wide pauses.
+        _bp = state_copy.get('bev_pause') or {}
+        if _bp.get('active') and (_bp.get('scope') or 'fleet') == 'fleet':
             return
 
         budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)

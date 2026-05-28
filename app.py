@@ -14923,19 +14923,26 @@ def process_txt():
     # --- BEV outage state + IP-pool egress ---------------------
     # Surfaced compactly so an agent curl-ing process.txt can see at
     # a glance whether the fleet is in a BEV-outage cooldown and which
-    # egress /24 (if any) is currently being shaped/blocked.
+    # egress /24 (if any) is currently being shaped/blocked. Also
+    # combines IP-pool aggregation with the steal signal so the same
+    # line tells you whether a /24 is network-shaped (high wpm) or
+    # hypervisor-contended (high steal) — the two flavours of "this
+    # pool is unhealthy".
     try:
+        from datetime import datetime as _dt
         bp = d.get('bev_pause') or {}
         if bp.get('active'):
-            from datetime import datetime as _dt
             try:
                 _u = _dt.fromisoformat(bp.get('until') or '')
                 _rem = max(0, int((_u - _dt.now(_u.tzinfo)).total_seconds()))
             except Exception:
                 _rem = int(bp.get('cooldown_s') or 0)
+            _scope = bp.get('scope') or 'fleet'
+            _pool_tag = f' pool={bp.get("pool")}' if _scope == 'pool' else ''
             out.append(
-                f'bev_pause: ACTIVE level={bp.get("level")}/4 '
-                f'remaining={_hms(_rem)} since={bp.get("since") or "?"} '
+                f'bev_pause: ACTIVE scope={_scope}{_pool_tag} '
+                f'level={bp.get("level")}/4 remaining={_hms(_rem)} '
+                f'since={bp.get("since") or "?"} '
                 f'reason={bp.get("reason") or "?"}'
             )
         else:
@@ -14945,12 +14952,33 @@ def process_txt():
                 _age = int(max(0, time.time() - float(_last_up)))
                 out.append(
                     f'bev_pause: clear (last unpause {_hms(_age)} ago, '
-                    f'prev level {_prev_level}/4 — next trigger would '
-                    f'escalate within 48h)'
+                    f'prev level {_prev_level}/4 — escalates within 48h)'
                 )
-            else:
-                # No history — omit the line to keep top section tight.
-                pass
+
+        # Recent pause-event history (24h ring). Show up to 6 most-
+        # recent events as a single compact line so the agent gets a
+        # picture of pool flapping over the last day without parsing
+        # the full director_state.json.
+        bph = d.get('bev_pause_history') or []
+        if bph:
+            evs = bph[-6:]
+            parts = []
+            for ev in evs:
+                _scope = ev.get('scope') or 'fleet'
+                _pool = ev.get('pool')
+                _lvl = ev.get('level')
+                _since = ev.get('since') or ''
+                # Compact HH:MM-HH:MM (UTC) span.
+                _from = _since.split('T')[-1][:5] if 'T' in _since else '?'
+                _end = (ev.get('ended') or '').split('T')[-1][:5] or '?'
+                _why = (ev.get('end_reason') or '').replace('cooldown', 'cd')
+                _tag = (f'{_scope}={_pool}'
+                        if _scope == 'pool' and _pool else _scope)
+                parts.append(
+                    f'{_tag}/L{_lvl}/{_from}-{_end}({_why})'
+                )
+            out.append('bev_pause_history: ' + ' · '.join(parts))
+
         pools = d.get('ip_pools') or {}
         if pools:
             # Sort by avg_wpm desc so the noisiest pool shows first.
@@ -14958,11 +14986,56 @@ def process_txt():
                            key=lambda kv: -float(kv[1].get('avg_wpm') or 0))
             parts = []
             for key, v in items[:6]:  # top 6 pools is plenty
+                _avg = float(v.get('avg_wpm') or 0)
+                _stl = v.get('steal_med')
+                _stl_tag = (f' stl={_stl:.0f}%'
+                            if isinstance(_stl, (int, float)) else '')
                 parts.append(
-                    f'{key}:n={v.get("n")} '
-                    f'avg={float(v.get("avg_wpm") or 0):.1f}wpm'
+                    f'{key}:n={v.get("n")} avg={_avg:.1f}wpm{_stl_tag}'
                 )
             out.append('ip_pools: ' + ' · '.join(parts))
+
+        # 24h per-pool peak (from ip_pools_history). One line summarising
+        # which pools had the worst BEV moments in the last 24h, plus
+        # peak steal. Skips pools that never went above ~1 wpm AND
+        # ~10% steal so quiet pools don't clutter the line.
+        iph = d.get('ip_pools_history') or []
+        if iph:
+            agg: dict = {}
+            for sample in iph:
+                for key, v in (sample.get('pools') or {}).items():
+                    a = agg.setdefault(
+                        key, {'wpm_max': 0.0, 'wpm_sum': 0.0,
+                              'stl_max': 0.0, 'n': 0})
+                    _w = float(v.get('avg_wpm') or 0)
+                    if _w > a['wpm_max']:
+                        a['wpm_max'] = _w
+                    a['wpm_sum'] += _w
+                    _s = v.get('steal_med')
+                    if isinstance(_s, (int, float)) and _s > a['stl_max']:
+                        a['stl_max'] = float(_s)
+                    a['n'] += 1
+            if agg:
+                items = sorted(
+                    agg.items(),
+                    key=lambda kv: (-kv[1]['wpm_max'], -kv[1]['stl_max']),
+                )
+                pp = []
+                for key, a in items[:6]:
+                    if a['wpm_max'] < 1.0 and a['stl_max'] < 10:
+                        continue
+                    _avg = a['wpm_sum'] / max(1, a['n'])
+                    pp.append(
+                        f'{key}:peak={a["wpm_max"]:.1f}wpm '
+                        f'avg={_avg:.1f}wpm stl_peak={a["stl_max"]:.0f}%'
+                    )
+                if pp:
+                    _span_h = int((iph[-1]['ts'] - iph[0]['ts']) / 3600) \
+                        if len(iph) > 1 else 0
+                    out.append(
+                        f'ip_pools_24h ({_span_h}h, n={len(iph)}): '
+                        + ' · '.join(pp)
+                    )
     except Exception:
         log.exception('process.txt bev_pause / ip_pools block failed')
 

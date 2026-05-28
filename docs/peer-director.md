@@ -382,6 +382,83 @@ the latest tick (scheduled, stopped, or unreachable past the 30-min
 grace). Useful when capacity_factor looks low but you can't tell
 which peer is the source.
 
+#### BEV outage handling (multi-pool parks)
+
+When `data.bev.gv.at` becomes unreachable for some egress pools but
+not others (the common failure mode — AWS NAT routes flap independently),
+the director uses `_check_bev_outage` + `_classify_outage_multi_pool`
+to park *the affected /24 pools only*, never the whole fleet on first
+trigger.
+
+Trigger conditions (all three):
+* Fleet BEV warns/min ≥ `BEV_OUTAGE_TRIGGER_WPM` (12.0)
+* over ≥ `BEV_OUTAGE_MIN_PEERS` (4) distinct peers
+* sustained for ≥ `BEV_OUTAGE_TRIGGER_PERSIST_S` (180 s)
+
+Classification:
+* `≥ OUTAGE_POOL_KNOWN_FRAC` (0.60) of warns must come from peers
+  with a known `outbound_24` (else most pressure is in `'?'` and we
+  can't attribute — fall through to fleet scope).
+* Sort known pools by 1m sum descending. Take the smallest prefix
+  whose cumulative share ≥ `OUTAGE_POOL_DOMINANCE` (0.70).
+* If `len(prefix) > OUTAGE_POOL_MAX_SET` (3): fleet scope.
+* Otherwise: pool scope, park every peer in each prefix pool.
+
+What "pool scope" does (per `_check_bev_outage`, the `scope == 'pools'`
+branch):
+* Sets `not_before` on every peer in the affected /24s with a
+  `bev_pool_park` canary_note (event, level, cooldown_until).
+* Gracefully stops any running peer in those pools.
+* Appends a per-pool entry to `bev_pause_history` (scope='pool',
+  ended=None until cooldown / manual clear).
+* Bumps `bev_pool_escalation[pool]` so the per-pool escalation
+  ladder ticks independently of fleet level.
+* **Does NOT set `bev_pause.active=True`** — the fleet-wide pause
+  flag is reserved for the fallback fleet-scope path. Peers in
+  healthy pools keep working.
+
+Escalation: 1h → 4h → 12h → 24h cooldowns (`BEV_OUTAGE_LEVELS_S`).
+A pool that re-triggers within `BEV_OUTAGE_RESET_S` (48 h) of its
+last unpause moves up one level. Across the prefix the director
+uses the max prev_level so a fresh-co-affected pool inherits the
+repeat-offender's escalation for this round.
+
+Manual clear: `POST /api/v1/director/bev_pause/clear` (admin-token
+in header). Body `{reason: str}` optional. Records an event with
+`end_reason='manual'` in `bev_pause_history`, drops the pool
+escalation entry (so next legit trigger starts at L1), busts the
+status cache. The dashboard's `BEV PAUSED` chip in the Service
+card is wired to the same endpoint (click → confirm → POST).
+
+**Cross-worker visibility gotcha** (fixed 8ce44cd): the director
+tick loop must reload `bev_pause` + `bev_pool_escalation` from
+disk on every tick. The clear endpoint runs in whichever gunicorn
+worker the request lands on; without the disk-merge, the
+director-loop worker keeps its stale in-mem `active=True` forever
+and the clear has no effect on actual scheduling. Both keys live
+in the same disk-merge block as `active_peer`/`mode`/`last_switch`
+at the top of `_loop()`.
+
+Warning-classification subtlety (`austria_processor._classify_warning`):
+intermediate `bev_retry: ... attempt N/M ... retrying in Ns...`
+warnings are filtered out of the `bev` bucket (proxy-lane noise,
+not a BEV-outage signal). Only the final `all N attempts exhausted`
+line counts. Without this filter every direct-first timeout on a
+broken pool emits a wpm of fleet-side `bev` warns, which by itself
+is enough to clear the 12 wpm trigger even when the wrapper is
+successfully falling back to proxy.
+
+Why egress-pool parking (not per-peer): every VM in an outbound
+/24 shares the same NAT gateway and same route to BEV. If TCP
+times out for one peer in `109.94.96.0/24`, it'll time out for
+every other peer in that /24 too. Per-peer parking would whack-
+a-mole — the director would activate an idle peer in the broken
+pool, watch it warn for 5 min, park it, activate the next, repeat
+— burning Copernicus minutes during each trigger streak. Pool
+parking parks the whole /24 in one shot, all `not_before`
+expiring together so the pool gets one clean retry per cooldown
+level.
+
 #### Director Modes
 
 | Mode | Behaviour |

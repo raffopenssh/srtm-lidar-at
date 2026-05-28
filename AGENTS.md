@@ -146,7 +146,7 @@ cumulative counter increased.
 
 ### Role-based parks (who is parked, and why)
 
-Only four reasons a peer is parked (`not_before` in the future):
+Only five reasons a peer is parked (`not_before` in the future):
 
 1. **Primary** — `_enforce_primary_park`, every tick. Floor
    `not_before=2027-01-01`, `pinned_role=idle`. Manual reset won't
@@ -174,6 +174,20 @@ Only four reasons a peer is parked (`not_before` in the future):
    is cheap. Frontier scheduling additionally biases against
    high-steal peers via `FRONTIER_HIGH_STEAL_BIAS_PCT` (50 %%) so
    credentials always land on the lowest-steal eligible peer.
+5. **BEV egress-pool park** — `_check_bev_outage` (since 2026-05-28,
+   commit 8ce44cd). When fleet BEV warns are sustained AND the
+   warning peers cluster into ≤ `OUTAGE_POOL_MAX_SET` (default 3)
+   /24 egress pools whose combined share ≥ `OUTAGE_POOL_DOMINANCE`
+   (70 %%), the director parks every peer in those /24s with
+   escalating 1h/4h/12h/24h cooldowns (`bev_pool_park` event,
+   level tracked per pool in `bev_pool_escalation`). Peers in
+   healthy pools keep working — no fleet-wide pause. Root cause is
+   per-egress reachability: AWS/cloud pools like `109.94.96.0/24`
+   and `162.43.189.0/24` can have TCP timeouts to `data.bev.gv.at`
+   while other pools (and the primary itself) reach it in <1s.
+   Fleet-scope pause is the fallback when attribution fails (>3
+   bad pools or `known_frac < OUTAGE_POOL_KNOWN_FRAC = 0.60`).
+   See `docs/peer-director.md → BEV outage handling` for details.
 
 The one-shot `_release_unverified_bw_parks` rescues peers that got
 parked-until-renewal *without* an `observed_cap_gb` (legacy budget-

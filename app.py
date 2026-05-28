@@ -134,6 +134,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/processing/retry',
     '/api/v1/processing/throttle',
     '/api/v1/processing/queue',
+    '/api/v1/processing/partial_kgs',
     '/api/v1/processing/cache_manifest',
     '/api/v1/processing/kg_strikes',
     '/api/v1/zenodo/lock',
@@ -4199,15 +4200,21 @@ def processing_partial_kgs_get():
 
 @app.route('/api/v1/processing/partial_kgs', methods=['DELETE'])
 def processing_partial_kgs_delete():
-    """Drop a KG from the partial registry (after manual review or re-queue)."""
-    if not _check_admin_token():
-        return jsonify({'error': 'admin token required'}), 403
+    """Drop a KG from the partial registry (after manual review or re-queue).
+
+    Auth handled globally by `_enforce_admin_token` via `_PROTECTED_PREFIXES`.
+    Supports `kg=ALL` (or `?all=1`) to clear the entire registry in one call —
+    cheaper than N-round-trips from the dashboard's `dismiss all`.
+    """
     code = request.args.get('kg') or (request.get_json(silent=True) or {}).get('kg', '')
-    if not code:
+    clear_all = (str(code).upper() == 'ALL') or request.args.get('all') in ('1', 'true')
+    if not code and not clear_all:
         return jsonify({'error': 'kg parameter required'}), 400
     import fcntl, tempfile, os as _os
     lock_path = PARTIAL_KGS_PATH.with_suffix('.lock')
     PARTIAL_KGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    existed = False
     with open(lock_path, 'w') as _lk:
         try:
             fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
@@ -4217,8 +4224,15 @@ def processing_partial_kgs_delete():
                     cur = json.loads(PARTIAL_KGS_PATH.read_text()) or {}
                 except Exception:
                     cur = {}
-            existed = code in cur
-            cur.pop(code, None)
+            if clear_all:
+                removed = len(cur)
+                existed = removed > 0
+                cur = {}
+            else:
+                existed = code in cur
+                if existed:
+                    cur.pop(code, None)
+                    removed = 1
             fd, tmp = tempfile.mkstemp(dir=str(PARTIAL_KGS_PATH.parent),
                                        prefix='.partial_', suffix='.tmp')
             try:
@@ -4232,6 +4246,8 @@ def processing_partial_kgs_delete():
         finally:
             try: fcntl.flock(_lk.fileno(), fcntl.LOCK_UN)
             except Exception: pass
+    if clear_all:
+        return jsonify({'status': 'cleared', 'removed': removed})
     return jsonify({'status': 'removed' if existed else 'not_found', 'kg': code})
 
 

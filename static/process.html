@@ -3858,9 +3858,8 @@ async function requeueAllPartial(e) {
       body: JSON.stringify({kgs: codes, position: 0, skip_processed: false})
     });
     if (!r.ok) { alert('Re-queue failed: ' + await r.text()); return; }
-    for (const c of codes) {
-      try { await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(c), {method: 'DELETE'}); } catch(_) {}
-    }
+    // Bulk-clear the registry in one call instead of N round-trips.
+    try { await fetch('/api/v1/processing/partial_kgs?kg=ALL', {method: 'DELETE'}); } catch(_) {}
     fetchPrioQueue();
   } catch(err) { alert('Re-queue all error: ' + err.message); }
 }
@@ -3869,9 +3868,7 @@ async function dismissAllPartial(e) {
   if (e) e.preventDefault();
   if (!_partialKgs.length) return;
   if (!confirm('Dismiss ALL ' + _partialKgs.length + ' partial KG(s) without re-running?')) return;
-  for (const k of _partialKgs.slice()) {
-    try { await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(k.code), {method: 'DELETE'}); } catch(_) {}
-  }
+  try { await fetch('/api/v1/processing/partial_kgs?kg=ALL', {method: 'DELETE'}); } catch(_) {}
   fetchPrioQueue();
 }
 

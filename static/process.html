@@ -857,6 +857,10 @@
             style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
                    padding:2px 7px;border:1px solid var(--border);border-radius:10px;
                    user-select:none">4h</span>
+      <span id="logCompact" title="Compact mode: smaller fetch limits + truncated message bodies. Click to load full bodies + more entries."
+            style="font-size:10px;cursor:pointer;font-weight:normal;color:var(--dim);
+                   padding:2px 7px;border:1px solid var(--border);border-radius:10px;
+                   user-select:none">compact</span>
       <label style="font-size:10px;color:var(--dim);cursor:pointer;font-weight:normal">
         <input type="checkbox" id="autoScroll" checked style="margin-right:3px">auto-scroll
       </label>
@@ -1983,6 +1987,18 @@ function clearKgTimer() {
 
 // ── Log ─────────────────────────────────────────────────────────
 let _logFilterIssues = false;
+// Compact log mode: smaller fetch limits + per-row truncation. Default on
+// so the dashboard doesn't pull ~1 MB of mostly-redundant BEV retry chatter
+// on every 30 s refresh. Toggle off via the 'compact' chip to inspect a
+// specific incident in full.
+let _logCompact = (function(){
+  try {
+    const v = localStorage.getItem('srtm_log_compact');
+    if (v === '0') return false;
+  } catch(_) {}
+  return true;
+})();
+const _LOG_MSG_TRUNC = 140;  // chars per row in compact mode
 // Log range mode: 'live' (single-poll recent_log), '4h', '24h'.
 // Default: 4h — fleet operators almost always want the recent
 // fleet-wide picture, but a full 24h is heavy (5000 entries / ~1 MB)
@@ -2018,6 +2034,15 @@ function _renderLogRangeChip() {
   r.textContent = _LOG_RANGE_LABEL[_logRangeMode] || '4h';
   _styleLogChip(r, _logRangeMode !== 'live', 'var(--blue)');
 }
+function _renderLogCompactChip() {
+  const c = document.getElementById('logCompact');
+  if (!c) return;
+  c.textContent = _logCompact ? 'compact' : 'full';
+  // 'compact' is the default-on/saving state — dim. 'full' is the
+  // opt-in heavier state — highlight so the operator notices it's
+  // pulling more bytes.
+  _styleLogChip(c, !_logCompact, 'var(--yellow)');
+}
 (function(){
   const f = document.getElementById('logFilter');
   if (f) f.addEventListener('click', () => {
@@ -2047,6 +2072,24 @@ function _renderLogRangeChip() {
       }
     });
   }
+  const c = document.getElementById('logCompact');
+  if (c) {
+    _renderLogCompactChip();
+    c.addEventListener('click', () => {
+      _logCompact = !_logCompact;
+      try { localStorage.setItem('srtm_log_compact', _logCompact ? '1' : '0'); } catch(_) {}
+      _renderLogCompactChip();
+      // Re-render now (truncation is render-time) and refetch if a
+      // historical range is active so the new limit takes effect.
+      prevLogHash = '';
+      if (_logRangeMode !== 'live') {
+        _logHistPayload = null;
+        fetchLogHistory(true);
+      } else if (_lastLogPayload) {
+        updateLog(_lastLogPayload);
+      }
+    });
+  }
   const s = document.getElementById('logSearch');
   if (s) {
     s.addEventListener('input', () => {
@@ -2070,8 +2113,11 @@ async function fetchLogHistory(force) {
   _logHistFetchInflight = true;
   const mode = _logRangeMode;
   const hours = mode === '24h' ? 24 : 4;
-  // Cap limit to keep the payload small in 4h mode.
-  const limit = mode === '24h' ? 5000 : 2000;
+  // Cap limit to keep the payload small. Compact mode shrinks both
+  // ranges further; the operator can opt-out via the 'compact' chip.
+  const limit = _logCompact
+    ? (mode === '24h' ? 1200 : 400)
+    : (mode === '24h' ? 5000 : 2000);
   try {
     const r = await fetch('/api/v1/director/log/history?hours=' + hours + '&limit=' + limit);
     if (!r.ok) return;
@@ -2164,7 +2210,17 @@ function updateLog(d) {
   sorted.forEach((e, i) => {
     const lvl = e.level || 'info';
     const cls = 'log-row log-' + lvl;
-    let msg = esc(e.msg);
+    // Compact mode: trim long messages and stash full body on the row
+    // as title= for hover-to-expand. Saves DOM weight and visual noise
+    // on noisy BEV retry chatter without losing forensic detail.
+    const fullMsg = e.msg || '';
+    let rowTitle = '';
+    let _displayMsg = fullMsg;
+    if (_logCompact && fullMsg.length > _LOG_MSG_TRUNC) {
+      _displayMsg = fullMsg.slice(0, _LOG_MSG_TRUNC) + '…';
+      rowTitle = fullMsg;
+    }
+    let msg = esc(_displayMsg);
     // Highlight quality badge in success messages
     msg = msg.replace(/quality=(\d+)% ([A-F])/g, function(m, pct, grade) {
       const colors = {A:'#3fb950',B:'#58a6ff',C:'#d29922',D:'#f0883e',F:'#f85149'};
@@ -2184,7 +2240,8 @@ function updateLog(d) {
     }
     const entryPeer = multi ? (e.peer || '') : logPeer;
     const peerTag = entryPeer ? '<span class="log-peer">' + esc(entryPeer) + '</span>' : '';
-    h += '<div class="' + cls + '">' +
+    const titleAttr = rowTitle ? ' title="' + esc(rowTitle) + '"' : '';
+    h += '<div class="' + cls + '"' + titleAttr + '>' +
       peerTag +
       '<span class="log-ts">' + fmtT(e.ts) + '</span>' +
       (e.kg ? '<span class="log-kg">[' + esc(e.kg) + ']</span>' : '') +

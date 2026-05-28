@@ -6629,13 +6629,38 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                          or "No tiles cover bbox" in _exc_str)
                 )
                 if _outside:
+                    # Benign — bbox falls outside BEV DOP coverage.
+                    # Segmentation still runs on LiDAR-only features.
                     tile_avail["ortho_outside_austria"] = True
                 elif _ortho_last_exc is not None:
+                    # Real upstream failure (timeout / 5xx / reset)
+                    # after escalating attempts. Mirror the LiDAR
+                    # policy: abort the KG for deferred retry rather
+                    # than emit a partial. RGB+NIR drive ~half the
+                    # spectral features and all ortho-based products
+                    # — a tile without them downgrades the whole KG.
                     tile_avail["upstream_fail"] = True
                     tile_avail.setdefault(
                         "upstream_fail_reason",
                         f"ortho: {type(_ortho_last_exc).__name__}: {_exc_str[:200]}",
                     )
+                    log.error(
+                        "KG %s %s: ortho unavailable after %d attempts — "
+                        "aborting KG for deferred retry (would emit partial)",
+                        kg_code, tile_label, len(_ORTHO_TIMEOUTS),
+                    )
+                    _tile_entry["status"] = "error"
+                    _tile_entry["issues"]["ortho"] = "fail"
+                    result["ortho_failed"] = True
+                    result["success"] = False
+                    result["error"] = (
+                        f"Ortho unavailable for tile {tile_idx+1}/{len(tiles)} "
+                        f"after {len(_ORTHO_TIMEOUTS)} attempts: "
+                        f"{tile_avail['upstream_fail_reason']}"
+                    )
+                    result["step"] = f"ortho_failed_tile_{tile_idx+1}"
+                    tile_data_availability.append(tile_avail)
+                    break  # abort tile loop — KG will be deferred
 
             # Accumulate spectral info for JSON
             if spectral and spectral.get("ndvi") is not None:
@@ -6980,6 +7005,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         "tile checkpoints preserved for deferred retry",
                         kg_code, tile_idx + 1, n_tiles)
             result["step"] = "aborted_lidar_failed"
+            return result
+        if result.get("ortho_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to ortho fetch exhaustion — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_ortho_failed"
             return result
 
         # --- 4. Merge terrain stats ---
@@ -9705,6 +9736,7 @@ def main():
                                     or 'PaymentRequired' in str(result.get("error", "")))
                 is_cop_batch_failure = result.get("copernicus_failed", False)
                 is_lidar_failure = result.get("lidar_failed", False)
+                is_ortho_failure = result.get("ortho_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
                 if is_cache_incomplete:
                     # Cache-only peer hit a missing tile.  The KG must be
@@ -9751,10 +9783,12 @@ def main():
                                       _r.status_code, _r.text[:200])
                     except Exception as _e:
                         log.debug('cache_miss POST failed: %s', _e)
-                elif is_lidar_failure:
-                    log.warning("KG %s: LiDAR fetch exhausted — deferring for retry", kg_code)
+                elif is_lidar_failure or is_ortho_failure:
+                    _what = "LiDAR" if is_lidar_failure else "ortho"
+                    log.warning("KG %s: %s fetch exhausted — deferring for retry",
+                                kg_code, _what)
                     progress.add_log("warning",
-                                     f"KG {kg_code}: LiDAR upstream exhausted — "
+                                     f"KG {kg_code}: {_what} upstream exhausted — "
                                      f"deferred retry (tile checkpoints preserved)",
                                      kg_code)
                     _append_retry_queue(kg_code)
@@ -9772,7 +9806,7 @@ def main():
                                      (i + DEFER_GAP, _deferred, _defer_n + 1))
                     progress.add_log(
                         "warning",
-                        f"KG {kg_code}: LiDAR upstream exhausted — "
+                        f"KG {kg_code}: {_what} upstream exhausted — "
                         f"deferred retry in {DEFER_GAP} KGs",
                         kg_code,
                     )

@@ -2690,6 +2690,25 @@ def _find_tile_for_point(e3035, n3035, tile_seg_results):
     return None
 
 
+# Phase 1 sidecar telemetry. Bumped by every gpkg_full sidecar lookup
+# (DTM/DSM/nDSM, multi-date DTM/DSM, ortho RGB+NIR) and drained once at
+# the end of build_full_gpkg_tiled into a single INFO log line. Reset
+# at function entry so each KG reports its own hit/miss ratio. Process-
+# local (one subprocess per KG) so plain module state is fine.
+_SIDECAR_STATS: dict = {
+    "dtm_hit": 0, "dtm_miss": 0,
+    "dtm_multi_hit": 0, "dtm_multi_miss": 0,
+    "ortho_hit": 0, "ortho_miss": 0,
+}
+
+
+def _sidecar_stat(key: str, n: int = 1) -> None:
+    try:
+        _SIDECAR_STATS[key] = _SIDECAR_STATS.get(key, 0) + n
+    except Exception:
+        pass
+
+
 def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = None):
     """Re-read DTM/DSM for a tile.
 
@@ -2707,9 +2726,12 @@ def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = No
             ckpt_root = DATA_DIR / "tile_checkpoints"
             cached = _trs.load_dtm_dsm(ckpt_root, kg_code, tile_idx, "default")
             if cached is not None:
+                _sidecar_stat("dtm_hit")
                 return cached
         except Exception:
             pass
+    if kg_code is not None and tile_idx is not None:
+        _sidecar_stat("dtm_miss")
     tdata = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
     if kg_code is not None and tile_idx is not None:
         try:
@@ -3213,6 +3235,12 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     segment_height) covering the full KG bbox, plus unified segment vectors."""
     import rasterio
     import rasterio.transform
+    # Reset Phase 1 sidecar telemetry for this KG's gpkg_full step.
+    # We emit one summary line at the end of the function (subprocess
+    # warnings JSONL — the parent step monitor relays into the merged
+    # 24h log so we can audit sidecar hit ratios fleet-wide).
+    for _k in list(_SIDECAR_STATS.keys()):
+        _SIDECAR_STATS[_k] = 0
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
     _purge_stale_gpkg(out_path)
     if not tile_seg_results:
@@ -3465,7 +3493,10 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                         DATA_DIR / "tile_checkpoints", kg_code, ti_idx, date_key)
                 except Exception:
                     d2 = None
-                if d2 is None:
+                if d2 is not None:
+                    _sidecar_stat("dtm_multi_hit")
+                else:
+                    _sidecar_stat("dtm_multi_miss")
                     d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
                     try:
                         import tile_raster_sidecar as _trs
@@ -3542,6 +3573,10 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                         rgb_t, nir_t = _hit
                 except Exception:
                     pass
+                if rgb_t is not None:
+                    _sidecar_stat("ortho_hit")
+                else:
+                    _sidecar_stat("ortho_miss")
                 if rgb_t is None:
                     tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
                     with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
@@ -3853,6 +3888,45 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
              fsize / 1e6, table_count, len(tile_seg_results))
+
+    # --- Phase 1 sidecar audit line (relayed via subprocess_warnings
+    # — parent step monitor pushes it into the merged 24h log so we
+    # can grep ?q=sidecar fleet-wide tomorrow and confirm gpkg_full is
+    # actually skipping BEV re-reads). Reads (BEV-eligible only):
+    # default DTM/DSM/nDSM (1 per tile), multi-date DTM/DSM (per year,
+    # per tile), ortho RGB+NIR (per year, per tile). hit_pct=100 means
+    # gpkg_full saw zero BEV calls; <50 means the sidecars weren't
+    # written (likely SIDECAR_MIN_FREE_GB tripped).
+    try:
+        s = _SIDECAR_STATS
+        hit = s["dtm_hit"] + s["dtm_multi_hit"] + s["ortho_hit"]
+        miss = s["dtm_miss"] + s["dtm_multi_miss"] + s["ortho_miss"]
+        tot = hit + miss
+        if tot > 0:
+            pct = (hit / tot) * 100.0
+            _summary = (
+                f"sidecar gpkg_full: "
+                f"dtm={s['dtm_hit']}/{s['dtm_hit']+s['dtm_miss']} "
+                f"dtm_multi={s['dtm_multi_hit']}/{s['dtm_multi_hit']+s['dtm_multi_miss']} "
+                f"ortho={s['ortho_hit']}/{s['ortho_hit']+s['ortho_miss']} "
+                f"hit_pct={pct:.0f}% (BEV reads saved: {hit}/{tot})"
+            )
+            log.info(_summary)
+            try:
+                import json as _j_sc
+                _warn_path = DATA_DIR / "subprocess_warnings.jsonl"
+                _entry = _j_sc.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info",
+                    "msg": _summary,
+                    "step": "gpkg_full",
+                }) + "\n"
+                with open(_warn_path, "a") as _wf:
+                    _wf.write(_entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
     return out_path, _label_remap
 
 

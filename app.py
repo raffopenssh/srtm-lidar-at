@@ -15499,7 +15499,12 @@ def process_txt():
         cmf_path = Path('data/austria_processor/cache_manifest.json')
         cmf = json.loads(cmf_path.read_text()) if cmf_path.exists() else {}
         # Schema: {depo_id, files: {fname: {tile_count, size, ...}}}.
-        files_d = (cmf.get('files') or {}) if isinstance(cmf, dict) else {}
+        # Exclude chkpt_* entries — those are the tile-tar registry
+        # (surfaced as its own chkpt_registry: line above), not tile-cache
+        # ZIPs. They share the deposit but the dashboard tile-cache count
+        # should match what cache-only peers consume.
+        files_d = {k: v for k, v in (cmf.get('files') or {}).items()
+                   if isinstance(cmf, dict) and not k.startswith('chkpt_')}
         cache_tiles = sum(int(v.get('tile_count') or 0)
                           for v in files_d.values())
         cache_bytes = sum(int(v.get('size') or 0) for v in files_d.values())

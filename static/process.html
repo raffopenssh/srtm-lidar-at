@@ -1999,6 +1999,23 @@ let _logCompact = (function(){
   return true;
 })();
 const _LOG_MSG_TRUNC = 140;  // chars per row in compact mode
+// Shared with app.py _is_bev_proxy_noise — keep token lists in sync.
+// These are GDAL-internal range-retry messages and bev_retry per-attempt
+// log lines that always resolve via the outer wrapper. On a flaky BEV
+// day they otherwise dominate the merged log. Hidden in compact mode
+// (default on); opt back in by flipping the chip to 'full'.
+const _BEV_NOISE_BEV_TOKENS = ['data.bev.gv.at','rasterio._err','bev_retry','als_dtm','als_dsm'];
+const _BEV_NOISE_INTERNAL_TOKENS = ['http error code: 0','http response code on','retrying again in','retrying in '];
+function _isBevProxyNoise(msg) {
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  if (m.indexOf('attempts exhausted') !== -1) return false;
+  let hit = false;
+  for (const t of _BEV_NOISE_BEV_TOKENS) { if (m.indexOf(t) !== -1) { hit = true; break; } }
+  if (!hit) return false;
+  for (const t of _BEV_NOISE_INTERNAL_TOKENS) { if (m.indexOf(t) !== -1) return true; }
+  return false;
+}
 // Log range mode: 'live' (single-poll recent_log), '4h', '24h'.
 // Default: 4h — fleet operators almost always want the recent
 // fleet-wide picture, but a full 24h is heavy (5000 entries / ~1 MB)
@@ -2165,14 +2182,17 @@ function updateLog(d) {
   const multi = !!d._multi_peer;
   // Determine peer source: proxied → _active_peer_id, local → instance field or 'primary'
   const logPeer = d._active_peer_id || d.instance || '';
-  // Update warn/err counter chip
-  const nWarn = log.filter(e => (e.level||'') === 'warning').length;
-  const nErr  = log.filter(e => (e.level||'') === 'error').length;
+  // Update warn/err counter chip. We count AFTER compact-noise filtering
+  // so the chip reflects what the user actually sees — otherwise the
+  // count stays high on noisy days while the visible list is empty.
+  const _visibleForCount = _logCompact ? log.filter(e => !_isBevProxyNoise(e.msg || '')) : log;
+  const nWarn = _visibleForCount.filter(e => (e.level||'') === 'warning').length;
+  const nErr  = _visibleForCount.filter(e => (e.level||'') === 'error').length;
   const cnt = document.getElementById('logFilterCount');
   if (cnt) cnt.innerHTML = '<span style="color:' + (nWarn?'var(--yellow)':'var(--dim)') + '">' + nWarn + ' warn</span> / ' +
                            '<span style="color:' + (nErr?'var(--red)':'var(--dim)') + '">' + nErr + ' err</span>';
   // Simple hash to avoid re-rendering identical log
-  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + '|r=' + _logRangeMode + '|q=' + _logSearchQuery;
+  const hash = log.length + (log.length > 0 ? log[0].ts + log[log.length-1].ts : '') + logPeer + (multi ? '|m' : '') + (_logFilterIssues ? '|f' : '') + (_logCompact ? '|c' : '') + '|r=' + _logRangeMode + '|q=' + _logSearchQuery;
   if (hash === prevLogHash) return;
   prevLogHash = hash;
 
@@ -2185,6 +2205,10 @@ function updateLog(d) {
   // Newest first; optionally filter to warnings + errors and free-text query.
   let sorted = [...log].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
   if (_logFilterIssues) sorted = sorted.filter(e => (e.level||'') === 'warning' || (e.level||'') === 'error');
+  // Compact mode hides BEV proxy-lane retry chatter (same classifier as
+  // /process.txt's default). Flip to 'full' to inspect a specific BEV
+  // incident with all per-attempt detail.
+  if (_logCompact) sorted = sorted.filter(e => !_isBevProxyNoise(e.msg || ''));
   if (_logSearchQuery) {
     const q = _logSearchQuery;
     sorted = sorted.filter(e =>

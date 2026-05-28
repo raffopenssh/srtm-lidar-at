@@ -6496,7 +6496,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 result["lidar_failed"] = True
                 result["success"] = False
                 result["error"] = (
-                    f"LiDAR unavailable for tile {tile_idx+1}/{len(tiles)} "
+                    f"LiDAR unavailable for tile {tile_idx+1}/{n_tiles} "
                     f"after {len(_LIDAR_TIMEOUTS)} attempts: "
                     f"{tile_avail['upstream_fail_reason']}"
                 )

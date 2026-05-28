@@ -14822,6 +14822,44 @@ def share_rename(old_id):
         return _error(str(e))
 
 
+# Shared classifier: "BEV proxy-lane noise" — GDAL-internal range-retry
+# chatter and our own bev_retry per-attempt log lines. These ALWAYS
+# resolve via the outer wrapper (or one of its proxy lanes), so they
+# are not a fleet-outage signal — they're just visible churn on a flaky
+# upstream day. We mirror austria_processor._classify_warning's token
+# logic exactly so the two stay in sync.
+#
+# Used by both /process.txt (filtered out unless ?verbose=1) and the
+# /process.html log renderer (filtered out when 'compact' chip is on,
+# which is the default).
+_BEV_NOISE_BEV_TOKENS = (
+    'data.bev.gv.at', 'rasterio._err', 'bev_retry', 'als_dtm', 'als_dsm',
+)
+_BEV_NOISE_INTERNAL_TOKENS = (
+    'http error code: 0',
+    'http response code on',
+    'retrying again in',
+    'retrying in ',
+)
+_BEV_NOISE_EXHAUSTED = 'attempts exhausted'
+
+def _is_bev_proxy_noise(msg: str) -> bool:
+    """True if the log msg is GDAL-internal / bev_retry per-attempt churn.
+
+    These are by definition transient: the outer ``bev_retry`` wrapper has
+    not yet given up. Once it does, the message contains
+    ``attempts exhausted`` (handled first) and we let that through.
+    """
+    if not msg:
+        return False
+    m = msg.lower()
+    if _BEV_NOISE_EXHAUSTED in m:
+        return False
+    if not any(t in m for t in _BEV_NOISE_BEV_TOKENS):
+        return False
+    return any(t in m for t in _BEV_NOISE_INTERNAL_TOKENS)
+
+
 @app.route('/process.txt')
 @app.route('/api/v1/dashboard.txt')
 def process_txt():
@@ -14854,6 +14892,11 @@ def process_txt():
         nlog = 60
     warn_only = request.args.get('warn') in ('1', 'true', 'yes')
     show_hidden = request.args.get('hidden') in ('1', 'true', 'yes')
+    # ``verbose=1`` opts BACK IN to the GDAL-internal / bev_retry per-attempt
+    # chatter (the "BEV is flaky today" noise). Default is filtered — those
+    # lines are pure proxy-lane churn that resolves on its own, and they
+    # otherwise dominate the log on bad-upstream days.
+    verbose = request.args.get('verbose') in ('1', 'true', 'yes')
     peer_q = (request.args.get('peer') or '').strip().lower()
     msg_q = (request.args.get('q') or '').strip().lower()
     try:
@@ -15857,6 +15900,7 @@ def process_txt():
                + (' warn+err' if warn_only else '')
                + (', peer~' + peer_q if peer_q else '')
                + (', q~' + msg_q if msg_q else '')
+               + ('' if verbose else ', bev-proxy-noise hidden')
                + ', newest first):')
     log_lines = []
     since_iso = (datetime.now(timezone.utc)
@@ -15871,6 +15915,8 @@ def process_txt():
         if peer_q and peer_q not in str(e.get('peer', '')).lower():
             return False
         if msg_q and msg_q not in str(e.get('msg', '')).lower():
+            return False
+        if not verbose and _is_bev_proxy_noise(e.get('msg', '')):
             return False
         return True
 
@@ -15929,7 +15975,9 @@ def process_txt():
         '# query: ?log=N (default 60, max 500), ?warn=1 (errors+warnings only),\n'
         '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
         '#        ?q=substring (msg filter), ?hours=H (default 24; uses\n'
-        '#        per-day gzipped archive in data/log_archive/ when H>24).\n'
+        '#        per-day gzipped archive in data/log_archive/ when H>24),\n'
+        '#        ?verbose=1 (also show GDAL-internal/bev_retry per-attempt\n'
+        '#        chatter — hidden by default as proxy-lane noise).\n'
         '#        Pair with /api/v1/director/log/history (also accepts hours=)\n'
         '#        for full structured access. New sections (May 2026):\n'
         '#          versions:/rollout: — fleet update progress\n'

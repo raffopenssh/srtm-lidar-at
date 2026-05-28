@@ -15308,17 +15308,56 @@ def process_txt():
     # Cross-peer tile checkpoint registry (Zenodo-backed metadata pickles
     # uploaded by aborting peers, downloaded by the next peer to pick
     # up the KG). Operational visibility for the "BEV-expensive aborts
-    # are not wasted" mechanism. Stats are dirt-cheap (one JSON read).
+    # are not wasted" mechanism. We read the FLEET view from the
+    # cache_manifest.json mirror (synced primary<->all 89 peers every
+    # 5 min by app._sync_peer_data) — the local checkpoint_registry.json
+    # is only ever written by the *uploading* peer, so on the primary
+    # (which never processes) it's always empty. cache_manifest.json is
+    # the only file that has the full fleet view here. mtime cache
+    # below avoids re-parsing the JSON on every text-dashboard hit
+    # (the endpoint also has a 10s outer cache).
     try:
-        import tile_checkpoint_registry as _ckpt_reg
-        cs = _ckpt_reg.stats() or {}
-        if cs.get('kgs'):
-            _age_h = cs.get('oldest_age_s', 0) / 3600.0
-            out.append(
-                f'chkpt_registry: kgs={cs["kgs"]} '
-                f'bytes={cs.get("bytes", 0) / 1e6:.1f}MB '
-                f'oldest={_age_h:.1f}h'
-            )
+        cmf_path = Path('data/austria_processor/cache_manifest.json')
+        if cmf_path.exists():
+            mtime = cmf_path.stat().st_mtime
+            cache = getattr(process_txt, '_chkpt_view', None)
+            if cache is None or cache.get('mtime') != mtime:
+                cmf_data = json.loads(cmf_path.read_text())
+                files = (cmf_data.get('files') or {}) \
+                    if isinstance(cmf_data, dict) else {}
+                chkpt = []
+                for fname, e in files.items():
+                    if not fname.startswith('chkpt_'):
+                        continue
+                    sz = int(e.get('size') or 0)
+                    if sz <= 0:
+                        continue  # tombstone (peer signalled delete)
+                    chkpt.append(e)
+                cache = {
+                    'mtime': mtime,
+                    'kgs': len(chkpt),
+                    'bytes': sum(int(e.get('size') or 0) for e in chkpt),
+                    'tiles': sum(int(e.get('tile_count') or 0) for e in chkpt),
+                    'oldest_iso': min((e.get('updated_at') or '')
+                                      for e in chkpt) if chkpt else '',
+                }
+                process_txt._chkpt_view = cache
+            if cache.get('kgs'):
+                _age_h = 0.0
+                try:
+                    from datetime import datetime as _dt
+                    iso = cache.get('oldest_iso') or ''
+                    if iso:
+                        _t = _dt.fromisoformat(iso.replace('Z', '+00:00'))
+                        _age_h = (time.time() - _t.timestamp()) / 3600.0
+                except Exception:
+                    pass
+                out.append(
+                    f'chkpt_registry: kgs={cache["kgs"]} '
+                    f'tiles={cache["tiles"]} '
+                    f'bytes={cache["bytes"] / 1e6:.1f}MB '
+                    f'oldest={_age_h:.1f}h'
+                )
     except Exception:
         pass
 

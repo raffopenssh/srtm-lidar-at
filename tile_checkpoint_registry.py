@@ -55,6 +55,14 @@ DATA_DIR = Path("data/austria_processor")
 REGISTRY_MANIFEST = DATA_DIR / "checkpoint_registry.json"
 CKPT_ROOT = DATA_DIR / "tile_checkpoints"
 
+# Cross-fleet visibility: mirror chkpt entries into cache_manifest.json
+# (the same deposit hosts both tile-cache ZIPs and chkpt tarballs, and
+# cache_manifest.json is already synced primary<->all peers every 5 min
+# by app._sync_peer_data). Entries are tagged with the CHKPT_PREFIX
+# filename so the primary's /process.txt + dashboard can derive a
+# fleet-wide chkpt registry view without any extra network round-trips.
+CACHE_MANIFEST = DATA_DIR / "cache_manifest.json"
+
 # Zenodo-side prefix (lives in the same deposit as the tile cache).
 ZENODO_PREFIX = "chkpt"
 
@@ -84,6 +92,36 @@ def _save_manifest(m: Dict) -> None:
     tmp = REGISTRY_MANIFEST.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(m, sort_keys=True))
     tmp.rename(REGISTRY_MANIFEST)
+
+
+def _mirror_to_cache_manifest(kg_code: str, name: str, size: int,
+                              n_tiles: int, deleted: bool = False) -> None:
+    """Mirror a chkpt entry into cache_manifest.json.
+
+    Hooks into the existing primary<->peers cache_manifest sync (5-min
+    cadence in app._sync_peer_data). Deletes are propagated as
+    size=0/tile_count=0 tombstones — the sync's last-writer-wins merge
+    on updated_at handles eviction naturally. The dashboard /process.txt
+    filters tombstones (size==0).
+    """
+    try:
+        from zenodo_cache import CacheManifest
+        cm = CacheManifest()
+        now_iso = (
+            __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc).isoformat())
+        cm.set_file(
+            zip_name=name,
+            url="",  # chkpt entries are not consumed via URL on peers
+            size=0 if deleted else int(size),
+            checksum="",
+            tile_count=0 if deleted else int(n_tiles),
+            updated_at=now_iso,
+        )
+        cm.save()
+    except Exception as e:  # never block upload/download on mirror failure
+        _log.debug("chkpt: mirror to cache_manifest skipped for %s: %s",
+                   kg_code, e)
 
 
 def _bundle_name(kg_code: str) -> str:
@@ -230,28 +268,35 @@ def _download_from_deposit(cache, name: str) -> Optional[bytes]:
 # Public API
 # ----------------------------------------------------------------------
 
-def upload_kg(kg_code: str) -> bool:
+def upload_kg(kg_code: str) -> Optional[Dict]:
     """Bundle this KG's tile pickles and upload to Zenodo registry.
 
     Idempotent: if the manifest already records the KG and the local
     pickles haven't changed in count, skip the re-upload. Acquires the
     fleet zenodo upload lock for the duration of the PUT only.
+
+    Returns ``{ok, n_tiles, bytes, name, skipped}`` on success/skip,
+    or ``None`` if nothing was bundled / upload failed.
     """
     blob = _bundle_tile_pickles(kg_code)
     if blob is None:
-        return False
+        return None
     n_tiles = sum(1 for p in (CKPT_ROOT / kg_code).iterdir()
                   if p.is_file() and p.name.startswith("tile_")
                   and p.name.endswith(".pkl"))
     m = _load_manifest()
     existing = m.get(kg_code)
+    name = _bundle_name(kg_code)
     if existing and existing.get("n_tiles") == n_tiles \
             and existing.get("bytes") == len(blob):
-        return True  # nothing to do
+        # Already on Zenodo; refresh cache_manifest mirror so the
+        # primary sees it even if its sync missed our last upload tick.
+        _mirror_to_cache_manifest(kg_code, name, len(blob), n_tiles)
+        return {"ok": True, "n_tiles": n_tiles, "bytes": len(blob),
+                "name": name, "skipped": True}
     cache = _get_cache()
     if cache is None:
-        return False
-    name = _bundle_name(kg_code)
+        return None
     # Per-bundle fleet lock — keep critical section minimal.
     try:
         from zenodo_lock import zenodo_upload_lock
@@ -259,9 +304,9 @@ def upload_kg(kg_code: str) -> bool:
             ok = _upload_blob_to_deposit(cache, name, blob)
     except Exception as e:
         _log.warning("chkpt_registry: lock acquire for %s failed: %s", kg_code, e)
-        return False
+        return None
     if not ok:
-        return False
+        return None
     m[kg_code] = {
         "ts": time.time(),
         "n_tiles": n_tiles,
@@ -279,47 +324,74 @@ def upload_kg(kg_code: str) -> bool:
                 pass
             m.pop(kg, None)
     _save_manifest(m)
+    _mirror_to_cache_manifest(kg_code, name, len(blob), n_tiles)
     _log.info("chkpt_registry: uploaded %s (%d tiles, %.1f MB)",
               kg_code, n_tiles, len(blob) / 1e6)
-    return True
+    return {"ok": True, "n_tiles": n_tiles, "bytes": len(blob),
+            "name": name, "skipped": False}
 
 
-def download_kg(kg_code: str) -> int:
+def download_kg(kg_code: str) -> Dict:
     """If the registry has this KG, download + extract pickles locally.
 
-    Returns the number of tile pickles installed (0 if not in registry
-    or already present locally).
+    Returns ``{n, bytes}`` (n=tile pickles installed, bytes=bundle size).
+    Falls back to the fleet-wide cache_manifest mirror when the local
+    chkpt manifest is empty — a fresh peer never authored an upload
+    so its local registry is empty, but the cache_manifest sync gives
+    it the full fleet view of available bundles.
     """
     m = _load_manifest()
-    if kg_code not in m:
-        return 0
+    name = _bundle_name(kg_code)
+    have_locally = kg_code in m
+    have_in_mirror = False
+    if not have_locally:
+        try:
+            from zenodo_cache import CacheManifest
+            mirror = CacheManifest().get_file(name)
+            have_in_mirror = bool(mirror and mirror.get("size"))
+        except Exception:
+            have_in_mirror = False
+    if not (have_locally or have_in_mirror):
+        return {"n": 0, "bytes": 0}
     cache = _get_cache()
     if cache is None:
-        return 0
-    blob = _download_from_deposit(cache, _bundle_name(kg_code))
+        return {"n": 0, "bytes": 0}
+    blob = _download_from_deposit(cache, name)
     if not blob:
-        return 0
+        return {"n": 0, "bytes": 0}
     n = _unpack_bundle(blob, kg_code)
     if n:
         _log.info("chkpt_registry: restored %d tile pickles for %s from Zenodo",
                   n, kg_code)
-    return n
+    return {"n": n, "bytes": len(blob)}
 
 
 def delete_kg(kg_code: str) -> bool:
-    """Drop a KG from the registry (call on successful completion)."""
+    """Drop a KG from the registry (call on successful completion).
+
+    Drops both the local registry entry and the Zenodo bundle, and
+    writes a size=0 tombstone into cache_manifest.json so other peers
+    drop their mirror view on the next sync tick.
+    """
     m = _load_manifest()
     entry = m.pop(kg_code, None)
-    if entry is None:
-        return False
-    _save_manifest(m)
+    # Always tombstone the cache_manifest mirror — a fresh peer that
+    # consumed the bundle via the mirror (no local registry entry)
+    # still owes the fleet a deletion signal.
+    name = (entry.get("name") if entry else None) or _bundle_name(kg_code)
+    _mirror_to_cache_manifest(kg_code, name, 0, 0, deleted=True)
+    if entry is not None:
+        _save_manifest(m)
     cache = _get_cache()
     if cache is None:
         return False
     try:
         from zenodo_lock import zenodo_upload_lock
         with zenodo_upload_lock(purpose=f"chkpt_delete:{kg_code}"):
-            return _delete_from_deposit(cache, entry.get("name") or _bundle_name(kg_code))
+            ok = _delete_from_deposit(cache, name)
+        if ok:
+            _log.info("chkpt_registry: deleted Zenodo bundle %s", name)
+        return ok
     except Exception as e:
         _log.info("chkpt_registry: delete lock failed for %s: %s", kg_code, e)
         return False

@@ -6071,12 +6071,31 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     # Phase 2: if this KG was aborted by another peer, pull its tile
     # pickles from the shared Zenodo registry before the tile loop.
     # Cheap (KB-MB) and the on-tile restore branch handles them.
+    # Outcome is mirrored as an INFO line into subprocess_warnings.jsonl
+    # so the parent step-monitor relays it into progress.add_log —
+    # giving fleet-wide visibility in the merged 24h log of which
+    # peer restored from a chkpt bundle on which KG.
     try:
         import tile_checkpoint_registry as _ckpt_reg
-        _restored = _ckpt_reg.download_kg(kg_code)
-        if _restored:
-            log.info("KG %s: restored %d tile pickle(s) from Zenodo checkpoint registry",
-                     kg_code, _restored)
+        _restored = _ckpt_reg.download_kg(kg_code) or {}
+        if _restored.get("n"):
+            mb = _restored.get("bytes", 0) / 1e6
+            _msg = (f"chkpt: restored {_restored['n']} tile pickle(s) "
+                    f"({mb:.1f} MB) for {kg_code} from Zenodo")
+            log.info("KG %s: %s", kg_code, _msg)
+            try:
+                import json as _j_chk
+                _warn_path = DATA_DIR / "subprocess_warnings.jsonl"
+                _entry = _j_chk.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info",
+                    "msg": _msg,
+                    "step": "init",
+                }) + "\n"
+                with open(_warn_path, "a") as _wf:
+                    _wf.write(_entry)
+            except Exception:
+                pass
     except Exception as _reg_e:
         log.debug("checkpoint_registry download skipped: %s", _reg_e)
 
@@ -8354,7 +8373,7 @@ def _append_retry_queue(kg_code: str):
         pass
 
 
-def _publish_checkpoints_to_registry(kg_code: str) -> None:
+def _publish_checkpoints_to_registry(kg_code: str, progress=None) -> None:
     """Upload this KG's tile pickles to the shared Zenodo registry.
 
     Called when a KG is deferred / re-queued. Best-effort — if the
@@ -8362,6 +8381,10 @@ def _publish_checkpoints_to_registry(kg_code: str) -> None:
     retries; we only lose the cross-peer benefit. Skipped on the
     primary (it is the lock broker and almost never processes), and
     when the directory is empty.
+
+    *progress* is ``main()``'s ``ProgressTracker`` — when supplied, the
+    upload outcome surfaces as an INFO/WARNING line in the merged 24h
+    log (fleet-wide visibility). Optional so legacy callers still work.
     """
     try:
         kg_dir = DATA_DIR / "tile_checkpoints" / kg_code
@@ -8374,11 +8397,29 @@ def _publish_checkpoints_to_registry(kg_code: str) -> None:
             return
         import threading as _th
         # Run in a background thread so the iteration loop isn't blocked
-        # on the fleet-wide lock + multi-second Zenodo PUT.
-        def _bg():
+        # on the fleet-wide lock + multi-second Zenodo PUT. Outcome is
+        # surfaced via progress.add_log so the merged 24h log + Live Log
+        # tail show one INFO line per chkpt upload across the fleet.
+        progress_ref = progress
+        def _bg(progress_ref=progress_ref):
             try:
                 import tile_checkpoint_registry as _ckpt_reg
-                _ckpt_reg.upload_kg(kg_code)
+                res = _ckpt_reg.upload_kg(kg_code)
+                if progress_ref is None:
+                    return  # nothing to log
+                if res and res.get("ok"):
+                    mb = res.get("bytes", 0) / 1e6
+                    verb = "refreshed" if res.get("skipped") else "uploaded"
+                    progress_ref.add_log(
+                        "info",
+                        f"chkpt: {verb} {kg_code} tile-tar to Zenodo "
+                        f"({res.get('n_tiles')} tiles, {mb:.1f} MB)",
+                        kg_code)
+                else:
+                    progress_ref.add_log(
+                        "warning",
+                        f"chkpt: upload of {kg_code} tile-tar to Zenodo failed",
+                        kg_code)
             except Exception as _e:
                 log.debug("checkpoint_registry upload skipped: %s", _e)
         _th.Thread(target=_bg, name=f"chkpt_pub_{kg_code}", daemon=True).start()
@@ -9454,12 +9495,15 @@ def main():
                                     f"KG {_code}: {entry.get('msg', '')}",
                                     _code,
                                 )
-                                # Attribute warning/error to the step that emitted it
-                                warn_step = entry.get("step") or last_step
-                                if warn_step:
-                                    cur = _step_issues.get(warn_step, "")
-                                    if lvl == "error" or cur != "error":
-                                        _step_issues[warn_step] = lvl
+                                # Attribute warning/error to the step that emitted it.
+                                # INFO relay (e.g. chkpt restored) MUST NOT colour
+                                # the step chip — it's a success signal, not an issue.
+                                if lvl in ("warning", "error"):
+                                    warn_step = entry.get("step") or last_step
+                                    if warn_step:
+                                        cur = _step_issues.get(warn_step, "")
+                                        if lvl == "error" or cur != "error":
+                                            _step_issues[warn_step] = lvl
                             except json.JSONDecodeError:
                                 pass
                         if new_lines:
@@ -9543,7 +9587,7 @@ def main():
                             # Remove first so it moves to the end of the file
                             _remove_from_retry_queue(kg_code)
                             _append_retry_queue(kg_code)
-                            _publish_checkpoints_to_registry(kg_code)
+                            _publish_checkpoints_to_registry(kg_code, progress)
                             _deferred_kg: dict = dict(kg)
                             _deferred_kg["_defer_attempt"] = 0  # reset
                             _append_deferred(_deferred_retries, 
@@ -9579,7 +9623,7 @@ def main():
                                 failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
                                 _save_failure_counts(failure_counts)
                                 _append_retry_queue(kg_code)
-                                _publish_checkpoints_to_registry(kg_code)
+                                _publish_checkpoints_to_registry(kg_code, progress)
                                 _deferred: dict = dict(kg)
                                 _deferred["_defer_attempt"] = _defer_n + 1
                                 _append_deferred(_deferred_retries, 
@@ -9828,9 +9872,28 @@ def main():
                     # Phase 2: KG done — evict its bundle from the shared
                     # Zenodo checkpoint registry. Best-effort, parent-side
                     # so the network round-trip never blocks the next KG.
+                    # Run in a background thread (Zenodo DELETE can take
+                    # multiple seconds + acquires the fleet lock) and
+                    # surface the outcome as one INFO line in the merged
+                    # log so we can audit eviction fleet-wide tomorrow.
                     try:
-                        import tile_checkpoint_registry as _ckpt_reg
-                        _ckpt_reg.delete_kg(kg_code)
+                        import threading as _th_del
+                        def _bg_del(_kg=kg_code, _pr=progress):
+                            try:
+                                import tile_checkpoint_registry as _ckpt_reg
+                                ok = _ckpt_reg.delete_kg(_kg)
+                                _pr.add_log(
+                                    "info" if ok else "warning",
+                                    ("chkpt: deleted " + _kg +
+                                     " tile-tar from Zenodo") if ok
+                                    else ("chkpt: delete of " + _kg +
+                                          " tile-tar from Zenodo failed"),
+                                    _kg)
+                            except Exception:
+                                pass
+                        _th_del.Thread(target=_bg_del,
+                                       name=f"chkpt_del_{kg_code}",
+                                       daemon=True).start()
                     except Exception:
                         pass
 
@@ -9949,7 +10012,7 @@ def main():
                                      kg_code)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
-                    _publish_checkpoints_to_registry(kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
                         _ts = _ckg.get("tile_statuses", [])
@@ -9974,7 +10037,7 @@ def main():
                                      kg_code)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
-                    _publish_checkpoints_to_registry(kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
                     # Save tile history for dashboard
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
@@ -9995,7 +10058,7 @@ def main():
                     # Re-queue for retry after pause ends (tile checkpoints preserved)
                     _append_retry_queue(kg_code)
                     log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
-                    _publish_checkpoints_to_registry(kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
                 else:
                     _err = result.get("error", "unknown")
                     _stp = result.get("step", "unknown")

@@ -816,6 +816,20 @@
   <div id="permFailedTags" class="prio-tags"></div>
 </div>
 
+<!-- Partial KGs (upstream-failed tiles) -->
+<div id="partialKgsWrap" style="display:none">
+  <div class="sec-t" style="margin-bottom:4px;">
+    <span style="color:#e3a020">⚠ Partial KGs <span id="partialKgsCount" style="color:var(--dim);font-weight:normal"></span></span>
+    <span style="font-size:10px;color:var(--dim)">
+      completed with upstream-failed tile(s) (BEV outage etc.) ·
+      click to re-queue ·
+      <a href="#" onclick="requeueAllPartial(event)" style="color:var(--green);text-decoration:none" title="Re-queue every partial KG at the front of the priority queue">↻ re-queue all</a> ·
+      <a href="#" onclick="dismissAllPartial(event)" style="color:var(--dim);text-decoration:none" title="Drop all entries from the partial registry without re-queueing">✕ dismiss all</a>
+    </span>
+  </div>
+  <div id="partialKgsTags" class="prio-tags"></div>
+</div>
+
 <!-- Live Log -->
 <div class="sec">
   <div class="sec-t">
@@ -3742,6 +3756,8 @@ async function submitPriority() {
 
 let _dragSrcIdx = null;
 
+let _partialKgs = [];
+
 async function fetchPrioQueue() {
   try {
     const r = await fetch('/api/v1/processing/queue');
@@ -3752,6 +3768,111 @@ async function fetchPrioQueue() {
     renderPrioQueue();
     renderPermFailed();
   } catch(e) { /* silent */ }
+  // Partial registry is a separate endpoint so the GET (above) stays
+  // public; the partial fetch attaches an admin-token if present but
+  // still tolerates 401 silently (dashboard works for read-only viewers).
+  try {
+    const r2 = await fetch('/api/v1/processing/partial_kgs');
+    if (r2.ok) {
+      const d2 = await r2.json();
+      _partialKgs = d2.partial_kgs || [];
+      renderPartialKgs();
+    }
+  } catch(e) { /* silent */ }
+}
+
+function renderPartialKgs() {
+  const wrap = document.getElementById('partialKgsWrap');
+  const container = document.getElementById('partialKgsTags');
+  const countEl = document.getElementById('partialKgsCount');
+  if (!_partialKgs.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  countEl.textContent = '(' + _partialKgs.length + ')';
+  container.innerHTML = '';
+  _partialKgs.forEach(kg => {
+    const tag = document.createElement('span');
+    tag.className = 'prio-tag';
+    tag.style.borderColor = '#e3a020';
+    const ts = (kg.ts || '').replace('T', ' ').slice(0, 16);
+    const ml = (kg.missing_layers || []).join(',') || 'none';
+    tag.title =
+      (kg.name || '') +
+      '\nupstream-failed tiles: ' + (kg.n_upstream_failed_tiles || 0) +
+      '\nquality: ' + (typeof kg.quality_score === 'number' ? Math.round(kg.quality_score * 100) + '%' : '?') +
+      ' ' + (kg.quality_grade || '') +
+      '\nmissing layers: ' + ml +
+      '\nrecorded: ' + ts +
+      '\nclick = re-queue · alt-click / right-click = dismiss';
+    const fail = ' <span style="font-size:9px;color:#e3a020" title="' +
+                 (kg.n_upstream_failed_tiles || 0) +
+                 ' tile(s) need re-fetch">⚠' + (kg.n_upstream_failed_tiles || 0) + '</span>';
+    const grade = kg.quality_grade ? ' <span style="font-size:9px;color:var(--dim)">' +
+                                     esc(kg.quality_grade) + '</span>' : '';
+    tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
+                    esc(kg.name || '') + fail + grade;
+    tag.style.cursor = 'pointer';
+    tag.addEventListener('click', (ev) => {
+      if (ev.altKey) { dismissPartial(kg.code); return; }
+      requeuePartial(kg.code);
+    });
+    tag.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      dismissPartial(kg.code);
+    });
+    container.appendChild(tag);
+  });
+}
+
+async function requeuePartial(code) {
+  if (!confirm('Re-queue partial KG ' + code + '?\n\nIts Zenodo manifest entries (_json, _full_gpkg, _light_gpkg) will be tombstoned so the re-run uploads cleanly.')) return;
+  try {
+    const r = await fetch('/api/v1/processing/queue', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kgs: [code], position: 0, skip_processed: false})
+    });
+    if (!r.ok) { alert('Re-queue failed: ' + await r.text()); return; }
+    // Drop from partial registry only after successful enqueue.
+    await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(code), {method: 'DELETE'});
+    fetchPrioQueue();
+  } catch(e) { alert('Re-queue error: ' + e.message); }
+}
+
+async function dismissPartial(code) {
+  if (!confirm('Dismiss partial KG ' + code + ' WITHOUT re-running?\n\n(The KG will retain its current degraded output. Use re-queue if you want a clean re-run.)')) return;
+  try {
+    await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(code), {method: 'DELETE'});
+    fetchPrioQueue();
+  } catch(e) { /* silent */ }
+}
+
+async function requeueAllPartial(e) {
+  if (e) e.preventDefault();
+  if (!_partialKgs.length) return;
+  const codes = _partialKgs.map(k => k.code);
+  if (!confirm('Re-queue ALL ' + codes.length + ' partial KG(s) at the front of the priority queue?')) return;
+  try {
+    const r = await fetch('/api/v1/processing/queue', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kgs: codes, position: 0, skip_processed: false})
+    });
+    if (!r.ok) { alert('Re-queue failed: ' + await r.text()); return; }
+    for (const c of codes) {
+      try { await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(c), {method: 'DELETE'}); } catch(_) {}
+    }
+    fetchPrioQueue();
+  } catch(err) { alert('Re-queue all error: ' + err.message); }
+}
+
+async function dismissAllPartial(e) {
+  if (e) e.preventDefault();
+  if (!_partialKgs.length) return;
+  if (!confirm('Dismiss ALL ' + _partialKgs.length + ' partial KG(s) without re-running?')) return;
+  for (const k of _partialKgs.slice()) {
+    try { await fetch('/api/v1/processing/partial_kgs?kg=' + encodeURIComponent(k.code), {method: 'DELETE'}); } catch(_) {}
+  }
+  fetchPrioQueue();
 }
 
 function _tileBadge(estTiles) {

@@ -15348,8 +15348,8 @@ def process_txt():
                     from datetime import datetime as _dt
                     iso = cache.get('oldest_iso') or ''
                     if iso:
-                        _t = _dt.fromisoformat(iso.replace('Z', '+00:00'))
-                        _age_h = (time.time() - _t.timestamp()) / 3600.0
+                        _dt_oldest = _dt.fromisoformat(iso.replace('Z', '+00:00'))
+                        _age_h = (time.time() - _dt_oldest.timestamp()) / 3600.0
                 except Exception:
                     pass
                 out.append(

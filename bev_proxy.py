@@ -29,6 +29,25 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Free proxy list sources (GitHub-hosted, updated periodically)
 # ---------------------------------------------------------------------------
+#
+# Sources are split into two tiers:
+#
+#   _PROXY_SOURCES_VERIFIED -- aggregators that pre-check proxies before
+#       publishing.  Live-tested yield is ~20-25 % phase-1 (HTTPS CONNECT),
+#       vs ~0.04 % for raw lists.  We validate EVERY proxy from these,
+#       no random sampling, because they're small (<5 k entries each).
+#
+#   _PROXY_SOURCES -- raw aggregators.  Combined size ~150 k unique
+#       entries.  We random-sample up to (5000 - len(verified)) from
+#       these to fill the validation budget.
+#
+# Confirmed 2026-05-29 by sampling 50 random proxies from each source
+# and counting HTTPS-CONNECT successes against httpbin.org/ip.
+_PROXY_SOURCES_VERIFIED = [
+    # elliottophellia/yakumo runs continuous validation; yield = 22 %
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+]
+
 _PROXY_SOURCES = [
     # Original five (2026-05-XX)
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
@@ -69,7 +88,6 @@ _PROXY_SOURCES = [
     "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
     # elliottophellia/yakumo pre-checks proxies, so phase-2 yield is higher.
-    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
     "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
     "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
     "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
@@ -303,36 +321,63 @@ def _save_history():
 # ---------------------------------------------------------------------------
 # Proxy fetching & validation
 # ---------------------------------------------------------------------------
-def _fetch_candidates() -> set[str]:
-    """Fetch proxy candidates from all free-proxy-list sources."""
-    candidates: set[str] = set()
+def _parse_proxy_list(data: str, sink: set[str]) -> None:
+    """Extract ``ip:port`` tokens from a free-proxy-list payload."""
+    for line in data.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("http://"):
+            line = line[7:]
+        elif line.startswith("https://"):
+            line = line[8:]
+        # Must start with ip:port. Some sources append a third
+        # ':country' / ':Anonymous' field (e.g. hideip.me
+        # "ip:port:Country") which we tolerate by taking just the
+        # first two colon-separated fields.
+        if ":" in line and "/" not in line and " " not in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                try:
+                    int(parts[1])
+                    sink.add(f"{parts[0]}:{parts[1]}")
+                except ValueError:
+                    pass
+
+
+def _fetch_one(url: str) -> set[str]:
+    """Fetch a single source and return its ``ip:port`` set."""
+    out: set[str] = set()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="ignore")
+        _parse_proxy_list(data, out)
+    except Exception as e:
+        log.debug("Failed to fetch %s: %s", url, e)
+    return out
+
+
+def _fetch_candidates() -> tuple[set[str], set[str]]:
+    """Fetch proxy candidates from all sources.
+
+    Returns ``(verified, raw)`` where ``verified`` comes from
+    aggregators that pre-check proxies (high phase-1 yield, validated
+    in full each refresh) and ``raw`` is the union of unchecked
+    aggregators (large pool, random-sampled to fit the validation
+    budget).  ``verified`` and ``raw`` are disjoint -- any entry that
+    appears in both is kept only in ``verified``.
+    """
+    verified: set[str] = set()
+    for url in _PROXY_SOURCES_VERIFIED:
+        verified |= _fetch_one(url)
+    raw: set[str] = set()
     for url in _PROXY_SOURCES:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="ignore")
-            for line in data.strip().split("\n"):
-                line = line.strip()
-                if line.startswith("http://"):
-                    line = line[7:]
-                elif line.startswith("https://"):
-                    line = line[8:]
-                # Must start with ip:port. Some sources append a
-                # third ':country' / ':Anonymous' field (e.g.
-                # hideip.me "ip:port:Country") which we tolerate by
-                # taking just the first two colon-separated fields.
-                if ":" in line and "/" not in line and " " not in line:
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        try:
-                            int(parts[1])
-                            candidates.add(f"{parts[0]}:{parts[1]}")
-                        except ValueError:
-                            pass
-        except Exception as e:
-            log.debug("Failed to fetch %s: %s", url, e)
-    log.info("Fetched %d unique proxy candidates from %d sources",
-             len(candidates), len(_PROXY_SOURCES))
-    return candidates
+        raw |= _fetch_one(url)
+    raw -= verified
+    log.info(
+        "Fetched %d verified + %d raw unique proxy candidates from %d sources",
+        len(verified), len(raw),
+        len(_PROXY_SOURCES_VERIFIED) + len(_PROXY_SOURCES),
+    )
+    return verified, raw
 
 
 def _validate_proxy(proxy: str) -> tuple[str, bool, float]:
@@ -374,8 +419,8 @@ def _refresh_pool():
     """Fetch, validate, and update the active proxy pool."""
     global _pool
 
-    candidates = _fetch_candidates()
-    if not candidates:
+    verified, raw = _fetch_candidates()
+    if not verified and not raw:
         log.warning("No proxy candidates fetched — keeping current pool")
         return
 
@@ -392,15 +437,22 @@ def _refresh_pool():
             if remaining > 600:
                 skip.add(key)
 
-    to_test = [p for p in candidates if p not in skip]
-    # Shuffle and cap to avoid testing thousands
-    random.shuffle(to_test)
-    # Cap validation budget. 2026-05-28: bumped 2000→5000 alongside the
-    # ~20x wider source funnel (~100k unique candidates) so the random
-    # subsample stays representative — at 60 parallel workers + 8s phase-1
-    # budget this is ~12 min wall time, comfortably under the 30 min
-    # REFRESH_INTERVAL.
-    to_test = to_test[:5000]
+    # Validation budget: verified sources go in full (they have ~20-25%%
+    # phase-1 yield vs 0.04%% for raw), then fill remaining slots from
+    # a random sample of raw sources.  Cap at 5000 total to keep
+    # refresh wall-time under ~12 min (well below 30 min REFRESH_INTERVAL).
+    VALIDATION_BUDGET = 5000
+    verified_list = [p for p in verified if p not in skip]
+    random.shuffle(verified_list)
+    verified_list = verified_list[:VALIDATION_BUDGET]
+    raw_list = [p for p in raw if p not in skip]
+    random.shuffle(raw_list)
+    raw_list = raw_list[:max(0, VALIDATION_BUDGET - len(verified_list))]
+    to_test = verified_list + raw_list
+    log.info(
+        "Validation queue: %d verified + %d raw (skipped %d on cooldown)",
+        len(verified_list), len(raw_list), len(skip),
+    )
 
     log.info("Validating %d proxy candidates (%d skipped on cooldown)...",
              len(to_test), len(skip))

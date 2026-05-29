@@ -317,6 +317,55 @@ def check_disk_space(current_kg_code: str = "") -> bool:
         rf_cop_cache = Path("rf_training_data/copernicus_cache")
         _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
 
+    # 4a. Raster sidecars from non-active KGs (Phase 1 dd08d74).
+    #     Raster sidecars (DTM/DSM/nDSM + multi-date + ortho .npy) are by
+    #     far the heaviest piece of tile_checkpoints and only need to
+    #     survive *within* a KG run (so the gpkg_full step can mmap them
+    #     instead of re-reading BEV). Once the next KG starts, sidecars
+    #     from previous KGs are pure dead weight — the metadata pickle
+    #     beside them is what lets a subprocess restart skip the tile
+    #     loop. Drop sidecars first (keeping pickles) before falling
+    #     through to the more aggressive whole-KG purge below.
+    if not _enough_freed():
+        ckpt_root = DATA_DIR / "tile_checkpoints"
+        if ckpt_root.exists():
+            try:
+                in_prog = IN_PROGRESS_FILE.read_text().strip() if IN_PROGRESS_FILE.exists() else ""
+            except Exception:
+                in_prog = ""
+            sidecar_freed = 0
+            sidecar_n_kgs = 0
+            try:
+                import tile_raster_sidecar as _trs_clean
+                for kg_dir in ckpt_root.iterdir():
+                    if _enough_freed():
+                        break
+                    if not kg_dir.is_dir():
+                        continue
+                    if kg_dir.name == in_prog:
+                        continue
+                    sz_before = 0
+                    for r, _, files in os.walk(kg_dir):
+                        if Path(r).name != "raster":
+                            continue
+                        for f in files:
+                            try:
+                                sz_before += (Path(r) / f).stat().st_size
+                            except OSError:
+                                pass
+                    if sz_before <= 0:
+                        continue
+                    _trs_clean.release_kg(ckpt_root, kg_dir.name)
+                    sidecar_freed += sz_before
+                    freed_bytes += sz_before
+                    sidecar_n_kgs += 1
+            except Exception:
+                pass
+            if sidecar_n_kgs:
+                _log.info("  tile_checkpoints: freed %.1f MB raster sidecars "
+                          "(%d non-active KGs; pickles kept)",
+                          sidecar_freed / 1e6, sidecar_n_kgs)
+
     # 4b. Stale tile_checkpoints/<kg> subdirs.
     #     Tile checkpoints accelerate same-KG retries, but on cache-only /
     #     demoted peers (or after a KG was reclaimed by a peer) they become
@@ -3372,19 +3421,28 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         # DTM / DSM / nDSM — feather-blended
         try:
             tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
-            tile_dtm = tdata["dtm"][:th_eff, :tw_eff].astype(np.float32)
-            tile_dsm = tdata["dsm"][:th_eff, :tw_eff].astype(np.float32)
-            tile_ndsm = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+            # Defensive shape clamp: BEV reads or sidecars occasionally return
+            # arrays off-by-one from the nominal ``tr["shape"]`` (window vs
+            # bbox-pixel rounding). Take the intersection so all slices,
+            # the feather weight, and the destination window match exactly.
+            _ah, _aw = tdata["dtm"].shape[:2]
+            th_eff_d = min(th_eff, _ah)
+            tw_eff_d = min(tw_eff, _aw)
+            r_end_d = row_off + th_eff_d
+            c_end_d = col_off + tw_eff_d
+            tile_dtm = tdata["dtm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+            tile_dsm = tdata["dsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+            tile_ndsm = tdata["ndsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
             del tdata
 
-            fw = _feather_weight(th_eff, tw_eff, margin=100)
+            fw = _feather_weight(th_eff_d, tw_eff_d, margin=100)
             valid = ~np.isnan(tile_dtm)
             w = np.where(valid, fw, 0.0).astype(np.float64)
 
-            dtm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_dtm, 0.0).astype(np.float64) * w
-            dsm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_dsm, 0.0).astype(np.float64) * w
-            ndsm_sum[row_off:r_end, col_off:c_end] += np.where(valid, tile_ndsm, 0.0).astype(np.float64) * w
-            weight_sum[row_off:r_end, col_off:c_end] += w
+            dtm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dtm, 0.0).astype(np.float64) * w
+            dsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dsm, 0.0).astype(np.float64) * w
+            ndsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_ndsm, 0.0).astype(np.float64) * w
+            weight_sum[row_off:r_end_d, col_off:c_end_d] += w
         except Exception as e:
             log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx + 1, e)
 
@@ -3505,15 +3563,22 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                             d2, date_key)
                     except Exception:
                         pass
-                td = d2["dtm"][:th_eff, :tw_eff].astype(np.float32)
-                ts2 = d2["dsm"][:th_eff, :tw_eff].astype(np.float32)
+                # Defensive shape clamp (off-by-one between nominal
+                # ``tr['shape']`` and BEV/sidecar arrays).
+                _mh, _mw = d2["dtm"].shape[:2]
+                th_eff_m = min(th_eff, _mh)
+                tw_eff_m = min(tw_eff, _mw)
+                r_end_m = row_off + th_eff_m
+                c_end_m = col_off + tw_eff_m
+                td = d2["dtm"][:th_eff_m, :tw_eff_m].astype(np.float32)
+                ts2 = d2["dsm"][:th_eff_m, :tw_eff_m].astype(np.float32)
                 del d2
-                fw = _feather_weight(th_eff, tw_eff, margin=100)
+                fw = _feather_weight(th_eff_m, tw_eff_m, margin=100)
                 v = ~np.isnan(td)
                 w = np.where(v, fw, 0.0).astype(np.float64)
-                dtm_sum2[row_off:r_end, col_off:c_end] += np.where(v, td, 0.0).astype(np.float64) * w
-                dsm_sum2[row_off:r_end, col_off:c_end] += np.where(v, ts2, 0.0).astype(np.float64) * w
-                wsum2[row_off:r_end, col_off:c_end] += w
+                dtm_sum2[row_off:r_end_m, col_off:c_end_m] += np.where(v, td, 0.0).astype(np.float64) * w
+                dsm_sum2[row_off:r_end_m, col_off:c_end_m] += np.where(v, ts2, 0.0).astype(np.float64) * w
+                wsum2[row_off:r_end_m, col_off:c_end_m] += w
                 any_data = True
             except Exception:
                 pass
@@ -3592,15 +3657,24 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                         pass
                 if rgb_t is not None:
                     got_rgb = True
-                    fw = _feather_weight(th_eff, tw_eff, margin=100).astype(np.float64)
+                    # Defensive shape clamp — same reasoning as the DTM
+                    # block: BEV/sidecar arrays can be off-by-one from the
+                    # nominal tile shape; intersect everything so all
+                    # slices and the destination window match exactly.
+                    _oh, _ow = rgb_t[0].shape[:2]
+                    th_eff_o = min(th_eff, _oh)
+                    tw_eff_o = min(tw_eff, _ow)
+                    r_end_o = row_off + th_eff_o
+                    c_end_o = col_off + tw_eff_o
+                    fw = _feather_weight(th_eff_o, tw_eff_o, margin=100).astype(np.float64)
                     for b in range(3):
-                        ortho_sum[b, row_off:r_end, col_off:c_end] += \
-                            rgb_t[b][:th_eff, :tw_eff].astype(np.float64) * fw
+                        ortho_sum[b, row_off:r_end_o, col_off:c_end_o] += \
+                            rgb_t[b][:th_eff_o, :tw_eff_o].astype(np.float64) * fw
                     if nir_t is not None:
                         got_nir = True
-                        ortho_sum[3, row_off:r_end, col_off:c_end] += \
-                            nir_t[:th_eff, :tw_eff].astype(np.float64) * fw
-                    ortho_w[row_off:r_end, col_off:c_end] += fw
+                        ortho_sum[3, row_off:r_end_o, col_off:c_end_o] += \
+                            nir_t[:th_eff_o, :tw_eff_o].astype(np.float64) * fw
+                    ortho_w[row_off:r_end_o, col_off:c_end_o] += fw
             except Exception as e:
                 log.warning("GPKG tile %d ortho yr=%d failed: %s", ti_idx + 1, o_year, e)
         # Normalise

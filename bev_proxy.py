@@ -55,14 +55,83 @@ _PROXY_SOURCES = [
     "https://api.openproxylist.xyz/http.txt",
     "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all",
     "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=https&timeout=10000&country=all",
+    # Added 2026-05-29: another funnel widening after we observed the
+    # active pool was 0 proxies for an extended period (only the 3
+    # direct slots remained). All sources below were live-probed and
+    # returned HTTP 200 with substantial payloads at that time. The
+    # 5000-sample random subsample cap in _refresh_pool() keeps refresh
+    # wall time bounded regardless of total funnel size.
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+    "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    # elliottophellia/yakumo pre-checks proxies, so phase-2 yield is higher.
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/MrMarble/proxy-list/main/all.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+    # Largest single source we know of (~500k entries). Wide but noisy;
+    # validation will discard most. The 5000-sample cap protects us.
+    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
+    "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/http.txt",
+    "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/https.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/aslisk/proxyhttps/main/https.txt",
+    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
 ]
 
 # URLs used to validate that a proxy can actually fetch BEV TIFF bytes.
 # We probe TWO distinct tiles + check the TIFF magic byte on each so
 # proxies that return cached error pages or partial bodies are caught
 # before they enter the pool.  See 2026-05-28 post-mortem.
+#
+# 2026-05-29: the two URLs below are now FALLBACK only.  By default each
+# validation picks two random tiles (layer × dataset × N/E) from the
+# real BEV tile grid via ``_random_bev_test_urls()`` so that a 5000-
+# candidate refresh (= ~10k range-requests) spreads across the full
+# 330-URL space (55 tiles × 2 layers × 3 dates) instead of hammering
+# the same two CDN objects.  This also makes the proxy validator a
+# better proxy for real workload behaviour (the actual processor reads
+# every tile, every date, both layers).
 _BEV_TEST_URL = "https://data.bev.gv.at/download/ALS/DTM/20220915/ALS_DTM_CRS3035RES50000mN2800000E4750000.tif"
 _BEV_TEST_URL_2 = "https://data.bev.gv.at/download/ALS/DTM/20240915/ALS_DTM_CRS3035RES50000mN2750000E4500000.tif"
+
+
+def _random_bev_test_urls() -> tuple[str, str]:
+    """Return two distinct random BEV tile URLs for proxy validation.
+
+    Picks (layer, dataset, N, E) independently for each URL from the
+    real 55-tile × 2-layer × 3-dataset grid (330 URLs).  Falls back
+    to the hard-coded constants if ``tile_index`` is unavailable for
+    any reason (keeps this module standalone-testable).
+    """
+    try:
+        from tile_index import DATASETS, TILE_COORDS
+        tiles = list(TILE_COORDS)
+        datasets = list(DATASETS.keys())
+        layers = ("DTM", "DSM")
+        def _pick() -> str:
+            n, e = random.choice(tiles)
+            ds = random.choice(datasets)
+            layer = random.choice(layers)
+            base = DATASETS[ds][f"{layer.lower()}_base"]
+            return f"{base}ALS_{layer}_CRS3035RES50000mN{n}E{e}.tif"
+        u1 = _pick()
+        u2 = _pick()
+        # Cheap retry to avoid testing the same URL twice (~0.3%% chance).
+        if u1 == u2:
+            u2 = _pick()
+        return u1, u2
+    except Exception:
+        return _BEV_TEST_URL, _BEV_TEST_URL_2
 # BigTIFF magic: 'II' (little-endian) + 0x002B (BigTIFF version).
 # Classic TIFF would be 'II' + 0x002A.  BEV uses BigTIFF for these tiles
 # but accept either to be safe.
@@ -296,7 +365,8 @@ def _validate_proxy(proxy: str) -> tuple[str, bool, float]:
                 return any(head.startswith(m) for m in _TIFF_MAGIC_LE)
         except Exception:
             return False
-    ok = _probe(_BEV_TEST_URL) and _probe(_BEV_TEST_URL_2)
+    u1, u2 = _random_bev_test_urls()
+    ok = _probe(u1) and _probe(u2)
     return proxy, ok, time.time() - t0
 
 

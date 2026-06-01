@@ -751,7 +751,15 @@ def summary() -> dict:
     without bloating the existing peer_status bandwidth budget.
     Consumed by the director to aggregate a ``fleet_proxy`` summary in
     /process.txt.
+
+    Also kicks off the background refresh thread on first call — needed
+    because in the peer's srv (gunicorn) process nothing else calls
+    ``next_proxy()`` (only the austria_processor subprocess does, via
+    bev_retry). Without this, the slim summary the heartbeat ships to
+    the director would stay at ``[None]*3 direct slots`` forever and
+    ``fleet_proxy`` would render all zeros.
     """
+    _ensure_refresh_started()
     now = time.monotonic()
     with _lock:
         healthy = 0

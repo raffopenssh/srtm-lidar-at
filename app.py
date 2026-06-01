@@ -15313,8 +15313,32 @@ def process_txt():
                 f'next_renew={fb.get("next_renew_in_days", "?")}d '
                 f'{cap_s}'
             )
+        # Learned per-peer renew_days (empirical, from observed BW
+        # drops). Anchors eligibility math on real cycles instead of
+        # the first_seen day-of-month heuristic.
+        bl = d.get('bw_learn') or {}
+        if bl:
+            obs = bl.get('observed') or []
+            by_day = bl.get('by_day') or {}
+            by_day_s = ' '.join(
+                f'd{k}={v}' for k, v in sorted(by_day.items()))
+            recent = obs[:5]
+            recent_s = ''
+            if recent:
+                bits = []
+                for e in recent:
+                    bits.append(
+                        f'{e["peer_id"]}@d{e["day"]}'
+                        f'({e["prev_gb"]:.0f}→{e["new_gb"]:.0f}GB)')
+                recent_s = ' · recent: ' + ', '.join(bits)
+            out.append(
+                f'bw_learn: peers_with_history={bl.get("peers_with_history", 0)} '
+                f'learned={bl.get("peers_learned", 0)} '
+                f'by_renew_day=[{by_day_s}]'
+                f'{recent_s}'
+            )
     except Exception:
-        pass
+        log.exception('process.txt fleet_bw block failed')
 
     # Fleet BEV-proxy-pool summary. Aggregated from the proxy_pool slim
     # dict each peer ships via /api/v1/director/peer_status (~200 B/peer).

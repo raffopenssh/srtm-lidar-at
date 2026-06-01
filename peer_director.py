@@ -132,6 +132,42 @@ def _peer_budget_bytes(peer: dict, cfg: dict) -> int:
     g = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) if isinstance(cfg, dict) else BANDWIDTH_BUDGET_GB
     return int(g * (1024 ** 3))
 
+
+def _peer_bw_depleted(peer: dict, bw: dict, cfg: dict,
+                     headroom_gb: float = 2.0) -> bool:
+    """Evidence-based bandwidth depletion check.
+
+    Canary-by-default philosophy (see _enforce_peer_bandwidth_walls):
+    we do NOT know exe.dev's real per-account limits or billing-cycle
+    anchors. The nominal ``budget_gb`` (95 / 200 / 250) is a guess —
+    the only authoritative wall is ``observed_cap_gb`` set by a quality-
+    grade canary slowdown.
+
+    A peer is considered depleted iff:
+      * it has an ``observed_cap_gb`` (a real, evidence-based wall), AND
+      * its current cycle ``used_gb`` is within ``headroom_gb`` of that
+        cap (i.e. ``cap - used < headroom``).
+
+    Peers without an ``observed_cap_gb`` are NEVER considered depleted
+    by this check, no matter how far past the nominal budget they run.
+    The canary slowdown detector + ``_enforce_peer_bandwidth_walls``
+    will park them when their real wall actually hits.
+
+    NB: previously this gate compared used_bytes to ``_peer_budget_bytes``
+    directly. That meant every peer past ~250 GB of nominal budget got
+    disqualified from all eligibility lists — including peers whose
+    billing cycle had just renewed but whose vnstat reading still
+    spanned the old cycle (the peer-side ``get_local_bandwidth`` keys
+    off the GLOBAL ``BANDWIDTH_RENEW_DAY=17``, not the peer's effective
+    renew_day). The new gate is consistent with canary-by-default.
+    """
+    cap = peer.get('observed_cap_gb') if isinstance(peer, dict) else None
+    if not isinstance(cap, (int, float)) or cap <= 0:
+        return False
+    used = (bw or {}).get('used_bytes', 0) or 0
+    used_gb = used / (1024 ** 3)
+    return used_gb >= float(cap) - float(headroom_gb)
+
 # Number of enabled peers to keep idle as reserve (never started by
 # the director).  Operational headroom for ad-hoc work, RF training,
 # and bandwidth/credential burst capacity.
@@ -548,6 +584,18 @@ FRONTIER_RESTART_COOLDOWN_S = 180
 # (every ~minute on the active poll loop, less for backed-off peers).
 # Ring is bounded so the state file can't blow up.
 CANARY_HISTORY_MAX = 240          # ~4h at 1 sample/min
+# Per-peer billing-cycle telemetry. Cumulative used_bytes only drops
+# at a billing-cycle renewal, so we don't need a full ring — a single
+# previous-sample is enough to detect each drop in flight, and we just
+# append the drop event (rare: <=1/month per peer). Total persisted
+# footprint is ~ (90 peers × ~30 B last + few events × ~50 B) ≈ a few
+# KB across the whole fleet — vs ~2 MB for a naive 30-day-of-samples
+# ring. Matches the design discipline of fleet_proxy_history (commit
+# 27aa243): persist only the shape the dashboard / learner needs.
+BW_HISTORY_INTERVAL_S = 3600       # min spacing between drop-checks
+BW_RENEWAL_DROP_FRAC = 0.5         # drop fraction to count as a renewal
+BW_RENEWAL_MIN_DROP_GB = 20.0      # absolute drop floor (anti-noise)
+BW_RENEWAL_EVENTS_MAX = 6          # keep last N renewals/peer (~6 months)
 CANARY_BASELINE_MIN_SAMPLES = 6   # need a baseline before we can compare
 CANARY_BASELINE_WINDOW_S = 1800   # 30-min trailing baseline
 CANARY_RECENT_WINDOW_S = 600      # 10-min recent throughput
@@ -860,13 +908,41 @@ def save_director_state(state: dict):
         raise
 
 
+def _peer_renewal_events(peer_id: str, state: dict) -> list:
+    """Return the per-peer renewal event log.
+
+    Each entry is [ts, prev_gb, new_gb] appended in-flight by
+    ``_sample_canary_history`` when cumulative used_bytes drops. Tiny
+    on disk (≤ BW_RENEWAL_EVENTS_MAX per peer).
+    """
+    rec = ((state or {}).get('bw_cycle') or {}).get(peer_id) or {}
+    return rec.get('events') or []
+
+
+def _learned_renew_day(peer_id: str, state: dict) -> int | None:
+    """Most recent renewal day-of-month observed for this peer.
+
+    Reads the event log written by ``_sample_canary_history``. Returns
+    None if no renewal has been observed yet (peer too young, no drop
+    visible).
+    """
+    events = _peer_renewal_events(peer_id, state)
+    if not events:
+        return None
+    ts_after = int(events[-1][0])
+    return datetime.fromtimestamp(ts_after, tz=timezone.utc).day
+
+
 def _peer_renew_day(peer: dict, cfg: dict) -> int:
     """Effective renew day for a peer.
 
-    Override > day-of-month of first_seen > global cfg renew_day.
-    Day is clamped to 1..28 so it always resolves on every month.
+    Operator override > observed BW drop > stored renew_day >
+    day-of-month of first_seen > global cfg renew_day. Day is clamped
+    to 1..28 so it always resolves on every month.
     """
-    rd = peer.get('renew_day')
+    rd = peer.get('renew_day_override') or peer.get('renew_day_learned')
+    if not rd:
+        rd = peer.get('renew_day')
     if not rd:
         fs = peer.get('first_seen')
         if isinstance(fs, str) and len(fs) >= 10:
@@ -1800,8 +1876,7 @@ def _clear_completed_reservations(cfg: dict, state: dict | None = None) -> bool:
         # exhausted, it can never claim — release so others can.
         if state is not None:
             bw = bw_map.get(p['id'], {})
-            used = bw.get('used_bytes', 0)
-            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
+            if _peer_bw_depleted(p, bw, cfg):
                 log.warning('Releasing held KG %s from %s '
                             '(cooldown elapsed but bandwidth exhausted)',
                             kg, p['id'])
@@ -1830,8 +1905,7 @@ def _ready_reservation_holder(cfg: dict, state: dict | None = None) -> str | Non
             continue
         if state is not None:
             bw = bw_map.get(p['id'], {})
-            used = bw.get('used_bytes', 0)
-            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
+            if _peer_bw_depleted(p, bw, cfg):
                 continue
         return p['id']
     return None
@@ -2136,9 +2210,17 @@ def choose_active_peer(cfg: dict, state: dict) -> str | None:
         pid = peer['id']
         bw = state.get('peer_bandwidth', {}).get(pid, {})
         used = bw.get('used_bytes', 0)
-        remaining = _peer_budget_bytes(peer, cfg) - used
-        if remaining < 2 * (1024 ** 3):
-            continue  # not enough headroom
+        # Canary-by-default: only disqualify when we have measured
+        # evidence (observed_cap_gb) that the peer has hit its wall.
+        if _peer_bw_depleted(peer, bw, cfg):
+            continue
+        # For ranking, expose remaining vs cap-or-nominal so peers with
+        # known caps still sort below those without (more headroom).
+        cap_g = peer.get('observed_cap_gb')
+        if isinstance(cap_g, (int, float)) and cap_g > 0:
+            remaining = int(float(cap_g) * (1024 ** 3) - used)
+        else:
+            remaining = _peer_budget_bytes(peer, cfg) - used
         noise = _peer_noise_score(pid, state)
         # CPU-steal penalty + hard tier. Frontier work burns scarce
         # Copernicus credentials, so we never want to land it on a
@@ -2939,7 +3021,7 @@ class PeerDirector:
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
                    'peer_history', 'fleet_proxy_history',
-                   'canary_history',
+                   'canary_history', 'bw_cycle',
                    'canary_slowdown_streaks', 'canary_fleet_slowdown',
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
@@ -3230,8 +3312,8 @@ class PeerDirector:
                 continue
             if _p.get('reserved_kg'):
                 continue
-            _used = (_bw_map.get(_pid) or {}).get('used_bytes', 0)
-            if (_peer_budget_bytes(_p, cfg) - _used) < 2 * (1024 ** 3):
+            _bw_p = _bw_map.get(_pid) or {}
+            if _peer_bw_depleted(_p, _bw_p, cfg):
                 continue
             # Online check via peers_status (which already polled).
             _row = next((r for r in peers_status if r['id'] == _pid), None)
@@ -3387,6 +3469,8 @@ class PeerDirector:
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
             'fleet_bw': self._fleet_bw_summary(peers_status),
+            # 5-min TTL'd — cheap on hot status recomputes.
+            'bw_learn': self._bw_learn_summary(state, cfg),
             'fleet_proxy': self._fleet_proxy_summary_with_history(peers_status),
             'fleet_proxy_history': (
                 list(self._proxy_history)
@@ -3687,6 +3771,70 @@ class PeerDirector:
             self._sample_canary_history()
         except Exception:
             log.debug('canary sample failed', exc_info=True)
+        try:
+            # Hourly cadence — bw_history only grows once per hour, so
+            # scanning more often is pure busywork. The throttle is
+            # in-memory only; a restart re-runs immediately (which is
+            # the right behaviour: catch up after downtime).
+            _now = time.time()
+            if (_now - getattr(self, '_renew_learn_last_ts', 0.0)
+                    >= BW_HISTORY_INTERVAL_S):
+                self._learn_renew_days()
+                self._renew_learn_last_ts = _now
+        except Exception:
+            log.debug('renew-day learn failed', exc_info=True)
+
+    def _learn_renew_days(self) -> None:
+        """Persist the empirically-observed billing-cycle renew day
+        for any peer that doesn't have an explicit override.
+
+        Replaces the ``first_seen`` day-of-month heuristic with the
+        actually-measured drop in cumulative used_bytes. Only updates
+        when the observation differs from the currently-effective
+        renew_day for that peer, and only when ``peer.renew_day`` is
+        not explicitly set by the operator (which always wins).
+
+        Self-heals the dashboard's ``next_renew_in_days`` chip and
+        keeps eligibility / park-until-renewal math anchored on real
+        per-peer cycles instead of a fleet-wide guess.
+        """
+        with self._lock:
+            cfg = self.cfg
+            state = self.state
+        dirty = False
+        for p in cfg.get('peers', []):
+            pid = p.get('id')
+            if not pid:
+                continue
+            # Operator override always wins.
+            if p.get('renew_day_override'):
+                continue
+            learned = _learned_renew_day(pid, state)
+            if learned is None:
+                continue
+            prev_learned = p.get('renew_day_learned')
+            if prev_learned == learned:
+                continue
+            p['renew_day_learned'] = learned
+            # Promote learned value into the live ``renew_day`` field
+            # so all existing code paths (eligibility, _peer_next_renew,
+            # process.txt rendering) pick it up without conditional
+            # plumbing. ``renew_day_learned`` is the audit trail.
+            p['renew_day'] = learned
+            dirty = True
+            try:
+                self.director_event(
+                    pid,
+                    'learned billing renew_day=%d from observed BW drop' % learned,
+                    level='info', kind='bw_learn',
+                )
+            except Exception:
+                pass
+        if dirty:
+            try:
+                save_peers_config(cfg)
+            except Exception:
+                log.warning('save peers.json after renew-day learn', exc_info=True)
 
     # ------------------------------------------------------------------
     # Canary bandwidth history
@@ -3742,6 +3890,49 @@ class PeerDirector:
                 # Trim to ring size.
                 if len(series) > CANARY_HISTORY_MAX:
                     del series[: len(series) - CANARY_HISTORY_MAX]
+            # Cycle-renewal detection (cheap, append-only).
+            # We don't store a full 30-day used_bytes ring — just the
+            # last sample + a tiny event log of detected drops. A
+            # renewal is the only thing that makes cumulative
+            # used_bytes decrease, so a one-step diff catches it.
+            # See fleet_proxy_history (commit 27aa243) for the same
+            # discipline: persist only the shape the dashboard / learner
+            # actually needs.
+            bw_cycle = self.state.setdefault('bw_cycle', {})
+            for stale_pid in list(bw_cycle.keys()):
+                if stale_pid not in keep_ids:
+                    bw_cycle.pop(stale_pid, None)
+            one_gb = 1024 ** 3
+            for p in cfg.get('peers', []):
+                if not p.get('enabled', True):
+                    continue
+                pid = p['id']
+                bw = bw_map.get(pid) or {}
+                used = bw.get('used_bytes')
+                if used is None or bw.get('error'):
+                    continue
+                used = int(used)
+                rec = bw_cycle.setdefault(pid, {'last': None, 'events': []})
+                last = rec.get('last') or [0, 0]
+                # Throttle: only check at most once per
+                # BW_HISTORY_INTERVAL_S. The tick fires every ~minute,
+                # so this collapses 60x of work.
+                if last[0] and (now - last[0]) < BW_HISTORY_INTERVAL_S:
+                    continue
+                prev_ts, prev_used = last
+                # Detect renewal drop relative to previous sample.
+                if prev_used and used < prev_used:
+                    drop = prev_used - used
+                    if (drop / one_gb) >= BW_RENEWAL_MIN_DROP_GB and \
+                       prev_used > 0 and (drop / prev_used) >= BW_RENEWAL_DROP_FRAC:
+                        rec['events'].append([
+                            now,
+                            round(prev_used / one_gb, 1),
+                            round(used / one_gb, 1),
+                        ])
+                        if len(rec['events']) > BW_RENEWAL_EVENTS_MAX:
+                            del rec['events'][:len(rec['events']) - BW_RENEWAL_EVENTS_MAX]
+                rec['last'] = [now, used]
 
     def _canary_throughput(self, pid: str, window_s: int,
                            *, frontier_only: bool = False) -> dict | None:
@@ -3823,6 +4014,75 @@ class PeerDirector:
             },
             'history': spark,
             'notes': (peer.get('canary_notes') or [])[-5:],
+        }
+
+    # 5-min TTL on the aggregate. Underlying data only changes on a
+    # detected renewal drop (rare) or an operator edit; the heavier
+    # status cache (30 s + stale-while-revalidate) sits above this so
+    # in practice the compute fires at most every few minutes per
+    # worker. Costs O(peers) per recompute (tiny event lists).
+    _BW_LEARN_CACHE_TTL = 300.0
+
+    def _bw_learn_summary(self, state: dict, cfg: dict) -> dict:
+        import time as _t
+        cache = getattr(self, '_bw_learn_cache', None)
+        if cache and (_t.time() - cache[0]) < self._BW_LEARN_CACHE_TTL:
+            return cache[1]
+        out = self._bw_learn_summary_compute(state, cfg)
+        self._bw_learn_cache = (_t.time(), out)
+        return out
+
+    def _bw_learn_summary_compute(self, state: dict, cfg: dict) -> dict:
+        """Aggregate view of empirically-learned renew days.
+
+        Returns:
+          * ``observed``: list of (peer_id, day, prev_gb, new_gb, ts)
+            for each *most-recent* observed BW renewal across peers,
+            newest first.
+          * ``by_day``: histogram of effective renew_day across the
+            fleet so the operator can see how peers cluster.
+          * ``peers_with_history``: how many peers have any BW history
+            samples (telemetry coverage).
+          * ``peers_learned``: how many peers have a learned renew_day.
+        """
+        from collections import Counter
+        bw_cycle = (state or {}).get('bw_cycle') or {}
+        observed: list[dict] = []
+        peers_with_history = 0
+        for p in cfg.get('peers', []):
+            pid = p.get('id')
+            if not pid:
+                continue
+            rec = bw_cycle.get(pid) or {}
+            if rec.get('last'):
+                peers_with_history += 1
+            events = rec.get('events') or []
+            if not events:
+                continue
+            ts_after, prev_gb, new_gb = events[-1][0], events[-1][1], events[-1][2]
+            observed.append({
+                'peer_id': pid,
+                'day': datetime.fromtimestamp(
+                    int(ts_after), tz=timezone.utc).day,
+                'prev_gb': round(float(prev_gb), 1),
+                'new_gb': round(float(new_gb), 1),
+                'ts': int(ts_after),
+            })
+        observed.sort(key=lambda e: -e['ts'])
+        by_day = Counter()
+        learned = 0
+        for p in cfg.get('peers', []):
+            try:
+                by_day[_peer_renew_day(p, cfg)] += 1
+            except Exception:
+                pass
+            if p.get('renew_day_learned'):
+                learned += 1
+        return {
+            'peers_with_history': peers_with_history,
+            'peers_learned': learned,
+            'observed': observed,
+            'by_day': dict(sorted(by_day.items())),
         }
 
     @staticmethod
@@ -6133,8 +6393,14 @@ class PeerDirector:
                     # Processor stopped (finished a KG or was stopped externally)
                     # Check if it should continue
                     bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
-                    used = bw.get('used_bytes', 0)
-                    remaining_gb = (_peer_budget_bytes(peer, cfg) - used) / (1024 ** 3)
+                    # Canary-by-default: only block continuation when we
+                    # have *evidence* (observed_cap_gb) of depletion.
+                    # Without evidence we let the peer keep working;
+                    # _check_and_switch will catch a real wall via the
+                    # canary slowdown detector.
+                    bw_depleted = _peer_bw_depleted(
+                        peer, bw, cfg,
+                        headroom_gb=float(BANDWIDTH_HARD_DEPLETED_GB))
                     # Honour not_before cooldown — if scheduled, demote
                     # the active peer so a different one can be picked.
                     if _peer_is_scheduled(peer):
@@ -6143,7 +6409,7 @@ class PeerDirector:
                         with self._lock:
                             self.state['active_peer'] = None
                             active_id = None
-                    elif remaining_gb >= BANDWIDTH_HARD_DEPLETED_GB:
+                    elif not bw_depleted:
                         excl = _excluded_kgs(cfg, exclude_peer_id=active_id)
                         # Re-issue with the current cred/strip plan so
                         # the active peer stays pinned to its slice.
@@ -7781,7 +8047,7 @@ class PeerDirector:
             # would sit idle indefinitely instead of running parallel
             # frontier work in the meantime.
             bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
-            if (_peer_budget_bytes(p, cfg) - bw.get('used_bytes', 0)) < 2 * (1024 ** 3):
+            if _peer_bw_depleted(p, bw, cfg):
                 continue
             ps = get_peer_status(p.get('url'))
             if ps.get('state') == 'unreachable':
@@ -8612,8 +8878,7 @@ class PeerDirector:
                 # Holds a frontier-only reservation — leave alone.
                 continue
             bw = state_copy.get('peer_bandwidth', {}).get(pid, {})
-            used = bw.get('used_bytes', 0)
-            if (_peer_budget_bytes(p, cfg) - used) < 2 * (1024 ** 3):
+            if _peer_bw_depleted(p, bw, cfg):
                 continue
             ps = get_peer_status(p.get('url'))
             st = ps.get('state', 'unknown')

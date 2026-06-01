@@ -15331,10 +15331,25 @@ def process_txt():
                         f'{e["peer_id"]}@d{e["day"]}'
                         f'({e["prev_gb"]:.0f}→{e["new_gb"]:.0f}GB)')
                 recent_s = ' · recent: ' + ', '.join(bits)
+            # Source breakdown: makes it obvious when the
+            # ``by_renew_day`` histogram is dominated by first_seen-
+            # day fallbacks (i.e. guesses) vs actual learned/override
+            # anchors. Without this the dashboard reads as
+            # "the fleet has anchors" even when 89/89 peers are
+            # guessing off the first_seen day-of-month.
+            srcs = bl.get('sources') or {}
+            src_order = ('override', 'learned', 'stored',
+                         'first_seen', 'global')
+            src_s = ' '.join(
+                f'{k}={srcs[k]}' for k in src_order
+                if srcs.get(k)
+            )
+            src_tail = f' sources=[{src_s}]' if src_s else ''
             out.append(
                 f'bw_learn: peers_with_history={bl.get("peers_with_history", 0)} '
                 f'learned={bl.get("peers_learned", 0)} '
                 f'by_renew_day=[{by_day_s}]'
+                f'{src_tail}'
                 f'{recent_s}'
             )
     except Exception:

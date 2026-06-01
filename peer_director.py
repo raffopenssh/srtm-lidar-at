@@ -991,13 +991,24 @@ BANDWIDTH_LOW_WATER_GB = 4.0
 BANDWIDTH_HARD_DEPLETED_GB = 1.0
 
 
-def get_billing_cycle_start() -> datetime:
-    """Return the start of the current billing cycle (17th of this/previous month)."""
+def get_billing_cycle_start(renew_day: int | None = None) -> datetime:
+    """Return the start of the current billing cycle for a given anchor day.
+
+    If ``renew_day`` is None we fall back to the global
+    ``BANDWIDTH_RENEW_DAY`` (17). When called from ``get_local_bandwidth``
+    on a peer that has an effective renew_day in ``peers.json``, that
+    value is passed in so the vnstat sum cuts on the *peer's* cycle,
+    not on the global anchor — critical once peers' learned days start
+    diverging from 17 (a peer first seen on day 3 of a future month
+    will have ``renew_day_learned=3``, and its vnstat used_bytes must
+    reset there, not wait 14 days for the global day 17).
+    """
     now = datetime.now(timezone.utc)
-    day = BANDWIDTH_RENEW_DAY
+    day = int(renew_day) if renew_day else BANDWIDTH_RENEW_DAY
+    day = max(1, min(28, day))
     if now.day >= day:
         return now.replace(day=day, hour=0, minute=0, second=0, microsecond=0)
-    # Before the 17th — cycle started last month
+    # Before the anchor day — cycle started last month.
     if now.month == 1:
         return now.replace(year=now.year - 1, month=12, day=day,
                            hour=0, minute=0, second=0, microsecond=0)
@@ -1005,8 +1016,51 @@ def get_billing_cycle_start() -> datetime:
                        hour=0, minute=0, second=0, microsecond=0)
 
 
-def get_local_bandwidth() -> dict:
-    """Get bandwidth usage from local vnstat."""
+def _local_peer_renew_day() -> int | None:
+    """Resolve this VM's effective renew_day from local peers.json.
+
+    Returns None when the peer has no anchor of its own — the caller
+    then falls back to ``BANDWIDTH_RENEW_DAY``. Cheap (single JSON read,
+    ~few KB) and tolerant: any failure returns None so vnstat math
+    continues using the global anchor exactly as before.
+    """
+    try:
+        import director_ha as _dha
+        sid = _dha.self_id()
+    except Exception:
+        return None
+    if not sid:
+        return None
+    try:
+        cfg = load_peers_config()
+    except Exception:
+        return None
+    me = get_peer_by_id(cfg, sid)
+    if not me:
+        return None
+    # Prefer evidence (override > learned > stored). Skip the
+    # first_seen day-of-month fallback here — it's a guess, and we'd
+    # rather use the global anchor than promote a guess to a per-peer
+    # cycle that's then invisible to the operator.
+    rd = (me.get('renew_day_override')
+          or me.get('renew_day_learned')
+          or me.get('renew_day'))
+    try:
+        return int(rd) if rd else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_local_bandwidth(renew_day: int | None = None) -> dict:
+    """Get bandwidth usage from local vnstat.
+
+    ``renew_day`` (1..28) anchors the billing cycle. Pass the peer's
+    effective renew_day when known so used_bytes resets on the right
+    day. When omitted, falls back to ``_local_peer_renew_day()`` (own
+    peers.json entry) and finally the global ``BANDWIDTH_RENEW_DAY``.
+    """
+    if renew_day is None:
+        renew_day = _local_peer_renew_day()
     try:
         result = subprocess.run(
             ['vnstat', '--json', 'm'],
@@ -1015,7 +1069,7 @@ def get_local_bandwidth() -> dict:
         data = json.loads(result.stdout)
         iface = data['interfaces'][0]
         now = datetime.now(timezone.utc)
-        cycle_start = get_billing_cycle_start()
+        cycle_start = get_billing_cycle_start(renew_day)
 
         # Sum traffic from cycle_start to now
         total_rx = 0
@@ -1042,6 +1096,7 @@ def get_local_bandwidth() -> dict:
             'remaining_gb': round(max(0, BANDWIDTH_BUDGET_BYTES - total) / (1024 ** 3), 2),
             'pct_used': round(100 * total / BANDWIDTH_BUDGET_BYTES, 1),
             'cycle_start': cycle_start.isoformat(),
+            'cycle_renew_day': cycle_start.day,
             'checked_at': now.isoformat(),
         }
     except Exception as e:
@@ -4069,13 +4124,38 @@ class PeerDirector:
                 'ts': int(ts_after),
             })
         observed.sort(key=lambda e: -e['ts'])
+        # Histogram of *effective* renew_day across the fleet — plus
+        # the per-source breakdown so the operator can tell apart
+        # "50 peers have a learned anchor" from "50 peers fell
+        # through to the first_seen day-of-month fallback". Without
+        # this split the dashboard looks identical whether the fleet
+        # has real evidence or is guessing wildly.
         by_day = Counter()
+        sources = Counter()  # override / learned / stored / first_seen / global
         learned = 0
         for p in cfg.get('peers', []):
             try:
                 by_day[_peer_renew_day(p, cfg)] += 1
             except Exception:
                 pass
+            # Categorise the source that won inside _peer_renew_day.
+            if p.get('renew_day_override'):
+                src = 'override'
+            elif p.get('renew_day_learned'):
+                src = 'learned'
+            elif p.get('renew_day'):
+                src = 'stored'
+            else:
+                fs = p.get('first_seen')
+                if isinstance(fs, str) and len(fs) >= 10:
+                    try:
+                        int(fs[8:10])
+                        src = 'first_seen'
+                    except (ValueError, TypeError):
+                        src = 'global'
+                else:
+                    src = 'global'
+            sources[src] += 1
             if p.get('renew_day_learned'):
                 learned += 1
         return {
@@ -4083,6 +4163,7 @@ class PeerDirector:
             'peers_learned': learned,
             'observed': observed,
             'by_day': dict(sorted(by_day.items())),
+            'sources': dict(sources),
         }
 
     @staticmethod

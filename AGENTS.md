@@ -95,10 +95,36 @@ on throughput collapse, park-until-renewal on near/over budget):
   - `CANARY` — has an explicit `budget_gb` override
   - `cap=80G` — peer's persisted `observed_cap_gb` (it has hit a wall)
   - `parked→3.1d` / `parked→4.5h` — active `not_before` cooldown
-  - `rd=15` — effective renew_day (override > first_seen day-of-month)
+  - `rd=15` — effective renew_day (override > **observed BW drop** >
+    stored > first_seen day-of-month). Learned values are persisted
+    as `renew_day_learned` in peers.json.
 * **`fleet_bw` JSON block** in `/api/v1/director/status` for structured
   consumers — fields above plus `observed_cap_gb_min/median`,
   `peers_enabled`, `peers_parked`.
+* **`bw_learn` line** (below `fleet_bw:`) — empirical billing-cycle
+  learning: `peers_with_history`, `learned`, `by_renew_day=[d1=50 …]`
+  histogram, plus the 5 most recent observed drops
+  (`peerX@dN(prev→newGB)`). Structured at
+  `/api/v1/director/status.bw_learn`. Detection: cumulative
+  `used_bytes` only decreases at a cycle renewal, so a one-step diff
+  in `_sample_canary_history` is enough; we persist just `bw_cycle =
+  {peer: {last:[ts,used], events:[…]}}` (~few KB fleet-wide, **not** a
+  30-day-of-samples ring — same persist-only-the-shape discipline as
+  `fleet_proxy_history`). Throttled hourly per peer + hourly on the
+  loop worker; `_bw_learn_summary` aggregate TTL-cached 5 min.
+
+**Critical invariant — eligibility is evidence-only.** Every gate
+that asks "does this peer have bandwidth headroom?" goes through
+`_peer_bw_depleted(peer, bw, cfg)`. A peer is depleted iff it has an
+`observed_cap_gb` AND `used_gb` is within headroom of that cap. Peers
+without a measured cap are NEVER disqualified by eligibility — the
+canary slowdown detector + `_enforce_peer_bandwidth_walls` will park
+them when their real wall hits. Do **not** re-introduce
+`_peer_budget_bytes(p,cfg) - used < 2 GB`-style gates: the nominal
+budget (95/200/250 GB) is a guess and a per-peer vnstat cycle that
+doesn't match `renew_day` (e.g. fleet rolled in on day 1, vnstat
+still aggregating from day 17) will strand the peer for weeks. See
+the Jun 2026 incident where 50 peers vanished from `cache_only_eligible`.
 
 Thresholds (peer_director.py):
 * `BANDWIDTH_LOW_WATER_GB = 4` — mid-KG triggers graceful stop +

@@ -1239,6 +1239,16 @@ def _peer_status_push_loop():
                 bw = _pd.get_local_bandwidth()
             except Exception:
                 bw = None
+            # BEV proxy-pool slim summary (~200 B). Shipped on every
+            # push (full + slim heartbeat) so the director can render a
+            # fleet_proxy: line in /process.txt without a separate
+            # /api/v1/info poll. summary() excludes the per-entry list
+            # (kept for /api/v1/info) to bound payload size.
+            try:
+                import bev_proxy as _bp
+                status['proxy_pool'] = _bp.summary()
+            except Exception:
+                pass
             try:
                 peer_id = (self_info or {}).get('id') or ''
             except Exception:
@@ -1284,6 +1294,7 @@ def _peer_status_push_loop():
                     'region': status.get('region'),
                     'instance': status.get('instance'),
                     'warning_rates': status.get('warning_rates'),
+                    'proxy_pool': status.get('proxy_pool'),
                     '_heartbeat': True,
                     'system': {
                         k: (status.get('system') or {}).get(k)
@@ -15304,6 +15315,59 @@ def process_txt():
             )
     except Exception:
         pass
+
+    # Fleet BEV-proxy-pool summary. Aggregated from the proxy_pool slim
+    # dict each peer ships via /api/v1/director/peer_status (~200 B/peer).
+    # See bev_proxy.summary() and _fleet_proxy_summary in peer_director.
+    try:
+        fp = d.get('fleet_proxy') or {}
+        if fp and fp.get('peers_reporting'):
+            age_med = fp.get('last_refresh_age_min_median')
+            age_max = fp.get('last_refresh_age_min_max')
+            age_s = ''
+            if age_med is not None:
+                age_s = f' refresh_age_med={age_med:.0f}m'
+                if age_max is not None and age_max > 60:
+                    age_s += f' max={age_max:.0f}m'
+            ph2 = fp.get('last_phase2_median')
+            ph2_s = f' phase2_med={ph2}' if isinstance(ph2, (int, float)) else ''
+            no_prx = fp.get('peers_no_proxies') or 0
+            no_s = f' no_proxies={no_prx}' if no_prx else ''
+            stale = fp.get('peers_stale') or 0
+            st_s = f' stale={stale}' if stale else ''
+            # Compact history strip (min/med/max across the ring) so
+            # an agent grepping process.txt sees trend at a glance.
+            hist_s = ''
+            try:
+                hist = d.get('fleet_proxy_history') or []
+                if hist:
+                    medians = [int(e.get('md') or 0) for e in hist]
+                    nrep = [int(e.get('n') or 0) for e in hist]
+                    if medians:
+                        span_h = max(
+                            0.0,
+                            (hist[-1]['t'] - hist[0]['t']) / 3600.0,
+                        ) if len(hist) > 1 else 0.0
+                        hist_s = (
+                            f' hist[{span_h:.1f}h n={len(hist)}'
+                            f' med_min={min(medians)}'
+                            f' med_med={sorted(medians)[len(medians)//2]}'
+                            f' med_max={max(medians)}'
+                            f' peers_med={sorted(nrep)[len(nrep)//2]}]'
+                        )
+            except Exception:
+                pass
+            out.append(
+                f'fleet_proxy: peers={fp.get("peers_reporting", 0)}'
+                f' proxies(min/med/max)='
+                f'{fp.get("proxies_min", 0)}/'
+                f'{fp.get("proxies_median", 0)}/'
+                f'{fp.get("proxies_max", 0)}'
+                f' total={fp.get("proxies_total", 0)}'
+                f'{ph2_s}{age_s}{no_s}{st_s}{hist_s}'
+            )
+    except Exception:
+        log.exception('process.txt fleet_proxy line failed')
 
     # Cross-peer tile checkpoint registry (Zenodo-backed metadata pickles
     # uploaded by aborting peers, downloaded by the next peer to pick

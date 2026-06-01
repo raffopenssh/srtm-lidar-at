@@ -2237,6 +2237,19 @@ class PeerDirector:
         # chart survives restarts and is visible to all gunicorn
         # workers.
         self._peer_history = _dq(maxlen=240)
+        # Fleet BEV-proxy-pool history. Sized for ~24h at 1 sample
+        # every 10 min (144 entries). Tighter cadence isn't useful —
+        # peer pools refresh every 30 min and the dashboard only needs
+        # "is the fleet seeing fewer proxies than usual" visibility.
+        # Each entry: {t, n_reporting, prx_total, prx_min, prx_med,
+        # prx_max, no_prx, stale}. Persisted via director_state.json.
+        self._proxy_history = _dq(maxlen=144)
+        self._proxy_history_last_ts = 0.0
+        try:
+            for entry in (self.state.get('fleet_proxy_history') or []):
+                self._proxy_history.append(entry)
+        except Exception:
+            pass
         # Restore persisted history on startup (and let non-director
         # gunicorn workers see the same data via load_director_state).
         try:
@@ -2925,7 +2938,8 @@ class PeerDirector:
         # clobbered.
         for _k in ('peer_update_state', 'capacity_factor',
                    'capacity_components', 'capacity_history',
-                   'peer_history', 'canary_history',
+                   'peer_history', 'fleet_proxy_history',
+                   'canary_history',
                    'canary_slowdown_streaks', 'canary_fleet_slowdown',
                    'capacity_ema_persisted', 'sub_factor_ema',
                    '_target_frontier_count',
@@ -3175,6 +3189,11 @@ class PeerDirector:
                              'disk_free_gb')
                     and v is not None
                 },
+                # BEV proxy-pool slim summary pushed by the peer
+                # (bev_proxy.summary()). Used by _fleet_proxy_summary
+                # to render fleet_proxy: in /process.txt without a
+                # per-peer /api/v1/info poll.
+                'proxy_pool': ps.get('proxy_pool'),
             })
 
         cache_ready = state.get('_cache_ready_cache') or {}
@@ -3368,6 +3387,12 @@ class PeerDirector:
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
             'fleet_bw': self._fleet_bw_summary(peers_status),
+            'fleet_proxy': self._fleet_proxy_summary_with_history(peers_status),
+            'fleet_proxy_history': (
+                list(self._proxy_history)
+                if getattr(self, '_lock_fd', None) is not None
+                else (state.get('fleet_proxy_history') or [])
+            ),
             'canary_fleet_slowdown': state.get('canary_fleet_slowdown'),
             'capacity_factor': state.get(
                 'capacity_factor', self._capacity_ema),
@@ -3878,6 +3903,127 @@ class PeerDirector:
             'observed_cap_gb_min': round(cap_min, 2) if cap_min is not None else None,
             'observed_cap_gb_median': round(cap_med, 2) if cap_med is not None else None,
             'next_renew_in_days': soonest_days,
+        }
+
+    def _fleet_proxy_summary_with_history(self, peers_status: list[dict]) -> dict:
+        """Compute the current fleet_proxy summary AND maintain the
+        in-memory + on-disk history ring.
+
+        Only the gunicorn worker holding the director lock appends to
+        the ring (mirrors the capacity_history pattern); the other
+        worker reads the ring from disk via load_director_state
+        through state['fleet_proxy_history']. Sample cadence is
+        ~10 min (PROXY_HISTORY_SAMPLE_S), tracked via
+        self._proxy_history_last_ts. Persistence happens implicitly:
+        save_director_state copies state['fleet_proxy_history'] when
+        the director loop saves on each tick (we set it below).
+        """
+        import time as _t
+        summ = self._fleet_proxy_summary(peers_status)
+        # Append to history only on the director-loop worker (lock held)
+        # and at most once per ~10 min. get_status is called more often
+        # than that (per-request via dashboards / proxy/* endpoints).
+        if getattr(self, '_lock_fd', None) is not None:
+            now = _t.time()
+            PROXY_HISTORY_SAMPLE_S = 600  # 10 min
+            if (now - getattr(self, '_proxy_history_last_ts', 0.0)
+                    >= PROXY_HISTORY_SAMPLE_S) and summ.get('peers_reporting'):
+                self._proxy_history_last_ts = now
+                entry = {
+                    't': int(now),
+                    'n': int(summ.get('peers_reporting') or 0),
+                    'tot': int(summ.get('proxies_total') or 0),
+                    'mn': int(summ.get('proxies_min') or 0),
+                    'md': int(summ.get('proxies_median') or 0),
+                    'mx': int(summ.get('proxies_max') or 0),
+                    'no': int(summ.get('peers_no_proxies') or 0),
+                    'st': int(summ.get('peers_stale') or 0),
+                }
+                self._proxy_history.append(entry)
+                # Mirror into state so save_director_state persists it
+                # alongside the other history rings. Cross-worker
+                # visibility relies on this snapshot — the other
+                # gunicorn worker re-reads director_state.json and
+                # picks up 'fleet_proxy_history'.
+                try:
+                    self.state['fleet_proxy_history'] = list(self._proxy_history)
+                except Exception:
+                    pass
+        return summ
+
+    @staticmethod
+    def _fleet_proxy_summary(peers_status: list[dict]) -> dict:
+        """Aggregate BEV-proxy-pool state across the fleet.
+
+        Input is the ``peers_status`` list built in ``_compute_status``.
+        Each row may carry a ``proxy_pool`` dict pushed by the peer
+        (bev_proxy.summary()) — small fixed-size dict, ~200 B/peer.
+        Output is rendered as a single ``fleet_proxy:`` line in
+        /process.txt and surfaced under ``fleet_proxy`` in
+        ``/api/v1/director/status`` for structured consumers.
+
+        Only counts peers whose processor is currently running (proxy
+        pool only matters for peers actively reading BEV); stopped /
+        idle peers carry stale state we don't want skewing min/median.
+        """
+        import time as _t
+        now = _t.time()
+        pools: list[dict] = []
+        peers_alive = 0
+        peers_stale = 0
+        STALE_REFRESH_S = 3 * 1800  # 3× REFRESH_INTERVAL = 90 min
+        for p in peers_status:
+            if p.get('processor_state') not in ('running', 'processing'):
+                continue
+            pp = p.get('proxy_pool')
+            if not isinstance(pp, dict):
+                continue
+            peers_alive += 1
+            lr = pp.get('last_refresh') or {}
+            lr_ts = float(lr.get('ts') or 0.0)
+            if lr_ts > 0 and (now - lr_ts) > STALE_REFRESH_S:
+                peers_stale += 1
+            pools.append(pp)
+        if not pools:
+            return {
+                'peers_reporting': 0,
+                'peers_stale': 0,
+            }
+        healthy = [int(p.get('healthy') or 0) for p in pools]
+        proxies = [int(p.get('proxies') or 0) for p in pools]
+        cooling = [int(p.get('cooling_down') or 0) for p in pools]
+        phase2 = [int((p.get('last_refresh') or {}).get('phase2') or 0)
+                  for p in pools]
+        ages_min = []
+        for p in pools:
+            lr = p.get('last_refresh') or {}
+            ts = float(lr.get('ts') or 0.0)
+            if ts > 0:
+                ages_min.append((now - ts) / 60.0)
+        def _med(xs: list) -> float | None:
+            if not xs:
+                return None
+            s = sorted(xs)
+            return s[len(s) // 2]
+        # Count peers running with zero proxies in pool (direct slots
+        # only) — acceptable when BEV direct egress is healthy, but
+        # worth surfacing.
+        peers_no_proxies = sum(1 for n in proxies if n == 0)
+        return {
+            'peers_reporting': peers_alive,
+            'peers_stale': peers_stale,
+            'peers_no_proxies': peers_no_proxies,
+            'proxies_total': sum(proxies),
+            'proxies_min': min(proxies),
+            'proxies_median': _med(proxies),
+            'proxies_max': max(proxies),
+            'healthy_total': sum(healthy),
+            'cooling_total': sum(cooling),
+            'last_phase2_median': _med(phase2),
+            'last_refresh_age_min_median': (
+                round(_med(ages_min), 1) if ages_min else None),
+            'last_refresh_age_min_max': (
+                round(max(ages_min), 1) if ages_min else None),
         }
 
     def _enforce_primary_park(self) -> None:

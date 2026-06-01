@@ -206,6 +206,19 @@ _history_loaded = False
 _refresh_thread: threading.Thread | None = None
 _refresh_started = False
 
+# Last refresh stats (wall time, validation counts, survivor counts).
+# Surfaced via status() so the director can aggregate a fleet view in
+# /process.txt without polling /api/v1/info on every peer. Updated at
+# the end of _refresh_pool().
+_last_refresh: dict = {
+    "ts": 0.0,        # epoch when refresh completed
+    "verified": 0,    # candidates from verified sources tested
+    "raw": 0,         # candidates from raw sources tested
+    "phase1": 0,      # HTTPS-CONNECT survivors
+    "phase2": 0,      # BEV-magic survivors (proxies added to pool)
+    "wall_s": 0.0,    # refresh wall time (s)
+}
+
 
 # ---------------------------------------------------------------------------
 # Proxy key helpers
@@ -419,6 +432,7 @@ def _refresh_pool():
     """Fetch, validate, and update the active proxy pool."""
     global _pool
 
+    _refresh_t0 = time.time()
     verified, raw = _fetch_candidates()
     if not verified and not raw:
         log.warning("No proxy candidates fetched — keeping current pool")
@@ -482,6 +496,14 @@ def _refresh_pool():
 
     if not https_capable:
         log.warning("No HTTPS-capable proxies found — keeping current pool")
+        _last_refresh.update({
+            "ts": time.time(),
+            "verified": len(verified_list),
+            "raw": len(raw_list),
+            "phase1": 0,
+            "phase2": 0,
+            "wall_s": round(time.time() - _refresh_t0, 1),
+        })
         return
 
     # Phase 2: validate against BEV specifically
@@ -498,6 +520,14 @@ def _refresh_pool():
 
     if not working:
         log.warning("No proxies passed BEV validation — keeping current pool")
+        _last_refresh.update({
+            "ts": time.time(),
+            "verified": len(verified_list),
+            "raw": len(raw_list),
+            "phase1": len(https_capable),
+            "phase2": 0,
+            "wall_s": round(time.time() - _refresh_t0, 1),
+        })
         return
 
     # Build new pool: direct slots + best proxies
@@ -524,6 +554,14 @@ def _refresh_pool():
 
     proxy_count = sum(1 for p in new_pool if p is not None)
     direct_count = sum(1 for p in new_pool if p is None)
+    _last_refresh.update({
+        "ts": time.time(),
+        "verified": len(verified_list),
+        "raw": len(raw_list),
+        "phase1": len(https_capable),
+        "phase2": len(working),
+        "wall_s": round(time.time() - _refresh_t0, 1),
+    })
     log.info(
         "Pool refreshed: %d proxies + %d direct slots (best latency: %.1fs)",
         proxy_count, direct_count, working[0][1] if working else 0,
@@ -690,9 +728,49 @@ def status() -> dict:
                     "status": "healthy",
                     "fail_score": round(score, 1),
                 })
+        # Count direct vs proxy slots in the pool (independent of
+        # healthy/cooling — those are by-entry).
+        direct = sum(1 for p in _pool if p is None)
+        proxies = sum(1 for p in _pool if p is not None)
         return {
             "total": len(_pool),
             "healthy": healthy,
             "cooling_down": cooling,
+            "direct": direct,
+            "proxies": proxies,
+            "last_refresh": dict(_last_refresh),
             "entries": entries,
         }
+
+
+def summary() -> dict:
+    """Slim, fixed-size status snapshot for cross-peer reporting.
+
+    Excludes the per-entry list (which can be ~80 proxies × ~80 B = ~6 KB);
+    sized to ~200 bytes so peers can ship it on every full status push
+    without bloating the existing peer_status bandwidth budget.
+    Consumed by the director to aggregate a ``fleet_proxy`` summary in
+    /process.txt.
+    """
+    now = time.monotonic()
+    with _lock:
+        healthy = 0
+        cooling = 0
+        for entry in _pool:
+            key = _proxy_key(entry)
+            st = _state.get(key)
+            if st and now < st.get("cooldown_until", 0):
+                cooling += 1
+            else:
+                healthy += 1
+        direct = sum(1 for p in _pool if p is None)
+        proxies = sum(1 for p in _pool if p is not None)
+        lr = dict(_last_refresh)
+    return {
+        "total": len(_pool),
+        "healthy": healthy,
+        "cooling_down": cooling,
+        "direct": direct,
+        "proxies": proxies,
+        "last_refresh": lr,
+    }

@@ -291,6 +291,49 @@ Fleet-side: peers don't currently NEED proxies (BEV direct egress is
 working), and the merged 48h log has **zero** `bev_proxy` warnings
 across all peers. The pool exists as insurance.
 
+### Fleet proxy view in `/process.txt`
+
+Each peer ships a slim `proxy_pool` summary (`bev_proxy.summary()`, ~200 B)
+on every `/api/v1/director/peer_status` push (full **and** slim heartbeat),
+so the director can render an aggregate without any extra fanout traffic.
+Only peers whose processor is actively `running` / `processing` are counted
+(stopped peers carry stale pool state). Surfaces as a single line:
+
+```
+fleet_proxy: peers=N proxies(min/med/max)=X/Y/Z total=T \
+             phase2_med=P refresh_age_med=Am [max=Bm] \
+             [no_proxies=K] [stale=S] \
+             hist[Hh n=M med_min=A med_med=B med_max=C peers_med=P]
+```
+
+Fields:
+- `peers` — running peers reporting a `proxy_pool`
+- `proxies(min/med/max)` — across the fleet's pools right now
+- `total` — sum of healthy + cooling proxies across all peers
+- `phase2_med` — median of each peer's last-refresh phase-2 survivor count
+  (proxies that passed both HTTPS-CONNECT and BEV-magic validation)
+- `refresh_age_med` / `max` — minutes since peers last refreshed their
+  pool. `max` is only printed when > 60 min (well past the 30 min
+  `REFRESH_INTERVAL`); a high value means at least one peer's refresh
+  thread has hung.
+- `no_proxies` — running peers operating with **zero** validated proxies
+  (direct slots only). Fine while BEV direct egress is healthy; load-bearing
+  signal when BEV starts shaping per-IP.
+- `stale` — peers whose last refresh is > 90 min old (3× `REFRESH_INTERVAL`).
+- `hist[...]` — 24h sliding-window strip from `fleet_proxy_history`
+  (sampled every 10 min on the director-loop worker, persisted to
+  `director_state.json` so the **other** gunicorn worker and HA shadow
+  see it). 144 entries max. Lets a forensic check tell `"this is normal"`
+  from `"the fleet's proxy pool has been collapsing for hours."`
+
+Structured view in `/api/v1/director/status` under `fleet_proxy`
+(same fields) + `fleet_proxy_history` (the ring as a list of compact
+entries: `{t,n,tot,mn,md,mx,no,st}`).
+
+**Cross-worker correctness**: only the director-loop worker (lock holder)
+appends to the in-memory ring; the other worker reads it from disk via
+`load_director_state` and surfaces the same history.
+
 **Debug recipes**:
 ```bash
 # Live pool state on primary's gunicorn worker:

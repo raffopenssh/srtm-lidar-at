@@ -57,7 +57,7 @@ GDAL_ENV = {
 }
 
 # === SECTION: BEV retry import ===
-from bev_retry import open_with_retry
+from bev_retry import open_with_retry, read_with_retry
 
 
 def _apply_gdal_env() -> None:
@@ -323,7 +323,11 @@ def _read_ortho_single_tile(
         "Reading DOP tile N%dE%d window [%.0f,%.0f]-[%.0f,%.0f] @ %.2fm",
         tile[0], tile[1], min_e, min_n, max_e, max_n, resolution,
     )
-    with open_with_retry(url, caller=f"DOP N{tile[0]}E{tile[1]}") as ds:
+    # Use read_with_retry so transient HTTP-range failures during ds.read()
+    # (e.g. CPLE_AppDefinedError: _TIFFPartialReadStripArray) trigger a full
+    # reopen + proxy rotation instead of bubbling up as warnings and leaving
+    # holes in the ortho mosaic.
+    def _do_read(ds):
         native_res = abs(ds.transform.a)
         num_bands = ds.count
         positive_y = ds.transform.e > 0  # south-up raster (BEV DOP tiles)
@@ -405,6 +409,8 @@ def _read_ortho_single_tile(
             )
 
         return data, out_transform, ds.crs
+
+    return read_with_retry(url, _do_read, caller=f"DOP N{tile[0]}E{tile[1]}")
 
 
 # === SECTION: Multi-tile mosaicking ===
@@ -850,17 +856,34 @@ def _try_read_rgbi_for_bbox(
             rgb_url = get_rgbi_url(opid, "RGB", series)
             nir_url = get_rgbi_url(opid, "NIR", series)
 
-            # Read a window from the source in its native CRS
-            with open_with_retry(rgb_url, caller=f"RGBI {opid} RGB") as ds:
-                win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
+            # Read a window from the source in its native CRS.
+            # Use read_with_retry so a transient HTTP-range strile failure
+            # during ds.read() triggers a full reopen + proxy rotation
+            # rather than poisoning this operate (which would leave the RGBI
+            # mosaic with a hole until the next-year fallback succeeds).
+            class _NoOverlap(Exception):
+                pass
+
+            def _do_read_rgb(ds):
+                win = from_bounds(
+                    oe_min, on_min, oe_max, on_max, ds.transform
+                )
                 try:
-                    win = win.intersection(Window(0, 0, ds.width, ds.height))
+                    win = win.intersection(
+                        Window(0, 0, ds.width, ds.height)
+                    )
                 except WindowError:
-                    continue  # bbox outside this operate's extent
+                    raise _NoOverlap()
                 if win.width < 1 or win.height < 1:
-                    continue
-                src_data = ds.read([1, 2, 3], window=win)
-                src_transform = ds.window_transform(win)
+                    raise _NoOverlap()
+                return ds.read([1, 2, 3], window=win), ds.window_transform(win)
+
+            try:
+                src_data, src_transform = read_with_retry(
+                    rgb_url, _do_read_rgb, caller=f"RGBI {opid} RGB"
+                )
+            except _NoOverlap:
+                continue  # bbox outside this operate's extent
 
             # Reproject RGB to EPSG:3035 target grid
             rgb = np.zeros((3, h, w), dtype=np.uint8)
@@ -875,28 +898,41 @@ def _try_read_rgbi_for_bbox(
                     resampling=RioResampling.bilinear,
                 )
 
-            # Read and reproject NIR
+            # Read and reproject NIR.
+            # Use read_with_retry so transient strile/HTTP-range failures
+            # during ds.read() (frequent against BEV's DOP CDN) trigger a
+            # full reopen + proxy rotation instead of dropping NIR for the
+            # entire operate — NIR holes degrade NDVI/ortho features.
             nir = None
+            def _do_read_nir(ds):
+                win = from_bounds(
+                    oe_min, on_min, oe_max, on_max, ds.transform
+                )
+                try:
+                    win = win.intersection(
+                        Window(0, 0, ds.width, ds.height)
+                    )
+                except WindowError:
+                    return None, None
+                if win.width < 1 or win.height < 1:
+                    return None, None
+                return ds.read(1, window=win), ds.window_transform(win)
+
             try:
-                with open_with_retry(nir_url, caller=f"RGBI {opid} NIR") as ds:
-                    win = from_bounds(oe_min, on_min, oe_max, on_max, ds.transform)
-                    try:
-                        win = win.intersection(Window(0, 0, ds.width, ds.height))
-                    except WindowError:
-                        win = Window(0, 0, 0, 0)  # no overlap
-                    if win.width >= 1 and win.height >= 1:
-                        src_nir = ds.read(1, window=win)
-                        src_nir_tf = ds.window_transform(win)
-                        nir = np.zeros((h, w), dtype=np.uint8)
-                        rio_reproject(
-                            source=src_nir,
-                            destination=nir,
-                            src_transform=src_nir_tf,
-                            src_crs=src_crs,
-                            dst_transform=dst_transform,
-                            dst_crs=dst_crs,
-                            resampling=RioResampling.bilinear,
-                        )
+                src_nir, src_nir_tf = read_with_retry(
+                    nir_url, _do_read_nir, caller=f"RGBI {opid} NIR"
+                )
+                if src_nir is not None:
+                    nir = np.zeros((h, w), dtype=np.uint8)
+                    rio_reproject(
+                        source=src_nir,
+                        destination=nir,
+                        src_transform=src_nir_tf,
+                        src_crs=src_crs,
+                        dst_transform=dst_transform,
+                        dst_crs=dst_crs,
+                        resampling=RioResampling.bilinear,
+                    )
             except Exception as e:
                 log.warning("NIR read failed for operate %s: %s", opid, e)
 

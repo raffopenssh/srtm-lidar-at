@@ -55,9 +55,17 @@ _log = logging.getLogger("tile_raster_sidecar")
 # post-cleanup target, currently 7 GB) so that disk_cleanup's target
 # headroom leaves enough room for sidecars to persist. Per-tile peak
 # is bounded by ~3 tiles × ~250 MB ≈ 750 MB (see ``release_tile``
-# semantics above), so 4 GB leaves a comfortable margin and still keeps
-# 2 GB above the system emergency floor.
-SIDECAR_MIN_FREE_GB = float(os.environ.get("SIDECAR_MIN_FREE_GB", "4"))
+# semantics above).
+#
+# 2026-06-02: lowered 4 → 1 GB after at23/at21 lost tile DTM/DSM in the
+# GPKG stitcher when transient direct-egress failures (DNS / Read failed
+# escalating bev_proxy 'direct' slot cooldown to 21h) coincided with
+# missing sidecars. Sidecar presence is the surgical fix: the stitcher's
+# ``_read_dtm_for_tile`` then hits the local cache instead of falling
+# through to BEV. Disk pressure is rare on our fleet (a 1 GB floor still
+# beats the system emergency floor at 0.5 GB) and the loss-mode is
+# strictly worse than a tight disk: NaN holes in the final raster.
+SIDECAR_MIN_FREE_GB = float(os.environ.get("SIDECAR_MIN_FREE_GB", "1"))
 
 
 def _enough_disk() -> bool:

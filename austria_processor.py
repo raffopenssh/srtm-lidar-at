@@ -3402,6 +3402,39 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     # ------------------------------------------------------------------
     # Paint each tile into the full-KG rasters
     # ------------------------------------------------------------------
+    def _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff):
+        """DTM/DSM/nDSM feather-blend for one tile. Raises on read failure.
+
+        Encapsulated so the deferred-retry pass below can call it again
+        after forcing a bev_proxy pool refresh. See the ``_deferred``
+        block below for the recovery rationale.
+        """
+        tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
+        # Defensive shape clamp: BEV reads or sidecars occasionally return
+        # arrays off-by-one from the nominal ``tr["shape"]`` (window vs
+        # bbox-pixel rounding). Take the intersection so all slices,
+        # the feather weight, and the destination window match exactly.
+        _ah, _aw = tdata["dtm"].shape[:2]
+        th_eff_d = min(th_eff, _ah)
+        tw_eff_d = min(tw_eff, _aw)
+        r_end_d = row_off + th_eff_d
+        c_end_d = col_off + tw_eff_d
+        tile_dtm = tdata["dtm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        tile_dsm = tdata["dsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        tile_ndsm = tdata["ndsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        del tdata
+
+        fw = _feather_weight(th_eff_d, tw_eff_d, margin=100)
+        valid = ~np.isnan(tile_dtm)
+        w = np.where(valid, fw, 0.0).astype(np.float64)
+
+        dtm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dtm, 0.0).astype(np.float64) * w
+        dsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dsm, 0.0).astype(np.float64) * w
+        ndsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_ndsm, 0.0).astype(np.float64) * w
+        weight_sum[row_off:r_end_d, col_off:c_end_d] += w
+
+    _deferred_dtm: list[tuple[int, dict, int, int, int, int]] = []
+
     for ti_idx, tr in enumerate(tile_seg_results):
         th, tw = tr["shape"]
         tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
@@ -3420,31 +3453,17 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
         # DTM / DSM / nDSM — feather-blended
         try:
-            tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
-            # Defensive shape clamp: BEV reads or sidecars occasionally return
-            # arrays off-by-one from the nominal ``tr["shape"]`` (window vs
-            # bbox-pixel rounding). Take the intersection so all slices,
-            # the feather weight, and the destination window match exactly.
-            _ah, _aw = tdata["dtm"].shape[:2]
-            th_eff_d = min(th_eff, _ah)
-            tw_eff_d = min(tw_eff, _aw)
-            r_end_d = row_off + th_eff_d
-            c_end_d = col_off + tw_eff_d
-            tile_dtm = tdata["dtm"][:th_eff_d, :tw_eff_d].astype(np.float32)
-            tile_dsm = tdata["dsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
-            tile_ndsm = tdata["ndsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
-            del tdata
-
-            fw = _feather_weight(th_eff_d, tw_eff_d, margin=100)
-            valid = ~np.isnan(tile_dtm)
-            w = np.where(valid, fw, 0.0).astype(np.float64)
-
-            dtm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dtm, 0.0).astype(np.float64) * w
-            dsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dsm, 0.0).astype(np.float64) * w
-            ndsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_ndsm, 0.0).astype(np.float64) * w
-            weight_sum[row_off:r_end_d, col_off:c_end_d] += w
+            _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff)
         except Exception as e:
-            log.warning("GPKG tile %d DTM re-read failed: %s", ti_idx + 1, e)
+            # Defer rather than accept a NaN hole. The most common cause
+            # is a transient direct-egress flap (DNS / Read failed) that
+            # has driven bev_proxy's ``direct`` slot into a multi-hour
+            # cooldown while the proxy pool hasn't refreshed yet. Forcing
+            # a pool refresh once after the loop almost always heals it.
+            log.warning(
+                "GPKG tile %d DTM read failed (deferred for retry): %s",
+                ti_idx + 1, e)
+            _deferred_dtm.append((ti_idx, tr, row_off, col_off, th_eff, tw_eff))
 
         # Segment type + segment height + labels (categorical — highest-weight-wins)
         # Only overwrite a pixel if this tile has a higher feather weight
@@ -3472,6 +3491,46 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
             best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
                 best_cat_weight[row_off:r_end, col_off:c_end], cat_fw)
+
+    # ------------------------------------------------------------------
+    # Deferred DTM retry: force a bev_proxy pool refresh, then re-attempt
+    # every tile we couldn't read on the first pass. The refresh both
+    # heals the ``direct`` slot's fail_score (decay 0.5 per success) and
+    # rebuilds the proxy roster, so a tile that hit a 21h cooldown 30s
+    # ago can now resolve via a fresh proxy. After this we accept the
+    # NaN hole and the caller's partial-KG bookkeeping promotes the KG
+    # to the retry queue for a future pass.
+    # ------------------------------------------------------------------
+    if _deferred_dtm:
+        log.info(
+            "GPKG: %d DTM tile(s) deferred; forcing bev_proxy pool refresh",
+            len(_deferred_dtm))
+        try:
+            import bev_proxy as _bp
+            _bp._refresh_pool()
+        except Exception as _e:
+            log.warning("GPKG: forced bev_proxy refresh failed: %s", _e)
+        still_failed: list[int] = []
+        for ti_idx, tr, row_off, col_off, th_eff, tw_eff in _deferred_dtm:
+            try:
+                _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff)
+                log.info("GPKG tile %d DTM recovered on retry", ti_idx + 1)
+            except Exception as e:
+                still_failed.append(ti_idx + 1)
+                log.error(
+                    "GPKG tile %d DTM RE-READ FAILED after pool refresh: "
+                    "%s — NaN hole in DTM/DSM/nDSM for this tile window",
+                    ti_idx + 1, e)
+        if still_failed:
+            # Surface as a structured partial-KG signal so the parent /
+            # director can promote the KG to retry_queue. The existing
+            # ``current_step.json`` warning-relay picks this up via
+            # ``log.warning`` already, so emit one summary line.
+            log.warning(
+                "GPKG: %d tile(s) left with NaN holes after deferred "
+                "retry: %s",
+                len(still_failed),
+                ",".join(str(t) for t in still_failed))
 
     # ------------------------------------------------------------------
     # Normalise weighted sums → final blended rasters

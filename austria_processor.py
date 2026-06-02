@@ -1919,6 +1919,52 @@ def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
         conn.close()
 
 
+# === Low-disk-pressure SQLite/GPKG writes ===
+#
+# Background: fiona's GPKG driver opens a single transaction per
+# `with fiona.open(...)` block and only COMMITs on exit. On big KGs
+# (>100k features × ~80 columns) the SQLite rollback journal grows
+# to ~the size of the data being inserted — a 2.6 GB GPKG can
+# require >1 GB of *additional* free space at COMMIT time, plus the
+# WAL temp file. When the peer is disk-tight (canary near BW cap,
+# sidecars + checkpoints competing), COMMIT explodes with:
+#     sqlite3_exec(COMMIT) failed: database or disk is full
+# and we lose the entire layer (real incident: at3 / KG 63304-center,
+# 2026-06-02, 375k segment polys + 115k segment points → segment_points
+# layer lost; main GPKG itself survived because GDAL had already
+# flushed the raster layers).
+#
+# Fix: tell SQLite to keep its journal in memory and skip fsync
+# (`temp_store=MEMORY`, `journal_mode=MEMORY`, `synchronous=OFF`).
+# We don't need crash-rollback safety here — if the process dies,
+# gpkg_full is restarted from scratch from the tile checkpoints.
+# This eliminates the on-disk journal entirely (the load-bearing
+# half of the disk-full failure mode) and roughly halves COMMIT
+# wall-time too. Applies via the OGR_SQLITE_PRAGMA config option,
+# scoped to the writer with `fiona.Env(...)`.
+#
+# Use the helper as `with _low_disk_sqlite_env(): fiona.open(...)`.
+_SQLITE_LOW_DISK_PRAGMA = (
+    'journal_mode=MEMORY,synchronous=OFF,temp_store=MEMORY'
+)
+
+
+def _low_disk_sqlite_env():
+    """Context manager: lower SQLite journal/sync pressure for GDAL/fiona.
+
+    Sets OGR_SQLITE_PRAGMA so the GPKG driver keeps its rollback
+    journal in memory and skips fsync. Halves transient disk usage
+    at COMMIT for the giant `segments` / `segment_points` layers.
+    Safe to nest — fiona.Env restores previous config on exit.
+    """
+    import fiona
+    return fiona.Env(
+        OGR_SQLITE_PRAGMA=_SQLITE_LOW_DISK_PRAGMA,
+        OGR_SQLITE_JOURNAL='MEMORY',
+        OGR_SQLITE_SYNCHRONOUS='OFF',
+    )
+
+
 def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
                            objects: list, mask: np.ndarray,
                            transform, layer_name: str = 'segments',
@@ -2008,8 +2054,10 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             ('obs_year', 'int'),
         ],
     }
-    with fiona.open(gpkg_path, 'w', driver='GPKG', layer=layer_name,
-                    schema=schema, crs=from_epsg(3035)) as dst:
+    with _low_disk_sqlite_env(), fiona.open(
+        gpkg_path, 'w', driver='GPKG', layer=layer_name,
+        schema=schema, crs=from_epsg(3035),
+    ) as dst:
         written = 0
         for geom_dict, val in rasterize_shapes(
             label_int, mask=mask, transform=transform, connectivity=4,
@@ -2174,8 +2222,10 @@ def _write_segment_points(gpkg_path: str, objects: list,
         ],
     }
 
-    with fiona.open(gpkg_path, 'w', driver='GPKG', layer=layer_name,
-                    schema=schema, crs=from_epsg(4326)) as dst:
+    with _low_disk_sqlite_env(), fiona.open(
+        gpkg_path, 'w', driver='GPKG', layer=layer_name,
+        schema=schema, crs=from_epsg(4326),
+    ) as dst:
         written = 0
         for obj in objects:
             # Convert centroid from EPSG:3035 to WGS84

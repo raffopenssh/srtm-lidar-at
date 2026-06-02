@@ -76,9 +76,35 @@ tile pickle(s) for <kg>` (subprocess, init step), and `chkpt: deleted
 
 Local raster sidecars (Phase 1, dd08d74) under `tile_checkpoints/<kg>/
 tile_N/raster/*.npy` are *not* part of the cross-peer registry — they're
-per-peer-disk only (gated on >= 8 GB free, see `tile_raster_sidecar.py`)
-and let the `gpkg_full` step mmap DTM/DSM/ortho instead of re-reading
-BEV. See `docs/austria-processor.md` for the full lifecycle.
+per-peer-disk only (gated on `SIDECAR_MIN_FREE_GB` free, default 1 GB
+since be7d155 — was 4 GB; lowered after at23/at21 lost DTM tiles in
+`gpkg_full` when transient direct-egress flaps coincided with missing
+sidecars) and let the `gpkg_full` step mmap DTM/DSM/ortho instead of
+re-reading BEV. The `gpkg_full` stitcher also has a deferred-retry pass
+(also be7d155): tiles that fail their initial DTM read are queued, then
+`bev_proxy._refresh_pool()` is forced once and the queue re-painted, so
+a 21h `direct`-slot cooldown can't cause a NaN hole. See
+`docs/austria-processor.md` for the full lifecycle.
+
+### Surgical eviction of a single KG's checkpoints
+
+Two steps — stop the peer first so it can't re-upload while you delete:
+
+```bash
+TOKEN=$(cat data/admin_token)
+# 1) stop the peer that holds the (possibly tainted) checkpoints
+curl -s -X POST -H "X-Admin-Token: $TOKEN" \
+  "http://localhost:8000/api/v1/processing/stop?peer_id=at23"
+# 2) clear local pickles + raster sidecars on that peer
+curl -s -X POST -H "X-Admin-Token: $TOKEN" \
+  "https://srtm-lidar-at23.exe.xyz:8000/api/v1/admin/clear_tile_checkpoints?kg=62133"
+# 3) drop the cross-peer Zenodo bundle + tombstone cache_manifest
+python3 -c 'import tile_checkpoint_registry as r; print(r.delete_kg("62133"))'
+```
+
+Step 3 writes a size=0 entry into `cache_manifest.json` so every peer
+drops its mirror view on the next 5-min sync tick; safe to run from
+the primary even if no local registry entry exists.
 
 ### Bandwidth fields in `/process.txt`
 

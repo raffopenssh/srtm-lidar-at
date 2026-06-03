@@ -1919,52 +1919,81 @@ def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
         conn.close()
 
 
-# === GPKG vector-layer disk-headroom guard ===
+# === Chunked GPKG vector-layer writer ===
 #
-# fiona's GPKG driver opens a single transaction per layer and only
-# COMMITs on exit; SQLite's rollback journal grows to ~the size of
-# the data being inserted. For 2.6 GB GPKGs the journal can exceed
-# 1 GB at COMMIT time. If disk runs out mid-COMMIT the layer is lost,
-# and a *subsequent* layer write inherits the half-broken transaction
-# state (rollback fails, triggers reference missing tables — see the
-# 2026-06-03 at2 / KG 90102-north cascade).
+# fiona's GPKG driver opens a single transaction per `with fiona.open(...)`
+# block and only COMMITs on exit. On big KGs (>100k features × ~80
+# columns), SQLite's rollback journal grows to roughly the size of the
+# inserted data. A 2.6 GB GPKG can need >1 GB of *additional* free
+# space at COMMIT time; if disk runs out mid-COMMIT the layer is lost
+# AND the half-broken transaction state cascades into the next layer
+# write (triggers reference missing tables, ROLLBACK fails — see the
+# 2026-06-03 at2 / KG 90102-north incident; the v0da6a77
+# `journal_mode=MEMORY` workaround made the cascade worse and was
+# reverted).
 #
-# Real fix has two parts:
-#  1. **Don't even start** a giant vector write if free disk is too
-#     low to safely hold the journal. `_ensure_disk_for_vector_layer`
-#     estimates worst-case journal size (~120 B per feature) and skips
-#     the write with a clean WARNING if there isn't room. Far better
-#     than losing a layer to a half-committed transaction and then
-#     cascading into the next one.
-#  2. **Force a fresh transaction** at the start of each writer by
-#     leaving SQLite in its default rollback-journal mode (the v0da6a77
-#     `journal_mode=MEMORY` override was the cascade trigger — reverted).
-_GPKG_JOURNAL_BYTES_PER_FEATURE = 120  # conservative SQLite journal estimate
-_GPKG_HEADROOM_BYTES = 1 * 1024 ** 3   # always keep ≥1 GB on top of journal
+# Real fix: chunked commits. We close + reopen the layer in append
+# mode every `_GPKG_CHUNK_FEATURES` features. Each chunk's journal is
+# bounded to ~(chunk_size × ~120 B) = ~1 MB — a peer with even a few
+# hundred MB free can finish a 400k-feature layer. Side benefits:
+#  - committed chunks survive a mid-write crash (durability)
+#  - no half-committed transaction can ever leak into the next layer
+#  - close+reopen is cheap (<100 ms) compared with the per-feature
+#    encoding cost, so overhead is negligible (~20 reopens for 200k
+#    features).
+#
+# `_write_gpkg_features_chunked` takes the schema/crs/layer and an
+# iterator of fiona feature dicts. The caller (a generator) owns all
+# the per-feature property construction.
+_GPKG_CHUNK_FEATURES = 10000
 
 
-def _ensure_disk_for_vector_layer(gpkg_path: str, n_features: int,
-                                  layer_name: str) -> bool:
-    """Return True if there's enough free disk to safely COMMIT a layer
-    of `n_features`; otherwise log a WARNING and return False so the
-    caller can skip the write cleanly (no half-committed transaction).
+def _write_gpkg_features_chunked(gpkg_path: str, schema: dict, crs,
+                                 layer_name: str, features,
+                                 chunk_size: int = _GPKG_CHUNK_FEATURES) -> int:
+    """Write features to a GPKG layer in bounded-transaction chunks.
+
+    First chunk creates the layer (`mode='w'`); subsequent chunks
+    open the layer for append (`mode='a'`). Each `with` block is
+    its own SQLite transaction, so the rollback journal is bounded
+    to ~`chunk_size * 120 B` regardless of total feature count.
+
+    Returns the number of features written.
     """
-    import shutil
-    try:
-        out_dir = os.path.dirname(gpkg_path) or '.'
-        free = shutil.disk_usage(out_dir).free
-    except OSError:
-        return True  # don't block on telemetry failures
-    need = (n_features * _GPKG_JOURNAL_BYTES_PER_FEATURE) + _GPKG_HEADROOM_BYTES
-    if free < need:
-        log.warning(
-            "Skipping GPKG layer '%s' (%d features): only %.1f GB free, "
-            "need ~%.1f GB (journal + 1 GB headroom). "
-            "Main GPKG raster layers preserved.",
-            layer_name, n_features, free / 1e9, need / 1e9,
-        )
-        return False
-    return True
+    import fiona
+    written = 0
+    batch: list = []
+    layer_exists = False
+
+    def _flush():
+        nonlocal written, layer_exists
+        if not batch:
+            return
+        if layer_exists:
+            with fiona.open(gpkg_path, 'a', driver='GPKG',
+                            layer=layer_name) as dst:
+                dst.writerecords(batch)
+        else:
+            with fiona.open(gpkg_path, 'w', driver='GPKG',
+                            layer=layer_name, schema=schema, crs=crs) as dst:
+                dst.writerecords(batch)
+            layer_exists = True
+        written += len(batch)
+        batch.clear()
+
+    for feat in features:
+        batch.append(feat)
+        if len(batch) >= chunk_size:
+            _flush()
+    _flush()
+
+    if not layer_exists:
+        # Zero features: still create an empty layer so the GPKG
+        # contents are consistent (callers expect the layer to exist).
+        with fiona.open(gpkg_path, 'w', driver='GPKG',
+                        layer=layer_name, schema=schema, crs=crs):
+            pass
+    return written
 
 
 def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
@@ -2056,15 +2085,7 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             ('obs_year', 'int'),
         ],
     }
-    # Pre-flight: budget conservatively against label count
-    # (final polygon count is bounded by it).
-    if not _ensure_disk_for_vector_layer(gpkg_path, len(objects) or 1, layer_name):
-        return
-    with fiona.open(
-        gpkg_path, 'w', driver='GPKG', layer=layer_name,
-        schema=schema, crs=from_epsg(3035),
-    ) as dst:
-        written = 0
+    def _feat_iter():
         for geom_dict, val in rasterize_shapes(
             label_int, mask=mask, transform=transform, connectivity=4,
         ):
@@ -2076,7 +2097,7 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
             hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
             hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
-            dst.write({
+            yield {
                 'geometry': _to_multi(geom_dict),
                 'properties': {
                     'id': oid,
@@ -2135,8 +2156,11 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
                     'color_height': hex_height,
                     'obs_year': obs_year or 0,
                 },
-            })
-            written += 1
+            }
+
+    written = _write_gpkg_features_chunked(
+        gpkg_path, schema, from_epsg(3035), layer_name, _feat_iter(),
+    )
     log.info("GPKG vector layer '%s': %d polygons", layer_name, written)
 
     try:
@@ -2228,13 +2252,7 @@ def _write_segment_points(gpkg_path: str, objects: list,
         ],
     }
 
-    if not _ensure_disk_for_vector_layer(gpkg_path, len(objects) or 1, layer_name):
-        return
-    with fiona.open(
-        gpkg_path, 'w', driver='GPKG', layer=layer_name,
-        schema=schema, crs=from_epsg(4326),
-    ) as dst:
-        written = 0
+    def _feat_iter():
         for obj in objects:
             # Convert centroid from EPSG:3035 to WGS84
             try:
@@ -2245,7 +2263,7 @@ def _write_segment_points(gpkg_path: str, objects: list,
             hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
             hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
             hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
-            dst.write({
+            yield {
                 'geometry': {'type': 'Point', 'coordinates': [round(lon, 7), round(lat, 7)]},
                 'properties': {
                     'id': obj.obj_id,
@@ -2303,8 +2321,11 @@ def _write_segment_points(gpkg_path: str, objects: list,
                     'color_height': hex_height,
                     'obs_year': obs_year or 0,
                 },
-            })
-            written += 1
+            }
+
+    written = _write_gpkg_features_chunked(
+        gpkg_path, schema, from_epsg(4326), layer_name, _feat_iter(),
+    )
     log.info("GPKG point layer '%s': %d points", layer_name, written)
 
     # Add point style

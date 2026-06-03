@@ -1919,50 +1919,52 @@ def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
         conn.close()
 
 
-# === Low-disk-pressure SQLite/GPKG writes ===
+# === GPKG vector-layer disk-headroom guard ===
 #
-# Background: fiona's GPKG driver opens a single transaction per
-# `with fiona.open(...)` block and only COMMITs on exit. On big KGs
-# (>100k features × ~80 columns) the SQLite rollback journal grows
-# to ~the size of the data being inserted — a 2.6 GB GPKG can
-# require >1 GB of *additional* free space at COMMIT time, plus the
-# WAL temp file. When the peer is disk-tight (canary near BW cap,
-# sidecars + checkpoints competing), COMMIT explodes with:
-#     sqlite3_exec(COMMIT) failed: database or disk is full
-# and we lose the entire layer (real incident: at3 / KG 63304-center,
-# 2026-06-02, 375k segment polys + 115k segment points → segment_points
-# layer lost; main GPKG itself survived because GDAL had already
-# flushed the raster layers).
+# fiona's GPKG driver opens a single transaction per layer and only
+# COMMITs on exit; SQLite's rollback journal grows to ~the size of
+# the data being inserted. For 2.6 GB GPKGs the journal can exceed
+# 1 GB at COMMIT time. If disk runs out mid-COMMIT the layer is lost,
+# and a *subsequent* layer write inherits the half-broken transaction
+# state (rollback fails, triggers reference missing tables — see the
+# 2026-06-03 at2 / KG 90102-north cascade).
 #
-# Fix: tell SQLite to keep its journal in memory and skip fsync
-# (`temp_store=MEMORY`, `journal_mode=MEMORY`, `synchronous=OFF`).
-# We don't need crash-rollback safety here — if the process dies,
-# gpkg_full is restarted from scratch from the tile checkpoints.
-# This eliminates the on-disk journal entirely (the load-bearing
-# half of the disk-full failure mode) and roughly halves COMMIT
-# wall-time too. Applies via the OGR_SQLITE_PRAGMA config option,
-# scoped to the writer with `fiona.Env(...)`.
-#
-# Use the helper as `with _low_disk_sqlite_env(): fiona.open(...)`.
-_SQLITE_LOW_DISK_PRAGMA = (
-    'journal_mode=MEMORY,synchronous=OFF,temp_store=MEMORY'
-)
+# Real fix has two parts:
+#  1. **Don't even start** a giant vector write if free disk is too
+#     low to safely hold the journal. `_ensure_disk_for_vector_layer`
+#     estimates worst-case journal size (~120 B per feature) and skips
+#     the write with a clean WARNING if there isn't room. Far better
+#     than losing a layer to a half-committed transaction and then
+#     cascading into the next one.
+#  2. **Force a fresh transaction** at the start of each writer by
+#     leaving SQLite in its default rollback-journal mode (the v0da6a77
+#     `journal_mode=MEMORY` override was the cascade trigger — reverted).
+_GPKG_JOURNAL_BYTES_PER_FEATURE = 120  # conservative SQLite journal estimate
+_GPKG_HEADROOM_BYTES = 1 * 1024 ** 3   # always keep ≥1 GB on top of journal
 
 
-def _low_disk_sqlite_env():
-    """Context manager: lower SQLite journal/sync pressure for GDAL/fiona.
-
-    Sets OGR_SQLITE_PRAGMA so the GPKG driver keeps its rollback
-    journal in memory and skips fsync. Halves transient disk usage
-    at COMMIT for the giant `segments` / `segment_points` layers.
-    Safe to nest — fiona.Env restores previous config on exit.
+def _ensure_disk_for_vector_layer(gpkg_path: str, n_features: int,
+                                  layer_name: str) -> bool:
+    """Return True if there's enough free disk to safely COMMIT a layer
+    of `n_features`; otherwise log a WARNING and return False so the
+    caller can skip the write cleanly (no half-committed transaction).
     """
-    import fiona
-    return fiona.Env(
-        OGR_SQLITE_PRAGMA=_SQLITE_LOW_DISK_PRAGMA,
-        OGR_SQLITE_JOURNAL='MEMORY',
-        OGR_SQLITE_SYNCHRONOUS='OFF',
-    )
+    import shutil
+    try:
+        out_dir = os.path.dirname(gpkg_path) or '.'
+        free = shutil.disk_usage(out_dir).free
+    except OSError:
+        return True  # don't block on telemetry failures
+    need = (n_features * _GPKG_JOURNAL_BYTES_PER_FEATURE) + _GPKG_HEADROOM_BYTES
+    if free < need:
+        log.warning(
+            "Skipping GPKG layer '%s' (%d features): only %.1f GB free, "
+            "need ~%.1f GB (journal + 1 GB headroom). "
+            "Main GPKG raster layers preserved.",
+            layer_name, n_features, free / 1e9, need / 1e9,
+        )
+        return False
+    return True
 
 
 def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
@@ -2054,7 +2056,11 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
             ('obs_year', 'int'),
         ],
     }
-    with _low_disk_sqlite_env(), fiona.open(
+    # Pre-flight: budget conservatively against label count
+    # (final polygon count is bounded by it).
+    if not _ensure_disk_for_vector_layer(gpkg_path, len(objects) or 1, layer_name):
+        return
+    with fiona.open(
         gpkg_path, 'w', driver='GPKG', layer=layer_name,
         schema=schema, crs=from_epsg(3035),
     ) as dst:
@@ -2222,7 +2228,9 @@ def _write_segment_points(gpkg_path: str, objects: list,
         ],
     }
 
-    with _low_disk_sqlite_env(), fiona.open(
+    if not _ensure_disk_for_vector_layer(gpkg_path, len(objects) or 1, layer_name):
+        return
+    with fiona.open(
         gpkg_path, 'w', driver='GPKG', layer=layer_name,
         schema=schema, crs=from_epsg(4326),
     ) as dst:

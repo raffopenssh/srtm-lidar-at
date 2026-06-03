@@ -602,6 +602,70 @@ grep -A60 'FEATURE_KEYS = \[' learned_classifier.py
 cat data/austria_processor/current_step.json | python3 -m json.tool
 ```
 
+### Quick GPKG validity check (download from Zenodo + verify)
+
+After changes to the GPKG writers (`_write_segment_vectors`,
+`_write_segment_points`, `_write_gpkg_features_chunked` in
+`austria_processor.py`, or `gpkg_streamed.py`), grab a couple of fresh
+uploads and verify they're structurally sound. Useful canary the first
+time new code reaches `gpkg_full` / `gpkg_light` on the fleet (delay
+from rollout to first GPKG completion is several hours). Token is in
+`zenodo_client.DEFAULT_TOKEN`.
+
+```bash
+TOKEN=$(python3 -c 'import zenodo_client; print(zenodo_client.DEFAULT_TOKEN)')
+# 1) Pick recent fleet GPKG completions (filter to the target version):
+curl -s 'http://localhost:8000/process.txt?hours=4&log=500&q=gpkg_full' \
+  | grep -E '^\s+06-' | head -10
+# 2) Resolve filename -> Zenodo bucket from the manifest:
+python3 -c "
+import json
+m=json.load(open('data/austria_processor/zenodo_manifest.json'))
+for k in ('66330_full_gpkg','62028_light_gpkg'):
+    e=m['entries'][k]
+    print(k, e['size']//1024//1024,'MB', e['bucket_url']+'/'+e['filename'])
+"
+# 3) Download (bucket URLs are private; bearer token required):
+mkdir -p /tmp/gpkg_check && cd /tmp/gpkg_check
+curl -sH "Authorization: Bearer $TOKEN" -o 66330_full.gpkg \
+  "https://zenodo.org/api/files/<bucket-uuid>/66330_full.gpkg"
+# 4) Validate: SQLite integrity + GPKG layer inventory + readback:
+python3 - <<'PY'
+import sqlite3, fiona
+for f in ['66330_full.gpkg','62028_light.gpkg']:
+    c=sqlite3.connect(f)
+    print(f, 'integrity:', c.execute('PRAGMA integrity_check').fetchone()[0],
+          'fk:', len(c.execute('PRAGMA foreign_key_check').fetchall()),
+          'app_id:', hex(c.execute('PRAGMA application_id').fetchone()[0]))
+    print('  gpkg_contents:', c.execute(
+        'SELECT table_name FROM gpkg_contents ORDER BY 1').fetchall())
+    print('  layer_styles:', c.execute(
+        'SELECT COUNT(DISTINCT f_table_name) FROM layer_styles').fetchone()[0])
+    for l in fiona.listlayers(f):
+        if l in ('segments','segment_points','parcels','buildings','new_buildings'):
+            with fiona.open(f, layer=l) as src:
+                cnt = sum(1 for _ in src)
+                print(f'  {l}: {cnt} features, {len(src.schema["properties"])} props')
+PY
+```
+
+What to expect on a healthy GPKG:
+- `integrity_check` = `ok`, `foreign_key_check` = 0 rows, `app_id` = `0x47504B47`.
+- `_full.gpkg`: ~22 entries in `gpkg_contents` (DTM/DSM/nDSM + multi-date,
+  Ortho/CIR/NDVI/SAR/Hansen/WorldCover, segment_type/height tiles, plus
+  vector `segments` (EPSG:3035) + `segment_points` (EPSG:4326)).
+- `_light.gpkg`: ~8 entries (`segments`, `segment_points`, `parcels`,
+  `buildings`, `new_buildings`, `infrastructure`, `segment_type`,
+  `segment_height`).
+- `layer_styles` row count == number of layers (every layer styled).
+- `segments` schema = 55 properties, `segment_points` = 54 (chunked
+  writer must keep schema identical across all chunks — drift would
+  show as fewer props on later features).
+- For 965326d (chunked-commit): layers > 10k features are written as
+  multiple bounded transactions but readback must report ONE
+  contiguous feature count matching the `gpkg_full — N tiles, M
+  objects` log line.
+
 More in `docs/cross-cutting-concerns.md`.
 
 ## Critical invariants (read before editing)

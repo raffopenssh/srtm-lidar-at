@@ -831,6 +831,20 @@ def _try_read_rgbi_for_bbox(
     if dst_transform is None:
         dst_transform = transform_from_origin(min_e, max_n, resolution, resolution)
 
+    # Mosaic accumulators. A single RGBI operate's *nominal* bbox can
+    # overlap the whole query bbox while its actual imagery only covers a
+    # fraction of it (operates are flown in N/S or E/W strips). Returning
+    # the first overlapping operate therefore leaves a hard black hole
+    # wherever that operate has no pixels — e.g. KG 45005 Eferding, whose
+    # east half came out black in Ortho/CIR 2020 & 2023 because operate
+    # 2023150 covers only the west ~64%% and 2023350 (the complementary
+    # strip) was never read. We now fill holes from each subsequent
+    # overlapping operate until coverage is complete.
+    acc_rgb = np.zeros((3, h, w), dtype=np.uint8)
+    acc_nir = np.zeros((h, w), dtype=np.uint8)
+    acc_filled = np.zeros((h, w), dtype=bool)
+    acc_nir_present = False
+
     for opid in operates:
         info = RGBI_OPERATES[opid]
         series = info["series"]
@@ -936,29 +950,46 @@ def _try_read_rgbi_for_bbox(
             except Exception as e:
                 log.warning("NIR read failed for operate %s: %s", opid, e)
 
-            has_data = np.any(rgb > 0, axis=0)
-            coverage = has_data.sum() / (h * w) if h * w > 0 else 0
+            # --- Merge this operate into the mosaic (fill holes only) ---
+            op_has = np.any(rgb > 0, axis=0)
+            new_mask = op_has & (~acc_filled)
+            for band in range(3):
+                acc_rgb[band][new_mask] = rgb[band][new_mask]
+            if nir is not None:
+                acc_nir_present = True
+                acc_nir[new_mask] = nir[new_mask]
+            acc_filled |= op_has
+            coverage = acc_filled.sum() / (h * w) if h * w > 0 else 0
             log.info(
                 "Read RGBI operate %s (series %s) reprojected to %dx%d @ %.1fm, "
-                "NIR=%s, coverage=%.0f%%",
+                "NIR=%s, op_cov=%.0f%% mosaic_cov=%.0f%%",
                 opid, series, w, h, resolution,
                 "yes" if nir is not None else "no",
+                op_has.sum() / (h * w) * 100 if h * w > 0 else 0,
                 coverage * 100,
             )
-            # --- Save to disk cache ---
-            try:
-                save_dict = {"rgb": rgb}
-                save_dict["nir"] = nir if nir is not None else np.array([], dtype=np.uint8)
-                np.savez_compressed(str(_cp), **save_dict)
-            except Exception as e:
-                log.warning("Failed to cache ortho: %s", e)
-            return rgb, nir
+            # Enough? Stop reading further operates (each is an HTTP-range
+            # read against BEV's CDN — don't fetch strips we don't need).
+            if coverage >= 0.999:
+                break
 
         except Exception as e:
             log.warning("RGBI operate %s failed: %s", opid, e)
             continue
 
-    return None, None
+    if not acc_filled.any():
+        return None, None
+
+    rgb = acc_rgb
+    nir = acc_nir if acc_nir_present else None
+    # --- Save to disk cache ---
+    try:
+        save_dict = {"rgb": rgb}
+        save_dict["nir"] = nir if nir is not None else np.array([], dtype=np.uint8)
+        np.savez_compressed(str(_cp), **save_dict)
+    except Exception as e:
+        log.warning("Failed to cache ortho: %s", e)
+    return rgb, nir
 
 
 def pick_rgbi_year_for_als(als_result: dict) -> int | None:

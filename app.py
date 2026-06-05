@@ -6781,7 +6781,20 @@ def zenodo_lock_acquire():
             'purpose': purpose, 'kg': kg,
         })
         _zenodo_lock_persist()
-        return jsonify({'token': token, 'ttl_s': _ZENODO_LOCK_TTL})
+    # Durable audit trail for EVERY Zenodo upload. This is the one
+    # chokepoint every product upload funnels through, so emitting a
+    # director_event here guarantees a permanent log record even when
+    # the uploading peer relays no per-tile/step lines to the director
+    # (the gap that left KG 45005 with zero log trace despite a clean
+    # June-4 upload). Cheap: one line per KG-upload lease, not per tile.
+    try:
+        if purpose == 'kg_upload':
+            director_event(
+                f'zenodo lock: {peer} acquired for KG {kg or "?"} (upload start)',
+                peer=peer, kg=str(kg or ''))
+    except Exception:
+        pass
+    return jsonify({'token': token, 'ttl_s': _ZENODO_LOCK_TTL})
 
 
 @app.route('/api/v1/zenodo/lock/heartbeat', methods=['POST'])
@@ -6813,16 +6826,28 @@ def zenodo_lock_release():
     with _ZENODO_LOCK_LOCK:
         if _ZENODO_LOCK['holder'] is None or _ZENODO_LOCK['token'] != token:
             return jsonify({'error': 'no_lease'}), 410
+        held = time.time() - _ZENODO_LOCK['acquired_at']
+        _rel_peer = _ZENODO_LOCK['holder']
+        _rel_purpose = _ZENODO_LOCK['purpose']
+        _rel_kg = _ZENODO_LOCK['kg']
         log.info('Zenodo lock: released by %s (purpose=%s, held %.1fs)',
-                 _ZENODO_LOCK['holder'], _ZENODO_LOCK['purpose'],
-                 time.time() - _ZENODO_LOCK['acquired_at'])
+                 _rel_peer, _rel_purpose, held)
         _ZENODO_LOCK.update({
             'holder': None, 'token': None,
             'acquired_at': 0.0, 'last_heartbeat': 0.0,
             'purpose': None, 'kg': None,
         })
         _zenodo_lock_persist()
-        return jsonify({'ok': True})
+    # Durable completion record (mirror of the acquire event).
+    try:
+        if _rel_purpose == 'kg_upload':
+            director_event(
+                f'zenodo lock: {_rel_peer} released KG {_rel_kg or "?"} '
+                f'(upload done, held {held:.0f}s)',
+                peer=_rel_peer or '', kg=str(_rel_kg or ''))
+    except Exception:
+        pass
+    return jsonify({'ok': True})
 
 
 @app.route('/api/v1/zenodo/lock', methods=['GET'])

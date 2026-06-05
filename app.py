@@ -7848,6 +7848,149 @@ except Exception as _e:
 
 # === SECTION: Search index API endpoints ===
 
+# === SECTION: live insights aggregate ===
+_INSIGHTS_CACHE = {'ts': 0.0, 'data': None}
+_INSIGHTS_TTL = 300  # 5 min — index changes slowly
+
+def _compute_insights():
+    """Compute the dynamic insights payload live from the search index.
+    Every number here is a `SELECT` against the current DB, so the page
+    is never an outdated snapshot. ~0.3 s cold; cached 5 min."""
+    idx = si.get_index()
+    c = idx._conn()
+    def rows(sql, *a):
+        return [tuple(x) for x in c.execute(sql, a).fetchall()]
+    def one(sql, *a):
+        r = c.execute(sql, a).fetchone()
+        return r[0] if r and r[0] is not None else 0
+
+    out = {}
+    out['generated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+    # ── headline KPIs ──────────────────────────────────────────────
+    out['headline'] = {
+        'kg_total': int(one('SELECT COUNT(*) FROM kg')),
+        'kg_processed': int(one('SELECT COUNT(*) FROM kg WHERE processed=1')),
+        'area_km2': round(one('SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'), 1),
+        'parcels': int(one('SELECT COUNT(*) FROM kg_parcels')),
+        'parcels_total': int(one('SELECT COALESCE(SUM(parcel_count),0) FROM kg WHERE processed=1')),
+        'segments': int(one('SELECT COALESCE(SUM(n_objects),0) FROM kg_landcover')),
+        'tree_count': int(one('SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1')),
+        'tree_volume_m3': int(one('SELECT COALESCE(SUM(tree_stem_volume_m3),0) FROM kg WHERE processed=1')),
+        'buildings': int(one('SELECT COALESCE(SUM(building_count),0) FROM kg WHERE processed=1')),
+        'new_buildings': int(one('SELECT COALESCE(SUM(new_building_count),0) FROM kg WHERE processed=1')),
+        'new_bldg_ha': round(one('SELECT COALESCE(SUM(new_building_footprint_sqm),0)/1e4 FROM kg WHERE processed=1'), 0),
+        'net_volume_change_m3': int(one('SELECT COALESCE(SUM(net_volume_change_m3),0) FROM kg WHERE processed=1')),
+        'disturbed_volume_m3': int(one('SELECT COALESCE(SUM(total_disturbed_volume_m3),0) FROM kg WHERE processed=1')),
+        'states': int(one('SELECT COUNT(DISTINCT state_code) FROM kg WHERE processed=1 AND state_code!=""')),
+        'districts': int(one('SELECT COUNT(DISTINCT district_code) FROM kg WHERE processed=1 AND district_code!=""')),
+        'rf_mean_conf': round(one('SELECT AVG(rf_mean_confidence) FROM kg WHERE processed=1 AND rf_mean_confidence IS NOT NULL'), 3),
+        'rf_diverged_pct': round(one('SELECT AVG(rf_diverged_pct) FROM kg WHERE processed=1 AND rf_diverged_pct IS NOT NULL'), 1),
+    }
+
+    # ── 1. Hansen forest loss by year (loss_pixels resampled to 1 m2) ──
+    PX_HA = 1.0 / 1e4
+    out['hansen'] = [{'yr': int(y), 'ha': round(p * PX_HA, 0)}
+                     for y, p in rows('SELECT loss_year,SUM(loss_pixels) FROM kg_hansen GROUP BY loss_year ORDER BY loss_year')]
+    hv = [r['ha'] for r in out['hansen']]
+    base = [r for r in out['hansen'] if 2001 <= r['yr'] <= 2016]
+    out['hansen_baseline_ha'] = round(sum(r['ha'] for r in base)/max(1,len(base)), 0)
+    out['hansen_total_ha'] = round(sum(hv), 0)
+    out['hansen_peak'] = max(out['hansen'], key=lambda r: r['ha']) if out['hansen'] else None
+
+    # ── 2. Land cover ──────────────────────────────────────────────
+    out['lc'] = [{'type': t, 'area_km2': round(a, 1), 'n': int(n)}
+                 for t, a, n in rows('SELECT object_type,SUM(area_sqm)/1e6,SUM(n_objects) FROM kg_landcover '
+                                     'WHERE object_type NOT IN ("unclassified") GROUP BY object_type ORDER BY 2 DESC')]
+    lc_total = sum(r['area_km2'] for r in out['lc']) or 1
+    green = sum(r['area_km2'] for r in out['lc'] if r['type'] in ('tree','grass','crop','shrub','hedge','orchard','vineyard','garden'))
+    out['green_pct'] = round(green/lc_total*100, 0)
+
+    # ── 3. Parcel auto-classification ──────────────────────────────
+    out['auto'] = [{'class': k, 'n': int(n)}
+                   for k, n in rows('SELECT auto_class,COUNT(*) FROM kg_parcels WHERE auto_class IS NOT NULL '
+                                    'GROUP BY auto_class ORDER BY 2 DESC')]
+
+    # ── 4. frav-derived dominant-type spread ───────────────────────
+    out['dominant'] = [{'type': t, 'n': int(n)}
+                       for t, n in rows('SELECT dominant_type,COUNT(*) FROM kg_parcels WHERE dominant_type IS NOT NULL '
+                                        'GROUP BY dominant_type ORDER BY 2 DESC LIMIT 14')]
+    out['frav'] = {
+        'veg_frac': round(one('SELECT AVG(vegetated_fraction) FROM kg_parcels'), 3),
+        'forest_frac': round(one('SELECT AVG(forested_fraction) FROM kg_parcels'), 3),
+    }
+
+    # ── 5. Tall trees / giant atlas ────────────────────────────────
+    out['tree_hist'] = [{'band': str(b), 'n': int(n)} for b, n in
+        rows("SELECT CASE WHEN height_max_m>=55 THEN '55+' ELSE CAST(height_max_m/5 AS INT)*5 END b,"
+             "COUNT(*) FROM kg_type_top WHERE object_type='tree' AND height_max_m>=35 GROUP BY b ORDER BY 1")]
+    out['giants_40'] = int(one("SELECT COUNT(*) FROM kg_type_top WHERE object_type='tree' AND height_max_m>=40"))
+    out['giants_40_55'] = int(one("SELECT COUNT(*) FROM kg_type_top WHERE object_type='tree' AND height_max_m BETWEEN 40 AND 55"))
+    out['tall_raw'] = [{'h': round(h,1), 'kg': k} for h, k in
+        rows("SELECT height_max_m,kg_code FROM kg_type_top WHERE object_type='tree' ORDER BY height_max_m DESC LIMIT 8")]
+
+    # ── 6. Buildings: stories histogram + roof types ───────────────
+    out['stories'] = [{'s': int(s), 'n': int(n)} for s, n in
+        rows('SELECT stories_est,COUNT(*) FROM kg_buildings WHERE stories_est BETWEEN 1 AND 12 '
+             'GROUP BY stories_est ORDER BY stories_est')]
+    out['roofs'] = [{'roof': (rt or 'unknown'), 'n': int(n), 'h': round(h or 0,1)} for rt, n, h in
+        rows("SELECT roof_type_hint,COUNT(*),AVG(max_height_m) FROM kg_buildings "
+             "WHERE roof_type_hint IN ('flat','pitched') GROUP BY roof_type_hint")]
+
+    # ── 7. Elevation gradient (KG-level bands) ─────────────────────
+    out['elev'] = [{'band': int(b), 'kgs': int(n), 'diversity': round(d,2), 'trees': round(tr,0), 'ndvi': round(nd,2)}
+        for b, n, d, tr, nd in rows(
+        'SELECT CAST(elevation_mean_m/250 AS INT)*250 b,COUNT(*),AVG(shannon_diversity),AVG(tree_count),AVG(ndvi_mean) '
+        'FROM kg WHERE processed=1 AND elevation_mean_m IS NOT NULL GROUP BY b ORDER BY b')]
+
+    # ── 8. Aspect compass ──────────────────────────────────────────
+    out['aspect'] = [{'a': a, 'n': int(n)} for a, n in
+        rows('SELECT aspect_dominant,COUNT(*) FROM kg_parcels WHERE aspect_dominant!="" '
+             'GROUP BY aspect_dominant')]
+
+    # ── 9. Terrain roughness (TRI classes) ─────────────────────────
+    out['terrain'] = [{'t': t, 'n': int(n), 'elev': round(e or 0,0), 'slope': round(sl or 0,1),
+                       'forest': round(ff or 0,3), 'veg': round(vf or 0,3), 'bldg_pct': round(bp or 0,1)}
+        for t, n, e, sl, ff, vf, bp in rows(
+        'SELECT terrain_class,COUNT(*),AVG(elevation_m),AVG(slope_mean_deg),AVG(forested_fraction),'
+        'AVG(vegetated_fraction),AVG(CASE WHEN building_count>0 THEN 100.0 ELSE 0 END) '
+        'FROM kg_parcels WHERE terrain_class IS NOT NULL GROUP BY terrain_class')]
+    _torder = {'level':0,'nearly_level':1,'slightly_rugged':2,'intermediately_rugged':3,'moderately_rugged':4,'highly_rugged':5}
+    out['terrain'].sort(key=lambda r: _torder.get(r['t'], 9))
+
+    # ── 10. Classifier divergence ──────────────────────────────────
+    out['divergence'] = [{'rf': rf, 'final': fn, 'n': int(n)} for rf, fn, n in
+        rows('SELECT rf_type,final_type,SUM(count) FROM kg_divergence GROUP BY rf_type,final_type '
+             'ORDER BY 3 DESC LIMIT 10')]
+
+    # ── bonus: state coverage ──────────────────────────────────────
+    out['states'] = [{'state': s, 'kgs': int(n)} for s, n in
+        rows('SELECT state_name,COUNT(*) FROM kg WHERE processed=1 AND state_name!="" '
+             'GROUP BY state_name ORDER BY 2 DESC')]
+    return out
+
+
+@app.route('/api/v1/insights')
+def api_insights():
+    """Live insights aggregate for /insights.html. Cached 5 min."""
+    force = request.args.get('force') in ('1', 'true')
+    now = time.time()
+    if not force and _INSIGHTS_CACHE['data'] and (now - _INSIGHTS_CACHE['ts']) < _INSIGHTS_TTL:
+        resp = jsonify(_INSIGHTS_CACHE['data'])
+        resp.headers['X-Cache'] = 'HIT'
+        return resp
+    try:
+        data = _compute_insights()
+    except Exception as e:
+        import traceback as _tb
+        return jsonify({'error': str(e), 'trace': _tb.format_exc()}), 500
+    _INSIGHTS_CACHE['data'] = data
+    _INSIGHTS_CACHE['ts'] = now
+    resp = jsonify(data)
+    resp.headers['X-Cache'] = 'MISS'
+    return resp
+
+
 @app.route('/api/v1/index/status')
 def index_status():
     """Search index status and statistics."""

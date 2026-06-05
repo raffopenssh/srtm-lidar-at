@@ -15014,6 +15014,10 @@ def process_txt():
         return f'{m}m'
 
     out = []
+    # Signals collected by the sections below; distilled into a one-line
+    # ``health:`` banner inserted just under the title so an agent can
+    # triage fleet state at a glance without reading the whole dump.
+    _health = {}
     now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
     out.append(f'# srtm-lidar process dashboard (text) — {now_iso}')
 
@@ -15132,6 +15136,8 @@ def process_txt():
                     pkN = int(v2[-1].get('pk') or 0)
                     d_fk = max(0, fkN - fk0)
                     d_pk = max(0, pkN - pk0)
+                    _health['kg_fail'] = {'fk_per_h': d_fk / win_h,
+                                          'pk_per_h': d_pk / win_h}
                     parts.append(
                         f'kg_outcome: failed={fkN}(+{d_fk}, '
                         f'{d_fk/win_h:.2f}/h) partial={pkN}(+{d_pk}, '
@@ -15303,15 +15309,68 @@ def process_txt():
         db_done = len(_get_completed_kgs())
     except Exception:
         db_done = prog.get('completed') or 0
-    total_kgs = prog.get('total_kgs') or 0
+    # ``total_kgs`` in progress.json reflects the *current run* (often 1
+    # for the primary's parked single-KG director job), NOT the fleet.
+    # Mirror process.html: fall back to the Austria-wide constant 8440
+    # when the run total is implausibly small. Otherwise an agent reads
+    # ``done=498/1 eta=138d`` and is badly misled about fleet progress.
+    run_total = prog.get('total_kgs') or 0
+    total_kgs = 8440 if (0 < run_total < 200) else (run_total or 8440)
     state_p = prog.get('state', '?')
+    # Rate/ETA from Zenodo-upload timestamps (counts ALL peers, resilient
+    # across processor restarts) rather than the local processor's
+    # session rate (which is the parked primary => ~0). Falls back to
+    # progress.json only if no manifest timestamps are available.
     rate_h = prog.get('rate_kgs_per_hour') or 0
     eta_s = prog.get('eta_seconds') or 0
+    win_n = 0
+    try:
+        _mfp = Path('data/austria_processor/zenodo_manifest.json')
+        _mf = json.loads(_mfp.read_text()) if _mfp.exists() else {}
+        _ents = (_mf.get('entries') or {}) if isinstance(_mf, dict) else {}
+        _real = {k: v for k, v in _ents.items()
+                 if not k.endswith('_error')}
+        now_ts = _t.time()
+        kg_done_at = {}
+        for k, e in _real.items():
+            ts = e.get('uploaded_at')
+            if not ts:
+                continue
+            kg = k.split('_', 1)[0]
+            try:
+                tt = datetime.fromisoformat(
+                    ts.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                continue
+            if kg not in kg_done_at or tt > kg_done_at[kg]:
+                kg_done_at[kg] = tt
+        times = sorted(kg_done_at.values())
+        recent = [tt for tt in times if now_ts - tt <= 24 * 3600]
+        if len(recent) >= 5:
+            window_s = max(now_ts - recent[0], 1.0)
+            win_n = len(recent)
+        elif len(times) >= 5:
+            tail = times[-50:]
+            window_s = max(now_ts - tail[0], 1.0)
+            win_n = len(tail)
+        else:
+            win_n = 0
+        if win_n:
+            rate_h = win_n / (window_s / 3600.0)
+            remaining = max(total_kgs - db_done, 0)
+            eta_s = (remaining / rate_h) * 3600.0 if rate_h > 0 else 0
+    except Exception:
+        pass
+    pct = (db_done / total_kgs * 100.0) if total_kgs else 0.0
+    win_tag = f' (last {win_n} uploads)' if win_n else ''
     out.append(
         f'progress: state={state_p} done={db_done}/{total_kgs} '
-        f'rate={rate_h:.1f}/h eta={_hms(eta_s)} '
-        f'failed={len(prog.get("failed_kgs") or [])}'
+        f'({pct:.1f}%) rate={rate_h:.1f}/h eta={_hms(eta_s)} '
+        f'failed={len(prog.get("failed_kgs") or [])}{win_tag}'
     )
+    _health['progress'] = {'pct': pct, 'rate': rate_h,
+                           'eta': eta_s, 'done': db_done,
+                           'total': total_kgs}
 
     # --- Zenodo manifest summary ---------------------------------
     try:
@@ -15366,14 +15425,22 @@ def process_txt():
                               + (' [FLEET-WIDE]' if fs.get('fleet_wide') else ''))
             except Exception:
                 pass
+            _used = fb.get('used_gb', 0) or 0
+            _budnom = fb.get('budget_gb_nominal', 0) or 0
             out.append(
-                f'fleet_bw: used={fb.get("used_gb", 0):.1f}GB '
-                f'budget_nominal={fb.get("budget_gb_nominal", 0):.0f}GB '
+                f'fleet_bw: used={_used:.1f}GB '
+                f'budget_nominal={_budnom:.0f}GB '
                 f'peers={fb.get("peers_enabled", 0)} '
                 f'parked={fb.get("peers_parked", 0)} '
                 f'next_renew={fb.get("next_renew_in_days", "?")}d '
                 f'{cap_s}'
             )
+            _health['bw'] = {
+                'used': _used, 'nominal': _budnom,
+                'parked': fb.get('peers_parked', 0),
+                'enabled': fb.get('peers_enabled', 0),
+                'next_renew': fb.get('next_renew_in_days'),
+            }
         # Learned per-peer renew_days (empirical, from observed BW
         # drops). Anchors eligibility math on real cycles instead of
         # the first_seen day-of-month heuristic.
@@ -15558,6 +15625,8 @@ def process_txt():
             _med = lambda xs: xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
             n_throttled = sum(1 for s in steals if s >= 15)
             n_warm = sum(1 for s in steals if 5 <= s < 15)
+            _health['cpu'] = {'n': n, 'steal_med': _med(steals),
+                              'throttled': n_throttled}
             worst = sorted(running_perf, key=lambda p: -p['steal'])[:3]
             worst_s = ' '.join(f'{p["id"]}:{p["steal"]:.0f}%' for p in worst)
             out.append(
@@ -16228,6 +16297,53 @@ def process_txt():
         '#          disk pressure — peers <5 GB free\n'
         '#          recent director events — rollout / cred-rotation events.'
     )
+    # --- Distil health banner (inserted just under the title) ----
+    try:
+        _hb = []
+        _flags = []
+        cpu = _health.get('cpu')
+        if cpu and cpu.get('n'):
+            _frac = cpu['throttled'] / cpu['n']
+            if _frac >= 0.5 or cpu['steal_med'] >= 40:
+                _flags.append(
+                    f'CPU-STARVED({cpu["throttled"]}/{cpu["n"]} '
+                    f'thr, steal_med={cpu["steal_med"]:.0f}%)')
+            else:
+                _hb.append(
+                    f'cpu {cpu["throttled"]}/{cpu["n"]} thr '
+                    f'({cpu["steal_med"]:.0f}% steal)')
+        bw = _health.get('bw')
+        if bw and bw.get('nominal'):
+            if bw['used'] >= bw['nominal']:
+                _flags.append(
+                    f'BW-OVER-NOMINAL({bw["used"]:.0f}/'
+                    f'{bw["nominal"]:.0f}GB, parked={bw["parked"]})')
+            else:
+                _hb.append(
+                    f'bw {bw["used"]:.0f}/{bw["nominal"]:.0f}GB '
+                    f'parked={bw["parked"]}')
+        kgf = _health.get('kg_fail')
+        if kgf:
+            if kgf['fk_per_h'] >= 1.0 or kgf['pk_per_h'] >= 2.0:
+                _flags.append(
+                    f'KG-FAILURES(fail={kgf["fk_per_h"]:.1f}/h '
+                    f'partial={kgf["pk_per_h"]:.1f}/h)')
+            else:
+                _hb.append(
+                    f'kg_fail={kgf["fk_per_h"]:.1f}/h')
+        pr = _health.get('progress')
+        if pr:
+            _hb.insert(0,
+                       f'{pr["done"]}/{pr["total"]} ({pr["pct"]:.0f}%) '
+                       f'@{pr["rate"]:.1f}/h eta {_hms(pr["eta"])}')
+        _status = 'OK' if not _flags else ' '.join(_flags)
+        _banner = 'health:   ' + _status
+        if _hb:
+            _banner += ' · ' + ' · '.join(_hb)
+        out.insert(1, _banner)
+    except Exception:
+        log.exception('process.txt health banner failed')
+
     body = '\n'.join(out) + '\n'
     try:
         cache[_cache_key] = (_now_t, body)

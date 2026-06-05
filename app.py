@@ -15991,17 +15991,18 @@ def process_txt():
     visible.sort(key=_peer_sort_key)
 
     out.append('')
-    out.append(
-        'peers (' + str(len(visible)) + ' shown'
-        + (', attn-only' if attn_only else '')
-        + (', ' + str(len(hidden)) + ' hidden'
-           + (' idle' if not attn_only else '')
-           if hidden and not show_hidden else '')
-        + '):'
-    )
     if not show_roster:
-        out.append('  (roster suppressed: roster=0)')
+        out.append(f'peers ({len(peers)} total, roster suppressed: roster=0)')
         visible = []
+    else:
+        out.append(
+            'peers (' + str(len(visible)) + ' shown'
+            + (', attn-only' if attn_only else '')
+            + (', ' + str(len(hidden)) + ' hidden'
+               + (' idle' if not attn_only else '')
+               if hidden and not show_hidden else '')
+            + '):'
+        )
     # Token-cheap commit recovery: rather than fan out HTTPS probes to
     # 60 peers (which is what causes the director to load up during
     # diagnostic moments — exactly when we *least* want extra fan-out),

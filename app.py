@@ -7849,8 +7849,36 @@ except Exception as _e:
 # === SECTION: Search index API endpoints ===
 
 # === SECTION: live insights aggregate ===
+# This runs on the director/primary, so the heavy ~0.3s of aggregate
+# SELECTs must fire at most ONCE PER DAY. The result is cached on disk
+# (shared across both gunicorn workers + survives restarts) and behind a
+# single-flight lock so a burst of page loads can never stampede the DB.
 _INSIGHTS_CACHE = {'ts': 0.0, 'data': None}
-_INSIGHTS_TTL = 300  # 5 min — index changes slowly
+_INSIGHTS_TTL = 86400  # 24h — index changes slowly; director must not be overwhelmed
+_INSIGHTS_FILE = 'data/insights_cache.json'
+_INSIGHTS_LOCK = threading.Lock()
+
+
+def _load_insights_disk():
+    """Hydrate the in-memory cache from disk (cross-worker / post-restart)."""
+    try:
+        with open(_INSIGHTS_FILE) as f:
+            blob = json.load(f)
+        if isinstance(blob, dict) and blob.get('data'):
+            return float(blob.get('ts', 0.0)), blob['data']
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    return 0.0, None
+
+
+def _store_insights_disk(ts, data):
+    try:
+        tmp = _INSIGHTS_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'ts': ts, 'data': data}, f)
+        os.replace(tmp, _INSIGHTS_FILE)
+    except OSError as e:
+        app.logger.warning('insights: disk persist failed: %s', e)
 
 def _compute_insights():
     """Compute the dynamic insights payload live from the search index.
@@ -7970,22 +7998,69 @@ def _compute_insights():
     return out
 
 
+def _insights_fresh(now):
+    """Return cached payload if still within TTL, else None.
+    Checks in-memory first, then falls back to the disk copy written by
+    the other worker / a previous boot."""
+    if _INSIGHTS_CACHE['data'] and (now - _INSIGHTS_CACHE['ts']) < _INSIGHTS_TTL:
+        return _INSIGHTS_CACHE['data']
+    ts, data = _load_insights_disk()
+    if data and (now - ts) < _INSIGHTS_TTL:
+        _INSIGHTS_CACHE['ts'], _INSIGHTS_CACHE['data'] = ts, data
+        return data
+    return None
+
+
 @app.route('/api/v1/insights')
 def api_insights():
-    """Live insights aggregate for /insights.html. Cached 5 min."""
-    force = request.args.get('force') in ('1', 'true')
+    """Daily insights aggregate for /insights.html.
+
+    Recomputed at most once per 24h. Result is cached in-memory AND on
+    disk (shared across gunicorn workers, survives restart). A
+    single-flight lock guarantees only one thread ever runs the heavy
+    aggregate; everyone else serves the existing (possibly stale) copy.
+    `?force=1` is admin-only so the public can't stampede the director.
+    """
     now = time.time()
-    if not force and _INSIGHTS_CACHE['data'] and (now - _INSIGHTS_CACHE['ts']) < _INSIGHTS_TTL:
-        resp = jsonify(_INSIGHTS_CACHE['data'])
+    force = request.args.get('force') in ('1', 'true')
+    if force:
+        # Forcing a recompute is admin/loopback-only — the public must
+        # never be able to stampede the director's DB on demand.
+        _tok = (request.headers.get('X-Admin-Token')
+                or request.args.get('admin_token')
+                or request.cookies.get('admin_token'))
+        if not (_request_is_loopback() or (_tok and _tok == _current_admin_token())):
+            force = False  # silently ignore
+
+    cached = _insights_fresh(now)
+    if cached is not None and not force:
+        resp = jsonify(cached)
         resp.headers['X-Cache'] = 'HIT'
         return resp
-    try:
-        data = _compute_insights()
-    except Exception as e:
-        import traceback as _tb
-        return jsonify({'error': str(e), 'trace': _tb.format_exc()}), 500
-    _INSIGHTS_CACHE['data'] = data
-    _INSIGHTS_CACHE['ts'] = now
+
+    # Single-flight: only one thread computes; others wait then serve cache.
+    with _INSIGHTS_LOCK:
+        now = time.time()
+        if not force:
+            cached = _insights_fresh(now)
+            if cached is not None:
+                resp = jsonify(cached)
+                resp.headers['X-Cache'] = 'HIT'
+                return resp
+        try:
+            data = _compute_insights()
+        except Exception as e:
+            import traceback as _tb
+            # Fall back to any stale copy rather than 500 on a transient DB error.
+            stale = _INSIGHTS_CACHE['data'] or _load_insights_disk()[1]
+            if stale:
+                resp = jsonify(stale)
+                resp.headers['X-Cache'] = 'STALE'
+                return resp
+            return jsonify({'error': str(e), 'trace': _tb.format_exc()}), 500
+        _INSIGHTS_CACHE['data'] = data
+        _INSIGHTS_CACHE['ts'] = now
+        _store_insights_disk(now, data)
     resp = jsonify(data)
     resp.headers['X-Cache'] = 'MISS'
     return resp

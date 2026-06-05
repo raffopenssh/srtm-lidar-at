@@ -115,14 +115,14 @@ footer a{margin-right:14px}
 </section>
 
 <section>
-  <h2>6 · buildings off the cadastre <span class="tag">[development]</span></h2>
+  <h2>6 · buildings <span class="tag">[development]</span></h2>
   <div class="tl" id="bldSub"></div>
   <div class="chart" id="stories"></div>
   <p class="fact" id="bldTxt"></p>
   <div class="q"><span class="arrow">→</span>
     <a href="/query.html?endpoint=/api/v1/query/parcels&params=auto_subclass%3Dapartments%26min_building_stories%3D5%26sort%3Dbuilding_max_height_m%26sort_dir%3Ddesc%26limit%3D100">apartment blocks 5+</a> ·
-    <a href="/query.html?endpoint=/api/v1/query/compound&params=min_new_buildings%3D3%26min_new_building_footprint%3D500%26min_new_building_height%3D5%26sort%3Dnew_building_count%26sort_dir%3Ddesc">construction hotspots</a> ·
-    <a href="/query.html?endpoint=/api/v1/query&params=new_buildings%3Dtrue%26min_count%3D50%26limit%3D50">50+ new buildings</a>
+    <a href="/query.html?endpoint=/api/v1/query/parcels&params=auto_class%3Dbuilt_up%26sort%3Darea_sqm%26sort_dir%3Ddesc%26limit%3D200">most built-up parcels</a> ·
+    <a href="/query.html?endpoint=/api/v1/query&params=type%3Droof%26metric%3Dfraction%26limit%3D20">densest roof cover</a>
   </div>
 </section>
 
@@ -208,8 +208,7 @@ fetch('/api/v1/insights').then(r=>r.json()).then(D=>{
     ['objects segmented',fmt(h.segments)],
     ['trees',fmt(h.tree_count)],
     ['tree stem volume',fmt(h.tree_volume_m3)+' m\u00b3'],
-    ['new buildings',fmt(h.new_buildings)],
-    ['…not in cadastre',fmt(h.new_bldg_ha,0)+' ha'],
+    ['buildings',fmt(h.buildings)],
     ['forest lost / 2000',fmt(D.hansen_total_ha,0)+' ha'],
     ['RF mean conf',Math.round(h.rf_mean_conf*100)+'%'],
     ['classifier divergence',h.rf_diverged_pct+'%'],
@@ -249,10 +248,10 @@ fetch('/api/v1/insights').then(r=>r.json()).then(D=>{
   $('tallTbl').innerHTML=D.tall_raw.map(r=>`<span class="lbl">KG ${pad(r.kg,6)}</span> <span class="${r.h>55?'bad':'bar'}">${pad(r.h+' m',9,true)}</span>  ${r.h>55?'<span class="bad">⚠ artefact</span>':'<span class="bar">✓ plausible</span>'}`).join('\n');
 
   // 6 buildings
-  $('bldSub').textContent=`${fmt(h.buildings)} catalogued + ${fmt(h.new_buildings)} newly detected · storeys from nDSM`;
+  $('bldSub').textContent=`${fmt(h.buildings)} buildings · storey count from the 1\u2009m nDSM`;
   $('stories').innerHTML=bars(D.stories.map(r=>({label:r.s+(r.s===1?' storey':' storeys'),value:r.n})),{lw:10,vfmt:v=>fmt(v)});
   const pit=D.roofs.find(r=>r.roof==='pitched')||{},fla=D.roofs.find(r=>r.roof==='flat')||{},rt=(pit.n||0)+(fla.n||0)||1;
-  $('bldTxt').innerHTML=`<b>pitched roofs ${Math.round((pit.n||0)/rt*100)}%</b> avg ${pit.h} m (village Austria), <b>flat ${Math.round((fla.n||0)/rt*100)}%</b> avg ${fla.h} m (sheds, garages, modern). <b>${fmt(h.new_buildings)} structures (${fmt(h.new_bldg_ha,0)} ha)</b> have no cadastre record.`;
+  $('bldTxt').innerHTML=`<b>pitched roofs ${Math.round((pit.n||0)/rt*100)}%</b> avg ${pit.h} m (village Austria), <b>flat ${Math.round((fla.n||0)/rt*100)}%</b> avg ${fla.h} m (sheds, garages, modern). Heights and storeys come straight off the 1\u2009m nDSM, parcel by parcel.`;
 
   // 7 elevation
   const eb=D.elev.filter(r=>r.kgs>=1);

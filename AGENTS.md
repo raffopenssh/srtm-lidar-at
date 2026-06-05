@@ -765,3 +765,35 @@ More in `docs/cross-cutting-concerns.md`.
   restart and the fleet never picks up your change. (`_ensure_origin_synced`
   pushes local main to origin every tick — so a forgotten `git push` is
   recoverable, but a forgotten restart is not.)
+- **Let the director roll out the fleet — do NOT hand-drive updates.**
+  After commit→push→`restart srv`, the new commit becomes the rollout
+  `target=` and the director's **wave-based auto-rollout** propagates it
+  on its own: idle peers get a hard restart, mid-KG peers a graceful
+  restart at the next KG boundary, capped at `STALE_UPDATE_HARD_PER_TICK=3`
+  + `STALE_UPDATE_GRACEFUL_PER_TICK=5` peers/tick (≈5 min for the whole
+  fleet). This pacing is load-bearing: it exists *because* a thundering
+  herd of simultaneous restarts has repeatedly broken the cluster.
+  **Do not** blast `POST /api/v1/director/update_peers` across the fleet
+  (especially not `graceful:false`), and do not loop `processing/stop` +
+  `clear_tile_checkpoints` over many peers to force a wave — that is the
+  thundering herd the wave logic prevents. On **2026-05-06** an all-at-once
+  `update_peers` exhausted gunicorn fds and tripped circuit breakers
+  fleet-wide; on **2026-06-05** a manual multi-peer force-update +
+  stop/clear churn during a 503 incident bounced the director off the
+  primary onto at106 (it auto-handed-back, but it was avoidable churn).
+  Just commit, push, restart srv, and watch `versions:`/`rollout:` in
+  `/process.txt` converge.
+- **Correct behaviour for a *single* stale/degraded peer**: if you must
+  intervene on one peer (e.g. it swallowed a transient upstream failure
+  with old code and is baking bad data into the current KG), the minimal
+  safe sequence is — (1) `POST …/api/v1/director/update_peers`
+  `{"peer_id":"<id>","graceful":false,"skip_push":true}` so *that one*
+  peer pulls + restarts onto the target commit; (2) `POST
+  …/<peer>/api/v1/processing/stop` and confirm the **processor** (not
+  just srv) is actually stopped — the web app restart alone leaves the
+  old processor running in RAM, already past the cadastre/upstream step;
+  (3) `POST …/<peer>/api/v1/admin/clear_tile_checkpoints?kg=<code>` to
+  drop the tainted tile pickles (otherwise the new code restores them
+  and re-bakes the bad data); then **leave starting to the director** —
+  it restarts stopped peers on the next tick (~30 s) onto a fresh KG.
+  One peer at a time; never script this across the fleet.

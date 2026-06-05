@@ -8038,6 +8038,20 @@ def api_insights():
         resp.headers['X-Cache'] = 'HIT'
         return resp
 
+    # Only the VM currently holding the director role may run the heavy
+    # aggregate. Every other peer serves whatever cached copy it has (of
+    # any age — the director refreshes it daily and it's synced over) and
+    # never touches the DB. This keeps the once-a-day compute pinned to a
+    # single VM even as the director role floats across the fleet.
+    if not _is_director_local():
+        stale = _INSIGHTS_CACHE['data'] or _load_insights_disk()[1]
+        if stale:
+            resp = jsonify(stale)
+            resp.headers['X-Cache'] = 'STALE-NONDIRECTOR'
+            return resp
+        return jsonify({'error': 'insights computed on the director only',
+                        'hint': 'this VM is not the active director and has no cached copy yet'}), 503
+
     # Single-flight: only one thread computes; others wait then serve cache.
     with _INSIGHTS_LOCK:
         now = time.time()

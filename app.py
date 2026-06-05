@@ -740,6 +740,43 @@ if _tombstone_path.exists():
             _MANIFEST_TOMBSTONES = raw
     except Exception: pass
 
+_TOMBSTONE_LOCK = threading.Lock()
+
+
+def _persist_tombstones_merged() -> None:
+    """Persist ``_MANIFEST_TOMBSTONES`` to disk, MERGING with whatever is
+    already on disk first.
+
+    gunicorn runs 2 workers, each with its own in-memory
+    ``_MANIFEST_TOMBSTONES`` and its own peer-sync thread. A naive
+    ``write_text(json.dumps(_MANIFEST_TOMBSTONES))`` from worker A blindly
+    overwrites tombstones that worker B just wrote — exactly what wiped
+    the 57-KG ortho-requeue tombstones moments after the operator POST
+    (the other worker's sync thread rewrote the file from stale memory).
+    Merge-on-write (newest ISO ts wins per key) makes the file a
+    cross-worker union instead of a last-writer-wins race.
+    """
+    with _TOMBSTONE_LOCK:
+        disk: dict = {}
+        try:
+            if _tombstone_path.exists():
+                d = json.loads(_tombstone_path.read_text())
+                if isinstance(d, dict):
+                    disk = d
+        except Exception:
+            disk = {}
+        for k, v in disk.items():
+            cur = _MANIFEST_TOMBSTONES.get(k, '')
+            if str(v) > str(cur):
+                _MANIFEST_TOMBSTONES[k] = v
+        try:
+            tmp = _tombstone_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+            tmp.replace(_tombstone_path)
+        except Exception:
+            pass
+
+
 def _sync_peer_data():
     """Background thread: sync KG JSONs and manifest entries from peers."""
     import requests as req
@@ -839,8 +876,7 @@ def _sync_peer_data():
                             changed_tomb = True
                     if changed_tomb:
                         try:
-                            _tombstone_path.write_text(
-                                json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+                            _persist_tombstones_merged()
                             log.info('Peer sync: merged tombstones from peer (now %d entries)',
                                      len(_MANIFEST_TOMBSTONES))
                         except Exception:
@@ -4123,7 +4159,7 @@ def processing_queue_add():
                 pass
         if tombstoned:
             try:
-                _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+                _persist_tombstones_merged()
             except Exception:
                 pass
 
@@ -4495,7 +4531,7 @@ def processing_manifest_delete(key):
         # Add tombstone so sync thread doesn't re-merge stale entries from peers
         import datetime as _dt
         _MANIFEST_TOMBSTONES[key] = _dt.datetime.utcnow().isoformat()
-        _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
+        _persist_tombstones_merged()
         return jsonify({'deleted': key, 'remaining': len(entries)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

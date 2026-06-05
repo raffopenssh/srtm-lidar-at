@@ -477,6 +477,49 @@ parking parks the whole /24 in one shot, all `not_before`
 expiring together so the pool gets one clean retry per cooldown
 level.
 
+#### Stuck-KG watchdog (`_check_stuck_kg`)
+
+A peer's processor can wedge *inside* a KG — a BEV re-read that never
+gives up (`bev_retry` exhausted its pool), a hung SSL upload, an
+infinite divide-warning loop. The peer keeps reporting `state=running`
+but makes zero progress, holding a running slot indefinitely. We
+observed peers frozen on the same KG+step for **72 h** (at21/at92/at94,
+Jun 2026) before this watchdog existed.
+
+Every director tick `_check_stuck_kg(_statuses)` computes a **progress
+fingerprint** per peer from the pushed status:
+`current_kg.code | step | current_tile | n_tiles | step_detail_ts | completed`.
+Any healthy work advances at least one component — crucially the
+legitimately-multi-hour steps (frontier `copernicus` openEO fetches up
+to ~5.7 h, big `upload_full_gpkg`) move `step_detail_ts` every few
+minutes (`harmonics N/12`, `upload N%`). A truly hung peer freezes
+*every* component at once.
+
+When the fingerprint stays unchanged for **`STUCK_KG_FROZEN_S` (12 h)**
+the peer gets a **hard** stop (mid-KG SIGTERM→SIGKILL — graceful
+"exit-after-KG" would never fire on a frozen loop). 12 h is ~2.4× the
+worst legit *opaque* window (a single step emitting no director-visible
+progress field; measured ~5 h over 7 days of fleet logs), so a slow but
+progressing KG is never killed. Tile checkpoints + the cross-peer chkpt
+registry make the restart nearly free — the next peer to pick up the KG
+resumes the finished tiles.
+
+False-positive guards:
+- **Fresh status only.** Stale/cached fallback (`_stale`) or
+  `unreachable` ticks are skipped — a flaky network must never look
+  like a frozen fingerprint. The timer is held, not advanced.
+- **Timer resets** the instant the fingerprint changes.
+- **Skips scheduled-off peers** (`_peer_is_scheduled`) so it won't
+  stomp a park cooldown.
+- No explicit park after the stop: the scheduler re-admits the peer on
+  a later tick and the KG flows back through the normal
+  in-progress/requeue path.
+
+Emits a `stuck-kg <pid>: KG <code> frozen on step "<step>" for Xh …`
+warning into the merged log (grep `?q=stuck-kg`). Tracker state lives in
+`state['stuck_kg_track']` (in-memory; rebuilt within 12 h after an HA
+handover — the timer simply restarts, which is safe).
+
 #### Director Modes
 
 | Mode | Behaviour |

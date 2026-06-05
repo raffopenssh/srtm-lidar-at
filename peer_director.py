@@ -452,6 +452,25 @@ STEAL_PARK_THRESHOLD_PCT = 70.0
 STEAL_PARK_RECOVERY_PCT = 50.0       # streak reset hysteresis
 STEAL_PARK_PERSIST_S = 10 * 60
 STEAL_PARK_COOLDOWN_S = 30 * 60
+# --- Stuck-KG watchdog --------------------------------------------------
+# A peer whose processor wedges *inside* a KG (e.g. a BEV re-read that
+# never gives up, or a hung SSL upload) holds a running slot forever
+# while producing nothing. We've seen peers frozen on the same KG+step
+# for 72 h (at21/at92/at94, Jun 2026). The tile-checkpoint + chkpt
+# registry machinery means a hard restart is nearly free — the next
+# peer resumes the finished tiles.
+#
+# CRITICAL: some KGs legitimately take a long time. The worst legit
+# *opaque* window (a single step emitting NO director-visible progress
+# field — gpkg_full stitch / upload chunk) observed over 7 days is ~5 h.
+# copernicus/upload steps move step_detail_ts every few minutes, so
+# their multi-hour totals don't count as "frozen". We therefore key the
+# watchdog off a FINGERPRINT (kg+step+tile+detail_ts+completed) that
+# advances during any healthy work, and only kill when that fingerprint
+# has been frozen for STUCK_KG_FROZEN_S — set to ~2.4x the worst legit
+# opaque window so a slow-but-progressing KG is never murdered.
+STUCK_KG_FROZEN_S = 12 * 3600        # no progress fingerprint change → kill
+STUCK_KG_MIN_STATUS_FRESH_S = 15 * 60  # require a recent (non-stale) status
 # Hard tier for frontier scheduling: peers at or above this rolling
 # steal % are demoted to the high-steal tier when picking active /
 # parallel frontier peers. A low-steal peer always outranks a
@@ -5166,6 +5185,130 @@ class PeerDirector:
                 log.exception('steal-park: save_peers_config failed')
 
     # ------------------------------------------------------------------
+    # Stuck-KG watchdog
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _kg_progress_fingerprint(ps: dict) -> str | None:
+        """A string that changes whenever a peer makes *any* visible
+        progress inside its current KG.
+
+        Components (all director-visible via the pushed status):
+          * current_kg.code      — new KG => fresh fingerprint
+          * current_kg.step      — step transition (starting/lidar/.../upload)
+          * current_kg.current_tile / n_tiles — per-tile loop advance
+          * current_kg.step_detail_ts — within-step detail update
+            (copernicus harmonics N/12, upload N%, ...), which is how
+            the legitimately-multi-hour steps prove they're alive
+          * completed            — a KG finished and a new one started
+
+        Returns None when the peer is not processing a KG (idle/stopped/
+        unreachable) — the watchdog skips those.
+        """
+        if not isinstance(ps, dict):
+            return None
+        state = (ps.get('state') or '').lower()
+        if state not in ('running', 'processing'):
+            return None
+        ckg = ps.get('current_kg')
+        if not isinstance(ckg, dict) or not ckg.get('code'):
+            return None
+        return '|'.join(str(x) for x in (
+            ckg.get('code'),
+            ckg.get('step'),
+            ckg.get('current_tile'),
+            ckg.get('n_tiles'),
+            ckg.get('step_detail_ts'),
+            ps.get('completed'),
+        ))
+
+    def _check_stuck_kg(self, statuses: dict) -> None:
+        """Hard-restart peers whose processor has wedged inside a KG.
+
+        A peer is "stuck" when its progress fingerprint
+        (:meth:`_kg_progress_fingerprint`) has not changed for
+        :data:`STUCK_KG_FROZEN_S`. We deliberately track a fingerprint
+        rather than wall-clock KG elapsed because some KGs (frontier
+        copernicus fetches, big gpkg uploads) legitimately run for
+        hours — but they keep moving the fingerprint (tile index /
+        step_detail_ts) while they do. A truly hung peer freezes every
+        component at once.
+
+        Guards against false positives:
+          * Only fires on fresh, non-stale status (we must actually be
+            seeing the peer's live state, not a cached fallback).
+          * Resets the timer the instant the fingerprint changes.
+          * Skips peers already scheduled-off (parked) — don't stomp a
+            cooldown.
+
+        Recovery is a *hard* stop (mid-KG SIGTERM→SIGKILL): the peer is
+        frozen, so a graceful "exit after current KG" would never fire.
+        Tile checkpoints + the cross-peer chkpt registry mean the work
+        done so far isn't lost — the next peer to pick up the KG resumes
+        the finished tiles. After the stop the scheduler re-admits the
+        peer on a subsequent tick (no explicit park), and the KG goes
+        back through the normal in-progress/requeue path.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        now_ts = time.time()
+        with self._lock:
+            track = self.state.setdefault('stuck_kg_track', {})
+            peers = list(self.cfg.get('peers', []))
+            live_ids = {p['id'] for p in peers if p.get('enabled', True)}
+        for p in peers:
+            if not p.get('enabled', True):
+                continue
+            pid = p['id']
+            ps = statuses.get(pid) or {}
+            # Require a fresh, real status read. A stale/cached fallback
+            # (the peer's gunicorn was briefly unreachable) must NOT be
+            # mistaken for a frozen fingerprint — otherwise a flaky
+            # network would get a busy peer killed.
+            if ps.get('_stale') or (ps.get('state') == 'unreachable'):
+                # Keep the existing timer but don't advance/evaluate it;
+                # we simply have no fresh evidence this tick.
+                continue
+            fp = self._kg_progress_fingerprint(ps)
+            if fp is None:
+                track.pop(pid, None)
+                continue
+            ent = track.get(pid)
+            if not ent or ent.get('fp') != fp:
+                track[pid] = {'fp': fp, 'since': now_ts,
+                              'kg': (ps.get('current_kg') or {}).get('code')}
+                continue
+            frozen_for = now_ts - float(ent.get('since') or now_ts)
+            if frozen_for < STUCK_KG_FROZEN_S:
+                continue
+            # Don't stomp on a peer we've deliberately parked.
+            if _peer_is_scheduled(p):
+                continue
+            kg_code = (ps.get('current_kg') or {}).get('code') or '?'
+            step = (ps.get('current_kg') or {}).get('step') or '?'
+            peer_url = p.get('url')
+            msg = (f'stuck-kg {pid}: KG {kg_code} frozen on step "{step}" '
+                   f'for {frozen_for/3600:.1f}h (no progress fingerprint '
+                   f'change) — hard restart')
+            log.warning(msg)
+            try:
+                _emit_director_event(msg, peer=pid, kg=str(kg_code),
+                                     level='warning')
+            except Exception:
+                pass
+            try:
+                # Hard stop: the processor is wedged, so graceful
+                # (exit-after-KG) would never take effect.
+                stop_peer_processor(peer_url, graceful=False)
+            except Exception as e:
+                log.warning('stuck-kg %s: hard stop failed: %s', pid, e)
+            # Clear the timer so we don't immediately re-fire if the
+            # status lingers before the stop takes hold.
+            track.pop(pid, None)
+        # Trim trackers for peers no longer in the fleet.
+        for stale_id in list(track.keys()):
+            if stale_id not in live_ids:
+                track.pop(stale_id, None)
+
+    # ------------------------------------------------------------------
     # BEV outage: escalating fleet pause
     # ------------------------------------------------------------------
     def _fleet_bev_warn_rate(self, statuses: dict) -> tuple[float, int]:
@@ -9837,6 +9980,14 @@ class PeerDirector:
                     self._check_steal_health()
                 except Exception:
                     log.exception('Steal health check error')
+                # Stuck-KG watchdog: hard-restart peers wedged inside a
+                # KG (progress fingerprint frozen for STUCK_KG_FROZEN_S).
+                # Uses the same fresh _statuses snapshot computed above.
+                try:
+                    self._check_stuck_kg(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('Stuck-KG watchdog error')
                 # BEV-outage detection: fleet-wide escalating pause
                 # when BEV emits sustained errors across many peers.
                 # Runs after capacity_factor was computed above (uses

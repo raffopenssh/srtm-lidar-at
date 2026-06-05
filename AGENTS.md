@@ -43,9 +43,13 @@ per-day archive when `hours` exceeds the live ring — returns the
 exist), avoiding the prior bug that truncated the tail of the day.
 Director orchestration events — peer auto-updates, Copernicus credential
 revalidation/add/remove, frontier credential & cache-cell plan changes,
-**bandwidth-wall auto-park / park-until-renewal** events — are emitted via
-`app.director_event(…)` and appear inline in the merged 24h log
-(`peer=director` for fleet-wide events, otherwise the affected peer id).
+**bandwidth-wall auto-park / park-until-renewal**, **stuck-KG hard
+restarts** (`stuck-kg <pid>: …` — peer wedged inside a KG with a frozen
+progress fingerprint for 12 h; see `docs/peer-director.md → Stuck-KG
+watchdog`) events — are emitted via `app.director_event(…)` and appear
+inline in the merged 24h log (`peer=director` for fleet-wide events,
+otherwise the affected peer id). Grep `?q=stuck-kg` to audit watchdog
+firings.
 
 ### Tile-checkpoint registry fields in `/process.txt`
 

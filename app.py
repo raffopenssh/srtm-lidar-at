@@ -14959,7 +14959,7 @@ def process_txt():
     """
     import time as _t
     try:
-        nlog = max(1, min(500, int(request.args.get('log', '60'))))
+        nlog = max(0, min(500, int(request.args.get('log', '60'))))
     except ValueError:
         nlog = 60
     warn_only = request.args.get('warn') in ('1', 'true', 'yes')
@@ -14969,6 +14969,13 @@ def process_txt():
     # lines are pure proxy-lane churn that resolves on its own, and they
     # otherwise dominate the log on bad-upstream days.
     verbose = request.args.get('verbose') in ('1', 'true', 'yes')
+    # attn=1: collapse the roster to attention-state peers only (offline,
+    #   needs-update, stale, paused, parked-mid-KG). The interesting rows
+    #   are otherwise buried under dozens of near-identical CACHE peers.
+    # roster=0: drop the peer table entirely (director/health/log only).
+    # log=0: drop the merged-log block (fleet+peer state only).
+    attn_only = request.args.get('attn') in ('1', 'true', 'yes')
+    show_roster = request.args.get('roster') not in ('0', 'false', 'no')
     peer_q = (request.args.get('peer') or '').strip().lower()
     msg_q = (request.args.get('q') or '').strip().lower()
     try:
@@ -14982,7 +14989,8 @@ def process_txt():
     # Multiple gunicorn workers each maintain their own cache; the
     # underlying director status is already cross-worker cached so the
     # work avoided here is pure Python text formatting + log scanning.
-    _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back)
+    _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
+                  attn_only, show_roster)
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
     if cache is None:
@@ -15012,6 +15020,9 @@ def process_txt():
         if h:
             return f'{h}h{m:02d}m'
         return f'{m}m'
+
+    class _StopLogRead(Exception):
+        """Sentinel: short-circuit the merged-log read when log=0."""
 
     out = []
     # Signals collected by the sections below; distilled into a one-line
@@ -15949,7 +15960,18 @@ def process_txt():
 
 
     hidden = [p for p in peers if _is_quiet(p)]
-    visible = peers if show_hidden else [p for p in peers if not _is_quiet(p)]
+    if attn_only:
+        # Only peers in an attention state (plus active/owner so the
+        # frontier is never silently dropped). Everything else collapses
+        # into the trailing hidden count.
+        visible = [p for p in peers
+                   if _is_attn(p) or p.get('is_active')
+                   or p.get('reserved_kg')]
+        hidden = [p for p in peers if p not in visible]
+    elif show_hidden:
+        visible = peers
+    else:
+        visible = [p for p in peers if not _is_quiet(p)]
 
     # Sort: running peers (oldest current_kg first) > owners > rest by id.
     def _peer_sort_key(p):
@@ -15971,9 +15993,15 @@ def process_txt():
     out.append('')
     out.append(
         'peers (' + str(len(visible)) + ' shown'
-        + (', ' + str(len(hidden)) + ' hidden idle' if hidden and not show_hidden else '')
+        + (', attn-only' if attn_only else '')
+        + (', ' + str(len(hidden)) + ' hidden'
+           + (' idle' if not attn_only else '')
+           if hidden and not show_hidden else '')
         + '):'
     )
+    if not show_roster:
+        out.append('  (roster suppressed: roster=0)')
+        visible = []
     # Token-cheap commit recovery: rather than fan out HTTPS probes to
     # 60 peers (which is what causes the director to load up during
     # diagnostic moments — exactly when we *least* want extra fan-out),
@@ -16204,8 +16232,12 @@ def process_txt():
                    + (' …' if len(pq) > len(head) else ''))
 
     # --- Merged log (live 24h ring + per-day archive) -----------
+    _skip_log = (nlog <= 0)
     out.append('')
-    out.append(f'merged log (last {nlog}'
+    if _skip_log:
+        out.append('merged log: suppressed (log=0)')
+    else:
+        out.append(f'merged log (last {nlog}'
                + (f', {hours_back:g}h back' if hours_back != 24.0 else '')
                + (' warn+err' if warn_only else '')
                + (', peer~' + peer_q if peer_q else '')
@@ -16231,6 +16263,8 @@ def process_txt():
         return True
 
     try:
+        if _skip_log:
+            raise _StopLogRead
         # Pull from per-day archive when the requested window predates
         # the live ring (or when the ring's first ts is later than
         # ``since_iso``). Cheap: archives are gzipped and we only iterate
@@ -16269,6 +16303,8 @@ def process_txt():
                     continue
                 if _accept(e):
                     log_lines.append(e)
+    except _StopLogRead:
+        pass
     except Exception as _e:
         out.append(f'  (log read error: {_e})')
     log_lines.sort(key=lambda e: e.get('ts', ''), reverse=True)
@@ -16282,12 +16318,17 @@ def process_txt():
 
     out.append('')
     out.append(
-        '# query: ?log=N (default 60, max 500), ?warn=1 (errors+warnings only),\n'
+        '# query: ?log=N (default 60, max 500; log=0 suppresses the log),\n'
+        '#        ?warn=1 (errors+warnings only),\n'
         '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
         '#        ?q=substring (msg filter), ?hours=H (default 24; uses\n'
         '#        per-day gzipped archive in data/log_archive/ when H>24),\n'
+        '#        ?attn=1 (roster → attention-state peers only),\n'
+        '#        ?roster=0 (drop peer table; director/health/log only),\n'
         '#        ?verbose=1 (also show GDAL-internal/bev_retry per-attempt\n'
         '#        chatter — hidden by default as proxy-lane noise).\n'
+        '#        Token-cheap combos: ?roster=0&log=0 (banner + fleet\n'
+        '#        lines only), ?attn=1&warn=1 (triage view).\n'
         '#        Pair with /api/v1/director/log/history (also accepts hours=)\n'
         '#        for full structured access. New sections (May 2026):\n'
         '#          versions:/rollout: — fleet update progress\n'

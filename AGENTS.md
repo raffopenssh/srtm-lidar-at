@@ -19,15 +19,35 @@ curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?peer=at3&log=200'
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?q=cred&log=300'
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hidden=1' # also list stopped/idle peers
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hours=168&log=500&q=Diendorf' # 7d back, archive
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?roster=0&log=0' # banner + fleet lines only (cheapest)
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?attn=1&warn=1' # triage: attention peers + warn log
 ```
 
+**First line is a `health:` banner** — distils triage signals
+(`done/8440 (pct%) @rate/h eta`, plus loud flags `CPU-STARVED`,
+`BW-OVER-NOMINAL`, `KG-FAILURES` when tripped; else `OK`). Read it
+first. The `progress:` line below it is now fleet-wide (was previously
+the primary's parked local processor reading `done=N/1 eta=138d` — that
+bug is fixed: total falls back to 8440 and rate/ETA come from Zenodo
+upload timestamps across all peers).
+
 Query params:
-- `log=N` (default 60, max 500) — merged-log line count, newest first
+- `log=N` (default 60, max 500) — merged-log line count, newest first.
+  **`log=0` suppresses the merged-log block entirely** (skips the disk
+  read too — use when you only want fleet/peer state).
 - `warn=1` — restrict log to warnings + errors
 - `peer=<substr>` — filter peer roster + log lines by id substring
 - `q=<substr>` — substring filter on log message body
 - `hidden=1` — also include stopped/idle/complete peers in roster
   (default: hidden; attention-state peers are always shown)
+- **`attn=1`** — collapse the roster to attention-state peers only
+  (offline / needs-update / stale / paused / parked-mid-KG, plus the
+  active frontier + owners). The interesting rows are otherwise buried
+  under dozens of near-identical CACHE peers; everything else folds into
+  the trailing hidden count.
+- **`roster=0`** — drop the peer table entirely (director / health /
+  fleet lines / log only). Pairs well with `log=0` for the cheapest
+  possible top-of-dashboard snapshot.
 - **`hours=H`** — look back H hours into the merged log. Default 24
   (live ring only). Higher values transparently dip into the
   **long-term archive** at `data/log_archive/YYYY-MM-DD.jsonl.gz`

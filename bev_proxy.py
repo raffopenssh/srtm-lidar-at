@@ -46,6 +46,16 @@ log = logging.getLogger(__name__)
 _PROXY_SOURCES_VERIFIED = [
     # elliottophellia/yakumo runs continuous validation; yield = 22 %
     "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+    # Added 2026-06-05 after no_proxies=4 / phase2_med=3 on a 44-peer
+    # fleet. Live-vetted the documented way (50-60 random samples,
+    # HTTPS-CONNECT against httpbin.org/ip); both cleared the >=10 %
+    # phase-1 bar that qualifies a source as "verified" (validate ALL,
+    # no sampling). Re-vet if phase-1 yield drops <10 %.
+    #   hendrikbgr/Free-Proxy-Repo  -> 13 % (356 entries, small but clean)
+    #   monosans/proxies/all        -> 8-12 % (continuously pre-checked
+    #                                  upstream; small ~120-entry list)
+    "https://raw.githubusercontent.com/hendrikbgr/Free-Proxy-Repo/master/proxy_list.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
 ]
 
 _PROXY_SOURCES = [
@@ -104,6 +114,11 @@ _PROXY_SOURCES = [
     "https://raw.githubusercontent.com/aslisk/proxyhttps/main/https.txt",
     "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
     "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    # Added 2026-06-05: live-probed HTTP 200 with payload; phase-1
+    # yield ~2 % (raw-tier, sampled under the 5000-entry budget).
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
+    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
 ]
 
 # URLs used to validate that a proxy can actually fetch BEV TIFF bytes.

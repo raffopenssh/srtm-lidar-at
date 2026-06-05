@@ -643,11 +643,66 @@ class Client:
     # a single PUT on any 4xx other than 404.
     _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
 
+    def _verify_via_deposit(
+        self,
+        depo_id: int,
+        filename: str,
+        expected_size: int,
+        expected_md5: Optional[str],
+    ) -> tuple[bool, str]:
+        """Confirm a bucket file via the deposition record's ``files`` array.
+
+        Fallback for :meth:`_verify_bucket_file` when a bare HEAD on the
+        bucket URL is rejected. Once a deposition leaves the draft-bucket
+        state (and on the production zenodo.org edge generally), HEAD/GET
+        on the public ``{bucket}/{filename}`` URL returns 403 even with a
+        valid Bearer token — which silently defeated the post-failure
+        verify recovery (every write-timeout fell through to a full
+        multi-GB re-upload). ``GET /api/deposit/depositions/{id}`` IS
+        authorised and embeds ``files: [{filename, filesize, checksum}]``
+        where ``checksum`` is a plain 32-hex md5 — exactly what we need.
+
+        Returns ``(ok, reason)``; never raises (verify must stay
+        side-effect-free so the caller's retry policy owns control flow).
+        """
+        try:
+            resp = self._session.get(
+                self._url(f"/api/deposit/depositions/{depo_id}"),
+                timeout=(10, 30),
+            )
+        except requests.exceptions.RequestException as exc:
+            return False, f"depo_error:{type(exc).__name__}"
+        if resp.status_code >= 400:
+            return False, f"depo_status:{resp.status_code}"
+        try:
+            files = (resp.json() or {}).get("files") or []
+        except Exception:
+            return False, "depo_unparseable"
+        match = next((f for f in files
+                      if f.get("filename") == filename), None)
+        if match is None:
+            return False, "depo_absent"
+        try:
+            got_size = int(match.get("filesize", -1))
+        except (TypeError, ValueError):
+            got_size = -1
+        if got_size != expected_size:
+            return False, f"depo_size_mismatch:{got_size}!={expected_size}"
+        got_md5 = str(match.get("checksum") or "").strip().lower()
+        if got_md5.startswith("md5:"):
+            got_md5 = got_md5.split(":", 1)[-1]
+        if expected_md5 and got_md5:
+            if got_md5 == expected_md5.lower():
+                return True, f"depo size+md5 ok ({got_size}B)"
+            return False, f"depo_md5_mismatch:{got_md5}!={expected_md5}"
+        return True, f"depo size ok ({got_size}B, no md5)"
+
     def _verify_bucket_file(
         self,
         put_url: str,
         expected_size: int,
         expected_md5: Optional[str],
+        depo_id: Optional[int] = None,
     ) -> tuple[bool, str]:
         """Check whether the file at ``put_url`` matches our expectations.
 
@@ -667,6 +722,13 @@ class Client:
         path: it lets us treat "SSL EOF after the last byte was
         written" as a success and skip a multi-GB re-upload.
         """
+        # Bucket-URL HEAD is the cheap happy path, but on production
+        # zenodo.org it returns 403 even with a valid token once the
+        # deposit is past draft. When we know the deposition id, fall
+        # back to the authorised deposition-record API, which carries
+        # the size + md5 we need. ``filename`` is the last path segment
+        # of put_url (bucket URLs have no query string).
+        filename = put_url.rsplit("/", 1)[-1]
         try:
             resp = self._session.head(
                 put_url,
@@ -674,10 +736,22 @@ class Client:
                 allow_redirects=True,
             )
         except requests.exceptions.RequestException as exc:
+            if depo_id is not None:
+                return self._verify_via_deposit(
+                    depo_id, filename, expected_size, expected_md5)
             return False, f"head_error:{type(exc).__name__}"
         if resp.status_code == 404:
+            # A 404 on the bucket URL is ambiguous on the public edge;
+            # only trust "absent" when we can't cross-check via the
+            # deposition record.
+            if depo_id is not None:
+                return self._verify_via_deposit(
+                    depo_id, filename, expected_size, expected_md5)
             return False, "absent"
         if resp.status_code >= 400:
+            if depo_id is not None:
+                return self._verify_via_deposit(
+                    depo_id, filename, expected_size, expected_md5)
             return False, f"head_status:{resp.status_code}"
         try:
             got_size = int(resp.headers.get("Content-Length", "-1"))
@@ -718,8 +792,13 @@ class Client:
         progress_callback,
         *,
         use_multipart: bool,
+        depo_id: Optional[int] = None,
     ) -> None:
         """Upload one local file to a Zenodo bucket URL.
+
+        ``depo_id`` (when known) lets the post-failure verify fall back
+        to the authorised deposition-record API when a bare bucket-URL
+        HEAD is rejected with 403 on the public edge.
 
         Tries multipart for large files (cleaner recovery from edge
         timeouts on multi-GB streams). Falls back to a single PUT on
@@ -788,7 +867,7 @@ class Client:
                 # a body and then garbles the JSON ack; we want every
                 # successful return to mean "file is in the bucket".
                 ok, why = self._verify_bucket_file(
-                    put_url, file_size, md5_hex)
+                    put_url, file_size, md5_hex, depo_id=depo_id)
                 if ok:
                     return
                 log.warning(
@@ -804,7 +883,7 @@ class Client:
                 # re-uploading; on a match we save a full file's worth
                 # of bandwidth + ~10 min of wall time.
                 ok, why = self._verify_bucket_file(
-                    put_url, file_size, md5_hex)
+                    put_url, file_size, md5_hex, depo_id=depo_id)
                 if ok:
                     log.info(
                         "PUT %s raised %s on attempt %d/%d but bucket "
@@ -848,7 +927,8 @@ class Client:
                 time.sleep(wait)
         # Exhausted attempts. One final verify before giving up — the
         # last PUT may have succeeded silently while we were sleeping.
-        ok, why = self._verify_bucket_file(put_url, file_size, md5_hex)
+        ok, why = self._verify_bucket_file(
+            put_url, file_size, md5_hex, depo_id=depo_id)
         if ok:
             log.info(
                 "PUT %s: bucket verify succeeded after %d attempts (%s)",
@@ -1200,7 +1280,8 @@ class Client:
             # Stream-upload new file (multipart for >1 GB).
             self._put_file_to_bucket(
                 bucket_url, filename, local_path, file_size,
-                progress_callback, use_multipart=use_multipart)
+                progress_callback, use_multipart=use_multipart,
+                depo_id=existing.depo_id)
 
             # Update metadata.
             meta_payload = meta_func(key, filename, version)
@@ -1225,7 +1306,8 @@ class Client:
             # Stream-upload file (multipart for >1 GB).
             self._put_file_to_bucket(
                 bucket_url, filename, local_path, file_size,
-                progress_callback, use_multipart=use_multipart)
+                progress_callback, use_multipart=use_multipart,
+                depo_id=depo_id)
 
             # Set metadata.
             meta_payload = meta_func(key, filename, version)

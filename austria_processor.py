@@ -1061,23 +1061,73 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
 
 # === SECTION: Cadastre data fetching (REST API calls) ===
 
+# Transient HTTP statuses worth retrying — the cadastre-process-api can be
+# briefly overloaded (503) or hit a gateway hiccup (502/504/429). A 404 or
+# other 4xx is NOT transient (the KG genuinely has no cadastre) and must not
+# trigger a retry/requeue.
+_CADASTRE_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+_CADASTRE_MAX_ATTEMPTS = 5
+_CADASTRE_BACKOFF_BASE_S = 5.0
+
+
 def fetch_cadastre_data(kg_code: str) -> dict:
-    """Fetch parcels, building footprints, buildings (addresses), landuse from cadastre API."""
+    """Fetch parcels, building footprints, buildings (addresses), landuse from cadastre API.
+
+    On a *transient* failure (timeout, connection error, or 5xx/429 from an
+    overloaded API) we retry with exponential backoff. If every attempt fails
+    we set ``result['_fetch_failed'] = True`` so the caller can abort + requeue
+    the KG rather than silently emit a GPKG with no parcels/buildings.
+    """
     result = {"parcels": [], "building_footprints": [], "landuse": [],
               "parcels_geojson": [], "buildings_geojson": [],
               "building_addresses": []}
-    try:
-        resp = requests.get(
-            f"{CADASTRE_BASE}/export/geojson",
-            params={"kg": kg_code,
-                    "layers": "parcels,building_footprints,buildings,landuse_polygons",
-                    "include_geometry": "true"},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        log.warning("KG %s: cadastre fetch failed: %s", kg_code, e)
+    data = None
+    last_exc = None
+    for _attempt in range(1, _CADASTRE_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.get(
+                f"{CADASTRE_BASE}/export/geojson",
+                params={"kg": kg_code,
+                        "layers": "parcels,building_footprints,buildings,landuse_polygons",
+                        "include_geometry": "true"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            last_exc = e
+            if status in _CADASTRE_TRANSIENT_STATUS and _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch transient %s (attempt %d/%d), "
+                            "retrying in %.0fs", kg_code, status, _attempt,
+                            _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+            # Non-transient (4xx other than 429) — genuine empty cadastre.
+            log.warning("KG %s: cadastre fetch failed (non-transient): %s", kg_code, e)
+            return result
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch %s (attempt %d/%d), "
+                            "retrying in %.0fs", kg_code, type(e).__name__,
+                            _attempt, _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+        except Exception as e:
+            # JSON decode / unexpected — treat as non-transient.
+            log.warning("KG %s: cadastre fetch failed: %s", kg_code, e)
+            return result
+
+    if data is None:
+        # All retries exhausted on a transient error — flag for requeue.
+        log.error("KG %s: cadastre fetch failed after %d attempts (API overloaded?): %s",
+                  kg_code, _CADASTRE_MAX_ATTEMPTS, last_exc)
+        result["_fetch_failed"] = True
         return result
 
     # Parse parcels
@@ -6628,6 +6678,22 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _parent_code = kg.get("_parent_kg_code", kg_code)
         cadastre_data = fetch_cadastre_data(_parent_code)
 
+        # --- 1.5. Abort + requeue on transient cadastre-API failure ---
+        # The cadastre-process-api can be briefly overloaded (503/timeout).
+        # fetch_cadastre_data() already retried with backoff; if it still
+        # failed it sets _fetch_failed. Proceeding would emit a degraded
+        # KG (GPKG missing the 'parcels'/'buildings' vector layers), which
+        # the validator flags but which still uploads. Abort instead so the
+        # director defers the KG for retry once the API recovers.
+        if cadastre_data.get("_fetch_failed"):
+            log.error("KG %s: aborting — cadastre API unavailable after retries; "
+                      "deferring for retry", kg_code)
+            result["cadastre_failed"] = True
+            result["success"] = False
+            result["error"] = "cadastre-process-api unavailable (overloaded?) after retries"
+            result["step"] = "aborted_cadastre_failed"
+            return result
+
         # --- 1a. Block parcel filtering ---
         # If this is a block (split from a larger KG), filter cadastre
         # to parcels whose centroid falls within the block's bbox.
@@ -10292,6 +10358,7 @@ def main():
                 is_cop_batch_failure = result.get("copernicus_failed", False)
                 is_lidar_failure = result.get("lidar_failed", False)
                 is_ortho_failure = result.get("ortho_failed", False)
+                is_cadastre_failure = result.get("cadastre_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
                 if is_cache_incomplete:
                     # Cache-only peer hit a missing tile.  The KG must be
@@ -10366,6 +10433,23 @@ def main():
                         f"deferred retry in {DEFER_GAP} KGs",
                         kg_code,
                     )
+                elif is_cadastre_failure:
+                    # cadastre-process-api was overloaded/unreachable even
+                    # after in-fetch retries. No tiles were processed yet
+                    # (cadastre is step 1) so there are no checkpoints to
+                    # preserve — just defer and come back once the API
+                    # recovers, rather than emit a parcel-less KG.
+                    log.warning("KG %s: cadastre API unavailable — deferring for retry", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: cadastre API overloaded — "
+                                     f"deferred retry",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _deferred = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
                 elif is_cop_batch_failure:
                     log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
                     progress.add_log("warning",

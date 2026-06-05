@@ -181,14 +181,22 @@ def _streamed_write_layer(
                 elif blend == 'categorical':
                     fw = _feather_weight(th_eff, tw_eff, margin=100)
                     fw_strip = fw[tile_r0:tile_r1, :]
-                    wins = fw_strip > best_w[strip_r0:strip_r1, col_off:col_off + tw_eff]
+                    # Validity gate (same rationale as Phase-A categorical
+                    # stitch / build_full_gpkg_tiled): a high-feather tile's
+                    # empty reprojected corner must not win the overlap seam
+                    # and block a valid lower-feather tile. Validity = band-0
+                    # has data (uint8 != 0 / non-NaN for float).
+                    b0 = bands[0][tile_r0:tile_r1, :tw_eff]
+                    valid = (b0 != 0) if dtype == 'uint8' else ~np.isnan(b0)
+                    _bw = best_w[strip_r0:strip_r1, col_off:col_off + tw_eff]
+                    wins = valid & (fw_strip > _bw)
                     for b in range(n_bands):
                         tile_sl = bands[b][tile_r0:tile_r1, :tw_eff]
                         accum[b, strip_r0:strip_r1, col_off:col_off + tw_eff] = np.where(
                             wins, tile_sl,
                             accum[b, strip_r0:strip_r1, col_off:col_off + tw_eff])
-                    best_w[strip_r0:strip_r1, col_off:col_off + tw_eff] = np.maximum(
-                        best_w[strip_r0:strip_r1, col_off:col_off + tw_eff], fw_strip)
+                    best_w[strip_r0:strip_r1, col_off:col_off + tw_eff] = np.where(
+                        valid, np.maximum(_bw, fw_strip), _bw)
 
                 else:  # overwrite
                     for b in range(n_bands):
@@ -283,7 +291,12 @@ def build_full_gpkg_streamed(
                 type_tile[labels_tile == uid] = obj.type_code
 
         fw = _feather_weight(th_eff, tw_eff, margin=100)
-        wins = fw > best_cat_weight[row_off:r_end, col_off:c_end]
+        # Only a pixel this tile actually segmented (label > 0) may win or raise
+        # the best-weight bar — see austria_processor.build_full_gpkg_tiled for
+        # the rotated-quad NaN-corner rationale (triangle-sliver fix).
+        tile_valid = labels_tile > 0
+        _bw = best_cat_weight[row_off:r_end, col_off:c_end]
+        wins = tile_valid & (fw > _bw)
         labels_full[row_off:r_end, col_off:c_end] = np.where(
             wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
         seg_type_full[row_off:r_end, col_off:c_end] = np.where(
@@ -294,8 +307,8 @@ def build_full_gpkg_streamed(
             seg_height_full[row_off:r_end, col_off:c_end] = np.where(
                 wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
 
-        best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
-            best_cat_weight[row_off:r_end, col_off:c_end], fw)
+        best_cat_weight[row_off:r_end, col_off:c_end] = np.where(
+            tile_valid, np.maximum(_bw, fw), _bw)
 
     del best_cat_weight
 
@@ -344,6 +357,15 @@ def build_full_gpkg_streamed(
         if table_count > 0:
             opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
+            if name == 'segment_type' and dtype == 'uint8':
+                # Colormap BEFORE pixels → palette PNG tiles. See the same block
+                # in austria_processor.build_full_gpkg_tiled._write_table;
+                # order is load-bearing (post-band write is ignored by GDAL).
+                try:
+                    from austria_processor import _segment_type_colormap
+                    dst.write_colormap(1, _segment_type_colormap())
+                except Exception as _e:
+                    log.warning("segment_type colormap write failed: %s", _e)
             for i, arr in enumerate(arrays, 1):
                 band = arr[:h, :w]
                 if dtype == 'float32':

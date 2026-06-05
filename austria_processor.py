@@ -1809,6 +1809,27 @@ SEGMENT_COLORS = {
 }
 
 
+def _segment_type_colormap():
+    """Build a GDAL color table {type_code: (R,G,B,A)} for the segment_type raster.
+
+    Baked into the uint8 ``segment_type`` band via ``dst.write_colormap`` so the
+    GPKG 'tiles' layer renders as a real colour PNG in *any* viewer (QGIS, GDAL,
+    web) — without it the band stores R=G=B=type_code and renders near-black
+    ("empty"). Code 0 (background / no segment) maps to fully transparent.
+    Mirrors the categorized QML written by ``_write_gpkg_all_styles`` so the
+    raster and the paletted style agree.
+    """
+    from object_segmentation import OBJECT_TYPES as _OT
+    cmap = {0: (0, 0, 0, 0)}  # background → transparent
+    for _name, _rgba in SEGMENT_COLORS.items():
+        _code = _OT.get(_name)
+        if _code is None:
+            continue
+        r, g, b, a = _rgba
+        cmap[int(_code)] = (int(r), int(g), int(b), int(a))
+    return cmap
+
+
 def _to_multi(geom_dict: dict) -> dict:
     """Promote a Polygon geometry dict to MultiPolygon for fiona schema compat."""
     if geom_dict and geom_dict.get('type') == 'Polygon':
@@ -3386,6 +3407,16 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         if dtype == 'float32': opts['nodata'] = _GPKG_NODATA
         if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
+            if name == 'segment_type' and dtype == 'uint8':
+                # Bake the type→colour table into the band BEFORE writing pixels
+                # so GDAL emits palette PNG tiles (mode 'P') that render as real
+                # colours in any viewer. Written after the band, GDAL ignores it
+                # for multi-tile rasters and stores grey 'L' tiles (R=G=B=code →
+                # near-black "empty" look). Order is load-bearing.
+                try:
+                    dst.write_colormap(1, _segment_type_colormap())
+                except Exception as _e:
+                    log.warning("segment_type colormap write failed: %s", _e)
             for i, arr in enumerate(arrays, 1):
                 band = arr[:h, :w]
                 if dtype == 'float32':
@@ -3557,7 +3588,14 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                 if obj: type_tile[labels_tile == uid] = obj.type_code
 
             cat_fw = _feather_weight(th_eff, tw_eff, margin=100)
-            wins = cat_fw > best_cat_weight[row_off:r_end, col_off:c_end]
+            # Only a pixel that this tile actually segmented (label > 0) may
+            # win or raise the best-weight bar. Otherwise a high-feather tile's
+            # empty corner (reprojected rotated-quad NaN triangle) would win the
+            # overlap seam and block a valid lower-feather tile, leaving the
+            # tapering triangular slivers seen in segments/segment_height.
+            tile_valid = labels_tile > 0
+            _bw = best_cat_weight[row_off:r_end, col_off:c_end]
+            wins = tile_valid & (cat_fw > _bw)
             labels_full[row_off:r_end, col_off:c_end] = np.where(
                 wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
             seg_type_full[row_off:r_end, col_off:c_end] = np.where(
@@ -3568,8 +3606,8 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                 seg_height_full[row_off:r_end, col_off:c_end] = np.where(
                     wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
 
-            best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
-                best_cat_weight[row_off:r_end, col_off:c_end], cat_fw)
+            best_cat_weight[row_off:r_end, col_off:c_end] = np.where(
+                tile_valid, np.maximum(_bw, cat_fw), _bw)
 
     # ------------------------------------------------------------------
     # Deferred DTM retry: force a bev_proxy pool refresh, then re-attempt
@@ -4164,6 +4202,13 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         if dtype == 'float32': opts['nodata'] = _GPKG_NODATA_L
         if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
         with rasterio.open(out_path, 'w', **opts) as dst:
+            if name == 'segment_type' and dtype == 'uint8':
+                # Colormap BEFORE pixels → palette PNG tiles. See the same block
+                # in build_full_gpkg_tiled._write_table; order is load-bearing.
+                try:
+                    dst.write_colormap(1, _segment_type_colormap())
+                except Exception as _e:
+                    log.warning("segment_type colormap write failed: %s", _e)
             for i, arr in enumerate(arrays, 1):
                 band = arr[:h, :w]
                 if dtype == 'float32':
@@ -4240,7 +4285,12 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     if obj: type_tile[labels_tile == uid] = obj.type_code
 
                 cat_fw = _feather_weight_light(th_eff, tw_eff, margin=100)
-                wins = cat_fw > best_cat_weight[row_off:r_end, col_off:c_end]
+                # Only a pixel this tile actually segmented (label > 0) may win
+                # or raise the best-weight bar — see build_full_gpkg_tiled for the
+                # rotated-quad NaN-corner rationale (triangle-sliver fix).
+                tile_valid = labels_tile > 0
+                _bw = best_cat_weight[row_off:r_end, col_off:c_end]
+                wins = tile_valid & (cat_fw > _bw)
                 labels_full[row_off:r_end, col_off:c_end] = np.where(
                     wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
                 seg_type_full[row_off:r_end, col_off:c_end] = np.where(
@@ -4251,8 +4301,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                     seg_height_full[row_off:r_end, col_off:c_end] = np.where(
                         wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
 
-                best_cat_weight[row_off:r_end, col_off:c_end] = np.maximum(
-                    best_cat_weight[row_off:r_end, col_off:c_end], cat_fw)
+                best_cat_weight[row_off:r_end, col_off:c_end] = np.where(
+                    tile_valid, np.maximum(_bw, cat_fw), _bw)
 
         del best_cat_weight
 

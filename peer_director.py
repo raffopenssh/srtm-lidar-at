@@ -9937,6 +9937,19 @@ class PeerDirector:
                             if _pid not in _live:
                                 _stl_ema.pop(_pid, None)
                         self.state['peer_steal_ema'] = _stl_ema
+                except RuntimeError as _re:
+                    # ``cannot schedule new futures after interpreter
+                    # shutdown`` fires when an *old* gunicorn worker is
+                    # mid-teardown during a srv restart but its loop
+                    # thread hasn't been joined yet. Benign — the new
+                    # worker's loop takes over. Self-stop quietly
+                    # instead of dumping a scary traceback every tick.
+                    if 'interpreter shutdown' in str(_re):
+                        log.info('director loop: interpreter shutting down '
+                                 '— stopping capacity poll')
+                        self._running = False
+                        return
+                    log.exception('capacity factor computation failed')
                 except Exception:
                     log.exception('capacity factor computation failed')
                 with self._lock:

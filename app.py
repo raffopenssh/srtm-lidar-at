@@ -777,6 +777,34 @@ def _persist_tombstones_merged() -> None:
             pass
 
 
+def _reload_tombstones_from_disk() -> None:
+    """Union on-disk tombstones into the in-memory ``_MANIFEST_TOMBSTONES``.
+
+    gunicorn runs 2 workers, each with its own in-memory tombstone dict.
+    A DELETE / requeue served by worker A writes a tombstone to disk, but
+    worker B's in-memory dict never learns about it — so worker B's manifest
+    re-merge gates (``api_manifest_push`` peer fast-path, ``api_manifest_
+    reconcile``, and the periodic peer-sync loop) would happily re-import a
+    peer's still-present orphan entry, undoing the operator's deletion within
+    a minute. Re-reading disk (union, newest ISO ts wins) at the top of every
+    re-merge gate makes the gate cross-worker-correct without any shared
+    memory. Cheap (~few KB JSON) and union-only, so it can never drop a
+    tombstone this worker added but hasn't persisted.
+    """
+    with _TOMBSTONE_LOCK:
+        try:
+            if not _tombstone_path.exists():
+                return
+            d = json.loads(_tombstone_path.read_text())
+        except Exception:
+            return
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if str(v) > str(_MANIFEST_TOMBSTONES.get(k, '')):
+                _MANIFEST_TOMBSTONES[k] = v
+
+
 def _sync_peer_data():
     """Background thread: sync KG JSONs and manifest entries from peers."""
     import requests as req
@@ -812,6 +840,13 @@ def _sync_peer_data():
             if not peer_urls:
                 time.sleep(300)
                 continue
+
+            # Cross-worker correctness: pick up tombstones the *other*
+            # gunicorn worker wrote to disk (DELETE / requeue) before we
+            # gate this cycle's peer manifest re-merge. Without this, a
+            # just-deleted orphan entry that peers still hold gets
+            # re-imported here within ~1 sync tick.
+            _reload_tombstones_from_disk()
 
             new_count = 0
             merged_manifest_entries = {}
@@ -4557,6 +4592,12 @@ def api_manifest_push():
         return jsonify({'error': 'key and entry required'}), 400
     new_ts = entry.get('uploaded_at') or ''
 
+    # Cross-worker correctness: a tombstone written by the other gunicorn
+    # worker (DELETE / requeue) lives on disk but not in this worker's
+    # memory. Union it in before gating, else this fast-path re-merges a
+    # peer's stale orphan entry seconds after an operator deleted it.
+    _reload_tombstones_from_disk()
+
     # Tombstone gate: stale entries (older than tombstone) are rejected.
     tomb_ts = _MANIFEST_TOMBSTONES.get(key) or ''
     if tomb_ts and new_ts and new_ts <= tomb_ts:
@@ -4659,6 +4700,8 @@ def api_manifest_reconcile():
         except Exception:
             local = {}
 
+    # Cross-worker correctness: union in tombstones the other worker wrote.
+    _reload_tombstones_from_disk()
     added = updated = blocked = 0
     import re as _re2
     for key, entry in best.items():

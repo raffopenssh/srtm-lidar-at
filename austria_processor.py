@@ -8747,9 +8747,21 @@ def _clear_tombstones(kg_code: str):
         from kg_splitter import is_block_code, parent_kg_code
         _prefixes = [kg_code + '_']
         if is_block_code(kg_code):
+            # A block finished: also clear parent-prefixed tombstones, but
+            # NOT sibling blocks (they may still be legitimately pending).
             _prefixes.append(parent_kg_code(kg_code) + '_')
-        keys_to_remove = [k for k in tombstones
-                          if any(k.startswith(p) for p in _prefixes)]
+            keys_to_remove = [k for k in tombstones
+                              if any(k.startswith(p) for p in _prefixes)]
+        else:
+            # A *whole* KG finished (processed unsplit). This supersedes any
+            # orphan block-suffixed tombstones left over from an earlier,
+            # abandoned split attempt of the same KG (e.g. '45005-south_*'
+            # stranded when the redo runs '45005' unsplit). Match both the
+            # 'NNNNN_' product prefix and the 'NNNNN-' block prefix.
+            _block_prefix = kg_code + '-'
+            keys_to_remove = [k for k in tombstones
+                              if any(k.startswith(p) for p in _prefixes)
+                              or k.startswith(_block_prefix)]
         if not keys_to_remove:
             return
         for k in keys_to_remove:

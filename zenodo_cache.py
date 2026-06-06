@@ -1320,6 +1320,78 @@ class ZenodoCache:
                                  else _NULL_CTX())
                 try:
                     with _zip_lock_ctx:
+                        # RACE GUARD (parallel-frontier lost-update).
+                        # The remote read + merge above ran OUTSIDE the
+                        # global upload lease, so another peer may have
+                        # uploaded tiles into this same ZIP while we were
+                        # building ours. Overwriting now would clobber
+                        # their tiles. Re-read the remote central
+                        # directory *under the lease* and append any
+                        # entries we don't already carry before the
+                        # upload. Harmless with a single active frontier;
+                        # load-bearing with N parallel ones (the cache
+                        # was flatlining because uploads stomped each
+                        # other). The heavy local-zip build stays outside
+                        # the lock — only this cheap reconcile (a few
+                        # newly-arrived tiles at most) is serialised.
+                        try:
+                            self.manifest.reload_if_changed()
+                            if self.manifest.get_file(zip_name):
+                                self._zip_indices.pop(zip_name, None)
+                                self._missing_zips.discard(zip_name)
+                                fresh_idx = self._get_zip_index(zip_name)
+                                if fresh_idx is not None:
+                                    # Force re-fetch of the central dir —
+                                    # the on-disk idx cache is keyed by
+                                    # URL (stable per filename) and is now
+                                    # stale if a peer just rewrote the ZIP.
+                                    fresh_idx.invalidate()
+                                    try:
+                                        fresh_names = set(
+                                            fresh_idx.list_entries())
+                                    except Exception:
+                                        fresh_names = set()
+                                    have = (set(local_entries)
+                                            | set(remote_data))
+                                    newly = fresh_names - have
+                                    added = 0
+                                    if newly:
+                                        with zipfile.ZipFile(
+                                                zip_path, "a",
+                                                zipfile.ZIP_DEFLATED) as zf:
+                                            for rname in newly:
+                                                try:
+                                                    data = fresh_idx.read_entry(
+                                                        rname)
+                                                except Exception:
+                                                    continue
+                                                if not data:
+                                                    continue
+                                                ok, reason = validate_tile_npz(
+                                                    data, product)
+                                                if not ok:
+                                                    stats["tiles_rejected"] = (
+                                                        stats.get(
+                                                            "tiles_rejected", 0)
+                                                        + 1)
+                                                    _log_pollution_event(
+                                                        product, rname, reason,
+                                                        "remote_merge_relock")
+                                                    continue
+                                                zf.writestr(rname, data)
+                                                added += 1
+                                    if added:
+                                        merged_count += added
+                                        stats["tiles_total"] += added
+                                        log.info(
+                                            "Race guard: merged %d tile(s) "
+                                            "uploaded by another peer into %s "
+                                            "before overwrite", added, zip_name)
+                        except Exception as exc:
+                            log.warning(
+                                "Race-guard reconcile for %s failed "
+                                "(uploading as-is): %s", zip_name, exc)
+
                         result = self._upload_file(depo_id, zip_path, zip_name)
                         checksum = result.get("checksum", "")
                         from datetime import datetime, timezone

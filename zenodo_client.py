@@ -1260,6 +1260,32 @@ class Client:
 
         existing = manifest.get(key)
 
+        # Guard against a deleted/vanished deposition. An operator (or the
+        # orphan-tombstone cleanup) may have deleted the draft this manifest
+        # entry points at. Reusing it then 404-wedges: every PUT to the dead
+        # bucket fails (`depo_status:404`) and the 6-attempt retry chain just
+        # spins for ~10 min before giving up, leaving the KG un-uploaded and
+        # the peer stuck re-trying forever on subsequent runs. Probe the
+        # deposition first; if it's gone, drop the stale manifest pointer and
+        # fall through to create a fresh deposit.
+        if existing is not None and existing.depo_id:
+            try:
+                self._do_request(
+                    "GET",
+                    self._url(f"/api/deposit/depositions/{existing.depo_id}"),
+                    max_retries=0,
+                )
+            except ZenodoError as exc:
+                if exc.status_code == 404:
+                    log.warning(
+                        "Existing deposition %d for key=%s is gone (404) — "
+                        "creating a fresh deposit instead of re-uploading to a "
+                        "dead bucket", existing.depo_id, key,
+                    )
+                    existing = None
+                # Non-404 (transient/auth) errors: keep the existing pointer
+                # and let the normal replace path + its retries handle it.
+
         if existing is not None and existing.depo_id:
             # ------ update existing deposition ----------------------------
             log.info(

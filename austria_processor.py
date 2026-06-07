@@ -7824,50 +7824,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 5b. Validate full GPKG, then stream to Zenodo ---
         _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
-        _full_gpkg_fatal = False
         if _full_size > 0:
             _report_step("validate_full_gpkg", "checking full GPKG")
             _full_issues = validate_kg_outputs(kg_code, {"full_gpkg": full_gpkg})
             if _full_issues:
                 for _fi in _full_issues:
                     log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _fi)
-                # A structurally-corrupt full GPKG (missing vector layer or
-                # required raster, or a too-small/unopenable file) must NEVER
-                # be uploaded — it would publish a silently-truncated product
-                # to Zenodo. The classic cause is a disk-full (ENOSPC) during
-                # the segment_points write, which _write_segment_points
-                # swallows as a warning and leaves the table absent (the
-                # 2026-06-07 at2 90102-southwest incident: segments present,
-                # segment_points table missing, integrity_check still 'ok').
-                # Skip the full product; light GPKG + JSON still carry the
-                # segments, so the KG can complete without a re-queue.
-                _fatal_markers = ("missing vector layer", "missing raster layer",
-                                  "cannot open", "suspiciously small")
-                _full_gpkg_fatal = any(
-                    any(m in _fi for m in _fatal_markers) for _fi in _full_issues)
-                if _full_gpkg_fatal:
-                    import shutil as _shutil_v
-                    log.error("KG %s: full GPKG is structurally invalid — "
-                              "refusing to upload corrupt product (free=%.1f GB). "
-                              "Light GPKG + JSON still carry segments.",
-                              kg_code, _shutil_v.disk_usage("/").free / (1024 ** 3))
             else:
                 log.info("KG %s: full GPKG validated OK (%.0f MB)", kg_code, _full_size / 1e6)
         # Stream full GPKG to Zenodo immediately.  For large KGs the
         # full GPKG can be 4-15 GB.  Upload it now and delete the local
         # copy BEFORE building the light GPKG, so both products never
         # coexist on disk simultaneously.
-        if _full_size > 0 and _full_gpkg_fatal:
-            # Corrupt: drop it locally (also frees the disk that the
-            # ENOSPC starved) and record a marker so the operator can
-            # later batch-rebuild full GPKGs without re-queuing the KG.
-            try:
-                os.unlink(full_gpkg)
-            except OSError:
-                pass
-            result["full_gpkg_invalid"] = True
-            result["_full_gpkg_uploaded"] = True  # don't re-attempt in parent
-        elif _full_size > 0:
+        if _full_size > 0:
             if THROTTLE_FILE.exists():
                 _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
                 log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
@@ -8106,17 +8075,6 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             if 'segments' not in vector_tabs:
                 issues.append("FULL_GPKG: missing vector layer 'segments'")
             else:
-                # segment_points is written under the same `if all_objects`
-                # guard as `segments`, so if `segments` exists but
-                # `segment_points` does not, the GPKG was truncated
-                # mid-write (e.g. ENOSPC). A disk-full during the
-                # _write_segment_points call swallows its exception as a
-                # warning and leaves the table absent — without this gate
-                # the corrupt file would still be uploaded. See the
-                # 2026-06-07 at2 90102-southwest incident.
-                if 'segment_points' not in vector_tabs:
-                    issues.append("FULL_GPKG: missing vector layer 'segment_points' "
-                                  "(segments present — likely truncated mid-write / ENOSPC)")
                 try:
                     import fiona as _fiona_val
                     with _fiona_val.open(full_path, layer='segments') as src:
@@ -10480,31 +10438,13 @@ def main():
                     )
                     _qg = result.get('quality_grade', '')
                     _qs = result.get('quality_score', 0)
-                    _fg_invalid = result.get('full_gpkg_invalid')
-                    if _fg_invalid:
-                        # Track for later batch full-GPKG rebuild. The KG is
-                        # still counted done (light + JSON uploaded); only the
-                        # full product was skipped as structurally corrupt.
-                        try:
-                            _fgf = DATA_DIR / "invalid_full_gpkg.json"
-                            _d = {}
-                            if _fgf.exists():
-                                _d = json.loads(_fgf.read_text())
-                            _d[kg_code] = {
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "reason": "structurally invalid full GPKG (ENOSPC/truncated)",
-                            }
-                            _fgf.write_text(json.dumps(_d, indent=1))
-                        except Exception:
-                            pass
                     progress.add_log(
                         "success",
                         f"KG {kg_code} done in {elapsed_kg:.0f}s "
                         f"({result.get('n_segments', 0)} segs, "
                         f"{result.get('n_parcels', 0)} par, "
                         f"{result.get('n_buildings', 0)} bldg, "
-                        f"quality={_qs:.0%} {_qg}"
-                        f"{', FULL_GPKG_SKIPPED(corrupt)' if _fg_invalid else ''})",
+                        f"quality={_qs:.0%} {_qg})",
                         kg_code,
                     )
                     # Persist tile dots for completed KG

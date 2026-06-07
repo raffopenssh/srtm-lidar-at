@@ -543,6 +543,22 @@ def check_disk_space(current_kg_code: str = "") -> bool:
             except Exception:
                 in_prog = ""
             keep_codes: set[str] = {in_prog} if in_prog else set()
+            # ALWAYS protect the KG we were explicitly told we're working
+            # on, plus its parent/blocks if it's a split block. The
+            # IN_PROGRESS_FILE marker can briefly lag the actual KG
+            # (written just after the per-KG disk check) and the GPKG-build
+            # eviction calls us mid-KG from the subprocess; dropping the
+            # live KG's tile checkpoints here would force a full re-fetch
+            # of every tile we already paid for.
+            if current_kg_code:
+                keep_codes.add(current_kg_code)
+                try:
+                    from kg_splitter import (is_block_code as _is_blk,
+                                             parent_kg_code as _parent_of)
+                    if _is_blk(current_kg_code):
+                        keep_codes.add(_parent_of(current_kg_code))
+                except Exception:
+                    pass
             try:
                 if RETRY_QUEUE_FILE.exists():
                     keep_codes.update(json.loads(RETRY_QUEUE_FILE.read_text() or "[]"))
@@ -7751,13 +7767,30 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _report_step("disk_cleanup", "freeing disk for GPKG build")
         try:
             import shutil as _shutil_ev
-            # Evict BEV + ortho caches (cheap to re-fetch via COG range reads)
+            # Budget for the GPKG build phase. The *final* full GPKG is
+            # ~20 bytes/px, but SQLite needs substantially more transient
+            # working space while building it: the R-tree spatial index,
+            # the gpkg_ogr_contents triggers, and the rollback/WAL journal
+            # can transiently hold 1.5-2x the final file on top of the
+            # file itself. We also build the light GPKG (segments +
+            # parcels + buildings) right after, before the full GPKG's
+            # local copy is always freed. Underestimating here is what let
+            # at2 hit `database or disk is full` mid-segment_points on KG
+            # 90102-southwest (2026-06-07) with a 1.5 GB final file and
+            # 3.2 GB free — the build peaked above the old
+            # `final + 2 GB` budget. Use a multiplier + larger fixed
+            # headroom so the eviction actually triggers in time.
+            _GPKG_BUILD_MULTIPLIER = 2.5   # transient SQLite working space
+            _GPKG_BUILD_HEADROOM_GB = 4.0  # light GPKG + journal + slack
             _usage = _shutil_ev.disk_usage("/")
             _free_gb = _usage.free / (1024 ** 3)
-            _estimated_gpkg_gb = _n_pixels * 20 / 1e9  # ~20 bytes/px for full GPKG
-            if _free_gb < _estimated_gpkg_gb + 2.0:  # need headroom
-                log.info("  Disk: %.1f GB free, need ~%.1f GB for GPKG — evicting caches",
-                         _free_gb, _estimated_gpkg_gb)
+            _final_gpkg_gb = _n_pixels * 20 / 1e9  # final full GPKG size
+            _need_gb = _final_gpkg_gb * _GPKG_BUILD_MULTIPLIER + _GPKG_BUILD_HEADROOM_GB
+            if _free_gb < _need_gb:
+                log.info("  Disk: %.1f GB free, need ~%.1f GB for GPKG build "
+                         "(final~%.1f GB × %.1f + %.1f GB headroom) — evicting caches",
+                         _free_gb, _need_gb, _final_gpkg_gb,
+                         _GPKG_BUILD_MULTIPLIER, _GPKG_BUILD_HEADROOM_GB)
                 for _cache_name in ["bev_tile_cache", "ortho_tile_cache",
                                     "copernicus_tiles", "hansen_tiles"]:
                     _cache_dir = DATA_DIR / _cache_name
@@ -7773,7 +7806,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                         pass
                             log.info("    Evicted %s (%.0f MB)", _cache_name, _csz / 1e6)
                 _usage2 = _shutil_ev.disk_usage("/")
-                log.info("  Disk after eviction: %.1f GB free", _usage2.free / (1024 ** 3))
+                _free_after = _usage2.free / (1024 ** 3)
+                log.info("  Disk after eviction: %.1f GB free", _free_after)
+                # If the cheap caches weren't enough, fall back to the
+                # full tiered cleanup: it flushes the tile cache to Zenodo
+                # (so tiles are restorable via HTTP range reads) before
+                # evicting the expensive openEO/Hansen caches, and purges
+                # stale tile_checkpoint dirs. This is the last line of
+                # defence against an ENOSPC mid-build.
+                if _free_after < _need_gb:
+                    log.warning("  Disk still tight (%.1f GB < %.1f GB needed) "
+                                "after cheap eviction — running tiered cleanup",
+                                _free_after, _need_gb)
+                    try:
+                        check_disk_space(current_kg_code=kg_code)
+                        _usage3 = _shutil_ev.disk_usage("/")
+                        log.info("  Disk after tiered cleanup: %.1f GB free",
+                                 _usage3.free / (1024 ** 3))
+                    except Exception as _tc_e:
+                        log.warning("  Tiered cleanup failed: %s", _tc_e)
         except Exception as _ev_e:
             log.warning("  Cache eviction failed: %s", _ev_e)
 

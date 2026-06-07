@@ -369,11 +369,11 @@ class CopernicusTileCache:
                 try:
                     from zenodo_cache import (_cell_for_bbox, _zip_filename,
                                               _npz_entry_name,
-                                              _legacy_strip_zip_for)
+                                              _legacy_strip_zips_for_cell)
                     bs, bn, bw, be = _cell_for_bbox(cs, cw)
                     candidates = [
                         _zip_filename(product, bs, bn, bw, be),
-                        _legacy_strip_zip_for(product, bs),
+                        *_legacy_strip_zips_for_cell(product, bs),
                     ]
                     seen_c = set()
                     candidates = [c for c in candidates
@@ -1106,11 +1106,11 @@ class HansenTileCache:
                 try:
                     from zenodo_cache import (_cell_for_bbox, _zip_filename,
                                               _npz_entry_name,
-                                              _legacy_strip_zip_for)
+                                              _legacy_strip_zips_for_cell)
                     bs, bn, bw, be = _cell_for_bbox(cs, cw)
                     candidates = [
                         _zip_filename("hansen", bs, bn, bw, be),
-                        _legacy_strip_zip_for("hansen", bs),
+                        *_legacy_strip_zips_for_cell("hansen", bs),
                     ]
                     seen_c = set()
                     candidates = [c for c in candidates

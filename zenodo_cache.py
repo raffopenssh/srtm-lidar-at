@@ -195,13 +195,39 @@ def _zip_filename(product: str, *cell: float) -> str:
 def _legacy_strip_zip_for(product: str, lat_south: float) -> str:
     """Filename of the legacy 0.5° lat-strip ZIP that may contain a tile.
 
-    Old deposits used STRIP_HEIGHT=0.5; this returns BOTH possible
-    legacy filenames (the 0.5° step that the lat falls into).
-    Returned as a list so callers can probe each.
+    Old deposits used STRIP_HEIGHT=0.5; this snaps *lat_south* to that
+    grid and returns the single 0.5° strip ZIP it falls into.
+
+    WARNING: callers that pass a 1° *cell* south (an integer degree) only
+    ever get the LOWER half-strip back, so tiles physically stored in the
+    upper half-strip (e.g. ``strip_47.5_48.0``) are invisible. Use
+    ``_legacy_strip_zips_for_cell`` on the read path to probe BOTH halves.
     """
     # Pre-migration step was 0.5° -- snap the input lat to that grid.
     base = math.floor(lat_south / 0.5) * 0.5
     return _zip_filename(product, round(base, 4), round(base + 0.5, 4))
+
+
+def _legacy_strip_zips_for_cell(product: str, cell_south: float) -> List[str]:
+    """Both legacy 0.5° strip ZIPs spanning a 1° bundle cell.
+
+    A 1° cell ``[cell_south, cell_south+1)`` overlaps two pre-migration
+    0.5° strips: ``[cell_south, cell_south+0.5)`` and
+    ``[cell_south+0.5, cell_south+1)``. The read path must probe BOTH,
+    because before the cell layout tiles were grouped into true 0.5°
+    strips (so an upper tile lives in the upper strip), AND the
+    cell-era writer dumps a whole 1° cell's tiles into whichever single
+    legacy strip already exists. Either way the actual NPZ entry name
+    encodes the tile's real latitude, so probing both halves never
+    yields a false positive.
+    """
+    base = math.floor(cell_south / 0.5) * 0.5
+    out = [
+        _zip_filename(product, round(base, 4), round(base + 0.5, 4)),
+        _zip_filename(product, round(base + 0.5, 4), round(base + 1.0, 4)),
+    ]
+    seen: set = set()
+    return [z for z in out if not (z in seen or seen.add(z))]
 
 
 def _npz_entry_name(product: str, w: float, s: float, e: float, n: float,
@@ -1508,7 +1534,7 @@ class ZenodoCache:
         cs, cn, cw, ce = _cell_for_bbox(s, w)
         candidates = [
             _zip_filename(product, cs, cn, cw, ce),
-            _legacy_strip_zip_for(product, cs),
+            *_legacy_strip_zips_for_cell(product, cs),
         ]
         seen = set()
         candidates = [c for c in candidates if not (c in seen or seen.add(c))]
@@ -1586,7 +1612,7 @@ class ZenodoCache:
         cs, cn, cw, ce = _cell_for_bbox(s, w)
         candidates = [
             _zip_filename("hansen", cs, cn, cw, ce),
-            _legacy_strip_zip_for("hansen", cs),
+            *_legacy_strip_zips_for_cell("hansen", cs),
         ]
         seen = set()
         candidates = [c for c in candidates if not (c in seen or seen.add(c))]

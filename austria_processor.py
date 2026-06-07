@@ -214,6 +214,167 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
         return False
 
 
+# === SECTION: Frontier cell pre-warm (Fix #2) ===
+#
+# A frontier only fetches the ~5-15 0.1° tiles for the KG it processes, so
+# the shared Zenodo tile cache never fills densely enough for a cache-only
+# peer to find a *whole* KG ready (is_kg_fully_cached needs every product
+# for every 0.1° cell of the KG). After each successful frontier KG we
+# proactively complete a small, bounded batch of still-uncached 0.1° cells
+# *within this peer's own KG_CELL_FILTER cell* across all 5 products
+# (ndvi/worldcover/sar/harmonics + hansen), then flush to Zenodo.
+#
+# This is gated entirely by the director (demand-side trigger
+# cache_ready_kgs<100 AND supply-side Copernicus-health gate), shipped to
+# peers as a 'prewarm' block in the synced cache_manifest.json. No restart,
+# no new endpoint, no new traffic.
+
+def _read_prewarm_flag() -> dict:
+    """Read the director-synced prewarm directive from cache_manifest.json.
+
+    Returns ``{}`` (disabled) on any error. Shape written by the director:
+    ``{"enabled": bool, "cells_per_kg": int, "updated_at": iso}``.
+    """
+    try:
+        p = DATA_DIR / "cache_manifest.json"
+        if not p.exists():
+            return {}
+        pw = (json.loads(p.read_text()) or {}).get("prewarm") or {}
+        return pw if isinstance(pw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _owning_cell_for_kg(kg: dict) -> tuple | None:
+    """Return this peer's KG_CELL_FILTER cell (s,n,w,e) containing *kg*.
+
+    Only frontier peers carry a cell filter; cache-only peers and an
+    unfiltered processor return None (caller skips pre-warm).
+    """
+    raw = os.environ.get("KG_CELL_FILTER", "").strip()
+    if not raw:
+        return None
+    try:
+        cells = [(float(s), float(n), float(w), float(e))
+                 for s, n, w, e in json.loads(raw)]
+    except Exception:
+        return None
+    bb = kg.get("bbox") or {}
+    s = bb.get("min_lat"); n = bb.get("max_lat")
+    w = bb.get("min_lon"); e = bb.get("max_lon")
+    if None in (s, n, w, e):
+        return None
+    lat_mid = 0.5 * (s + n)
+    lon_mid = 0.5 * (w + e)
+    for cs, cn, cw, ce in cells:
+        if (cs - 1e-9 <= lat_mid < cn - 1e-9
+                and cw - 1e-9 <= lon_mid < ce - 1e-9):
+            return (cs, cn, cw, ce)
+    return None
+
+
+def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
+    """Densify the shared Zenodo cache around a just-completed frontier KG.
+
+    Walks the 0.1° grid of this peer's owning KG_CELL_FILTER cell, and for
+    a bounded number of *fully-uncached* cells fetches all Copernicus
+    products (ndvi/worldcover/sar/harmonics) + the parent Hansen tile, so
+    each touched 0.1° cell becomes wholly cache-ready. Then flushes.
+
+    No-op (returns 0) when:
+      * cache-only peer (``COPERNICUS_FORBIDDEN``) — can't fetch, and
+      * the director hasn't enabled warming, or
+      * this processor has no owning cell.
+
+    Bounds work to ``cells_per_kg`` (director-scaled by Copernicus health).
+    Honours CreditsExhausted / IPThrottled / CacheMiss by stopping early.
+    """
+    if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
+        return 0
+    flag = _read_prewarm_flag()
+    if not flag.get("enabled"):
+        return 0
+    budget = int(flag.get("cells_per_kg", 0) or 0)
+    if budget <= 0:
+        return 0
+    cell = _owning_cell_for_kg(kg)
+    if cell is None:
+        return 0
+    cs, cn, cw, ce = cell
+
+    from tile_cache import CacheMissError
+    try:
+        from copernicus import CreditsExhaustedError, IPThrottledError
+    except Exception:
+        class CreditsExhaustedError(Exception):
+            pass
+        class IPThrottledError(Exception):
+            pass
+
+    cop = _get_cop_cache()
+    hc = _get_hansen_cache()
+    step = 0.1
+    done = 0
+
+    # Iterate the cell's 0.1° grid in deterministic (row-major) order so
+    # repeated calls march through the grid, skipping cells already filled
+    # by earlier completions. Skip-check uses local_ok=True: a cell already
+    # on this peer's disk should not consume the per-KG fetch budget. Such
+    # local-but-not-yet-Zenodo cells are still pushed to the fleet because
+    # flush_tile_cache_to_zenodo(force=True) below uploads the whole local
+    # cache, not just what we fetched this call.
+    lat = round(cs, 4)
+    while lat < cn - 1e-9 and done < budget:
+        lon = round(cw, 4)
+        while lon < ce - 1e-9 and done < budget:
+            csub = {"west": round(lon, 4), "south": round(lat, 4),
+                    "east": round(lon + step, 4), "north": round(lat + step, 4)}
+            already = False
+            try:
+                already = cop.has_cached(
+                    csub, ndvi=True, landcover=True, sar=True,
+                    harmonics=True, year=obs_year, local_ok=True)
+            except Exception:
+                already = False
+            if already:
+                lon = round(lon + step, 4)
+                continue
+            try:
+                cop.get_ndvi(csub, year=obs_year)
+                cop.get_landcover(csub)
+                cop.get_sar(csub, year=obs_year)
+                cop.get_harmonics(csub, year=obs_year)
+                try:
+                    hc.get_raw((csub["west"], csub["south"],
+                                csub["east"], csub["north"]))
+                except Exception as he:
+                    log.debug("prewarm: hansen cell skipped: %s", he)
+                done += 1
+            except (CreditsExhaustedError, IPThrottledError) as e:
+                log.info("prewarm: stopping early (Copernicus throttled/exhausted): %s", e)
+                lat = cn  # break outer
+                break
+            except CacheMissError:
+                # Shouldn't happen off-cache-only, but be defensive.
+                lat = cn
+                break
+            except Exception as e:
+                log.debug("prewarm: cell %.2f,%.2f fetch failed: %s",
+                          csub["west"], csub["south"], e)
+            lon = round(lon + step, 4)
+        lat = round(lat + step, 4)
+
+    if done > 0:
+        log.info("prewarm: filled %d 0.1° cell(s) in cell "
+                 "[%.0f,%.0f,%.0f,%.0f] after KG %s; flushing",
+                 done, cs, cn, cw, ce, kg.get("kg_code", "?"))
+        try:
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as e:
+            log.warning("prewarm: flush failed: %s", e)
+    return done
+
+
 def check_disk_space(current_kg_code: str = "") -> bool:
     """Check free disk space and clean caches if below threshold.
 
@@ -7845,6 +8006,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 flush_tile_cache_to_zenodo()  # honours interval
         except Exception as _zfe:
             log.debug("Zenodo cache flush at KG end: %s", _zfe)
+
+        # Fix #2: frontier cell pre-warm. Proactively densify the shared
+        # Zenodo cache around this peer's owning cell so cache-only peers
+        # can find whole KGs ready. Gated + bounded by the director via
+        # the synced 'prewarm' flag; no-op in cache-only mode.
+        try:
+            prewarm_cell_tiles(kg, obs_year)
+        except Exception as _pwe:
+            log.debug("Frontier cell pre-warm at KG end: %s", _pwe)
 
     except Exception as e:
         result["error"] = str(e)

@@ -2898,6 +2898,17 @@ def processing_cache_manifest():
         if manifest_path.exists():
             local = json.loads(manifest_path.read_text())
 
+        # Adopt the frontier cell pre-warm directive from the incoming
+        # manifest. Only the director writes it (Fix #2); it rides this
+        # sync to every peer so the processor can read it with no restart.
+        # Newest updated_at wins so a stale push can't revert it.
+        if isinstance(incoming.get('prewarm'), dict):
+            inc_pw = incoming['prewarm']
+            loc_pw = local.get('prewarm') if isinstance(
+                local.get('prewarm'), dict) else {}
+            if inc_pw.get('updated_at', '') >= loc_pw.get('updated_at', ''):
+                local['prewarm'] = inc_pw
+
         # Always adopt depo_id / record_id from the incoming manifest.
         # The primary is the authority — peers must use the shared deposit.
         if incoming.get('depo_id'):

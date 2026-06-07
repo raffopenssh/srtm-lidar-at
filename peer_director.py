@@ -187,6 +187,25 @@ MIN_RESERVE_PEERS = 0
 # from spinning up an absurd number of peers if min_reserve is misset.
 MAX_CACHE_ONLY_PEERS = 64
 
+# === Frontier cell pre-warm (Fix #2) ===
+# A frontier only fetches the handful of 0.1° tiles its KG needs, so the
+# shared Zenodo cache never fills densely enough for a cache-only peer to
+# find a *whole* KG ready. We let each frontier proactively densify the
+# Zenodo cache around its own cell after every successful KG. The trigger
+# is demand-side (too few cache-ready KGs); a Copernicus-health gate is the
+# supply-side brake. The flag rides the existing cache_manifest.json sync
+# to peers (no restart, no new endpoint).
+#
+# Enable warming only while the cache-only fleet is starved:
+PREWARM_CACHE_READY_LOW = 100     # enable when cache_ready_kgs < this
+PREWARM_CACHE_READY_HIGH = 150    # disable again above this (hysteresis)
+# Supply-side gate: only warm when Copernicus is healthy.
+PREWARM_COP_EMA_MIN = 0.8         # require sub_factor_ema['copernicus'] >=
+# Bounded extra fetches per completed frontier KG, scaled by Copernicus
+# health between MIN and MAX (a 0.1° cell = 4 Copernicus products + Hansen).
+PREWARM_CELLS_PER_KG_MAX = 8
+PREWARM_CELLS_PER_KG_MIN = 2
+
 # Per-peer circuit breaker. Each peer has a (failure_count, open_until)
 # tuple. After CB_OPEN_THRESHOLD consecutive failures across *any*
 # director-outbound HTTP call, the peer is skipped for CB_OPEN_SECONDS
@@ -8039,6 +8058,83 @@ class PeerDirector:
         common = set.intersection(*[per_product[p] for p in required])
         return sorted(common)
 
+    def _update_prewarm_flag(self, cache_ready_count: int):
+        """Set the frontier cell pre-warm directive in cache_manifest.json.
+
+        Demand-side TRIGGER: enable while ``cache_ready_count`` is below
+        ``PREWARM_CACHE_READY_LOW`` (hysteresis off above
+        ``PREWARM_CACHE_READY_HIGH``) — i.e. when the cache-only fleet is
+        starved for ready KGs.
+
+        Supply-side GATE: only enable when Copernicus is healthy
+        (``sub_factor_ema['copernicus'] >= PREWARM_COP_EMA_MIN`` AND not
+        circuit-paused). ``cells_per_kg`` scales with the Copernicus EMA so
+        we back off the extra fetches as upstream pressure rises — mirrors
+        how ``_max_cache_only_peers`` damps on ``cpu_factor``.
+
+        Written into the manifest under ``prewarm`` so it rides the
+        existing primary→peer cache_manifest sync (no restart, no new
+        endpoint). Idempotent: only rewrites when the directive changes.
+        """
+        try:
+            cop_ema = float(self._sub_factor_ema.get('copernicus',
+                                                     THROTTLE_MAX_FACTOR))
+        except Exception:
+            cop_ema = THROTTLE_MAX_FACTOR
+        cop_paused = (DATA_DIR / 'copernicus_paused').exists()
+
+        # Hysteresis on the demand trigger using the last-published state.
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        prev = {}
+        try:
+            if manifest_path.exists():
+                prev = (json.loads(manifest_path.read_text())
+                        .get('prewarm') or {})
+        except Exception:
+            prev = {}
+        was_on = bool(prev.get('enabled'))
+        if was_on:
+            demand = cache_ready_count < PREWARM_CACHE_READY_HIGH
+        else:
+            demand = cache_ready_count < PREWARM_CACHE_READY_LOW
+
+        supply_ok = (cop_ema >= PREWARM_COP_EMA_MIN) and not cop_paused
+        enabled = bool(demand and supply_ok)
+
+        if enabled:
+            span = PREWARM_CELLS_PER_KG_MAX - PREWARM_CELLS_PER_KG_MIN
+            # Linear ramp from MIN (at the gate threshold) to MAX (at 1.0).
+            frac = (cop_ema - PREWARM_COP_EMA_MIN) / max(
+                1e-6, (THROTTLE_MAX_FACTOR - PREWARM_COP_EMA_MIN))
+            frac = max(0.0, min(1.0, frac))
+            cells = PREWARM_CELLS_PER_KG_MIN + int(round(span * frac))
+        else:
+            cells = 0
+
+        # No-op if unchanged (avoid churning the manifest mtime + sync).
+        if (was_on == enabled
+                and int(prev.get('cells_per_kg', 0) or 0) == cells):
+            return
+        try:
+            data = {}
+            if manifest_path.exists():
+                data = json.loads(manifest_path.read_text())
+            data['prewarm'] = {
+                'enabled': enabled,
+                'cells_per_kg': cells,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(manifest_path) + '.prewarm.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+            log.info('prewarm flag: enabled=%s cells_per_kg=%d '
+                     '(cache_ready=%d cop_ema=%.2f paused=%s)',
+                     enabled, cells, cache_ready_count, cop_ema, cop_paused)
+        except Exception as e:
+            log.debug('prewarm flag write failed: %s', e)
+
     def _compute_cache_ready_kgs(self, max_kgs: int = 200) -> list[str]:
         """Return KG codes that are fully present in the local+Zenodo cache.
 
@@ -10056,6 +10152,16 @@ class PeerDirector:
                     self._orchestrate_cache_only()
                 except Exception:
                     log.exception('Cache-only orchestration error')
+                # Fix #2: publish the frontier cell pre-warm directive
+                # (rides the cache_manifest sync to peers). Demand-side
+                # trigger = cache-ready starvation; supply-side gate =
+                # Copernicus health. Reads the count just refreshed by
+                # _orchestrate_cache_only's _compute_cache_ready_kgs.
+                try:
+                    _cr = (self.state.get('_cache_ready_cache') or {})
+                    self._update_prewarm_flag(len(_cr.get('codes') or []))
+                except Exception:
+                    log.exception('Pre-warm flag update error')
                 # Record fleet-shape sample for the Progress card
                 # sparkline. Counts as observed *after* orchestration
                 # this tick — gives the truest 30s-resolution view of

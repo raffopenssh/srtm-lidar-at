@@ -1467,6 +1467,51 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
         _SYNC_BACKOFF[peer_url] = entry
 
 
+# === SECTION: Cross-peer dispatch claim registry ===
+# Closes the race where the same KG is handed to two peers within one
+# director tick: the frontier queue sync (``sync_queue_to_peer``) and the
+# cache-only whitelist push (``_push_queue_to_peer``) both run from the
+# director loop, but a peer's ``current_kg`` isn't visible in its status
+# snapshot for a few seconds after it's started — so the status-based
+# ``in_progress`` gate can't see a KG that was dispatched moments earlier.
+# We record every (code -> peer, ts) dispatch and refuse to re-hand a code
+# to a *different* peer inside the TTL window. Same-peer re-syncs (the
+# common every-tick case) are never blocked and refresh the claim.
+# Lives in the director-loop worker (single lock holder), so the dict is
+# effectively process-local and consistent for the dispatch paths.
+_RECENT_DISPATCH: dict = {}        # code -> (ts, peer_url)
+_RECENT_DISPATCH_TTL = 150.0       # seconds; covers status-visibility lag
+_DISPATCH_LOCK = threading.Lock()
+
+
+def _claim_dispatch(codes: list, peer_url: str) -> list:
+    """Return the subset of *codes* not recently claimed by another peer,
+    recording the survivors as claimed by *peer_url*.
+
+    A code claimed by a *different* peer within ``_RECENT_DISPATCH_TTL`` is
+    dropped (the other peer already got it this tick). After the TTL the
+    claim lapses so a genuinely-reassigned KG (dead peer) can move.
+    """
+    if not codes:
+        return codes
+    now = time.time()
+    out: list = []
+    with _DISPATCH_LOCK:
+        # Prune expired claims so the dict can't grow unbounded.
+        for _c in [k for k, (t, _) in _RECENT_DISPATCH.items()
+                   if now - t > _RECENT_DISPATCH_TTL]:
+            _RECENT_DISPATCH.pop(_c, None)
+        for c in codes:
+            claim = _RECENT_DISPATCH.get(c)
+            if (claim and claim[1] != peer_url
+                    and (now - claim[0]) <= _RECENT_DISPATCH_TTL):
+                continue  # another peer was handed this KG moments ago
+            out.append(c)
+        for c in out:
+            _RECENT_DISPATCH[c] = (now, peer_url)
+    return out
+
+
 def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     """Push the local priority queue to a remote peer.
 
@@ -1485,6 +1530,12 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
         queue = []
     if exclude:
         queue = [c for c in queue if c not in exclude]
+    # Claim-gate: drop codes another peer was handed within the last TTL
+    # window (the status-based in_progress gate can't see a just-dispatched
+    # KG until the peer's current_kg becomes visible). Prevents two peers
+    # racing the same KG — e.g. at100 (cache-only whitelist) + at102
+    # (frontier queue) both starting 40318 15s apart.
+    queue = _claim_dispatch(queue, peer_url)
     if not queue:
         return {'status': 'empty_queue', 'synced': 0}
 
@@ -1547,6 +1598,13 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
     Used when sending a *cache-only* peer a whitelist of fully-cached KGs.
     Replaces the peer's priority queue with the given codes.
     """
+    if not codes:
+        return {'status': 'empty_whitelist', 'synced': 0}
+    # Claim-gate against the cross-peer dispatch registry so a code already
+    # handed to another peer this tick (via the frontier queue or another
+    # cache-only slice) isn't re-dispatched here. Same-peer re-syncs refresh
+    # the claim and are never blocked.
+    codes = _claim_dispatch(list(codes), peer_url)
     if not codes:
         return {'status': 'empty_whitelist', 'synced': 0}
     try:
@@ -9759,6 +9817,64 @@ class PeerDirector:
                             tombstoned.add(m.group(1))
         except Exception:
             pass
+        # --- Break the force-requeue self-perpetuation loop. ---------------
+        # A force-requeue stamps ``<kg>_requeue`` (and partial product keys)
+        # as tombstones and keeps the code in retry_queue.json. Tombstoned
+        # codes are exempt from staleness below, so the code re-pushes to a
+        # peer with skip_processed=False forever; the peer's /processing/queue
+        # handler re-stamps ``<kg>_requeue=now`` for any completed code, and
+        # ``_get_completed_kgs`` drops tombstoned codes from ``completed`` — so
+        # the KG reprocesses on a loop (delete+re-upload its gpkgs every cycle,
+        # producing recurring 404 windows). Once the KG has genuinely
+        # *re-completed* (a fresh ``_json`` manifest entry uploaded AFTER the
+        # tombstone), drop its ``_requeue``/product tombstones so it counts as
+        # completed again and falls out of the queue. Mirrors the satisfied-
+        # tombstone sweep in app.py's priority-queue GET handler, but runs on
+        # the director loop so the on-disk queue is actually drained.
+        try:
+            import re as _re2
+            _mf_path = DATA_DIR / 'zenodo_manifest.json'
+            _mf_entries = {}
+            if _mf_path.exists():
+                _mf_data = json.loads(_mf_path.read_text())
+                _mf_entries = _mf_data.get('entries', _mf_data) or {}
+            _tdata = {}
+            if _tombstone_path and _tombstone_path.exists():  # type: ignore
+                _td = json.loads(_tombstone_path.read_text())  # type: ignore
+                if isinstance(_td, dict):
+                    _tdata = _td
+            _drop_keys = []
+            _recompleted = set()
+            for _tk, _tv in _tdata.items():
+                _m = _re2.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', _tk)
+                if not _m:
+                    continue
+                _kg = _m.group(1)
+                _je = _mf_entries.get(_kg + '_json')
+                if isinstance(_je, dict):
+                    _ua = _je.get('uploaded_at', '') or ''
+                    if _ua and str(_ua) > str(_tv):
+                        _drop_keys.append(_tk)
+                        _recompleted.add(_kg)
+            if _drop_keys:
+                for _k in _drop_keys:
+                    _tdata.pop(_k, None)
+                try:
+                    _tmp = _tombstone_path.with_suffix('.tmp')  # type: ignore
+                    _tmp.write_text(json.dumps(_tdata, indent=2))
+                    _tmp.replace(_tombstone_path)  # type: ignore
+                except Exception as _e:
+                    log.warning('prune retry_queue: tombstone rewrite failed: %s', _e)
+                # These KGs are completed again — un-exempt them so the
+                # staleness check below drops them from the queue.
+                tombstoned -= _recompleted
+                completed |= _recompleted
+                log.info('prune retry_queue: cleared %d satisfied requeue '
+                         'tombstone(s) for %d re-completed KG(s): %s',
+                         len(_drop_keys), len(_recompleted),
+                         sorted(_recompleted)[:10])
+        except Exception as _e:
+            log.warning('prune retry_queue: requeue-loop resolution failed: %s', _e)
         # Parent→done check via kg_splitter, mirroring app.py's GET
         # handler so on-disk pruning is consistent with what the
         # dashboard already does at view time.

@@ -4183,6 +4183,21 @@ def processing_queue_add():
                         partial_keys.append(key)
             if c not in completed and not partial_keys:
                 continue
+            # Guard against the force-requeue self-perpetuation loop: if the
+            # KG already has a fresh ``_json`` upload AND an existing
+            # ``<c>_requeue`` tombstone that predates it, the KG genuinely
+            # re-completed since the last requeue. Re-stamping ``_requeue=now``
+            # here (e.g. when the director re-pushes the still-queued code with
+            # skip_processed=False) would resurrect the loop — the code never
+            # leaves the queue and reprocesses forever. Skip the re-stamp and
+            # let the satisfied-tombstone sweep drain it instead.
+            _existing_rq = _MANIFEST_TOMBSTONES.get(c + '_requeue')
+            if _existing_rq and mentries is not None:
+                _je = mentries.get(c + '_json')
+                if isinstance(_je, dict):
+                    _ua = _je.get('uploaded_at', '') or ''
+                    if _ua and str(_ua) > str(_existing_rq):
+                        continue
             _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
             tombstoned.append(c + '_requeue')
             for key in partial_keys:

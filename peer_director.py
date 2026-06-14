@@ -405,6 +405,17 @@ HOLD_TENDENCY_WINDOW_HOURS = 6
 HOLD_TENDENCY_FACTOR = 3
 HOLD_TENDENCY_MAX_MIN = 24 * 60   # 24 h ceiling
 
+# A reserved KG is held for a cooled-down peer so it can resume from its
+# own tile checkpoints. But the held KG must never be deadlocked behind a
+# multi-day park (manual long cooldown, role park to 2027, billing-cycle
+# park to next renewal). Once the holder's cooldown exceeds this many
+# hours, ``_clear_completed_reservations`` releases the KG so any peer can
+# pick it up (checkpoints survive on the cross-peer Zenodo chkpt registry,
+# so the resume is still cheap). 36h comfortably exceeds the longest
+# legitimate short-cooldown (24h HOLD_TENDENCY ceiling) so a normal
+# escalated Zenodo cooldown is never prematurely released.
+RESERVATION_MAX_HOLD_HOURS = 36
+
 # --- Server-friendliness throttle ----------------------------------------
 #
 # When BEV / Zenodo / Copernicus servers start emitting warnings (HTTP 0
@@ -758,6 +769,132 @@ def _default_peers_config() -> dict:
             },
         ],
     }
+
+
+# === SECTION: operator intent journal (cross-worker) ===
+# gunicorn runs 2 worker processes; only one runs the director loop. The
+# loop holds ``self.cfg`` in memory for the whole tick and re-saves it
+# mid-tick (first_seen stamping, canary parks, role changes). Because
+# ``_merge_peers_with_disk`` lets the in-memory row win per-peer, an
+# operator action served by the OTHER worker (release-hold / clear-
+# cooldown popping ``reserved_kg`` / ``not_before`` and writing disk) is
+# silently resurrected by the loop's stale snapshot, then re-read on the
+# next reload — so the clear never sticks. The dashboard "release hold"
+# button appeared to do nothing for exactly this reason.
+#
+# Fix: operator mutations append an idempotent *intent* here in addition
+# to writing peers.json immediately. The director loop drains intents at
+# the top of every tick (after it reloads disk into ``self.cfg``) and
+# re-applies them to its own in-memory cfg, so a stale snapshot can no
+# longer resurrect a cleared field. Intents are re-applied every tick
+# until they expire (default 5 min) — long enough to outlast any single
+# tick's mid-flight save, after which the loop's reload already sees the
+# clean disk value. Tiny JSON, append+prune, fcntl-locked.
+PEER_INTENTS = DATA_DIR / 'peer_intents.json'
+PEER_INTENTS_LOCK = PEER_INTENTS.with_suffix('.json.lock')
+PEER_INTENT_TTL_S = 300
+
+
+def record_peer_intent(peer_id: str,
+                       set_fields: dict | None = None,
+                       clear_fields: list | None = None,
+                       ttl_s: int = PEER_INTENT_TTL_S) -> None:
+    """Append an operator intent for ``peer_id``.
+
+    ``set_fields`` maps peer-row keys to values to force; ``clear_fields``
+    lists keys to remove. Re-applied by the director loop every tick until
+    ``ttl_s`` elapses. Safe to call from any gunicorn worker.
+    """
+    if not peer_id or (not set_fields and not clear_fields):
+        return
+    import fcntl as _fcntl
+    rec = {
+        'id': f'{peer_id}-{time.time():.6f}',
+        'peer_id': peer_id,
+        'set': dict(set_fields or {}),
+        'clear': list(clear_fields or []),
+        'created': time.time(),
+        'expires': time.time() + max(30, int(ttl_s)),
+    }
+    PEER_INTENTS.parent.mkdir(parents=True, exist_ok=True)
+    with open(PEER_INTENTS_LOCK, 'a+') as _lf:
+        try:
+            _fcntl.flock(_lf.fileno(), _fcntl.LOCK_EX)
+        except OSError:
+            pass
+        try:
+            cur = []
+            try:
+                if PEER_INTENTS.exists():
+                    cur = json.loads(PEER_INTENTS.read_text()) or []
+            except Exception:
+                cur = []
+            now = time.time()
+            cur = [i for i in cur if isinstance(i, dict)
+                   and float(i.get('expires', 0)) > now]
+            cur.append(rec)
+            tmp = PEER_INTENTS.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(cur, indent=2))
+            tmp.replace(PEER_INTENTS)
+        finally:
+            try:
+                _fcntl.flock(_lf.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def apply_peer_intents(cfg: dict) -> bool:
+    """Apply all live operator intents to ``cfg`` in place.
+
+    Returns True if any peer row changed. Drops expired intents from
+    disk. Intents are NOT removed on apply (kept until expiry) so a
+    mid-tick resurrection by a stale director snapshot is re-corrected
+    on the following tick.
+    """
+    import fcntl as _fcntl
+    if not PEER_INTENTS.exists():
+        return False
+    changed = False
+    with open(PEER_INTENTS_LOCK, 'a+') as _lf:
+        try:
+            _fcntl.flock(_lf.fileno(), _fcntl.LOCK_EX)
+        except OSError:
+            pass
+        try:
+            try:
+                intents = json.loads(PEER_INTENTS.read_text()) or []
+            except Exception:
+                intents = []
+            now = time.time()
+            live = [i for i in intents if isinstance(i, dict)
+                    and float(i.get('expires', 0)) > now]
+            if len(live) != len(intents):
+                try:
+                    tmp = PEER_INTENTS.with_suffix('.json.tmp')
+                    tmp.write_text(json.dumps(live, indent=2))
+                    tmp.replace(PEER_INTENTS)
+                except Exception:
+                    pass
+            by_id = {p.get('id'): p for p in (cfg.get('peers') or [])
+                     if isinstance(p, dict)}
+            for it in live:
+                p = by_id.get(it.get('peer_id'))
+                if not p:
+                    continue
+                for k, v in (it.get('set') or {}).items():
+                    if p.get(k) != v:
+                        p[k] = v
+                        changed = True
+                for k in (it.get('clear') or []):
+                    if k in p:
+                        p.pop(k, None)
+                        changed = True
+        finally:
+            try:
+                _fcntl.flock(_lf.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
+    return changed
 
 
 def load_peers_config() -> dict:
@@ -2020,8 +2157,31 @@ def _clear_completed_reservations(cfg: dict, state: dict | None = None) -> bool:
             p.pop('reserved_kg', None)
             changed = True
             continue
-        # Holder still in cooldown? keep reservation.
+        # Multi-day hold? A KG must never be deadlocked behind a holder
+        # that won't be eligible for a long time (manual long park, role
+        # park to 2027, billing-cycle park to next renewal). The holder's
+        # tile checkpoints survive on Zenodo's chkpt registry, so any peer
+        # that later picks up the KG resumes cheaply — there's no reason to
+        # pin it. Release as soon as the cooldown exceeds the long-hold
+        # threshold so the operator never has to hand-release a held KG.
         if _peer_is_scheduled(p):
+            nb = p.get('not_before')
+            if nb:
+                try:
+                    nb_dt = datetime.fromisoformat(str(nb))
+                    if nb_dt.tzinfo is None:
+                        nb_dt = nb_dt.replace(tzinfo=timezone.utc)
+                    hold_h = (nb_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+                    if hold_h >= RESERVATION_MAX_HOLD_HOURS:
+                        log.warning('Releasing held KG %s from %s '
+                                    '(multi-day hold: %.0fh until not_before %s)',
+                                    kg, p['id'], hold_h, nb)
+                        p.pop('reserved_kg', None)
+                        changed = True
+                        continue
+                except Exception:
+                    pass
+            # Short cooldown — keep the reservation so the holder resumes.
             continue
         # not_before elapsed (or absent). If holder is bandwidth-
         # exhausted, it can never claim — release so others can.
@@ -9843,6 +10003,14 @@ class PeerDirector:
                 _td = json.loads(_tombstone_path.read_text())  # type: ignore
                 if isinstance(_td, dict):
                     _tdata = _td
+            try:
+                from app import _requeue_recompleted  # type: ignore
+            except Exception:
+                _requeue_recompleted = None  # type: ignore
+            try:
+                from app import _kg_structurally_complete  # type: ignore
+            except Exception:
+                _kg_structurally_complete = None  # type: ignore
             _drop_keys = []
             _recompleted = set()
             for _tk, _tv in _tdata.items():
@@ -9850,21 +10018,53 @@ class PeerDirector:
                 if not _m:
                     continue
                 _kg = _m.group(1)
-                _je = _mf_entries.get(_kg + '_json')
-                if isinstance(_je, dict):
-                    _ua = _je.get('uploaded_at', '') or ''
-                    if _ua and str(_ua) > str(_tv):
-                        _drop_keys.append(_tk)
-                        _recompleted.add(_kg)
+                # Split-aware re-completion: a split parent never emits a
+                # parent ``_json`` — it completes via per-block ``_json``
+                # entries. The old parent-only check left split parents
+                # (e.g. 49106/22017/40320) re-stamping their ``_requeue``
+                # tombstone every tick and never draining. Use the shared
+                # helper that recognises all-blocks-complete.
+                _done = False
+                if _requeue_recompleted is not None:
+                    try:
+                        _done = _requeue_recompleted(_kg, _tv, _mf_entries)
+                    except Exception:
+                        _done = False
+                # A loop can bump the requeue tombstone ahead of the block
+                # uploads, so a strict ts-ordered check never fires. If the
+                # KG is structurally complete right now (split-aware), the
+                # requeue tombstone is stale by definition — drop it.
+                if not _done and _kg_structurally_complete is not None:
+                    try:
+                        _done = _kg_structurally_complete(_kg, _mf_entries)
+                    except Exception:
+                        _done = False
+                if not _done:
+                    _je = _mf_entries.get(_kg + '_json')
+                    if isinstance(_je, dict):
+                        _ua = _je.get('uploaded_at', '') or ''
+                        _done = bool(_ua) and str(_ua) > str(_tv)
+                if _done:
+                    _drop_keys.append(_tk)
+                    _recompleted.add(_kg)
             if _drop_keys:
                 for _k in _drop_keys:
                     _tdata.pop(_k, None)
+                # Hard-delete the satisfied keys from the in-memory dict AND
+                # disk via app's helper (a plain file rewrite here races the
+                # gunicorn workers' union-on-persist, which would resurrect
+                # them). Fall back to a direct rewrite only if the import
+                # fails.
                 try:
-                    _tmp = _tombstone_path.with_suffix('.tmp')  # type: ignore
-                    _tmp.write_text(json.dumps(_tdata, indent=2))
-                    _tmp.replace(_tombstone_path)  # type: ignore
-                except Exception as _e:
-                    log.warning('prune retry_queue: tombstone rewrite failed: %s', _e)
+                    from app import _drop_tombstone_keys  # type: ignore
+                    _drop_tombstone_keys(_drop_keys)
+                except Exception:
+                    try:
+                        _tmp = _tombstone_path.with_suffix('.tmp')  # type: ignore
+                        _tmp.write_text(json.dumps(_tdata, indent=2))
+                        _tmp.replace(_tombstone_path)  # type: ignore
+                    except Exception as _e:
+                        log.warning('prune retry_queue: tombstone rewrite failed: %s', _e)
                 # These KGs are completed again — un-exempt them so the
                 # staleness check below drops them from the queue.
                 tombstoned -= _recompleted
@@ -10029,6 +10229,17 @@ class PeerDirector:
                         if 'bev_pool_escalation' in disk_state:
                             self.state['bev_pool_escalation'] = (
                                 disk_state['bev_pool_escalation'])
+                    # Re-apply live operator intents (release-hold / clear-
+                    # cooldown served by the OTHER gunicorn worker) onto our
+                    # freshly-reloaded cfg, BEFORE any mid-tick save can
+                    # resurrect the cleared field from this loop's snapshot.
+                    # See the operator-intent-journal section above.
+                    _intent_dirty = False
+                    try:
+                        with self._lock:
+                            _intent_dirty = apply_peer_intents(self.cfg)
+                    except Exception:
+                        log.exception('apply_peer_intents failed')
                     # Stamp first_seen on legacy peers that lack it so
                     # the warmup hold doesn't retroactively block them.
                     # New peers added via the API already get a stamp.
@@ -10038,7 +10249,7 @@ class PeerDirector:
                         if not _p.get('first_seen'):
                             _p['first_seen'] = _now_iso
                             _dirty = True
-                    if _dirty:
+                    if _dirty or _intent_dirty:
                         save_peers_config(self.cfg)
                 except Exception:
                     pass

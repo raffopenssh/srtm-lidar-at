@@ -777,6 +777,42 @@ def _persist_tombstones_merged() -> None:
             pass
 
 
+def _drop_tombstone_keys(keys) -> int:
+    """Hard-delete tombstone keys from BOTH the in-memory dict and disk.
+
+    ``_persist_tombstones_merged`` unions disk back in (newest-wins), so a
+    plain ``pop`` from memory is silently resurrected on the next persist.
+    This helper removes the keys under the lock from the on-disk file too,
+    so a satisfied ``_requeue`` tombstone actually disappears fleet-wide.
+    Returns the number of keys removed.
+    """
+    keys = set(keys)
+    if not keys:
+        return 0
+    removed = 0
+    with _TOMBSTONE_LOCK:
+        for k in keys:
+            if _MANIFEST_TOMBSTONES.pop(k, None) is not None:
+                removed += 1
+        disk = {}
+        try:
+            if _tombstone_path.exists():
+                d = json.loads(_tombstone_path.read_text())
+                if isinstance(d, dict):
+                    disk = d
+        except Exception:
+            disk = {}
+        for k in keys:
+            disk.pop(k, None)
+        try:
+            tmp = _tombstone_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(disk, indent=2))
+            tmp.replace(_tombstone_path)
+        except Exception:
+            pass
+    return removed
+
+
 def _reload_tombstones_from_disk() -> None:
     """Union on-disk tombstones into the in-memory ``_MANIFEST_TOMBSTONES``.
 
@@ -3838,6 +3874,98 @@ def _get_completed_kgs() -> set:
     return completed
 
 
+def _requeue_recompleted(code, requeue_ts, mentries):
+    """True iff a force-requeued KG has genuinely *re-completed* since its
+    ``<code>_requeue`` tombstone was stamped at ``requeue_ts``.
+
+    Split-aware. A non-split KG re-completes when its ``<code>_json`` manifest
+    entry was uploaded after ``requeue_ts``. A *split* parent never produces a
+    parent ``_json`` — it completes via per-block ``<code>-<dir>_json`` entries.
+    So for a split parent we require that EVERY block has a ``_json`` entry and
+    that the newest of those block uploads postdates ``requeue_ts``.
+
+    This is the load-bearing fix for the split-KG force-requeue loop: the POST
+    re-stamp guard and the director-loop prune sweep both relied on a parent
+    ``_json`` that split KGs never emit, so split parents re-stamped
+    ``_requeue=now`` forever and never drained.
+    """
+    if not requeue_ts or not isinstance(mentries, dict):
+        return False
+    rq = str(requeue_ts)
+    # Non-split (or block-keyed parent json) fast path.
+    je = mentries.get(code + '_json')
+    if isinstance(je, dict):
+        ua = je.get('uploaded_at', '') or ''
+        if ua and str(ua) > rq:
+            return True
+    # Split-parent path: all blocks json present AND newest block postdates rq.
+    try:
+        from kg_splitter import maybe_split_kg, is_block_code
+        if is_block_code(code):
+            return False
+        import search_index as _si
+        row = _si.get_index()._conn().execute(
+            'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
+            'FROM kg WHERE kg_code=?', (code,)).fetchone()
+        if not row or row['min_lon'] is None:
+            return False
+        fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
+                   'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
+                            'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
+        blocks = maybe_split_kg(fake_kg)
+        if len(blocks) <= 1:
+            return False
+        newest = ''
+        for b in blocks:
+            bcode = b['kg_code'] if isinstance(b, dict) else b
+            bj = mentries.get(bcode + '_json')
+            if not isinstance(bj, dict):
+                return False  # a block is still missing → not re-completed
+            bua = bj.get('uploaded_at', '') or ''
+            if str(bua) > newest:
+                newest = str(bua)
+        return bool(newest) and newest > rq
+    except Exception:
+        return False
+
+
+def _kg_structurally_complete(code, mentries):
+    """True iff the KG currently has all its products in the manifest,
+    split-aware. Non-split: ``<code>_json`` present. Split parent: every
+    block has a ``_json`` entry. Ignores timestamps — answers only
+    "is it done right now?".
+    """
+    if not isinstance(mentries, dict):
+        return False
+    je = mentries.get(code + '_json')
+    if isinstance(je, dict) and 'error' not in (je.get('status', '') or ''):
+        return True
+    try:
+        from kg_splitter import maybe_split_kg, is_block_code
+        if is_block_code(code):
+            return False
+        import search_index as _si
+        row = _si.get_index()._conn().execute(
+            'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
+            'FROM kg WHERE kg_code=?', (code,)).fetchone()
+        if not row or row['min_lon'] is None:
+            return False
+        fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
+                   'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
+                            'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
+        blocks = maybe_split_kg(fake_kg)
+        if len(blocks) <= 1:
+            return False
+        for b in blocks:
+            bcode = b['kg_code'] if isinstance(b, dict) else b
+            bj = mentries.get(bcode + '_json')
+            if not (isinstance(bj, dict) and 'error' not in (bj.get('status', '') or '')):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 @app.route('/api/v1/processing/completed_recent')
 def processing_completed_recent():
     """Return recently completed KGs in chronological order (most recent last).
@@ -4193,11 +4321,29 @@ def processing_queue_add():
             # let the satisfied-tombstone sweep drain it instead.
             _existing_rq = _MANIFEST_TOMBSTONES.get(c + '_requeue')
             if _existing_rq and mentries is not None:
-                _je = mentries.get(c + '_json')
-                if isinstance(_je, dict):
-                    _ua = _je.get('uploaded_at', '') or ''
-                    if _ua and str(_ua) > str(_existing_rq):
-                        continue
+                # An existing ``_requeue`` tombstone + a KG that is now
+                # structurally complete (split-aware: all blocks have _json)
+                # is the reprocess-loop fingerprint. The director re-pushes
+                # the still-queued code with skip_processed=False every tick;
+                # without this guard we'd re-stamp ``_requeue=now`` forever,
+                # bumping the tombstone ahead of the block uploads so even a
+                # timestamp-ordered ``_requeue_recompleted`` check can never
+                # fire. Suppress the re-stamp AND clear the satisfied
+                # tombstone(s) so the code drains from the queue. Timestamp
+                # ordering is irrelevant here: a re-stamp on an already-
+                # complete KG is never useful.
+                if (_requeue_recompleted(c, _existing_rq, mentries)
+                        or _kg_structurally_complete(c, mentries)):
+                    # Drop this KG's _requeue + product tombstones (memory AND
+                    # disk) so the satisfied-tombstone sweep / prune drops it
+                    # from the queue and it stops reprocessing.
+                    import re as _re_rq
+                    _drop = [k for k in list(_MANIFEST_TOMBSTONES)
+                             if _re_rq.match(
+                                 r'^' + _re_rq.escape(c) + r'(-[a-z][-a-z0-9]*)?_',
+                                 k)]
+                    _drop_tombstone_keys(_drop)
+                    continue
             _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
             tombstoned.append(c + '_requeue')
             for key in partial_keys:
@@ -5172,6 +5318,18 @@ def director_cooldown_peer(peer_id):
     # Cooldown always releases any KG hold so the substitute can pick it up.
     released_kg = peer.pop('reserved_kg', None)
     pd.save_peers_config(cfg)
+    # Journal the change so the director-loop worker (other gunicorn
+    # process) can't resurrect the old not_before / reserved_kg from its
+    # in-memory snapshot mid-tick. Clearing a cooldown (hours<=0) is the
+    # operation most prone to the resurrection race.
+    try:
+        if hours <= 0:
+            pd.record_peer_intent(peer_id, clear_fields=['not_before', 'reserved_kg'])
+        else:
+            pd.record_peer_intent(peer_id, set_fields={'not_before': nb_iso},
+                                  clear_fields=['reserved_kg'])
+    except Exception:
+        pass
     # Stop the peer's processor so the cooldown takes immediate effect.
     stopped = False
     if hours > 0:
@@ -5229,10 +5387,19 @@ def director_release_hold(peer_id):
         return jsonify({'error': f'Peer {peer_id} not found'}), 404
     released_kg = peer.pop('reserved_kg', None)
     cleared = False
+    clear_fields = ['reserved_kg']
     if clear_cd and peer.get('not_before'):
         peer.pop('not_before', None)
         cleared = True
+        clear_fields.append('not_before')
     pd.save_peers_config(cfg)
+    # Journal the clear so the director-loop worker can't resurrect it
+    # from its in-memory snapshot mid-tick (cross-worker race). See
+    # peer_director.record_peer_intent.
+    try:
+        pd.record_peer_intent(peer_id, clear_fields=clear_fields)
+    except Exception:
+        pass
     pd.get_director().reload_config()
     return jsonify({'status': 'ok', 'peer_id': peer_id,
                     'released_kg': released_kg,

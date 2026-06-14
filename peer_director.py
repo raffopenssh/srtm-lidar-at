@@ -8404,6 +8404,41 @@ class PeerDirector:
                 except Exception:
                     pass
 
+            # --- Index-authoritative completion guard. ---------------------
+            # ``_get_completed_kgs()`` only ever yields *block* codes for a
+            # split KG (``22017-east``/``22017-west``) — never the parent
+            # ``22017`` — AND it discards any code carrying a force-requeue
+            # tombstone. So an already-processed split parent leaks back into
+            # this whitelist, gets expanded into blocks below, and is
+            # re-dispatched to a (second) cache-only peer that races the
+            # block another peer just finished (observed: at62 + at94 both on
+            # 22017-west). The retry-queue force-requeue fixes (0afd538,
+            # b0fcf1d) only ever touched the frontier retry-queue path — not
+            # this opportunistic cache-only backfill.
+            #
+            # The robust cross-check is the search index ``processed`` flag
+            # (per AGENTS.md it matches the db_processed counter and covers
+            # all peer-synced KGs, not just locally-uploaded ones). It is
+            # split-agnostic: a parent flips to processed=1 once its products
+            # exist, regardless of how ``maybe_split_kg`` happens to slice it
+            # *now* (block sets drift as strike counts / tile thresholds
+            # change, so a manifest-vs-current-blocks structural check misses
+            # KGs that were split adaptively in the past — 62013/40016/40326
+            # etc.). Deliberate re-processing still flows through the
+            # frontier retry queue (which honours tombstones); cache-only
+            # backfill must never re-touch a KG the index already calls done.
+            processed_codes: set = set()
+            try:
+                import search_index as _si
+                _conn = _si.get_index()._conn()
+                for _row in _conn.execute(
+                        'SELECT kg_code FROM kg WHERE processed=1'):
+                    processed_codes.add(_row[0])
+            except Exception as _e:
+                log.debug('Cache-ready processed-flag guard skipped: %s', _e)
+            if processed_codes:
+                completed = completed | processed_codes
+
             try:
                 import tile_index as ti
                 year = ti.dataset_to_year(ti.DEFAULT_DATASET)

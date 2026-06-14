@@ -9786,13 +9786,40 @@ class PeerDirector:
                     c = kg.get('kg_code')
                     if c:
                         kg_by_code[c] = kg
+            # Block-level guards the PARENT-granularity whitelist scan in
+            # ``_compute_cache_ready_kgs`` structurally cannot apply (it only
+            # ever sees parent codes from kg_list.json):
+            #  * A per-block cache miss is recorded under the BLOCK code
+            #    (e.g. ``91101-east`` uncacheable), but the whitelist scan
+            #    only excludes the PARENT (``91101``) — which isn't in the
+            #    miss set — so the bad block re-enters *here* after expansion
+            #    and churns ``deferred to frontier`` every tick across
+            #    successive cache-only peers (observed: 91101-east, 62201 on
+            #    at44/at101/at122/at124).
+            #  * A split parent can be half-done: one block already has a
+            #    ``_json`` (in ``_get_completed_kgs``), the other doesn't, so
+            #    the parent isn't ``processed=1`` and stays on the whitelist —
+            #    the finished block must not be re-dispatched alongside its
+            #    unfinished sibling.
+            try:
+                block_excluded = set(self._cache_miss_excluded())
+            except Exception:
+                block_excluded = set()
+            try:
+                from app import _get_completed_kgs as _gck
+                block_excluded |= _gck()
+            except Exception:
+                pass
             expanded: list[str] = []
             n_split = 0
+            n_block_excl = 0
             for code in whitelist:
                 if is_block_code(code):
                     # Already a block code (e.g. queued explicitly) —
-                    # honor as-is, skip in_progress siblings.
-                    if code not in in_progress:
+                    # honor as-is, skip in_progress / done / missed siblings.
+                    if code in block_excluded:
+                        n_block_excl += 1
+                    elif code not in in_progress:
                         expanded.append(code)
                     continue
                 kg = kg_by_code.get(code)
@@ -9804,12 +9831,20 @@ class PeerDirector:
                     n_split += 1
                     for blk in blocks:
                         bc = blk['kg_code']
-                        # Drop sibling blocks already claimed by some peer.
+                        # Drop sibling blocks already claimed by some peer,
+                        # already completed, or with an unresolved cache miss.
+                        if bc in block_excluded:
+                            n_block_excl += 1
+                            continue
                         if bc in in_progress:
                             continue
                         expanded.append(bc)
                 else:
                     expanded.append(code)
+            if n_block_excl:
+                log.info('Cache-only whitelist: dropped %d split-block code(s) '
+                         'already completed or cache-missed (block-level guard)',
+                         n_block_excl)
             if n_split:
                 log.info('Cache-only whitelist: expanded %d parent KGs into '
                          'blocks (%d → %d codes) for cross-peer distribution',

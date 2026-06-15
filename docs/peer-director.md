@@ -520,6 +520,65 @@ warning into the merged log (grep `?q=stuck-kg`). Tracker state lives in
 `state['stuck_kg_track']` (in-memory; rebuilt within 12 h after an HA
 handover — the timer simply restarts, which is safe).
 
+#### Duplicate-KG reconciler (`_check_duplicate_kgs`)
+
+The dispatch-side guards — the cross-peer **claim registry**
+(`_claim_dispatch`, `_RECENT_DISPATCH_TTL=150s`), the `_in_progress_kgs`
+status filter, and the block-level whitelist guard (commits `0afd538` →
+`ac74cf2`) — stop two peers being *handed* the same KG **within a
+director tick**. They structurally cannot undo a duplicate that arose
+*outside* that 150 s window:
+
+- two peers self-picked the same parent code from their **own**
+  `retry_queue.json` minutes or hours apart (well past the claim TTL);
+- a peer started a KG before another peer finished *uploading* it, so
+  neither saw the other in `_in_progress_kgs` at start time.
+
+Those run side-by-side to completion, burning a second peer's CPU +
+bandwidth on identical work. Observed Jun 2026: `92111` on at26+at112
+(37 min apart), `49008` on at109+at115 (~2.4 h apart), `01803` on
+at27+at114.
+
+Every tick `_check_duplicate_kgs(_statuses)` groups running peers by
+**parent** KG code (so block `92117-west` collides with parent `92117`
+and sibling `92117-east`), and for any parent with ≥2 distinct peers it
+keeps the **furthest-along** peer and **hard-stops** the rest. Progress
+is ranked by `_kg_progress_frac`, which mirrors `_peerKgFrac` in
+`static/process.html` *exactly* (tile fraction `(current_tile-1)/n_tiles`
+dominates; else canonical pipeline step index) so the director's
+"winner" matches the % the dashboard shows. Tiebreak: longest-running,
+then lowest id — fully deterministic, so both gunicorn workers and a
+post-handover director would pick the same winner from the same
+snapshot. Hard stop (not graceful) because a graceful "exit-after-KG"
+would let the loser finish the very work we're deduping; tile
+checkpoints + the cross-peer chkpt registry preserve the loser's
+finished tiles for resume.
+
+Anti-herd guards (mirror the stuck-KG watchdog so the director is never
+overwhelmed and the fleet never thundering-herds):
+- **Reuses the existing `_statuses` snapshot** gathered once per tick for
+  capacity/throttle — **zero extra peer fanout**.
+- **Fresh status only** — `_stale`/`unreachable` ticks skipped.
+- **`DUP_KG_MIN_AGE_S` (5 min)**: every collide-member must be ≥5 min
+  into the KG, so a just-started peer (whose `current_kg` may not yet be
+  claim-visible) is never treated as a duplicate.
+- **`DUP_KG_PERSIST_S` (120 s)**: the exact dup member-set must hold for
+  two ticks before any stop — we never fight a fresh dispatch the claim
+  registry is still resolving.
+- **Skips scheduled-off peers** (`_peer_is_scheduled`) — won't stomp a
+  park/steal/canary cooldown.
+- **`DUP_KG_STOPS_PER_TICK` (2)** caps loser stops per tick.
+- **Active-director only**: the whole loop self-stops unless this
+  process holds `is_director` (single fcntl lock holder across both
+  gunicorn workers; the HA shadow never has the flag), so it runs once,
+  on one worker, on the live director.
+
+Emits `dup-kg <loser>: KG <code> also running on <winner> (winner X% vs
+Y%) — hard stop loser` into the merged log (grep `?q=dup-kg`). Tracker
+lives in `state['dup_kg_track']` (in-memory, self-pruning; after an HA
+handover the fresh director simply re-observes the dup and waits
+`DUP_KG_PERSIST_S` again — the conservative direction).
+
 #### Director Modes
 
 | Mode | Behaviour |

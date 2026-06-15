@@ -501,6 +501,25 @@ STEAL_PARK_COOLDOWN_S = 30 * 60
 # opaque window so a slow-but-progressing KG is never murdered.
 STUCK_KG_FROZEN_S = 12 * 3600        # no progress fingerprint change → kill
 STUCK_KG_MIN_STATUS_FRESH_S = 15 * 60  # require a recent (non-stale) status
+# --- Duplicate-KG reconciler -------------------------------------------
+# The dispatch-side guards (cross-peer claim registry + _in_progress_kgs
+# filter + block-level whitelist guard) stop two peers being *handed* the
+# same KG within a director tick. They cannot undo a duplicate that arose
+# OUTSIDE that window — e.g. two peers self-picked the same parent code
+# from their own retry queues minutes/hours apart (well past the 150s
+# _RECENT_DISPATCH_TTL), or a peer started a KG before another finished
+# uploading it. Those run to completion side-by-side, burning a second
+# peer's CPU + bandwidth on identical work (observed: 92111 on at26+at112
+# 37 min apart; 49008 on at109+at115 ~2.4h apart; 01803 on at27+at114).
+# This reconciler keeps the furthest-along peer and hard-stops the
+# loser(s) so they rejoin rotation onto fresh work — the dispatch guards
+# then keep them off the winner's KG. Modeled on the stuck-KG watchdog:
+# fresh-status-only, scheduled-peer-safe, rate-limited, and it requires
+# the duplicate to persist across DUP_KG_PERSIST_S so we never fight a
+# brand-new dispatch the claim registry is still resolving.
+DUP_KG_PERSIST_S = 120.0             # dup set must hold this long before we act
+DUP_KG_MIN_AGE_S = 300.0             # both peers must be >5 min into the KG
+DUP_KG_STOPS_PER_TICK = 2            # cap loser hard-stops per tick (anti-herd)
 # Hard tier for frontier scheduling: peers at or above this rolling
 # steal % are demoted to the high-steal tier when picking active /
 # parallel frontier peers. A low-steal peer always outranks a
@@ -5546,6 +5565,189 @@ class PeerDirector:
                 track.pop(stale_id, None)
 
     # ------------------------------------------------------------------
+    # Duplicate-KG reconciler
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _kg_progress_frac(ps: dict) -> float:
+        """Return a 0..1 progress estimate for the peer's current KG.
+
+        Mirrors ``_peerKgFrac`` in static/process.html exactly so the
+        director's "who is furthest along" decision matches the number
+        the dashboard shows in each peer's progress bar:
+          * tile progress (``(current_tile-1)/n_tiles``) dominates when
+            tile info is present — it's what every long step iterates;
+          * otherwise fall back to the step's index in the canonical
+            pipeline order.
+        """
+        ckg = ps.get('current_kg') if isinstance(ps, dict) else None
+        if not isinstance(ckg, dict):
+            return 0.0
+        try:
+            ct = int(ckg.get('current_tile') or 0)
+            nt = int(ckg.get('n_tiles') or 0)
+        except (TypeError, ValueError):
+            ct = nt = 0
+        if nt > 0 and ct > 0:
+            return min(1.0, max(0.0, (ct - 1) / nt))
+        # Canonical pipeline order — keep in sync with STEPS in
+        # static/process.html.
+        steps = ('cadastre', 'lidar', 'terrain', 'ortho', 'copernicus',
+                 'hansen', 'segment', 'vectorise', 'gpkg_full',
+                 'gpkg_light', 'json', 'validate', 'upload', 'done')
+        step = str(ckg.get('step') or '')
+        import re as _re
+        if _re.match(r'^tile_\d+$', step):
+            step = 'segment'
+        if step.startswith('upload'):
+            step = 'upload'
+        if step == 'json_summary':
+            step = 'json'
+        try:
+            idx = steps.index(step)
+        except ValueError:
+            idx = 0
+        return idx / max(1, len(steps) - 1)
+
+    def _check_duplicate_kgs(self, statuses: dict) -> None:
+        """Detect two+ peers running the *same* KG and stop the laggards.
+
+        Dispatch guards (claim registry, ``_in_progress_kgs`` filter,
+        block-level whitelist guard) prevent two peers being *handed*
+        the same KG inside a tick. This handles the residue: duplicates
+        that arise outside the 150s claim window — peers self-picking
+        the same parent code from their own retry queues hours apart, or
+        a peer starting a KG before another finished its upload. Those
+        otherwise run side-by-side to completion, wasting a peer.
+
+        Resolution: group running peers by *parent* KG code (so block
+        ``92117-west`` collides with ``92117``), keep the peer with the
+        highest progress fraction (tiebreak: longest-running, then id),
+        and hard-stop the rest. Tile checkpoints + the cross-peer chkpt
+        registry mean the loser's finished tiles aren't lost; the winner
+        (or whoever next picks the KG) resumes them. After the stop the
+        scheduler re-admits the loser on a later tick onto fresh work,
+        and the dispatch guards keep it off the winner's KG.
+
+        Anti-herd guards (mirrors the stuck-KG watchdog):
+          * fresh-status only — never act on a stale/cached fallback;
+          * both peers must be > ``DUP_KG_MIN_AGE_S`` into the KG (a
+            just-started peer's current_kg may not yet be claim-visible);
+          * the duplicate must persist for ``DUP_KG_PERSIST_S`` before we
+            act (don't fight a dispatch the claim registry is resolving);
+          * never stop a deliberately-parked peer;
+          * cap stops at ``DUP_KG_STOPS_PER_TICK`` per tick.
+        """
+        import re as _re
+        from datetime import datetime as _dt
+        now_ts = time.time()
+
+        def _parent(code: str) -> str:
+            m = _re.match(r'^(\d+)(?:-[a-z][-a-z0-9]*)?$', str(code))
+            return m.group(1) if m else str(code)
+
+        def _started_ts(ps: dict) -> float:
+            ckg = ps.get('current_kg') or {}
+            s = ckg.get('started_at') if isinstance(ckg, dict) else None
+            if not s:
+                return now_ts
+            try:
+                return _dt.fromisoformat(str(s)).timestamp()
+            except Exception:
+                return now_ts
+
+        with self._lock:
+            peers = list(self.cfg.get('peers', []))
+            track = self.state.setdefault('dup_kg_track', {})
+            by_id = {p['id']: p for p in peers}
+
+        # Group active, fresh-status peers by parent KG.
+        groups: dict[str, list] = {}
+        for p in peers:
+            if not p.get('enabled', True):
+                continue
+            pid = p['id']
+            ps = statuses.get(pid) or {}
+            if ps.get('_stale') or ps.get('state') == 'unreachable':
+                continue
+            if ps.get('state') not in ('running', 'processing'):
+                continue
+            ckg = ps.get('current_kg') or {}
+            code = ckg.get('code') if isinstance(ckg, dict) else None
+            if not code:
+                continue
+            groups.setdefault(_parent(code), []).append((pid, ps))
+
+        dup_parents = {par for par, lst in groups.items() if len(lst) > 1}
+        # Prune trackers for parents no longer duplicated.
+        for par in list(track.keys()):
+            if par not in dup_parents:
+                track.pop(par, None)
+
+        stops_done = 0
+        for par in sorted(dup_parents):
+            lst = groups[par]
+            # All collide-members must be genuinely settled into the KG
+            # before we trust the duplicate (avoids racing a dispatch the
+            # claim registry is still resolving / a peer mid-startup).
+            if any((now_ts - _started_ts(ps)) < DUP_KG_MIN_AGE_S
+                   for _, ps in lst):
+                track.pop(par, None)
+                continue
+            members = sorted(pid for pid, _ in lst)
+            ent = track.get(par)
+            if not ent or ent.get('members') != members:
+                track[par] = {'members': members, 'since': now_ts}
+                continue
+            if (now_ts - float(ent.get('since') or now_ts)) < DUP_KG_PERSIST_S:
+                continue
+            # Rank: keep highest progress, then longest-running, then id.
+            # Keep highest progress; tiebreak longest-running (smaller
+            # started_ts), then lowest id — fully deterministic so both
+            # gunicorn workers (and a post-handover director) would pick
+            # the same winner from the same snapshot.
+            ranked = sorted(
+                lst,
+                key=lambda t: (-self._kg_progress_frac(t[1]),
+                               _started_ts(t[1]),
+                               t[0]),
+            )
+            winner_id = ranked[0][0]
+            for loser_id, lps in ranked[1:]:
+                if stops_done >= DUP_KG_STOPS_PER_TICK:
+                    break
+                lp = by_id.get(loser_id)
+                if not lp:
+                    continue
+                if _peer_is_scheduled(lp):
+                    continue  # don't stomp a deliberate park
+                lkg = (lps.get('current_kg') or {}).get('code') or par
+                wfrac = self._kg_progress_frac(
+                    dict(ranked[0][1]))
+                lfrac = self._kg_progress_frac(lps)
+                msg = (f'dup-kg {loser_id}: KG {lkg} also running on '
+                       f'{winner_id} (winner {wfrac*100:.0f}% vs '
+                       f'{lfrac*100:.0f}%) — hard stop loser')
+                log.warning(msg)
+                try:
+                    _emit_director_event(msg, peer=loser_id,
+                                         kg=str(lkg), level='warning')
+                except Exception:
+                    pass
+                try:
+                    # Hard stop: a graceful exit-after-KG would let the
+                    # loser finish the very work we're deduping. The
+                    # winner keeps the KG; loser's tile checkpoints are
+                    # preserved for resume.
+                    stop_peer_processor(lp.get('url'), graceful=False)
+                    stops_done += 1
+                except Exception as e:
+                    log.warning('dup-kg %s: hard stop failed: %s',
+                                loser_id, e)
+            # Clear so we re-evaluate from scratch next tick (the loser's
+            # status will flip to stopped and the group dissolves).
+            track.pop(par, None)
+
+    # ------------------------------------------------------------------
     # BEV outage: escalating fleet pause
     # ------------------------------------------------------------------
     def _fleet_bev_warn_rate(self, statuses: dict) -> tuple[float, int]:
@@ -10494,6 +10696,15 @@ class PeerDirector:
                         locals().get('_statuses') or {})
                 except Exception:
                     log.exception('Stuck-KG watchdog error')
+                # Duplicate-KG reconciler: stop laggards when two+ peers
+                # ended up on the same KG outside the dispatch-claim
+                # window. Reuses the SAME `_statuses` snapshot — no extra
+                # fanout — and caps stops/tick (anti-herd).
+                try:
+                    self._check_duplicate_kgs(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('Duplicate-KG reconciler error')
                 # BEV-outage detection: fleet-wide escalating pause
                 # when BEV emits sustained errors across many peers.
                 # Runs after capacity_factor was computed above (uses

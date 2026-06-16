@@ -3874,94 +3874,186 @@ def _get_completed_kgs() -> set:
     return completed
 
 
+# === SECTION: KG geographic-coverage completion oracle ===
+# A KG is "complete" iff its committed ``_json`` products geographically
+# cover the parent bbox. Split KGs are an EXACT axis-aligned grid partition
+# of the parent (see ``kg_splitter._split_bbox_grid``: the union of all block
+# bboxes equals the parent bbox). Coverage is therefore immune to split-
+# layout drift -- unlike re-running ``maybe_split_kg()``, whose block set
+# changes as ``kg_strikes.json`` counts change. That drift was mislabelling
+# historically-split KGs in BOTH directions: genuinely-complete ones
+# (40326/62013 -- east+west tile the parent) were re-dispatched forever
+# (double-processing + wasteful multi-GB re-uploads) and never drained from
+# the priority queue, while genuinely-incomplete ones (40016 -- only -west;
+# 32001 -- north third missing) were only flagged correctly by luck of the
+# current strike count. This oracle replaces the ``maybe_split_kg``-based
+# check everywhere a "is this KG done?" decision is made (Jun 2026).
+import re as _re_cov
+
+_COV_JSON_DIR = Path('data/austria_processor/json')
+_COV_BBOX_RE = _re_cov.compile(r'"bbox"\s*:\s*\{(.*?)\}', _re_cov.DOTALL)
+
+
+def _read_bbox_cheap(code, json_dir=None):
+    """``(min_lon, min_lat, max_lon, max_lat)`` from a KG/block JSON without
+    parsing the whole multi-MB file -- the ``bbox`` object sits in the first
+    few hundred bytes. Returns ``None`` if unreadable / absent."""
+    jd = json_dir or _COV_JSON_DIR
+    try:
+        with open(Path(jd) / f'{code}.json', 'r') as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    m = _COV_BBOX_RE.search(head)
+    if not m:
+        return None
+    body = m.group(1)
+
+    def _g(key):
+        mm = _re_cov.search(r'"' + key + r'"\s*:\s*(-?\d+(?:\.\d+)?)', body)
+        return float(mm.group(1)) if mm else None
+    vals = [_g('min_lon'), _g('min_lat'), _g('max_lon'), _g('max_lat')]
+    return tuple(vals) if all(v is not None for v in vals) else None
+
+
+def _rects_cover_parent(parent, rects):
+    """Exact axis-aligned rectangle coverage via coordinate compression:
+    do ``rects`` (committed product bboxes) cover the ``parent`` bbox?
+    Every sub-rectangle of the compressed grid must lie inside >=1 rect."""
+    plo, pla, phi, pha = parent
+    if phi <= plo or pha <= pla or not rects:
+        return False
+    eps = 1e-9
+    xs = sorted({plo, phi} | {r[0] for r in rects} | {r[2] for r in rects})
+    ys = sorted({pla, pha} | {r[1] for r in rects} | {r[3] for r in rects})
+    xs = [x for x in xs if plo - eps <= x <= phi + eps]
+    ys = [y for y in ys if pla - eps <= y <= pha + eps]
+    for i in range(len(xs) - 1):
+        cx = (xs[i] + xs[i + 1]) / 2.0
+        for j in range(len(ys) - 1):
+            cy = (ys[j] + ys[j + 1]) / 2.0
+            if not any(r[0] - eps <= cx <= r[2] + eps
+                       and r[1] - eps <= cy <= r[3] + eps for r in rects):
+                return False
+    return True
+
+
+def _parent_bbox_from_index(code):
+    try:
+        row = si.get_index()._conn().execute(
+            'SELECT min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?',
+            (code,)).fetchone()
+        if row and row['min_lon'] is not None:
+            return (row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat'])
+    except Exception:
+        pass
+    return None
+
+
+def _kg_coverage_complete(code, mentries, after_ts=None, json_dir=None):
+    """``(complete, newest_uploaded_at)`` -- geographic-coverage oracle.
+
+    * Block code: complete iff its own committed ``_json`` exists.
+    * Parent code: complete iff committed ``_json`` products (the plain
+      parent and/or its blocks, in any historical split layout) cover the
+      parent bbox. When ``after_ts`` is given, additionally require the
+      newest covering product to postdate it (re-completion semantics for
+      force-requeue tombstones).
+
+    Conservative on ambiguity: if a committed block's geometry can't be read
+    we fall back to "parent ``_json`` present" rather than guessing coverage,
+    so the oracle never claims a KG is done when it might have a hole (worst
+    case it is reprocessed, never silently lost)."""
+    if not isinstance(mentries, dict):
+        return (False, '')
+    from kg_splitter import is_block_code as _isb
+
+    def _good_ts(c):
+        e = mentries.get(c + '_json')
+        if not isinstance(e, dict) or 'error' in (e.get('status', '') or ''):
+            return None
+        return e.get('uploaded_at') or ''  # '' = committed but timestamp-less
+
+    if _isb(code):
+        ua = _good_ts(code)
+        if ua is None:
+            return (False, '')
+        ok = (after_ts is None) or bool(ua and str(ua) > str(after_ts))
+        return (ok, ua or '')
+
+    parent_ua = _good_ts(code)
+    fam = []  # (block_or_parent_code, uploaded_at)
+    pre = code + '-'
+    for k in mentries:
+        if not k.endswith('_json'):
+            continue
+        c = k[:-5]
+        if c != code and not c.startswith(pre):
+            continue
+        ua = _good_ts(c)
+        if ua is not None:
+            fam.append((c, ua))
+    if not fam:
+        return (False, '')
+    newest = max((ua for _, ua in fam if ua), default='')
+
+    pbbox = _parent_bbox_from_index(code)
+    if pbbox is None:
+        complete = parent_ua is not None
+    else:
+        rects, ok_geom = [], True
+        for c, _ in fam:
+            if c == code:
+                rects.append(pbbox)
+                continue
+            bb = _read_bbox_cheap(c, json_dir)
+            if bb is None:
+                ok_geom = False
+                break
+            rects.append(bb)
+        complete = (_rects_cover_parent(pbbox, rects) if ok_geom
+                    else parent_ua is not None)
+    if not complete:
+        return (False, newest)
+    if after_ts is not None:
+        return (bool(newest and str(newest) > str(after_ts)), newest)
+    return (True, newest)
+
+
 def _requeue_recompleted(code, requeue_ts, mentries):
     """True iff a force-requeued KG has genuinely *re-completed* since its
     ``<code>_requeue`` tombstone was stamped at ``requeue_ts``.
 
-    Split-aware. A non-split KG re-completes when its ``<code>_json`` manifest
-    entry was uploaded after ``requeue_ts``. A *split* parent never produces a
-    parent ``_json`` — it completes via per-block ``<code>-<dir>_json`` entries.
-    So for a split parent we require that EVERY block has a ``_json`` entry and
-    that the newest of those block uploads postdates ``requeue_ts``.
-
-    This is the load-bearing fix for the split-KG force-requeue loop: the POST
-    re-stamp guard and the director-loop prune sweep both relied on a parent
-    ``_json`` that split KGs never emit, so split parents re-stamped
-    ``_requeue=now`` forever and never drained.
+    Coverage-oracle backed (split-layout-drift immune): a parent re-completes
+    when its committed ``_json`` products geographically cover the parent
+    bbox AND the newest covering upload postdates ``requeue_ts``. A block code
+    re-completes when its own ``_json`` postdates ``requeue_ts``. See
+    ``_kg_coverage_complete``.
     """
     if not requeue_ts or not isinstance(mentries, dict):
         return False
-    rq = str(requeue_ts)
-    # Non-split (or block-keyed parent json) fast path.
-    je = mentries.get(code + '_json')
-    if isinstance(je, dict):
-        ua = je.get('uploaded_at', '') or ''
-        if ua and str(ua) > rq:
-            return True
-    # Split-parent path: all blocks json present AND newest block postdates rq.
     try:
-        from kg_splitter import maybe_split_kg, is_block_code
-        if is_block_code(code):
-            return False
-        import search_index as _si
-        row = _si.get_index()._conn().execute(
-            'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
-            'FROM kg WHERE kg_code=?', (code,)).fetchone()
-        if not row or row['min_lon'] is None:
-            return False
-        fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
-                   'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
-                            'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
-        blocks = maybe_split_kg(fake_kg)
-        if len(blocks) <= 1:
-            return False
-        newest = ''
-        for b in blocks:
-            bcode = b['kg_code'] if isinstance(b, dict) else b
-            bj = mentries.get(bcode + '_json')
-            if not isinstance(bj, dict):
-                return False  # a block is still missing → not re-completed
-            bua = bj.get('uploaded_at', '') or ''
-            if str(bua) > newest:
-                newest = str(bua)
-        return bool(newest) and newest > rq
+        done, _newest = _kg_coverage_complete(code, mentries, after_ts=requeue_ts)
+        return bool(done)
     except Exception:
         return False
 
 
 def _kg_structurally_complete(code, mentries):
-    """True iff the KG currently has all its products in the manifest,
-    split-aware. Non-split: ``<code>_json`` present. Split parent: every
-    block has a ``_json`` entry. Ignores timestamps — answers only
-    "is it done right now?".
+    """True iff the KG currently has all its products committed, judged by
+    geographic coverage of the parent bbox (split-layout-drift immune).
+
+    Non-split / single-pass: the plain ``<code>_json`` covers the whole
+    parent bbox. Historically-split parent: its committed block ``_json``
+    products tile the parent bbox (any era's split layout). Block code: its
+    own ``<code>_json``. Ignores timestamps -- answers only "is it done right
+    now?". See ``_kg_coverage_complete``.
     """
     if not isinstance(mentries, dict):
         return False
-    je = mentries.get(code + '_json')
-    if isinstance(je, dict) and 'error' not in (je.get('status', '') or ''):
-        return True
     try:
-        from kg_splitter import maybe_split_kg, is_block_code
-        if is_block_code(code):
-            return False
-        import search_index as _si
-        row = _si.get_index()._conn().execute(
-            'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
-            'FROM kg WHERE kg_code=?', (code,)).fetchone()
-        if not row or row['min_lon'] is None:
-            return False
-        fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
-                   'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
-                            'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
-        blocks = maybe_split_kg(fake_kg)
-        if len(blocks) <= 1:
-            return False
-        for b in blocks:
-            bcode = b['kg_code'] if isinstance(b, dict) else b
-            bj = mentries.get(bcode + '_json')
-            if not (isinstance(bj, dict) and 'error' not in (bj.get('status', '') or '')):
-                return False
-        return True
+        done, _newest = _kg_coverage_complete(code, mentries)
+        return bool(done)
     except Exception:
         return False
 
@@ -4066,13 +4158,30 @@ def processing_queue_get():
         if not _m:
             continue
         _kg = _m.group(1)
-        # Check if this KG has a fresh _json upload after the tombstone
-        _json_entry = _mf_entries.get(_kg + '_json')
-        if _json_entry:
-            _uploaded_at = _json_entry.get('uploaded_at', '')
-            if _uploaded_at and _uploaded_at > str(ts_val):
-                _stale_tombstones.append(key)
-                continue
+        # Is this KG complete *right now* (coverage oracle, timestamp-
+        # ignoring)? Two reasons we ignore ts here rather than requiring
+        # ``newest_upload > tombstone``:
+        #   1. Split parents NEVER emit a parent ``<kg>_json`` -- they
+        #      complete via per-block ``_json`` products -- so the old
+        #      parent-``_json``-after-ts check left re-completed split
+        #      parents (40326/62013) tombstoned forever.
+        #   2. The ``<kg>_requeue`` tombstone self-perpetuates: it is
+        #      re-stamped to "now" on every director queue push, so a strict
+        #      ``newest_upload > ts`` check can NEVER fire for a KG whose
+        #      products were uploaded before the latest re-stamp -- the exact
+        #      reprocess loop this fix targets.
+        # Timestamp-ignoring "complete now" is the documented loop-breaker
+        # (mirrors the POST re-stamp guard's ``_kg_structurally_complete``
+        # OR-clause). It is safe because a *genuine* operator force-requeue
+        # DELETES the KG's manifest products first, so a real reprocess
+        # request is not "complete now" and is not cleared here.
+        try:
+            _recompleted, _ = _kg_coverage_complete(_kg, _mf_entries)
+        except Exception:
+            _recompleted = False
+        if _recompleted:
+            _stale_tombstones.append(key)
+            continue
         tombstoned_kgs.add(_kg)
     if _stale_tombstones:
         for k in _stale_tombstones:
@@ -4083,31 +4192,17 @@ def processing_queue_get():
                      len(_stale_tombstones), _stale_tombstones[:5])
         except Exception:
             pass
-    # Build a set of "effectively completed" codes — includes parent codes whose
-    # all blocks are done (e.g. '49006' when '49006-south/center/north' are done).
-    from kg_splitter import is_block_code, maybe_split_kg, all_block_codes_for_parent
-    try:
-        idx = si.get_index()
-        _conn = idx._conn()
-        def _parent_fully_done(code: str) -> bool:
-            if is_block_code(code):
-                return False  # block codes checked directly
-            row = _conn.execute(
-                'SELECT min_lon, min_lat, max_lon, max_lat, kg_name FROM kg WHERE kg_code=?',
-                (code,)
-            ).fetchone()
-            if not row or row['min_lon'] is None:
-                return False
-            fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
-                       'bbox': {'min_lon': row['min_lon'], 'min_lat': row['min_lat'],
-                                'max_lon': row['max_lon'], 'max_lat': row['max_lat']}}
-            blocks = maybe_split_kg(fake_kg)
-            if len(blocks) <= 1:
-                return False  # not a split KG
-            done = all_block_codes_for_parent(code, completed)
-            return len(done) >= len(blocks)
-    except Exception:
-        def _parent_fully_done(code: str) -> bool:
+    # "Effectively completed" = the coverage oracle says the KG's committed
+    # ``_json`` products tile the parent bbox (split-layout-drift immune).
+    # Replaces the old ``len(done_blocks) >= len(maybe_split_kg(now))`` check
+    # that mislabelled historically-split KGs (e.g. left 40326/62013 -- which
+    # ARE geographically complete -- queued forever because maybe_split now
+    # returns a single block whose parent ``_json`` was never emitted).
+    def _parent_fully_done(code: str) -> bool:
+        try:
+            done, _ = _kg_coverage_complete(code, _mf_entries)
+            return bool(done)
+        except Exception:
             return False
 
     dirty = len(codes)

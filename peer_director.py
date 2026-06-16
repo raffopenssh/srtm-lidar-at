@@ -10347,34 +10347,28 @@ class PeerDirector:
                          sorted(_recompleted)[:10])
         except Exception as _e:
             log.warning('prune retry_queue: requeue-loop resolution failed: %s', _e)
-        # Parent→done check via kg_splitter, mirroring app.py's GET
-        # handler so on-disk pruning is consistent with what the
-        # dashboard already does at view time.
+        # Parent→done check via the app.py coverage oracle (split-layout-drift
+        # immune), mirroring the GET handler so on-disk pruning agrees with
+        # what the dashboard does at view time. The old
+        # ``len(done_blocks) >= len(maybe_split_kg(now))`` check left
+        # historically-split-but-geographically-complete KGs (40326/62013)
+        # queued forever because maybe_split now returns a single block whose
+        # parent ``_json`` was never emitted.
         _parent_done = None
         try:
-            import search_index as _si
-            from kg_splitter import (maybe_split_kg, all_block_codes_for_parent,
-                                     is_block_code)
-            _conn = _si.get_index()._conn()
+            _mf_path_pd = DATA_DIR / 'zenodo_manifest.json'
+            _mf_pd = {}
+            if _mf_path_pd.exists():
+                _mf_raw_pd = json.loads(_mf_path_pd.read_text())
+                _mf_pd = _mf_raw_pd.get('entries', _mf_raw_pd) or {}
+            from app import _kg_coverage_complete as _cov_pd  # type: ignore
 
             def _parent_done(code: str) -> bool:
-                if is_block_code(code):
+                try:
+                    done, _ = _cov_pd(code, _mf_pd)
+                    return bool(done)
+                except Exception:
                     return False
-                row = _conn.execute(
-                    'SELECT min_lon, min_lat, max_lon, max_lat, kg_name '
-                    'FROM kg WHERE kg_code=?', (code,)).fetchone()
-                if not row or row['min_lon'] is None:
-                    return False
-                fake_kg = {'kg_code': code, 'kg_name': row['kg_name'],
-                           'bbox': {'min_lon': row['min_lon'],
-                                    'min_lat': row['min_lat'],
-                                    'max_lon': row['max_lon'],
-                                    'max_lat': row['max_lat']}}
-                blocks = maybe_split_kg(fake_kg)
-                if len(blocks) <= 1:
-                    return False
-                done = all_block_codes_for_parent(code, completed)
-                return len(done) >= len(blocks)
         except Exception:
             _parent_done = None
 

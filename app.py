@@ -6689,6 +6689,65 @@ def director_heal_peers_json():
     return jsonify(results)
 
 
+def _free_disk_for_update(min_free_gb: float = 0.5) -> dict:
+    """Evict stale tile_checkpoints to make room before a git-pull + restart.
+
+    A git pull on a near-full disk can fail mid-write (ENOSPC) and leave the
+    peer wedged: srv won't restart cleanly, the director keeps re-issuing the
+    update, and the peer never picks up new code. The cheapest safe reclaim is
+    the per-KG ``tile_checkpoints/<kg>`` dirs: they only matter for resuming a
+    KG that is *currently in flight* on THIS peer. Any other checkpoint dir is
+    either already-uploaded (the KG completed) or belongs to a KG some other
+    peer owns now -- safe to drop (cross-peer recovery still works via the
+    Zenodo chkpt registry). We keep only the in-progress KG's dir.
+
+    Only acts when free disk is below ``min_free_gb`` (default 0.5 GB) so it is
+    a no-op on healthy peers. Best-effort; never raises.
+    """
+    import shutil as _sh
+    out = {'ran': False, 'freed_mb': 0, 'dirs_removed': 0}
+    try:
+        free_gb = _sh.disk_usage('/').free / (1024 ** 3)
+        if free_gb >= min_free_gb:
+            return out
+        out['ran'] = True
+        out['free_gb_before'] = round(free_gb, 3)
+        data_dir = Path('data/austria_processor')
+        keep = set()
+        try:
+            ipf = data_dir / 'in_progress_kg.txt'
+            if ipf.exists():
+                cur = ipf.read_text().strip()
+                if cur:
+                    keep.add(cur)
+        except Exception:
+            pass
+        ckpt_root = data_dir / 'tile_checkpoints'
+        if ckpt_root.exists():
+            for d in ckpt_root.iterdir():
+                if not d.is_dir() or d.name in keep:
+                    continue
+                try:
+                    sz = sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
+                    _sh.rmtree(d, ignore_errors=True)
+                    out['freed_mb'] += sz / 1e6
+                    out['dirs_removed'] += 1
+                except Exception:
+                    pass
+        out['freed_mb'] = round(out['freed_mb'], 1)
+        try:
+            out['free_gb_after'] = round(_sh.disk_usage('/').free / (1024 ** 3), 3)
+        except Exception:
+            pass
+        log.info('update disk-eviction: %.0f MB freed from %d stale checkpoint dir(s) '
+                 '(free %.2f -> %.2f GB; kept in-progress %s)',
+                 out['freed_mb'], out['dirs_removed'], out.get('free_gb_before', 0),
+                 out.get('free_gb_after', 0), sorted(keep) or 'none')
+    except Exception as _e:
+        log.warning('update disk-eviction failed: %s', _e)
+    return out
+
+
 @app.route('/api/v1/admin/update', methods=['POST'])
 def admin_update():
     """Git pull and restart the web server (called by director on peers).
@@ -6737,6 +6796,12 @@ def admin_update():
                         if not still:
                             break
                         _t.sleep(15)
+                    # Free disk before the pull so a near-full peer doesn't
+                    # wedge mid-write (ENOSPC) and get stuck off the rollout.
+                    try:
+                        _free_disk_for_update()
+                    except Exception:
+                        pass
                     # Now run the actual update + restart sequence.
                     try:
                         _safe_git_sync(repo, sp)
@@ -6749,6 +6814,12 @@ def admin_update():
                     'note': 'will git-pull + restart srv once processor exits at next KG boundary',
                 })
             # No processor running → fall through to immediate path.
+        # Free disk before the pull so a near-full peer doesn't wedge mid-write
+        # (ENOSPC) and get stuck off the rollout. No-op above min_free_gb.
+        try:
+            _free_disk_for_update()
+        except Exception:
+            pass
         # Reset any tracked files that have local modifications + pull, with
         # stale-lock cleanup, serialization, and bumped timeouts. See
         # _safe_git_sync() docstring.

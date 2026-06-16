@@ -7840,6 +7840,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # GPKG that we reuse verbatim.
         _existing_full = str(GPKG_DIR / f"{kg_code}_full.gpkg")
         _reuse_full = False
+        _full_already_on_zenodo = False
         try:
             if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
                 _reuse_full = True
@@ -7851,8 +7852,75 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                              f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
         except Exception:
             _reuse_full = False
+        # Manifest-aware reuse: a prior run (possibly on another peer)
+        # streamed the full GPKG to Zenodo early -- to free disk -- and then
+        # deleted the local file. Without this check a fresh peer that picks
+        # the KG up rebuilds the full GPKG from scratch AND replaces the
+        # Zenodo file (a 1-15 GB re-upload) every retry. If the run then gets
+        # interrupted before the JSON step (big KGs frequently do -- auto-park
+        # on throughput collapse, cred rotation, role eviction), the KG never
+        # produces a ``_json`` entry, never drains from the priority queue,
+        # and the rebuild+re-upload loops indefinitely (KG 40016, Jun 2026).
+        # If the manifest already has a non-error ``{kg}_full_gpkg`` entry,
+        # skip BOTH the rebuild and the re-upload and proceed straight to
+        # light + JSON so the run can actually complete and the KG drains.
+        # A genuine operator force-requeue deletes the manifest entry, so a
+        # real rebuild is unaffected (no entry -> falls through to build).
+        if not _reuse_full:
+            try:
+                _mf_raw = json.loads(MANIFEST_PATH.read_text()) if MANIFEST_PATH.exists() else {}
+                _mf_entries = _mf_raw.get("entries", _mf_raw) or {}
+                _fe = _mf_entries.get(f"{kg_code}_full_gpkg")
+                _fe_ok = (isinstance(_fe, dict) and (_fe.get("size") or 0) > 0
+                          and "error" not in (_fe.get("status", "") or ""))
+                # Timestamp guard against an operator force-requeue. The
+                # requeue handler (app.py) DELETES the manifest entry AND
+                # stamps a PRODUCT-level tombstone ``{kg_code}_full_gpkg`` at
+                # the requeue instant. The entry deletion is the primary
+                # rebuild signal (propagates via peer-sync -> no entry ->
+                # rebuild); the product tombstone is the secondary defence for
+                # the window where the tombstone has propagated but the
+                # deletion hasn't. Reuse ONLY when the entry's upload is
+                # strictly newer than its product tombstone (== genuine
+                # re-completion after the last invalidation). Same semantics as
+                # app.py peer-sync's ``entry_ts <= tombstone_ts`` gate.
+                #
+                # CRUCIAL: do NOT gate on the ``_requeue`` tombstone. That one
+                # is re-stamped to ``now`` on every queue push (the documented
+                # force-requeue self-perpetuation), so an entry would always
+                # look older than it and we'd rebuild forever -- recreating the
+                # exact loop this fix removes. Split blocks are covered because
+                # a parent requeue tombstones each block's OWN product key.
+                if _fe_ok:
+                    _entry_ts = str(_fe.get("uploaded_at", "") or "")
+                    _tomb_ts = ""
+                    try:
+                        _tp = DATA_DIR / "manifest_tombstones.json"
+                        if _tp.exists():
+                            _td = json.loads(_tp.read_text())
+                            if isinstance(_td, dict):
+                                _tomb_ts = str(_td.get(f"{kg_code}_full_gpkg", "") or "")
+                    except Exception:
+                        _tomb_ts = ""
+                    if _tomb_ts and not (_entry_ts and _entry_ts > _tomb_ts):
+                        log.info("KG %s: full GPKG on Zenodo but product "
+                                 "tombstone (%s) >= entry (%s) -- rebuilding",
+                                 kg_code, _tomb_ts, _entry_ts or "<none>")
+                        _fe_ok = False
+                if _fe_ok:
+                    _full_already_on_zenodo = True
+                    full_gpkg = ""
+                    _boundary_remap = {}
+                    log.info("KG %s: full GPKG already on Zenodo (depo=%s, %.0f MB) -- "
+                             "skipping rebuild + re-upload",
+                             kg_code, _fe.get("depo_id"), (_fe.get("size") or 0) / 1e6)
+                    _report_step("gpkg_full",
+                                 f"already on Zenodo ({(_fe.get('size') or 0) / 1e6:.0f} MB) -- skip")
+            except Exception as _mfe:
+                log.warning("KG %s: manifest reuse check failed: %s", kg_code, _mfe)
+                _full_already_on_zenodo = False
         try:
-            if not _reuse_full:
+            if not _reuse_full and not _full_already_on_zenodo:
                 full_gpkg, _boundary_remap = build_full_gpkg_tiled(
                     kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
         except Exception as _bge:
@@ -7872,6 +7940,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 return result
             raise
         result["files"]["full_gpkg"] = full_gpkg
+
+        # If the full GPKG was already on Zenodo (manifest reuse above), it is
+        # neither rebuilt nor re-uploaded. Signal the parent to reload the
+        # manifest and skip its own upload attempt -- exactly as for the
+        # subprocess early-upload path.
+        if _full_already_on_zenodo:
+            result["_full_gpkg_uploaded"] = True
+            result["files"]["full_gpkg"] = ""
 
         # --- 5b. Validate full GPKG, then stream to Zenodo ---
         _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0

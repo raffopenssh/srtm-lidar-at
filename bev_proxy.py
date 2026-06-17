@@ -119,6 +119,24 @@ _PROXY_SOURCES = [
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
     "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
+    # Added 2026-06-17 after no_proxies=2 / phase2_med=5 and the pool
+    # collapsed to 0 proxies (3 direct slots only) on the primary's
+    # worker. Live-vetted the documented way (HTTPS-CONNECT yield
+    # against httpbin.org/ip, samples of 60-180 random entries; the
+    # 3 verified-tier sources calibrated at 8-12% in the same run, so
+    # the harness is sound). All four land in the raw tier (avg
+    # ~7-9% phase-1 across repeated runs, too noisy to confidently
+    # clear the >=10% verified-all bar). proxyspace.pro is an
+    # independent (non-GitHub) host, so it diversifies the funnel
+    # away from correlated GitHub-mirror staleness.
+    #   Vann-Dev/proxy-list      -> 5-13%  (901 entries)
+    #   proxyspace.pro/http      -> 7-9%   (~4000 entries)
+    #   proxyspace.pro/https     -> 8-13%  (~340 entries)
+    #   noctiro/getproxy         -> 6-8%   (~4800 entries)
+    "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/http.txt",
+    "https://proxyspace.pro/http.txt",
+    "https://proxyspace.pro/https.txt",
+    "https://raw.githubusercontent.com/noctiro/getproxy/master/file/http.txt",
 ]
 
 # URLs used to validate that a proxy can actually fetch BEV TIFF bytes.

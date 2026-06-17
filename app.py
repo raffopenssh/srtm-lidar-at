@@ -4415,30 +4415,48 @@ def processing_queue_add():
             # leaves the queue and reprocesses forever. Skip the re-stamp and
             # let the satisfied-tombstone sweep drain it instead.
             _existing_rq = _MANIFEST_TOMBSTONES.get(c + '_requeue')
-            if _existing_rq and mentries is not None:
-                # An existing ``_requeue`` tombstone + a KG that is now
-                # structurally complete (split-aware: all blocks have _json)
-                # is the reprocess-loop fingerprint. The director re-pushes
-                # the still-queued code with skip_processed=False every tick;
-                # without this guard we'd re-stamp ``_requeue=now`` forever,
-                # bumping the tombstone ahead of the block uploads so even a
-                # timestamp-ordered ``_requeue_recompleted`` check can never
-                # fire. Suppress the re-stamp AND clear the satisfied
-                # tombstone(s) so the code drains from the queue. Timestamp
-                # ordering is irrelevant here: a re-stamp on an already-
-                # complete KG is never useful.
-                if (_requeue_recompleted(c, _existing_rq, mentries)
+            if _existing_rq:
+                # IDEMPOTENT RE-PUSH GUARD. A ``_requeue`` tombstone already
+                # exists, so this code was force-requeued by an EARLIER call
+                # and its manifest products were already invalidated then. The
+                # director's queue-sync re-POSTs every still-queued tombstoned
+                # code with skip_processed=False on EVERY tick (~30 s), which
+                # lands right back here. We must treat that re-push as a no-op:
+                # NEVER re-stamp ``_requeue``/product tombstones and NEVER
+                # re-delete manifest entries on a re-push.
+                #
+                # The old guard only short-circuited when the KG was COMPLETE.
+                # For a genuinely-INCOMPLETE tombstoned KG (e.g. 40016 -- no
+                # parent _json; west-only blocks) it fell through and, every
+                # tick: (a) re-stamped ``40016_full_gpkg=now`` AND (b) deleted
+                # the fresh ``40016_full_gpkg`` manifest entry. That bumped the
+                # product tombstone past the Zenodo upload, so the next peer's
+                # manifest-aware reuse check saw ``tomb > entry`` and REBUILT
+                # the multi-GB full GPKG + re-uploaded it (the BW overage),
+                # instead of skipping straight to light+JSON. The KG never
+                # produced a parent _json (superseded mid-JSON by the next
+                # dispatch) -> never drained -> infinite loop (Jun 2026).
+                #
+                # Leaving the original (older) tombstones + the Zenodo products
+                # in place lets the manifest-aware reuse engage on the next
+                # peer (entry newer than the original requeue tombstone), so it
+                # skips the rebuild, completes light+JSON, and the KG drains.
+                if mentries is not None and (
+                        _requeue_recompleted(c, _existing_rq, mentries)
                         or _kg_structurally_complete(c, mentries)):
-                    # Drop this KG's _requeue + product tombstones (memory AND
-                    # disk) so the satisfied-tombstone sweep / prune drops it
-                    # from the queue and it stops reprocessing.
+                    # Already re-completed: drop this KG's _requeue + product
+                    # tombstones (memory AND disk) so the satisfied-tombstone
+                    # sweep / prune drops it from the queue.
                     import re as _re_rq
                     _drop = [k for k in list(_MANIFEST_TOMBSTONES)
                              if _re_rq.match(
                                  r'^' + _re_rq.escape(c) + r'(-[a-z][-a-z0-9]*)?_',
                                  k)]
                     _drop_tombstone_keys(_drop)
-                    continue
+                # Incomplete OR complete: re-push is idempotent -> no re-stamp,
+                # no manifest deletion. The code stays in the queue (it is
+                # appended to ``codes`` after this loop regardless).
+                continue
             _MANIFEST_TOMBSTONES[c + '_requeue'] = ts
             tombstoned.append(c + '_requeue')
             for key in partial_keys:

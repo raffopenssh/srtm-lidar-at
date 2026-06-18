@@ -10899,6 +10899,14 @@ def main():
             probe_count = 0
             while COPERNICUS_PAUSE_FILE.exists():
                 probe_count += 1
+                # Re-save so the time-windowed warning_rates in
+                # progress.json keep decaying while we sleep. Without
+                # this the frozen snapshot taken at pause time (e.g.
+                # copernicus 5m=1.0) is forwarded to the director
+                # forever, pinning the fleet capacity_factor at the
+                # throttle floor (~0.2) for hours after the underlying
+                # 402 storm has stopped — the brake can never self-clear.
+                progress.save()
                 time.sleep(900)  # 15 min
                 if _shutdown_requested:
                     break
@@ -10958,6 +10966,11 @@ def main():
                 # Network = peer-side issue: probe more often (2 min)
                 # so the director can switch faster.
                 # Rate-limit / auth = global: probe every 10 min.
+                # Re-save first so the time-windowed warning_rates keep
+                # decaying while we sleep (see the Copernicus pause loop
+                # above) — otherwise a frozen zenodo rate pins the fleet
+                # throttle long after the rate-limit storm has passed.
+                progress.save()
                 _wait = 600 if _is_global else 120
                 time.sleep(_wait)
                 if _shutdown_requested:

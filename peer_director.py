@@ -3761,7 +3761,7 @@ class PeerDirector:
         # other gunicorn worker / HA shadow read the same scores.
         try:
             with self._lock:
-                self.state['credentials'] = cred_pool
+                self.state['credentials'] = self._slim_cred_pool_for_state(cred_pool)
         except Exception:
             log.debug('stash aggregated credentials failed', exc_info=True)
         # Append a fleet-shape sample using the SAME numbers we return
@@ -7336,6 +7336,33 @@ class PeerDirector:
     # user as 'min_creds_per_frontier' in peers.json (default 2).
     MIN_CREDS_PER_FRONTIER_DEFAULT = 2
 
+    @staticmethod
+    def _slim_cred_pool_for_state(cred_pool: list[dict]) -> list[dict]:
+        """Return assignment-only copies of ``cred_pool`` for stashing into
+        ``state['credentials']`` (which is persisted to director_state.json).
+
+        The frontier assignment path (``_valid_credentials`` /
+        ``_assign_cred_indices``) only reads ``health``, ``last_status``,
+        ``exhausted``, ``index`` and ``client_id`` — it NEVER touches the
+        per-hour ``usage.buckets`` (168 entries/cred ≈ 6.5 KB) or
+        ``by_product`` telemetry. Persisting those into the already-large
+        director_state.json (and reloading them on every status recompute)
+        bloated the save/load cycle enough to time out the dashboard's
+        status fetch, which then rendered every credential as "no traffic".
+        The dashboard itself reads the FULL ``cred_pool`` returned by
+        ``_compute_status`` (a local var), so slimming the *stashed* copy
+        keeps the usage sparklines intact while keeping state lean.
+        """
+        slim = []
+        for c in cred_pool:
+            d = dict(c)
+            u = d.get('usage')
+            if isinstance(u, dict):
+                d['usage'] = {k: v for k, v in u.items()
+                              if k not in ('buckets', 'by_product')}
+            slim.append(d)
+        return slim
+
     def _credential_pool(self) -> list[dict]:
         """Return the local credential list (no secrets)."""
         try:
@@ -7382,7 +7409,7 @@ class PeerDirector:
             return
         self._last_cred_health_refresh = now
         with self._lock:
-            self.state['credentials'] = cred_pool
+            self.state['credentials'] = self._slim_cred_pool_for_state(cred_pool)
             try:
                 save_director_state(self.state)
             except Exception:

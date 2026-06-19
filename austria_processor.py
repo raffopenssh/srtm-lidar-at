@@ -7819,10 +7819,28 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                 "after cheap eviction — running tiered cleanup",
                                 _free_after, _need_gb)
                     try:
-                        check_disk_space(current_kg_code=kg_code)
+                        _disk_ok = check_disk_space(current_kg_code=kg_code)
                         _usage3 = _shutil_ev.disk_usage("/")
                         log.info("  Disk after tiered cleanup: %.1f GB free",
                                  _usage3.free / (1024 ** 3))
+                        if not _disk_ok:
+                            # Cleanup couldn't free enough for a safe GPKG
+                            # build. Don't barrel into gpkg_full and risk an
+                            # ENOSPC that permanently fails the KG. Abort
+                            # cleanly: every tile pickle is already on disk,
+                            # so the parent publishes them to the shared
+                            # registry and a disk-healthy peer restores them
+                            # and resumes straight at the GPKG build.
+                            log.warning("KG %s: disk still critically low after "
+                                        "cleanup (%.1f GB) — aborting before "
+                                        "GPKG build for cross-peer handoff",
+                                        kg_code, _usage3.free / (1024 ** 3))
+                            result["disk_low"] = True
+                            result["success"] = False
+                            result["error"] = ("disk critically low before GPKG "
+                                               "build — deferred for handoff")
+                            result["step"] = "aborted_disk_low"
+                            return result
                     except Exception as _tc_e:
                         log.warning("  Tiered cleanup failed: %s", _tc_e)
         except Exception as _ev_e:
@@ -8927,6 +8945,18 @@ def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool
     # --- BEV data server hiccups ---
     if "rasterio" in err_lower and ("http" in err_lower or "curl" in err_lower):
         return True
+
+    # --- Local disk exhaustion is transient (peer-specific) ---
+    # A peer that hits ENOSPC mid-build hasn't found a *bad* KG — it just
+    # ran out of space. Defer + republish checkpoints so a disk-healthy
+    # peer can finish it, rather than burning a permanent-fail strike.
+    _disk_patterns = [
+        "no space left", "enospc", "disk is full", "disk full",
+        "database or disk is full", "out of disk", "errno 28",
+    ]
+    for pat in _disk_patterns:
+        if pat in err_lower:
+            return True
 
     return False
 
@@ -10683,7 +10713,33 @@ def main():
                 is_ortho_failure = result.get("ortho_failed", False)
                 is_cadastre_failure = result.get("cadastre_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
-                if is_cache_incomplete:
+                is_disk_low = result.get("disk_low", False)
+                if is_disk_low:
+                    # This peer ran out of disk before/while building the
+                    # GPKG. Every tile pickle is on disk — publish them to
+                    # the shared Zenodo registry and defer so a disk-healthy
+                    # peer can restore + resume at the GPKG build instead of
+                    # re-fetching every tile. Not a permanent failure.
+                    log.warning("KG %s: disk low — deferring for cross-peer "
+                                "handoff (tile checkpoints preserved)", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: disk critically low — "
+                                     f"deferred for handoff (checkpoints kept)",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _remove_from_retry_queue(kg_code)
+                    _append_retry_queue(kg_code)
+                    _deferred = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
+                elif is_cache_incomplete:
                     # Cache-only peer hit a missing tile.  The KG must be
                     # processed by the frontier (primary) peer, which has
                     # Copernicus credentials.  Re-queue without marking

@@ -5425,7 +5425,7 @@ function renderHealthCell(h) {
   const pct = Math.round(s * 100);
   const label = h.label || '';
   let color;
-  if (label === 'exhausted' || label === 'unusable') color = 'var(--red)';
+  if (label === 'exhausted' || label === 'unusable' || label === 'stalled') color = 'var(--red)';
   else if (label === 'degraded') color = 'var(--red)';
   else if (label === 'hot') color = 'var(--yellow)';
   else if (label === 'warm') color = 'var(--yellow)';

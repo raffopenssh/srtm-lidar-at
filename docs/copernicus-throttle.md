@@ -176,6 +176,59 @@ grep 'Authenticated successfully\|Rotated to credential\|IP-throttled\|transient
 
 ---
 
+## Credential health scoring & the recency-stall gate
+
+`copernicus.score_credential_health(meta)` returns a `[0,1]` score the
+director uses to **order frontier credential assignment** (best score =
+picked first, in `peer_director._assign_cred_indices`). Signals:
+last-OIDC-status, error-recency ramp (1h→24h), 7d error-rate, rotation
+churn, recent-exhaustion residual, freshness bonus (never-used creds get
++0.25 so they rotate in), hot-workload de-prioritisation, and the
+**recency-stall gate**.
+
+### Why the stall gate exists (Jun 2026 dead-cred oscillation)
+
+CDSE accounts expire after ~90 days. An **expired** account still issues
+OIDC tokens (so `_probe_credential` *passes*) but 402s on every data
+request — so the 402 handler treats it as a *transient* throttle and
+never marks it `exhausted`. The cred stays `valid`/`degraded`.
+
+With a flat 7-day window that's a disaster: a cred that was alive last
+week carries hundreds of stale successes. `error_rate =
+e7/(s7+e7)` stays tiny (617 old successes vs 114 fresh errors → 0.16 →
+only −0.06). The only real penalty was `error_recency` (−0.50), and
+**that ages out within 6h**. So a freshly-dead cred climbs back to ~0.71
+"warm", gets re-preferred for frontier work, fails, drops to ~0.31, gets
+evicted, its error ages out, climbs to 0.71 again — **infinite
+oscillation**, burning frontier slots on a token that fetches nothing.
+
+### The fix
+
+The gate sums **recent-window (last 24h)** success/error from the
+per-hour buckets. If `success_recent_24h == 0` and `error_recent_24h >=
+8`, the cred is presumed dead and **hard-clamped** below every fresh
+candidate (cap 0.15 / 0.08 / 0.03 by how long since the last success),
+label `stalled`. Properties:
+
+* **Recency-true** — ignores last week's stale successes entirely; keys
+  only on "is this credential producing data *right now*?".
+* **Stable** — the clamp does not depend on `last_error` age, so it
+  cannot oscillate as the error-recency penalty decays.
+* **Robust to transient IP-throttle** — a real throttle recovers within
+  the ~2h cooldown, so within one 24h window the cred lands ≥1 success
+  and the gate releases. Sustained zero-success over a full day is not a
+  blip; it is a dead credential.
+* **Evidence-gated** — needs ≥8 recent errors so 1–2 blips don't stall a
+  cred.
+
+Dead creds end up at 0.03–0.08 (far below `_assign_cred_indices`'
+`UNHEALTHY=0.35` eviction floor), so the director evicts whoever holds
+them and rotates the fresh (1.0, freshness-bonus) pool in. Surfaced in
+`/process.txt` and the dashboard as `stalled` (red), with
+`success_recent_24h` / `error_recent_24h` in the health `signals`.
+
+Regression: `python3 test_cred_stall.py`.
+
 ---
 
 *See `AGENTS.md` for the project map.*

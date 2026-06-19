@@ -572,7 +572,14 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
       * ``score`` — final value in [0, 1] used for ordering.
       * ``components`` — per-signal contribution (negative = penalty,
         positive = bonus). Frontend renders this in the tooltip.
-      * ``label`` — "healthy" / "warm" / "hot" / "degraded" / "exhausted".
+      * ``label`` — "healthy" / "warm" / "hot" / "degraded" /
+        "stalled" / "exhausted". ``stalled`` is the recency circuit
+        breaker: many recent attempts, zero recent successes → the
+        credential is presumed dead (expired account / revoked secret /
+        hard quota) and clamped below every fresh candidate, ignoring
+        last week's now-stale successes. This is what stops a
+        just-expired cred from oscillating back into the warm set every
+        time its ``error_recency`` penalty ages out.
     """
     if now is None:
         now = time.time()
@@ -582,6 +589,28 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
     r7 = int(u.get("rotated_7d") or 0)
     last_use = float(u.get("last_use") or 0)
     last_err = float(u.get("last_error") or 0)
+    last_ok = float(u.get("last_success") or 0)
+
+    # Recent-window (last RECENT_WINDOW_H hours) success/error tally,
+    # summed from the per-hour buckets. This is what catches a
+    # credential that has *recently gone dead* (90d account expiry,
+    # revoked secret, hard quota cap) — its 7d totals are still
+    # dominated by last week's successes, but the last 24h are all
+    # errors. Without this, a dead cred's error_recency penalty ages
+    # out within 6h and the score climbs back into "warm", so it gets
+    # re-preferred for frontier work, fails, gets evicted, recovers,
+    # and oscillates forever while never actually fetching anything.
+    RECENT_WINDOW_H = 24
+    now_h = int(now // 3600)
+    s_recent = e_recent = 0
+    for b in (u.get("buckets") or []):
+        try:
+            age_h = now_h - int(b.get("h"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= age_h < RECENT_WINDOW_H:
+            s_recent += int(b.get("s", 0) or 0)
+            e_recent += int(b.get("e", 0) or 0)
 
     components: dict[str, float] = {}
     score = 1.0
@@ -682,9 +711,41 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
             score += pen
             components["workload"] = pen
 
+    # 8) RECENT-STALL GATE (the dead-credential circuit breaker).
+    #
+    # A credential that has made a meaningful number of attempts in the
+    # last 24h with ZERO successes is presumed dead (expired account,
+    # revoked secret, hard quota wall). Hard-clamp it below every fresh
+    # candidate so the director stops handing it frontier work. This is
+    # recency-true: it ignores last week's stale successes entirely and
+    # keys only on "is this credential producing data RIGHT NOW?".
+    #
+    # Robust to transient IP-throttle: a real throttle recovers within
+    # the ~2h cooldown, so within one 24h window the cred lands at least
+    # one success and the gate releases. Sustained zero-success over a
+    # full day is not a blip — it is a dead credential.
+    STALL_MIN_RECENT_ERR = 8     # need real evidence, not 1-2 blips
+    stalled = False
+    if s_recent == 0 and e_recent >= STALL_MIN_RECENT_ERR:
+        stalled = True
+        # Scale the clamp by how long since the last *success*: the
+        # longer it's been dead, the lower it sits. >48h dead → ~0.03.
+        ok_age_h = ((now - last_ok) / 3600.0) if last_ok > 0 else 1e9
+        if ok_age_h >= 48.0:
+            cap = 0.03
+        elif ok_age_h >= 24.0:
+            cap = 0.08
+        else:
+            cap = 0.15
+        if score > cap:
+            components["recent_stall"] = round(cap - score, 4)
+            score = cap
+
     score = max(0.0, min(1.0, score))
 
-    if score >= 0.85:
+    if stalled:
+        label = "stalled"
+    elif score >= 0.85:
         label = "healthy"
     elif score >= 0.65:
         label = "warm"
@@ -707,6 +768,9 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
             "last_error_age_s": int(now - last_err) if last_err else None,
             "last_status": meta.get("last_status"),
             "exhausted_at_age_s": int(now - exh_at) if exh_at else None,
+            "success_recent_24h": s_recent,
+            "error_recent_24h": e_recent,
+            "stalled": stalled,
         },
     }
 

@@ -9330,9 +9330,23 @@ def _record_failure(kg_code: str, failure_counts: dict,
 
 
 def _copernicus_probe() -> bool:
-    """Try a tiny Copernicus request to check if credits are back."""
+    """Try a tiny Copernicus request to check if credits are back.
+
+    Reloads the on-disk credential store first so a parent stuck in the
+    pause loop picks up credentials added to the fleet *after* it paused
+    (e.g. operator tops up the pool while frontiers are parked at a
+    credit wall). Without this the frozen in-memory ``_CREDENTIALS`` list
+    means a wedged frontier probes the same dead creds forever and can
+    never self-heal — see the 2026-06-19 incident where 21 frontiers
+    parked on an exhausted 10-cred account while 30 fresh creds sat
+    unused on disk.
+    """
     try:
         import copernicus
+        try:
+            copernicus._reload_credentials_from_disk()
+        except Exception as _re:
+            log.warning("probe: credential reload failed: %s", _re)
         copernicus.credits_exhausted = False
         copernicus.ip_throttled = False  # Reset throttle flag for fresh probe
         copernicus._connection = None

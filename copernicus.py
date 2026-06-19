@@ -961,30 +961,58 @@ class CredentialRotatedError(Exception):
 
 
 def _probe_credential(cred_index: int) -> bool:
-    """Lightweight probe to check if a credential is actually exhausted.
+    """Probe whether a credential still has *processing-unit quota*.
 
-    Attempts to authenticate with the given credential.  If auth succeeds
-    the credential likely still has credits and the 402 was a transient
-    rate-limit.  Returns True if the credential appears healthy.
+    CRITICAL: authentication is NOT a quota test. A CDSE service account
+    with zero credits still authenticates successfully via OIDC — the
+    402 ``PaymentRequired`` only surfaces on a PU-consuming request. An
+    auth-only probe therefore reports every exhausted credential as
+    "healthy", which makes ``_retry_on_rotation`` conclude ``n_exhausted
+    == 0`` and mislabel genuine credit exhaustion as IP-level throttling
+    (see the 2026-06-19 incident: 10 creds on a depleted account, every
+    one auth-OK, every data call 402, classifier shouted "IP-throttled"
+    and the fleet sat parked behind a 2 h cooldown for the wrong reason).
+
+    So we issue the smallest possible real request (single-band, ~0.01°
+    extent, one time step) and only treat a 402 on *that* as exhaustion.
+    Auth/network/5xx failures get the benefit of the doubt (transient).
     """
     try:
         cid, csecret = _CREDENTIALS[cred_index]
         logger.info("Probing credential %d (client_id=%s) ...", cred_index + 1, cid[:16] + "...")
         conn = openeo.connect(OPENEO_URL)
         conn.authenticate_oidc_client_credentials(client_id=cid, client_secret=csecret)
-        # If auth succeeds, credential is likely still valid
-        logger.info("Probe OK — credential %d is still valid", cred_index + 1)
-        # Refresh the cached connection
+    except Exception as auth_exc:
+        # Auth itself failed (network, OIDC outage, bad secret). Not a
+        # quota signal — give the benefit of the doubt so we don't mark
+        # a credential exhausted over a transient connectivity blip.
+        logger.info("Probe inconclusive for credential %d (auth: %s) — treating as healthy",
+                    cred_index + 1, auth_exc)
+        return True
+    try:
+        # Minimal PU-consuming request — this is the ONLY thing that can
+        # distinguish a credit-exhausted credential from a healthy one.
+        cube = conn.load_collection(
+            'SENTINEL2_L2A',
+            spatial_extent={'west': 15, 'south': 47,
+                            'east': 15.01, 'north': 47.01},
+            temporal_extent=['2024-06-01', '2024-06-15'],
+            bands=['B04'],
+        )
+        cube.max_time().download()
+        logger.info("Probe OK — credential %d has quota", cred_index + 1)
         _connections[cred_index] = conn
         return True
     except Exception as probe_exc:
         probe_msg = str(probe_exc)
         if '402' in probe_msg and 'PaymentRequired' in probe_msg:
-            logger.warning("Probe confirmed credential %d is exhausted", cred_index + 1)
+            logger.warning("Probe confirmed credential %d is exhausted (402 on data request)",
+                           cred_index + 1)
             return False
-        # Other errors (network, 5xx) — give benefit of the doubt
+        # Non-402 (network, 5xx, timeout) — give benefit of the doubt.
         logger.info("Probe inconclusive for credential %d (%s) — treating as healthy",
                     cred_index + 1, probe_exc)
+        _connections[cred_index] = conn
         return True
 
 

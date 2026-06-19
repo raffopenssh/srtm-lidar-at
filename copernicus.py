@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import tempfile
 import threading
 import time
@@ -1238,8 +1239,65 @@ def _retry_on_rotation(fn):
     return wrapper
 
 
+def _pick_next_credential_index(current: int) -> int | None:
+    """Pick the next credential index: weighted-random, preferring health.
+
+    Replaces the old ``(current + 1) % N`` round-robin, which deterministically
+    handed work to low-index credentials first — including *stalled* (dead /
+    expired) ones whose score has collapsed but whose ``last_status`` is still
+    ``valid`` (they auth fine, only 402 on data). Round-robin meant a peer that
+    rotated off a dead cred frequently landed on the *next* dead cred, churning
+    instead of escaping.
+
+    Selection (caller must hold ``_cred_lock``):
+      * candidate set = all indices except ``current``, ``_exhausted_cred_indices``
+        and (if set) those outside ``_ALLOWED_CRED_INDICES``;
+      * each candidate is scored via ``score_credential_health`` over its local
+        usage (the peer process *is* the one making the calls, so its buckets
+        are authoritative);
+      * weight = max(score, floor)**2 so a healthy cred is strongly preferred
+        but a stalled one still has a small non-zero chance (avoids a hard
+        starve if scoring is momentarily wrong), and the **random** draw spreads
+        load across all the healthy creds instead of always the lowest index.
+
+    Returns the chosen index, or ``None`` if there is no other candidate.
+    """
+    n = len(_CREDENTIALS)
+    if n <= 1:
+        return None
+    candidates = [i for i in range(n)
+                  if i != current and i not in _exhausted_cred_indices]
+    if _ALLOWED_CRED_INDICES is not None:
+        candidates = [i for i in candidates if i in _ALLOWED_CRED_INDICES]
+    if not candidates:
+        return None
+    weights: list[float] = []
+    for i in candidates:
+        cid = _CREDENTIALS[i][0]
+        try:
+            meta = dict(_cred_meta.get(cid, {}))
+            meta['client_id'] = cid
+            meta['usage'] = _read_usage_for(cid)
+            score = float((score_credential_health(meta) or {}).get('score') or 0.0)
+        except Exception:
+            score = 0.5
+        # Quadratic weighting with a small floor: healthy creds dominate,
+        # stalled creds keep a residual chance so they're never hard-starved.
+        weights.append(max(score, 0.02) ** 2)
+    try:
+        return random.choices(candidates, weights=weights, k=1)[0]
+    except Exception:
+        # Defensive: degenerate weights → uniform random.
+        return random.choice(candidates)
+
+
 def rotate_credentials(_locked: bool = False) -> bool:
-    """Switch to the next credential pair. Returns True if rotated, False if exhausted all.
+    """Switch to another credential pair. Returns True if rotated, False if none.
+
+    Picks a **weighted-random, health-preferring** next credential (see
+    :func:`_pick_next_credential_index`) rather than a deterministic
+    ``+1 mod N`` walk. This stops a peer from repeatedly rotating onto the
+    *next* stalled credential and instead spreads work across the healthy pool.
 
     Parameters
     ----------
@@ -1250,15 +1308,15 @@ def rotate_credentials(_locked: bool = False) -> bool:
 
     def _do_rotate():
         global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
-        old_idx = _credential_index
-        _credential_index = (_credential_index + 1) % len(_CREDENTIALS)
-        if _credential_index == old_idx and len(_CREDENTIALS) == 1:
-            return False  # only one set of credentials
+        nxt = _pick_next_credential_index(_credential_index)
+        if nxt is None:
+            return False  # no other usable credential
+        _credential_index = nxt
         CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
         _connection = None  # force re-auth with new credentials
         logger.info("Rotated to credential set %d/%d (client_id=%s)",
                     _credential_index + 1, len(_CREDENTIALS), CLIENT_ID[:16] + "...")
-        return _credential_index != old_idx  # True unless we wrapped all the way around
+        return True
 
     if _locked:
         return _do_rotate()

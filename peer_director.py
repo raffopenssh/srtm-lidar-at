@@ -3747,6 +3747,23 @@ class PeerDirector:
             self._aggregate_credential_usage(cred_pool, peers_list)
         except Exception as e:
             log.debug('aggregate_credential_usage: %s', e)
+        # Stash the *aggregated, health-scored* pool into state so the
+        # frontier assignment path sees real per-cred health (incl. the
+        # ``stalled`` clamp). Without this, ``_assign_cred_indices`` and
+        # ``_valid_credentials`` fall back to the primary's LOCAL
+        # ``copernicus.list_credentials()`` — but the primary never
+        # processes, so every cred there scores a flat 1.0 with no stall
+        # signal. Tied scores collapse the rank key ``(-score, idx)`` to
+        # pure index order, so the low-index stalled creds (1, 3, 9, 10…)
+        # were deterministically assigned first, churning peers onto dead
+        # tokens. Only the director-loop worker (which computes this
+        # aggregate) writes it; the value rides director_state.json so the
+        # other gunicorn worker / HA shadow read the same scores.
+        try:
+            with self._lock:
+                self.state['credentials'] = cred_pool
+        except Exception:
+            log.debug('stash aggregated credentials failed', exc_info=True)
         # Append a fleet-shape sample using the SAME numbers we return
         # to the dashboard so the sparkline's last point always matches
         # the card text. Throttled to avoid pile-on from concurrent
@@ -7328,6 +7345,50 @@ class PeerDirector:
             log.warning('credential_pool: %s', e)
             return []
 
+    # Throttle for the director-loop credential-health refresh. The
+    # aggregate fanout (~one /api/v1/credentials GET per peer) is cheap
+    # but not free; 90s keeps the assignment health fresh without piling
+    # on the dashboard's own get_status fanout.
+    _CRED_HEALTH_REFRESH_S = 90
+    _last_cred_health_refresh: float = 0.0
+
+    def _refresh_credential_health_if_due(self) -> None:
+        """Director-loop hook: rebuild the fleet-aggregated, health-scored
+        credential pool and stash it in ``state['credentials']`` so
+        ``_assign_cred_indices`` / ``_valid_credentials`` rank by REAL
+        per-cred health instead of the primary's flat all-1.0 local pool.
+
+        This must run on the director-loop worker (the one that calls the
+        frontier orchestrator). ``_compute_status`` also stashes the same
+        aggregate, but it only runs on whichever gunicorn worker serves a
+        dashboard request — which may not be the loop worker, so the
+        assigner could otherwise never see scored creds. Throttled to
+        ``_CRED_HEALTH_REFRESH_S``.
+        """
+        now = time.time()
+        if now - float(self._last_cred_health_refresh or 0) < self._CRED_HEALTH_REFRESH_S:
+            return
+        try:
+            cred_pool = self._credential_pool()
+        except Exception:
+            cred_pool = []
+        if not cred_pool:
+            return
+        try:
+            peers_list = list(self.cfg.get('peers', []))
+            self._aggregate_credential_usage(cred_pool, peers_list)
+        except Exception as e:
+            log.debug('refresh_credential_health aggregate failed: %s', e)
+            return
+        self._last_cred_health_refresh = now
+        with self._lock:
+            self.state['credentials'] = cred_pool
+            try:
+                save_director_state(self.state)
+            except Exception:
+                log.debug('save_director_state during cred-health refresh failed',
+                          exc_info=True)
+
     def _aggregate_credential_usage(self, cred_pool: list[dict],
                                      peers_list: list[dict]) -> None:
         """Merge per-peer /api/v1/credentials usage into cred_pool entries.
@@ -7530,13 +7591,26 @@ class PeerDirector:
         is that the request path *cannot* probe — only the director
         loop can.
         """
-        creds = self._credential_pool()
+        # Prefer the fleet-aggregated, health-scored pool stashed by
+        # ``_compute_status``; it carries the ``stalled`` clamp derived
+        # from per-peer usage. Fall back to the primary's LOCAL pool only
+        # when the aggregate hasn't been computed yet (fresh director).
+        creds = self.state.get('credentials') or self._credential_pool()
         valid = []
         for c in creds:
             if c.get('exhausted'):
                 continue
             st = (c.get('last_status') or '').lower()
             if st in ('exhausted', 'invalid'):
+                continue
+            # Drop credentials the health scorer has flagged dead
+            # (expired account / revoked secret / hard quota): they still
+            # authenticate (``last_status==valid``) but 402 on every data
+            # request, so they must never be handed to a frontier. Only
+            # excluded when we actually have a health verdict — a missing
+            # ``health`` block (local-pool fallback) leaves the cred in.
+            label = ((c.get('health') or {}).get('label') or '').lower()
+            if label in ('stalled', 'unusable'):
                 continue
             valid.append(int(c.get('index')))
         return valid
@@ -7912,12 +7986,22 @@ class PeerDirector:
                 except Exception:
                     h = None
             health_by_idx[idx] = h or {'score': 0.5}
-        # Sort key: best health first (descending score), then index
-        # ascending for stable tie-break. Negate score so ``sorted``
-        # ascending puts the best candidate first.
+        # Sort key: best health first (descending score). Among creds of
+        # (near-)equal score we want a RANDOM pick rather than the lowest
+        # index every time — otherwise leftover slices always land on the
+        # same low-index creds, defeating load-spreading across the
+        # healthy pool. We bucket the score (0.05 granularity) so clearly
+        # healthier creds still strictly win, then break ties randomly.
+        # Existing peers keep their slice via the prior-plan preservation
+        # pass below, so this randomisation only affects *new* allocations
+        # and never churns a stable assignment.
+        import random as _rnd
+        _jitter = {i: _rnd.random() for i in valid_set_all}
         def _rank(i: int) -> tuple:
             h = health_by_idx.get(i) or {'score': 0.5}
-            return (-float(h.get('score') or 0.0), i)
+            score = float(h.get('score') or 0.0)
+            bucket = round(score / 0.05)  # higher bucket = healthier
+            return (-bucket, _jitter[i])
         valid = sorted(valid_set_all, key=_rank)
         per = self._effective_creds_per_frontier(cfg)
         out: dict[str, list[int]] = {}
@@ -10741,6 +10825,15 @@ class PeerDirector:
                         locals().get('_statuses') or {})
                 except Exception:
                     log.exception('Stale-peer update orchestration error')
+                # Refresh the fleet-aggregated credential HEALTH scores
+                # before any frontier assignment so creds are ranked by
+                # real per-peer usage (incl. the ``stalled`` clamp), not
+                # the primary's flat local 1.0 pool. Must run on the loop
+                # worker since the assigner reads state['credentials'].
+                try:
+                    self._refresh_credential_health_if_due()
+                except Exception:
+                    log.exception('Credential-health refresh error')
                 # Parallel-frontier orchestration: start additional
                 # frontier peers when credential capacity permits.
                 try:

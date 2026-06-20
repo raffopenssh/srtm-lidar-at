@@ -1485,6 +1485,14 @@ _ROLE_DEMOTED_AT_FILE = Path('data/austria_processor/role_demoted_at')
 # request timing out for ~30 minutes (the at40 wedge of 2026-05-07).
 # Primary is unaffected (it always keeps the index).
 ROLE_INDEX_BUILD_DELAY_S = 1800        # 30 min after non-primary promotion
+# Max age of a `shadow/meta.json` push before we stop treating ourselves as
+# the designated shadow for keep-role purposes. A live shadow is refreshed
+# every director_ha.SHADOW_SYNC_INTERVAL (~30 s), so this is hugely generous
+# and only trips on de-elected shadows whose stale meta would otherwise pin
+# ~5 GB of JSON+index on disk forever (filling the VM → mid-KG aborts →
+# frontier reassignment churn). Role-data eviction adds its own 1 h grace
+# on top before anything is actually purged.
+KEEP_ROLE_SHADOW_FRESH_S = 1800        # 30 min
 _ROLE_PROMOTED_AT_FILE = Path('data/austria_processor/role_promoted_at')
 
 
@@ -1583,7 +1591,30 @@ def _is_keep_role_data() -> bool:
         designated = (meta.get('shadow_id')
                       or (meta.get('director_state') or {}).get('shadow_peer'))
         if designated and designated == sid:
-            return True
+            # Freshness gate (mirrors the watchdog's promote gate in
+            # director_ha): a peer that *was* shadow once and then got
+            # de-elected keeps a stale meta.json forever (a plain
+            # shadow re-election never notifies the loser). Without
+            # this check it stays keep-role indefinitely and retains
+            # the ~5 GB JSON corpus + index — which fills its disk to
+            # zero, aborts the in-flight KG mid-run, and re-queues it
+            # to the frontier (the frontier-reassignment / dup-kg churn).
+            # A live shadow gets a snapshot push every
+            # director_ha.SHADOW_SYNC_INTERVAL (~30 s), so received_ts
+            # is always fresh; only multi-hour-stale metas are rejected.
+            try:
+                received_ts = float(meta.get('received_ts') or 0.0)
+            except Exception:
+                received_ts = 0.0
+            age = time.time() - received_ts
+            if received_ts > 0 and age <= KEEP_ROLE_SHADOW_FRESH_S:
+                return True
+            # Stale shadow meta — we are not actually being maintained as
+            # shadow. Fall through to non-keep so role-data eviction can
+            # reclaim the disk (with its own 1 h grace before purging).
+            log.info('keep-role: ignoring stale shadow meta '
+                     '(shadow_id=%s, age=%.0fs > %ds) — not keep-role',
+                     designated, age, KEEP_ROLE_SHADOW_FRESH_S)
     except Exception as e:
         log.debug('keep-role check failed (assuming keep): %s', e)
         return True   # fail-safe: never delete on uncertainty

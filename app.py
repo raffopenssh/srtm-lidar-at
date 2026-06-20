@@ -7817,11 +7817,18 @@ def admin_role_evict():
     force = bool(body.get('force', False))
     if force:
         # Bypass keep_role check by stamping a far-past demotion marker.
+        # Best-effort only: on a *full* disk the marker write fails with
+        # ENOSPC, but the inline purge below is exactly what frees space,
+        # so we must NOT abort here — that would leave a wedged 0-GB peer
+        # unrecoverable. The marker is only an optimisation (so the
+        # background tick stays in the demoted state); the purge itself
+        # doesn't need it.
         try:
             _ROLE_DEMOTED_AT_FILE.parent.mkdir(parents=True, exist_ok=True)
             _ROLE_DEMOTED_AT_FILE.write_text(str(int(time.time()) - ROLE_EVICT_GRACE_SECONDS - 1))
         except Exception as e:
-            return jsonify({'ok': False, 'err': str(e)}), 500
+            log.warning('role_evict force: marker write failed (%s) — '
+                        'proceeding with inline purge anyway', e)
         # Override keep check for one tick by directly running the purge body.
         # Simpler: call tick. If force pretends keep=False, the existing tick
         # would still see keep=True. So bypass: do the purge inline.

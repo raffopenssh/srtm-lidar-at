@@ -696,6 +696,52 @@ What to expect on a healthy GPKG:
 
 More in `docs/cross-cutting-concerns.md`.
 
+## Re-queueing already-processed KGs (the tombstone trap)
+
+`POST /api/v1/processing/queue {kgs:[…], position:0, skip_processed:false}`
+is the **only** correct path to reprocess a KG that already has manifest
+products. The dashboard's "Queue KG by name" box and `↻ re-queue all`
+button call exactly this — there is no separate "forced" endpoint.
+(`/processing/single` and `/processing/retry` just append the code; they
+do **not** clear completion state, so the GET prune below re-drops it.)
+
+**Why a re-queue can silently fail to stick.** `GET
+/api/v1/processing/queue` (which `process.html` polls every few seconds)
+is **not** read-only — it rewrites `retry_queue.json`, pruning any code
+its coverage-oracle (`_kg_coverage_complete`) calls complete
+(app.py:~4245). A KG survives the prune **only if** it is
+oracle-incomplete OR carries a live `<code>_requeue` tombstone. The
+oracle judges completeness by `_json` **coverage of the parent bbox**,
+ignoring missing GPKGs — so a **JSON-only KG (has `_json`, no
+`_full_gpkg`/`_light_gpkg`) reads as complete** and is pruned.
+
+**The trap (cost us a confusing 274→254 drop, Jun 2026).** The POST has
+an *idempotent re-push guard* (app.py:~4451): if a `<code>_requeue`
+tombstone **already exists** and the KG is structurally complete, the
+POST treats the call as a director re-push — it **drops** the tombstones
+and **refuses to re-delete `_json`**. Net effect: the code is appended
+to the queue, then pruned on the next dashboard GET. The first-time path
+(no live `_requeue`) instead **deletes the `_json` manifest entry** +
+stamps fresh tombstones → oracle now incomplete → KG sticks. So whether
+a re-queue holds depends on **prior tombstone state**, not on which UI
+you use.
+
+**Recipe to reliably reprocess a JSON-only / coverage-complete KG:**
+1. Ensure no stale live `<code>_requeue` tombstone exists (else you hit
+   the idempotent guard and `_json` is never deleted). Drop it first via
+   the satisfied-tombstone sweep (just re-POST once; if it's complete the
+   guard removes the tombstone) **then** POST again, OR delete the
+   `<code>_json` manifest entry directly so the oracle reads incomplete.
+2. `POST …/processing/queue {kgs:[code], position:0, skip_processed:false}`.
+3. Verify it survives a GET: `curl …/processing/queue` then re-read
+   `retry_queue.json` — the code must still be present.
+
+Diagnostic one-liner — list queued parents the oracle will prune (so you
+know which re-queues won't hold without a manifest `_json` delete):
+```bash
+python3 -c "import json,app; me=json.load(open('data/austria_processor/zenodo_manifest.json')).get('entries',{}); q=json.load(open('data/austria_processor/retry_queue.json')); print([c for c in q if app._kg_coverage_complete(c,me)[0]])"
+```
+
 ## Critical invariants (read before editing)
 
 - **Object types & colors** are duplicated across `app.py`, `austria_processor.py`,

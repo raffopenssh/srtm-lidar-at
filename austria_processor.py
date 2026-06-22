@@ -77,6 +77,18 @@ MAX_KG_PIXELS = 4_000_000
 # are constrained; revert to 12/9 when peer CPU allocation recovers.
 KG_TIMEOUT_SECONDS = 16 * 60 * 60        # 16 hours — first attempt
 KG_RETRY_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — retry attempt (checkpoints restore completed tiles)
+# Hard wall-clock cap on opportunistic frontier cell pre-warm. Pre-warm runs
+# INSIDE the KG subprocess AFTER the json file is built but BEFORE the result
+# returns to the parent (which performs the json Zenodo upload). A pre-warm
+# that marches through many uncached 0.1° cells -- each potentially hitting a
+# 180s openEO sync timeout then a multi-minute batch job -- can therefore
+# block the subprocess for hours, freezing the reported step on "json". The
+# stuck-kg watchdog then hard-restarts the peer at +12h and the block (full +
+# light GPKG already on Zenodo, but no _json product) re-queues forever and is
+# never marked complete. Pre-warm is purely opportunistic cache densification
+# and is NEVER required for KG completion, so cap its total wall time. (Jun
+# 2026 reprocess-loop fix: 49006-south, 63304-center, 90102-southeast et al.)
+PREWARM_MAX_SECONDS = 8 * 60  # 8 min budget for opportunistic pre-warm
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
@@ -315,6 +327,9 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
     hc = _get_hansen_cache()
     step = 0.1
     done = 0
+    # Hard wall-clock deadline: pre-warm must NEVER block the subprocess
+    # result (and therefore the json upload) for more than this budget.
+    _deadline = time.time() + PREWARM_MAX_SECONDS
 
     # Iterate the cell's 0.1° grid in deterministic (row-major) order so
     # repeated calls march through the grid, skipping cells already filled
@@ -324,9 +339,9 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
     # flush_tile_cache_to_zenodo(force=True) below uploads the whole local
     # cache, not just what we fetched this call.
     lat = round(cs, 4)
-    while lat < cn - 1e-9 and done < budget:
+    while lat < cn - 1e-9 and done < budget and time.time() < _deadline:
         lon = round(cw, 4)
-        while lon < ce - 1e-9 and done < budget:
+        while lon < ce - 1e-9 and done < budget and time.time() < _deadline:
             csub = {"west": round(lon, 4), "south": round(lat, 4),
                     "east": round(lon + step, 4), "north": round(lat + step, 4)}
             already = False
@@ -363,6 +378,11 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
                           csub["west"], csub["south"], e)
             lon = round(lon + step, 4)
         lat = round(lat + step, 4)
+
+    if time.time() >= _deadline:
+        log.info("prewarm: hit %ds wall-clock budget after %d cell(s) — "
+                 "stopping so json upload is not blocked",
+                 PREWARM_MAX_SECONDS, done)
 
     if done > 0:
         log.info("prewarm: filled %d 0.1° cell(s) in cell "
@@ -8136,6 +8156,57 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         else:
             log.info("KG %s: JSON validated OK", kg_code)
 
+        # --- 7c. Early JSON upload (interruption resilience) ---
+        # The ``_json`` product is the canonical completion marker: a KG only
+        # drains from the priority queue / counts as done once its json is on
+        # Zenodo (see app._get_completed_kgs / _kg_coverage_complete). Until
+        # now json was uploaded ONLY by the parent, AFTER this subprocess
+        # returned -- i.e. after the (now deadline-capped) frontier pre-warm.
+        # For big split blocks the json BUILD itself takes ~30 min, so a
+        # frontier peer that auto-parks on throughput collapse (every ~2h),
+        # rotates a credential, or is role-evicted mid-build kills the
+        # subprocess before json ever reaches the parent. The full + light
+        # GPKG were already streamed to Zenodo early, so the block lands in a
+        # "gpkg-but-no-json" limbo: never complete, re-queued forever,
+        # re-processed from scratch each time (49006-south, 63304-center,
+        # 90102-southeast et al., Jun 2026). Stream json to Zenodo HERE, the
+        # instant it is validated, so any later interruption can't lose it.
+        # Small file (~KB-MB) so the extra upload is negligible; on the happy
+        # path the parent skips its own json upload via ``_json_uploaded``.
+        if THROTTLE_FILE.exists():
+            # Throttle mode never uploads json (matches parent behaviour);
+            # leave it for the parent's throttle handling.
+            pass
+        else:
+            try:
+                from zenodo_client import (Client as _ZClientJ,
+                                            landscape_metadata as _lmJ,
+                                            Manifest as _ZManifestJ)
+                _zclientJ = _ZClientJ(token=ZENODO_TOKEN)
+                _qsJ = result.get("quality_score", 0)
+                _qgJ = result.get("quality_grade", "")
+                _alJ = result.get("available_layers") or []
+                _mlJ = result.get("missing_layers") or []
+                _zmetaJ = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                    _qs=_qsJ, _qg=_qgJ, _al=_alJ, _ml=_mlJ: \
+                    _lmJ(_kg, _name, v, "json", quality_score=_qs,
+                         quality_grade=_qg, available_layers=_al,
+                         missing_layers=_ml)
+                _zmanifestJ = _ZManifestJ(str(DATA_DIR / "zenodo_manifest.json"))
+                # Keep json on local disk (delete_after=False) so the parent
+                # can still run log_kg_stats_from_json afterwards.
+                _zclientJ.upload_stream(
+                    f"{kg_code}_json", json_path, VERSION, _zmetaJ,
+                    _zmanifestJ, delete_after=False)
+                result["_json_uploaded"] = True
+                log.info("KG %s: JSON streamed to Zenodo early (interruption-safe)",
+                         kg_code)
+            except Exception as _jue:
+                # Non-fatal: the parent will upload json the usual way. We
+                # just lose the early-upload safety net for this run.
+                log.warning("KG %s: early JSON upload failed (%s) -- "
+                            "parent will retry", kg_code, _jue)
+
         result["success"] = True
         result["step"] = "done"
         # Clean up tile checkpoints on success
@@ -10507,13 +10578,23 @@ def main():
                 # If the subprocess already streamed the full GPKG to
                 # Zenodo (to free disk), reload the manifest so we see
                 # the entry and don't try to re-upload a deleted file.
-                if result.get("_full_gpkg_uploaded"):
+                if result.get("_full_gpkg_uploaded") or result.get("_json_uploaded"):
                     manifest = Manifest(str(MANIFEST_PATH))
-                    log.info("KG %s: full GPKG was uploaded by subprocess — manifest reloaded",
+                    log.info("KG %s: subprocess pre-uploaded product(s) — manifest reloaded",
                              kg_code)
 
+                # Drop json from the parent's upload set when the subprocess
+                # already streamed it early (interruption-safe path). The
+                # file stays on disk for log_kg_stats_from_json above; we
+                # just don't re-upload it. full_gpkg is handled in the
+                # subprocess (it blanks result['files']['full_gpkg']).
+                _upload_files = result["files"]
+                if result.get("_json_uploaded"):
+                    _upload_files = {k: v for k, v in result["files"].items()
+                                     if k != "json"}
+
                 upload_stats = upload_kg_to_zenodo(
-                    kg_code, kg_name, result["files"], manifest,
+                    kg_code, kg_name, _upload_files, manifest,
                     quality_score=result.get("quality_score", 0),
                     quality_grade=result.get("quality_grade", ""),
                     available_layers=result.get("available_layers"),

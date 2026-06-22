@@ -8121,6 +8121,48 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except OSError:
                 pass
             result["files"]["light_gpkg"] = ""  # prevent parent upload attempt
+        elif _light_size > 0 and result.get("_full_gpkg_uploaded") \
+                and not result.get("zenodo_failed"):
+            # --- 6c. Early light GPKG upload (ordering invariant) ---
+            # The _json product is the canonical completion marker; the
+            # coverage oracle treats a KG as done the moment json is on
+            # Zenodo. We must therefore guarantee BOTH GPKGs are uploaded
+            # BEFORE json, so an interruption can only ever leave the safe
+            # "gpkg(s) present, json missing" state (re-queue + reprocess),
+            # never "json present, gpkg missing" (silently-complete hole).
+            # Upload light here, in strict order after full, and only attempt
+            # the early json upload below when both flags are set. Gated on
+            # _full_gpkg_uploaded so we never put light ahead of a full that
+            # hasn't landed yet.
+            _report_step("upload_light_gpkg",
+                         f"streaming {_light_size / 1e6:.0f} MB to Zenodo")
+            try:
+                from zenodo_client import (Client as _ZClientL,
+                                            landscape_metadata as _lmL,
+                                            Manifest as _ZManifestL)
+                _zclientL = _ZClientL(token=ZENODO_TOKEN)
+                _zmetaL = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""): \
+                    _lmL(_kg, _name, v, "gpkg")
+                _zmanifestL = _ZManifestL(str(DATA_DIR / "zenodo_manifest.json"))
+                def _sub_light_cb(sent, total):
+                    pct = round(100 * sent / total) if total else 0
+                    _report_step("upload_light_gpkg",
+                                 f"streaming {total / 1e6:.0f} MB \u2014 {pct}% "
+                                 f"({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
+                _zclientL.upload_stream(
+                    f"{kg_code}_light_gpkg", light_gpkg, VERSION, _zmetaL,
+                    _zmanifestL, delete_after=True,
+                    progress_callback=_sub_light_cb)
+                result["_light_gpkg_uploaded"] = True
+                result["files"]["light_gpkg"] = ""  # parent skips re-upload
+                log.info("KG %s: light GPKG streamed to Zenodo early", kg_code)
+            except Exception as _lue:
+                # Non-fatal: keep the file on disk and let the parent upload
+                # it (in order) later. Do NOT set zenodo_failed here -- a
+                # light failure shouldn't trigger the full re-queue path; we
+                # simply skip the early json upload below so ordering holds.
+                log.warning("KG %s: early light GPKG upload failed (%s) -- "
+                            "parent will retry", kg_code, _lue)
 
         # --- 7. Build JSON summary ---
         result["step"] = "json"
@@ -8173,10 +8215,30 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # instant it is validated, so any later interruption can't lose it.
         # Small file (~KB-MB) so the extra upload is negligible; on the happy
         # path the parent skips its own json upload via ``_json_uploaded``.
+        #
+        # ORDERING INVARIANT: json is the completion marker, so it must be
+        # the LAST product on Zenodo. Only upload it early once BOTH GPKGs
+        # are already up (full via the early-upload block above; light via
+        # the early-upload block we just added). A light product with size 0
+        # (genuinely absent) counts as satisfied -- there is nothing to be
+        # out-of-order with. If either GPKG hasn't landed early (upload
+        # failed / deferred), we skip the early json upload and let the
+        # parent upload everything in order (full, light, json).
+        _gpkgs_on_zenodo = (
+            result.get("_full_gpkg_uploaded")
+            and (result.get("_light_gpkg_uploaded") or _light_size == 0)
+            and not result.get("zenodo_failed")
+        )
         if THROTTLE_FILE.exists():
             # Throttle mode never uploads json (matches parent behaviour);
             # leave it for the parent's throttle handling.
             pass
+        elif not _gpkgs_on_zenodo:
+            # GPKG(s) not yet on Zenodo -- defer json to the parent so it is
+            # uploaded strictly after the GPKGs (ordering invariant).
+            log.info("KG %s: deferring JSON upload to parent (GPKGs not yet "
+                     "on Zenodo) to preserve full\u2192light\u2192json order",
+                     kg_code)
         else:
             try:
                 from zenodo_client import (Client as _ZClientJ,
@@ -10578,7 +10640,9 @@ def main():
                 # If the subprocess already streamed the full GPKG to
                 # Zenodo (to free disk), reload the manifest so we see
                 # the entry and don't try to re-upload a deleted file.
-                if result.get("_full_gpkg_uploaded") or result.get("_json_uploaded"):
+                if (result.get("_full_gpkg_uploaded")
+                        or result.get("_light_gpkg_uploaded")
+                        or result.get("_json_uploaded")):
                     manifest = Manifest(str(MANIFEST_PATH))
                     log.info("KG %s: subprocess pre-uploaded product(s) — manifest reloaded",
                              kg_code)

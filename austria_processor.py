@@ -8921,6 +8921,27 @@ def _pool_worker_init():
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
     except Exception:
         pass
+    # Leave the parent's process group so a *group-broadcast* SIGTERM
+    # can't kill us mid-KG. The API's graceful stop
+    # (``/processing/stop?graceful=1``) does ``os.killpg(pgid, SIGTERM)``
+    # — SIGTERM to the WHOLE process group — intending only to set the
+    # parent's ``_shutdown_requested`` so it finishes the current KG and
+    # exits at the next loop boundary. But the worker is in that same
+    # group and (below) maps SIGTERM→SIG_DFL, so the broadcast used to
+    # kill the worker instantly, mid-KG. The parent then saw the worker
+    # die, recorded a failure, and re-queued — and if both GPKGs had
+    # already streamed to Zenodo (they have, by the json-build stage),
+    # the KG stranded as "gpkg present, json missing" and was
+    # re-processed from scratch forever (63304-center + ~95 others,
+    # Jun 2026). PR_SET_PDEATHSIG above still guarantees we die if the
+    # parent dies, and ``Pool.terminate()`` cancels us by PID (not via
+    # the group), so real hard-stops / timeouts / postpone are
+    # unaffected — only the graceful group-SIGTERM now correctly skips
+    # the worker.
+    try:
+        os.setpgrp()
+    except Exception:
+        pass
     # Workers must not handle SIGTERM/SIGINT themselves — the parent
     # owns shutdown and will terminate() the pool. Inheriting the
     # parent's handler would set _shutdown_requested in the worker copy

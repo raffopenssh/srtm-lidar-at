@@ -232,6 +232,15 @@ def _is_server_error(exc: Exception) -> bool:
     # Also check chained cause
     cause_msg = str(exc.__cause__) if exc.__cause__ else ""
     combined = f"{msg} {cause_msg}"
+    # A 'source product missing on the CDSE cluster' error is NOT transient
+    # — the scene file simply isn't staged, so retrying the same window
+    # burns PUs to no effect. (get_sar_backscatter already falls back to a
+    # prior summer internally; if it still raises, every candidate year was
+    # missing and a cell-level retry won't help.) Classify as non-transient
+    # even though the wrapped message often contains a '[500]'.
+    if ("does not exist on the cluster" in combined
+            or "path to SAR product" in combined):
+        return False
     server_patterns = (
         "[500]", "[502]", "[503]",
         "Internal Server Error", "Bad Gateway", "Service Unavailable",

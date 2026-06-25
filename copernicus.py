@@ -1025,6 +1025,37 @@ class CredentialRotatedError(Exception):
     pass
 
 
+class MissingProductError(RuntimeError):
+    """Raised when openEO reports a source scene is absent from the CDSE
+    EODATA cluster (``FileNotFoundError ... does not exist on the
+    cluster``).
+
+    Distinct from a transient 5xx: rotating credentials or retrying the
+    *same* time window will never help — the scene is simply not staged.
+    Callers that have a sensible alternative (e.g. SAR backscatter, which
+    is seasonally stable) may catch this and fall back to a different
+    temporal window. Subclasses ``RuntimeError`` so existing
+    ``except Exception`` handlers still treat it as a normal failure.
+    """
+    pass
+
+
+def _is_missing_product_error(exc: Exception) -> bool:
+    """True if *exc* (or its cause) is a CDSE 'product not on cluster'
+    error — the openEO backend couldn't find the source scene file.
+
+    These are NOT transient: the scene is missing for *every* credential,
+    so the credential-rotation / 5xx-retry machinery just burns time and
+    PUs re-hitting the same dead window.
+    """
+    msg = f"{exc} {getattr(exc, '__cause__', '') or ''}"
+    return (
+        "does not exist on the cluster" in msg
+        or "FileNotFoundError: sar_backscatter" in msg
+        or "path to SAR product" in msg
+    )
+
+
 def _probe_credential(cred_index: int) -> bool:
     """Probe whether a credential still has *processing-unit quota*.
 
@@ -1596,6 +1627,14 @@ def _run_datacube(
             # 402 → CredentialRotatedError (propagates to decorator) or
             #        CreditsExhaustedError/IPThrottledError (propagates out)
             _check_credits_error(exc)
+            # CDSE source scene missing from the cluster — a batch job will
+            # fail identically (and waste 3 min + PUs). Surface it so the
+            # caller can fall back to a different temporal window instead.
+            if _is_missing_product_error(exc):
+                logger.warning(
+                    "Source product missing on CDSE cluster for %s (%s) — "
+                    "not retrying via batch", title, str(exc)[:200])
+                raise MissingProductError(str(exc)) from exc
             # Not a 402 — fall back to batch
             logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
 
@@ -1614,6 +1653,14 @@ def _run_datacube(
         )
     except Exception as batch_exc:
         _check_credits_error(batch_exc)  # raises CredentialRotatedError on 402
+        # Source scene missing from the cluster — batch fails the same way
+        # for every credential and window. Surface as MissingProductError
+        # so a seasonal product can fall back to a different year.
+        if _is_missing_product_error(batch_exc):
+            logger.warning(
+                "Batch job for %s failed: source product missing on CDSE "
+                "cluster (%s) — not rotating", title, str(batch_exc)[:200])
+            raise MissingProductError(str(batch_exc)) from batch_exc
         # Batch job failed (status: error) — this is often transient or
         # credential-specific.  Rotate to the next credential and let
         # @_retry_on_rotation retry the whole function from scratch.
@@ -2349,33 +2396,70 @@ def get_sar_backscatter(
     )
     conn = _conn or _get_connection()
 
-    s1 = conn.load_collection(
-        "SENTINEL1_GRD",
-        spatial_extent=bbox,
-        temporal_extent=[start_date, end_date],
-        bands=["VV", "VH"],
-    )
-
-    # Apply SAR backscatter processing (terrain correction)
-    s1_processed = s1.sar_backscatter(
-        coefficient="sigma0-ellipsoid",
-    )
-
-    # Temporal median composite
-    sar_composite = s1_processed.reduce_dimension(
-        dimension="t",
-        reducer="median",
-    )
-
-    try:
+    def _run_window(w_start: str, w_end: str) -> None:
+        """Build + download the SAR composite for one temporal window.
+        Writes to the (year-of-request) *cache_file* on success."""
+        s1 = conn.load_collection(
+            "SENTINEL1_GRD",
+            spatial_extent=bbox,
+            temporal_extent=[w_start, w_end],
+            bands=["VV", "VH"],
+        )
+        # Apply SAR backscatter processing (terrain correction)
+        s1_processed = s1.sar_backscatter(
+            coefficient="sigma0-ellipsoid",
+        )
+        # Temporal median composite
+        sar_composite = s1_processed.reduce_dimension(
+            dimension="t",
+            reducer="median",
+        )
         _run_datacube(sar_composite, cache_file, title="SAR backscatter", bbox=bbox)
-    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
-        raise  # let @_retry_on_rotation handle these
-    except Exception as exc:
-        logger.error("Failed to download SAR backscatter: %s", exc)
-        raise RuntimeError(f"SAR backscatter download failed: {exc}") from exc
 
-    return _parse_sar_tiff(cache_file, start_date, end_date)
+    # SAR backscatter is seasonally stable year-over-year, so when CDSE
+    # has not staged the requested summer's Sentinel-1 scenes on its
+    # EODATA cluster (MissingProductError), fall back to the *previous*
+    # summer rather than deferring the whole KG. This keeps products
+    # complete (a SAR-less KG downgrades classification) without
+    # re-hitting the dead window or disturbing the fleet. The window is
+    # tagged in the result so consumers can see it differs from the
+    # nominal observation year.
+    windows = [(start_date, end_date)]
+    try:
+        _y = int(start_date[:4])
+        windows.append((f"{_y - 1}-06-01", f"{_y - 1}-09-30"))
+    except (ValueError, IndexError):
+        pass
+
+    last_missing: Optional[Exception] = None
+    for i, (w_start, w_end) in enumerate(windows):
+        try:
+            if i > 0:
+                logger.warning(
+                    "SAR backscatter: %s–%s missing on CDSE cluster — "
+                    "falling back to prior summer %s–%s",
+                    start_date, end_date, w_start, w_end)
+            _run_window(w_start, w_end)
+            result = _parse_sar_tiff(cache_file, w_start, w_end)
+            if i > 0 and isinstance(result, dict):
+                result["fallback_year"] = int(w_start[:4])
+            return result
+        except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+            raise  # let @_retry_on_rotation handle these
+        except MissingProductError as exc:
+            last_missing = exc
+            continue  # try the next (earlier) summer window
+        except Exception as exc:
+            logger.error("Failed to download SAR backscatter: %s", exc)
+            raise RuntimeError(f"SAR backscatter download failed: {exc}") from exc
+
+    logger.error(
+        "Failed to download SAR backscatter: source scenes missing on CDSE "
+        "cluster for all candidate summers (%s)",
+        ", ".join(f"{w[0][:4]}" for w in windows))
+    raise RuntimeError(
+        f"SAR backscatter download failed: source product missing on cluster "
+        f"for all candidate years: {last_missing}") from last_missing
 
 
 def _parse_sar_tiff(

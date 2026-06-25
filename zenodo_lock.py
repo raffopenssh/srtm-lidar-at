@@ -164,6 +164,7 @@ def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
     lease: Optional[ZenodoLease] = None
     backoff = _ACQUIRE_RETRY_INTERVAL
     transport_failures = 0
+    overload_5xx = 0
     while True:
         try:
             r = requests.post(
@@ -202,6 +203,18 @@ def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
             data = r.json() if r.content else {}
             log.info('Zenodo lock busy (held by %s for %ss, idle %ss) — waiting',
                      data.get('holder'), data.get('age_s'), data.get('idle_s'))
+        elif r.status_code in (500, 502, 503, 504):
+            # Broker transiently overloaded: the primary's gunicorn workers
+            # (or the exe.dev proxy in front of them) returned a 5xx HTML
+            # page, not a lock decision. The primary IS reachable (it just
+            # answered), so unlike a transport error we keep waiting for it
+            # to recover rather than failing open into an uncoordinated
+            # upload. Retry quietly with backoff up to the 30-min deadline
+            # instead of spamming a warning on every cache-only peer each
+            # tick. (Don't touch transport_failures — that gates fail-open.)
+            overload_5xx += 1
+            log.info('Zenodo lock broker %d (transient overload) — retry %d',
+                     r.status_code, overload_5xx)
         else:
             log.warning('Zenodo lock acquire returned HTTP %d: %s',
                         r.status_code, r.text[:200])

@@ -10744,6 +10744,21 @@ def main():
                     except Exception:
                         pass
                     _append_retry_queue(kg_code)
+                    # Publish tile checkpoints to the cross-peer Zenodo
+                    # registry so the NEXT peer that picks this KG up
+                    # resumes mid-KG instead of reprocessing every tile
+                    # from scratch. Without this, a transient Zenodo
+                    # upload failure after a fully-built KG (GPKGs + JSON
+                    # done, only the upload timed out) silently discarded
+                    # all the completed work (e.g. KG 63302, Jun 2026:
+                    # at91 finished json at 15:41 then re-queued, and
+                    # at37/at35 started tile 1/9 from zero). This is the
+                    # only re-queue site that was missing the publish call
+                    # — every other path (postpone/timeout/abort) already
+                    # publishes. The subprocess keeps the metadata pickles
+                    # on zenodo_failed (see the gpkg_full block), so they
+                    # are on disk and ready to upload here.
+                    _publish_checkpoints_to_registry(kg_code, progress)
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
                         _ts = _ckg.get("tile_statuses", [])

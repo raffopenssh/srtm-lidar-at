@@ -484,6 +484,33 @@
   #zenTbl .zen-th-date { width: 21%; }
   #zenTbl .zen-th-url  { width: 12%; }
   .zen-url-icon { display: none; }
+  /* Per-KG completeness colouring of manifest rows (font colour only). A
+     "KG" here is the exact code incl. block suffix, e.g. 50017 or
+     50017-west — each produces its own full+light+json triple.
+       green  : full + light + json all present
+       yellow : something still missing, first file < 48h old (in flight)
+       red    : something missing AND first file ≥ 48h old (stalled —
+                e.g. wedged on gpkg_full, never completed the triple) */
+  #zenTbl tr.zk-green td:not([style*="center"]) { color: var(--green); }
+  #zenTbl tr.zk-yellow td:not([style*="center"]) { color: var(--yellow); }
+  #zenTbl tr.zk-red td:not([style*="center"]) { color: var(--red); }
+  /* Status filter chips */
+  .zen-stat-chip {
+    font-family: inherit; font-size: 10px; line-height: 16px;
+    padding: 0 7px; border: 1px solid var(--border); border-radius: 9px;
+    background: transparent; color: var(--dim); cursor: pointer;
+    white-space: nowrap; flex-shrink: 0;
+  }
+  .zen-stat-chip:hover { border-color: var(--dim); }
+  .zen-stat-chip.active { color: var(--bg); font-weight: 600; }
+  .zen-stat-chip[data-stat="green"].active  { background: var(--green);  border-color: var(--green); }
+  .zen-stat-chip[data-stat="yellow"].active { background: var(--yellow); border-color: var(--yellow); }
+  .zen-stat-chip[data-stat="red"].active    { background: var(--red);    border-color: var(--red); }
+  .zen-stat-chip .zen-stat-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:3px; vertical-align:middle; }
+  .zen-stat-chip[data-stat="green"] .zen-stat-dot  { background: var(--green); }
+  .zen-stat-chip[data-stat="yellow"] .zen-stat-dot { background: var(--yellow); }
+  .zen-stat-chip[data-stat="red"] .zen-stat-dot    { background: var(--red); }
+  .zen-stat-chip.active .zen-stat-dot { background: var(--bg); }
   /* Pulsing glow on priority-queue tags whose KG is currently being processed */
   @keyframes prioKgGlow {
     0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,0.0), inset 0 0 0 0 rgba(88,166,255,0); border-color: var(--blue); }
@@ -902,6 +929,11 @@
           </div>
           <span class="zen-filter-badge" id="zenFilterBadge"></span>
           <button class="zen-filter-clear" id="zenFilterClear" title="Clear filter" style="display:none">✕</button>
+          <span style="display:inline-flex;gap:4px;align-items:center">
+            <button class="zen-stat-chip" data-stat="green" id="zenChipGreen" title="Complete: full + light + json all present"><span class="zen-stat-dot"></span>done</button>
+            <button class="zen-stat-chip" data-stat="yellow" id="zenChipYellow" title="In flight: a product is still missing, first file &lt; 48h old"><span class="zen-stat-dot"></span>partial</button>
+            <button class="zen-stat-chip" data-stat="red" id="zenChipRed" title="Stalled: a product is missing and the first file is &ge; 48h old"><span class="zen-stat-dot"></span>stalled</button>
+          </span>
           <svg id="zenRateSpark" class="zen-rate-spark" width="100" height="22" style="flex-shrink:0;cursor:pointer" onclick="_toggleZenSparkMode()"><title>Zenodo upload rate (last 24h, hourly) · click for all-time history</title></svg>
           <span id="zenRateLabel" class="zen-rate-label" style="font-size:10px;color:var(--dim);white-space:nowrap;flex-shrink:0"></span>
         </div>
@@ -2760,6 +2792,57 @@ function _updateActiveProcessingKgs(peers) {
   _applyActiveKgGlow();
 }
 let _zenFilterLabel = ''; // display label for active filter
+let _zenStatFilter = '';  // '', 'green', 'yellow', or 'red'
+const ZEN_STALE_MS = 48 * 3600 * 1000;  // first-file age past which an
+                                        // incomplete KG counts as 'stalled'
+
+// Parse a manifest entry into { code, product } where product is one of
+// 'full' | 'light' | 'json' | null. The grouping `code` keeps the block
+// suffix (50017 vs 50017-west) because each block uploads its own triple.
+function _zenEntryParts(e) {
+  const key = String((e && e.key) || '');
+  let m = key.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_(full_gpkg|light_gpkg|json)$/);
+  if (m) {
+    return { code: m[1],
+             product: m[2] === 'full_gpkg' ? 'full'
+                    : m[2] === 'light_gpkg' ? 'light' : 'json' };
+  }
+  // Fallback: derive from filename (e.g. 50017_full.gpkg / 50017.json).
+  const fn = String((e && e.filename) || '');
+  m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_full\.gpkg$/i);
+  if (m) return { code: m[1], product: 'full' };
+  m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_light\.gpkg$/i);
+  if (m) return { code: m[1], product: 'light' };
+  m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)\.json$/i);
+  if (m) return { code: m[1], product: 'json' };
+  return { code: '', product: null };
+}
+
+// Build { code -> {products:Set, firstTs:ms, status:'green'|'yellow'|'red'} }
+// from the live manifest entries (error markers excluded by caller).
+function _zenStatusIndex(entries) {
+  const idx = new Map();
+  for (const e of entries) {
+    const { code, product } = _zenEntryParts(e);
+    if (!code || !product) continue;
+    let g = idx.get(code);
+    if (!g) { g = { products: new Set(), firstTs: Infinity }; idx.set(code, g); }
+    g.products.add(product);
+    const t = e.uploaded_at ? Date.parse(e.uploaded_at) : NaN;
+    if (isFinite(t) && t < g.firstTs) g.firstTs = t;
+  }
+  const now = Date.now();
+  for (const g of idx.values()) {
+    const complete = g.products.has('full') && g.products.has('light')
+                  && g.products.has('json');
+    if (complete) g.status = 'green';
+    else if (isFinite(g.firstTs) && (now - g.firstTs) >= ZEN_STALE_MS)
+      g.status = 'red';
+    else g.status = 'yellow';
+  }
+  return idx;
+}
+let _zenStatusIdx = new Map();  // populated each render by fetchManifest
 
 function _zenManifestRow(e) {
   const url = e.download_url || (e.depo_id && e.filename
@@ -2775,7 +2858,10 @@ function _zenManifestRow(e) {
     const min = String(dt.getMinutes()).padStart(2,'0');
     return dd+'/'+mm+' '+hh+':'+min;
   })() : '—';
-  return '<tr>' +
+  const _sp = _zenEntryParts(e);
+  const _g = _sp.code ? _zenStatusIdx.get(_sp.code) : null;
+  const _cls = _g ? ' class="zk-' + _g.status + '"' : '';
+  return '<tr' + _cls + '>' +
     '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
     '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
     '<td title="' + fname + '">' + fname + '</td>' +
@@ -2800,7 +2886,10 @@ async function fetchManifest() {
     .sort();
   let sorted = keys.map(k => ({key:k, ...entries[k]}))
     .sort((a,b) => (b.uploaded_at||'').localeCompare(a.uploaded_at||''));
-  // Apply filter
+  // Per-KG completeness index (green/yellow/red) over ALL entries — must be
+  // computed before the row renderer and before any subsetting filter.
+  _zenStatusIdx = _zenStatusIndex(sorted);
+  // Apply text filter
   const fc = _zenFilterCode;
   if (fc) {
     sorted = sorted.filter(e => {
@@ -2808,6 +2897,16 @@ async function fetchManifest() {
       const key = (e.key || '').toLowerCase();
       return fname.startsWith(fc.toLowerCase()) || key.toLowerCase().includes(fc.toLowerCase());
     });
+  }
+  // Apply status chip filter (green/yellow/red)
+  if (_zenStatFilter) {
+    sorted = sorted.filter(e => {
+      const p = _zenEntryParts(e);
+      const g = p.code ? _zenStatusIdx.get(p.code) : null;
+      return g && g.status === _zenStatFilter;
+    });
+  }
+  if (fc || _zenStatFilter) {
     document.getElementById('zenFilterBadge').textContent = sorted.length + ' match' + (sorted.length !== 1 ? 'es' : '');
   } else {
     document.getElementById('zenFilterBadge').textContent = '';
@@ -2946,6 +3045,20 @@ function _renderZenRateSpark(entries) {
   }
 
   clearBtn.addEventListener('click', () => applyFilter('', ''));
+
+  // Status chips (green/yellow/red) — mutually exclusive toggle.
+  const chips = ['Green','Yellow','Red'].map(s => document.getElementById('zenChip'+s));
+  function _syncChips() {
+    chips.forEach(c => c && c.classList.toggle('active',
+      c.getAttribute('data-stat') === _zenStatFilter));
+  }
+  chips.forEach(c => c && c.addEventListener('click', () => {
+    const stat = c.getAttribute('data-stat');
+    _zenStatFilter = (_zenStatFilter === stat) ? '' : stat;
+    _syncChips();
+    lastManFetch = 0;
+    fetchManifest();
+  }));
 
   // Extract unique KG codes present in the manifest
   function _manifestKgCodes() {

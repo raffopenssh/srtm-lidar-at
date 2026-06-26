@@ -1668,6 +1668,61 @@ def _claim_dispatch(codes: list, peer_url: str) -> list:
     return out
 
 
+def _requeue_interrupted_kg(code: str, *, reason: str = '') -> bool:
+    """Push an interrupted parent KG onto the director-side retry queue.
+
+    Load-bearing for the stuck-KG watchdog (and any other path that
+    hard-stops a peer mid-KG without a surviving peer holding the same
+    code). A SIGKILL'd processor only re-adds its in-flight KG to its
+    *own* local pending pool via ``IN_PROGRESS_FILE`` crash-recovery —
+    but the director then re-admits the peer onto a *different*
+    dispatch, so the original KG is silently orphaned (it lives in
+    ``kg_list.json`` but is referenced by nothing: not the retry queue,
+    not failed/deferred sets, no manifest entry). This bites big,
+    disk-bound parents (e.g. 50017/Hörgersteig, Jun 2026) that wedge on
+    ``gpkg_full`` on peer after peer and never get auto-split because
+    each interruption lands on a different peer's local strike file.
+
+    Goes through the canonical ``POST /api/v1/processing/queue``
+    endpoint on the local loopback (``127.0.0.1:8000``) rather than
+    writing ``retry_queue.json`` directly. This matters because the
+    primary runs gunicorn with two workers: a direct file write from
+    the director-loop worker would race the OTHER worker's queue
+    GET-prune / POST handlers (last-writer-wins truncation) and would
+    bypass the endpoint's completed-code filtering. The endpoint
+    serialises queue mutations and is the single source of truth the
+    dashboard, the GET-prune oracle, and the peer dispatch all share.
+
+    Pushes the *parent* code (strips any ``-block`` suffix) at the
+    front (``position: 0``) with ``skip_processed: True`` — so a KG
+    that genuinely completed on some other peer between the freeze and
+    now is dropped instead of needlessly reprocessed. The interrupted
+    parent we care about is coverage-incomplete (no manifest products),
+    so it survives the filter and the next eligible peer picks it up
+    via ``sync_queue_to_peer``. Returns True on a successful enqueue.
+    """
+    import re as _re
+    m = _re.match(r'^(\d+)(?:-[a-z][-a-z0-9]*)?$', str(code))
+    parent = m.group(1) if m else str(code)
+    try:
+        r = requests.post(
+            'http://127.0.0.1:8000/api/v1/processing/queue',
+            json={'kgs': [parent], 'position': 0, 'skip_processed': True},
+            timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
+        if not r.ok:
+            log.warning('requeue interrupted KG %s: HTTP %s',
+                        parent, r.status_code)
+            return False
+        body = r.json() if r.content else {}
+    except Exception as e:
+        log.warning('requeue interrupted KG %s failed: %s', parent, e)
+        return False
+    log.info('requeued interrupted KG %s to retry_queue front%s (%s)',
+             parent, (f' ({reason})' if reason else ''),
+             body.get('status', 'ok'))
+    return True
+
+
 def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     """Push the local priority queue to a remote peer.
 
@@ -5573,6 +5628,22 @@ class PeerDirector:
                 stop_peer_processor(peer_url, graceful=False)
             except Exception as e:
                 log.warning('stuck-kg %s: hard stop failed: %s', pid, e)
+            # Re-queue the interrupted KG on the director side. The
+            # SIGKILL'd peer only re-adds it to its OWN local pending
+            # pool (IN_PROGRESS_FILE crash-recovery); the director then
+            # re-admits this peer onto a DIFFERENT dispatch, orphaning
+            # the wedged KG entirely (lives in kg_list.json but nothing
+            # references it — not the queue, not failed/deferred, no
+            # manifest entry). Pushing it to the retry queue closes that
+            # hole. The prune oracle keeps it only while coverage-
+            # incomplete, so a since-finished KG can't loop.
+            if kg_code and kg_code != '?':
+                try:
+                    _requeue_interrupted_kg(
+                        kg_code, reason=f'stuck-kg {pid} hard restart')
+                except Exception as e:
+                    log.warning('stuck-kg %s: requeue %s failed: %s',
+                                pid, kg_code, e)
             # Clear the timer so we don't immediately re-fire if the
             # status lingers before the stop takes hold.
             track.pop(pid, None)

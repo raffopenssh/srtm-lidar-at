@@ -580,7 +580,10 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
         hard quota) and clamped below every fresh candidate, ignoring
         last week's now-stale successes. This is what stops a
         just-expired cred from oscillating back into the warm set every
-        time its ``error_recency`` penalty ages out.
+        time its ``error_recency`` penalty ages out. A complementary
+        **week-long** gate (zero successes across the full 7d window
+        with ≥3 errors) catches creds that died days ago and are now
+        retried too rarely to trip the 24h gate.
     """
     if now is None:
         now = time.time()
@@ -740,6 +743,37 @@ def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
             cap = 0.15
         if score > cap:
             components["recent_stall"] = round(cap - score, 4)
+            score = cap
+
+    # 8b) WEEK-LONG STALL GATE (low-retry dead-credential breaker).
+    #
+    # The 24h gate above keys on RECENT error volume, so it only fires
+    # for creds that are still being hammered. A credential that died
+    # days ago and has since sunk in the ordering gets retried rarely
+    # (a handful of probes spread across the week), so its 24h error
+    # count never reaches STALL_MIN_RECENT_ERR — yet it climbs back to
+    # "hot"/"warm" purely on the freshness bonus and out-ranks nothing
+    # it should. The 7d totals make the verdict unambiguous: ZERO
+    # successes across the entire week with a meaningful error count is
+    # a dead credential, not a transient blip (a real IP-throttle or
+    # quota window recovers within hours and lands at least one success
+    # somewhere in 7 days). Clamp it below every fresh candidate too.
+    #
+    # Note: a brand-new, never-yet-successful cred has e7==0 here (it is
+    # picked up by the freshness path, not retried-to-failure), so the
+    # evidence floor leaves genuinely-untested creds untouched.
+    STALL_MIN_7D_ERR = 3
+    if not stalled and s7 == 0 and e7 >= STALL_MIN_7D_ERR:
+        stalled = True
+        ok_age_h = ((now - last_ok) / 3600.0) if last_ok > 0 else 1e9
+        if ok_age_h >= 48.0:
+            cap = 0.03
+        elif ok_age_h >= 24.0:
+            cap = 0.08
+        else:
+            cap = 0.15
+        if score > cap:
+            components["week_stall"] = round(cap - score, 4)
             score = cap
 
     score = max(0.0, min(1.0, score))

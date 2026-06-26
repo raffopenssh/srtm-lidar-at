@@ -37,8 +37,28 @@ assert sc(0, 0, 0, 0, 1e9, 1e9)["score"] == 1.0
 h = sc(300, 25, 30, 20, 3, 0.2)
 assert h["signals"]["stalled"] is False, h
 
-# A cred with a single recent error is below the evidence floor.
+# A cred with a single recent error is below the recent-evidence floor
+# AND below the 7d floor (e7==1 < 3) but has plenty of 7d successes.
 h = sc(100, 1, 0, 1, 5, 0.5)
+assert h["signals"]["stalled"] is False, h
+
+# WEEK-LONG STALL GATE: a cred that died days ago, retried rarely so its
+# 24h error count is below the recent floor (e_recent < 8), but has ZERO
+# successes across the whole 7d window and >=3 errors -> must be stalled.
+# Mirrors the Jun 2026 fleet: e.g. sh-7c6b428f 0/273, sh-fc415fbf 0/17.
+h = sc(0, 17, 0, 3, 1e9, 5)   # s7=0, e7=17, only 3 errs in last 24h
+assert h["label"] == "stalled", h
+assert h["score"] <= 0.10, h
+h = sc(0, 273, 0, 2, 1e9, 7)  # barely retried now, but a week of errors
+assert h["label"] == "stalled", h
+
+# Edge: genuinely-untested fresh cred (no successes, no errors) must NOT
+# trip the 7d gate — the evidence floor (e7>=3) protects it.
+assert sc(0, 0, 0, 0, 1e9, 1e9)["signals"]["stalled"] is False
+
+# Edge: low-volume cred with 1-2 lifetime errors but no successes is
+# below the 7d evidence floor (don't kill a barely-probed newcomer).
+h = sc(0, 2, 0, 0, 1e9, 30)
 assert h["signals"]["stalled"] is False, h
 
 print("OK: stall gate behaves correctly")

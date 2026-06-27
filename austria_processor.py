@@ -89,6 +89,16 @@ KG_RETRY_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — retry attempt (checkpoin
 # and is NEVER required for KG completion, so cap its total wall time. (Jun
 # 2026 reprocess-loop fix: 49006-south, 63304-center, 90102-southeast et al.)
 PREWARM_MAX_SECONDS = 8 * 60  # 8 min budget for opportunistic pre-warm
+# Minimum tile count for a KG to eagerly publish its COMPLETE tile-checkpoint
+# bundle to the cross-peer registry the instant its full GPKG lands on Zenodo
+# (i.e. when it enters the "gpkg(s)-present, json-missing" limbo window). The
+# point is to keep a SIGKILL'd finish recoverable as cache-only work instead
+# of forcing the next peer to re-fetch tiles via Copernicus (frontier work,
+# burns a credential slot). Only large split blocks (~20 tiles) make this
+# worthwhile -- a small KG is cheap to reprocess, so we don't spend a metadata
+# PUT on it (fleet BW is the scarce resource). (Jun 2026: 90013-northwest had
+# only a stale 12/20-tile bundle and got reprocessed as frontier on at42.)
+PRE_JSON_CHKPT_PUBLISH_MIN_TILES = 12
 JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
 MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
 DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
@@ -8080,6 +8090,51 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 pass
             log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
                      kg_code)
+        elif result.get("_full_gpkg_uploaded") and n_tiles >= PRE_JSON_CHKPT_PUBLISH_MIN_TILES:
+            # Full GPKG is already on Zenodo but the JSON product hasn't
+            # landed yet: we are entering the "gpkg(s)-present, json-missing"
+            # limbo window (see 7fed914 / f59511d). The light + json builds
+            # below can still be interrupted before the early json upload
+            # (big split blocks take ~30 min to build json and a frontier
+            # peer auto-parks / rotates a credential / is role-evicted every
+            # couple of hours), and those interruptions are SIGKILLs — no
+            # cleanup handler runs, so we get exactly ONE chance to preserve
+            # cross-peer recoverability, and it is HERE.
+            #
+            # At this point ALL tiles have valid checkpoints on disk (they
+            # were just used to build the full GPKG). Publish the COMPLETE
+            # bundle to the cross-peer registry now so the next peer can
+            # restore every tile and finish light + json with ZERO
+            # Copernicus — completable on a cache-only peer instead of
+            # being reprocessed as frontier work that burns a credential
+            # slot. Without this we rmtree'd the checkpoints the instant
+            # the full GPKG was uploaded, so the only bundle left for the
+            # next peer was whatever a PRIOR interrupted attempt happened
+            # to publish — e.g. 90013-northwest: a stale 12/20-tile bundle,
+            # forcing tiles 13-20 to be re-fetched via NDVI/SAR on at42
+            # (Jun 2026). Keep the metadata pickles for the same-subprocess
+            # json build; release only the heavy raster sidecars (the
+            # registry is metadata-only anyway). On the happy path the
+            # "done" step clears them locally and the parent evicts the
+            # registry bundle, so this only costs a one-off ~metadata-sized
+            # PUT that is reclaimed on completion.
+            try:
+                import tile_raster_sidecar as _trs
+                _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+            except Exception:
+                pass
+            try:
+                # NB: ``progress`` (main()'s ProgressTracker) is NOT in scope
+                # in this subprocess; the upload still surfaces fleet-wide via
+                # the cache_manifest mirror + chkpt_registry log line.
+                _publish_checkpoints_to_registry(kg_code)
+                log.info("KG %s: publishing complete checkpoint bundle before "
+                         "json (full GPKG on Zenodo, json pending) so an "
+                         "interrupted finish stays cache-only-completable",
+                         kg_code)
+            except Exception as _pe:
+                log.warning("KG %s: pre-json checkpoint publish failed: %s",
+                            kg_code, _pe)
         else:
             try:
                 import shutil as _shutil_ckpt

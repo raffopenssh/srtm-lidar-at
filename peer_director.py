@@ -4782,10 +4782,14 @@ class PeerDirector:
                 log.exception('Primary park enforce: save_peers_config failed')
 
     def _release_unverified_bw_parks(self) -> None:
-        """One-shot cleanup: clear not_before from peers we parked on
+        """Periodic cleanup: clear not_before from peers we parked on
         a budget guess (no observed_cap_gb) so they rejoin the rotation.
 
-        Runs once per process under a state flag so we don't churn.
+        Runs at most once per hour (state-throttled). Was one-shot,
+        but the nominal-budget gate in _check_and_switch kept minting
+        new unverified park-until-renewal stamps after the flag was
+        set (Jul 2026: 19 peers stranded for weeks). That gate is now
+        evidence-only too, so this sweep is belt-and-braces.
         Only releases parks tagged by ``_park_peer_until_renewal``
         (event=='park_until_renewal' in canary_notes) where the peer
         never earned an ``observed_cap_gb``. Hand-set ``not_before``
@@ -4794,7 +4798,11 @@ class PeerDirector:
         """
         from datetime import datetime as _dt, timezone as _tz
         with self._lock:
-            if self.state.get('_unverified_bw_parks_released'):
+            last = self.state.get('_unverified_bw_parks_released')
+            # Legacy value was boolean True (one-shot); treat as "long
+            # ago" so upgraded directors sweep immediately.
+            if isinstance(last, (int, float)) and \
+                    (time.time() - last) < 3600:
                 return
             cfg = self.cfg
             changed = False
@@ -4838,7 +4846,7 @@ class PeerDirector:
                     save_peers_config(self.cfg)
                 except Exception:
                     log.exception('release_unverified_bw_parks: save failed')
-            self.state['_unverified_bw_parks_released'] = True
+            self.state['_unverified_bw_parks_released'] = time.time()
         if released:
             log.warning('Released unverified BW parks on %d peers '
                         '(no observed_cap_gb evidence): %s',
@@ -6984,12 +6992,25 @@ class PeerDirector:
         #     auto-parks on idle (handled in the idle/stopped branch
         #     further down via _peer_is_scheduled).
         #   remaining < LOW_WATER_GB & idle — park (no work to finish).
+        #
+        # Evidence-only invariant (see _peer_bw_depleted / AGENTS.md):
+        # "remaining" is measured against the peer's *observed_cap_gb*
+        # — the only evidence-based wall — NOT the nominal budget_gb
+        # guess. Peers without an observed cap are never parked here;
+        # the canary slowdown detector catches their real wall. The
+        # previous nominal-budget gate parked every freshly-promoted
+        # frontier whose vnstat cycle exceeded 95 GB, causing constant
+        # frontier reassignment churn (Jul 2026 incident: 19 peers
+        # parked weeks-long with "-478 GB remaining").
         if active_id:
             bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})
             used = bw.get('used_bytes', 0)
             active_peer_cfg = get_peer_by_id(cfg, active_id) or {}
-            active_budget_bytes = _peer_budget_bytes(active_peer_cfg, cfg)
-            remaining_gb = (active_budget_bytes - used) / (1024 ** 3)
+            cap_gb = active_peer_cfg.get('observed_cap_gb')
+            if isinstance(cap_gb, (int, float)) and cap_gb > 0:
+                remaining_gb = float(cap_gb) - used / (1024 ** 3)
+            else:
+                remaining_gb = float('inf')  # no evidence → no park
 
             if remaining_gb < BANDWIDTH_LOW_WATER_GB:
                 peer = get_peer_by_id(cfg, active_id)
@@ -10839,9 +10860,9 @@ class PeerDirector:
                     self._enforce_primary_park()
                 except Exception:
                     log.exception('primary park enforce failed')
-                # One-shot: release park-until-renewal records we wrote
-                # on a *guessed* 95 GB budget without canary-shaping
-                # evidence. exe.dev's real per-account limits and
+                # Hourly sweep: release park-until-renewal records we
+                # wrote on a *guessed* nominal budget without canary-
+                # shaping evidence. exe.dev's real per-account limits and
                 # billing anchors are unknown; canary-by-default means
                 # we only park on observed throughput collapse.
                 try:

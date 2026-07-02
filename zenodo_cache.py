@@ -1229,6 +1229,22 @@ class ZenodoCache:
 
         depo_id = None if dry_run else self._ensure_deposit()
 
+        # Deposit-fullness guard: Zenodo enforces a hard 100-file cap per
+        # deposit. Our _upload_file() cycle is delete-then-PUT, so
+        # RE-uploading an existing ZIP is safe even at the cap (net file
+        # count 0) — but creating a NEW ZIP when the deposit is full 400s
+        # AFTER any local state was primed, and (worse) chkpt bundles had
+        # been crowding the deposit so tile ZIPs couldn't grow (Jul 2026:
+        # harmonics strips stuck at 1 tile / lost). Count live remote
+        # files once per flush and skip creation of new names near cap.
+        _live_files = 0
+        try:
+            _live_files = sum(
+                1 for _n, _e in (self.manifest.all_files() or {}).items()
+                if (_e or {}).get("size", 0) > 0)
+        except Exception:
+            pass
+
         for (product, cs, cn, cw, ce), files in sorted(groups.items()):
             zip_name = _zip_filename(product, cs, cn, cw, ce)
             # Read-side compat: if a legacy strip ZIP already covers
@@ -1239,6 +1255,18 @@ class ZenodoCache:
             if (self.manifest.get_file(legacy_name)
                     and not self.manifest.get_file(zip_name)):
                 zip_name = legacy_name
+
+            # Skip creating brand-new ZIP names when the deposit is near
+            # the 100-file cap (see guard comment above the loop).
+            if (not dry_run and _live_files >= 90
+                    and not self.manifest.get_file(zip_name)):
+                log.warning(
+                    "Zenodo cache: deposit near file cap (%d live files); "
+                    "deferring creation of new ZIP %s", _live_files,
+                    zip_name)
+                stats["zips_deferred_cap"] = (
+                    stats.get("zips_deferred_cap", 0) + 1)
+                continue
 
             # Build set of entry names we have locally, validating each
             local_entries = {}

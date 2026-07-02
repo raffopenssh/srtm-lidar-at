@@ -66,8 +66,19 @@ CACHE_MANIFEST = DATA_DIR / "cache_manifest.json"
 # Zenodo-side prefix (lives in the same deposit as the tile cache).
 ZENODO_PREFIX = "chkpt"
 
-# Hard cap on number of KGs in registry (LRU on ts). Plenty for our fleet.
-MAX_REGISTRY_KGS = 200
+# Hard cap on number of KGs in registry (LRU on ts). The Zenodo deposit
+# has a HARD 100-file limit shared with the tile-cache ZIPs (~45 files
+# and growing as the cell layout fills in). Letting chkpt bundles crowd
+# the deposit caused the Jul 2026 incident where a tile-cache ZIP was
+# deleted-then-400'd on re-upload (deposit full) and its tiles were
+# lost. Keep chkpt well under half the deposit.
+MAX_REGISTRY_KGS = 30
+
+# Never upload a NEW chkpt bundle when the deposit is already this full
+# (Zenodo hard limit = 100 files). Leaves headroom for tile-cache ZIPs,
+# whose delete-then-PUT re-upload cycle is NOT safe against a full
+# deposit (the delete succeeds, the PUT 400s, the data is gone).
+DEPOSIT_FILE_HEADROOM = 90
 
 # Cap per-KG bundle size. Metadata pickles should never exceed this;
 # if they do, the KG has anomalous tile counts and we skip uploading.
@@ -297,6 +308,25 @@ def upload_kg(kg_code: str) -> Optional[Dict]:
     cache = _get_cache()
     if cache is None:
         return None
+    # Deposit-fullness guard: the shared Zenodo deposit has a hard
+    # 100-file cap. If the (fleet-synced) cache manifest shows we're
+    # near it, refuse NEW bundles — a full deposit breaks the tile
+    # cache's delete-then-PUT re-upload cycle (data loss, Jul 2026).
+    # Re-uploads of an existing bundle are fine (net file count 0).
+    if not existing:
+        try:
+            from zenodo_cache import CacheManifest
+            cm = CacheManifest()
+            live = sum(1 for _n, _e in (cm.all_files() or {}).items()
+                       if (_e or {}).get("size", 0) > 0)
+            if live >= DEPOSIT_FILE_HEADROOM:
+                _log.warning(
+                    "chkpt_registry: deposit near file cap (%d >= %d); "
+                    "skipping upload of %s", live, DEPOSIT_FILE_HEADROOM,
+                    name)
+                return None
+        except Exception:
+            pass
     # Per-bundle fleet lock — keep critical section minimal.
     try:
         from zenodo_lock import zenodo_upload_lock

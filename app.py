@@ -961,6 +961,15 @@ def _sync_peer_data():
                 for key, entry in (peer_manifest.items() if _keep_role else ()):
                     if not key.endswith('_json'):
                         continue
+                    # Skip entries that are tombstoned locally — the file
+                    # was deliberately deleted (e.g. split-KG replaced by
+                    # unsplit parent).  Without this check we hammer
+                    # Zenodo with 404s every sync cycle.
+                    tombstone_ts = _MANIFEST_TOMBSTONES.get(key)
+                    if tombstone_ts:
+                        entry_ts = entry.get('uploaded_at', '') or ''
+                        if not entry_ts or entry_ts <= tombstone_ts:
+                            continue
                     code = key.replace('_json', '')
                     local_path = json_dir / f'{code}.json'
                     needs_dl = True

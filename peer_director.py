@@ -8492,7 +8492,11 @@ class PeerDirector:
         # Collect legacy strip lat-ranges per product so we can stitch
         # 0.5° strips into 1° lat bands for the austria_cells expansion.
         per_product_strip_ranges: dict[str, list[tuple[float, float]]] = {}
-        for name in files:
+        for name, _entry in files.items():
+            # Skip size=0 tombstones (deleted/404'd ZIPs — e.g. the Jul
+            # 2026 deposit-cap loss) so they don't count as coverage.
+            if not ((_entry or {}).get('size', 0) or 0):
+                continue
             base_n = name.replace('.zip', '')
             try:
                 if '_cell_' in base_n:
@@ -8636,7 +8640,10 @@ class PeerDirector:
             base = _m.floor(s / 1.0) * 1.0
             return (round(base, 4), round(base + 1.0, 4))
         per_product: dict[str, set[tuple[float, float]]] = {}
-        for name in files:
+        for name, _entry in files.items():
+            # Skip size=0 tombstones (deleted/404'd ZIPs).
+            if not ((_entry or {}).get('size', 0) or 0):
+                continue
             try:
                 base_n = name.replace('.zip', '')
                 if '_cell_' in base_n:

@@ -193,8 +193,17 @@ Thresholds (peer_director.py):
   Otherwise the peer was probably just Zenodo-upload-bound.
 * `CANARY_QUALITY_PERSIST_S = 15 min` — the slowdown must be
   continuously observed for 15 min (streak resets above ratio 0.60)
-  before counting as quality. Defends against transient network
-  blips and short upstream outages.
+  before the peer is parked at all (Jul 2026: previously the soft
+  park fired at streak 0 s, which both wasted a 1 h park per
+  transient blip and made the quality gate unsatisfiable — the peer
+  was stopped before the streak could mature, so `observed_cap_gb`
+  was never learned fleet-wide). During the window the peer keeps
+  running (`canary observe <pid>` INFO line, once per streak); if
+  the ratio recovers ≥0.60 the streak resets and zero peer-hours
+  are lost. Only a slowdown that survives the full 15 min parks —
+  quality-grade (network-grade + not fleet-wide) parks learn the
+  wall, others soft-park. Streak is cleared on park so the peer
+  gets a fresh observation window after the cooldown.
 * `FLEET_CONCURRENT_SLOWDOWN_FRAC = 0.30` — if ≥0.30 of canary-eligible
   peers are simultaneously in slowdown, treat as a fleet-wide upstream
   event (BEV/Zenodo/internet hiccup); soft park still fires defensively

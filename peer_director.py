@@ -5288,6 +5288,7 @@ class PeerDirector:
             reasons: list[str] = []
             slowdown_tripped = False
             quality_obs = False
+            slowdown_observing = False
             if entry['usable']:
                 ratio = entry['ratio']
                 base_mbps = entry['base_mbps']
@@ -5318,22 +5319,50 @@ class PeerDirector:
                     quality_obs = (
                         network_grade and persistent and not fleet_wide
                     )
-                    qtag = ' [QUALITY]' if quality_obs else ' [soft'
-                    if not quality_obs:
-                        why = []
-                        if not network_grade:
-                            why.append('not network-grade')
-                        if not persistent:
-                            why.append(f'streak {int(streak_age)}s<{CANARY_QUALITY_PERSIST_S}s')
-                        if fleet_wide:
-                            why.append('fleet-wide event')
-                        qtag = ' [soft: ' + ', '.join(why) + ']'
-                    reasons.append(
-                        f'throughput collapsed: '
-                        f'recent={recent_mbps:.2f} MB/s '
-                        f'vs baseline {base_mbps:.2f} MB/s '
-                        f'(ratio={ratio:.2f})' + qtag
-                    )
+                    # --- Observation window (quality-path fix, Jul 2026).
+                    # Parking at streak 0s made the 15-min persistence
+                    # gate unsatisfiable: the peer was stopped before
+                    # the streak could mature, so observed_cap_gb was
+                    # NEVER learned fleet-wide (0 quality obs at 33 TB
+                    # used) and every slowdown cost a 1 h idle cooldown
+                    # — even for transient Zenodo blips that recover in
+                    # minutes. New behaviour: let the peer keep running
+                    # through the persistence window. If the slowdown
+                    # is a blip, the streak resets (ratio ≥ 0.60) and
+                    # we never lost a peer-hour. If it's real shaping,
+                    # we park once with evidence (and, when network-
+                    # grade, learn the wall). Worst case we "waste" 15
+                    # min of degraded throughput — far cheaper than a
+                    # guaranteed 1 h park per blip.
+                    if not persistent:
+                        slowdown_observing = True
+                        # Log once per streak so process.txt shows the
+                        # observation without per-tick spam.
+                        s = streaks.get(pid)
+                        if s is not None and not s.get('observe_logged'):
+                            s['observe_logged'] = True
+                            log.info(
+                                'canary observe %s: throughput ratio=%.2f '
+                                '(recent=%.2f vs baseline %.2f MB/s) — '
+                                'watching for %ds before park',
+                                pid, ratio, recent_mbps, base_mbps,
+                                CANARY_QUALITY_PERSIST_S)
+                    else:
+                        qtag = ' [QUALITY]' if quality_obs else ' [soft'
+                        if not quality_obs:
+                            why = []
+                            if not network_grade:
+                                why.append('not network-grade')
+                            if fleet_wide:
+                                why.append('fleet-wide event')
+                            qtag = ' [soft: ' + ', '.join(why) + ']'
+                        reasons.append(
+                            f'throughput collapsed: '
+                            f'recent={recent_mbps:.2f} MB/s '
+                            f'vs baseline {base_mbps:.2f} MB/s '
+                            f'(ratio={ratio:.2f}, streak {int(streak_age)}s)'
+                            + qtag
+                        )
             # Noise-park: stricter, canary-override peers only.
             is_override_canary = p.get('budget_gb') is not None
             if is_override_canary:
@@ -5388,6 +5417,11 @@ class PeerDirector:
                     del notes[: len(notes) - 32]
                 cfg_changed = True
                 peer_url = live.get('url')
+            # Fresh observation window after the cooldown: without
+            # this, the stale 'since' timestamp makes any post-resume
+            # slowdown instantly 'persistent' (streak_age includes the
+            # parked period).
+            streaks.pop(pid, None)
             tag = 'canary park' if is_override_canary else 'auto-park'
             log.warning('%s %s: %s — not_before=%s',
                         tag, pid, '; '.join(reasons), cooldown.isoformat())

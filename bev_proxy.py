@@ -137,6 +137,29 @@ _PROXY_SOURCES = [
     "https://proxyspace.pro/http.txt",
     "https://proxyspace.pro/https.txt",
     "https://raw.githubusercontent.com/noctiro/getproxy/master/file/http.txt",
+    # Added 2026-07-02 ahead of a cache-only surge (deposit-cap fix
+    # unblocked cache_ready growth). Live-vetted per the documented
+    # harness; calibration in the same run put the verified tier at
+    # 7-12% (pool ecosystem degraded vs the usual 22%), so these
+    # 2-5% raw-tier yields are proportionally solid. None cleared the
+    # >=10% verified-all bar.
+    #   themiralay/Proxy-List-World -> 5%  (197 entries, small+clean)
+    #   vmheaven http/https         -> 3%  (~4200/~3300 entries)
+    #   im-razvan/proxy_list        -> 2%  (268 entries)
+    #   berkay-digital/Proxy-Scraper-> 2%  (190 entries)
+    #   andigwandi/free-proxy       -> 2%  (691 entries)
+    #   ObcbO/getproxy http         -> 2%  (~4500 entries)
+    #   proxyscrape v4 api          -> 2%  (~1000 entries, non-GitHub)
+    #   iplocate/free-proxy-list    -> 2%  (855 entries)
+    "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+    "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/http.txt",
+    "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/https.txt",
+    "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
+    "https://raw.githubusercontent.com/berkay-digital/Proxy-Scraper/main/proxies.txt",
+    "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
+    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=http",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
 ]
 
 # URLs used to validate that a proxy can actually fetch BEV TIFF bytes.

@@ -11402,9 +11402,20 @@ class PeerDirector:
         peers = cfg.get('peers') or []
         my_commit = _LOCAL_GIT_COMMIT
         # Candidate filter: enabled, reachable, running OUR git commit
-        # (so the snapshot endpoint exists), enough disk (>5 GB free) and
+        # (so the snapshot endpoint exists), enough disk (>3 GB free) and
         # enough remaining bandwidth (>10 GB) to act as director if needed.
-        SHADOW_MIN_DISK_GB = 5.0
+        #
+        # As of Jul 2026 the shadow no longer replicates the ~5–7 GB JSON
+        # corpus (see app._is_keep_role_data) — it only stages the small
+        # snapshot state. So the disk gate no longer needs to reserve
+        # corpus space; it just guards against a peer that's genuinely out
+        # of room. Keeping it modest is what breaks the old death loop:
+        # previously a designated shadow downloaded the corpus, filled its
+        # own disk below 5 GB, got rejected here next tick, and the election
+        # ping-ponged to the other candidate — which then did the same. With
+        # the corpus gone from the shadow, the elected peer stays above the
+        # gate and the stickiness logic keeps it put.
+        SHADOW_MIN_DISK_GB = 3.0
         SHADOW_MIN_BANDWIDTH_GB = 10.0
         candidates: list[tuple[float, dict]] = []
         rejected: list[tuple[str, str]] = []

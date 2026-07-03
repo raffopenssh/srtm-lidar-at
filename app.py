@@ -1577,12 +1577,33 @@ def _index_build_deferred() -> tuple[bool, int]:
 
 
 def _is_keep_role_data() -> bool:
-    """Return True iff this VM should retain the JSON corpus + index.
+    """Return True iff this VM should retain the FULL JSON corpus + index.
 
-    Keep when:
+    Keep (full-corpus role) when:
       - we are the primary (canonical home, regardless of director state)
-      - we are the current director (running peer_director loop)
-      - we are the designated shadow (per shadow/meta.json)
+      - we are the current director (running peer_director loop — it serves
+        the search index / dashboard and must be able to answer queries)
+
+    NOT the shadow. As of Jul 2026 the designated shadow deliberately does
+    **not** replicate the ~5–7 GB JSON corpus. The fleet's VMs all have
+    24.5 GB disks with only ~5–7 GB free steady-state, and the corpus has
+    grown to fill that headroom. When the shadow downloaded the full corpus
+    it filled its own disk to 0 GB, aborting the in-flight KG mid-copernicus
+    (burning credentials), failing GPKG writes and returning srv 500s (the
+    shadow-push http_500). That, combined with the shadow election
+    ping-ponging between two peers as each one filled its disk and got
+    rejected by the low-disk gate, produced a shadow-election ↔
+    disk-eviction death loop that stalled fleet progress for ~28 h
+    (Jul 1–3 2026).
+
+    A shadow only needs the small snapshot state (director_ha.SNAPSHOT_FILES,
+    pushed every ~30 s independently of this function) plus the manifest
+    merge (~370 KB, which _sync_peer_data does regardless of keep-role).
+    On a REAL promotion the ex-shadow becomes director → keep-role here →
+    _sync_peer_data replenishes the corpus and the deferred index build
+    (ROLE_INDEX_BUILD_DELAY_S) runs; Zenodo backfill (run_backfill) fills
+    any gap. The manifest is the catch-up substrate, so a promoted shadow
+    has an instantly-correct view of what's already on Zenodo.
     """
     try:
         import director_ha as _dha
@@ -1591,39 +1612,6 @@ def _is_keep_role_data() -> bool:
         sid = _dha.self_id()
         if sid == 'primary':
             return True
-        meta = {}
-        try:
-            if _dha.SHADOW_META_FILE.exists():
-                meta = json.loads(_dha.SHADOW_META_FILE.read_text())
-        except Exception:
-            meta = {}
-        designated = (meta.get('shadow_id')
-                      or (meta.get('director_state') or {}).get('shadow_peer'))
-        if designated and designated == sid:
-            # Freshness gate (mirrors the watchdog's promote gate in
-            # director_ha): a peer that *was* shadow once and then got
-            # de-elected keeps a stale meta.json forever (a plain
-            # shadow re-election never notifies the loser). Without
-            # this check it stays keep-role indefinitely and retains
-            # the ~5 GB JSON corpus + index — which fills its disk to
-            # zero, aborts the in-flight KG mid-run, and re-queues it
-            # to the frontier (the frontier-reassignment / dup-kg churn).
-            # A live shadow gets a snapshot push every
-            # director_ha.SHADOW_SYNC_INTERVAL (~30 s), so received_ts
-            # is always fresh; only multi-hour-stale metas are rejected.
-            try:
-                received_ts = float(meta.get('received_ts') or 0.0)
-            except Exception:
-                received_ts = 0.0
-            age = time.time() - received_ts
-            if received_ts > 0 and age <= KEEP_ROLE_SHADOW_FRESH_S:
-                return True
-            # Stale shadow meta — we are not actually being maintained as
-            # shadow. Fall through to non-keep so role-data eviction can
-            # reclaim the disk (with its own 1 h grace before purging).
-            log.info('keep-role: ignoring stale shadow meta '
-                     '(shadow_id=%s, age=%.0fs > %ds) — not keep-role',
-                     designated, age, KEEP_ROLE_SHADOW_FRESH_S)
     except Exception as e:
         log.debug('keep-role check failed (assuming keep): %s', e)
         return True   # fail-safe: never delete on uncertainty

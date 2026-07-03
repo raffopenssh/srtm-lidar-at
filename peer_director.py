@@ -2525,6 +2525,35 @@ def _peer_noise_score(peer_id: str, state: dict) -> float:
     return score
 
 
+def _peer_noise_score_live(peer_id: str, state: dict) -> float:
+    """Live-only noise score for *park* decisions.
+
+    Unlike :func:`_peer_noise_score` (which max-es with the slow long
+    EMA and is meant for scheduling bias), this uses only the current
+    5-min warning rates, and deliberately excludes ``copernicus``:
+    Copernicus 402/errors follow the *credential*, not the peer —
+    parking the peer never fixes a degraded cred (the rotator does),
+    it just knocks a healthy VM out of rotation.
+
+    Jul 2026 incident: the noise-park gate used the EMA-backed score,
+    which barely decays during a 1 h park. Canary-override peers
+    (at26..at48) cycled park→unpark→park for 6+ h with live rates of
+    0.0, collapsing the parallel-frontier set and triggering
+    plan-drift restart storms on the survivors.
+    """
+    wr = ((state.get('peer_warning_rates') or {}).get(peer_id) or {})
+    if not wr:
+        return 0.0
+    score = 0.0
+    for kind in ('bev', 'zenodo'):
+        sat = THROTTLE_SATURATION_RATE.get(kind) or 0.0
+        if sat <= 0:
+            continue
+        r_now = float(((wr.get(kind) or {}).get('5m')) or 0.0)
+        score += r_now / sat
+    return score
+
+
 def _peer_pool_bev_wpm(peer_id: str, cfg: dict, state: dict) -> float:
     """Return the peer's egress /24 BEV avg_wpm (0.0 if unknown).
 
@@ -5364,11 +5393,16 @@ class PeerDirector:
                             + qtag
                         )
             # Noise-park: stricter, canary-override peers only.
+            # LIVE rates only (bev+zenodo) — the EMA-backed
+            # _peer_noise_score is for scheduling bias and barely
+            # decays across a 1 h park, which produced ghost
+            # park→unpark→park loops (Jul 2026). Copernicus noise is
+            # excluded: it follows the credential, not the peer.
             is_override_canary = p.get('budget_gb') is not None
             if is_override_canary:
-                noise = _peer_noise_score(pid, state)
+                noise = _peer_noise_score_live(pid, state)
                 if noise >= CANARY_NOISE_PARK_THRESHOLD:
-                    reasons.append(f'noise_score={noise:.2f}')
+                    reasons.append(f'noise_score={noise:.2f} (live)')
             if not reasons:
                 continue
             # Park: write not_before, persist, send graceful stop.

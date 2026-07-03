@@ -559,26 +559,38 @@ _INDEX_WATCH_LOCK_PATH = '/tmp/srtm_index_watch.lock'
 
 def _init_search_index():
     import fcntl as _fcntl, os as _os
-    # Demoted peers (not primary/director/shadow) skip the index entirely.
-    # The role-data eviction loop will purge any leftover database files
-    # after the grace period. This avoids rebuilding ~5 GB of FTS+R-tree
-    # indices on a peer that's about to delete them anyway.
-    try:
-        if not _is_keep_role_data():
-            log.info('🔍 Search index disabled on demoted peer (not primary/director/shadow)')
-            return
-    except Exception:
-        pass
-    # Defer initial build on freshly-promoted non-primary peers. Wait until
-    # the cluster has settled (ROLE_INDEX_BUILD_DELAY_S) so the build's
-    # memory + CPU spike doesn't pile onto director-takeover load. Re-check
-    # every 30s; either we cross the threshold or get demoted (in which
-    # case _is_keep_role_data flips and we exit cleanly).
+    # Demoted peers (not primary/director) skip the index build. Instead
+    # of exiting permanently, WAIT for a possible promotion: as of Jul 2026
+    # the shadow is non-keep-role, so every director takeover happens on a
+    # peer that booted demoted. If this thread exited, the promoted
+    # director would have no index (and no watcher) until its next srv
+    # restart — peer_director's cache-only backfill processed=1 guard
+    # would silently degrade. Poll cheaply until keep-role flips.
+    _waited = False
     while True:
+        # Phase A: wait until we're keep-role.
         try:
             if not _is_keep_role_data():
-                log.info('🔍 Search index: demoted while waiting; exiting')
-                return
+                if not _waited:
+                    log.info('🔍 Search index idle on demoted peer (not '
+                             'primary/director); will build if promoted')
+                    _waited = True
+                time.sleep(300)
+                continue
+        except Exception:
+            break
+        # Phase B: defer initial build on freshly-promoted non-primary
+        # peers until the cluster has settled (ROLE_INDEX_BUILD_DELAY_S)
+        # so the build's memory + CPU spike doesn't pile onto
+        # director-takeover load. If we get demoted mid-deferral (likely:
+        # auto-handback often lands within the 30-min window), fall back
+        # to phase A instead of exiting — a later re-promotion must still
+        # find a live thread.
+        try:
+            if not _is_keep_role_data():
+                log.info('🔍 Search index: demoted while waiting; back to idle')
+                _waited = False
+                continue
             deferred, remaining = _index_build_deferred()
             if not deferred:
                 break
@@ -852,7 +864,7 @@ def _sync_peer_data():
 
     while True:
         try:
-            # Demoted peers (not primary/director/shadow) skip the heavy bits
+            # Demoted peers (not primary/director) skip the heavy bits
             # (JSON downloads, search-index update) but still merge peer
             # manifests. Manifest is ~370KB and is the catch-up substrate:
             # keeping it fresh means a promoted peer has an instantly-correct
@@ -1461,7 +1473,11 @@ threading.Thread(target=_peer_status_push_loop, daemon=True,
 #   - the **primary** (canonical home for search/dashboard)
 #   - the **current director** (peer_director consults the index for
 #     cache-ready KGs, KG splits, etc.)
-#   - the **current shadow** (must be ready to take over)
+#
+# NOT the shadow (as of Jul 2026, commit 84a123c): the shadow only stages
+# the small snapshot state; replicating the ~5-7 GB corpus filled its
+# 24.5 GB disk and caused the shadow-election <-> disk-eviction death
+# loop. See _is_keep_role_data() for the full story.
 #
 # A peer that *was* director (e.g. at17 after handback) accumulates the
 # full JSON corpus + search_index.db (~5–10 GB on a fully-built fleet).
@@ -1469,7 +1485,7 @@ threading.Thread(target=_peer_status_push_loop, daemon=True,
 # disk-pressure eviction of expensive Copernicus tile caches.
 #
 # Policy:
-#   1. Every tick, classify our role (primary / director / shadow / other).
+#   1. Every tick, classify our role (primary / director / other).
 #   2. If "other", record the demotion timestamp in role_demoted_at.
 #   3. After ROLE_EVICT_GRACE_SECONDS (1h) of continuous demotion, delete
 #      data/austria_processor/json/*.json and data/search_index.db*.
@@ -1485,7 +1501,7 @@ threading.Thread(target=_peer_status_push_loop, daemon=True,
 ROLE_EVICT_GRACE_SECONDS = 3600        # 1h grace before purging
 ROLE_EVICT_TICK_SECONDS = 600          # check every 10 min
 _ROLE_DEMOTED_AT_FILE = Path('data/austria_processor/role_demoted_at')
-# Non-primary peers that get promoted (director or shadow) defer building
+# Non-primary peers that get promoted (become director) defer building
 # the search index for this long. The index build pulls ~8000 KG JSONs into
 # memory and a freshly-promoted director under load (already churning on
 # director-loop work, peer fan-out, snapshot PUTs) is the worst possible
@@ -1494,14 +1510,6 @@ _ROLE_DEMOTED_AT_FILE = Path('data/austria_processor/role_demoted_at')
 # request timing out for ~30 minutes (the at40 wedge of 2026-05-07).
 # Primary is unaffected (it always keeps the index).
 ROLE_INDEX_BUILD_DELAY_S = 1800        # 30 min after non-primary promotion
-# Max age of a `shadow/meta.json` push before we stop treating ourselves as
-# the designated shadow for keep-role purposes. A live shadow is refreshed
-# every director_ha.SHADOW_SYNC_INTERVAL (~30 s), so this is hugely generous
-# and only trips on de-elected shadows whose stale meta would otherwise pin
-# ~5 GB of JSON+index on disk forever (filling the VM → mid-KG aborts →
-# frontier reassignment churn). Role-data eviction adds its own 1 h grace
-# on top before anything is actually purged.
-KEEP_ROLE_SHADOW_FRESH_S = 1800        # 30 min
 _ROLE_PROMOTED_AT_FILE = Path('data/austria_processor/role_promoted_at')
 
 
@@ -1516,7 +1524,7 @@ def _is_primary_self() -> bool:
 
 def _record_promotion_if_needed() -> None:
     """Stamp ``role_promoted_at`` when a non-primary peer first becomes
-    keep-role (director or shadow). Cleared on demotion. Used to defer
+    keep-role (becomes director). Cleared on demotion. Used to defer
     the search-index build by ``ROLE_INDEX_BUILD_DELAY_S`` so the spike
     in memory + CPU doesn't land on top of director-takeover load.
     """

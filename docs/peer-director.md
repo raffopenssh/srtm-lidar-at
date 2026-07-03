@@ -762,7 +762,16 @@ to:
 * the **primary** (canonical home for search index + dashboard) — always keep
 * the **current director** (peer_director consults the index for cache-ready
   KGs, KG-split lookups)
-* the **current shadow** (must be ready to take over)
+
+**NOT the shadow** (Jul 2026, commit 84a123c): the shadow only stages the
+small snapshot state (`director_ha.SNAPSHOT_FILES`); replicating the
+~5–7 GB corpus filled its 24.5 GB disk to 0 and caused the
+shadow-election ↔ disk-eviction death loop (Jul 1–3 2026 fleet stall).
+A designated shadow is therefore *non-keep-role*: it stamps
+`role_demoted_at` like any other peer and its stale corpus (if it was
+ever director) is purged after the 1 h grace. On real promotion the
+ex-shadow becomes director → keep-role → corpus replenishes via
+`_sync_peer_data` + deferred index build.
 
 A peer that *was* director (e.g. after handback to primary) accumulates
 the full corpus. Without eviction, that data crowds out expensive
@@ -770,12 +779,12 @@ Copernicus tile caches and trips the disk-pressure threshold (1.6 GB
 free on at17 was the trigger for adding this).
 
 **Loop** (`app.py:_role_data_eviction_loop`, 10 min tick):
-1. Classify role via `_is_keep_role_data()` — reads `is_director`,
-   `self.json:id`, and `shadow/meta.json:shadow_id`.
+1. Classify role via `_is_keep_role_data()` — reads `is_director` and
+   `self.json:id` (shadow meta is no longer consulted).
 2. If demoted, stamp `data/austria_processor/role_demoted_at`.
 3. After `ROLE_EVICT_GRACE_SECONDS` (1 h) of continuous demotion,
    delete `json/*.json` + `search_index.db{,-wal,-shm,-journal}`.
-4. Promotion (becoming director or designated shadow) clears the marker.
+4. Promotion (becoming director) clears the marker.
 5. `_sync_peer_data` and `_init_search_index` short-circuit on demoted
    peers so we don't immediately re-fetch what we just freed.
 

@@ -9290,6 +9290,21 @@ class PeerDirector:
         old_cred_plan = state_copy.get('frontier_cred_plan') or {}
         old_strip_plan = state_copy.get('frontier_strip_plan') or {}
         peers_to_restart: list[str] = []
+        # Adopt-not-restart (Jul 2026): a running frontier is only
+        # hard-restarted on a *hard* conflict — all its held creds are
+        # invalid, a held cred is also wanted by ANOTHER running peer
+        # this tick, or its strips vanished from the canonical set.
+        # Cosmetic diffs (per_eff flapping 1↔2 trims a spare cred,
+        # fair-share strip re-slicing) instead ADOPT the running plan.
+        # Restarting mid-KG for a cosmetic slice change caused the
+        # Jul 2026 loop where every frontier was killed every few
+        # minutes and no KG ever completed (progress flat for 2 days,
+        # sawtooth EMA, zero copernicus/segment log lines).
+        _valid_all = set(self._valid_credentials())
+        _strip_set_all = {tuple(s) for s in strips}
+        _running_set = {active_id} | set(running)
+        _adopted_creds: set[int] = set()
+        _adopted_pids: set[str] = set()
         for pid in [active_id] + list(running):
             want_creds = sorted(cred_plan.get(pid) or [])
             want_strips = sorted(
@@ -9299,15 +9314,63 @@ class PeerDirector:
             have_strips = sorted(
                 tuple(s) for s in (old_strip_plan.get(pid) or [])
             )
-            if want_creds and want_strips and (
-                want_creds != have_creds or want_strips != have_strips
-            ):
+            if not (want_creds and want_strips):
+                continue
+            if want_creds == have_creds and want_strips == have_strips:
+                continue
+            # --- hard-conflict tests on the HELD plan -------------
+            held_valid = [c for c in have_creds if c in _valid_all]
+            held_strips_ok = [s for s in have_strips
+                              if s in _strip_set_all]
+            other_running_want = set()
+            for opid in _running_set:
+                if opid != pid:
+                    other_running_want.update(cred_plan.get(opid) or [])
+            conflict = (
+                not held_valid
+                or not held_strips_ok
+                or bool(set(held_valid) & other_running_want)
+            )
+            if conflict:
                 log.warning(
-                    'Frontier %s plan drift: have creds=%s strips=%s, '
-                    'want creds=%s strips=%s — restarting',
-                    pid, have_creds, have_strips, want_creds, want_strips,
+                    'Frontier %s plan drift (hard conflict): have '
+                    'creds=%s strips=%s, want creds=%s strips=%s — '
+                    'restarting',
+                    pid, have_creds, have_strips, want_creds,
+                    want_strips,
                 )
                 peers_to_restart.append(pid)
+                continue
+            # --- adopt: keep the peer running on what it holds ----
+            cred_plan[pid] = held_valid
+            strip_plan[pid] = [list(s) for s in held_strips_ok]
+            _adopted_creds.update(held_valid)
+            _adopted_pids.add(pid)
+            log.info(
+                'Frontier %s plan drift (cosmetic): adopting held '
+                'creds=%s strips=%s (planner wanted creds=%s)',
+                pid, held_valid, held_strips_ok, want_creds)
+        # Creds adopted by running peers must not be double-issued to
+        # not-yet-started candidates this tick. Strip them; a candidate
+        # left credless is simply skipped by the start loop below.
+        if _adopted_creds:
+            for opid in list(cred_plan.keys()):
+                if opid in _running_set or opid in _adopted_pids:
+                    continue
+                _new = [c for c in (cred_plan.get(opid) or [])
+                        if c not in _adopted_creds]
+                cred_plan[opid] = _new
+        if _adopted_pids:
+            _adopted_strips = set()
+            for apid in _adopted_pids:
+                _adopted_strips.update(
+                    tuple(s) for s in (strip_plan.get(apid) or []))
+            for opid in list(strip_plan.keys()):
+                if opid in _running_set or opid in _adopted_pids:
+                    continue
+                strip_plan[opid] = [
+                    s for s in (strip_plan.get(opid) or [])
+                    if tuple(s) not in _adopted_strips]
 
         for pid in peers_to_restart:
             peer = get_peer_by_id(cfg, pid)

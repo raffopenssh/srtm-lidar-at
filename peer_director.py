@@ -9252,16 +9252,37 @@ class PeerDirector:
         # hard-conflict test below and the peer is pointlessly
         # hard-restarted every few minutes (Jul 2026 loop).
         _running_now = {active_id} | set(running)
-        if active_id and active_id not in reported_env and (
-                not prior_cred_plan.get(active_id)
-                or not prior_strip_plan_seed.get(active_id)):
-            _aps = get_peer_status(
-                (get_peer_by_id(cfg, active_id) or {}).get('url'),
-                peer_id=active_id)
-            _rc = _aps.get('cred_indices')
-            _rs = _aps.get('cell_filter')
-            if _rc or _rs:
-                reported_env[active_id] = (_rc, _rs)
+        # Pushed status payloads are built from progress.json and do
+        # NOT carry cred_indices / cell_filter (only the
+        # /processing/status route synthesises them by scanning the
+        # processor subprocess's /proc/<pid>/environ). So for any
+        # running frontier whose held plan is empty, do a DIRECT poll
+        # of the peer's status endpoint — bypassing the push cache —
+        # to learn the env its processor actually holds.
+        def _poll_reported_env(_pid: str) -> tuple | None:
+            _pr = get_peer_by_id(cfg, _pid)
+            if not _pr or not _pr.get('url'):
+                return None
+            try:
+                r = _peer_request(
+                    'GET',
+                    _pr['url'].rstrip('/') + '/api/v1/processing/status',
+                    peer_id=_pid, timeout=12)
+                if r is None or r.status_code != 200:
+                    return None
+                d = r.json()
+            except Exception:
+                return None
+            return (d.get('cred_indices'),
+                    d.get('cell_filter') or d.get('lat_strip_filter'))
+        for _pid in sorted(_running_now):
+            if not _pid or _pid in reported_env:
+                continue
+            if prior_cred_plan.get(_pid) and prior_strip_plan_seed.get(_pid):
+                continue
+            _env = _poll_reported_env(_pid)
+            if _env is not None:
+                reported_env[_pid] = _env
         for _pid, (_rc, _rs) in reported_env.items():
             if _rc and not prior_cred_plan.get(_pid):
                 try:
@@ -9440,6 +9461,24 @@ class PeerDirector:
                     _adopted_creds.update(cred_plan[pid])
                     _adopted_pids.add(pid)
                     continue
+                if _renv is None:
+                    # Poll failed — no EVIDENCE the peer is credless.
+                    # Adopt the wanted plan for bookkeeping only and
+                    # leave the peer running; a restart on missing
+                    # evidence is what fed the Jul 2026 loop. If it
+                    # truly has no creds, a later successful poll
+                    # (empty env) will trigger the restart below.
+                    log.info(
+                        'Frontier %s: held plan empty, env poll '
+                        'failed — adopting wanted plan creds=%s '
+                        'strips=%s for bookkeeping, no restart',
+                        pid, want_creds, want_strips)
+                    _adopted_creds.update(want_creds)
+                    _adopted_pids.add(pid)
+                    continue
+                # Poll succeeded and the processor env has NO creds —
+                # the only empty-held case where a restart is truly
+                # needed (peer started without a cred env).
             # --- hard-conflict tests on the HELD plan -------------
             held_valid = [c for c in have_creds if c in _valid_all]
             held_strips_ok = [s for s in have_strips

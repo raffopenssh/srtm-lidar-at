@@ -8135,7 +8135,8 @@ class PeerDirector:
         return max(1, min(cap_creds, cap_cells))
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
-                              prior: dict | None = None) -> dict:
+                              prior: dict | None = None,
+                              sticky: set[str] | None = None) -> dict:
         """Distribute valid credential indices across frontier peers.
 
         Each peer gets a disjoint slice of length ``min_creds_per_frontier``
@@ -8148,6 +8149,15 @@ class PeerDirector:
         overlap with another peer's slice). New peers get fresh slices
         from whatever credentials remain. This avoids restarts caused
         by membership churn re-sorting the assignment.
+
+        ``sticky`` is a set of peer ids whose prior slice must be kept
+        verbatim as long as every index is still valid — no health
+        eviction, no per_eff trim. Use it for peers that are currently
+        RUNNING a frontier: their processor already has these creds in
+        its env, and any reallocation of a still-valid held cred to
+        another peer forces a hard restart (the Jul 2026 plan-drift
+        loop). A sticky cred is only released when it turns invalid /
+        exhausted, or when the peer stops.
         """
         valid_set_all = set(self._valid_credentials())
         # Order valid creds by *health* score (highest = best candidate)
@@ -8221,7 +8231,27 @@ class PeerDirector:
         # let the leftover pass refill from a healthier candidate.
         # 0.35 ~ "degraded" — rotation churn or recent errors.
         UNHEALTHY = 0.35
+        sticky = sticky or set()
+        # Pass 0 — sticky (RUNNING) peers keep their held slice
+        # verbatim, minus creds that turned invalid. No health
+        # eviction, no per_eff trim: reallocating a still-valid cred
+        # away from a running processor forces a hard restart, which
+        # costs far more than a temporarily sub-optimal slice.
         for pid in frontier_ids:
+            if pid not in sticky:
+                continue
+            slice_ = prior.get(pid)
+            if not slice_:
+                continue
+            slice_ = [int(i) for i in slice_
+                      if int(i) in valid_set and int(i) not in used]
+            if not slice_:
+                continue
+            out[pid] = slice_
+            used.update(slice_)
+        for pid in frontier_ids:
+            if pid in out:
+                continue
             slice_ = prior.get(pid)
             if not slice_:
                 continue
@@ -9079,6 +9109,12 @@ class PeerDirector:
         retained_unreachable: list[str] = []
         running: list[str] = []
         candidates: list[dict] = []
+        # {pid: (cred_indices, cell_filter)} as reported by the peer's
+        # own progress.json — the env its processor subprocess ACTUALLY
+        # holds. Used to self-heal the persisted frontier plans when a
+        # running peer's entry was pruned on a previous tick (the
+        # "have creds=[] strips=[]" empty-held restart loop, Jul 2026).
+        reported_env: dict[str, tuple] = {}
         for p in peers:
             pid = p['id']
             if pid == active_id:
@@ -9138,6 +9174,10 @@ class PeerDirector:
             is_cache_only_run = bool(ps.get('cache_only'))
             if is_running and not is_cache_only_run:
                 running.append(pid)
+                _rc = ps.get('cred_indices')
+                _rs = ps.get('cell_filter')
+                if _rc or _rs:
+                    reported_env[pid] = (_rc, _rs)
             else:
                 candidates.append({
                     'peer': p,
@@ -9201,9 +9241,49 @@ class PeerDirector:
         # promoted peers get fresh slices. Without this, a peer entering
         # or leaving the running set would shuffle every other peer's
         # cred slice, triggering plan-drift restart loops.
-        prior_cred_plan = state_copy.get('frontier_cred_plan') or {}
+        prior_cred_plan = dict(state_copy.get('frontier_cred_plan') or {})
+        prior_strip_plan_seed = dict(
+            state_copy.get('frontier_strip_plan') or {})
+        # Self-heal: a RUNNING frontier whose entry vanished from the
+        # persisted plans (pruned by the ordered-trim on a previous
+        # tick, or a restart-early-return that saved a pruned plan)
+        # gets it reconstructed from the env its processor actually
+        # reports. Without this, the empty held plan trips the
+        # hard-conflict test below and the peer is pointlessly
+        # hard-restarted every few minutes (Jul 2026 loop).
+        _running_now = {active_id} | set(running)
+        if active_id and active_id not in reported_env and (
+                not prior_cred_plan.get(active_id)
+                or not prior_strip_plan_seed.get(active_id)):
+            _aps = get_peer_status(
+                (get_peer_by_id(cfg, active_id) or {}).get('url'),
+                peer_id=active_id)
+            _rc = _aps.get('cred_indices')
+            _rs = _aps.get('cell_filter')
+            if _rc or _rs:
+                reported_env[active_id] = (_rc, _rs)
+        for _pid, (_rc, _rs) in reported_env.items():
+            if _rc and not prior_cred_plan.get(_pid):
+                try:
+                    prior_cred_plan[_pid] = [int(i) for i in _rc]
+                    log.info('Frontier %s: restored cred plan %s from '
+                             'peer-reported env (held plan was empty)',
+                             _pid, prior_cred_plan[_pid])
+                except Exception:
+                    pass
+            if _rs and not prior_strip_plan_seed.get(_pid):
+                try:
+                    prior_strip_plan_seed[_pid] = [list(s) for s in _rs]
+                    log.info('Frontier %s: restored strip plan %s from '
+                             'peer-reported env (held plan was empty)',
+                             _pid, prior_strip_plan_seed[_pid])
+                except Exception:
+                    pass
+        # Sticky: RUNNING peers keep their held creds verbatim (only
+        # invalid creds are released) — see _assign_cred_indices.
         cred_plan = self._assign_cred_indices(
-            ordered, cfg, prior=prior_cred_plan)
+            ordered, cfg, prior=prior_cred_plan,
+            sticky=_running_now & set(ordered))
 
         # Lat strips: distribute ALL Austria strips contiguously across
         # the frontier peers. With 7 strips and 3 frontiers each peer
@@ -9219,7 +9299,7 @@ class PeerDirector:
         strip_plan: dict[str, list] = {}
         n_peers = len(ordered)
         n_strips = len(strips)
-        prior_strip_plan = state_copy.get('frontier_strip_plan') or {}
+        prior_strip_plan = prior_strip_plan_seed
         if n_peers > 0 and n_strips > 0:
             # Preserve existing peer→strip assignments where the prior
             # slice still fits within the canonical strip set; only fill
@@ -9252,8 +9332,13 @@ class PeerDirector:
                 kept = [s for s in old_t
                         if s in strip_set and s not in used]
                 # Trim to fair share so leftover strips remain for new
-                # frontiers.
-                kept = kept[:fair_share.get(pid, 0)]
+                # frontiers — but NOT for peers currently RUNNING a
+                # frontier: re-slicing a running peer's strips is
+                # exactly the cosmetic drift that fed the Jul 2026
+                # restart loop. Running peers release strips only when
+                # they stop or the strip leaves the canonical set.
+                if pid not in _running_now:
+                    kept = kept[:fair_share.get(pid, 0)]
                 if kept:
                     strip_plan[pid] = [list(s) for s in kept]
                     used.update(kept)
@@ -9279,16 +9364,26 @@ class PeerDirector:
             for pid in ordered:
                 strip_plan[pid] = []
         # Trim peers that ended up without a strip (no cap collision).
-        ordered = [pid for pid in ordered if strip_plan.get(pid)]
-        cred_plan = {pid: cred_plan[pid] for pid in ordered if pid in cred_plan}
+        # RUNNING peers are exempt from the prune: dropping a running
+        # frontier's entry from the persisted plans makes the next
+        # tick see "have creds=[] strips=[]" and hard-restart it
+        # (Jul 2026 loop). Their entries stay until they stop.
+        ordered = [pid for pid in ordered
+                   if strip_plan.get(pid) or pid in _running_now]
+        _keep = set(ordered) | _running_now
+        cred_plan = {pid: v for pid, v in cred_plan.items() if pid in _keep}
+        strip_plan = {pid: v for pid, v in strip_plan.items() if pid in _keep}
 
         # Detect peers running with a stale plan (creds OR strips don't
         # match). Hard-stop them so the next tick re-issues with the
         # correct env. This is what catches the case where the active
         # peer was started without a lat_strips env (e.g. via the
         # legacy choose_active_peer path).
-        old_cred_plan = state_copy.get('frontier_cred_plan') or {}
-        old_strip_plan = state_copy.get('frontier_strip_plan') or {}
+        # Use the self-healed prior plans (seeded from peer-reported
+        # env above) so a running peer whose persisted entry was
+        # pruned isn't judged against an empty held plan.
+        old_cred_plan = prior_cred_plan
+        old_strip_plan = prior_strip_plan
         peers_to_restart: list[str] = []
         # Adopt-not-restart (Jul 2026): a running frontier is only
         # hard-restarted on a *hard* conflict — all its held creds are
@@ -9318,6 +9413,33 @@ class PeerDirector:
                 continue
             if want_creds == have_creds and want_strips == have_strips:
                 continue
+            # Empty held plan on a RUNNING peer: after self-heal this
+            # means neither the persisted plans nor the peer's own
+            # reported env carry creds/strips. If the peer at least
+            # reports creds in its processor env, adopt the wanted
+            # plan for BOOKKEEPING only (no restart) — the running
+            # subprocess already has working creds; restarting it
+            # gains nothing and feeds the loop. Only a peer truly
+            # running without creds warrants a restart.
+            if not have_creds and not have_strips:
+                _renv = reported_env.get(pid)
+                if _renv and _renv[0]:
+                    log.info(
+                        'Frontier %s: held plan empty but peer reports '
+                        'cred env %s — adopting reported plan, no '
+                        'restart', pid, _renv[0])
+                    try:
+                        cred_plan[pid] = sorted(int(i) for i in _renv[0])
+                    except Exception:
+                        cred_plan[pid] = want_creds
+                    if _renv[1]:
+                        try:
+                            strip_plan[pid] = [list(s) for s in _renv[1]]
+                        except Exception:
+                            pass
+                    _adopted_creds.update(cred_plan[pid])
+                    _adopted_pids.add(pid)
+                    continue
             # --- hard-conflict tests on the HELD plan -------------
             held_valid = [c for c in have_creds if c in _valid_all]
             held_strips_ok = [s for s in have_strips

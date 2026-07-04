@@ -2721,6 +2721,28 @@ def _processing_status_compute():
                         pass
             if _ci:
                 data['cred_indices'] = [int(x) for x in _ci.split(',') if x.strip()]
+            # Fallback: /proc/<pid>/environ is unreadable when the
+            # visible pid is the root-owned sudo/systemd-run wrapper
+            # (EACCES for the exedev-owned gunicorn). Use the sidecar
+            # written by the start route — authoritative for the
+            # current run since it's rewritten/cleared on every start.
+            if not data.get('cred_indices') and data.get('state') in (
+                    'running', 'processing', 'paused_zenodo',
+                    'paused_copernicus', 'paused_disk'):
+                try:
+                    _asn = json.loads(Path(
+                        'data/austria_processor/proc_assignment.json'
+                    ).read_text())
+                    if _asn.get('cred_indices'):
+                        data['cred_indices'] = [
+                            int(i) for i in _asn['cred_indices']]
+                    if _asn.get('cell_filter') and not data.get('cell_filter'):
+                        data['cell_filter'] = _asn['cell_filter']
+                    if (_asn.get('lat_strip_filter')
+                            and not data.get('lat_strip_filter')):
+                        data['lat_strip_filter'] = _asn['lat_strip_filter']
+                except Exception:
+                    pass
         except Exception:
             pass
         # DB-sourced processed count (authoritative: counts all peers via Zenodo manifest sync)
@@ -3234,6 +3256,34 @@ def processing_start():
                 proc_env['KG_LAT_STRIP_FILTER'] = json.dumps(tuples)
         except Exception:
             pass
+    # Persist the director-issued assignment to a sidecar. The status
+    # route reports cred_indices / cell_filter by scanning
+    # /proc/<pid>/environ — but the visible pid is the root-owned sudo/
+    # systemd-run wrapper, so the environ read fails with EACCES and
+    # the peer reports cred_indices=None even while running a frontier
+    # with creds. The director then sees an empty held plan and hard-
+    # restarts the peer (Jul 2026 plan-drift loop). The sidecar is the
+    # authoritative fallback: written on EVERY start (cleared when the
+    # start carries no assignment) so it can never go stale across runs.
+    try:
+        _asn = Path('data/austria_processor/proc_assignment.json')
+        _payload = {}
+        if proc_env.get('COPERNICUS_CRED_INDICES'):
+            _payload['cred_indices'] = [
+                int(x) for x in
+                proc_env['COPERNICUS_CRED_INDICES'].split(',') if x.strip()]
+        if proc_env.get('KG_CELL_FILTER'):
+            _payload['cell_filter'] = json.loads(proc_env['KG_CELL_FILTER'])
+        if proc_env.get('KG_LAT_STRIP_FILTER'):
+            _payload['lat_strip_filter'] = json.loads(
+                proc_env['KG_LAT_STRIP_FILTER'])
+        if _payload:
+            _payload['ts'] = time.time()
+            _asn.write_text(json.dumps(_payload))
+        elif _asn.exists():
+            _asn.unlink()
+    except Exception as _ae:
+        log.warning('proc_assignment sidecar write failed: %s', _ae)
     if 'ZENODO_LOCK_URL' not in proc_env:
         lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
         is_director = Path('data/austria_processor/is_director').exists()

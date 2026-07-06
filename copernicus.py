@@ -361,6 +361,55 @@ ip_throttled: bool = False
 _ip_throttled_at: float = 0  # monotonic timestamp
 _IP_THROTTLE_COOLDOWN = 7200  # 2 hours — observed recovery time
 
+# --- openEO outage circuit breaker (Jul 2026) ---------------------------
+# During CDSE-side outages ('[503] no available server', batch jobs failing
+# inside their Spark cluster) credential rotation can't help — every retry
+# burns a ~1h batch wait + PUs. Track consecutive outage-signature failures
+# process-wide; at threshold raise IPThrottledError so the existing
+# copernicus_paused path parks this peer and the director backs off.
+# Bracketed 5xx forms only — bare '503' would false-positive on job ids /
+# byte counts embedded in error strings.
+_OUTAGE_SIGNS = ('no available server', '[503]', '[502]', '[504]',
+                 '502 Server Error', '503 Server Error', '504 Server Error',
+                 'Bad Gateway', 'Gateway Time', 'Service Unavailable',
+                 'GDAL Exception Code', 'MalformedProjectionException',
+                 'MalformedDataTypeException',
+                 # batch failures reach _outage_note only after 402/credits
+                 # + missing-product were already ruled out — what remains
+                 # is a server-side (Spark cluster) failure.
+                 "didn't finish successfully", 'Status: error')
+_OUTAGE_BREAKER_THRESHOLD = 3
+_outage_streak = 0
+_outage_lock = threading.Lock()
+
+
+def _outage_note(exc_str: str) -> None:
+    """Record an openEO failure; raise IPThrottledError on outage cascade."""
+    global _outage_streak, ip_throttled, _ip_throttled_at
+    if not any(s in exc_str for s in _OUTAGE_SIGNS):
+        with _outage_lock:
+            _outage_streak = 0
+        return
+    with _outage_lock:
+        _outage_streak += 1
+        streak = _outage_streak
+    logger.warning("openEO outage signature (%d/%d consecutive): %s",
+                   streak, _OUTAGE_BREAKER_THRESHOLD, exc_str[:160])
+    if streak >= _OUTAGE_BREAKER_THRESHOLD:
+        ip_throttled = True
+        _ip_throttled_at = time.monotonic()
+        with _outage_lock:
+            _outage_streak = 0
+        raise IPThrottledError(
+            f"openEO outage circuit breaker: {streak} consecutive "
+            f"server-side failures — backing off")
+
+
+def _outage_ok() -> None:
+    global _outage_streak
+    with _outage_lock:
+        _outage_streak = 0
+
 # Short-term memory for NDVI months that recently failed with 500 (Spark timeout)
 # or persistent 402.  Key = (bbox_hash, month_label), value = expiry timestamp.
 # Skips re-downloading the same month for the same area within the cooldown period.
@@ -1639,6 +1688,7 @@ def _run_datacube(
             # Verify non-empty before committing
             if tmp_path.exists() and tmp_path.stat().st_size > 0:
                 tmp_path.rename(output_path)
+                _outage_ok()
                 logger.info("Synchronous download complete: %s", output_path)
                 try:
                     record_credential_usage(_credential_index, "success", _product_from_title(title))
@@ -1669,7 +1719,10 @@ def _run_datacube(
                     "Source product missing on CDSE cluster for %s (%s) — "
                     "not retrying via batch", title, str(exc)[:200])
                 raise MissingProductError(str(exc)) from exc
-            # Not a 402 — fall back to batch
+            # Not a 402 — note outage signature (raises IPThrottledError on
+            # cascade so we stop burning batch-job hours during CDSE outages),
+            # else fall back to batch
+            _outage_note(str(exc))
             logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
 
     # Batch job fallback
@@ -1700,12 +1753,17 @@ def _run_datacube(
         # @_retry_on_rotation retry the whole function from scratch.
         batch_msg = str(batch_exc)
         if "didn't finish successfully" in batch_msg or "Status: error" in batch_msg:
+            # Outage breaker first: a batch job that failed with server-side
+            # signatures (Spark GDAL read errors, 5xx) fails identically on
+            # every credential — rotation just wastes ~1h/attempt.
+            _outage_note(batch_msg + ' ' + getattr(batch_exc, '_error_logs_str', ''))
             logger.warning("Batch job failed (%s) — rotating credential for retry", batch_msg)
             if rotate_credentials():
                 raise CredentialRotatedError(
                     f"Batch job failed, rotated credential for retry: {batch_msg}"
                 )
         raise
+    _outage_ok()
     logger.info("Batch job %s finished", job.job_id)
 
     # Find the result file

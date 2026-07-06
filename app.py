@@ -15703,6 +15703,40 @@ def process_txt():
                  (7d) to mine the long-term forensic record.
     """
     import time as _t
+    if request.args.get('help') in ('1', 'true', 'yes'):
+        return Response(
+            '# /process.txt query params\n'
+            'log=N      merged-log lines (default 60, max 500; 0 = suppress '
+            'block + skip disk read)\n'
+            'warn=1     log restricted to warnings + errors\n'
+            'hidden=1   include stopped/idle/complete peers in roster\n'
+            'attn=1     roster collapsed to attention-state peers only\n'
+            'roster=0   drop the peer table entirely\n'
+            'creds=1    full per-credential listing (default: histogram + '
+            'active/held/unhealthy rows only)\n'
+            'peer=X     substring filter on peer id (roster + log)\n'
+            'q=X        substring filter on log msg body\n'
+            'hours=H    log lookback (default 24; >24 reads per-day gzipped '
+            'archive in data/log_archive/)\n'
+            'verbose=1  keep GDAL/bev_retry chatter + full-length log msgs '
+            '(default: noise hidden, msgs capped at 220 chars, consecutive '
+            'duplicates collapsed as \xd7N)\n'
+            '\n'
+            '# cheap combos\n'
+            'roster=0&log=0   banner + fleet lines only\n'
+            'attn=1&warn=1    triage view\n'
+            '\n'
+            '# structured equivalents\n'
+            '/api/v1/director/status, /api/v1/director/log/history?hours=H\n'
+            '\n'
+            '# sections\n'
+            'health/director/throttle banners \xb7 bev_pause \xb7 ip_pools \xb7 '
+            'progress \xb7 zenodo \xb7 fleet_bw/bw_learn \xb7 fleet_proxy \xb7 '
+            'chkpt_registry \xb7 fleet_cpu/pools \xb7 versions/rollout \xb7 '
+            'copernicus credentials \xb7 frontier plan \xb7 peer roster \xb7 '
+            'disk pressure \xb7 director events \xb7 recent failures \xb7 '
+            'priority queue \xb7 merged log\n',
+            mimetype='text/plain; charset=utf-8')
     try:
         nlog = max(0, min(500, int(request.args.get('log', '60'))))
     except ValueError:
@@ -15721,6 +15755,10 @@ def process_txt():
     # log=0: drop the merged-log block (fleet+peer state only).
     attn_only = request.args.get('attn') in ('1', 'true', 'yes')
     show_roster = request.args.get('roster') not in ('0', 'false', 'no')
+    # creds=1: full per-credential listing (all 100+ rows). Default is a
+    #   compact view: health histogram + detail rows only for creds that
+    #   are held by a frontier, used in the last 24h, or unhealthy.
+    creds_full = request.args.get('creds') in ('1', 'true', 'yes')
     peer_q = (request.args.get('peer') or '').strip().lower()
     msg_q = (request.args.get('q') or '').strip().lower()
     try:
@@ -15735,7 +15773,7 @@ def process_txt():
     # underlying director status is already cross-worker cached so the
     # work avoided here is pure Python text formatting + log scanning.
     _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
-                  attn_only, show_roster)
+                  attn_only, show_roster, creds_full)
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
     if cache is None:
@@ -15803,10 +15841,32 @@ def process_txt():
     )
     sh = d.get('shadow_peer')
     if sh:
+        _sp_ts = d.get('shadow_last_push_ts') or 0
+        try:
+            _sp_age = _hms(int(_t.time() - float(_sp_ts))) if _sp_ts else '-'
+        except Exception:
+            _sp_age = '-'
         out.append(
             f'shadow:   {sh} ok={d.get("shadow_last_push_ok")} '
-            f'last_push={d.get("shadow_last_push_ts") or "-"}'
+            f'push_age={_sp_age}'
         )
+
+    # --- Cache conveyor (frontier → cache-only pipeline) ---------
+    # cache_ready=0 with many eligible peers idle = frontier-starved
+    # fleet (the July 2026 CDSE outage read exactly like this). One
+    # line answers "why are N peers idle?" without pulling JSON.
+    try:
+        _cr = d.get('cache_ready_kgs')
+        _cr_n = len(_cr) if isinstance(_cr, (list, dict)) else (_cr or 0)
+        out.append(
+            f'cache_pipeline: ready_kgs={_cr_n} '
+            f'running={d.get("cache_only_running", "-")}'
+            f'/{d.get("max_cache_only_peers", "-")}max '
+            f'eligible={d.get("cache_only_eligible", "-")} '
+            f'miss_count={d.get("cache_miss_count", "-")}'
+        )
+    except Exception:
+        pass
 
     # --- Throttle / director efficiency history ------------------
     # capacity_history is a ~2h ring (240 × 30s ticks) persisted via
@@ -16511,6 +16571,7 @@ def process_txt():
     # Cheap one-line summary so an agent can immediately see whether a
     # fleet-wide update has actually landed everywhere. Format:
     #   versions: c705b81=42 1213f67=15 29fa0f1=2  (target=c705b81)
+    _rollout_target = ''
     try:
         from collections import Counter as _Ctr
         target = (d.get('director_commit') or d.get('local_git_commit')
@@ -16522,6 +16583,7 @@ def process_txt():
             except Exception:
                 target = ''
         target = (target or '')[:7]
+        _rollout_target = target  # reused by the roster's ver column
         ver_ct = _Ctr()
         for p in (d.get('peers') or []):
             v = (p.get('git_commit') or '-')[:7] or '-'
@@ -16590,8 +16652,6 @@ def process_txt():
             for i in (idxs or []):
                 held_by_idx[int(i)] = pid
         out.append('')
-        out.append(f'copernicus credentials ({len(cred_pool)}):')
-        out.append('  # id              health  held_by  s/e/r 7d   last_use   last_err')
         now_ts = _t.time()
         # Pre-compute per-credential 7d daily aggregates (oldest → newest).
         # Buckets are per-hour; we collapse to 7 daily slots aligned to the
@@ -16612,21 +16672,51 @@ def process_txt():
                 days[slot][0] += int(b.get('s', 0) or 0)
                 days[slot][1] += int(b.get('e', 0) or 0)
             return [(s, e) for s, e in days]
+        # Default (compact) view: health histogram + fleet 7d totals +
+        # detail rows ONLY for creds that matter right now — held by a
+        # frontier, used/errored in the last 24h, or unhealthy. The
+        # 100+ healthy-idle rows are pure token waste for an agent;
+        # ?creds=1 restores the full listing.
+        hist: dict = {}
+        tot_s7 = tot_e7 = tot_r7 = 0
+        active_rows = []
         for c in cred_pool:
             i = c.get('index')
-            cid_short = (c.get('client_id_short') or '')[:14].ljust(14)
-            health = (c.get('health', {}).get('label') or '-')[:7].ljust(7)
-            held = (held_by_idx.get(i) or '-')[:7].ljust(7)
+            label = (c.get('health', {}).get('label') or '-')
+            hist[label] = hist.get(label, 0) + 1
             u = c.get('usage') or {}
             s7 = u.get('success_7d') or 0
             e7 = u.get('error_7d') or 0
+            tot_s7 += s7
+            tot_e7 += e7
+            tot_r7 += u.get('rotated_7d') or 0
+            lu_ts = u.get('last_use') or 0
+            le_ts = u.get('last_error') or 0
+            recent = max(float(lu_ts or 0), float(le_ts or 0))
+            if creds_full or i in held_by_idx or (
+                    recent and (now_ts - recent) < 24 * 3600) or (
+                    label not in ('healthy', 'warm', '-')):
+                active_rows.append((i, c, u, s7, e7, label))
+        hist_s = ' '.join(f'{k}={v}' for k, v in
+                          sorted(hist.items(), key=lambda kv: -kv[1]))
+        out.append(f'copernicus credentials ({len(cred_pool)}): {hist_s} '
+                   f'· 7d s/e/r={tot_s7}/{tot_e7}/{tot_r7}'
+                   + ('' if creds_full else
+                      f' · showing {len(active_rows)} active/held/unhealthy'
+                      f' (creds=1 for all)'))
+        if active_rows:
+            out.append('  # id              health  held_by  s/e/r 7d   last_use   last_err')
+        def _ago(ts):
+            if not ts:
+                return '   never'
+            age = max(0, int(now_ts - float(ts)))
+            return _hms(age).rjust(8)
+        for i, c, u, s7, e7, label in active_rows:
+            cid_short = (c.get('client_id_short') or '')[:14].ljust(14)
+            health = label[:7].ljust(7)
+            held = (held_by_idx.get(i) or '-')[:7].ljust(7)
             r7 = u.get('rotated_7d') or 0
             ser = (f'{s7}/{e7}/{r7}').ljust(11)
-            def _ago(ts):
-                if not ts:
-                    return '   never'
-                age = max(0, int(now_ts - float(ts)))
-                return _hms(age).rjust(8)
             lu = _ago(u.get('last_use'))
             le = _ago(u.get('last_error'))
             out.append(f'  {i} {cid_short} {health} {held} {ser} {lu}  {le}')
@@ -16788,11 +16878,20 @@ def process_txt():
                 v = commit_from_log.get(p.get('id'))
                 if v:
                     p['git_commit'] = v
-    out.append('  id     role     state     kg     name                 step          elapsed  bw%   used/bud   ver     creds  last  bw_extras')
+    out.append('  id     role     kg     name                 step          elapsed  bw%   used/bud   ver     creds  last_kg  extras')
     for p in visible:
         pid = _short(p.get('id', '?'), 6).ljust(6)
-        role = _short(_peer_role(p), 8).ljust(8)
-        st = _short(p.get('processor_state', '-'), 9).ljust(9)
+        role_v = _peer_role(p)
+        role = _short(role_v, 8).ljust(8)
+        # 'state' column dropped — role encodes it; surface only when the
+        # raw state adds info beyond the role (e.g. paused_zenodo).
+        _state_v = (p.get('processor_state') or '').lower()
+        _implied = {
+            'FRONTIER': ('running', 'processing'),
+            'CACHE': ('running', 'processing'),
+            'RUN': ('running', 'processing'),
+            'STOPPED': ('stopped',), 'PAUSED': ('paused',),
+        }.get(role_v, (_state_v,))
         kg = _short(p.get('current_kg') or p.get('reserved_kg') or '-', 6).ljust(6)
         name = _short(p.get('current_kg_name') or '', 20).ljust(20)
         step = _short(p.get('current_kg_step') or '-', 13).ljust(13)
@@ -16858,8 +16957,14 @@ def process_txt():
             _iow = _sysd.get('cpu_iowait')
         if isinstance(_iow, (int, float)) and _iow >= 5:
             extras.append(f'iow={_iow:.0f}%')
+        # Odd state (e.g. paused_zenodo, interrupted) not implied by role
+        # → surface it as an extras token instead of a fixed column.
+        if _state_v and _state_v not in _implied:
+            extras.insert(0, f'state={_state_v}')
         bw_extra_s = ' '.join(extras) if extras else ''
-        ver = (_short(p.get('git_commit') or '-', 7)).ljust(7)
+        # ver: '·' when at rollout target — only stale commits stand out.
+        _pv = (p.get('git_commit') or '-')[:7]
+        ver = ('·' if (_pv and _pv == _rollout_target) else _pv).ljust(7)
         # Surface assigned credential indices so we can verify each
         # frontier peer is actually on its slice (the recent index-
         # mismatch incident was diagnosed by spotting blank creds here).
@@ -16879,7 +16984,7 @@ def process_txt():
         if not p.get('online'):
             flags += ' ⚠off'
         out.append(
-            f'  {pid} {role} {st} {kg} {name} {step} {el_col} {bw_pct} {bw_ub} {ver} {ci_col} {last}'
+            f'  {pid} {role} {kg} {name} {step} {el_col} {bw_pct} {bw_ub} {ver} {ci_col} {last}'
             + (f'  {bw_extra_s}' if bw_extra_s else '')
             + flags
         )
@@ -17054,35 +17159,42 @@ def process_txt():
     except Exception as _e:
         out.append(f'  (log read error: {_e})')
     log_lines.sort(key=lambda e: e.get('ts', ''), reverse=True)
-    for e in log_lines[:nlog]:
+    # Collapse consecutive identical (peer, msg) pairs — retry loops
+    # produce dozens of near-identical lines; one line + ×N suffices.
+    _prev_key = None
+    _dup_n = 0
+    _rendered = 0
+    for e in log_lines:
+        if _rendered >= nlog:
+            break
+        msg = e.get('msg', '')
+        key = (e.get('peer'), msg)
+        if key == _prev_key:
+            _dup_n += 1
+            continue
+        if _dup_n:
+            out[-1] += f' ×{_dup_n + 1}'
+            _dup_n = 0
+        _prev_key = key
         ts = (e.get('ts') or '')[5:19].replace('T', ' ')
         peer = _short(e.get('peer', '-'), 8).ljust(8)
         lvl = (e.get('level') or 'info')[0].upper()
         kg = e.get('kg') or ''
         kg_s = f' [{kg}]' if kg else ''
-        out.append(f'  {ts} {lvl} {peer}{kg_s} {e.get("msg", "")}')
+        # Cap message length — 'creds revalidated' style lines carry a
+        # 400+ char per-cred tail that costs ~100 tokens each. Verbose
+        # mode keeps the full text.
+        if not verbose and len(msg) > 220:
+            msg = msg[:219] + '…'
+        out.append(f'  {ts} {lvl} {peer}{kg_s} {msg}')
+        _rendered += 1
+    if _dup_n:
+        out[-1] += f' ×{_dup_n + 1}'
 
     out.append('')
     out.append(
-        '# query: ?log=N (default 60, max 500; log=0 suppresses the log),\n'
-        '#        ?warn=1 (errors+warnings only),\n'
-        '#        ?hidden=1 (include stopped/idle), ?peer=at3 (substring),\n'
-        '#        ?q=substring (msg filter), ?hours=H (default 24; uses\n'
-        '#        per-day gzipped archive in data/log_archive/ when H>24),\n'
-        '#        ?attn=1 (roster → attention-state peers only),\n'
-        '#        ?roster=0 (drop peer table; director/health/log only),\n'
-        '#        ?verbose=1 (also show GDAL-internal/bev_retry per-attempt\n'
-        '#        chatter — hidden by default as proxy-lane noise).\n'
-        '#        Token-cheap combos: ?roster=0&log=0 (banner + fleet\n'
-        '#        lines only), ?attn=1&warn=1 (triage view).\n'
-        '#        Pair with /api/v1/director/log/history (also accepts hours=)\n'
-        '#        for full structured access. New sections (May 2026):\n'
-        '#          versions:/rollout: — fleet update progress\n'
-        '#          copernicus credentials — per-cred 7d usage/health/holder\n'
-        '#          frontier plan / parallel frontiers active — cred slicing\n'
-        '#          active zenodo uploads — peers mid-upload + progress\n'
-        '#          disk pressure — peers <5 GB free\n'
-        '#          recent director events — rollout / cred-rotation events.'
+        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 '
+        'peer=<substr> q=<substr> hours=H verbose=1 help=1'
     )
     # --- Distil health banner (inserted just under the title) ----
     try:

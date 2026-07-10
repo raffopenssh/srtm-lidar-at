@@ -620,6 +620,12 @@ THROTTLE_DRIFT_AMPLITUDE = 0.04        # ±4% wobble around the EMA value
 RAMP_MIN_STARTS_PER_TICK = 1
 RAMP_MAX_STARTS_PER_TICK = 3
 
+# Strip-hog release: minimum interval between graceful stops sent to a
+# running frontier that holds more than its fair share of strips while
+# credentialed candidates are starving (empty strip plans). Graceful =
+# KG-boundary stop, so the in-flight KG always completes + uploads.
+FRONTIER_HOG_RELEASE_COOLDOWN_S = 3600
+
 # Minimum interval between processor restarts on the same active frontier
 # peer when the cred/strip plan + exclude set haven't changed. The
 # director sees ``state in ('idle','stopped')`` between KGs (the
@@ -9318,6 +9324,11 @@ class PeerDirector:
         # When fewer strips than frontiers (very rare with 7 strips),
         # tail peers get nothing — we then trim ``ordered``.
         strip_plan: dict[str, list] = {}
+        # Strip-hog release bookkeeping (see block below): {pid: trimmed
+        # slice} for running frontiers whose planned slice was cut back
+        # to fair share this tick. Consulted by the adopt-not-restart
+        # block so it doesn't re-adopt the oversized held plan.
+        _hog_trimmed: dict[str, list] = {}
         n_peers = len(ordered)
         n_strips = len(strips)
         prior_strip_plan = prior_strip_plan_seed
@@ -9365,6 +9376,75 @@ class PeerDirector:
                     used.update(kept)
             leftover = [s for s in strips if tuple(s) not in used]
             unassigned = [pid for pid in ordered if pid not in strip_plan]
+            # --- strip-hog release (Jul 2026 follow-up) ------------
+            # The _running_now exemption above lets a running frontier
+            # keep MORE than its fair share indefinitely — e.g. a sole
+            # frontier that was once granted ALL 13 Austria cells. When
+            # credentialed candidates are then starving (leftover
+            # empty), every promotion gets strips=[] → trimmed /
+            # skipped by the start loop → the fleet is stuck at
+            # parallel=1 until the hog stops on its own (never). Fix:
+            # trim the hog's PLANNED slice to fair share so leftovers
+            # exist for candidates, and send the hog ONE graceful
+            # (KG-boundary) stop — max one hog per tick, cooldown
+            # FRONTIER_HOG_RELEASE_COOLDOWN_S — so it eventually
+            # re-launches with the trimmed cell_filter env. NEVER a
+            # hard stop: the in-flight KG must complete + upload.
+            # Until that boundary the hog's env still covers the
+            # released cells (bounded transient overlap: it works one
+            # KG in one cell at a time).
+            _cred_unassigned = [p for p in unassigned if cred_plan.get(p)]
+            if _cred_unassigned and not leftover:
+                _hogs = sorted(
+                    (p for p in ordered
+                     if p in _running_now
+                     and len(strip_plan.get(p) or [])
+                     > max(1, fair_share.get(p, 0))),
+                    key=lambda p: -len(strip_plan.get(p) or []))
+                for hpid in _hogs:
+                    _kept = strip_plan.get(hpid) or []
+                    _fair = max(1, fair_share.get(hpid, 0))
+                    _released = _kept[_fair:]
+                    if not _released:
+                        continue
+                    _trimmed = [list(s) for s in _kept[:_fair]]
+                    strip_plan[hpid] = _trimmed
+                    _hog_trimmed[hpid] = [list(s) for s in _trimmed]
+                    used.difference_update(tuple(s) for s in _released)
+                    log.info(
+                        'Strip-hog release: %s planned slice trimmed '
+                        '%d → %d strips (candidates starving: %s)',
+                        hpid, len(_kept), len(_trimmed),
+                        ','.join(_cred_unassigned))
+                if _hog_trimmed:
+                    leftover = [s for s in strips if tuple(s) not in used]
+                    _now_ts = time.time()
+                    _target = None
+                    with self._lock:
+                        _cool = self.state.setdefault(
+                            'frontier_hog_release', {})
+                        for hpid in sorted(_hog_trimmed):
+                            if (_now_ts - float(_cool.get(hpid) or 0)
+                                    >= FRONTIER_HOG_RELEASE_COOLDOWN_S):
+                                _target = hpid
+                                _cool[hpid] = _now_ts
+                                break
+                    if _target:
+                        _hp = get_peer_by_id(cfg, _target)
+                        try:
+                            stop_peer_processor(
+                                (_hp or {}).get('url'), graceful=True)
+                            _emit_director_event(
+                                'strip-hog release: graceful stop (KG '
+                                'boundary) — planned slice trimmed to '
+                                'fair share (%d strips); freed strips '
+                                'go to starving frontier candidates'
+                                % len(_hog_trimmed[_target]),
+                                peer=_target)
+                        except Exception as e:
+                            log.warning(
+                                'Strip-hog graceful stop on %s failed: '
+                                '%s', _target, e)
             if unassigned and leftover:
                 base = len(leftover) // len(unassigned)
                 extra = len(leftover) % len(unassigned)
@@ -9504,7 +9584,16 @@ class PeerDirector:
                 continue
             # --- adopt: keep the peer running on what it holds ----
             cred_plan[pid] = held_valid
-            strip_plan[pid] = [list(s) for s in held_strips_ok]
+            if pid in _hog_trimmed:
+                # Strip-hog release in flight: do NOT re-adopt the
+                # oversized held slice — that would re-mark the freed
+                # strips as adopted and strip them back off the
+                # starving candidates below, undoing the release.
+                # Keep the trimmed plan; the peer's env still covers
+                # the extra cells until its graceful KG-boundary stop.
+                strip_plan[pid] = [list(s) for s in _hog_trimmed[pid]]
+            else:
+                strip_plan[pid] = [list(s) for s in held_strips_ok]
             _adopted_creds.update(held_valid)
             _adopted_pids.add(pid)
             log.info(

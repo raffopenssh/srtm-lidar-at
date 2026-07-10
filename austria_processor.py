@@ -2247,6 +2247,7 @@ def _write_gpkg_features_chunked(gpkg_path: str, schema: dict, crs,
         nonlocal written, layer_exists
         if not batch:
             return
+        _gpkg_heartbeat(f"vectors {layer_name}: {written + len(batch)} features")
         if layer_exists:
             with fiona.open(gpkg_path, 'a', driver='GPKG',
                             layer=layer_name) as dst:
@@ -3115,6 +3116,44 @@ def _sidecar_stat(key: str, n: int = 1) -> None:
         pass
 
 
+# --- GPKG-build liveness heartbeat ------------------------------------
+# The director's stuck-KG watchdog (peer_director._check_stuck_kg) kills
+# any peer whose progress fingerprint freezes for STUCK_KG_FROZEN_S (12h).
+# The fingerprint moves on step_detail_ts, which only updates through
+# process_one_kg._report_step — a closure the GPKG builders historically
+# never called during their multi-hour raster stitches. Result (Jul 2026):
+# ~40 healthy gpkg_full builds on big KGs (91017, 01651, 50017, ...) were
+# hard-killed at exactly 12.0h and looped across peers indefinitely.
+#
+# process_one_kg registers its _report_step here so module-level builders
+# (and gpkg_streamed) can emit within-step detail without plumbing a
+# callback through every signature. Throttled to one write per 60s —
+# the watchdog only needs the fingerprint to move well within 12h.
+_STEP_REPORT_HOOK = [None]      # [callable(step, detail) | None]
+_HB_LAST = [0.0]
+_HB_MIN_INTERVAL_S = 60.0
+
+
+def _gpkg_heartbeat(detail: str, force: bool = False) -> None:
+    """Emit a step-detail heartbeat (throttled) so the stuck-KG watchdog
+    sees progress during long GPKG builds. Re-reports the CURRENT step
+    (the hook closes over process_one_kg's step state) so a heartbeat
+    from a shared helper (e.g. the chunked vector writer, used by both
+    gpkg_full and gpkg_light) never mislabels the step. No-op when no
+    hook is set (unit tests importing the builders directly)."""
+    try:
+        hook = _STEP_REPORT_HOOK[0]
+        if hook is None:
+            return
+        now = time.time()
+        if not force and (now - _HB_LAST[0]) < _HB_MIN_INTERVAL_S:
+            return
+        _HB_LAST[0] = now
+        hook(detail)
+    except Exception:
+        pass
+
+
 def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = None):
     """Re-read DTM/DSM for a tile.
 
@@ -3636,6 +3675,58 @@ def _purge_stale_gpkg(path: str) -> None:
                 log.warning("_purge_stale_gpkg: cannot remove %s: %s", p, e)
 
 
+def _gpkg_reuse_ok(path: str) -> bool:
+    """Return True iff an on-disk full GPKG from a prior attempt is safe
+    to reuse verbatim (skip rebuild + upload as-is).
+
+    A stuck-KG hard restart (SIGKILL mid-build) leaves a structurally
+    incomplete file; before this gate the reuse path shipped those to
+    Zenodo. Checks, cheapest first:
+
+      * no hot SQLite sidecars (-wal/-shm/-journal — interrupted write)
+      * GPKG application_id magic (0x47504B47)
+      * ``layer_styles`` table exists with rows — written by
+        ``_write_gpkg_all_styles`` at the very END of BOTH the in-memory
+        and streamed builders, so its presence implies the build ran to
+        completion. (Streamed builds write segment vectors early, so
+        vector-layer presence alone would be a false completeness signal.)
+      * ``PRAGMA quick_check(1)`` passes (stops at first corruption; much
+        cheaper than integrity_check on multi-GB files).
+    """
+    import sqlite3 as _sq3
+    try:
+        for _sfx in ("-wal", "-shm", "-journal"):
+            if os.path.exists(path + _sfx):
+                log.warning("GPKG reuse check: hot sidecar %s present", path + _sfx)
+                return False
+        con = _sq3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            app_id = con.execute("PRAGMA application_id").fetchone()[0]
+            if app_id != 0x47504B47:
+                log.warning("GPKG reuse check: bad application_id 0x%x", app_id)
+                return False
+            row = con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='layer_styles'").fetchone()
+            if not row or row[0] == 0:
+                log.warning("GPKG reuse check: no layer_styles table "
+                            "(build did not reach the final styles step)")
+                return False
+            if (con.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0] or 0) == 0:
+                log.warning("GPKG reuse check: layer_styles empty")
+                return False
+            qc = con.execute("PRAGMA quick_check(1)").fetchone()[0]
+            if qc != "ok":
+                log.warning("GPKG reuse check: quick_check failed: %s", qc)
+                return False
+        finally:
+            con.close()
+        return True
+    except Exception as e:
+        log.warning("GPKG reuse check errored (%s) — treating as not reusable", e)
+        return False
+
+
 def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=False):
     """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
     segment_height) covering the full KG bbox, plus unified segment vectors."""
@@ -3658,6 +3749,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
     def _write_table(name, arrays, h, w, tf, dtype='float32', descs=None):
         nonlocal table_count
+        _gpkg_heartbeat(f"writing layer {name}", force=True)
         opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
                     dtype=dtype, crs='EPSG:3035', transform=tf,
                     RASTER_TABLE=name, RASTER_IDENTIFIER=name)
@@ -3802,7 +3894,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
     _deferred_dtm: list[tuple[int, dict, int, int, int, int]] = []
 
+    _n_tiles_hb = len(tile_seg_results)
     for ti_idx, tr in enumerate(tile_seg_results):
+        _gpkg_heartbeat(f"stitch tile {ti_idx + 1}/{_n_tiles_hb}")
         th, tw = tr["shape"]
         tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
 
@@ -3963,6 +4057,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         wsum2 = np.zeros((full_h, full_w), dtype=np.float64)
         any_data = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"DTM/DSM {year} tile {ti_idx + 1}/{_n_tiles_hb}")
             th, tw = tr["shape"]
             tile_left = tr["bounds_3035"][0]
             tile_top = tr["bounds_3035"][3]
@@ -4048,6 +4143,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         got_rgb = False
         got_nir = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"ortho {o_year} tile {ti_idx + 1}/{_n_tiles_hb}")
             th, tw = tr["shape"]
             tile_left = tr["bounds_3035"][0]
             tile_top = tr["bounds_3035"][3]
@@ -4151,6 +4247,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         ndvi_wsum = np.zeros((full_h, full_w), dtype=np.float64)
         any_ndvi = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"NDVI tile {ti_idx + 1}/{_n_tiles_hb}")
             bbox_wgs = tr["bbox_wgs"]
             tw_t, ts_t, te_t, tn_t = bbox_wgs
             bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
@@ -4210,6 +4307,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         wc_full = np.zeros((full_h, full_w), dtype=np.uint8)
         any_wc = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"WorldCover tile {ti_idx + 1}/{_n_tiles_hb}")
             bbox_wgs = tr["bbox_wgs"]
             tw_t, ts_t, te_t, tn_t = bbox_wgs
             bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
@@ -4262,6 +4360,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         vh_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
         any_sar = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"SAR tile {ti_idx + 1}/{_n_tiles_hb}")
             bbox_wgs = tr["bbox_wgs"]
             tw_t, ts_t, te_t, tn_t = bbox_wgs
             bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
@@ -4319,6 +4418,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
         ly_full = np.zeros((full_h, full_w), dtype=np.uint8)
         any_hansen = False
         for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"Hansen tile {ti_idx + 1}/{_n_tiles_hb}")
             bbox_wgs = tr["bbox_wgs"]
             tw_t, ts_t, te_t, tn_t = bbox_wgs
             th_t, tw_t2 = tr["shape"]
@@ -6856,6 +6956,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         except Exception:
             pass
 
+    # Register the step reporter for module-level GPKG builders so their
+    # multi-hour stitches can heartbeat step_detail_ts (stuck-KG watchdog
+    # liveness — see _gpkg_heartbeat). Re-reports the CURRENT step name
+    # (from _prev_step) so shared helpers never flip the step label.
+    # One subprocess per KG, so plain module state is safe.
+    _STEP_REPORT_HOOK[0] = lambda detail: _report_step(
+        _prev_step[0] or "gpkg_full", detail)
+    _HB_LAST[0] = 0.0
+
     try:
         # --- Determine bbox ---
         result["step"] = "bbox"
@@ -7891,13 +8000,27 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _full_already_on_zenodo = False
         try:
             if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
-                _reuse_full = True
-                full_gpkg = _existing_full
-                _boundary_remap = {}
-                log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
-                        kg_code, os.path.getsize(_existing_full) / 1e6)
-                _report_step("gpkg_full",
-                             f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
+                # Integrity gate before reuse. A stuck-KG hard restart
+                # (SIGKILL mid-build) leaves a structurally incomplete
+                # GPKG — possibly with a hot -wal/-journal — and blind
+                # reuse would upload a corrupt product. Cheap checks:
+                # GPKG magic application_id + SQLite quick_check + the
+                # expected final layers (segment vectors are written
+                # near the end of the build, so their presence implies
+                # the build ran to completion).
+                _reuse_full = _gpkg_reuse_ok(_existing_full)
+                if _reuse_full:
+                    full_gpkg = _existing_full
+                    _boundary_remap = {}
+                    log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
+                            kg_code, os.path.getsize(_existing_full) / 1e6)
+                    _report_step("gpkg_full",
+                                 f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
+                else:
+                    log.warning("KG %s: existing full GPKG failed integrity/completeness "
+                                "check (likely interrupted build) — purging and rebuilding",
+                                kg_code)
+                    _purge_stale_gpkg(_existing_full)
         except Exception:
             _reuse_full = False
         # Manifest-aware reuse: a prior run (possibly on another peer)

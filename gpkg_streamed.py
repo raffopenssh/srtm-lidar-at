@@ -14,6 +14,21 @@ import numpy as np
 
 log = logging.getLogger("austria_processor")
 
+
+def _hb(detail, force=False):
+    """Relay a liveness heartbeat to the parent step monitor.
+
+    The director's stuck-KG watchdog kills peers whose progress
+    fingerprint freezes for 12 h; the streamed builder runs for many
+    hours on monster KGs, so every strip/tile loop must keep
+    step_detail_ts moving. See austria_processor._gpkg_heartbeat.
+    """
+    try:
+        from austria_processor import _gpkg_heartbeat
+        _gpkg_heartbeat(detail, force=force)
+    except Exception:
+        pass
+
 # Switch to streamed writing above this pixel count (full_h * full_w).
 # 100 Mpx ≈ 10 km × 10 km.  Below this the in-memory path is fine.
 _STREAM_PIXEL_THRESHOLD = 100_000_000
@@ -124,9 +139,11 @@ def _streamed_write_layer(
         for b_idx, desc in enumerate(band_descs, 1):
             dst.set_band_description(b_idx, desc)
 
+        n_strips = (full_h + strip_h - 1) // strip_h
         for strip_start in range(0, full_h, strip_h):
             strip_end = min(strip_start + strip_h, full_h)
             sh = strip_end - strip_start
+            _hb(f"layer {layer_name}: strip {strip_start // strip_h + 1}/{n_strips}")
 
             # Allocate strip accumulators
             if blend == 'feather':
@@ -156,6 +173,7 @@ def _streamed_write_layer(
                 strip_r0 = t_row_start - strip_start
                 strip_r1 = t_row_end - strip_start
 
+                _hb(f"layer {layer_name}: strip {strip_start // strip_h + 1}/{n_strips} tile {_ti_idx + 1}")
                 bands = fetch_fn(tr, th_eff, tw_eff)
                 if bands is None:
                     continue
@@ -279,6 +297,7 @@ def build_full_gpkg_streamed(
     best_cat_weight = np.zeros((full_h, full_w), dtype=np.float32)
 
     for _ti_idx, tr, (row_off, col_off, r_end, c_end, th_eff, tw_eff) in tile_info:
+        _hb(f"categorical stitch tile {_ti_idx + 1}/{len(tile_info)}")
         if tr.get("labels") is None:
             continue
         labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
@@ -323,6 +342,7 @@ def build_full_gpkg_streamed(
             ndsm_w = np.zeros((full_h, full_w), dtype=np.float64)
             for _ti_idx, tr, (row_off, col_off, r_end, c_end, th_eff, tw_eff) in tile_info:
                 try:
+                    _hb(f"boundary-merge nDSM tile {_ti_idx + 1}/{len(tile_info)}")
                     tdata = _read_dtm_for_tile(tr)
                     tile_ndsm = tdata["ndsm"][:th_eff, :tw_eff].astype(np.float32)
                     del tdata

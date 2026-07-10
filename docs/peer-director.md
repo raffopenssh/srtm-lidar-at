@@ -504,6 +504,21 @@ progressing KG is never killed. Tile checkpoints + the cross-peer chkpt
 registry make the restart nearly free — the next peer to pick up the KG
 resumes the finished tiles.
 
+**Jul 2026 fix — gpkg_full was a silent step.** The GPKG builders
+(`build_full_gpkg_tiled` / `gpkg_streamed`) historically emitted zero
+within-step detail, so on big KGs (91017, 01651, 50017, 90014, …) a
+*healthy* multi-hour raster stitch froze the fingerprint and got killed
+at exactly 12.0 h, looping the KG across peers indefinitely (~40 kills
+in 14 days). Fixed processor-side, NOT by raising the 12 h timeout:
+`austria_processor._gpkg_heartbeat()` (registered per-KG via
+`_STEP_REPORT_HOOK`, throttled to 1/min) now moves `step_detail_ts`
+from every tile/strip/layer loop in both builders. A companion
+`_gpkg_reuse_ok()` gate stops the retry path from reusing (and
+uploading) a GPKG left structurally incomplete by a prior mid-build
+SIGKILL — it requires no hot -wal/-journal, the GPKG application_id,
+a populated `layer_styles` table (written at the very end of both
+builders), and a passing `PRAGMA quick_check`.
+
 False-positive guards:
 - **Fresh status only.** Stale/cached fallback (`_stale`) or
   `unreachable` ticks are skipped — a flaky network must never look

@@ -118,6 +118,40 @@ New/relevant fields:
 **File lock**: Only one gunicorn worker runs the director loop (fcntl file lock
 on `data/austria_processor/director.lock`). The other worker skips it.
 
+#### Fleet-dormant hold mode (whole fleet powered off)
+
+When **every** remote enabled peer is continuously unreachable for
+`FLEET_DORMANT_AFTER_S` (15 min) — e.g. exe.dev shut down the entire peer
+fleet — the director enters a **dormant hold** instead of churning forever
+against dead URLs:
+
+- `state['fleet_dormant'] = {active, since, remote_peers}` persisted to
+  `director_state.json`; surfaced in `/api/v1/director/status.fleet_dormant`,
+  as a `dormant:` line in `/process.txt`, and as a `FLEET-DORMANT` flag in
+  the health banner.
+- While dormant, each 30 s tick runs ONLY: primary-park enforcement + a
+  light probe sweep (`_fleet_dormant_probe`, every 5 min, 5 peers
+  round-robin, short timeouts, bypasses circuit breakers). Everything
+  else — bandwidth polls, capacity fanout, activation, shadow election,
+  stale-update retries, canary/steal/BEV checks, OIDC credential probes
+  (`_oidc_reval_loop` skips too) — is suspended. `app._sync_peer_data`
+  also reads the flag and skips its 5-min peer fanout.
+- **Wake is automatic and instant**: any peer that comes back either
+  (a) pushes its status heartbeat to the director (`_peer_status_push_loop`
+  lands in `get_pushed_status`, evaluated every tick even while dormant), or
+  (b) answers the probe sweep. `_wake_from_dormant` clears all circuit
+  breakers + bandwidth backoffs, stamps `woke_at`/`woken_by`, and normal
+  orchestration resumes on the next tick.
+- The primary keeps serving the interactive app, dashboard, search index,
+  and shares untouched throughout. With no processor running anywhere,
+  interactive `/api/v1/segment` requests may again use the live openEO
+  path on Copernicus cache misses (`_try_copernicus` gates on
+  `_is_processor_running()`, which reads local progress.json).
+- Belt-and-braces: `POST /api/v1/processing/start` on the primary returns
+  403 unless `?force_primary=1` — the processor must never launch on the
+  dashboard host even by accidental direct API call (systemd autostart is
+  already disabled; `_enforce_primary_park` pins `not_before=2027`).
+
 #### Bandwidth Management
 
 - Each exe.dev VM has 100 GB/month (resets on the 17th)

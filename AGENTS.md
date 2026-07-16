@@ -25,7 +25,10 @@ curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?attn=1&warn=1' # triage:
 
 **First line is a `health:` banner** — distils triage signals
 (`done/8440 (pct%) @rate/h eta`, plus loud flags `CPU-STARVED`,
-`BW-OVER-NOMINAL`, `KG-FAILURES` when tripped; else `OK`). Read it
+`BW-OVER-NOMINAL`, `KG-FAILURES`, `FLEET-DORMANT` when tripped; else `OK`).
+`FLEET-DORMANT` = every remote peer unreachable ≥15 min (fleet powered
+off); director is on hold in ping mode and wakes automatically on the
+first peer return — see `docs/peer-director.md → Fleet-dormant hold mode`. Read it
 first. The `progress:` line below it is now fleet-wide (was previously
 the primary's parked local processor reading `done=N/1 eta=138d` — that
 bug is fixed: total falls back to 8440 and rate/ETA come from Zenodo

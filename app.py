@@ -889,6 +889,22 @@ def _sync_peer_data():
                 time.sleep(300)
                 continue
 
+            # Fleet-dormant hold (director decided every remote peer is
+            # unreachable — e.g. exe.dev powered off the fleet). Skip
+            # the whole peer fanout: 100+ dead URLs × 15 s timeouts is
+            # pure log noise + wasted cycles. The director's dormant
+            # probe / peer push heartbeats handle wake-up; we resume on
+            # the next 5-min tick after the flag clears.
+            try:
+                _ds = json.loads(Path(
+                    'data/austria_processor/director_state.json'
+                ).read_text())
+                if (_ds.get('fleet_dormant') or {}).get('active'):
+                    time.sleep(300)
+                    continue
+            except Exception:
+                pass
+
             # Cross-worker correctness: pick up tombstones the *other*
             # gunicorn worker wrote to disk (DELETE / requeue) before we
             # gate this cycle's peer manifest re-merge. Without this, a
@@ -3176,6 +3192,21 @@ def processing_peers_combined():
 def processing_start():
     """Start the Austria processor as a background process."""
     global _processor_process
+    # Hard gate: the primary hosts the public dashboard / search index /
+    # Zenodo lock broker and must NEVER run the processor. The director
+    # enforces this via pinned_role=idle + not_before=2027, systemd
+    # autostart is disabled — this closes the last path (direct API
+    # call). Override only with explicit ?force_primary=1.
+    try:
+        import director_ha as _dha
+        _force = request.args.get('force_primary', '').lower() in ('1', 'true', 'yes')
+        if _dha.self_id() == 'primary' and not _force:
+            return jsonify({
+                'error': 'Refusing to start processor on the primary '
+                         '(dashboard host). Pass ?force_primary=1 to '
+                         'override deliberately.'}), 403
+    except Exception:
+        pass
     if _processor_process is not None and _processor_process.poll() is None:
         return jsonify({'error': 'Processor already running', 'pid': _processor_process.pid}), 409
     # Also check if processor is running externally (e.g. via systemd or another start)
@@ -15839,6 +15870,20 @@ def process_txt():
         f'parallel={len(par_active)}/{max_par} '
         f'cache_strips={len(strips)}/{len(aus_strips)}'
     )
+    _dorm = d.get('fleet_dormant') or {}
+    if _dorm.get('active'):
+        _health['dormant'] = _dorm
+        out.append(
+            f'dormant:  ALL remote peers unreachable since '
+            f'{_dorm.get("since", "?")} — director on hold '
+            f'(ping mode, probe every 5m; wakes on first peer return)'
+        )
+    elif _dorm.get('woke_at'):
+        out.append(
+            f'dormant:  woke {_dorm.get("woke_at")} '
+            f'(by {",".join(_dorm.get("woken_by") or [])}; '
+            f'was dormant since {_dorm.get("since", "?")})'
+        )
     sh = d.get('shadow_peer')
     if sh:
         _sp_ts = d.get('shadow_last_push_ts') or 0
@@ -17200,6 +17245,10 @@ def process_txt():
     try:
         _hb = []
         _flags = []
+        if _health.get('dormant'):
+            _flags.append(
+                'FLEET-DORMANT(since '
+                + str(_health['dormant'].get('since', '?')) + ')')
         cpu = _health.get('cpu')
         if cpu and cpu.get('n'):
             _frac = cpu['throttled'] / cpu['n']

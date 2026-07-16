@@ -261,6 +261,11 @@ class _CircuitOpenError(Exception):
     """Raised when a peer's breaker is open and we skip the call."""
 
 
+class _DormantSkipFanout(Exception):
+    """Control-flow sentinel: fleet is dormant — skip the capacity
+    fanout + EMA bookkeeping but keep the pushed-status snapshot."""
+
+
 def _cb_should_skip(peer_id: str) -> bool:
     if not peer_id:
         return False
@@ -385,6 +390,18 @@ BANDWIDTH_BACKOFF_SECONDS = 900     # 15 min — be tender with flaky peers
 # Number of consecutive unreachable polls before failover (avoids killing
 # peers during heavy GPKG builds that briefly starve gunicorn).
 UNREACHABLE_FAILOVER_THRESHOLD = 3
+# --- Fleet-dormant hold mode ---------------------------------------
+# When EVERY remote enabled peer is unreachable continuously for this
+# long (e.g. exe.dev powered off the whole fleet), the director enters
+# a dormant hold: it stops all orchestration (activation churn, shadow
+# election, stale-update retries, OIDC probes, canary/steal/BEV checks)
+# and instead runs a light reachability probe sweep every
+# FLEET_DORMANT_PROBE_INTERVAL_S. The first peer that becomes reachable
+# again (either via its own status push heartbeat or a successful probe)
+# wakes the director instantly back into normal operation. The primary
+# keeps serving the interactive app / dashboard untouched throughout.
+FLEET_DORMANT_AFTER_S = 15 * 60
+FLEET_DORMANT_PROBE_INTERVAL_S = 300
 # How long to keep a peer out of rotation after a local Zenodo network
 # failure (the same peer hitting the same network problem on retry would
 # loop forever).  Cleared automatically when not_before passes.
@@ -3454,6 +3471,7 @@ class PeerDirector:
                    '_creds_revalidated_at',
                    '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch',
+                   'fleet_dormant', 'fleet_last_reachable_ts',
                    'bev_pause', 'bev_pause_history',
                    'bev_pool_escalation', 'bev_pool_probes',
                    'ip_pools', 'ip_pools_history',
@@ -3952,6 +3970,7 @@ class PeerDirector:
             'peer_last_live_ts': state.get('peer_last_live_ts') or {},
             'peer_meta': state.get('peer_meta') or {},
             # BEV outage + IP-pool stats (surfaced in /process.txt).
+            'fleet_dormant': state.get('fleet_dormant') or {},
             'bev_pause': state.get('bev_pause') or {},
             'bev_pause_history': state.get('bev_pause_history') or [],
             'bev_pool_escalation': state.get('bev_pool_escalation') or {},
@@ -4748,6 +4767,137 @@ class PeerDirector:
             'last_refresh_age_min_max': (
                 round(max(ages_min), 1) if ages_min else None),
         }
+
+    # --- Fleet-dormant hold mode -------------------------------------
+    def _update_fleet_dormancy(self, statuses: dict) -> bool:
+        """Track whole-fleet reachability; enter/exit dormant hold.
+
+        Returns True while the fleet is dormant (every remote enabled
+        peer unreachable for >= FLEET_DORMANT_AFTER_S). While dormant
+        the director loop skips all orchestration and only runs the
+        primary-park enforcer + a light probe sweep
+        (``_fleet_dormant_probe``). Wake is instant on the first
+        reachable peer — either via this tick's status snapshot (peer
+        push heartbeats land here) or via a successful probe.
+
+        Rationale: when exe.dev powers off the whole peer fleet, the
+        director would otherwise churn forever — activation attempts
+        against dead URLs, shadow-election warnings, stale-update
+        retries, OIDC probes — filling logs with noise and wasting
+        cycles on the dashboard host. Holding is the correct state;
+        the interactive app on / keeps running untouched.
+        """
+        now = time.time()
+        remote_ids = {p['id'] for p in self.cfg.get('peers', [])
+                      if p.get('url') and p.get('enabled', True)}
+        if not remote_ids:
+            return False
+        reachable = [pid for pid, ps in (statuses or {}).items()
+                     if pid in remote_ids and isinstance(ps, dict)
+                     and ps.get('state') != 'unreachable']
+        dorm = self.state.get('fleet_dormant') or {}
+        if reachable:
+            with self._lock:
+                self.state['fleet_last_reachable_ts'] = now
+            if dorm.get('active'):
+                self._wake_from_dormant(sorted(reachable)[:5])
+            return False
+        if dorm.get('active'):
+            return True
+        last = float(self.state.get('fleet_last_reachable_ts') or 0.0)
+        if not last:
+            # First observation — start the clock, don't go dormant yet.
+            with self._lock:
+                self.state['fleet_last_reachable_ts'] = now
+            return False
+        if (now - last) < FLEET_DORMANT_AFTER_S:
+            return False
+        since = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        with self._lock:
+            self.state['fleet_dormant'] = {
+                'active': True, 'since': since,
+                'remote_peers': len(remote_ids),
+            }
+        log.warning('FLEET DORMANT: all %d remote peers unreachable for '
+                    '%.0f min — director on hold, probing every %d min. '
+                    'Wakes automatically when any peer returns.',
+                    len(remote_ids), (now - last) / 60,
+                    FLEET_DORMANT_PROBE_INTERVAL_S // 60)
+        _emit_director_event(
+            'fleet dormant: all %d remote peers unreachable for %.0fm — '
+            'director on hold (ping mode, every %dm); wakes automatically '
+            'when any peer returns' % (
+                len(remote_ids), (now - last) / 60,
+                FLEET_DORMANT_PROBE_INTERVAL_S // 60),
+            level='warning')
+        return True
+
+    def _wake_from_dormant(self, woken_by: list[str]) -> None:
+        """Exit dormant hold: clear breakers so the next tick fans out
+        with fresh eyes, stamp wake metadata, log loudly."""
+        dorm = self.state.get('fleet_dormant') or {}
+        if not dorm.get('active'):
+            return
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        with self._lock:
+            self.state['fleet_dormant'] = {
+                'active': False, 'since': dorm.get('since'),
+                'woke_at': now_iso, 'woken_by': list(woken_by),
+            }
+            self.state['fleet_last_reachable_ts'] = time.time()
+        # Reset all circuit breakers + bandwidth backoffs so the resumed
+        # orchestration isn't blinded for up to 30 min by stale opens.
+        with _PEER_CB_LOCK:
+            _PEER_CB.clear()
+        with self._lock:
+            self.state['_bandwidth_backoff'] = {}
+            self.state['_bandwidth_misses'] = {}
+        log.warning('FLEET WAKE: peer(s) %s reachable again (dormant since '
+                    '%s) — resuming orchestration',
+                    ','.join(woken_by), dorm.get('since'))
+        _emit_director_event(
+            'fleet wake: peer(s) %s reachable again (dormant since %s) — '
+            'resuming orchestration' % (','.join(woken_by),
+                                        dorm.get('since')),
+            level='warning')
+
+    def _fleet_dormant_probe(self) -> None:
+        """Light reachability sweep while dormant. Every
+        FLEET_DORMANT_PROBE_INTERVAL_S, probe up to 5 peers round-robin
+        (bypassing circuit breakers) with short timeouts. Any success
+        triggers an immediate wake. Peer push heartbeats provide the
+        fast path anyway (a rebooting peer pushes to the director within
+        ~30 s); this sweep is the belt-and-braces for peers whose push
+        loop is broken or misconfigured.
+        """
+        now = time.time()
+        last = float(self.state.get('_dormant_probe_ts') or 0.0)
+        if (now - last) < FLEET_DORMANT_PROBE_INTERVAL_S:
+            return
+        with self._lock:
+            self.state['_dormant_probe_ts'] = now
+        remote = [p for p in self.cfg.get('peers', [])
+                  if p.get('url') and p.get('enabled', True)]
+        if not remote:
+            return
+        idx = int(self.state.get('_dormant_probe_idx') or 0)
+        n = min(5, len(remote))
+        woke: list[str] = []
+        for i in range(n):
+            p = remote[(idx + i) % len(remote)]
+            try:
+                r = requests.get(
+                    p['url'].rstrip('/') + '/api/v1/processing/status',
+                    timeout=(3, 8))
+                if r.ok:
+                    woke.append(p['id'])
+                    _cb_record_success(p['id'])
+            except Exception:
+                pass
+        with self._lock:
+            self.state['_dormant_probe_idx'] = (idx + n) % len(remote)
+        if woke:
+            self._wake_from_dormant(woke)
 
     def _enforce_primary_park(self) -> None:
         """Belt-and-braces: keep the primary peer parked.
@@ -7829,6 +7979,13 @@ class PeerDirector:
         try:
             while self._running and not self._oidc_stop.is_set():
                 try:
+                    # Fleet dormant — nobody is consuming credentials;
+                    # don't burn OIDC round-trips (and CDSE goodwill)
+                    # probing 100+ creds every 10 min for a parked fleet.
+                    if (self.state.get('fleet_dormant') or {}).get('active'):
+                        if self._oidc_stop.wait(timeout=30.0):
+                            break
+                        continue
                     self._refresh_credentials_if_due()
                 except Exception:
                     log.debug('oidc-reval iteration failed', exc_info=True)
@@ -11110,7 +11267,10 @@ class PeerDirector:
                         save_peers_config(self.cfg)
                 except Exception:
                     pass
-                self._update_bandwidth()
+                _was_dormant = bool(
+                    (self.state.get('fleet_dormant') or {}).get('active'))
+                if not _was_dormant:
+                    self._update_bandwidth()
                 # Credential revalidation moved off the director loop
                 # into a dedicated daemon thread (see _oidc_reval_loop)
                 # so a 30 s parallel sweep can't stall this tick.
@@ -11127,6 +11287,23 @@ class PeerDirector:
                     )
                     _peers = list(self.cfg.get('peers', []))
                     _statuses: dict[str, dict] = {}
+                    if _was_dormant:
+                        # Dormant: no network fanout. Evaluate pushed
+                        # heartbeats only (a rebooting peer pushes to
+                        # us within ~30 s and wakes the fleet); the
+                        # probe sweep below covers push-less peers.
+                        for _p in _peers:
+                            if not _p.get('url'):
+                                continue
+                            _pu = get_pushed_status(_p['id'])
+                            if _pu is not None:
+                                _d = dict(_pu.get('status') or {})
+                                _d['_pushed'] = True
+                                _statuses[_p['id']] = _d
+                            else:
+                                _statuses[_p['id']] = {
+                                    'state': 'unreachable'}
+                        raise _DormantSkipFanout()
                     with _Tpe(max_workers=BANDWIDTH_POLL_CONCURRENCY,
                                 thread_name_prefix='dir-cap') as _ex:
                         _futs = {_ex.submit(get_peer_status, p.get('url')): p
@@ -11230,8 +11407,33 @@ class PeerDirector:
                         self._running = False
                         return
                     log.exception('capacity factor computation failed')
+                except _DormantSkipFanout:
+                    pass  # dormant: pushed-only snapshot, no fanout
                 except Exception:
                     log.exception('capacity factor computation failed')
+                # Fleet-dormant gate: when every remote peer is
+                # unreachable for FLEET_DORMANT_AFTER_S, hold. Only the
+                # primary-park enforcer + a light probe sweep run; all
+                # orchestration below is skipped until a peer returns.
+                try:
+                    _dormant = self._update_fleet_dormancy(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('fleet dormancy tracking failed')
+                    _dormant = False
+                if _dormant:
+                    try:
+                        self._enforce_primary_park()
+                    except Exception:
+                        log.exception('primary park enforce failed')
+                    try:
+                        self._fleet_dormant_probe()
+                    except Exception:
+                        log.exception('dormant probe sweep failed')
+                    with self._lock:
+                        save_director_state(self.state)
+                    time.sleep(DIRECTOR_POLL_INTERVAL)
+                    continue
                 with self._lock:
                     if _clear_completed_reservations(self.cfg, self.state):
                         save_peers_config(self.cfg)

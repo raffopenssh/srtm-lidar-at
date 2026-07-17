@@ -5870,6 +5870,25 @@ class PeerDirector:
             # hole. The prune oracle keeps it only while coverage-
             # incomplete, so a since-finished KG can't loop.
             if kg_code and kg_code != '?':
+                # Bump the adaptive-split strike counter on the DIRECTOR's
+                # authoritative kg_strikes.json. The SIGKILL'd peer bumps
+                # only its own local file (IN_PROGRESS_FILE crash
+                # recovery) — but the KG bounces to a *different* peer
+                # each time, so without this the strikes never accumulate
+                # anywhere that matters and oversize KGs (91017 Schröcken,
+                # 50017 Hörgersteig) are re-dispatched whole forever.
+                # The director's file is max-merge synced to every peer
+                # at dispatch time (_sync_kg_strikes_to_peer), so after
+                # ADAPTIVE_SPLIT_THRESHOLD watchdog firings the next
+                # dispatch expands the parent into blocks.
+                try:
+                    from kg_splitter import bump_strike, parent_kg_code
+                    _strikes = bump_strike(parent_kg_code(str(kg_code)))
+                    log.info('stuck-kg %s: strike %d recorded for KG %s',
+                             pid, _strikes, kg_code)
+                except Exception as e:
+                    log.warning('stuck-kg %s: strike bump for %s failed: %s',
+                                pid, kg_code, e)
                 try:
                     _requeue_interrupted_kg(
                         kg_code, reason=f'stuck-kg {pid} hard restart')

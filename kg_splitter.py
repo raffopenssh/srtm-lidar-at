@@ -79,6 +79,28 @@ def bump_strike(kg_code: str) -> int:
         return 0
 
 
+def clear_single_strike(code: str):
+    """Remove exactly one code's strike entry (no prefix cascade).
+
+    Used when a single block completes but sibling blocks are still
+    pending — the parent's strike count must survive so the split
+    stays in force until the whole family is done.
+    """
+    import json
+    p = _strikes_file_path()
+    try:
+        if not p.exists():
+            return
+        data = json.loads(p.read_text())
+        if data.pop(str(code), None) is None:
+            return
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
 def clear_strikes(kg_code: str):
     """Remove a KG (and any of its block codes) from strike file on success."""
     import json
@@ -109,6 +131,51 @@ MAX_TILES_PER_BLOCK = 22
 # heavy gpkg_full / segmentation step — splitting halves the per-child
 # working set without operator intervention.
 ADAPTIVE_SPLIT_THRESHOLD = 2
+
+# Runtime oversize tolerance. The splitter estimates tiles from the KG
+# *API* bbox, but process_one_kg expands the bbox to the cadastre union
+# before computing the real grid — some KGs (91017 Schröcken: 20 est →
+# 30 runtime) blow well past MAX_TILES_PER_BLOCK only at runtime. When
+# the runtime grid exceeds MAX * this factor, the subprocess aborts with
+# needs_split instead of grinding into a gpkg_full it cannot finish.
+# The 1.3 slack means moderately-over KGs (23-28 tiles) that complete
+# fine today are left alone — no churn.
+RUNTIME_SPLIT_FACTOR = 1.3
+
+
+def runtime_tile_limit() -> int:
+    """Tile count above which a runtime (post-expansion) grid must split."""
+    return math.ceil(MAX_TILES_PER_BLOCK * RUNTIME_SPLIT_FACTOR)
+
+
+def force_split(kg_code: str) -> int:
+    """Raise a KG's strike count to at least ADAPTIVE_SPLIT_THRESHOLD so
+    the next maybe_split_kg() call splits it. Returns the resulting count.
+
+    Used by the runtime-oversize abort (needs_split): one observation of
+    a too-large runtime grid is deterministic evidence — no need to burn
+    two more failed attempts accumulating strikes organically.
+    """
+    import json
+    p = _strikes_file_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                data = {}
+        cur = int(data.get(str(kg_code), 0))
+        new = max(cur, ADAPTIVE_SPLIT_THRESHOLD)
+        if new != cur:
+            data[str(kg_code)] = new
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(p)
+        return new
+    except Exception:
+        return 0
 
 
 def _compute_n_tiles(west, south, east, north, tile_km=1.5, overlap_km=0.1):

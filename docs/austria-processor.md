@@ -434,6 +434,51 @@ blocks for processing. Each block is named with a directional suffix:
 - `search_index.py` — `_enrich_kg_from_blocks()` aggregates block JSONs into parent row
 - `app.py` — queue API resolves block codes via parent KG
 
+**Adaptive splits (strikes) & runtime oversize guard (Jul 2026):**
+
+The splitter's tile estimate uses the KG **API bbox**, but
+`process_one_kg` expands the bbox to the cadastre union before computing
+the real grid — some KGs blow past the estimate only at runtime (91017
+Schröcken: 20 estimated → 30 runtime tiles). Such KGs overran peer disk
+(`disk_low` handoffs) and wedged `gpkg_full` (stuck-kg hard restarts)
+without ever splitting, because strikes only accumulated in each peer's
+*local* `kg_strikes.json`. Fixes:
+
+1. **Runtime oversize abort** — after the tile grid is computed (and
+   only for non-blocks), if `n_tiles > runtime_tile_limit()`
+   (`MAX_TILES_PER_BLOCK × RUNTIME_SPLIT_FACTOR` = 22×1.3 → 29) the
+   subprocess returns `needs_split` *before* the tile loop.
+   `kg_splitter.force_split()` raises the strike counter straight to
+   the split threshold (deterministic evidence — no need to burn two
+   failed attempts). The parent handler splits immediately and inserts
+   the blocks into the local pending list — no director round-trip.
+2. **Director-side strike bump** — the stuck-KG watchdog
+   (`peer_director._check_stuck_kg`) bumps the parent's strike on the
+   **director's** authoritative `kg_strikes.json` before requeueing.
+   That file is HA-snapshotted and max-merge synced to peers at
+   dispatch, so after 2 watchdog firings the next dispatch splits.
+3. **Peer→director strike push** — `_push_strikes_to_director()`
+   (fire-and-forget daemon thread, one tiny PUT per rare event) runs on
+   needs_split, disk-low handoff, crash-recovery bump, and
+   non-permanent failure, so peer-local strikes reach the fleet.
+4. **Split-aware mid-run requeue** — parent codes injected from
+   `retry_queue.json` mid-run now go through `maybe_split_kg()` (they
+   previously bypassed the startup expansion and always re-ran whole).
+5. **Disk-low handoffs count as strikes** — two handoffs (any peers)
+   ⇒ adaptive split.
+6. **Strike clearing is family-aware** — a completed block clears only
+   its own strike (`clear_single_strike`); the parent's strikes (which
+   keep the split in force) are cleared only when every sibling block
+   is complete. Clearing early would collapse a strike-driven split
+   while siblings are still pending.
+
+**No upstream cost is repeated on split**: the Copernicus/Hansen/WC
+tile cache (local + Zenodo) is keyed by geographic 0.1° grid cells, not
+KG code — blocks re-read exactly the cells any earlier whole-KG attempt
+already fetched. What *is* lost on split are the parent-keyed tile
+pickles (`tile_checkpoints/<parent>/`) — acceptable, since the split
+only triggers on deterministic oversize or repeated failure.
+
 ### Where to Look When Debugging
 
 | Problem area | Look at |

@@ -7126,6 +7126,38 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         log.info("KG %s: %d tiles (%.1fkm base) covering %.4f,%.4f → %.4f,%.4f",
                  kg_code, n_tiles, tile_km,
                  full_west, full_south, full_east, full_north)
+
+        # --- 2a. Runtime oversize guard (needs_split) ---
+        # The splitter (maybe_split_kg) estimates tiles from the KG *API*
+        # bbox, but the cadastre-union expansion above can grow the grid
+        # far past that estimate (91017 Schröcken: 20 estimated → 30
+        # runtime tiles). Such KGs overrun peer disk during gpkg_full and
+        # wedge (stuck-kg hard restarts) without ever accumulating the
+        # strikes needed for an adaptive split — each interruption lands
+        # on a different peer's local strike file. Abort *before* the
+        # tile loop, force the strike counter to the split threshold, and
+        # let the parent requeue the split blocks. Copernicus/Hansen/WC
+        # data is NOT wasted: the tile_cache + Zenodo cache are keyed by
+        # geographic 0.1° cells, so the blocks re-read the exact same
+        # cached cells any earlier whole-KG attempt already fetched.
+        if not _is_block:
+            from kg_splitter import runtime_tile_limit, force_split
+            _rt_limit = runtime_tile_limit()
+            if n_tiles > _rt_limit:
+                _msg = (f"runtime grid {n_tiles} tiles > {_rt_limit} limit "
+                        f"(post-cadastre-expansion) — aborting for split")
+                log.warning("KG %s: %s", kg_code, _msg)
+                try:
+                    force_split(kg_code)
+                except Exception:
+                    pass
+                result["needs_split"] = True
+                result["success"] = False
+                result["error"] = _msg
+                result["n_tiles_runtime"] = n_tiles
+                result["step"] = "aborted_needs_split"
+                return result
+
         _tile_progress[1] = n_tiles
         _report_step("tiles", f"{n_tiles} tiles @ {tile_km}km")
 
@@ -9446,6 +9478,55 @@ def _append_retry_queue(kg_code: str):
         pass
 
 
+def _push_strikes_to_director() -> None:
+    """Push the local kg_strikes.json to the director (best-effort,
+    fire-and-forget in a daemon thread — never blocks the KG loop and a
+    slow/unreachable director costs nothing).
+
+    The director's copy is the authoritative one: it is HA-snapshotted
+    and synced to every peer at dispatch time (_sync_kg_strikes_to_peer,
+    max-merge). Without this push, strikes observed on THIS peer (e.g.
+    a runtime-oversize needs_split, or repeated disk-low handoffs) stay
+    local and the next peer to receive the same parent KG re-runs it
+    whole. One tiny PUT per rare event — negligible director load.
+
+    No-op on the primary/director itself (loopback would merge the
+    file into itself — harmless but pointless).
+    """
+    def _bg():
+        try:
+            p = DATA_DIR / "kg_strikes.json"
+            if not p.exists():
+                return
+            data = json.loads(p.read_text() or "{}")
+            if not data:
+                return
+            director_url = (os.environ.get("ZENODO_LOCK_URL", "").strip()
+                            or "http://127.0.0.1:8000")
+            if "127.0.0.1" in director_url or "localhost" in director_url:
+                return  # we ARE the director/primary; file is already local
+            headers = {}
+            try:
+                tok = Path("data/admin_token").read_text().strip()
+                if tok:
+                    headers["X-Admin-Token"] = tok
+            except Exception:
+                pass
+            r = requests.put(
+                director_url.rstrip("/") + "/api/v1/processing/kg_strikes",
+                json=data, timeout=15, headers=headers)
+            if r.ok:
+                log.info("kg_strikes pushed to director (%d updated)",
+                         (r.json() or {}).get("updated", 0))
+            else:
+                log.warning("kg_strikes push to director: HTTP %d",
+                            r.status_code)
+        except Exception as e:
+            log.warning("kg_strikes push to director failed: %s", e)
+
+    threading.Thread(target=_bg, name="kg_strikes_push", daemon=True).start()
+
+
 def _publish_checkpoints_to_registry(kg_code: str, progress=None) -> None:
     """Upload this KG's tile pickles to the shared Zenodo registry.
 
@@ -9680,6 +9761,7 @@ def _record_failure(kg_code: str, failure_counts: dict,
         try:
             from kg_splitter import bump_strike
             bump_strike(kg_code)
+            _push_strikes_to_director()
         except Exception:
             pass
         progress.add_log(
@@ -10075,6 +10157,10 @@ def main():
             try:
                 from kg_splitter import bump_strike
                 strikes = bump_strike(interrupted_kg)
+                # Propagate to the director's authoritative strike file —
+                # crash-recovery strikes otherwise stay peer-local and
+                # never accumulate for a KG that bounces between peers.
+                _push_strikes_to_director()
             except Exception:
                 strikes = 0
             log.info("Previous run interrupted during KG %s — will retry "
@@ -11051,11 +11137,33 @@ def main():
                     _clear_tombstones(kg_code)
 
                     # Reset adaptive-split strike counter on success.
+                    # For a block: clear the BLOCK's own strikes always,
+                    # but the PARENT's only once every sibling block is
+                    # complete — clearing early would collapse the split
+                    # (maybe_split_kg reverts to 1 block for strike-driven
+                    # splits) while siblings are still pending, so a
+                    # parent-code requeue in that window would re-run the
+                    # oversize whole KG. (The runtime oversize guard would
+                    # catch it again, but don't rely on the backstop.)
                     try:
-                        from kg_splitter import clear_strikes, parent_kg_code, is_block_code
-                        clear_strikes(kg_code)
+                        from kg_splitter import (clear_strikes,
+                                                 clear_single_strike,
+                                                 parent_kg_code,
+                                                 is_block_code)
                         if is_block_code(kg_code):
-                            clear_strikes(parent_kg_code(kg_code))
+                            _sp = parent_kg_code(kg_code)
+                            _parent_kg_d = next(
+                                (k for k in kgs if k["kg_code"] == _sp), None)
+                            _done_now = completed_codes | {kg_code}
+                            _sibs = ([b["kg_code"] for b
+                                      in maybe_split_kg(_parent_kg_d)]
+                                     if _parent_kg_d is not None else [])
+                            if _sibs and all(b in _done_now for b in _sibs):
+                                clear_strikes(_sp)  # drops block keys too
+                            else:
+                                clear_single_strike(kg_code)
+                        else:
+                            clear_strikes(kg_code)
                     except Exception:
                         pass
 
@@ -11073,7 +11181,65 @@ def main():
                 is_cadastre_failure = result.get("cadastre_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
                 is_disk_low = result.get("disk_low", False)
-                if is_disk_low:
+                is_needs_split = result.get("needs_split", False)
+                if is_needs_split:
+                    # Runtime grid (post-cadastre-expansion) exceeded the
+                    # oversize limit — the subprocess aborted before the
+                    # tile loop and forced the strike counter to the split
+                    # threshold. Split NOW and insert the blocks right
+                    # after the current queue position so this peer keeps
+                    # working the same KG (as blocks) without a director
+                    # round-trip. Push the strike file to the director so
+                    # any future dispatch of the parent (by any peer)
+                    # expands into blocks too. Copernicus / Hansen / WC
+                    # tiles are reused via the geographic 0.1° tile_cache
+                    # + Zenodo cache — no upstream cost is repeated.
+                    _n_rt = result.get("n_tiles_runtime", "?")
+                    log.warning("KG %s: runtime oversize (%s tiles) — "
+                                "splitting into blocks", kg_code, _n_rt)
+                    _push_strikes_to_director()
+                    _split_blocks = maybe_split_kg(kg)
+                    if len(_split_blocks) <= 1:
+                        # Defensive: force_split should have guaranteed a
+                        # split; if not, defer like a transient failure so
+                        # we never tight-loop start→abort→start.
+                        log.error("KG %s: needs_split but splitter returned "
+                                  "%d block(s) — deferring",
+                                  kg_code, len(_split_blocks))
+                        _defer_n = kg.get("_defer_attempt", 0)
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _append_deferred(_deferred_retries,
+                                         (i + DEFER_GAP, _deferred, _defer_n + 1))
+                    else:
+                        _ins = 0
+                        for _blk in _split_blocks:
+                            _bc = _blk["kg_code"]
+                            if (_bc in completed_codes or _bc in failed_kgs
+                                    or any(p.get("kg_code") == _bc
+                                           for p in pending[i + 1:])):
+                                continue
+                            _blk = dict(_blk)
+                            _blk["_defer_attempt"] = 0
+                            pending.insert(i + 1 + _ins, _blk)
+                            _ins += 1
+                        progress.add_log(
+                            "warning",
+                            f"KG {kg_code}: runtime grid too large "
+                            f"({_n_rt} tiles) — split into "
+                            f"{len(_split_blocks)} blocks, "
+                            f"{_ins} queued here",
+                            kg_code)
+                        log.info("KG %s: split into %d blocks, %d inserted "
+                                 "into local queue", kg_code,
+                                 len(_split_blocks), _ins)
+                    # Parent code must leave the priority queue — the
+                    # blocks replace it. (Director-side GET-prune keeps
+                    # coverage-incomplete parents; the strike sync makes
+                    # any re-dispatch expand to blocks, so no orphan.)
+                    _remove_from_retry_queue(kg_code)
+                    progress.save()
+                elif is_disk_low:
                     # This peer ran out of disk before/while building the
                     # GPKG. Every tile pickle is on disk — publish them to
                     # the shared Zenodo registry and defer so a disk-healthy
@@ -11085,6 +11251,22 @@ def main():
                                      f"KG {kg_code}: disk critically low — "
                                      f"deferred for handoff (checkpoints kept)",
                                      kg_code)
+                    # A disk-low abort is soft evidence the KG's working
+                    # set exceeds peer capacity. Bump a strike and push to
+                    # the director's authoritative file: after the second
+                    # handoff (on any peer) the adaptive splitter kicks in
+                    # and the KG is re-dispatched as blocks. Blocks skip
+                    # this for their parent — a block that still overruns
+                    # disk accrues strikes under its own block code.
+                    try:
+                        from kg_splitter import bump_strike as _bs
+                        _n_str = _bs(str(kg_code))
+                        log.info("KG %s: disk-low strike %d recorded",
+                                 kg_code, _n_str)
+                        _push_strikes_to_director()
+                    except Exception as _bs_e:
+                        log.warning("KG %s: disk-low strike bump failed: %s",
+                                    kg_code, _bs_e)
                     _append_retry_queue(kg_code)
                     _publish_checkpoints_to_registry(kg_code, progress)
                     with progress._lock:
@@ -11472,6 +11654,35 @@ def main():
                     rq_kg = None
             else:
                 rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
+                # Split-aware injection: a parent code pushed mid-run
+                # (director requeue after a stuck-kg restart, disk-low
+                # handoff, operator re-queue) bypasses the startup block
+                # expansion — so honour maybe_split_kg here too. Without
+                # this, even a parent with enough strikes to split is
+                # re-run whole when it arrives via the retry queue (the
+                # exact path oversize KGs like 91017 always take).
+                if rq_kg is not None:
+                    _rq_blocks = maybe_split_kg(rq_kg)
+                    if len(_rq_blocks) > 1:
+                        _n_ins = 0
+                        for _blk in _rq_blocks:
+                            _bc = _blk["kg_code"]
+                            if (_bc in completed_codes or _bc in failed_kgs
+                                    or any(p.get("kg_code") == _bc
+                                           for p in pending[i + 1:])):
+                                continue
+                            _blk = dict(_blk)
+                            _blk["_defer_attempt"] = 0
+                            pending.insert(i + 1 + _insert_offset, _blk)
+                            _insert_offset += 1
+                            _n_ins += 1
+                        _known_queue_codes.add(rq_code)
+                        failed_kgs.discard(rq_code)
+                        _save_failed_kgs(failed_kgs)
+                        log.info("↻ New priority: KG %s split into %d "
+                                 "blocks (%d inserted)",
+                                 rq_code, len(_rq_blocks), _n_ins)
+                        continue
             if rq_kg:
                 rq_kg = dict(rq_kg)
                 rq_kg["_defer_attempt"] = 0

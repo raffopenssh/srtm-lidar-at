@@ -4814,6 +4814,45 @@ def processing_queue_add():
                             break
                     if code == c or code.startswith(c + '-'):
                         partial_keys.append(key)
+            # --- Preserve COMPLETE sibling blocks (Aug 2026) ----------
+            # The match above sweeps in every product of every block of a
+            # split parent, including blocks that are fully and correctly
+            # done. Deleting their manifest entries + tombstoning them
+            # throws away finished work: re-queueing Soelden/80110 to
+            # recover 2 out-of-coverage blocks invalidated all 117
+            # products of its 38 finished blocks (~40 GB). The Zenodo
+            # deposits survive, but the local pointers are gone and the
+            # tombstones then BLOCK re-import from peers, so the loss
+            # looks permanent from the dashboard.
+            #
+            # A block is worth invalidating only if it is *incomplete* --
+            # i.e. missing its ``_json`` completion marker (GPKGs uploaded
+            # but json missing = the partial-run case this logic exists
+            # for). A block with a committed ``_json`` is done; leave it
+            # alone. The parent's own products (code == c) are always
+            # invalidated: re-running the parent supersedes them.
+            if partial_keys and mentries is not None:
+                def _code_of(k):
+                    for s in ('_full_gpkg', '_light_gpkg', '_json'):
+                        if k.endswith(s):
+                            return k[:-len(s)]
+                    return k
+                _complete_blocks = {
+                    _code_of(k) for k in partial_keys
+                    if k.endswith('_json') and _code_of(k) != c
+                    and 'error' not in ((mentries.get(k) or {})
+                                        .get('status', '') or '')
+                }
+                if _complete_blocks:
+                    _kept = [k for k in partial_keys
+                             if _code_of(k) in _complete_blocks]
+                    partial_keys = [k for k in partial_keys
+                                    if _code_of(k) not in _complete_blocks]
+                    log.info(
+                        'requeue %s: preserving %d products of %d complete '
+                        'sibling block(s); invalidating %d',
+                        c, len(_kept), len(_complete_blocks),
+                        len(partial_keys))
             if c not in completed and not partial_keys:
                 continue
             # Guard against the force-requeue self-perpetuation loop: if the

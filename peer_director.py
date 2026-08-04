@@ -974,10 +974,31 @@ def load_peers_config() -> dict:
 # on top of this lock.
 PEERS_CONFIG_LOCK = PEERS_CONFIG.with_suffix(PEERS_CONFIG.suffix + '.lock')
 
+# How long a removal tombstone keeps a peer id out of the roster.
+# Long enough that every stale in-memory snapshot (gunicorn workers,
+# director loop, HA shadow snapshot pushes) has been refreshed many
+# times over; short enough that ids can eventually be recycled.
+PEER_TOMBSTONE_TTL_S = 30 * 86400
+
+
+def _peer_tombstones(cfg: dict | None) -> dict:
+    """Return the ``{peer_id: removed_at_epoch}`` tombstone map."""
+    tomb = (cfg or {}).get('removed_peers')
+    if not isinstance(tomb, dict):
+        return {}
+    out = {}
+    for pid, ts in tomb.items():
+        try:
+            out[str(pid)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+    return out
+
 
 def _merge_peers_with_disk(mem_cfg: dict,
                            disk_cfg: dict | None,
-                           removed_ids: set | None = None) -> dict:
+                           removed_ids: set | None = None,
+                           readded_ids: set | None = None) -> dict:
     """Reconcile ``mem_cfg`` with the freshly-read ``disk_cfg``.
 
     Goal: prevent two concurrent writers from silently dropping each
@@ -999,13 +1020,38 @@ def _merge_peers_with_disk(mem_cfg: dict,
       ids are filtered out of the merged roster regardless of which
       side they appear on. ``remove_peer`` uses this so a removal
       can't be "undone" by a disk-only entry.
+    * Deletions are **durable**: every removed id is recorded in a
+      ``removed_peers`` tombstone map (id → removal epoch, TTL
+      ``PEER_TOMBSTONE_TTL_S``) that is itself merged from both sides
+      and re-applied on every save. Without this, a *later* save from
+      a writer whose in-memory ``cfg`` predates the removal would
+      resurrect the peer via the union rule above — which is exactly
+      what happened on 2026-08-04 when 92 shut-down peers were deleted
+      one-by-one and the next director tick brought them all back.
+      To genuinely re-add a peer, ``director_add_peer`` drops its
+      tombstone explicitly.
     * Order: disk order first (stable for operators reading the file),
       mem-only peers appended at the end.
     """
     if not isinstance(disk_cfg, dict):
         disk_cfg = {}
-    removed = set(removed_ids or ())
+    now = time.time()
+    # Merged, TTL-pruned tombstones from both sides + this call's deletions.
+    tomb = _peer_tombstones(disk_cfg)
+    for pid, ts in _peer_tombstones(mem_cfg).items():
+        tomb[pid] = max(ts, tomb.get(pid, 0.0))
+    for pid in (removed_ids or ()):
+        tomb[str(pid)] = now
+    for pid in (readded_ids or ()):
+        tomb.pop(str(pid), None)
+    tomb = {pid: ts for pid, ts in tomb.items()
+            if now - ts < PEER_TOMBSTONE_TTL_S}
+    removed = set(removed_ids or ()) | set(tomb)
     out = dict(mem_cfg)
+    if tomb:
+        out['removed_peers'] = tomb
+    else:
+        out.pop('removed_peers', None)
     mem_peers = list(mem_cfg.get('peers') or [])
     disk_peers = list(disk_cfg.get('peers') or [])
     mem_by_id = {p.get('id'): p for p in mem_peers if isinstance(p, dict) and p.get('id')}
@@ -1027,11 +1073,16 @@ def _merge_peers_with_disk(mem_cfg: dict,
             continue
         merged.append(mp)
         seen.add(pid)
+    # A tombstone must never outrank an explicit re-add: if the caller
+    # kept the peer in mem_cfg *and* dropped its tombstone (see
+    # director_add_peer), the loop above already skipped it — so this
+    # is only a safety net for tombstones that no longer apply.
     out['peers'] = merged
     return out
 
 
-def save_peers_config(cfg: dict, removed_ids: set | None = None):
+def save_peers_config(cfg: dict, removed_ids: set | None = None,
+                      readded_ids: set | None = None):
     """Atomically persist ``cfg`` to ``peers.json`` under fcntl lock.
 
     Concurrent writers (other gunicorn workers, director loop ticks,
@@ -1045,7 +1096,11 @@ def save_peers_config(cfg: dict, removed_ids: set | None = None):
     filter those ids out of the union regardless of which side they
     were on. A plain ``save_peers_config(cfg)`` will NOT delete a peer
     that's also on disk; this prevents stale snapshots from quietly
-    dropping peers.
+    dropping peers. Deletions are also persisted as durable
+    ``removed_peers`` tombstones (TTL ``PEER_TOMBSTONE_TTL_S``) so a
+    later save from a writer holding a pre-removal snapshot can't
+    resurrect the peer. Pass ``readded_ids={'atNN'}`` to clear a
+    tombstone when genuinely re-adding a peer.
     """
     PEERS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     import fcntl as _fcntl
@@ -1064,7 +1119,8 @@ def save_peers_config(cfg: dict, removed_ids: set | None = None):
                     disk = json.loads(PEERS_CONFIG.read_text())
             except Exception:
                 disk = None
-            merged = _merge_peers_with_disk(cfg, disk, removed_ids)
+            merged = _merge_peers_with_disk(cfg, disk, removed_ids,
+                                            readded_ids)
             PEERS_CONFIG.write_text(json.dumps(merged, indent=2, default=str))
             return
         try:
@@ -1074,7 +1130,8 @@ def save_peers_config(cfg: dict, removed_ids: set | None = None):
                     disk = json.loads(PEERS_CONFIG.read_text())
             except Exception:
                 disk = None
-            merged = _merge_peers_with_disk(cfg, disk, removed_ids)
+            merged = _merge_peers_with_disk(cfg, disk, removed_ids,
+                                            readded_ids)
             fd, tmp = _tempfile.mkstemp(
                 dir=str(PEERS_CONFIG.parent), suffix='.tmp')
             try:
@@ -1107,6 +1164,61 @@ def load_director_state() -> dict:
         'peer_bandwidth': {},  # peer_id -> {used_bytes, cycle_start, last_check}
         'mode': 'auto',  # auto | manual | paused
     }
+
+
+# Per-peer-keyed maps inside director_state.json. Removing a peer must
+# drop its rows or director_state.json grows without bound (it hit 5 MB
+# / 125 peer keys before the Aug-2026 fleet shutdown, most of it dead).
+# Lists (capacity_history, ip_pools_history, ...) are fleet-wide rings
+# and intentionally NOT in this set.
+_PEER_KEYED_STATE_MAPS = (
+    'peer_bandwidth', '_bandwidth_backoff', '_bandwidth_misses',
+    '_peer_caps', 'peer_last_live_ts', 'peer_warning_rates',
+    'peer_noise_long_ema', 'peer_steal_ema', 'peer_steal_streak',
+    'canary_history', 'canary_slowdown_streaks', 'bw_cycle',
+    'stuck_kg_track', 'dup_kg_track', 'frontier_hog_release',
+    '_frontier_restart_log', '_cred_bootstrap_at', 'peer_update_state',
+    'unreachable_count', 'parallel_unreachable_count',
+    'frontier_cred_plan', 'frontier_strip_plan', 'cache_only_assigned',
+    'graceful_stop_sent', 'bev_pool_escalation',
+)
+
+# Fleet-membership lists in director_state.json (values are peer ids).
+_PEER_KEYED_STATE_LISTS = (
+    'cache_only_active', 'parallel_frontiers_active',
+)
+
+
+def _gc_peer_state(state: dict, dead_ids: set) -> int:
+    """Drop every per-peer row for ``dead_ids`` from ``state``.
+
+    Returns the number of entries removed. Purely a size/hygiene
+    optimisation — nothing depends on these rows existing, and every
+    consumer already tolerates a missing peer key (the maps are
+    lazily repopulated on the next sample for live peers).
+    """
+    if not dead_ids:
+        return 0
+    dropped = 0
+    for key in _PEER_KEYED_STATE_MAPS:
+        m = state.get(key)
+        if not isinstance(m, dict):
+            continue
+        for pid in dead_ids:
+            if m.pop(pid, None) is not None:
+                dropped += 1
+    for key in _PEER_KEYED_STATE_LISTS:
+        lst = state.get(key)
+        if not isinstance(lst, list):
+            continue
+        kept = [x for x in lst if x not in dead_ids]
+        if len(kept) != len(lst):
+            dropped += len(lst) - len(kept)
+            state[key] = kept
+    for key in ('active_peer', 'shadow_peer'):
+        if state.get(key) in dead_ids:
+            state[key] = None
+    return dropped
 
 
 def save_director_state(state: dict):
@@ -4108,6 +4220,7 @@ class PeerDirector:
             self.state.get('peer_bandwidth', {}).pop(peer_id, None)
             if self.state.get('active_peer') == peer_id:
                 self.state['active_peer'] = None
+            _gc_peer_state(self.state, {peer_id})
             save_director_state(self.state)
             self.cfg = cfg
         # Remove from peer_urls.txt
@@ -11624,6 +11737,26 @@ class PeerDirector:
                         self._prune_priority_queue()
                     except Exception:
                         log.exception('priority queue prune failed')
+                    # GC per-peer state rows for ids no longer in the
+                    # roster (removed by another gunicorn worker, or by
+                    # an older director that lacked the GC-on-remove
+                    # path). Keeps director_state.json bounded.
+                    try:
+                        with self._lock:
+                            live = {p['id'] for p in
+                                    (self.cfg.get('peers') or [])
+                                    if p.get('id')}
+                            dead = set()
+                            for _k in _PEER_KEYED_STATE_MAPS:
+                                _m = self.state.get(_k)
+                                if isinstance(_m, dict):
+                                    dead |= (set(_m) - live)
+                            n = _gc_peer_state(self.state, dead)
+                        if n:
+                            log.info('director_state GC: dropped %d row(s) '
+                                     'for %d removed peer(s)', n, len(dead))
+                    except Exception:
+                        log.exception('director_state peer GC failed')
                     self._sync_queue_to_active()
                     sync_counter = 0
                 # Elect / refresh shadow & push snapshot every tick.

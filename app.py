@@ -5317,11 +5317,15 @@ def director_peers_config():
     """GET: return peers config. POST: update it."""
     if request.method == 'GET':
         return jsonify(pd.load_peers_config())
-    # POST: update config
+    # POST: update config. An explicit full-roster POST is authoritative,
+    # so any id it lists clears its removal tombstone (otherwise a peer
+    # deliberately re-added this way would be filtered straight back out).
     new_cfg = request.json
     if not new_cfg or 'peers' not in new_cfg:
         return jsonify({'error': 'peers array required'}), 400
-    pd.save_peers_config(new_cfg)
+    listed = {p.get('id') for p in (new_cfg.get('peers') or [])
+              if isinstance(p, dict) and p.get('id')}
+    pd.save_peers_config(new_cfg, readded_ids=listed)
     d = pd.get_director()
     d.reload_config()
     return jsonify({'status': 'updated', 'config': new_cfg})
@@ -5346,6 +5350,13 @@ def director_add_peer():
         return jsonify({'error': 'url must start with https://'}), 400
 
     cfg = pd.load_peers_config()
+    # Explicit re-add clears any removal tombstone (see
+    # peer_director._merge_peers_with_disk) — otherwise the durable
+    # tombstone would filter this peer straight back out on save.
+    tomb = cfg.get('removed_peers')
+    if isinstance(tomb, dict):
+        tomb.pop(peer_id, None)
+    readd = {peer_id}
     # Check for duplicate
     existing_ids = {p['id'] for p in cfg.get('peers', [])}
     existing_urls = {p.get('url') for p in cfg.get('peers', [])}
@@ -5398,7 +5409,7 @@ def director_add_peer():
         # holds off on frontier promotion for ~5 min.
         'first_seen': _dtnow.now(_tznow.utc).isoformat(),
     })
-    pd.save_peers_config(cfg)
+    pd.save_peers_config(cfg, readded_ids=readd)
     d = pd.get_director()
     d.reload_config()
 

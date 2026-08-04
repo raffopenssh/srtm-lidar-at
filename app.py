@@ -7749,6 +7749,57 @@ def zenodo_lock_status():
         })
 
 
+@app.route('/api/v1/admin/drop_tombstones', methods=['POST'])
+def admin_drop_tombstones():
+    """Hard-delete manifest tombstone keys (in-memory + disk).
+
+    Recovery tool for an over-broad force-requeue. ``POST
+    /processing/queue {skip_processed:false}`` on a *split parent* deletes
+    the manifest entry AND stamps a tombstone for **every** product of
+    **every** block — e.g. re-queueing Soelden/80110 to recover two
+    out-of-coverage blocks tombstoned all 117 products of its 38 finished
+    blocks (~40 GB of completed work). The Zenodo deposits are untouched,
+    but the local pointers are gone and the tombstones actively block
+    re-import from peers (``_sync_peer_data`` skips any entry whose
+    ``uploaded_at`` predates a live tombstone).
+
+    Editing ``manifest_tombstones.json`` by hand is not enough: the keys
+    live in the ``_MANIFEST_TOMBSTONES`` dict of each gunicorn worker and
+    ``_persist_tombstones_merged`` unions disk back in (newest-wins), so a
+    file edit is resurrected on the next persist. This route goes through
+    ``_drop_tombstone_keys`` which removes from both under the lock.
+
+    Body: ``{"keys": [...]}`` for exact keys, or ``{"prefix": "80110"}``
+    to drop every tombstone for a KG family. ``keep`` (list, default
+    ``[]``) exempts keys from a prefix sweep — use it to preserve the
+    ``<code>_requeue`` marker that legitimately keeps a parent in the
+    priority queue while dropping only the product tombstones.
+
+    Read-only w.r.t. Zenodo and the tile caches; touches nothing but
+    tombstone state.
+
+    Auth: global ``_enforce_admin_token`` hook (``/api/v1/admin/*``).
+    """
+    body = (request.json or {}) if request.is_json else {}
+    keys = list(body.get('keys') or [])
+    prefix = (body.get('prefix') or request.args.get('prefix') or '').strip()
+    keep = set(body.get('keep') or [])
+    if prefix:
+        _reload_tombstones_from_disk()
+        keys += [k for k in list(_MANIFEST_TOMBSTONES)
+                 if k.startswith(prefix) and k not in keep]
+    keys = [k for k in dict.fromkeys(keys) if k not in keep]
+    if not keys:
+        return jsonify({'error': 'keys or prefix required',
+                        'matched': 0}), 400
+    removed = _drop_tombstone_keys(keys)
+    log.info('admin_drop_tombstones: removed %d/%d (prefix=%r keep=%s)',
+             removed, len(keys), prefix, sorted(keep))
+    return jsonify({'status': 'ok', 'requested': len(keys),
+                    'removed': removed, 'kept': sorted(keep),
+                    'remaining': len(_MANIFEST_TOMBSTONES)})
+
+
 @app.route('/api/v1/admin/unfail_kgs', methods=['POST'])
 def admin_unfail_kgs():
     """Clear the permanent-failure verdict on specific KG/block codes.

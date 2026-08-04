@@ -7901,6 +7901,86 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
         _all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
         if not _all_rights:
+            # No tile produced a raster. Two very different causes:
+            #
+            #  (a) every tile is a genuine *boundary* tile — the block
+            #      lies entirely outside BEV LiDAR coverage (across the
+            #      national border). Deterministic and permanent: there
+            #      is no data to fetch, ever. Sinking this into the
+            #      failure path makes the block permanently failed,
+            #      which leaves the PARENT KG geometrically incomplete
+            #      forever — it can never drain from retry_queue.json,
+            #      and the director keeps a cell alive (and a peer
+            #      restart-looping) for work that cannot exist.
+            #      Aug 2026: 80110-southeast-3 / -6 (Sölden, 11.09-11.15E
+            #      x 46.77-46.85N — 100% NoData in the BEV DTM, i.e.
+            #      South Tyrol) wedged Sölden and burned a Copernicus
+            #      credential on at106 for hours.
+            #      Correct outcome: emit an EMPTY-coverage product so
+            #      the parent's coverage oracle closes over this
+            #      rectangle, exactly like a zero-object tile does
+            #      inside a normal block.
+            #
+            #  (b) at least one tile hit a real upstream failure —
+            #      transient, must be retried. Keep the hard failure so
+            #      the deferred-retry path runs.
+            _n_boundary = sum(
+                1 for t in tile_data_availability
+                if (t.get('outside_austria')
+                    or t.get('ortho_outside_austria'))
+                and not t.get('upstream_fail')
+            )
+            _n_upstream = sum(1 for t in tile_data_availability
+                              if t.get('upstream_fail'))
+            if _n_upstream == 0 and _n_boundary >= n_tiles:
+                log.warning(
+                    "KG %s: all %d tiles are outside BEV coverage — "
+                    "emitting empty-coverage product (no data exists "
+                    "for this area; not a failure)", kg_code, n_tiles)
+                result['out_of_coverage'] = True
+                result['success'] = True
+                result['step'] = 'json'
+                _report_step('json', 'empty (outside BEV coverage)')
+                _empty = {
+                    'version': VERSION,
+                    'kg_code': kg_code,
+                    'kg_name': kg.get('kg_name', ''),
+                    'state': kg.get('state_name', ''),
+                    'gemeinde': kg.get('gemeinde_name', ''),
+                    'district': kg.get('district_name', ''),
+                    'bbox': kg.get('bbox', {}),
+                    'total_area_sqm': 0,
+                    'generated_at': datetime.now(timezone.utc).isoformat(),
+                    'out_of_coverage': True,
+                    'objects': [],
+                    'area_summary': {},
+                    'parcels': [],
+                    'buildings': [],
+                    'new_buildings': [],
+                    'infrastructure': [],
+                    'data_quality': {
+                        'quality_score': 0.0,
+                        'quality_grade': 'N',
+                        'available_layers': [],
+                        'missing_layers': [],
+                        'n_tiles': n_tiles,
+                        'n_boundary_tiles': _n_boundary,
+                        'n_upstream_failed_tiles': 0,
+                        'upstream_failed_tiles': [],
+                        'note': ('all tiles outside BEV LiDAR coverage '
+                                 '(outside Austria) — no data exists for '
+                                 'this area'),
+                    },
+                }
+                JSON_DIR.mkdir(parents=True, exist_ok=True)
+                _ep = str(JSON_DIR / f"{kg_code}.json")
+                with open(_ep, 'w') as _f:
+                    json.dump(_empty, _f, indent=2, default=str)
+                result['files']['json'] = _ep
+                result['quality_score'] = 0.0
+                result['quality_grade'] = 'N'
+                result['n_segments'] = 0
+                return result
             # All tiles were skipped (boundary or upstream-fail) — nothing to
             # segment.  Abort cleanly so the partial-KG path can record this.
             raise RuntimeError(
@@ -8660,6 +8740,23 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
         try:
             with open(json_path) as f:
                 js = json.load(f)
+
+            # Out-of-coverage marker product: a block that lies entirely
+            # outside BEV LiDAR coverage (across the national border).
+            # It intentionally carries no objects / area / parcels — its
+            # only job is to close the parent KG's geographic coverage
+            # so the parent can drain from the priority queue. Every
+            # check below (area_summary non-empty, total_area_sqm > 0,
+            # per-layer presence) is meaningless here and would emit a
+            # wall of false-positive validation warnings.
+            if js.get("out_of_coverage"):
+                for k in ("version", "kg_code", "bbox", "data_quality"):
+                    if k not in js:
+                        issues.append(
+                            f"JSON(out_of_coverage): missing key '{k}'")
+                log.info("  JSON: out-of-coverage marker product — "
+                         "schema checks skipped")
+                return issues
 
             # Required top-level keys
             required_keys = [

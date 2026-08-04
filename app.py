@@ -7749,6 +7749,65 @@ def zenodo_lock_status():
         })
 
 
+@app.route('/api/v1/admin/unfail_kgs', methods=['POST'])
+def admin_unfail_kgs():
+    """Clear the permanent-failure verdict on specific KG/block codes.
+
+    ``failed_kgs.json`` is a terminal verdict and ``retried_kgs.json``
+    records that a code already burned its one automatic fresh attempt,
+    so a code present in both is skipped forever. That is correct for
+    genuinely-unprocessable data, but a code can also land there because
+    of a *classification* bug we later fixed — e.g. Soelden's
+    ``80110-southeast-{3,6}``, which are 100% NoData in BEV (South
+    Tyrol) and were treated as failures instead of legitimately-empty
+    out-of-coverage blocks. Because the coverage oracle needs a ``_json``
+    for every rectangle, those two verdicts made the whole parent KG
+    undrainable.
+
+    Clearing both files lets the fixed code path run once more. Purely a
+    state edit: no cache reads/writes, no upstream traffic, and tile
+    checkpoints are deliberately left intact so a retry resumes cheaply.
+
+    POST ``{"kgs": ["code", ...]}`` (or ``?kg=<code>``).
+
+    NOTE ordering: ``app._sync_peer_data`` unions peers' ``failed``
+    lists into the primary's registry, so when clearing fleet-wide you
+    must clear every *peer* before the primary, else the verdict is
+    re-imported on the next 5-min sync tick.
+
+    Auth: covered by the global ``_enforce_admin_token`` before_request
+    hook (``/api/v1/admin/*`` is a protected path; loopback exempt).
+    """
+    codes = []
+    if request.is_json:
+        codes = (request.json or {}).get('kgs') or []
+    one = request.args.get('kg')
+    if one:
+        codes.append(one)
+    codes = [str(c).strip() for c in codes if str(c).strip()]
+    if not codes:
+        return jsonify({'error': 'kgs (list) or kg param required'}), 400
+
+    data_dir = Path('data/austria_processor')
+    cleared = {}
+    for name in ('failed_kgs.json', 'retried_kgs.json'):
+        p = data_dir / name
+        if not p.exists():
+            continue
+        try:
+            cur = set(json.loads(p.read_text() or '[]'))
+        except Exception:
+            continue
+        hit = cur & set(codes)
+        if hit:
+            p.write_text(json.dumps(sorted(cur - hit), indent=2))
+            cleared[name] = sorted(hit)
+            log.info('admin_unfail_kgs: cleared %s from %s',
+                     sorted(hit), name)
+    return jsonify({'status': 'ok', 'requested': codes,
+                    'cleared': cleared})
+
+
 @app.route('/api/v1/admin/clear_tile_checkpoints', methods=['POST'])
 def admin_clear_tile_checkpoints():
     """Delete ``data/austria_processor/tile_checkpoints/<kg>`` for one KG.

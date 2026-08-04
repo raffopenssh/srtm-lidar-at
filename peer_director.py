@@ -4032,6 +4032,8 @@ class PeerDirector:
             'cached_cells': [list(c) for c in self._cached_cells()],
             'austria_lat_strips': [[s, n] for s, n in austria_strips],
             'austria_cells': [[s, n, w, e] for s, n, w, e in austria_cells],
+            'frontier_cells': [list(c) for c in self._frontier_cells()],
+            'barren_cells': [list(c) for c in sorted(self._barren_cells())],
             'parallel_frontiers_active': state.get('parallel_frontiers_active', []),
             'cache_miss_count': len(self._load_cache_misses()),
             'cycle_start': get_billing_cycle_start().isoformat(),
@@ -7548,7 +7550,7 @@ class PeerDirector:
                             plan_cred = (self._assign_cred_indices([active_id], cfg)
                                           .get(active_id))
                         if not plan_strip:
-                            strips = self._austria_cells()
+                            strips = self._frontier_cells()
                             # No prior plan: give all strips to this
                             # lone frontier; orchestrator will trim later.
                             plan_strip = [list(s) for s in strips] if strips else None
@@ -7723,7 +7725,7 @@ class PeerDirector:
                     self._refresh_peer_caps(peer)
                     plan = self._assign_cred_indices([new_peer], cfg)
                     creds_for_peer = plan.get(new_peer)
-                    strips = self._austria_cells()
+                    strips = self._frontier_cells()
                     # Lone frontier on activation: own all strips.
                     # The parallel orchestrator will redistribute later
                     # when more frontiers come online.
@@ -8426,7 +8428,7 @@ class PeerDirector:
         # Cap on how many disjoint cells we can hand out. With ~14
         # non-empty cells across Austria this should never bind
         # — cred capacity is the real ceiling.
-        cap_cells = max(1, len(self._austria_cells()))
+        cap_cells = max(1, len(self._frontier_cells()))
         return max(1, min(cap_creds, cap_cells))
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
@@ -8686,6 +8688,233 @@ class PeerDirector:
             log.warning('austria_cells: empty-cell prune failed: %s', e)
         self._austria_cells_cache = raw
         return raw
+
+    # --- No-work frontier restart-loop watchdog -------------------
+    # A frontier whose assigned cells hold no pending work starts,
+    # exits in <1 s ("Processing complete: ... in 0.0 hours"), and is
+    # re-started by the next tick — forever, while pinning a
+    # Copernicus credential. ``_frontier_cells`` prevents the common
+    # case (cells fully processed), but the peer's own view can differ
+    # (its manifest sync is ahead of ours, per-peer tombstones,
+    # ``peer_claimed`` filtering, block-split drift). So we also watch
+    # for the symptom: the same peer restarted with the SAME plan many
+    # times in a short window. When that trips, the plan's cells are
+    # quarantined so the next tick redistributes the peer onto cells
+    # that actually have work.
+    FRONTIER_CHURN_WINDOW_S = 30 * 60
+    FRONTIER_CHURN_MAX_STARTS = 6
+    BARREN_CELL_TTL_S = 6 * 3600
+
+    @staticmethod
+    def _plan_key(creds, cells) -> str:
+        try:
+            _c = ','.join(str(int(c)) for c in sorted(creds or []))
+        except Exception:
+            _c = str(creds)
+        try:
+            _s = ';'.join('%g/%g/%g/%g' % tuple(x)
+                          for x in sorted(tuple(y) for y in (cells or [])))
+        except Exception:
+            _s = str(cells)
+        return _c + '|' + _s
+
+    def _note_frontier_start_churn(self, pid: str, creds, cells) -> None:
+        """Record a frontier start; quarantine cells on restart loops."""
+        now = time.time()
+        key = self._plan_key(creds, cells)
+        trip = False
+        with self._lock:
+            churn = self.state.setdefault('frontier_start_churn', {})
+            rec = churn.get(pid) or {}
+            if rec.get('key') != key or (now - float(rec.get('first') or 0)
+                                         > self.FRONTIER_CHURN_WINDOW_S):
+                rec = {'key': key, 'first': now, 'n': 0}
+            rec['n'] = int(rec.get('n', 0)) + 1
+            rec['last'] = now
+            churn[pid] = rec
+            if rec['n'] >= self.FRONTIER_CHURN_MAX_STARTS:
+                barren = self.state.setdefault('barren_cells', {})
+                for c in (cells or []):
+                    try:
+                        barren['%g/%g/%g/%g' % tuple(c)] = now
+                    except Exception:
+                        continue
+                churn.pop(pid, None)
+                trip = True
+            save_director_state(self.state)
+        if trip:
+            self._frontier_cells_cache = None
+            log.warning('Frontier %s restarted %d× in %d min with the same '
+                        'plan and no progress — quarantining cells %s for '
+                        '%dh', pid, self.FRONTIER_CHURN_MAX_STARTS,
+                        self.FRONTIER_CHURN_WINDOW_S // 60, cells,
+                        self.BARREN_CELL_TTL_S // 3600)
+            try:
+                _emit_director_event(
+                    'no-work restart loop: %d starts in %d min with the same '
+                    'plan — cells %s quarantined for %dh, peer will be '
+                    're-sliced onto cells with pending work'
+                    % (self.FRONTIER_CHURN_MAX_STARTS,
+                       self.FRONTIER_CHURN_WINDOW_S // 60,
+                       ','.join('%g-%g/%g-%g' % tuple(c)
+                                for c in (cells or [])),
+                       self.BARREN_CELL_TTL_S // 3600),
+                    peer=pid, level='warning')
+            except Exception:
+                pass
+
+    def _clear_frontier_start_churn(self, pid: str) -> None:
+        """Forget churn history for *pid* (it made real progress)."""
+        if not pid:
+            return
+        with self._lock:
+            churn = self.state.get('frontier_start_churn') or {}
+            if churn.pop(pid, None) is not None:
+                save_director_state(self.state)
+
+    def _barren_cells(self) -> set:
+        """Currently-quarantined cells (TTL-expired entries pruned)."""
+        now = time.time()
+        raw = dict(self.state.get('barren_cells') or {})
+        out = set()
+        expired = []
+        for k, ts in raw.items():
+            if now - float(ts or 0) > self.BARREN_CELL_TTL_S:
+                expired.append(k)
+                continue
+            try:
+                s, n, w, e = (float(x) for x in k.split('/'))
+            except Exception:
+                expired.append(k)
+                continue
+            out.add((round(s, 4), round(n, 4), round(w, 4), round(e, 4)))
+        if expired:
+            with self._lock:
+                b = self.state.get('barren_cells') or {}
+                for k in expired:
+                    b.pop(k, None)
+                save_director_state(self.state)
+            self._frontier_cells_cache = None
+        return out
+
+    # TTL for the pending-work cell scan (kg_list + splitter expansion
+    # is ~1 s; completion state only moves at KG-completion rate).
+    FRONTIER_CELLS_TTL_S = 300
+
+    def _frontier_cells(self) -> list[tuple[float, float, float, float]]:
+        """Austria cells that still contain *unprocessed* KG work.
+
+        ``_austria_cells`` only prunes cells with zero KGs **ever**. As
+        the run completes region by region, cells become *exhausted*:
+        every KG (and every block of every split KG) in them is already
+        in the manifest. A frontier pinned to such a cell starts its
+        processor, logs ``KG_CELL_FILTER active (2 cells): 6540 -> 8
+        KGs`` → ``Expanded 8 large KGs into blocks: 8 → 0 items`` →
+        ``Processing complete`` and exits within a second. The director
+        sees a stopped-but-authorised frontier, re-issues the same plan
+        next tick, and the peer restart-loops forever while holding a
+        Copernicus credential hostage and never doing any work
+        (observed Aug 2026 on at106 with cells 46-47/10-12 +
+        46-47/16-18, whose only survivors were the two permanently
+        failed ``80110-southeast-*`` blocks).
+
+        This method applies the *same* pending computation the
+        processor does — completed set (manifest + local JSON, minus
+        force-requeue tombstones), permanently-failed set, and
+        ``kg_splitter.maybe_split_kg`` block expansion — and returns
+        only cells with ≥1 pending item. Cells are assigned by KG bbox
+        *centroid*, exactly like ``KG_CELL_FILTER`` in
+        ``austria_processor``, so the director's view and the peer's
+        view cannot disagree.
+
+        Falls back to ``_austria_cells()`` on any error, and also when
+        the scan finds nothing pending anywhere (fleet finished / state
+        files unreadable) so we never return an empty cell list — the
+        caller treats that as a transient glitch and bails out.
+        """
+        all_cells = self._austria_cells()
+        now = time.time()
+        barren = self._barren_cells()
+        cached = getattr(self, '_frontier_cells_cache', None)
+        if cached and (now - cached[0]) < self.FRONTIER_CELLS_TTL_S:
+            return cached[1]
+        try:
+            kg_path = DATA_DIR / 'kg_list.json'
+            if not kg_path.exists():
+                return all_cells
+            kgs = json.loads(kg_path.read_text())
+            try:
+                from app import _get_completed_kgs
+                completed = _get_completed_kgs()
+            except Exception:
+                completed = set()
+            failed: set = set()
+            fp = DATA_DIR / 'failed_kgs.json'
+            if fp.exists():
+                try:
+                    failed = set(json.loads(fp.read_text()))
+                except Exception:
+                    failed = set()
+            if not completed:
+                # No completion evidence — can't judge exhaustion.
+                return all_cells
+            from kg_splitter import maybe_split_kg
+            pending_cells: set[tuple[float, float, float, float]] = set()
+            for kg in kgs:
+                code = kg.get('kg_code')
+                bb = kg.get('bbox') or {}
+                if not code or code in failed:
+                    continue
+                try:
+                    lat = (float(bb['min_lat']) + float(bb['max_lat'])) / 2
+                    lon = (float(bb['min_lon']) + float(bb['max_lon'])) / 2
+                except Exception:
+                    continue
+                cell = None
+                for c in all_cells:
+                    if c[0] <= lat < c[1] and c[2] <= lon < c[3]:
+                        cell = c
+                        break
+                if cell is None or cell in pending_cells:
+                    continue
+                if code in completed:
+                    # Parent done as a whole — nothing pending here.
+                    continue
+                try:
+                    blocks = maybe_split_kg(kg)
+                except Exception:
+                    blocks = []
+                if len(blocks) > 1:
+                    has_work = any(
+                        b.get('kg_code') not in completed
+                        and b.get('kg_code') not in failed
+                        for b in blocks)
+                else:
+                    has_work = True
+                if has_work:
+                    pending_cells.add(cell)
+            cells = [c for c in all_cells
+                     if c in pending_cells and c not in barren]
+            if not cells:
+                # Everything pending is quarantined (or nothing pending
+                # at all). Prefer pending-but-quarantined over the full
+                # set so we don't hand out provably-dead cells.
+                cells = [c for c in all_cells if c in pending_cells]
+            if not cells:
+                return all_cells
+            if len(cells) < len(all_cells):
+                dead = [c for c in all_cells if c not in cells]
+                prev = set((getattr(self, '_frontier_cells_cache', None)
+                            or (0, all_cells))[1])
+                if set(cells) != prev:
+                    log.info('frontier_cells: %d/%d cells have pending work '
+                             '(exhausted: %s)', len(cells), len(all_cells),
+                             ', '.join('%g-%g/%g-%g' % c for c in dead))
+            self._frontier_cells_cache = (now, cells)
+            return cells
+        except Exception as e:
+            log.warning('frontier_cells scan failed: %s', e)
+            return all_cells
 
     def _strip_fingerprint(self, lat_south: float, lat_north: float) -> str:
         """Return a cheap fingerprint of the cache manifest for one lat strip.
@@ -9364,7 +9593,15 @@ class PeerDirector:
         # Zenodo cache ZIP write — even when opening regions that aren't
         # yet cached. Cached vs uncached cells are equivalent here:
         # tile uploads are scoped to one cell per ZIP.
-        strips = self._austria_cells()
+        #
+        # Use ``_frontier_cells()`` (not ``_austria_cells()``): cells
+        # whose every KG/block is already processed must be excluded
+        # from the distribution, else the peer holding one starts its
+        # processor, finds 0 pending items, exits in <1 s, and the
+        # director re-issues the same dead plan every tick — a restart
+        # loop that also pins a Copernicus credential (Aug 2026:
+        # at106 on 46-47/10-12 + 46-47/16-18).
+        strips = self._frontier_cells()
         if not strips:
             # Empty cells is transient (config glitch / startup race).
             # Do NOT wipe parallel_frontiers_active here — the
@@ -9469,6 +9706,23 @@ class PeerDirector:
             is_cache_only_run = bool(ps.get('cache_only'))
             if is_running and not is_cache_only_run:
                 running.append(pid)
+                # Real progress cancels the no-work restart-loop
+                # suspicion: a peer that has been on a KG for >5 min
+                # is doing actual work, not exiting instantly.
+                try:
+                    _ck = (ps.get('current_kg') or {})
+                    _st = _ck.get('started_at')
+                    if _st:
+                        from datetime import datetime as _dtp
+                        _t = _dtp.fromisoformat(str(_st))
+                        if _t.tzinfo is None:
+                            _t = _t.replace(tzinfo=timezone.utc)
+                        _age = (datetime.now(timezone.utc)
+                                - _t).total_seconds()
+                        if _age > 300:
+                            self._clear_frontier_start_churn(pid)
+                except Exception:
+                    pass
                 _rc = ps.get('cred_indices')
                 _rs = ps.get('cell_filter')
                 if _rc or _rs:
@@ -10014,6 +10268,7 @@ class PeerDirector:
                     pid, (res or {}).get('error') or res)
                 continue
             started.append(pid)
+            self._note_frontier_start_churn(pid, creds, strips_for)
             # Surface the start — with its cred/strip assignment — in the
             # 24h merged log so operators see when a peer was promoted
             # and what slice it owns. (log.info above is logs/srv only.)

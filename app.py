@@ -927,6 +927,61 @@ def _sync_peer_data():
                 peer_manifest = peer_data.get('manifest', {})
                 peer_tombstones = peer_data.get('tombstones', {}) or {}
 
+                # --- Fleet-wide permanent-failure union ---------------
+                # ``failed_kgs.json`` is a *deterministic* verdict (bad
+                # source data / unprocessable geometry), so a block that
+                # is permanently failed on one peer is failed for the
+                # whole fleet. Until now the registry never flowed at
+                # all: each peer wrote its own file and the primary's
+                # stayed empty.
+                #
+                # That divergence is load-bearing for scheduling. The
+                # director derives "which cells still have pending
+                # work" from the primary's view; a peer derives "what
+                # to process" from its own. With the primary blind to
+                # the failures it hands a peer a cell whose only
+                # survivors are permanently-failed blocks → the peer
+                # starts, logs ``Expanded 8 large KGs into blocks: 8 →
+                # 0 items`` / ``Processing complete ... 0.0 hours``,
+                # exits in <1 s, and the director re-issues the same
+                # dead plan every tick. Aug 2026: at106 restart-looped
+                # for hours on cells 46-47/10-12 + 46-47/16-18 whose
+                # only remaining work was ``80110-southeast-3`` and
+                # ``80110-southeast-6`` — while pinning a Copernicus
+                # credential no other peer could use.
+                try:
+                    _pf_list = peer_data.get('failed') or []
+                    if isinstance(_pf_list, list) and _pf_list:
+                        _fpath = Path(
+                            'data/austria_processor/failed_kgs.json')
+                        _cur_failed = []
+                        if _fpath.exists():
+                            try:
+                                _cur_failed = json.loads(
+                                    _fpath.read_text()) or []
+                            except Exception:
+                                _cur_failed = []
+                        _merged = set(_cur_failed) | {
+                            str(c) for c in _pf_list if c}
+                        # Never resurrect a code that has since been
+                        # completed (a re-queue may have fixed it).
+                        try:
+                            _done_now = _get_completed_kgs()
+                        except Exception:
+                            _done_now = set()
+                        _merged -= _done_now
+                        if _merged != set(_cur_failed):
+                            _fpath.parent.mkdir(parents=True, exist_ok=True)
+                            _fpath.write_text(json.dumps(
+                                sorted(_merged), indent=2))
+                            log.info(
+                                'Peer sync: merged permanent-failure '
+                                'registry from %s (%d → %d codes)',
+                                peer_url, len(set(_cur_failed)),
+                                len(_merged))
+                except Exception as e:
+                    log.debug('Peer sync: failed_kgs merge skipped: %s', e)
+
                 # Merge peer tombstones into ours (newest timestamp wins).
                 # Propagates force-requeue requests across the fleet so
                 # peers with stale local JSONs don't silently skip a
@@ -16119,6 +16174,26 @@ def process_txt():
         f'parallel={len(par_active)}/{max_par} '
         f'cache_strips={len(strips)}/{len(aus_strips)}'
     )
+    # Cells with pending work vs the full Austria grid, plus any cells
+    # quarantined by the no-work restart-loop watchdog. A shrinking
+    # frontier_cells count is the late-run signal that peers are about
+    # to run out of assignable regions.
+    try:
+        _fc = d.get('frontier_cells')
+        _ac = d.get('austria_cells') or []
+        if _fc is not None and _ac:
+            _bc = d.get('barren_cells') or []
+            _line = f'cells: work={len(_fc)}/{len(_ac)}'
+            if len(_fc) < len(_ac):
+                _dead = [c for c in _ac if list(c) not in [list(x) for x in _fc]]
+                _line += ' exhausted=' + ','.join(
+                    '%g-%g/%g-%g' % tuple(c) for c in _dead)
+            if _bc:
+                _line += ' quarantined=' + ','.join(
+                    '%g-%g/%g-%g' % tuple(c) for c in _bc)
+            out.append(_line)
+    except Exception:
+        pass
     _dorm = d.get('fleet_dormant') or {}
     if _dorm.get('active'):
         _health['dormant'] = _dorm

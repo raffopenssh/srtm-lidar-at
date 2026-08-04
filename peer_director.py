@@ -11083,6 +11083,89 @@ class PeerDirector:
             self.state['cache_only_assigned'] = new_assigned
             save_director_state(self.state)
 
+    # Split-layout-drift wedge repair: how many parents to unwedge per
+    # sweep (each repair invalidates a few block products and triggers a
+    # re-process, so pace it like every other fleet-touching action).
+    SPLIT_DRIFT_REPAIRS_PER_SWEEP = 2
+
+    def _repair_split_drift_wedges(self) -> int:
+        """Unwedge queued parent KGs stuck by split-layout drift.
+
+        Symptom (Egg/91007, Aug 2026): the dashboard shows every block pip
+        filled ("complete") yet the code never leaves the priority queue and
+        no peer ever works on it. Cause: ``kg_splitter.maybe_split_kg`` is a
+        function of ``kg_strikes.json``, so a KG's block layout changes as
+        strikes accumulate (Egg: 8 blocks -> 15 blocks at 2 strikes). Labels
+        are reused between layouts but the bboxes differ, so the manifest ends
+        up holding a mix of old- and new-geometry block ``_json`` products
+        that cover every current *label* while leaving a geometric hole:
+
+          * ``process.html`` pips are label-based        -> looks complete
+          * ``_kg_coverage_complete`` is geometry-based  -> never pruned
+          * ``austria_processor`` skips blocks by CODE   -> nothing schedulable
+
+        Repair: invalidate the minimal set of block products whose *current*
+        bbox spans the hole (``app._split_drift_plan``), so those blocks
+        become schedulable again and re-process with today's geometry. The
+        parent then genuinely completes and drains from the queue.
+
+        Runs on the same cadence as ``_prune_priority_queue`` (~2.5 min) and
+        is a no-op on a healthy fleet.
+        """
+        try:
+            from app import (_split_drift_wedged as _wedged,  # type: ignore
+                             _repair_split_drift as _repair)
+        except Exception:
+            return 0
+        queue_path = DATA_DIR / 'retry_queue.json'
+        mf_path = DATA_DIR / 'zenodo_manifest.json'
+        try:
+            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+            mf_raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+        except Exception:
+            return 0
+        mentries = mf_raw.get('entries', mf_raw) or {}
+        if not queue or not mentries:
+            return 0
+        repaired = 0
+        for code in queue:
+            if repaired >= self.SPLIT_DRIFT_REPAIRS_PER_SWEEP:
+                break
+            try:
+                wedged, plan = _wedged(code, mentries)
+            except Exception:
+                continue
+            if not wedged:
+                continue
+            if not plan:
+                msg = (f'split-drift {code}: wedged (all current blocks '
+                       f'committed but coverage incomplete) and no block '
+                       f'repair closes the hole - needs manual inspection')
+                log.warning(msg)
+                _emit_director_event(msg, kg=str(code), level='warning')
+                continue
+            try:
+                dropped = _repair(code, plan)
+            except Exception as e:
+                log.warning('split-drift %s: repair failed: %s', code, e)
+                continue
+            if not dropped:
+                continue
+            repaired += 1
+            msg = (f'split-drift {code}: block layout changed between runs - '
+                   f'invalidated {len(dropped)} product(s) for '
+                   f'{",".join(plan)} so they re-process with the current '
+                   f'geometry and the KG can drain')
+            log.warning(msg)
+            _emit_director_event(msg, kg=str(code), level='warning')
+            # Manifest changed underneath us; re-read for the next candidate.
+            try:
+                mf_raw = json.loads(mf_path.read_text())
+                mentries = mf_raw.get('entries', mf_raw) or {}
+            except Exception:
+                break
+        return repaired
+
     def _prune_priority_queue(self) -> int:
         """Drop stale codes from the local retry_queue.json.
 
@@ -11733,6 +11816,10 @@ class PeerDirector:
                 # Sync queue every 5 iterations (~2.5 min at 30s interval)
                 sync_counter += 1
                 if sync_counter >= 5:
+                    try:
+                        self._repair_split_drift_wedges()
+                    except Exception:
+                        log.exception('split-drift wedge repair failed')
                     try:
                         self._prune_priority_queue()
                     except Exception:

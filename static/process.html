@@ -123,6 +123,13 @@
   .prio-tag .split-pips { display: inline-flex; gap: 2px; margin-left: 3px; align-items: center; }
   .prio-tag .split-pip { width: 6px; height: 6px; border-radius: 50%; border: 1.5px solid rgba(139,148,158,0.6); background: transparent; }
   .prio-tag .split-pip.done { background: var(--green); border-color: var(--green); box-shadow: 0 0 3px rgba(63,185,80,0.5); }
+  /* Split-layout-drift wedge: every pip is label-"done" but the KG's block
+     bboxes leave a geometric hole, so it can never drain. Pips would otherwise
+     read as a fully-green "complete" KG sitting in the queue forever. */
+  .prio-tag.wedged { border-color: var(--red); background: rgba(248,81,73,0.08); }
+  .prio-tag.wedged .prio-code { color: var(--red); }
+  .prio-tag.wedged .split-pip.done { background: var(--yellow); border-color: var(--yellow); box-shadow: none; }
+  .prio-tag .wedge-badge { font-size: 9px; color: var(--red); margin-left: 2px; }
   .prio-tags-empty { color: var(--dim); font-size: 11px; font-style: italic; }
   .prio-tiles { display: inline-flex; align-items: center; gap: 1px; margin-left: 2px; margin-right: 1px; }
   .prio-tiles .t-block { width: 3px; height: 8px; border-radius: 1px; opacity: 0.7; }
@@ -4215,8 +4222,10 @@ function renderPrioQueue() {
     const fc = _failClass(kg.failures);
     const isTomb = !!kg.tombstoned;
     const isDeferred = !!kg.deferred;
+    const isWedged = !!kg.wedged;
     let cls = 'prio-tag';
-    if (isDeferred) cls += ' deferred';
+    if (isWedged) cls += ' wedged';
+    else if (isDeferred) cls += ' deferred';
     else if (isTomb) cls += ' tombstoned';
     else if (fc) cls += ' ' + fc;
     // Active-glow decision: handled later via _applyActiveKgGlow once pips
@@ -4233,6 +4242,18 @@ function renderPrioQueue() {
     if (kg.est_tiles) titleParts.push('~' + kg.est_tiles + ' tiles');
     if (isTomb) titleParts.push('queued for reprocessing (was already processed)');
     if (isDeferred) titleParts.push('deferred — retrying after a few KGs');
+    if (isWedged) {
+      // Explain the "looks complete but never drains" state. Pips are per
+      // LABEL; this KG's block layout changed between runs (kg_strikes
+      // driven), so old + new geometry blocks cover every label while
+      // leaving a real hole. The director auto-repairs it.
+      titleParts.push('WEDGED (split-layout drift): all block labels have '
+        + 'products but their bboxes leave a coverage hole — no block is '
+        + 'schedulable, so the KG cannot drain'
+        + ((kg.wedge_repair && kg.wedge_repair.length)
+            ? '. Director will re-process: ' + kg.wedge_repair.join(', ')
+            : '. No single-block repair found — needs manual inspection'));
+    }
     if (kg.n_blocks) {
       const done = (kg.blocks_done || []).length;
       titleParts.push('split into ' + kg.n_blocks + ' blocks (' + done + '/' + kg.n_blocks + ' done)');
@@ -4243,6 +4264,7 @@ function renderPrioQueue() {
     // Build badges
     const tombBadge = isTomb ? '<span class="tombstone-badge" title="Previously processed — queued for reprocessing">↺</span>' : '';
     const deferBadge = isDeferred ? '<span class="split-badge" style="color:var(--dim)" title="Deferred — retrying after a few KGs">⏳</span>' : '';
+    const wedgeBadge = isWedged ? '<span class="wedge-badge" title="Wedged by split-layout drift — see tooltip">⚠wedged</span>' : '';
     let splitHtml = '';
     if (kg.n_blocks) {
       const done = (kg.blocks_done || []).length;
@@ -4260,7 +4282,7 @@ function renderPrioQueue() {
       splitHtml = '<span class="split-pips" title="' + done + '/' + total + ' blocks done">' + pips + '</span>';
     }
     tag.innerHTML = '<span class="prio-code">' + esc(kg.code) + '</span> ' +
-      esc(kg.name) + tombBadge + deferBadge + splitHtml + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
+      esc(kg.name) + tombBadge + deferBadge + wedgeBadge + splitHtml + _tileBadge(kg.est_tiles) + _failBadge(kg.failures) +
       '<span class="prio-rm" onclick="removePrioKg(event,' + i + ')">✕</span>';
     // Drag events
     tag.addEventListener('dragstart', e => {

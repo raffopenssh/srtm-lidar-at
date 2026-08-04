@@ -4137,6 +4137,230 @@ def _kg_coverage_complete(code, mentries, after_ts=None, json_dir=None):
     return (True, newest)
 
 
+# === SECTION: split-layout-drift wedge detection & repair ===
+# A parent KG can wedge itself permanently in ``retry_queue.json`` when its
+# block layout CHANGED between processing runs. ``kg_splitter.maybe_split_kg``
+# is a function of ``kg_strikes.json``: as strikes accumulate the adaptive
+# split raises the block count (e.g. Egg/91007: 8 blocks at 0-1 strikes -> 15
+# blocks at 2 strikes). Labels are reused across layouts but their bboxes are
+# NOT the same rectangles. The manifest then holds a mix of old- and
+# new-geometry block ``_json`` products whose *label set* happens to cover
+# every label of the current layout, while their *geometry* leaves a hole:
+#
+#   * ``process.html`` renders one pip per label -> 15/15 filled -> "complete"
+#   * ``_kg_coverage_complete`` judges geometry -> hole -> never pruned
+#   * ``austria_processor`` skips every block of the current layout because
+#     all those block CODES are in ``completed_codes`` -> nothing schedulable
+#
+# Net effect: an immortal queue entry with a real data hole and no peer able
+# to make progress on it. The repair is to invalidate the *old-geometry*
+# block(s) whose current-layout bbox spans the hole, so they get re-processed
+# with today's geometry and the coverage closes.
+
+
+def _current_block_bboxes(code):
+    """``{block_code: (min_lon, min_lat, max_lon, max_lat)}`` for ``code``
+    under the CURRENT split layout, or ``{}`` when the KG isn't split (or the
+    index has no bbox for it)."""
+    pbbox = _parent_bbox_from_index(code)
+    if pbbox is None:
+        return {}
+    try:
+        from kg_splitter import maybe_split_kg
+        blocks = maybe_split_kg({
+            'kg_code': code, 'kg_name': code,
+            'bbox': {'min_lon': pbbox[0], 'min_lat': pbbox[1],
+                     'max_lon': pbbox[2], 'max_lat': pbbox[3]},
+        })
+    except Exception:
+        return {}
+    if len(blocks) < 2:
+        return {}
+    out = {}
+    for b in blocks:
+        bb = b.get('bbox') or {}
+        try:
+            out[b['kg_code']] = (bb['min_lon'], bb['min_lat'],
+                                 bb['max_lon'], bb['max_lat'])
+        except (KeyError, TypeError):
+            return {}
+    return out
+
+
+def _coverage_holes(parent, rects):
+    """Sub-rectangles of ``parent`` not covered by any of ``rects``.
+
+    Same coordinate-compression grid as ``_rects_cover_parent`` (which is just
+    ``not _coverage_holes(...)``, kept separate so the hot path stays cheap).
+    """
+    plo, pla, phi, pha = parent
+    if phi <= plo or pha <= pla:
+        return []
+    eps = 1e-9
+    xs = sorted({plo, phi} | {r[0] for r in rects} | {r[2] for r in rects})
+    ys = sorted({pla, pha} | {r[1] for r in rects} | {r[3] for r in rects})
+    xs = [x for x in xs if plo - eps <= x <= phi + eps]
+    ys = [y for y in ys if pla - eps <= y <= pha + eps]
+    holes = []
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            cx = (xs[i] + xs[i + 1]) / 2.0
+            cy = (ys[j] + ys[j + 1]) / 2.0
+            if not any(r[0] - eps <= cx <= r[2] + eps
+                       and r[1] - eps <= cy <= r[3] + eps for r in rects):
+                holes.append((xs[i], ys[j], xs[i + 1], ys[j + 1]))
+    return holes
+
+
+def _split_drift_plan(code, mentries, json_dir=None, max_rounds=6):
+    """``(plan, closes)`` -- minimal set of block codes to re-process so a
+    drift-wedged parent's coverage closes.
+
+    ``plan`` is a list of CURRENT-layout block codes; re-processing them
+    replaces their committed (old-geometry) bbox with today's bbox.
+    ``closes`` says whether the plan is provably sufficient. Empty plan means
+    the parent isn't repairable this way (no split layout / no hole / hole not
+    reachable by any current block -- e.g. the index bbox itself changed).
+
+    Greedy fixpoint: paint committed bboxes, find holes, adopt every current
+    block whose new bbox intersects a hole, repeat. Adopting a block can open
+    a *new* hole where its old bbox used to sit, hence the iteration.
+    """
+    pbbox = _parent_bbox_from_index(code)
+    cur = _current_block_bboxes(code)
+    if pbbox is None or not cur:
+        return ([], False)
+    committed = {}
+    pre = code + '-'
+    for k in mentries or {}:
+        if not k.endswith('_json'):
+            continue
+        c = k[:-5]
+        if not c.startswith(pre):
+            continue
+        e = mentries.get(k)
+        if not isinstance(e, dict) or 'error' in (e.get('status', '') or ''):
+            continue
+        bb = _read_bbox_cheap(c, json_dir)
+        if bb is None:
+            return ([], False)  # can't reason about geometry -- stay safe
+        committed[c] = bb
+    if not committed:
+        return ([], False)
+
+    def _intersects(a, b):
+        return not (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1])
+
+    plan = []
+    for _ in range(max_rounds):
+        rects = [cur[c] if c in plan else bb for c, bb in committed.items()]
+        rects += [cur[c] for c in plan if c not in committed]
+        holes = _coverage_holes(pbbox, rects)
+        if not holes:
+            return (sorted(plan), True)
+        add = [c for c, nb in cur.items()
+               if c not in plan and any(_intersects(nb, h) for h in holes)]
+        if not add:
+            return (sorted(plan), False)
+        plan.extend(add)
+    return (sorted(plan), False)
+
+
+def _split_drift_wedged(code, mentries, json_dir=None):
+    """``(wedged, plan)`` for a parent code.
+
+    Wedged := coverage-incomplete AND every block of the current layout
+    already has a committed ``_json`` (so ``austria_processor`` has nothing
+    schedulable and the code can never drain). ``plan`` is the repair set
+    from ``_split_drift_plan``.
+    """
+    try:
+        from kg_splitter import is_block_code
+    except Exception:
+        return (False, [])
+    if not code or is_block_code(code):
+        return (False, [])
+    if not isinstance(mentries, dict):
+        return (False, [])
+    try:
+        done, _ = _kg_coverage_complete(code, mentries, json_dir=json_dir)
+    except Exception:
+        return (False, [])
+    if done:
+        return (False, [])
+    cur = _current_block_bboxes(code)
+    if not cur:
+        return (False, [])
+
+    def _committed(c):
+        e = mentries.get(c + '_json')
+        return isinstance(e, dict) and 'error' not in (e.get('status', '') or '')
+    if any(not _committed(c) for c in cur):
+        return (False, [])  # normal case: blocks still schedulable
+    plan, _closes = _split_drift_plan(code, mentries, json_dir=json_dir)
+    return (True, plan)
+
+
+def _repair_split_drift(code, plan, *, dry_run=False):
+    """Invalidate ``plan`` blocks so they re-process under today's geometry.
+
+    Deletes each block's ``_json`` / ``_full_gpkg`` / ``_light_gpkg`` manifest
+    entry and stamps a tombstone for it, so (a) the coverage oracle sees the
+    parent as incomplete for a *reachable* reason, (b) ``austria_processor``
+    finds those block codes schedulable again, and (c) the peer-sync thread
+    doesn't re-import the stale entries from another peer.
+
+    Returns the list of manifest keys dropped.
+    """
+    if not plan:
+        return []
+    manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    try:
+        mdata = json.loads(manifest_path.read_text())
+    except Exception:
+        return []
+    mentries = mdata.get('entries', mdata) or {}
+    suffixes = ('_json', '_full_gpkg', '_light_gpkg')
+    dropped = [b + s for b in plan for s in suffixes if (b + s) in mentries]
+    if not dropped or dry_run:
+        return dropped
+    from datetime import datetime as _dt_r, timezone as _tz_r
+    ts = _dt_r.now(_tz_r.utc).isoformat()
+    for k in dropped:
+        mentries.pop(k, None)
+        _MANIFEST_TOMBSTONES[k] = ts
+    try:
+        import tempfile as _tf
+        fd, tmp = _tf.mkstemp(dir=manifest_path.parent, suffix='.tmp',
+                              prefix='.manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'entries': mentries}, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        log.warning('split-drift repair %s: manifest write failed: %s', code, e)
+        return []
+    # Local JSONs must go too: _get_completed_kgs() also scans data/.../json,
+    # so a leftover file would keep the block "completed" for the processor.
+    for b in plan:
+        try:
+            (Path('data/austria_processor/json') / f'{b}.json').unlink()
+        except OSError:
+            pass
+    try:
+        _persist_tombstones_merged()
+    except Exception:
+        pass
+    return dropped
+
+
 def _requeue_recompleted(code, requeue_ts, mentries):
     """True iff a force-requeued KG has genuinely *re-completed* since its
     ``<code>_requeue`` tombstone was stamped at ``requeue_ts``.
@@ -4426,6 +4650,20 @@ def processing_queue_get():
                         item['n_blocks'] = len(_blocks)
                         item['blocks_done'] = _done_labels
                         item['blocks_pending'] = [l for l in _all_labels if l not in _done_labels]
+                        # Honest completeness: pips are LABEL-based, so a KG
+                        # whose block layout drifted between runs renders
+                        # 15/15 done while the coverage oracle still sees a
+                        # geometric hole (and the processor has no schedulable
+                        # block). Surface that so the dashboard can say
+                        # "wedged" instead of silently lying. See
+                        # peer_director._repair_split_drift_wedges.
+                        try:
+                            _wed, _plan = _split_drift_wedged(code, _mf_entries)
+                            if _wed:
+                                item['wedged'] = 'split_drift'
+                                item['wedge_repair'] = _plan
+                        except Exception:
+                            pass
                 return item
             return {'code': code, 'name': code, 'failures': failure_counts.get(code, 0), 'tombstoned': is_tombstoned, 'deferred': is_deferred}
         items = [_resolve(c) for c in codes]
@@ -16462,6 +16700,43 @@ def process_txt():
                     f'bytes={cache["bytes"] / 1e6:.1f}MB '
                     f'oldest={_age_h:.1f}h'
                 )
+    except Exception:
+        pass
+
+    # Split-layout-drift wedges: queued parent KGs that LOOK complete on the
+    # dashboard (every block label has a product) but whose block bboxes leave
+    # a geometric hole, so the coverage oracle never prunes them and no peer
+    # has anything schedulable. The director auto-repairs these
+    # (_repair_split_drift_wedges); this line makes the state visible while a
+    # repair round-trips (the invalidated blocks must re-process + upload).
+    # Cached on the manifest+queue mtimes -- the scan reads bbox heads from
+    # every block JSON, so it must not run on every render.
+    try:
+        _qp = Path('data/austria_processor/retry_queue.json')
+        _mp = Path('data/austria_processor/zenodo_manifest.json')
+        _key = (_qp.stat().st_mtime if _qp.exists() else 0,
+                _mp.stat().st_mtime if _mp.exists() else 0)
+        _wv = getattr(process_txt, '_wedge_view', None)
+        if not _wv or _wv.get('key') != _key:
+            _rows = []
+            try:
+                _q = json.loads(_qp.read_text()) if _qp.exists() else []
+                _mraw = json.loads(_mp.read_text()) if _mp.exists() else {}
+                _me = _mraw.get('entries', _mraw) or {}
+                for _c in _q:
+                    _wed, _plan = _split_drift_wedged(_c, _me)
+                    if _wed:
+                        _rows.append((_c, _plan))
+            except Exception:
+                _rows = []
+            _wv = {'key': _key, 'rows': _rows}
+            process_txt._wedge_view = _wv
+        if _wv.get('rows'):
+            _parts = []
+            for _c, _plan in _wv['rows'][:6]:
+                _parts.append(f'{_c}→{",".join(_plan) if _plan else "MANUAL"}')
+            out.append('queue_wedged: n=%d split-layout-drift (repair: %s)'
+                       % (len(_wv['rows']), ' · '.join(_parts)))
     except Exception:
         pass
 

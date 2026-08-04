@@ -16312,6 +16312,7 @@ def process_txt():
                 'parked': fb.get('peers_parked', 0),
                 'enabled': fb.get('peers_enabled', 0),
                 'next_renew': fb.get('next_renew_in_days'),
+                'cap_obs': cap_n,
             }
         # Learned per-peer renew_days (empirical, from observed BW
         # drops). Anchors eligibility math on real cycles instead of
@@ -17273,7 +17274,17 @@ def process_txt():
                     f'({cpu["steal_med"]:.0f}% steal)')
         bw = _health.get('bw')
         if bw and bw.get('nominal'):
-            if bw['used'] >= bw['nominal']:
+            # Loud flag only when there is *evidence* of a real wall
+            # (≥1 quality-grade observed_cap across the fleet). The
+            # nominal budget is a guess and per-peer vnstat cycles don't
+            # match renew_day, so used_gb legitimately exceeds nominal
+            # on long-lived VMs — same evidence-only doctrine as
+            # _peer_bw_depleted. Without this gate the banner reads
+            # BW-OVER-NOMINAL permanently and drowns real signals
+            # (tripped the moment the Aug-2026 shutdown shrank the
+            # roster from 101 to 8, dividing nominal by ~13 while
+            # used_gb stayed cumulative).
+            if bw['used'] >= bw['nominal'] and bw.get('cap_obs'):
                 _flags.append(
                     f'BW-OVER-NOMINAL({bw["used"]:.0f}/'
                     f'{bw["nominal"]:.0f}GB, parked={bw["parked"]})')

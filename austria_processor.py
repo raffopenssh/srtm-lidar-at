@@ -8978,24 +8978,51 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
         log.warning("KG %s: cannot read JSON for stats: %s", kg_code, e)
         return
 
-    parcels = js.get("parcels", {})
-    bfp = js.get("building_footprints", {})
-    landscape = js.get("landscape", {})
-    terrain = js.get("terrain", {})
-    area_sum = js.get("area_summary", {})
-    tree_stats = js.get("tree_stats", {})
-    top_obj = js.get("top_10_objects", [{}])
-    top_tree = js.get("top_10_trees", [{}])
-    hansen = js.get("hansen", {})
-    ndvi = js.get("ndvi", {})
-    new_b = js.get("new_buildings", {})
-    infra = js.get("infrastructure", {})
+    # An out-of-coverage product (all tiles NoData -- see the
+    # empty-coverage gate in process_one_kg) carries plain LISTS where a
+    # normal product carries summary dicts (parcels/new_buildings/
+    # infrastructure). Coerce so a legitimately-empty KG can't crash the
+    # stats logger -- which it did on at11 for 80110-southeast-3:
+    # ``AttributeError: 'list' object has no attribute 'get'`` was raised
+    # AFTER the JSON had been written and validated, so the KG was booked
+    # as a failure and the block never drained.
+    def _d(key):
+        v = js.get(key)
+        return v if isinstance(v, dict) else {}
 
-    n_seg = landscape.get("n_segments", 0)
-    n_par = parcels.get("count", 0)
-    n_bld = bfp.get("count", 0)
-    n_new = new_b.get("count", 0)
-    n_inf = infra.get("total", 0)
+    def _l(key):
+        v = js.get(key)
+        return v if isinstance(v, list) else []
+
+    def _n(key, *names):
+        """Count from either a summary dict or a raw list."""
+        v = js.get(key)
+        if isinstance(v, list):
+            return len(v)
+        if isinstance(v, dict):
+            for nm in names:
+                if nm in v:
+                    return v.get(nm) or 0
+        return 0
+
+    parcels = _d("parcels")
+    bfp = _d("building_footprints")
+    landscape = _d("landscape")
+    terrain = _d("terrain")
+    area_sum = _d("area_summary")
+    tree_stats = _d("tree_stats")
+    top_obj = _l("top_10_objects") or [{}]
+    top_tree = _l("top_10_trees") or [{}]
+    hansen = _d("hansen")
+    ndvi = _d("ndvi")
+    new_b = _d("new_buildings")
+    infra = _d("infrastructure")
+
+    n_seg = landscape.get("n_segments", 0) or len(_l("objects"))
+    n_par = _n("parcels", "count")
+    n_bld = _n("building_footprints", "count") or _n("buildings", "count")
+    n_new = _n("new_buildings", "count")
+    n_inf = _n("infrastructure", "total", "count")
 
     log.info("KG %s: SUCCESS in %.0fs", kg_code, elapsed)
     log.info("  %d segments | %d parcels | %d buildings | %d new buildings | %d infrastructure",
@@ -9008,7 +9035,9 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
     top5 = list(area_sum.items())[:5]
     if top5:
         log.info("  top types: %s",
-                 ", ".join(f"{t}={v.get('area_sqm',0)}m\u00b2" for t, v in top5))
+                 ", ".join(
+                     f"{t}={(v.get('area_sqm', 0) if isinstance(v, dict) else v)}"
+                     f"m\u00b2" for t, v in top5))
     log.info("  tallest=%.1fm | tallest_tree=%.1fm | trees=%d | stem_vol=%.0f m\u00b3",
              top_obj[0].get("height_max_m", 0) if top_obj else 0,
              top_tree[0].get("height_m", 0) if top_tree else 0,

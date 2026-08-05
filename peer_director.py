@@ -1895,9 +1895,24 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     try:
         import re as _re
         tpath = DATA_DIR / 'manifest_tombstones.json'
+        # Negative tombstones (app.py drop journal): a dropped tombstone
+        # must not be pushed to peers with skip_processed=False, or the
+        # peer re-runs finished work (Soelden/80110, Aug 2026).
+        _drops: dict = {}
+        try:
+            _dp = DATA_DIR / 'manifest_tombstone_drops.json'
+            if _dp.exists():
+                _dj = json.loads(_dp.read_text())
+                if isinstance(_dj, dict):
+                    _drops = {k: str(v) for k, v in _dj.items()
+                              if isinstance(v, str)}
+        except Exception:
+            _drops = {}
         if tpath.exists():
             tdata = json.loads(tpath.read_text())
             if isinstance(tdata, dict):
+                tdata = {k: v for k, v in tdata.items()
+                         if not (k in _drops and not str(v) > _drops[k])}
                 for key in tdata:
                     m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
                     if m:

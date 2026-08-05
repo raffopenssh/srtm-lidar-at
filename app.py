@@ -754,6 +754,113 @@ if _tombstone_path.exists():
 
 _TOMBSTONE_LOCK = threading.Lock()
 
+# --- Tombstone DROP journal (negative tombstones) ---------------------
+# Dropping a tombstone is only durable if the drop itself is recorded.
+# Three independent resurrection paths otherwise undo it within seconds:
+#   1. the *other* gunicorn worker's in-memory ``_MANIFEST_TOMBSTONES``
+#      re-persists the key via ``_persist_tombstones_merged``;
+#   2. the local peer-sync thread re-merges it from any peer that still
+#      holds it (``/processing/peers`` -> ``tombstones``);
+#   3. peers run the same sync against each other, so one dirty peer
+#      re-poisons the whole fleet -- including a primary swept clean.
+# That is exactly what happened to the 117 Soelden/80110 product
+# tombstones (Aug 2026): ``/admin/drop_tombstones`` reported success on
+# every peer, yet 114 keys were back on all 7 peers minutes later, and
+# the peers' processors then dropped those blocks from ``completed_codes``
+# and started re-running ~40 already-finished blocks (~9 h each) whose
+# products were still perfectly intact on Zenodo.
+#
+# The journal records ``{key: dropped_at_iso}``. A tombstone is honoured
+# only when its own timestamp is STRICTLY NEWER than the recorded drop,
+# so a genuine later force-requeue (ts = now) still works while any stale
+# copy of a dropped tombstone is filtered out -- no matter which worker,
+# peer, or sync direction it arrives from. Entries are TTL-pruned after
+# ``_TOMBSTONE_DROP_TTL_S``.
+_tombstone_drop_path = Path(
+    'data/austria_processor/manifest_tombstone_drops.json')
+_TOMBSTONE_DROP_TTL_S = 30 * 86400
+
+
+def _load_tombstone_drops() -> dict:
+    """Read the drop journal from disk (TTL-pruned, never raises)."""
+    try:
+        if not _tombstone_drop_path.exists():
+            return {}
+        d = json.loads(_tombstone_drop_path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    # Local import: the module-level ``from datetime import ...`` lives
+    # further down the file, but every caller here runs post-import.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    cutoff = (_dt.now(_tz.utc)
+              - _td(seconds=_TOMBSTONE_DROP_TTL_S)).isoformat()
+    return {k: str(v) for k, v in d.items()
+            if isinstance(v, str) and str(v) >= cutoff}
+
+
+def _write_tombstone_drops(j: dict) -> None:
+    try:
+        _tombstone_drop_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _tombstone_drop_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(j, indent=2, sort_keys=True))
+        tmp.replace(_tombstone_drop_path)
+    except Exception:
+        pass
+
+
+def _record_tombstone_drops(keys, ts: str | None = None) -> dict:
+    """Merge ``keys`` into the drop journal (newest drop wins)."""
+    from datetime import datetime as _dt, timezone as _tz
+    ts = ts or _dt.now(_tz.utc).isoformat()
+    j = _load_tombstone_drops()
+    for k in keys:
+        if str(ts) > str(j.get(k, '')):
+            j[k] = str(ts)
+    _write_tombstone_drops(j)
+    return j
+
+
+def _filter_dropped(d: dict, drops: dict | None = None) -> dict:
+    """Return ``d`` minus every tombstone superseded by a recorded drop."""
+    drops = _load_tombstone_drops() if drops is None else drops
+    if not drops or not d:
+        return d
+    return {k: v for k, v in d.items()
+            if not (k in drops and not str(v) > str(drops[k]))}
+
+
+def _merge_tombstone_drops(incoming: dict) -> int:
+    """Union a peer's drop journal into ours and evict any live tombstone
+    the (possibly newer) drop now supersedes.
+
+    This is what makes a sweep converge fleet-wide: the node the operator
+    swept propagates the *drops*, so peers stop re-broadcasting the
+    tombstones -- instead of the sweep having to out-race them forever.
+    Returns the number of live tombstones evicted.
+    """
+    if not isinstance(incoming, dict) or not incoming:
+        return 0
+    with _TOMBSTONE_LOCK:
+        merged = _load_tombstone_drops()
+        changed = False
+        for k, v in incoming.items():
+            if isinstance(v, str) and str(v) > str(merged.get(k, '')):
+                merged[k] = str(v)
+                changed = True
+        if changed:
+            _write_tombstone_drops(merged)
+        evicted = [k for k, dts in merged.items()
+                   if k in _MANIFEST_TOMBSTONES
+                   and not str(_MANIFEST_TOMBSTONES[k]) > str(dts)]
+    if evicted:
+        # Outside the lock: _drop_tombstone_keys takes it (non-reentrant).
+        _drop_tombstone_keys(evicted, record=False)
+        log.info('Tombstone drops merged from peer: evicted %d live '
+                 'tombstone(s) (journal now %d)', len(evicted), len(merged))
+    return len(evicted)
+
 
 def _persist_tombstones_merged() -> None:
     """Persist ``_MANIFEST_TOMBSTONES`` to disk, MERGING with whatever is
@@ -781,6 +888,15 @@ def _persist_tombstones_merged() -> None:
             cur = _MANIFEST_TOMBSTONES.get(k, '')
             if str(v) > str(cur):
                 _MANIFEST_TOMBSTONES[k] = v
+        # Honour the drop journal on every persist: the sibling worker (or
+        # a peer sync that ran before the journal was merged) may still
+        # hold keys the operator dropped. Filtering here is what makes a
+        # drop survive a restart instead of being resurrected on the
+        # first write after it.
+        _dropped = _filter_dropped(dict(_MANIFEST_TOMBSTONES))
+        if len(_dropped) != len(_MANIFEST_TOMBSTONES):
+            _MANIFEST_TOMBSTONES.clear()
+            _MANIFEST_TOMBSTONES.update(_dropped)
         try:
             tmp = _tombstone_path.with_suffix('.tmp')
             tmp.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
@@ -789,7 +905,7 @@ def _persist_tombstones_merged() -> None:
             pass
 
 
-def _drop_tombstone_keys(keys) -> int:
+def _drop_tombstone_keys(keys, record: bool = True) -> int:
     """Hard-delete tombstone keys from BOTH the in-memory dict and disk.
 
     ``_persist_tombstones_merged`` unions disk back in (newest-wins), so a
@@ -803,6 +919,11 @@ def _drop_tombstone_keys(keys) -> int:
         return 0
     removed = 0
     with _TOMBSTONE_LOCK:
+        if record:
+            # Durable negative tombstone: without this the key comes back
+            # from the sibling gunicorn worker or from any peer that still
+            # holds it (see the DROP journal comment above).
+            _record_tombstone_drops(keys)
         for k in keys:
             if _MANIFEST_TOMBSTONES.pop(k, None) is not None:
                 removed += 1
@@ -848,7 +969,8 @@ def _reload_tombstones_from_disk() -> None:
             return
         if not isinstance(d, dict):
             return
-        for k, v in d.items():
+        # Union-only, but never re-admit a key the drop journal supersedes.
+        for k, v in _filter_dropped(d).items():
             if str(v) > str(_MANIFEST_TOMBSTONES.get(k, '')):
                 _MANIFEST_TOMBSTONES[k] = v
 
@@ -926,6 +1048,17 @@ def _sync_peer_data():
 
                 peer_manifest = peer_data.get('manifest', {})
                 peer_tombstones = peer_data.get('tombstones', {}) or {}
+                # Negative tombstones first: adopt the peer's drop journal
+                # so a sweep performed anywhere converges everywhere, then
+                # filter this peer's live tombstones through the merged
+                # journal. Without this the merge below happily re-imports
+                # tombstones we deliberately dropped (Soelden/80110).
+                try:
+                    _merge_tombstone_drops(
+                        peer_data.get('tombstone_drops') or {})
+                    peer_tombstones = _filter_dropped(peer_tombstones)
+                except Exception:
+                    pass
 
                 # --- Fleet-wide permanent-failure union ---------------
                 # ``failed_kgs.json`` is a *deterministic* verdict (bad
@@ -2980,11 +3113,20 @@ def processing_peers_status():
     tomb_path = data_dir / 'manifest_tombstones.json'
     if tomb_path.exists():
         try:
-            result['tombstones'] = json.loads(tomb_path.read_text())
+            result['tombstones'] = _filter_dropped(
+                json.loads(tomb_path.read_text()))
         except Exception:
             result['tombstones'] = {}
     else:
         result['tombstones'] = {}
+
+    # Negative tombstones (drop journal). Consumers must merge this BEFORE
+    # merging ``tombstones`` — it is the only thing that stops a dropped
+    # tombstone from ping-ponging back around the fleet forever.
+    try:
+        result['tombstone_drops'] = _load_tombstone_drops()
+    except Exception:
+        result['tombstone_drops'] = {}
 
     return jsonify(result)
 

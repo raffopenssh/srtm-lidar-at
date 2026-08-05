@@ -7347,6 +7347,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tvalid = int(tdata["mask"].sum())
             if tvalid < 100:
                 log.info("KG %s %s: skipping (only %d valid px)", kg_code, tile_label, tvalid)
+                # The BEV tile-index *covers* this bbox but the raster is
+                # all-NoData -- i.e. we are past the national border inside
+                # a tile that nominally exists (South Tyrol, Bavaria...).
+                # Flag it like a boundary tile so the all-tiles-empty gate
+                # in the merge step can emit an out-of-coverage product
+                # instead of raising. Without this the 564a696 fix never
+                # fires for Soelden's -southeast-3/-6: raster_io returns a
+                # valid window (no "No tiles cover bbox" ValueError), so
+                # ``outside_austria`` was never set and the block failed
+                # permanently -- leaving the parent's coverage oracle
+                # unsatisfiable forever.
+                tile_avail["outside_austria"] = True
+                tile_avail["no_valid_pixels"] = True
                 tile_data_availability.append(tile_avail)
                 # Cache empty tiles — deterministic, no point retrying
                 _save_tile_checkpoint(tile_idx, None, [], [], [], tile_avail, None, {}, {}, {}, 0)
@@ -7924,10 +7937,20 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             #  (b) at least one tile hit a real upstream failure —
             #      transient, must be retried. Keep the hard failure so
             #      the deferred-retry path runs.
+            # A tile counts as "no data exists here" when it is either
+            # outside the BEV tile index (raster_io ValueError) or the
+            # window read back all-NoData (``valid_pixels == 0`` -- past
+            # the national border inside a tile that nominally exists).
+            # The valid_pixels arm also covers tile_avail dicts RESTORED
+            # from checkpoints written before the flag existed, so an
+            # already-checkpointed block (Soelden -southeast-3/-6) is
+            # classified correctly on its next attempt without an
+            # operator having to clear its tile pickles.
             _n_boundary = sum(
                 1 for t in tile_data_availability
                 if (t.get('outside_austria')
-                    or t.get('ortho_outside_austria'))
+                    or t.get('ortho_outside_austria')
+                    or not (t.get('valid_pixels') or 0))
                 and not t.get('upstream_fail')
             )
             _n_upstream = sum(1 for t in tile_data_availability
@@ -8183,6 +8206,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             _td = json.loads(_tp.read_text())
                             if isinstance(_td, dict):
                                 _tomb_ts = str(_td.get(f"{kg_code}_full_gpkg", "") or "")
+                        # Drop journal wins over a stale product tombstone
+                        # (see the completed_codes gate in main()): a dropped
+                        # tombstone must not force a 1-15 GB GPKG rebuild.
+                        _dp2 = DATA_DIR / "manifest_tombstone_drops.json"
+                        if _tomb_ts and _dp2.exists():
+                            _dj2 = json.loads(_dp2.read_text())
+                            _d2 = (str(_dj2.get(f"{kg_code}_full_gpkg", "") or "")
+                                   if isinstance(_dj2, dict) else "")
+                            if _d2 and not _tomb_ts > _d2:
+                                _tomb_ts = ""
                     except Exception:
                         _tomb_ts = ""
                     if _tomb_ts and not (_entry_ts and _entry_ts > _tomb_ts):
@@ -10203,11 +10236,41 @@ def main():
     # the priority list.
     tombstoned_kgs: set[str] = set()
     tombstone_path = DATA_DIR / "manifest_tombstones.json"
+    # Negative tombstones ("drop journal", app.py). A tombstone that an
+    # operator explicitly dropped must NOT force a reprocess, even if a
+    # stale copy of it is still sitting in our local tombstone file or
+    # arrives from a peer that hasn't converged yet. Aug 2026: the 117
+    # Soelden/80110 product tombstones were dropped fleet-wide, came back
+    # via peer-sync, and this loop then removed ~40 finished blocks from
+    # completed_codes -- re-running ~9 h of work per block for products
+    # that were intact on Zenodo. Honour the journal here too so the
+    # processor can never be the one to act on a superseded tombstone.
+    _tomb_drops: dict = {}
+    try:
+        _dp = DATA_DIR / "manifest_tombstone_drops.json"
+        if _dp.exists():
+            _dj = json.loads(_dp.read_text())
+            if isinstance(_dj, dict):
+                _tomb_drops = {k: str(v) for k, v in _dj.items()
+                               if isinstance(v, str)}
+    except Exception:
+        _tomb_drops = {}
     if tombstone_path.exists():
         try:
             _tdata = json.loads(tombstone_path.read_text())
             if isinstance(_tdata, dict):
                 import re as _re_t
+                _n_sup = 0
+                for _tk in list(_tdata.keys()):
+                    # Superseded == drop is newer than (or equal to) the
+                    # tombstone. A genuine later requeue has ts > drop.
+                    _dts = _tomb_drops.get(_tk)
+                    if _dts and not str(_tdata.get(_tk, "")) > _dts:
+                        _tdata.pop(_tk, None)
+                        _n_sup += 1
+                if _n_sup:
+                    log.info("Ignoring %d tombstone(s) superseded by the "
+                             "drop journal", _n_sup)
                 for _tk in _tdata.keys():
                     _m = _re_t.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', _tk)
                     if _m:

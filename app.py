@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response, redirect
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, redirect, g
 from shapely.geometry import mapping, shape, Point, LineString as SLineString
 
 import tile_index as ti
@@ -10819,6 +10819,12 @@ def _get_geometry():
         else:
             raise ValueError("No geometry provided. Send GeoJSON, KML, or coordinates.")
 
+    # Repair invalid input polygons (self-intersections, mis-ordered ring sets
+    # where a hole is emitted as the exterior, etc.). Without this a caller can
+    # get a confident answer computed on the wrong footprint — see the Jun 2026
+    # cadastre parcel 63334-235 report (0.04 ha vs 17.53 ha, no warning).
+    features = _repair_invalid_geometries(features)
+
     # Validate each feature is within Austria
     for feat in features:
         geo_parse.validate_austria_bounds(feat['geometry'])
@@ -10834,6 +10840,83 @@ def _get_geometry():
             feat['geometry'] = _non_polygon_to_polygon(geom)
 
     return features
+
+
+def _repair_invalid_geometries(features):
+    """make_valid() any invalid input geometry; record what we did in `g`.
+
+    Callers surface the record via `_geometry_meta()` so a consumer can tell
+    a repaired footprint from a pristine one (`meta.geometry_repaired`).
+    """
+    from shapely.validation import explain_validity, make_valid
+    from shapely.geometry import MultiPolygon as _MP, Polygon as _P
+    from shapely.ops import unary_union as _uu
+
+    notes = []
+    out = []
+    for feat in features:
+        geom = feat.get('geometry')
+        try:
+            if geom is None or geom.is_empty or geom.is_valid:
+                out.append(feat)
+                continue
+            reason = explain_validity(geom)
+            fixed = make_valid(geom)
+            # make_valid can return GeometryCollection / lines for degenerate
+            # input — keep only the polygonal parts when any exist.
+            if fixed.geom_type == 'GeometryCollection':
+                polys = [gm for gm in fixed.geoms if gm.geom_type in ('Polygon', 'MultiPolygon')]
+                if polys:
+                    fixed = _uu(polys)
+            if fixed.is_empty or fixed.geom_type not in ('Polygon', 'MultiPolygon'):
+                # Nothing polygonal survived — fall back to buffer(0), then original.
+                try:
+                    b = geom.buffer(0)
+                    fixed = b if (not b.is_empty and b.geom_type in ('Polygon', 'MultiPolygon')) else geom
+                except Exception:
+                    fixed = geom
+            if fixed is not geom and not fixed.is_empty:
+                feat = dict(feat)
+                feat['geometry'] = fixed
+                notes.append({
+                    'name': feat.get('name'),
+                    'reason': str(reason),
+                    'area_before_sqm': None,
+                    'geom_type': fixed.geom_type,
+                })
+        except Exception as e:  # never fail the request on a repair attempt
+            log.warning('geometry repair failed: %s', e)
+        out.append(feat)
+
+    if notes:
+        try:
+            g._geometry_repairs = notes
+        except Exception:
+            pass
+        log.info('repaired %d invalid input geometry(ies): %s',
+                 len(notes), [n['reason'] for n in notes][:3])
+    return out
+
+
+def _geometry_meta():
+    """Meta fields describing input-geometry repairs done by `_get_geometry()`.
+
+    Empty dict when the input was already valid, so healthy responses are
+    unchanged.
+    """
+    try:
+        notes = getattr(g, '_geometry_repairs', None)
+    except Exception:
+        notes = None
+    if not notes:
+        return {}
+    return {
+        'geometry_repaired': True,
+        'warnings': [
+            f"input geometry invalid ({n['reason']}); repaired with make_valid() "
+            f"before rasterising" for n in notes
+        ],
+    }
 
 
 def _clean_polygon(geom, min_hole_area=500, min_part_area=100):
@@ -11252,7 +11335,8 @@ def elevation():
                 result_features.append({"type": "Feature", "properties": props, "geometry": geom_dict})
 
         return jsonify({"type": "FeatureCollection", "features": result_features,
-                        "meta": {"dataset": dataset, "processing_time_s": round(time.time()-t0, 2)}})
+                        "meta": {"dataset": dataset, "processing_time_s": round(time.time()-t0, 2),
+                                 **_geometry_meta()}})
     except ValueError as e:
         return _error(str(e))
     except Exception as e:
@@ -11282,7 +11366,8 @@ def terrain():
             props['terrain'] = terrain_stats
             results.append({"type": "Feature", "properties": props, "geometry": mapping(feat['geometry'])})
         return jsonify({"type": "FeatureCollection", "features": results,
-                        "meta": {"dataset": dataset, "processing_time_s": round(time.time()-t0, 2)}})
+                        "meta": {"dataset": dataset, "processing_time_s": round(time.time()-t0, 2),
+                                 **_geometry_meta()}})
     except ValueError as e:
         return _error(str(e))
     except Exception as e:
@@ -11315,6 +11400,9 @@ def segment_objects():
         params = _get_params()
     except Exception as e:
         return _error(str(e))
+
+    # Carry any input-geometry repair notes into the (possibly async) response
+    params['_geometry_meta'] = _geometry_meta()
 
     # Capture raw geometry text for auto-save share recovery
     geometry_text = ''
@@ -11767,6 +11855,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "mark_uncertain": mark_uncertain,
             "processing_time_s": round(time.time() - t0, 2),
             **_rf_model_meta(),
+            **(params.get('_geometry_meta') or {}),
         },
     }
     if all_evaluation:
@@ -13735,7 +13824,7 @@ def changes():
             "summary": {"total_events": len(events), "by_type": by_type},
             "comparison_stats": comparison["stats"],
             "meta": {"date_a": date_a, "date_b": date_b, "min_change_m": min_change,
-                     "processing_time_s": round(time.time()-t0, 2)},
+                     "processing_time_s": round(time.time()-t0, 2), **_geometry_meta()},
         })
     except ValueError as e:
         return _error(str(e))
@@ -13789,7 +13878,7 @@ def changes_trees():
             "type": "FeatureCollection", "features": tree_features,
             "summary": {"total_trees": len(tree_changes), "by_status": by_status},
             "meta": {"date_a": date_a, "date_b": date_b,
-                     "processing_time_s": round(time.time()-t0, 2)},
+                     "processing_time_s": round(time.time()-t0, 2), **_geometry_meta()},
         })
     except ValueError as e:
         return _error(str(e))
@@ -13819,7 +13908,7 @@ def changes_summary():
         _validate_area(geom_3035)
 
         result = tca.temporal_summary(geom_3035, dates=dates)
-        result["meta"] = {"processing_time_s": round(time.time()-t0, 2)}
+        result["meta"] = {"processing_time_s": round(time.time()-t0, 2), **_geometry_meta()}
         return jsonify(result)
     except ValueError as e:
         return _error(str(e))

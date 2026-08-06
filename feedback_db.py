@@ -584,6 +584,13 @@ def match_text(text: str, kg_code: str = None, lon: float = None, lat: float = N
 
 # ---------------------------------------------------------------- feedback
 
+_KNOWN_FEEDBACK_KEYS = {
+    'obj_ref', 'kg_code', 'point', 'context_text', 'selected_text', 'kind',
+    'predicted_type', 'predicted_attrs', 'corrected_type', 'corrected_attrs',
+    'value', 'confidence', 'notes', 'note', 'user', 'token', 'source_app',
+}
+
+
 def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'student',
                     source_app: str = 'web') -> dict:
     ensure_schema()
@@ -620,6 +627,16 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
         c.close()
         if row: resolved_kg_code = row['kg_code']
 
+    # Accept both `notes` (canonical) and `note` (documented alias) — silently
+    # dropping the payload cost a reporter their whole bug report (Jun 2026).
+    fb_notes = payload.get('notes')
+    if fb_notes in (None, ''):
+        fb_notes = payload.get('note')
+
+    # `value` is the documented key for a corrected type; `corrected_type` is
+    # what the schema calls it. Accept both.
+    fb_corrected = payload.get('corrected_type') or payload.get('value')
+
     now = int(time.time())
     role_w = {'admin': 5.0, 'trusted': 2.0, 'student': 1.0, 'anon': 0.5}.get(user_role, 1.0)
     fb_kind = payload.get('kind') or 'report'
@@ -636,10 +653,10 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
              payload.get('predicted_type'),
              json.dumps(payload.get('predicted_attrs') or {}),
              fb_kind,
-             payload.get('corrected_type'),
+             fb_corrected,
              json.dumps(payload.get('corrected_attrs') or {}),
              user_id, user_role, payload.get('confidence'),
-             payload.get('notes'), source_app, context_text, now))
+             fb_notes, source_app, context_text, now))
         fb_id = cur.lastrowid
         c.execute('''INSERT INTO feedback_events
             (ts, feedback_id, kind, obj_ref, kg_code, action, corrected_type,
@@ -647,13 +664,29 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
             VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
             (now, fb_id, 'submit', resolved_obj_ref or obj_ref,
              resolved_kg_code or kg_code, fb_kind,
-             payload.get('corrected_type'),
-             user_id, user_role, role_w, payload.get('notes')))
+             fb_corrected,
+             user_id, user_role, role_w, fb_notes))
         c.commit(); c.close()
-    return {'id': fb_id, 'resolved_obj_ref': resolved_obj_ref,
-            'resolved_kg_code': resolved_kg_code,
-            'resolved_distance_m': resolved_distance_m,
-            'resolution_status': resolution_status}
+    out = {'id': fb_id, 'resolved_obj_ref': resolved_obj_ref,
+           'resolved_kg_code': resolved_kg_code,
+           'resolved_distance_m': resolved_distance_m,
+           'resolution_status': resolution_status,
+           'notes_stored': bool(fb_notes)}
+    # Surface silently-dropped payloads instead of a bare ok:true.
+    warnings = []
+    unknown = [k for k in payload
+               if k not in _KNOWN_FEEDBACK_KEYS]
+    if unknown:
+        warnings.append(f"ignored unknown field(s): {', '.join(sorted(unknown))}")
+    if fb_kind == 'correct_type' and not fb_corrected:
+        warnings.append("kind=correct_type without 'value'/'corrected_type' "
+                        "— no correction recorded")
+    if fb_kind in ('reject', 'report_missing') and not (fb_notes or context_text):
+        warnings.append(f"kind={fb_kind} carries no note/context_text — "
+                        "nothing but the vote was stored")
+    if warnings:
+        out['warnings'] = warnings
+    return out
 
 
 def list_feedback(kg_code=None, user=None, since=None, status='active',

@@ -1924,9 +1924,14 @@ class SearchIndex:
             links['zenodo_light_gpkg'] = d['zenodo_light_gpkg_url']
         if d.get('zenodo_full_gpkg_url'):
             links['zenodo_full_gpkg'] = d['zenodo_full_gpkg_url']
-        if d.get('processed'):
-            links['segment'] = f'{BASE_URL}/api/v1/segment'
-            links['terrain'] = f'{BASE_URL}/api/v1/terrain'
+        # segment/terrain are geometry-driven, not KG-driven: they work on any
+        # Austrian geometry regardless of whether this KG has precomputed
+        # aggregates. Always advertise them, and flag the on-demand case so a
+        # consumer doesn't read processed:0 as "no terrain here".
+        links['segment'] = f'{BASE_URL}/api/v1/segment'
+        links['terrain'] = f'{BASE_URL}/api/v1/terrain'
+        if not d.get('processed'):
+            d['terrain_on_demand'] = True
         return links
 
     # ════════════════════════════════════════════════════════════════

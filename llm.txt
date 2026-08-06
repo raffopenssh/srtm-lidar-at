@@ -306,6 +306,11 @@ Enrich features with DSM/DTM elevation.
 
 #### POST /api/v1/terrain
 Terrain characterisation: slope, aspect, TRI, TPI, curvature.
+Invalid input polygons (self-intersections, ring sets where a hole is emitted
+as the exterior — common with raw cadastre geometry) are repaired server-side
+with make_valid() before rasterising. When that happens the response carries
+meta.geometry_repaired=true and meta.warnings[]. Applies to all
+geometry-driven endpoints (/terrain, /elevation, /segment, /changes*).
 
 #### POST /api/v1/changes
 Temporal change detection between two ALS dates.
@@ -471,8 +476,15 @@ Totals by code/severity/type. Useful for QA dashboards.
 
 #### POST /api/v1/feedback
 User confirms/rejects/corrects an object. Body:
-  {obj_ref, kind: confirm|reject|correct_type, value: <new_type>?,
-   note?, user?}. Resolves matching flags atomically.
+  {obj_ref, kind: confirm|reject|correct_type|report_missing,
+   value|corrected_type: <new_type>?, notes|note?, user?}.
+Both spellings are accepted (`notes`/`note`, `value`/`corrected_type`).
+Resolves matching flags atomically.
+Returns {ok, id, resolved_obj_ref, resolution_status, notes_stored,
+         warnings?}. `warnings` lists silently-ignored fields (unknown keys,
+correct_type without a value, reject/report_missing with no note) — check it
+rather than trusting a bare ok:true.
+`user_role` is server-assigned ('student'); it is not settable by clients.
 
 #### GET /api/v1/feedback/events
 Recent feedback actions (live activity feed).

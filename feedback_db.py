@@ -22,6 +22,7 @@ The schema is built lazily on first use. Cheap migrations only.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -158,20 +159,46 @@ def _conn() -> sqlite3.Connection:
     c.execute('PRAGMA foreign_keys=ON')
     return c
 
+
+@contextlib.contextmanager
+def _conn_ctx():
+    """Connection that is ALWAYS rolled back + closed, even on exception.
+
+    Aug 2026 incident: `write_objects_and_flags` raised mid-write on a
+    duplicate obj_ref and never reached its `c.commit(); c.close()`. The
+    abandoned connection kept an open write transaction inside a long-lived
+    gunicorn worker, so every later feedback write returned
+    "database is locked" until srv was restarted. Any code path that WRITES
+    must go through this.
+    """
+    c = _conn()
+    try:
+        yield c
+        c.commit()
+    except BaseException:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
 _initialised = False
 
 def ensure_schema(force: bool = False):
     global _initialised
     if _initialised and not force: return
-    with _LOCK:
-        c = _conn()
+    with _LOCK, _conn_ctx() as c:
         for stmt in _SCHEMA:
             c.execute(stmt)
         # Cheap migration: add `weight` column to flags if missing.
         cols = {r[1] for r in c.execute('PRAGMA table_info(flags)')}
         if 'weight' not in cols:
             c.execute('ALTER TABLE flags ADD COLUMN weight REAL NOT NULL DEFAULT 1.0')
-        c.commit(); c.close()
     _initialised = True
 
 
@@ -184,8 +211,17 @@ def write_objects_and_flags(objects: list, flags: list, rule_version: str):
         return
     kgs = sorted({o['kg_code'] for o in objects} | {f['kg_code'] for f in flags})
     now = int(time.time())
-    with _LOCK:
-        c = _conn()
+    # A KG JSON can legitimately repeat an obj_ref (split blocks, re-emitted
+    # groups). Last write wins — dedupe here rather than letting the INSERT
+    # blow up mid-transaction.
+    seen_refs = {}
+    for o in objects:
+        seen_refs[o['obj_ref']] = o
+    if len(seen_refs) != len(objects):
+        log.warning('write_objects_and_flags: %d duplicate obj_ref(s) collapsed',
+                    len(objects) - len(seen_refs))
+        objects = list(seen_refs.values())
+    with _LOCK, _conn_ctx() as c:
         # Snapshot existing flag set per KG so we can emit removed/changed events.
         prior = {}
         for kg in kgs:
@@ -254,7 +290,6 @@ def write_objects_and_flags(objects: list, flags: list, rule_version: str):
                 (now, 'removed', key[0], old.get('kg_code') or '', key[1],
                  old.get('severity'), old.get('weight'),
                  old.get('rule_version'), old.get('attrs_json')))
-        c.commit(); c.close()
 
 
 # ---------------------------------------------------------------- reads
@@ -640,8 +675,7 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
     now = int(time.time())
     role_w = {'admin': 5.0, 'trusted': 2.0, 'student': 1.0, 'anon': 0.5}.get(user_role, 1.0)
     fb_kind = payload.get('kind') or 'report'
-    with _LOCK:
-        c = _conn()
+    with _LOCK, _conn_ctx() as c:
         cur = c.execute('''INSERT INTO feedback
             (obj_ref, kg_code, point_lon, point_lat,
              resolved_obj_ref, resolved_kg_code, resolved_distance_m, resolution_status,
@@ -666,7 +700,6 @@ def record_feedback(payload: dict, user_id: str = 'anon', user_role: str = 'stud
              resolved_kg_code or kg_code, fb_kind,
              fb_corrected,
              user_id, user_role, role_w, fb_notes))
-        c.commit(); c.close()
     out = {'id': fb_id, 'resolved_obj_ref': resolved_obj_ref,
            'resolved_kg_code': resolved_kg_code,
            'resolved_distance_m': resolved_distance_m,

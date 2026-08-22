@@ -206,6 +206,24 @@ PREWARM_COP_EMA_MIN = 0.8         # require sub_factor_ema['copernicus'] >=
 PREWARM_CELLS_PER_KG_MAX = 8
 PREWARM_CELLS_PER_KG_MIN = 2
 
+# --- Small-fleet efficiency knobs (2026-08-22) ------------------------
+# Shadow self-park is skipped while the fleet is small: dedicating a
+# whole worker to a standby role costs ~1/N of fleet throughput, which
+# is fine at N=50 but not at N=8. The shadow keeps processing; on
+# promotion it aborts its in-flight KG (tile checkpoints + the chkpt
+# registry make that loss cheap). Above the threshold we return to the
+# conservative park-the-shadow behaviour.
+SHADOW_PARK_MIN_FLEET = 12   # park shadow only when enabled workers >= this
+# Cache-only mix-in: when cache-ready KGs accumulate, reserve a slice
+# of the fleet for cache-only work instead of letting the parallel-
+# frontier orchestrator absorb every peer. Only binds when peer count
+# (not credential capacity) is the frontier ceiling — i.e. exactly the
+# small-fleet regime; at scale creds bind first and the reservation is
+# a no-op, so this stays scale-ready.
+CACHE_MIX_MIN_READY = 20     # reserve only when cache_ready_kgs >= this
+CACHE_MIX_FRAC = 0.25        # fraction of enabled peers reserved
+CACHE_MIX_MAX_RESERVE = 8    # cap so big fleets still favour frontiers
+
 # Per-peer circuit breaker. Each peer has a (failure_count, open_until)
 # tuple. After CB_OPEN_THRESHOLD consecutive failures across *any*
 # director-outbound HTTP call, the peer is skipped for CB_OPEN_SECONDS
@@ -5218,7 +5236,16 @@ class PeerDirector:
         if me != 'primary':
             targets[me] = 'director'
         if shadow and shadow != 'primary' and shadow != me:
-            targets[shadow] = 'shadow'
+            # Small-fleet exception (2026-08-22): with only a handful
+            # of workers, parking the shadow costs a full processing
+            # slot for a role that is pure standby. Let it process;
+            # the snapshot push is cheap and a promotion just aborts
+            # its in-flight KG (checkpoints make that loss small).
+            n_workers = sum(1 for p in (self.cfg.get('peers') or [])
+                            if p.get('enabled', True)
+                            and p.get('id') != 'primary')
+            if n_workers >= SHADOW_PARK_MIN_FLEET:
+                targets[shadow] = 'shadow'
         # Note: empty targets is fine and falls through to the cleanup
         # loop below — we still want to release ex-directors / ex-shadows
         # whose pinned_role was set by a previous tick but never cleared.
@@ -9748,6 +9775,62 @@ class PeerDirector:
                     'state': ps.get('state', 'unknown'),
                     'needs_stop_cache_only': is_running and is_cache_only_run,
                 })
+
+        # Cache-mix reservation (2026-08-22): when cache-ready KGs have
+        # accumulated, keep a slice of the fleet free for cache-only
+        # work instead of promoting every last peer to frontier. This
+        # only binds when total_enabled (not cred capacity) is the
+        # frontier ceiling — the small-fleet regime. Never trims below
+        # what's already running (active + running frontiers), so it
+        # drains via natural KG-boundary churn, not hard stops.
+        try:
+            _cache_ready_n = len(self._compute_cache_ready_kgs() or [])
+        except Exception:
+            _cache_ready_n = 0
+        if _cache_ready_n >= CACHE_MIX_MIN_READY:
+            _reserve = min(CACHE_MIX_MAX_RESERVE,
+                           max(1, int(round(total_enabled * CACHE_MIX_FRAC))))
+            _running_total = ((1 if active_id else 0)
+                              + len(set(running) | set(retained_unreachable)))
+            _target_cap = max(1, total_enabled - min_reserve - _reserve)
+            _cap_frontier = max(_running_total, _target_cap)
+            if max_par > _cap_frontier:
+                log.info('cache-mix: %d cache-ready KGs — reserving %d '
+                         'peer(s) for cache-only; max_parallel_frontiers '
+                         '%d → %d', _cache_ready_n, _reserve,
+                         max_par, _cap_frontier)
+                max_par = _cap_frontier
+            # Gentle drain: frontier processors run indefinitely, so an
+            # over-cap fleet never converges on its own. Gracefully stop
+            # at most ONE excess parallel frontier per tick (noisiest
+            # first, never the active, never a retained-unreachable) —
+            # it finishes its current KG, stops, and the cache-only
+            # orchestrator picks it up on a later tick. The floor above
+            # keeps its cred/strip plan intact while it drains.
+            _excess_fr = _running_total - _target_cap
+            if _excess_fr > 0 and running:
+                _drain_order = sorted(
+                    running,
+                    key=lambda pid: (-_peer_noise_score(pid, state_copy),
+                                     pid))
+                _now_ts = time.time()
+                for _pid in _drain_order:
+                    if _now_ts - _LAST_GRACEFUL_STOP_TS.get(_pid, 0) < 600:
+                        continue
+                    _pr = get_peer_by_id(cfg, _pid)
+                    if not _pr:
+                        continue
+                    try:
+                        stop_peer_processor(_pr.get('url'), graceful=True)
+                        _LAST_GRACEFUL_STOP_TS[_pid] = _now_ts
+                        log.info('cache-mix: gracefully draining frontier '
+                                 '%s (excess %d over target %d) — will '
+                                 'flip to cache-only after current KG',
+                                 _pid, _excess_fr, _target_cap)
+                    except Exception as _e:
+                        log.warning('cache-mix drain of %s failed: %s',
+                                    _pid, _e)
+                    break  # one per tick
 
         # Slot budget = max_par - 1 (subtract active). Also keep reserve.
         slack = max(0, total_enabled - (1 if active_id else 0)

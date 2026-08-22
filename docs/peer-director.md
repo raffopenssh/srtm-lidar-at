@@ -684,6 +684,29 @@ free disk and ≥ 10 GB remaining bandwidth**. Sticky: keeps the current
 shadow unless the noise-score gap to the best alternative exceeds 0.3.
 The director PUTs a full state snapshot to the shadow every 30 s.
 
+**Small-fleet shadow (2026-08-22)**: `_enforce_director_self_park` only
+role-parks the shadow when the fleet has ≥ `SHADOW_PARK_MIN_FLEET` (12)
+enabled non-primary workers. Below that, dedicating a whole worker to a
+pure-standby role costs ~1/N of fleet throughput, so the shadow keeps
+processing (frontier or cache-only). On promotion it aborts its
+in-flight KG — tile checkpoints + the cross-peer chkpt registry make
+that loss cheap. The active director still self-parks at any scale
+(fanout BW cost is real). Above the threshold, behaviour reverts to
+parking both director and shadow.
+
+**Cache-mix reservation (2026-08-22)**: when `cache_ready_kgs ≥
+CACHE_MIX_MIN_READY` (20), `_orchestrate_parallel_frontiers` caps
+frontier count at `total_enabled − min_reserve − reserve` where
+`reserve = min(CACHE_MIX_MAX_RESERVE=8, round(total_enabled ×
+CACHE_MIX_FRAC=0.25))`, so accumulated cache-only work drains in
+parallel instead of every peer being absorbed by the frontier. Only
+binds in the small-fleet regime where peer count (not credential
+capacity) is the frontier ceiling — at scale creds bind first and the
+reservation is a no-op. Over-cap fleets converge via a gentle drain:
+at most ONE excess parallel frontier per tick gets a graceful stop
+(noisiest first, 10 min re-send guard); it finishes its current KG and
+the cache-only orchestrator picks it up on a later tick.
+
 **Snapshot contents** (small JSON, ~200 KB total): `director_state.json`,
 `kg_strikes.json`, `failure_counts.json`, `cache_miss_kgs.json`,
 `deferred_kgs.json`, `retry_queue.json`, `failed_kgs.json`,

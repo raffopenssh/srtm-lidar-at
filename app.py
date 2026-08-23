@@ -14135,8 +14135,48 @@ def _tree_v2_params(params):
         'smooth_sigma': float(params.get('smooth_sigma', tv.DEFAULT_SMOOTH_SIGMA)),
         'crown_cap_factor': float(params.get('crown_cap_factor', tv.DEFAULT_CROWN_CAP_FACTOR)),
         'max_crown_area': float(params.get('max_crown_area', tv.DEFAULT_MAX_CROWN_AREA)),
+        'min_apex_prominence_m': float(params.get('min_apex_prominence_m',
+                                                  tv.DEFAULT_MIN_APEX_PROMINENCE_M)),
+        'leaf_type_min_conf': float(params.get('leaf_type_min_conf', 0.5)),
+        'h_dom_basis': str(params.get('h_dom_basis', 'canopy')).lower(),
     }
     return eff
+
+
+def _tree_v2_ortho_meta(data, year=None):
+    """Best-effort provenance of the orthophoto that feeds vitality (Q7.3).
+
+    Reports the RGBI operates whose bbox covers the AOI in preference
+    order (the mosaic reads them newest-first until coverage completes).
+    """
+    try:
+        import ortho_io, pyproj
+        tf = data['transform']; h, w = data['shape']; res = abs(tf.a)
+        min_e, max_n = tf.c, tf.f
+        max_e, min_n = min_e + w * res, max_n - h * res
+        tx = pyproj.Transformer.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+        lon_min, lat_min = tx.transform(min_e, min_n)
+        lon_max, lat_max = tx.transform(max_e, max_n)
+        ops = ortho_io.find_rgbi_operates(lat_min, lon_min, lat_max, lon_max,
+                                          year=year)
+        if not ops:
+            return {'ortho_source': 'DOP 50km fallback (RGB only, no NIR)'}
+        infos = []
+        for opid in ops[:4]:
+            info = ortho_io.RGBI_OPERATES.get(opid, {})
+            infos.append({'operate_id': opid,
+                          'flight_year': int(opid[:4]),
+                          'series': info.get('series')})
+        return {
+            'ortho_operates': infos,
+            'ortho_epoch': infos[0]['flight_year'],
+            'ortho_operate_id': infos[0]['operate_id'],
+            'ortho_note': ('mosaic reads operates newest-first until AOI '
+                           'coverage completes; first entry dominates. '
+                           'Operate flight month/day not published by BEV.'),
+        }
+    except Exception as e:
+        return {'ortho_source': f'unknown ({e})'}
 
 
 def _tree_v2_inventory(data, eff, include_ortho, task_id):
@@ -14158,6 +14198,8 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
         a=eff['crown_radius_a'], b=eff['crown_radius_b'],
         smooth_sigma=eff['smooth_sigma'], cap_factor=eff['crown_cap_factor'],
         max_crown_area=eff['max_crown_area'],
+        min_apex_prominence=eff.get('min_apex_prominence_m', 0.0),
+        leaf_type_min_conf=eff.get('leaf_type_min_conf', 0.5),
         spectral=spectral, nir=nir)
     return trees, labels, canopy, (rgb is not None), (nir is not None)
 
@@ -14174,6 +14216,7 @@ def _tree_v2_feature(t, geom_out):
         'dbh_est_cm': t.dbh_est_cm, 'dbh_method': 'heuristic_h_crown',
         'volume_m3_est': t.volume_m3_est,
         'leaf_type': t.leaf_type, 'leaf_type_conf': t.leaf_type_conf,
+        'leaf_type_prob_conifer': t.leaf_type_prob_conifer,
         'vitality': t.vitality, 'vitality_conf': t.vitality_conf,
     }
     props.update(t.spectral)
@@ -14218,7 +14261,10 @@ def _trees_v2_core(task_id, features, params):
         tree_features.append(_tree_v2_feature(t, geom_out))
 
     summary = tv.summarise(trees, canopy, data['mask'], data['transform'],
-                           geom_3035.area)
+                           geom_3035.area, ndsm=data['ndsm'],
+                           h_dom_basis=eff.get('h_dom_basis', 'canopy'))
+    import als_acquisition
+    acq = als_acquisition.lookup(geom_3035, dataset)
     eff_meta = dict(eff, dataset=dataset, crown_geometry=crown_geometry,
                     include_ortho=include_ortho)
     return {
@@ -14228,8 +14274,14 @@ def _trees_v2_core(task_id, features, params):
             'tree_algo_version': tv.TREE_ALGO_VERSION,
             'params_hash': tv.params_hash(eff_meta),
             'algorithm': 'marker_watershed_variable_window',
+            'acquisition': acq,
             'ortho_used': ortho_used, 'nir_used': nir_used,
-            'vitality_note': ('NDVI-based (real NIR)' if nir_used else
+            **(_tree_v2_ortho_meta(data) if ortho_used else {}),
+            'vitality_note': ('NDVI anomaly within leaf-type population '
+                              '(stressed = <= p10 in AOI); dead = absolute '
+                              'NDVI < 0.15. Raw ndvi_percentile_in_aoi per '
+                              'tree for client-side thresholds.'
+                              if nir_used else
                               'unknown — no NIR coverage for this AOI/epoch'),
             'processing_time_s': round(time.time() - t0, 2),
             **eff_meta,
@@ -14285,14 +14337,25 @@ def _changes_trees_v2_core(task_id, features, params):
                           match_radius_m=match_radius_m,
                           felling_min_drop_m=felling_min_drop_m,
                           growth_eps_m=growth_eps_m,
-                          a=eff['crown_radius_a'], b=eff['crown_radius_b'])
+                          a=eff['crown_radius_a'], b=eff['crown_radius_b'],
+                          labels_a=labels_a, labels_b=labels_b)
 
-    days = None
+    # Q1: real acquisition dates. The BEV ALS folders are national mosaic
+    # snapshots, NOT flight dates — normalise growth by the per-block
+    # flight years when known.
+    import als_acquisition
+    acq_a = als_acquisition.lookup(geom_3035, date_a)
+    acq_b = als_acquisition.lookup(geom_3035, date_b)
+    days_nominal = None
     try:
-        days = (_dt.strptime(date_b, _TREE_V2_DATE_FMT)
-                - _dt.strptime(date_a, _TREE_V2_DATE_FMT)).days
+        days_nominal = (_dt.strptime(date_b, _TREE_V2_DATE_FMT)
+                        - _dt.strptime(date_a, _TREE_V2_DATE_FMT)).days
     except Exception:
         pass
+    days_effective = als_acquisition.effective_days(acq_a, acq_b)
+    same_flight_epoch = days_effective == 0
+    growth_is_nominal = days_effective is None or days_effective <= 0
+    days = days_nominal if growth_is_nominal else days_effective
     years = (days / 365.25) if days else None
 
     crowns_b = crowns_a = {}
@@ -14342,12 +14405,14 @@ def _changes_trees_v2_core(task_id, features, params):
         min_tree_height=eff['min_tree_height'], min_patch_sqm=min_patch_sqm)
     patch_features = []
     felled_area = 0.0
-    felled_volume = 0.0
+    felled_volume_patch = 0.0
     for p in patches:
         felled_area += p['area_sqm']
-        # rough standing volume estimate on the patch: mean canopy height
-        # before x area x 0.5 packing x 0.42 form → conservative m³
-        felled_volume += p['area_sqm'] * p['height_a_mean_m'] * 0.21 / 10.0
+        # patch-derived standing-volume proxy (stand-level yield rule):
+        # Vorrat [m³/ha] ≈ 16 × mean canopy height [m] for spruce-dominated
+        # stands → vol = area_ha × h_before × 16. Reported separately as
+        # felled_volume_m3_patch — NOT a per-tree sum (Q2).
+        felled_volume_patch += (p['area_sqm'] / 1e4) * p['height_a_mean_m'] * 16.0
         patch_features.append({'type': 'Feature', 'properties': {
             'area_sqm': p['area_sqm'], 'drop_mean_m': p['drop_mean_m'],
             'drop_max_m': p['drop_max_m'],
@@ -14358,6 +14423,12 @@ def _changes_trees_v2_core(task_id, features, params):
     for f in tree_features:
         s = f['properties']['status']
         by_status[s] = by_status.get(s, 0) + 1
+
+    # Q2: felled volume = sum of per-tree allometric volumes over
+    # status=felled (same allometry as /v2/trees).
+    felled_volume_trees = round(sum(
+        f['properties'].get('volume_m3_est') or 0.0
+        for f in tree_features if f['properties']['status'] == 'felled'), 1)
 
     gr = np.array(growth_rates, dtype=np.float32)
     growth_pct = {}
@@ -14379,17 +14450,52 @@ def _changes_trees_v2_core(task_id, features, params):
             'n_records': len(tree_features),
             'n_trees_a': len(trees_a), 'n_trees_b': len(trees_b),
             'felled_area_sqm': round(felled_area, 1),
-            'felled_volume_m3_est': round(felled_volume, 1),
+            'felled_volume_m3_est': felled_volume_trees,
+            'felled_volume_m3_est_note': ('sum of per-tree volume_m3_est '
+                                          'over status=felled (same '
+                                          'allometry as /v2/trees)'),
+            'felled_volume_m3_patch': round(felled_volume_patch, 1),
+            'felled_volume_m3_patch_note': (
+                'patch-derived proxy: area_ha x height_before_mean_m x '
+                '16 m3/ha per metre of stand height (spruce yield rule of '
+                'thumb); independent of tree segmentation'),
             'felled_note': ('felled requires raster veto: nDSM(3 m radius, '
                             f'date_b) dropped >= {felling_min_drop_m} m AND '
-                            '< 40% of date_a height; failures are unmatched_a'),
+                            '< 40% of date_a height; failures are sub-'
+                            'classified unmatched_a_canopy_intact (canopy '
+                            'still standing - matching failure, not a '
+                            'loss), unmatched_a_partial_drop (crown break/'
+                            'damage), unmatched_a_ambiguous'),
             'growth_cm_yr_percentiles': growth_pct,
+            'growth_cm_yr_is_nominal': growth_is_nominal,
+            'growth_cm_yr_note': (
+                ('WARNING: both epochs were flown in the same year(s) per '
+                 'the BEV flight-block overlay - the rasters are likely '
+                 'the SAME acquisition republished; height changes are '
+                 'processing noise, not growth')
+                if same_flight_epoch else
+                ('normalised by nominal mosaic dates - REAL flight dates '
+                 'unknown for this AOI; treat rates as "per nominal epoch"')
+                if growth_is_nominal else
+                (f'normalised by effective acquisition span '
+                 f'({days_effective} days from per-block flight years, '
+                 f'mid-year assumption) - NOT the nominal '
+                 f'{days_nominal}-day mosaic span')),
         },
-        'epoch_dates': {'a': date_a, 'b': date_b, 'days': days},
+        'epoch_dates': {'a': date_a, 'b': date_b, 'days': days,
+                        'days_nominal': days_nominal,
+                        'days_effective': days_effective,
+                        'same_flight_epoch': same_flight_epoch},
         'meta': {
             'tree_algo_version': tv.TREE_ALGO_VERSION,
             'params_hash': tv.params_hash(eff_meta),
+            'acquisition': {'a': acq_a, 'b': acq_b,
+                            'note': ('BEV ALS folders are national mosaic '
+                                     'snapshots, not flight dates; per-'
+                                     'block Flugjahr from the BEV '
+                                     '"Aktualitaet DGM - ALS" overlay')},
             'ortho_used': ortho_used, 'nir_used': nir_used,
+            **(_tree_v2_ortho_meta(data_b) if ortho_used else {}),
             'processing_time_s': round(time.time() - t0, 2),
             **eff_meta,
             **params.get('_geometry_meta', {}),
@@ -14397,43 +14503,97 @@ def _changes_trees_v2_core(task_id, features, params):
     }
 
 
-def _trees_v2_by_polygons_core(task_id, features, params):
-    """POST /api/v2/trees/by-polygons — per-stand batch inventory.
+def _tree_v2_prepare_stands(features, params, warnings):
+    """Shared stand prep for the by-polygons endpoints (Q9).
 
-    Computes the inventory ONCE on the union raster, then assigns trees to
-    stands by apex containment (no double counting at boundaries).
+    Handles: null keys -> key: null + warning; merge_by_key=true merges
+    multipart stands (n_parts); duplicate-key flags; overlap diagnostics.
     """
-    import tree_inventory as tv
     from shapely.ops import unary_union
-    from shapely.strtree import STRtree
-    from rasterio.features import geometry_mask
-    t0 = time.time()
-    dataset = params.get('dataset', ti.DEFAULT_DATASET)
-    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
-    include_trees = str(params.get('include_trees', 'false')).lower() in ('true', '1', 'yes')
     key_prop = str(params.get('key_property', 'name'))
-    eff = _tree_v2_params(params)
+    merge_by_key = str(params.get('merge_by_key', 'false')).lower() in ('true', '1', 'yes')
 
     if not features:
         raise ValueError('No stand polygons provided')
     stands = []
     for i, f in enumerate(features):
         props = f.get('properties', {}) or {}
-        key = str(props.get(key_prop) or props.get('name') or f'stand_{i+1}')
+        raw = props.get(key_prop, props.get('name'))
+        if raw is None or (isinstance(raw, str) and
+                           raw.strip().lower() in ('', 'none', 'null')):
+            key = None
+            warnings.append(f'feature {i}: missing/null key property '
+                            f'{key_prop!r} - returned as key: null')
+        else:
+            key = str(raw)
         g3035 = ti.geometry_to_3035(f['geometry'])
-        stands.append({'key': key, 'geom': g3035, 'props': props})
+        if not g3035.is_valid:
+            g3035 = g3035.buffer(0)
+        stands.append({'key': key, 'feature_index': i, 'geom': g3035,
+                       'props': props, 'n_parts': 1})
+
+    if merge_by_key:
+        by_key = {}
+        order = []
+        for s in stands:
+            k = s['key']
+            if k not in by_key:
+                by_key[k] = []
+                order.append(k)
+            by_key[k].append(s)
+        merged = []
+        for k in order:
+            grp = by_key[k]
+            if len(grp) == 1:
+                merged.append(grp[0])
+            else:
+                merged.append({'key': k, 'feature_index': grp[0]['feature_index'],
+                               'geom': unary_union([g['geom'] for g in grp]),
+                               'props': grp[0]['props'], 'n_parts': len(grp)})
+        stands = merged
+    else:
+        seen = {}
+        for s in stands:
+            seen[s['key']] = seen.get(s['key'], 0) + 1
+        for s in stands:
+            if seen[s['key']] > 1:
+                s['key_is_duplicate'] = True
+
+    # overlap diagnostics (owner-drawn stand maps overlap; Q9.4)
+    n_overlap_pairs = 0
+    overlap_area = 0.0
+    try:
+        from shapely.strtree import STRtree
+        geoms = [s['geom'] for s in stands]
+        tree = STRtree(geoms)
+        seen_pairs = set()
+        for i, g in enumerate(geoms):
+            for j in tree.query(g):
+                j = int(j)
+                if j <= i:
+                    continue
+                inter = g.intersection(geoms[j])
+                if inter.area > 1.0:
+                    seen_pairs.add((i, j))
+                    overlap_area += inter.area
+        n_overlap_pairs = len(seen_pairs)
+    except Exception:
+        pass
 
     union = unary_union([s['geom'] for s in stands])
-    _validate_area(union)
+    diagnostics = {
+        'union_area_ha': round(union.area / 1e4, 3),
+        'sum_area_ha': round(sum(s['geom'].area for s in stands) / 1e4, 3),
+        'n_overlapping_pairs': n_overlap_pairs,
+        'overlap_area_ha': round(overlap_area / 1e4, 3),
+    }
+    return stands, union, key_prop, merge_by_key, diagnostics
 
-    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset} '
-                                    f'({len(stands)} stands, union raster)…')
-    data = raster_io.read_dtm_dsm(union, dataset=dataset)
-    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
-        data, eff, include_ortho, task_id)
 
-    _progress_set(task_id, 'assign', 'Assigning trees to stands…')
-    stand_geoms = [s['geom'] for s in stands]
+def _tree_v2_assign(stands, trees):
+    """Apex-containment assignment (no double counting at boundaries...
+    unless stands themselves overlap, which the diagnostics expose)."""
+    from shapely.strtree import STRtree
     tree_pts = [Point(t.apex_e, t.apex_n) for t in trees]
     tree_kd = STRtree(tree_pts) if tree_pts else None
     assigned = {}
@@ -14444,6 +14604,36 @@ def _trees_v2_by_polygons_core(task_id, features, params):
                 if s['geom'].contains(tree_pts[int(ti_)]):
                     idxs.append(int(ti_))
         assigned[si] = idxs
+    return assigned
+
+
+def _trees_v2_by_polygons_core(task_id, features, params):
+    """POST /api/v2/trees/by-polygons — per-stand batch inventory.
+
+    Computes the inventory ONCE on the union raster, then assigns trees to
+    stands by apex containment (no double counting at boundaries).
+    """
+    import tree_inventory as tv
+    from rasterio.features import geometry_mask
+    t0 = time.time()
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+    include_trees = str(params.get('include_trees', 'false')).lower() in ('true', '1', 'yes')
+    eff = _tree_v2_params(params)
+
+    warnings = []
+    stands, union, key_prop, merge_by_key, diag = _tree_v2_prepare_stands(
+        features, params, warnings)
+    _validate_area(union)
+
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset} '
+                                    f'({len(stands)} stands, union raster)…')
+    data = raster_io.read_dtm_dsm(union, dataset=dataset)
+    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
+        data, eff, include_ortho, task_id)
+
+    _progress_set(task_id, 'assign', 'Assigning trees to stands…')
+    assigned = _tree_v2_assign(stands, trees)
 
     # per-stand canopy area from the shared canopy raster
     results = []
@@ -14451,10 +14641,18 @@ def _trees_v2_by_polygons_core(task_id, features, params):
         smask = geometry_mask([mapping(s['geom'])], out_shape=data['shape'],
                               transform=data['transform'], invert=True)
         s_canopy = canopy & smask & data['mask']
+        s_ndsm = np.where(smask, data['ndsm'], np.nan)
         s_trees = [trees[i] for i in assigned[si]]
         summary = tv.summarise(s_trees, s_canopy, data['mask'],
-                               data['transform'], s['geom'].area)
-        entry = {'key': s['key'], 'summary': summary}
+                               data['transform'], s['geom'].area,
+                               ndsm=s_ndsm,
+                               h_dom_basis=eff.get('h_dom_basis', 'canopy'))
+        entry = {'key': s['key'], 'feature_index': s['feature_index'],
+                 'summary': summary}
+        if s.get('n_parts', 1) > 1:
+            entry['n_parts'] = s['n_parts']
+        if s.get('key_is_duplicate'):
+            entry['key_is_duplicate'] = True
         if include_trees:
             entry['trees'] = [
                 _tree_v2_feature(t, mapping(ti.geometry_from_3035(
@@ -14464,24 +14662,127 @@ def _trees_v2_by_polygons_core(task_id, features, params):
         _progress_set(task_id, 'assign',
                       f'Summarised stand {si+1}/{len(stands)}…')
 
-    eff_meta = dict(eff, dataset=dataset, include_ortho=include_ortho)
+    import als_acquisition
+    acq = als_acquisition.lookup(union, dataset)
+    eff_meta = dict(eff, dataset=dataset, include_ortho=include_ortho,
+                    merge_by_key=merge_by_key)
     return {
         'stands': results,
         'summary': {
             'n_stands': len(stands),
             'n_trees_total': len(trees),
             'n_trees_assigned': sum(len(v) for v in assigned.values()),
-            'union_area_ha': round(union.area / 1e4, 3),
+            **diag,
         },
+        'warnings': warnings,
         'meta': {
             'tree_algo_version': tv.TREE_ALGO_VERSION,
             'params_hash': tv.params_hash(eff_meta),
             'key_property': key_prop,
+            'acquisition': acq,
             'ortho_used': ortho_used, 'nir_used': nir_used,
+            **(_tree_v2_ortho_meta(data) if ortho_used else {}),
             'processing_time_s': round(time.time() - t0, 2),
             **eff_meta,
         },
     }
+
+
+def _changes_trees_v2_by_polygons_core(task_id, features, params):
+    """POST /api/v2/changes/trees/by-polygons — per-stand growth+mortality.
+
+    Runs the full two-epoch change analysis ONCE on the union raster,
+    then buckets the per-tree change records into stands by apex
+    containment (apex_b preferred, apex_a fallback). Q9.5.
+    """
+    import tree_inventory as tv
+    t0 = time.time()
+    include_records = str(params.get('include_records', 'false')).lower() in ('true', '1', 'yes')
+
+    warnings = []
+    stands, union, key_prop, merge_by_key, diag = _tree_v2_prepare_stands(
+        features, params, warnings)
+    _validate_area(union)
+
+    # Reuse the single-AOI changes core on the union geometry.
+    union_feat = [{'type': 'Feature', 'properties': {},
+                   'geometry': ti.geometry_from_3035(union)}]
+    changes = _changes_trees_v2_core(task_id, union_feat, dict(params))
+
+    _progress_set(task_id, 'assign', 'Assigning change records to stands…')
+    from shapely.strtree import STRtree
+    recs = changes['features']
+    pts = []
+    for f in recs:
+        p = f['properties']
+        # prefer epoch-b apex (survivors/new), fall back to epoch-a (felled)
+        lon = p.get('apex_b_lon', p.get('apex_a_lon'))
+        lat = p.get('apex_b_lat', p.get('apex_a_lat'))
+        g = ti.geometry_to_3035(Point(lon, lat))
+        pts.append(g)
+    kd = STRtree(pts) if pts else None
+    per_stand = {si: [] for si in range(len(stands))}
+    for si, s in enumerate(stands):
+        if kd is None:
+            continue
+        for i in kd.query(s['geom']):
+            if s['geom'].contains(pts[int(i)]):
+                per_stand[si].append(int(i))
+
+    growth_keys = ('grown', 'stable', 'shrunk')
+    results = []
+    for si, s in enumerate(stands):
+        idx = per_stand[si]
+        by_status = {}
+        growth = []
+        felled_vol = 0.0
+        felled_n = 0
+        for i in idx:
+            p = recs[i]['properties']
+            st = p['status']
+            by_status[st] = by_status.get(st, 0) + 1
+            if st in growth_keys and p.get('growth_cm_yr') is not None:
+                growth.append(p['growth_cm_yr'])
+            if st == 'felled':
+                felled_n += 1
+                felled_vol += p.get('volume_m3_est') or 0.0
+        garr = np.array(growth, dtype=np.float32)
+        gsum = {}
+        if len(garr):
+            gsum = {f'p{q}': round(float(np.percentile(garr, q)), 1)
+                    for q in (10, 50, 90)}
+        entry = {
+            'key': s['key'], 'feature_index': s['feature_index'],
+            'summary': {
+                'n_records': len(idx),
+                'by_status': by_status,
+                'area_ha_total': round(s['geom'].area / 1e4, 3),
+                'growth_cm_yr_percentiles': gsum,
+                'felled_volume_m3_est': round(felled_vol, 1),
+                'mortality_pct': round(100.0 * felled_n /
+                                       max(1, sum(by_status.get(k, 0)
+                                                  for k in growth_keys) + felled_n), 2),
+            },
+        }
+        if s.get('n_parts', 1) > 1:
+            entry['n_parts'] = s['n_parts']
+        if s.get('key_is_duplicate'):
+            entry['key_is_duplicate'] = True
+        if include_records:
+            entry['records'] = [recs[i] for i in idx]
+        results.append(entry)
+
+    out = {
+        'stands': results,
+        'summary': {**changes['summary'], 'n_stands': len(stands), **diag},
+        'warnings': warnings,
+        'epoch_dates': changes['epoch_dates'],
+        'felling_patches': changes['felling_patches'],
+        'meta': {**changes['meta'], 'key_property': key_prop,
+                 'merge_by_key': merge_by_key,
+                 'processing_time_s': round(time.time() - t0, 2)},
+    }
+    return out
 
 
 @app.route('/api/v2/trees', methods=['POST'])
@@ -14502,9 +14803,16 @@ def trees_inventory_v2():
 def changes_trees_v2():
     """Apex-matched tree change detection with raster veto + felling patches.
 
-    Statuses: stable|grown|shrunk|felled|new|unmatched_a|unmatched_b.
+    Two-pass matching: apex nearest-neighbour, then crown-overlap (>=30% of smaller crown)
+    for apex-unmatched trees (match_method: apex|crown|none). Statuses:
+    stable|grown|shrunk|felled|new|unmatched_a_canopy_intact|
+    unmatched_a_partial_drop|unmatched_a_ambiguous|
+    unmatched_b_canopy_preexisting.
     'felled' and 'new' are gated by raw-nDSM evidence at the apex, so
     segmentation churn produces honest 'unmatched' instead of false felling.
+    growth_cm_yr uses REAL per-block acquisition dates when known
+    (meta.acquisition, epoch_dates.days_effective); otherwise
+    growth_cm_yr_is_nominal=true.
     Params: date_a, date_b, match_radius_m, felling_min_drop_m, growth_eps_m,
     min_patch_sqm, + all /api/v2/trees params.
     """
@@ -14552,6 +14860,19 @@ def trees_by_polygons_v2():
     id property, default 'name'), include_trees, + /api/v2/trees params.
     """
     return _tree_endpoint(_trees_v2_by_polygons_core, geometry_fn=_get_geometry_multi)
+
+
+@app.route('/api/v2/changes/trees/by-polygons', methods=['POST'])
+def changes_trees_by_polygons_v2():
+    """Per-stand growth + mortality in one call (Q9.5): FeatureCollection
+    of stand polygons in, per-stand change summaries out (by_status,
+    growth percentiles, felled volume, mortality_pct). Change analysis
+    runs once on the union raster; records bucketed by apex containment.
+    Params: key_property, merge_by_key, include_records, + all
+    /api/v2/changes/trees params (date_a, date_b, ...).
+    """
+    return _tree_endpoint(_changes_trees_v2_by_polygons_core,
+                          geometry_fn=_get_geometry_multi)
 
 
 # === SECTION: Multi-epoch summary ===

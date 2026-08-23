@@ -376,65 +376,131 @@ Params:
   max_crown_area     m² hard cap per crown (default 250)
   crown_geometry     polygon (default) | point
   include_ortho      true (default) — 0.2 m RGBI spectra when covered
+  min_apex_prominence_m  m (default 0 = off) — filter apices by h-maxima
+                     prominence; suppresses branch-level false apices
+  leaf_type_min_conf 0..1 (default 0.5) — below this leaf_type='unknown'
+  h_dom_basis        canopy (default) | total — area basis for h_dom
   async              recommended for areas > ~50 ha
 Per-tree properties: tree_id (STABLE, location-derived: t_<E_dm>_<N_dm>,
 EPSG:3035 apex rounded to 1 dm — deterministic across re-runs and epochs),
 seq, apex_lon/apex_lat (the local maximum, for field navigation), height_m
 (raw nDSM at apex), crown_area_sqm, crown_radius_mean_m/max_m, is_edge
 (crown touches AOI boundary — exclude from density), dbh_est_cm +
-dbh_method (heuristic), volume_m3_est, leaf_type + leaf_type_conf,
-vitality (vital|stressed|dead|unknown) + vitality_conf (NDVI-based; only
-trustworthy when meta.nir_used=true), ndvi_mean/ndvi_p10/nir_mean/
+dbh_method (heuristic), volume_m3_est, leaf_type + leaf_type_conf +
+leaf_type_prob_conifer (raw probability — re-threshold client-side),
+vitality (vital|stressed|dead|unknown) + vitality_conf. Vitality is
+RELATIVE: 'stressed' = NDVI <= p10 within the AOI's same-leaf-type
+population (per-tree spectral.ndvi_percentile_in_aoi lets you re-cut);
+'dead' stays absolute (ndvi_mean<0.15 & ndvi_p10<0.10 & h>=5). Only
+trustworthy when meta.nir_used=true. Also ndvi_mean/ndvi_p10/nir_mean/
 brightness_mean (when spectra available).
 Summary (explicit denominators): n_trees, n_trees_edge, area_ha_total,
 area_ha_canopy (nDSM >= min_tree_height), stems_per_ha_canopy,
-stems_per_ha_total (both non-edge only), h_mean_m, h_p50/p90/p95/max_m,
-h_dom_m (mean of 100 tallest per ha over TOTAL area; see h_dom_note),
-crown_area_total_sqm, crown_cover_pct_canopy, crown_cover_pct_total,
-height_histogram_2m (2 m bins), by_leaf_type, by_vitality,
-volume_m3_est_total.
+stems_per_ha_total (both non-edge only), h_mean_m, h_p50/p90/p95/p99/max_m,
+h_dom_m (mean of 100 tallest per ha over CANOPY area by default — see
+h_dom_basis/h_dom_note), h_top100_m (tallest stem per 100 m grid cell,
+robust moving-hectare Oberhöhe), crown_area_total_sqm,
+crown_cover_pct_canopy, crown_cover_pct_total, height_histogram_2m (2 m
+bins, STEMS — detection-biased below ~10 m under closed canopy),
+layer_profile_2m (nDSM PIXEL heights in 2 m bins — use for structure/
+plenter tests), canopy_gap_fraction (share of AOI pixels 2–10 m — where
+low stems are actually visible to first-return DSM), understory_detectable
+(always false: suppressed stems below dominant layer are invisible to a
+1 m first-return DSM — see detection_floor_note), by_leaf_type,
+by_vitality, volume_m3_est_total, volume_method (full allometry formula +
+known bias; generic spruce heuristic, NOT Pollanschütz — calibration
+against plot data available on request).
 meta: tree_algo_version, params_hash (deterministic over effective params
 — same params → same result; invalidate caches when tree_algo_version
-changes), all effective parameters echoed.
+changes), acquisition (REAL flight years per BEV flight-block overlay:
+blocks[{flugjahr, year_from/to, gebiet, coverage_frac}], effective_date —
+the folder date 20220915 etc. is a mosaic snapshot, NOT the flight date;
+e.g. Steiermark '20220915' was flown 2010), ortho_operates/ortho_epoch
+(which RGBI operate fed the spectra), all effective parameters echoed.
 
 #### POST /api/v2/changes/trees
 Apex-matched change detection that survives re-segmentation.
-Matching: greedy nearest-neighbour on APEX points, radius
-max(match_radius_m, 0.75*r(h)). Raster veto: 'felled' requires max nDSM in
-3 m radius at date_b to have dropped >= felling_min_drop_m AND be < 40% of
-date_a height — otherwise the record is 'unmatched_a' (honest, not false
-felling). 'new' requires date_a nDSM < max(3 m, 30% of date_b height),
-else 'unmatched_b'.
-Statuses: stable | grown | shrunk | felled | new | unmatched_a | unmatched_b.
+Matching pass 1: greedy nearest-neighbour on APEX points, radius
+max(match_radius_m, 0.75*r(h)). Pass 2: apex-unmatched trees whose crown
+masks overlap >= 30% of the smaller crown across epochs are the same tree
+(apex jumped to another branch) — match_method=apex|crown|none, crown
+matches carry crown_overlap_frac. Raster veto: 'felled' requires max nDSM
+in 3 m radius at date_b to have dropped >= felling_min_drop_m AND be < 40%
+of date_a height. Veto failures are SUB-CLASSIFIED, not lumped:
+  unmatched_a_canopy_intact       date_b canopy >= 70% of date_a height —
+                                  matching failure, NOT a loss
+  unmatched_a_partial_drop        30–70% height remains — crown break /
+                                  snow / wind damage
+  unmatched_a_ambiguous           the rest
+'new' requires date_a nDSM < max(3 m, 30% of date_b height), else
+unmatched_b_canopy_preexisting (apex churn, not a new tree).
+Statuses: stable | grown | shrunk | felled | new | unmatched_a_* |
+unmatched_b_canopy_preexisting.
 Params: date_a, date_b, match_radius_m (default 3.0), felling_min_drop_m
 (default 5.0), growth_eps_m (default 0.3), min_patch_sqm (default 25),
 crown_geometry=point (default)|polygon, + all /api/v2/trees params.
 Per-record: tree_id (epoch-a id; tree_id_b when matched), status,
-height_a_m, height_b_m, height_change_m (null when not matched — never
-reused as a height), growth_cm_yr (normalised by real epoch day span),
-crown_area_a/b_sqm, ndsm_max_a/b_m (the raster evidence at the apex, for
-audit without re-downloading rasters), match_distance_m, match_confidence,
+match_method, height_a_m, height_b_m, height_change_m (null when not
+matched — never reused as a height), growth_cm_yr, volume_m3_est (felled
+records: allometric volume of the lost tree), crown_area_a/b_sqm,
+ndsm_max_a/b_m (the raster evidence at the apex, for audit without
+re-downloading rasters), match_distance_m, match_confidence,
 apex_a_lon/lat, apex_b_lon/lat.
+growth_cm_yr normalisation (IMPORTANT): the ALS folder dates are mosaic
+snapshots, not flight dates. When the BEV flight-block overlay knows the
+real Flugjahr for the AOI, growth is normalised by days_effective
+(mid-year assumption) — e.g. Steiermark 20220915→20240915 is really
+2010→2022 = 4383 days, not 731. summary.growth_cm_yr_is_nominal=true
+flags AOIs where real dates are unknown. If both epochs were flown the
+same year (same_flight_epoch=true) the rasters are likely the same
+acquisition republished — treat height changes as noise.
 Response also carries:
   felling_patches    FeatureCollection of contiguous raw-nDSM-drop polygons
                      (>= min_patch_sqm, despeckled) with area_sqm,
                      drop_mean_m, drop_max_m, height_before_mean_m — the
                      segmentation-independent disturbance product.
-  epoch_dates        {a, b, days}
+  epoch_dates        {a, b, days, days_nominal, days_effective,
+                     same_flight_epoch}
   summary            by_status, n_trees_a/b, felled_area_sqm,
-                     felled_volume_m3_est, growth_cm_yr_percentiles
-                     (p10/p25/p50/p75/p90).
+                     felled_volume_m3_est (SUM of per-tree allometric
+                     volumes over status=felled — same allometry as
+                     /v2/trees), felled_volume_m3_patch (independent
+                     patch-based proxy: area_ha × height_before × 16 m³/ha
+                     per metre; formula in the *_note fields),
+                     growth_cm_yr_percentiles (p10/p25/p50/p75/p90).
+  meta.acquisition   {a, b} real flight-year blocks per epoch.
 
 #### POST /api/v2/trees/by-polygons
 Per-stand batch inventory. Body: GeoJSON FeatureCollection of stand
 polygons (WGS84; reproject client-side from EPSG:32633 etc.). Computed
 ONCE on the union raster; trees assigned by apex containment (no double
-counting at stand boundaries).
+counting at stand boundaries — but if the stand polygons themselves
+overlap, trees in the overlap are counted in every containing stand;
+see n_overlapping_pairs / overlap_area_ha in the response summary).
 Params: key_property (stand id property name, default 'name'),
-include_trees=true to embed per-tree Features per stand, + all
-/api/v2/trees params. async strongly recommended.
-Response: {stands: [{key, summary, trees?}], summary: {n_stands,
-n_trees_total, n_trees_assigned, union_area_ha}, meta}.
+merge_by_key=true to union same-key features into one multipart stand
+(entry carries n_parts), include_trees=true to embed per-tree Features
+per stand, + all /api/v2/trees params. async strongly recommended.
+Null/missing keys → key: null + a warning (never silently renamed);
+duplicate keys without merge_by_key are flagged key_is_duplicate.
+Response: {stands: [{key, feature_index, summary, n_parts?,
+key_is_duplicate?, trees?}], summary: {n_stands, n_trees_total,
+n_trees_assigned, union_area_ha, sum_area_ha, n_overlapping_pairs,
+overlap_area_ha}, warnings, meta}.
+
+#### POST /api/v2/changes/trees/by-polygons
+Per-stand growth + mortality in ONE call. Body: FeatureCollection of
+stand polygons. Runs the full two-epoch change analysis once on the
+union raster, then buckets records into stands by apex containment
+(apex_b preferred, apex_a fallback for felled).
+Params: all /api/v2/changes/trees params + key_property, merge_by_key,
+include_records=true to embed the per-tree change records per stand.
+async strongly recommended.
+Response: {stands: [{key, feature_index, summary: {n_records, by_status,
+area_ha_total, growth_cm_yr_percentiles (p10/p50/p90),
+felled_volume_m3_est, mortality_pct}}], summary (whole-union, incl.
+overlap diagnostics), warnings, epoch_dates, felling_patches (union-wide),
+meta}.
 
 #### POST /api/v1/changes/summary
 Multi-epoch change summary (2022→2023→2024).
@@ -515,6 +581,25 @@ range-requests supported — use GDAL /vsicurl/, no directory listing):
   Example (covers the Kohlschwarz/WILHELM AOI at E4708478 N2682287):
   https://data.bev.gv.at/download/ALS/DSM/20240915/ALS_DSM_CRS3035RES50000mN2650000E4700000.tif
   nDSM is NOT published — compute DSM - DTM (clamp negatives to 0).
+
+ALS flight dates (IMPORTANT): the epoch folder names (20220915 etc.) are
+national mosaic snapshot dates, NOT acquisition dates. Real per-block
+flight years come from the BEV "Aktualitaet DGM - ALS" overlay
+(Metadatenuebersicht shapefiles on www.bev.gv.at, ALS-Hoehenraster page;
+vendored in this repo at data/als_acquisition/*.geojson, queried by
+als_acquisition.py and surfaced as meta.acquisition on the v2 tree
+endpoints). Blocks can be over a decade apart between epochs — e.g. the
+Steiermark block in the '20220915' mosaic was flown 2010, while
+'20230915'/'20240915' carry a 2022 flight. Always use
+epoch_dates.days_effective (not the nominal folder-date span) for growth
+rates. Only Flugjahr (year, sometimes a range) is published — no
+month/day.
+
+Raw LiDAR point clouds (LAZ): BEV publishes ONLY the derived 1 m DTM/DSM
+rasters nationally — no national point-cloud download. Point clouds are
+held by the federal states (Laender): several offer open LAZ downloads
+(e.g. data.gv.at portals for Ober-/Niederoesterreich, Tirol, Kaernten,
+Stmk GIS), others on request. This service is raster-only.
 
 DOP orthophoto RGB (0.2 m, EPSG:3035, same 50 km grid):
   https://data.bev.gv.at/download/DOP/20220128/DOP_CRS3035RES50000mN{N}E{E}_20220128.tif

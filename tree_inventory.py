@@ -30,7 +30,7 @@ from scipy import ndimage
 log = logging.getLogger(__name__)
 
 #: Bump when the algorithm changes in a way that invalidates caches.
-TREE_ALGO_VERSION = "2.0.0"
+TREE_ALGO_VERSION = "2.1.0"
 
 # Defaults (spruce-oriented; all exposed as request params)
 DEFAULT_CROWN_RADIUS_A = 1.2    # m — base local-max window radius
@@ -42,6 +42,19 @@ DEFAULT_MAX_CROWN_AREA = 250.0  # m² hard cap per crown
 DEFAULT_MATCH_RADIUS_M = 3.0    # apex matching radius floor
 DEFAULT_FELLING_MIN_DROP_M = 5.0
 DEFAULT_GROWTH_EPS_M = 0.3      # |dh| below this → stable
+# Q3: crown-overlap second matching pass — minimum overlap as a fraction of
+# the SMALLER crown. Within one epoch watershed crowns are disjoint, so a
+# cross-epoch overlap this large is very unlikely for two different trees.
+CROWN_OVERLAP_MIN_FRAC = 0.3
+DEFAULT_MIN_APEX_PROMINENCE_M = 0.0  # m; 0 = off (Q3/Q10 request)
+
+#: Allometry provenance (Q5) — surfaced via volume_method in summaries.
+FORM_FACTOR = 0.42
+VOLUME_METHOD = ("heuristic_h_crown: dbh_cm = max(5, 1.2*h + 3.0*max(0, "
+                 "crown_diam-4)); vol = form_factor 0.42 * basal_area * h. "
+                 "Generic spruce heuristic, NOT Pollanschütz. Over-estimates "
+                 "DBH ~25-35% in dense stands where crowns under-split; "
+                 "verify against local measurements.")
 
 
 def _disk(r: int) -> np.ndarray:
@@ -60,11 +73,16 @@ def detect_apices(
     a: float = DEFAULT_CROWN_RADIUS_A,
     b: float = DEFAULT_CROWN_RADIUS_B,
     smooth_sigma: float = DEFAULT_SMOOTH_SIGMA,
+    min_prominence: float = DEFAULT_MIN_APEX_PROMINENCE_M,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Variable-window local maxima on the smoothed nDSM.
 
     Returns (apex_bool, smooth, canopy_bool). Window radius per pixel is
     r(h) = a + b*h, quantised to integer pixel radii (1 m grid).
+
+    ``min_prominence`` (m): if > 0, apices must stand at least that far
+    above their surrounding saddle (h-maxima transform) — suppresses
+    branch-tip apices in dense canopy (Q3/Q10 stabiliser).
     """
     z = np.where(mask & np.isfinite(ndsm), ndsm, 0.0).astype(np.float32)
     smooth = ndimage.gaussian_filter(z, sigma=smooth_sigma) if smooth_sigma > 0 else z
@@ -78,6 +96,12 @@ def detect_apices(
         fp = _disk(int(rv))
         mx = ndimage.maximum_filter(smooth, footprint=fp, mode="nearest")
         apex |= canopy & (r_int == rv) & (smooth >= mx - 1e-4)
+
+    if min_prominence > 0 and apex.any():
+        from skimage.morphology import h_maxima
+        hm = h_maxima(smooth, float(min_prominence))
+        # keep apices that coincide with (or touch) a prominent maximum
+        apex &= ndimage.binary_dilation(hm.astype(bool), iterations=1)
 
     # Collapse plateaus (adjacent apex pixels) to a single representative px.
     lab, n = ndimage.label(apex)
@@ -167,6 +191,7 @@ class Tree:
     volume_m3_est: float = 0.0
     leaf_type: str = "unknown"
     leaf_type_conf: float = 0.0
+    leaf_type_prob_conifer: float = 0.5
     vitality: str = "unknown"
     vitality_conf: float = 0.0
     spectral: dict = field(default_factory=dict)
@@ -182,11 +207,14 @@ def build_inventory(
     smooth_sigma: float = DEFAULT_SMOOTH_SIGMA,
     cap_factor: float = DEFAULT_CROWN_CAP_FACTOR,
     max_crown_area: float = DEFAULT_MAX_CROWN_AREA,
+    min_apex_prominence: float = DEFAULT_MIN_APEX_PROMINENCE_M,
+    leaf_type_min_conf: float = 0.5,
     spectral: dict | None = None,
     nir: np.ndarray | None = None,
 ) -> tuple[list[Tree], np.ndarray, np.ndarray]:
     """Full apex-based inventory. Returns (trees, labels, canopy_mask)."""
-    apex, smooth, canopy = detect_apices(ndsm, mask, min_height, a, b, smooth_sigma)
+    apex, smooth, canopy = detect_apices(ndsm, mask, min_height, a, b,
+                                         smooth_sigma, min_apex_prominence)
     labels, ar, ac, ah = segment_crowns(
         smooth, canopy, apex, ndsm, a, b, cap_factor, max_crown_area)
     n = len(ar)
@@ -247,28 +275,18 @@ def build_inventory(
         for k, v in spec_stats.items():
             spec[k] = round(float(v[i]), 3)
 
-        # leaf type: crown steepness + red/green index
+        # leaf type: crown steepness + red/green index → soft probability
         steep = (h - float(hmean[i])) / max(r_mean, 0.5)
         rg = spec.get("rg_index_mean", 0.0)
-        if steep > 2.2 or (steep > 1.5 and rg < -0.02):
-            leaf, conf = "coniferous", min(0.9, 0.5 + 0.1 * steep)
-        elif steep < 1.2 and area > 20:
-            leaf, conf = "broadleaf", 0.5
+        # logistic blend: steeper crowns + redder-than-green → conifer
+        p_con = 1.0 / (1.0 + np.exp(-(1.6 * (steep - 1.6) - 8.0 * (rg + 0.02))))
+        p_con = float(np.clip(0.25 + 0.5 * p_con + 0.15, 0.05, 0.95))  # Austrian conifer prior
+        if p_con >= 0.5:
+            leaf, conf = "coniferous", p_con
         else:
-            leaf, conf = "coniferous", 0.4  # Austrian prior
-
-        # vitality (needs real NDVI from NIR to be trustworthy)
-        vit, vconf = "unknown", 0.0
-        if has_real_ndvi:
-            nd_mean = spec.get("ndvi_mean", 0.0)
-            nd_p10 = spec.get("ndvi_p10", nd_mean)
-            if nd_mean < 0.15 and nd_p10 < 0.10 and h >= 5.0:
-                vit, vconf = "dead", min(0.95, 0.6 + (0.15 - nd_mean) * 2)
-                leaf, conf = "dead", vconf
-            elif nd_mean < 0.35:
-                vit, vconf = "stressed", 0.5
-            else:
-                vit, vconf = "vital", min(0.9, nd_mean)
+            leaf, conf = "broadleaf", 1.0 - p_con
+        if conf < leaf_type_min_conf:
+            leaf = "unknown"  # Q8: don't report coin flips as classifications
 
         trees.append(Tree(
             tree_id=_stable_tree_id(e, np_), seq=i + 1, label=i + 1,
@@ -280,9 +298,49 @@ def build_inventory(
             is_edge=(i + 1) in edge_labels,
             dbh_est_cm=dbh, volume_m3_est=vol,
             leaf_type=leaf, leaf_type_conf=round(conf, 2),
-            vitality=vit, vitality_conf=round(vconf, 2),
+            leaf_type_prob_conifer=round(p_con, 3),
             spectral=spec,
         ))
+
+    # --- Vitality (Q7): relative NDVI anomaly, not a fixed cut ------------
+    # 'dead' keeps the absolute threshold (it validated well); 'stressed'
+    # is now an ANOMALY within the AOI + same leaf class: NDVI <= p10 of
+    # its leaf-type population. Raw percentile is shipped per tree so
+    # clients can re-threshold (ndvi_percentile_in_aoi).
+    if has_real_ndvi and trees:
+        nd_all = np.array([t.spectral.get("ndvi_mean", np.nan) for t in trees],
+                          dtype=np.float32)
+        # dead first (absolute)
+        for t, nd in zip(trees, nd_all):
+            nd_p10 = t.spectral.get("ndvi_p10", nd)
+            if np.isfinite(nd) and nd < 0.15 and nd_p10 < 0.10 and t.height_m >= 5.0:
+                t.vitality = "dead"
+                t.vitality_conf = round(min(0.95, 0.6 + (0.15 - float(nd)) * 2), 2)
+                t.leaf_type = "dead"
+                t.leaf_type_conf = t.vitality_conf
+        # percentile within leaf-type population (excluding dead)
+        for cls in ("coniferous", "broadleaf", "unknown"):
+            sel = [i for i, t in enumerate(trees)
+                   if t.vitality != "dead"
+                   and (t.leaf_type == cls or (cls == "unknown" and t.leaf_type
+                                               not in ("coniferous", "broadleaf", "dead")))
+                   and np.isfinite(nd_all[i])]
+            if not sel:
+                continue
+            vals = nd_all[sel]
+            order = np.argsort(np.argsort(vals))
+            pct = (order + 0.5) / len(vals) * 100.0
+            p10 = float(np.percentile(vals, 10))
+            for j, i in enumerate(sel):
+                t = trees[i]
+                t.spectral["ndvi_percentile_in_aoi"] = round(float(pct[j]), 1)
+                if vals[j] <= p10:
+                    t.vitality = "stressed"
+                    t.vitality_conf = round(min(0.8, 0.4 + (p10 - float(vals[j])) * 3), 2)
+                else:
+                    t.vitality = "vital"
+                    t.vitality_conf = round(min(0.9, float(pct[j]) / 100.0 + 0.3), 2)
+
     return trees, labels, canopy
 
 
@@ -291,8 +349,17 @@ def build_inventory(
 # ---------------------------------------------------------------------------
 
 def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
-              transform, aoi_area_sqm: float) -> dict:
-    """Explicit, self-consistent summary block (denominators included)."""
+              transform, aoi_area_sqm: float,
+              ndsm: np.ndarray | None = None,
+              h_dom_basis: str = "canopy") -> dict:
+    """Explicit, self-consistent summary block (denominators included).
+
+    Q4: h_dom is computed over the CANOPY area by default (Oberhöhe is
+    defined over stocked area); pass h_dom_basis='total' for the old
+    behaviour. Also ships h_p99_m and h_top100_m (moving-hectare grid).
+    Q6: understory detectability caveat + canopy_gap_fraction +
+    layer_profile (nDSM PIXEL heights in 2 m bins, if ndsm given).
+    """
     px_area = abs(transform.a * transform.e)
     area_ha_total = aoi_area_sqm / 1e4
     area_ha_canopy = float(canopy.sum()) * px_area / 1e4
@@ -300,10 +367,22 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
     hs = np.array([t.height_m for t in trees], dtype=np.float32)
     crown_area_total = float(sum(t.crown_area_sqm for t in trees))
 
-    # h_dom: mean of the 100 tallest stems per ha, computed over TOTAL area
-    n_dom = max(1, int(round(100 * area_ha_total)))
+    # h_dom: mean of the 100 tallest stems per ha over the chosen basis
+    basis_ha = area_ha_canopy if h_dom_basis == "canopy" else area_ha_total
+    n_dom = max(1, int(round(100 * max(basis_ha, 0.01))))
     hs_sorted = np.sort(hs)[::-1]
     h_dom = float(np.mean(hs_sorted[:min(n_dom, len(hs_sorted))])) if len(hs) else 0.0
+
+    # h_top100: mean of the tallest 100/ha on a moving 100 m grid (robust
+    # Oberhöhe — immune to the small-stand collapse noted in Q4)
+    h_top100 = 0.0
+    if trees:
+        cell = {}
+        for t in trees:
+            key = (int(t.apex_e // 100), int(t.apex_n // 100))
+            cell.setdefault(key, []).append(t.height_m)
+        tops = [max(v) for v in cell.values()]
+        h_top100 = float(np.mean(tops)) if tops else 0.0
 
     hist = {}
     if len(hs):
@@ -322,7 +401,27 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
         by_leaf[t.leaf_type] = by_leaf.get(t.leaf_type, 0) + 1
         by_vitality[t.vitality] = by_vitality.get(t.vitality, 0) + 1
 
-    return {
+    # Q6: canopy gap fraction — share of AOI where an nDSM 2-10 m pixel is
+    # NOT overtopped, i.e. where low stems are actually visible to a
+    # first-return 1 m DSM. Plus a pixel-height layer profile.
+    gap_frac = None
+    layer_profile = None
+    if ndsm is not None and ndsm.shape == canopy.shape:
+        z = np.where(mask & np.isfinite(ndsm), ndsm, np.nan)
+        valid = np.isfinite(z)
+        nvalid = int(valid.sum())
+        if nvalid:
+            low_visible = valid & (z >= 2.0) & (z < 10.0)
+            gap_frac = round(float(low_visible.sum()) / nvalid, 4)
+            zz = z[valid & (z >= 0)]
+            if zz.size:
+                top = int(np.ceil(min(float(np.nanmax(zz)), 60.0) / 2.0) * 2)
+                edges2 = np.arange(0, top + 2, 2)
+                cnt, _ = np.histogram(np.clip(zz, 0, 60), bins=edges2)
+                layer_profile = {f"{int(edges2[i])}-{int(edges2[i+1])}": int(c)
+                                 for i, c in enumerate(cnt) if c}
+
+    out = {
         "n_trees": len(trees),
         "n_trees_edge": len(trees) - len(non_edge),
         "area_ha_total": round(area_ha_total, 3),
@@ -334,10 +433,15 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
         "stems_per_ha_note": "non-edge trees only; canopy = nDSM >= min_tree_height",
         "h_mean_m": round(float(np.mean(hs)), 2) if len(hs) else 0.0,
         "h_p50_m": _pct(50), "h_p90_m": _pct(90), "h_p95_m": _pct(95),
+        "h_p99_m": _pct(99),
         "h_max_m": round(float(hs.max()), 2) if len(hs) else 0.0,
         "h_dom_m": round(h_dom, 2),
+        "h_dom_basis": h_dom_basis,
         "h_dom_note": f"mean of the {min(n_dom, len(hs))} tallest stems "
-                      f"(100/ha x {round(area_ha_total, 2)} ha total area)",
+                      f"(100/ha x {round(basis_ha, 2)} ha {h_dom_basis} area)",
+        "h_top100_m": round(h_top100, 2),
+        "h_top100_note": "mean of the tallest stem per 100 m grid cell "
+                         "(moving-hectare Oberhöhe; robust for small stands)",
         "crown_area_total_sqm": round(crown_area_total, 1),
         "crown_cover_pct_canopy": round(100.0 * crown_area_total /
                                         (area_ha_canopy * 1e4), 1)
@@ -349,12 +453,62 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
         "by_vitality": by_vitality,
         "volume_m3_est_total": round(sum(t.volume_m3_est for t in trees), 1),
         "dbh_method": "heuristic_h_crown (generic spruce; verify locally)",
+        "volume_method": VOLUME_METHOD,
+        # Q6: machine-readable detectability caveat
+        "understory_detectable": False,
+        "detection_floor_note": (
+            "suppressed/sub-canopy stems below the dominant layer are not "
+            "detectable from 1 m first-return DSM; the histogram below "
+            "~10 m is valid only in gaps and open stands"),
     }
+    if gap_frac is not None:
+        out["canopy_gap_fraction"] = gap_frac
+        out["canopy_gap_fraction_note"] = (
+            "share of valid AOI pixels whose nDSM is 2-10 m (low vegetation "
+            "actually visible to first-return DSM)")
+    if layer_profile is not None:
+        out["layer_profile_2m"] = layer_profile
+        out["layer_profile_note"] = (
+            "nDSM PIXEL heights in 2 m bins (not stems) — first-return "
+            "surface distribution; use for multi-layer/plenter structure "
+            "tests instead of the stem histogram")
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Cross-epoch matching with raster veto
 # ---------------------------------------------------------------------------
+
+def _matched_rec(ta: Tree, tb: Tree, d: float, method: str,
+                 growth_eps_m: float, match_radius_m: float,
+                 max_a3: np.ndarray, max_b3: np.ndarray,
+                 crown_overlap: float | None = None) -> dict:
+    dh = tb.height_m - ta.height_m
+    if dh >= growth_eps_m:
+        status = "grown"
+    elif dh <= -growth_eps_m:
+        status = "shrunk"
+    else:
+        status = "stable"
+    rec = {
+        "tree_id": ta.tree_id, "tree_id_b": tb.tree_id,
+        "status": status, "match_method": method,
+        "height_a_m": ta.height_m, "height_b_m": tb.height_m,
+        "height_change_m": round(dh, 2),
+        "crown_area_a_sqm": ta.crown_area_sqm,
+        "crown_area_b_sqm": tb.crown_area_sqm,
+        "ndsm_max_a_m": round(float(max_a3[ta.apex_row, ta.apex_col]), 2),
+        "ndsm_max_b_m": round(float(max_b3[tb.apex_row, tb.apex_col]), 2),
+        "match_distance_m": round(d, 2),
+        "match_confidence": round(max(0.1, 1.0 - d / max(match_radius_m, 1e-6)
+                                      * 0.5 - abs(dh) / 30.0), 2),
+        "apex_a": (ta.apex_e, ta.apex_n), "apex_b": (tb.apex_e, tb.apex_n),
+        "_ta": ta, "_tb": tb,
+    }
+    if crown_overlap is not None:
+        rec["crown_overlap_frac"] = round(float(crown_overlap), 2)
+    return rec
+
 
 def match_trees(
     trees_a: list[Tree],
@@ -366,10 +520,23 @@ def match_trees(
     growth_eps_m: float = DEFAULT_GROWTH_EPS_M,
     a: float = DEFAULT_CROWN_RADIUS_A,
     b: float = DEFAULT_CROWN_RADIUS_B,
+    labels_a: np.ndarray | None = None,
+    labels_b: np.ndarray | None = None,
 ) -> list[dict]:
-    """Greedy nearest-neighbour apex matching + raster veto for felled/new.
+    """Two-pass matching (apex, then crown overlap) + raster veto.
 
     Rasters must share the same grid. Returns per-tree change records.
+
+    Pass 1: greedy nearest-neighbour apex matching (match_method='apex').
+    Pass 2 (Q3): apex-unmatched trees are matched at CROWN level — if the
+    epoch-a and epoch-b crown label masks overlap >= CROWN_OVERLAP_MIN_FRAC
+    (30%) of the smaller
+    crown, they are the same tree whose local maximum jumped to another
+    branch (match_method='crown'). Requires labels_a/labels_b.
+    Unmatched leftovers are sub-classified by raster evidence:
+    felled / unmatched_a_partial_drop (crown break) /
+    unmatched_a_canopy_intact (matching failure, NOT a loss) /
+    new / unmatched_b_canopy_preexisting.
     """
     from scipy.spatial import cKDTree
 
@@ -400,31 +567,53 @@ def match_trees(
             if ia in matched_a or ib in matched_b:
                 continue
             matched_a.add(ia); matched_b.add(ib)
-            ta, tb = trees_a[ia], trees_b[ib]
-            dh = tb.height_m - ta.height_m
-            if dh >= growth_eps_m:
-                status = "grown"
-            elif dh <= -growth_eps_m:
-                status = "shrunk"
-            else:
-                status = "stable"
-            recs.append({
-                "tree_id": ta.tree_id, "tree_id_b": tb.tree_id,
-                "status": status,
-                "height_a_m": ta.height_m, "height_b_m": tb.height_m,
-                "height_change_m": round(dh, 2),
-                "crown_area_a_sqm": ta.crown_area_sqm,
-                "crown_area_b_sqm": tb.crown_area_sqm,
-                "ndsm_max_a_m": round(float(max_a3[ta.apex_row, ta.apex_col]), 2),
-                "ndsm_max_b_m": round(float(max_b3[tb.apex_row, tb.apex_col]), 2),
-                "match_distance_m": round(d, 2),
-                "match_confidence": round(max(0.1, 1.0 - d / max(match_radius_m, 1e-6)
-                                              * 0.5 - abs(dh) / 30.0), 2),
-                "apex_a": (ta.apex_e, ta.apex_n), "apex_b": (tb.apex_e, tb.apex_n),
-                "_ta": ta, "_tb": tb,
-            })
+            recs.append(_matched_rec(trees_a[ia], trees_b[ib], d, "apex",
+                                     growth_eps_m, match_radius_m,
+                                     max_a3, max_b3))
 
-    # Unmatched in a → felled ONLY with raster veto passing, else unmatched_a
+    # --- Pass 2 (Q3): crown-overlap matching for apex-unmatched trees ---
+    if labels_a is not None and labels_b is not None \
+            and labels_a.shape == labels_b.shape:
+        rem_a = [ia for ia in range(len(trees_a)) if ia not in matched_a]
+        rem_b_by_label = {trees_b[ib].label: ib for ib in range(len(trees_b))
+                          if ib not in matched_b}
+        if rem_a and rem_b_by_label:
+            # overlap histogram: for every px, (label_a, label_b) joint counts
+            la = labels_a.ravel(); lb = labels_b.ravel()
+            both = (la > 0) & (lb > 0)
+            if both.any():
+                key = la[both].astype(np.int64) * (int(lb.max()) + 1) + lb[both]
+                uniq, cnt = np.unique(key, return_counts=True)
+                ov_a = uniq // (int(lb.max()) + 1)
+                ov_b = uniq % (int(lb.max()) + 1)
+                area_a = np.bincount(la, minlength=int(la.max()) + 1)
+                area_b = np.bincount(lb, minlength=int(lb.max()) + 1)
+                cand = []
+                a_by_label = {trees_a[ia].label: ia for ia in rem_a}
+                for j in range(len(uniq)):
+                    ia = a_by_label.get(int(ov_a[j]))
+                    ib = rem_b_by_label.get(int(ov_b[j]))
+                    if ia is None or ib is None:
+                        continue
+                    smaller = min(area_a[int(ov_a[j])], area_b[int(ov_b[j])])
+                    frac = cnt[j] / max(int(smaller), 1)
+                    if frac >= CROWN_OVERLAP_MIN_FRAC:
+                        cand.append((-frac, ia, ib))
+                cand.sort()
+                for negf, ia, ib in cand:
+                    if ia in matched_a or ib in matched_b:
+                        continue
+                    matched_a.add(ia); matched_b.add(ib)
+                    ta, tb = trees_a[ia], trees_b[ib]
+                    d = float(np.hypot(ta.apex_e - tb.apex_e,
+                                       ta.apex_n - tb.apex_n))
+                    recs.append(_matched_rec(ta, tb, d, "crown",
+                                             growth_eps_m, match_radius_m,
+                                             max_a3, max_b3,
+                                             crown_overlap=-negf))
+
+    # Unmatched in a → felled ONLY with raster veto passing, else
+    # sub-classified (Q3): canopy_intact / partial_drop / ambiguous
     for ia, ta in enumerate(trees_a):
         if ia in matched_a:
             continue
@@ -432,10 +621,18 @@ def match_trees(
         drop = ta.height_m - evid_b
         if drop >= felling_min_drop_m and evid_b < 0.4 * ta.height_m:
             status = "felled"
+        elif evid_b >= 0.7 * ta.height_m:
+            # canopy still there (and often taller) → matching failure,
+            # NOT a loss
+            status = "unmatched_a_canopy_intact"
+        elif evid_b >= 0.4 * ta.height_m or drop < felling_min_drop_m:
+            # 30%..felling-threshold drop → crown break / snow / wind damage
+            status = "unmatched_a_partial_drop"
         else:
-            status = "unmatched_a"
+            status = "unmatched_a_ambiguous"
         recs.append({
             "tree_id": ta.tree_id, "status": status,
+            "match_method": "none",
             "height_a_m": ta.height_m, "height_b_m": None,
             "height_change_m": round(-drop, 2) if status == "felled" else None,
             "crown_area_a_sqm": ta.crown_area_sqm, "crown_area_b_sqm": None,
@@ -443,6 +640,7 @@ def match_trees(
             "ndsm_max_b_m": round(evid_b, 2),
             "match_distance_m": None, "match_confidence": None,
             "apex_a": (ta.apex_e, ta.apex_n), "apex_b": None,
+            **({"volume_m3_est": ta.volume_m3_est} if status == "felled" else {}),
             "_ta": ta, "_tb": None,
         })
 
@@ -454,9 +652,12 @@ def match_trees(
         if evid_a < max(3.0, 0.3 * tb.height_m):
             status = "new"
         else:
-            status = "unmatched_b"
+            # canopy of comparable height already existed at date a →
+            # apex churn, not a genuinely new tree
+            status = "unmatched_b_canopy_preexisting"
         recs.append({
             "tree_id": tb.tree_id, "status": status,
+            "match_method": "none",
             "height_a_m": None, "height_b_m": tb.height_m,
             "height_change_m": None,
             "crown_area_a_sqm": None, "crown_area_b_sqm": tb.crown_area_sqm,

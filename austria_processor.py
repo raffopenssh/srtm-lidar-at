@@ -7977,10 +7977,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     'out_of_coverage': True,
                     'objects': [],
                     'area_summary': {},
-                    'parcels': [],
+                    # Same dict shapes as normal products so index
+                    # merge / consumers never see legacy list shapes
+                    # (see search_index._merge_block_data hardening).
+                    'parcels': {'count': 0, 'total_area_sqm': 0,
+                                'details': []},
                     'buildings': [],
-                    'new_buildings': [],
-                    'infrastructure': [],
+                    'building_footprints': {'count': 0, 'details': []},
+                    'new_buildings': {'count': 0, 'features': []},
+                    'infrastructure': {'total': 0, 'by_type': {}},
                     'data_quality': {
                         'quality_score': 0.0,
                         'quality_grade': 'N',

@@ -1121,8 +1121,12 @@ class SearchIndex:
                     ac.get('confidence'),
                 ))
             if prc_rows:
+                # OR REPLACE: belt-and-braces against duplicate
+                # (kg_code, parcel_id) — e.g. malformed source JSONs —
+                # so one dupe can never abort the whole batch and wipe
+                # the KG's parcels (DELETE above already ran).
                 c.executemany(
-                    'INSERT INTO kg_parcels VALUES (' + ','.join(['?'] * 34) + ')',
+                    'INSERT OR REPLACE INTO kg_parcels VALUES (' + ','.join(['?'] * 34) + ')',
                     prc_rows)
 
     @staticmethod
@@ -1322,22 +1326,58 @@ class SearchIndex:
         merged['generated_at'] = _any_val(['generated_at'])
         merged['observation_period'] = _any_val(['observation_period']) or {}
 
-        # ── parcels (concatenate ALL details) ────────────────────
-        all_parcel_details = []
+        # ── parcels (concatenate + dedupe by parcel_id) ──────────
+        # Parcels straddling a split-KG block boundary are emitted by
+        # EVERY block that intersects them. Keep the record from the
+        # block covering the largest share (proxy: largest area_sqm;
+        # ties → freshest block, since block_list is code-sorted and
+        # later assignment wins only on strictly-better keep-score).
+        # Without this, kg_parcels' (kg_code, parcel_id) PK aborts the
+        # whole INSERT batch and the KG loses ALL parcel rows
+        # (recurring '32016-*: UNIQUE constraint failed' warnings).
+        _parcels_by_id = {}
+        _parcel_order = []
         for _, d in block_list:
-            all_parcel_details.extend(d.get('parcels', {}).get('details', []))
+            _prc = d.get('parcels')
+            if not isinstance(_prc, dict):
+                _prc = {}  # legacy empty-list shape
+            for p in _prc.get('details', []):
+                pid = p.get('parcel_id', '')
+                prev = _parcels_by_id.get(pid)
+                if prev is None:
+                    _parcels_by_id[pid] = p
+                    _parcel_order.append(pid)
+                elif (float(p.get('area_sqm') or 0)
+                        > float(prev.get('area_sqm') or 0)):
+                    _parcels_by_id[pid] = p
+        all_parcel_details = [_parcels_by_id[pid] for pid in _parcel_order]
         merged['parcels'] = {
             'count': len(all_parcel_details),
             'total_area_sqm': round(
-                sum((d.get('parcels', {}) or {}).get('total_area_sqm', 0) or 0
-                    for _, d in block_list), 1),
+                sum(float(p.get('area_sqm') or 0)
+                    for p in all_parcel_details), 1),
             'details': all_parcel_details,
         }
 
-        # ── buildings (concatenate ALL details) ──────────────────
-        all_bf_details = []
+        # ── buildings (concatenate + dedupe by building_id) ──────
+        # Same boundary-straddle issue: kg_buildings has no PK, so
+        # duplicates silently double-count instead of erroring.
+        _blds_by_id = {}
+        _bld_order = []
         for _, d in block_list:
-            all_bf_details.extend(d.get('building_footprints', {}).get('details', []))
+            _bfd = d.get('building_footprints')
+            if not isinstance(_bfd, dict):
+                _bfd = {}  # legacy empty-list shape
+            for b in _bfd.get('details', []):
+                bid = b.get('building_id', '')
+                prev = _blds_by_id.get(bid)
+                if prev is None:
+                    _blds_by_id[bid] = b
+                    _bld_order.append(bid)
+                elif (float(b.get('footprint_area_sqm') or 0)
+                        > float(prev.get('footprint_area_sqm') or 0)):
+                    _blds_by_id[bid] = b
+        all_bf_details = [_blds_by_id[bid] for bid in _bld_order]
         merged['building_footprints'] = {
             'count': len(all_bf_details),
             'details': all_bf_details,
@@ -1346,7 +1386,11 @@ class SearchIndex:
         # ── new buildings (concatenate features) ─────────────────
         all_nb = []
         for _, d in block_list:
-            all_nb.extend(d.get('new_buildings', {}).get('features', []))
+            _nb = d.get('new_buildings')
+            if isinstance(_nb, dict):
+                all_nb.extend(_nb.get('features', []))
+            elif isinstance(_nb, list):
+                all_nb.extend(_nb)  # legacy flat-list shape
         merged['new_buildings'] = {
             'count': len(all_nb),
             'features': all_nb,
@@ -1357,7 +1401,9 @@ class SearchIndex:
         # Concatenate features per type, sum counts/areas; recompute total.
         merged_inf_by_type = {}
         for _, d in block_list:
-            inf = d.get('infrastructure', {}) or {}
+            inf = d.get('infrastructure')
+            if not isinstance(inf, dict):
+                inf = {}  # legacy empty-list shape
             for typ, info in (inf.get('by_type') or {}).items():
                 if typ not in merged_inf_by_type:
                     merged_inf_by_type[typ] = {

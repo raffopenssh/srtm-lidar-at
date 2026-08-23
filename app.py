@@ -16434,7 +16434,9 @@ def process_txt():
             'hours=H    log lookback (default 24; >24 reads per-day gzipped '
             'archive in data/log_archive/)\n'
             'stall=N    stalled/partial product-triple rows under zen_stall: '
-            '(default 10, max 100, 0 = summary only)\n'
+            '(default: only action-needed rows — GAP + orphan*; '
+            'stall=N shows up to N rows of all kinds, max 100, '
+            '0 = summary only)\n'
             'verbose=1  keep GDAL/bev_retry chatter + full-length log msgs '
             '(default: noise hidden, msgs capped at 220 chars, consecutive '
             'duplicates collapsed as \xd7N)\n'
@@ -16997,11 +16999,14 @@ def process_txt():
     #                out_of_coverage jsons (block fully outside BEV
     #                LiDAR, e.g. high-Alps border blocks): no GPKG will
     #                ever exist by design -> counted as ooc, suppressed.
-    # ?stall=N rows (default 10, max 100, 0 = summary line only).
+    # ?stall=N rows (default: only action-needed rows — GAP + orphan*;
+    # explicit stall=N lists all kinds up to N, max 100, 0 = summary only).
+    _stall_arg = request.args.get('stall')
     try:
-        _stall_lim = max(0, min(int(request.args.get('stall', 10)), 100))
+        _stall_lim = max(0, min(int(_stall_arg), 100)) \
+            if _stall_arg is not None else 100
     except Exception:
-        _stall_lim = 10
+        _stall_arg, _stall_lim = None, 100
     try:
         _sv = getattr(process_txt, '_stall_view', None)
         _mf_mt = int(mf_path.stat().st_mtime) if mf_path.exists() else 0
@@ -17131,8 +17136,11 @@ def process_txt():
             # orphan* rows (both need follow-up), then stalled
             # newest-stale first. drift rows (legit split-window
             # residue) and ooc rows (outside BEV coverage) are
-            # suppressed entirely.
+            # suppressed entirely. Default (no ?stall=): token-lean —
+            # only rows needing operator action (GAP + orphan*).
             _vis = [r for r in rows if r[4] not in ('drift', 'ooc')]
+            if _stall_arg is None:
+                _vis = [r for r in _vis if r[4] in ('GAP', 'orphan*')]
             _ord = sorted(_vis, key=lambda r: (
                 r[0] != 'partial', r[4] != 'GAP',
                 r[4] != 'orphan*', -r[1]))
@@ -17151,6 +17159,9 @@ def process_txt():
             if len(_vis) > _stall_lim:
                 out.append(f'  … +{len(_vis) - _stall_lim} more '
                            f'(?stall=N, max 100)')
+            elif _stall_arg is None and len(_vis) < len(rows):
+                out.append(f'  … +{len(rows) - len(_vis)} routine rows '
+                           f'hidden (?stall=N to list)')
     except Exception:
         log.exception('process.txt zen_stall block failed')
     # Fleet bandwidth summary (canary-by-default).

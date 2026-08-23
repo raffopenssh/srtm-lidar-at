@@ -16433,6 +16433,8 @@ def process_txt():
             'q=X        substring filter on log msg body\n'
             'hours=H    log lookback (default 24; >24 reads per-day gzipped '
             'archive in data/log_archive/)\n'
+            'stall=N    stalled/partial product-triple rows under zen_stall: '
+            '(default 10, max 100, 0 = summary only)\n'
             'verbose=1  keep GDAL/bev_retry chatter + full-length log msgs '
             '(default: noise hidden, msgs capped at 220 chars, consecutive '
             'duplicates collapsed as \xd7N)\n'
@@ -16488,7 +16490,8 @@ def process_txt():
     # underlying director status is already cross-worker cached so the
     # work avoided here is pure Python text formatting + log scanning.
     _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
-                  attn_only, show_roster, creds_full)
+                  attn_only, show_roster, creds_full,
+                  request.args.get('stall', '10'))
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
     if cache is None:
@@ -16966,6 +16969,115 @@ def process_txt():
         f'zenodo:   kgs_uploaded={len(kg_codes)} files={n_files} '
         f'bytes={total_b/1e9:.2f}GB {depo_s}'
     )
+    # --- Stalled / partial product triples (mirrors process.html chips) --
+    # A code is *done* when json + full_gpkg + light_gpkg are all
+    # committed; *partial* while something is missing and the first
+    # product is < 48h old (in flight); *stalled* past 48h. "Went
+    # stale" is DERIVED (first_upload + 48h) so no history ring or
+    # tombstones are needed; failed/partial EVENT-rate history already
+    # lives in capacity_history (fk/pk -> kg_outcome line above).
+    # Each row carries a pickup verdict from the coverage oracle:
+    #   hole+queued  parent bbox uncovered AND in retry_queue -> imminent
+    #   hole         parent bbox uncovered -> auto-repicked by the
+    #                pending sweep at next processor start (no action)
+    #   orphan       coverage OK (old-split residue / superseded block)
+    #                -> NEVER auto-repicked; cosmetic unless products
+    #                are wanted per-code (re-queue recipe in AGENTS.md)
+    # ?stall=N rows (default 10, max 100, 0 = summary line only).
+    try:
+        _stall_lim = max(0, min(int(request.args.get('stall', 10)), 100))
+    except Exception:
+        _stall_lim = 10
+    try:
+        _sv = getattr(process_txt, '_stall_view', None)
+        _mf_mt = int(mf_path.stat().st_mtime) if mf_path.exists() else 0
+        if not _sv or _sv.get('mt') != _mf_mt or \
+                _t.time() - _sv.get('ts', 0) > 300:
+            import re as _re
+            _PRODS = ('json', 'full_gpkg', 'light_gpkg')
+            _rx = _re.compile(
+                r'^(\d+(?:-[a-z][-a-z0-9]*)?)_(json|full_gpkg|light_gpkg)$')
+            _trip = {}
+            for k, e in real.items():
+                m = _rx.match(k)
+                if not m:
+                    continue
+                c, prod = m.groups()
+                g = _trip.setdefault(c, {'p': set(), 'first': None})
+                g['p'].add(prod)
+                ts = e.get('uploaded_at')
+                if ts:
+                    try:
+                        tt = datetime.fromisoformat(
+                            ts.replace('Z', '+00:00')).timestamp()
+                        if g['first'] is None or tt < g['first']:
+                            g['first'] = tt
+                    except Exception:
+                        pass
+            try:
+                _rq = set(json.loads(Path(
+                    'data/austria_processor/retry_queue.json').read_text()))
+            except Exception:
+                _rq = set()
+            _now2 = _t.time()
+            _cov_cache = {}
+            rows = []  # (kind, stale_ts, code, missing, verdict)
+            for c, g in _trip.items():
+                miss = [p for p in _PRODS if p not in g['p']]
+                if not miss:
+                    continue
+                first = g['first'] or 0
+                stale_at = first + 48 * 3600
+                kind = 'stalled' if (not first or _now2 >= stale_at) \
+                    else 'partial'
+                parent = c.split('-')[0]
+                if parent not in _cov_cache:
+                    try:
+                        _cov_cache[parent] = _kg_coverage_complete(
+                            parent, real)[0]
+                    except Exception:
+                        _cov_cache[parent] = True  # conservative: no noise
+                if _cov_cache[parent]:
+                    verdict = 'orphan'
+                elif c in _rq or parent in _rq:
+                    verdict = 'hole+queued'
+                else:
+                    verdict = 'hole'
+                rows.append((kind, stale_at, c, miss, verdict))
+            process_txt._stall_view = _sv = {
+                'mt': _mf_mt, 'ts': _t.time(), 'rows': rows,
+                'done': sum(1 for g in _trip.values()
+                            if len(g['p']) == 3)}
+        rows = _sv['rows']
+        n_part = sum(1 for r in rows if r[0] == 'partial')
+        n_stal = len(rows) - n_part
+        n_hole = sum(1 for r in rows if r[4] != 'orphan')
+        n_q = sum(1 for r in rows if r[4] == 'hole+queued')
+        out.append(
+            f'zen_stall: done={_sv["done"]} partial={n_part} '
+            f'stalled={n_stal} | holes={n_hole} ({n_q} queued, '
+            f'{n_hole - n_q} pending-sweep) '
+            f'orphans={len(rows) - n_hole} (old-split residue)')
+        if _stall_lim and rows:
+            # partial first (active), then stalled newest-stale first.
+            _ord = sorted(rows, key=lambda r: (r[0] != 'partial', -r[1]))
+            _now3 = _t.time()
+            for kind, stale_at, c, miss, verdict in _ord[:_stall_lim]:
+                if kind == 'partial':
+                    when = f'stale-in={_hms(max(stale_at - _now3, 0))}'
+                else:
+                    when = ('stale-since=' + datetime.fromtimestamp(
+                        stale_at).strftime('%m-%d') if stale_at > 1e9
+                        else 'stale-since=?')
+                _miss_s = ','.join(m.split('_')[0] for m in miss)
+                out.append(
+                    f'  {kind:<7} {c:<18} miss={_miss_s:<12} '
+                    f'{when:<18} {verdict}')
+            if len(rows) > _stall_lim:
+                out.append(f'  … +{len(rows) - _stall_lim} more '
+                           f'(?stall=N, max 100)')
+    except Exception:
+        log.exception('process.txt zen_stall block failed')
     # Fleet bandwidth summary (canary-by-default).
     try:
         fb = d.get('fleet_bw') or {}

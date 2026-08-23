@@ -21,6 +21,7 @@ curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hidden=1' # also list st
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?hours=168&log=500&q=Diendorf' # 7d back, archive
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?roster=0&log=0' # banner + fleet lines only (cheapest)
 curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?attn=1&warn=1' # triage: attention peers + warn log
+curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?stall=40'      # all stalled/partial Zenodo product triples
 ```
 
 **First line is a `health:` banner** — distils triage signals
@@ -77,6 +78,23 @@ reconciler`) events — are emitted via `app.director_event(…)` and appear
 inline in the merged 24h log (`peer=director` for fleet-wide events,
 otherwise the affected peer id). Grep `?q=stuck-kg` / `?q=dup-kg` to
 audit watchdog firings.
+
+### Stalled / partial Zenodo triples (`zen_stall:` line)
+
+Mirrors the done/partial/stalled chips on `/process.html`'s Zenodo
+Manifest card. A KG-code is *done* when `_json` + `_full_gpkg` +
+`_light_gpkg` are all committed; *partial* while missing something and
+first upload < 48h old; *stalled* past 48h. Stale timestamps are
+DERIVED (`first_upload + 48h`) — no history ring, no tombstones. Rows
+(default 10, `?stall=N` up to 100, `stall=0` summary-only) carry a
+pickup verdict from the coverage oracle: `hole+queued` (in retry_queue,
+imminent), `hole` (parent bbox uncovered → auto-repicked by the pending
+sweep at next processor run cycle — verified: no such parent has a
+completing `_json` set, so `completed_codes` never gates it out),
+`orphan` (coverage complete — old-split residue, never auto-repicked;
+use the re-queue recipe above if its products are wanted). Failed/
+partial *event-rate* history already lives in the capacity_history
+ring (`kg_outcome:` line + F/P chart ticks) — no extra chart needed.
 
 ### Tile-checkpoint registry fields in `/process.txt`
 

@@ -3413,7 +3413,10 @@ function _highlightSelectedPeerCard() {
 
 async function _refreshCompletedKgs() {
   try {
-    const r = await fetch('/api/v1/processing/completed_recent?limit=2000');
+    // limit=0 → no truncation (server default caps at 500; a fixed cap
+    // like 2000 made the carousel counter pin at "2000 / 2000" once the
+    // fleet crossed 2000 completed KGs). Full list is ~70 KB at 8440 KGs.
+    const r = await fetch('/api/v1/processing/completed_recent?limit=0');
     if (!r.ok) return;
     const j = await r.json();
     _completedKgs = j.codes || [];

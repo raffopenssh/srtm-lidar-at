@@ -355,6 +355,87 @@ Summary: total_trees, stems_per_ha, by_leaf_type, height_mean_m, height_max_m,
 top_height_m (h_dom — mean of the 100 tallest stems per ha), crown_area_total_sqm,
 crown_cover_pct.
 
+NOTE: for forestry-grade stem density / height distributions prefer the
+/api/v2 tree service below — v1 watershed under-segments closed conifer
+canopy ~2× and its summary uses the whole-AOI denominator.
+
+### v2 tree service (apex-based, forestry-grade)
+
+#### POST /api/v2/trees
+Apex-based single-tree inventory. Variable-window local maxima on nDSM
+(smoothed sigma=smooth_sigma), window radius r(h) = crown_radius_a +
+crown_radius_b*h; marker-controlled watershed seeded by those apices;
+crown radius capped at r(h)*crown_cap_factor and max_crown_area.
+Params:
+  dataset            ALS date (default: 20240915)
+  min_tree_height    m (default 3.0)
+  crown_radius_a     m, local-max window base (default 1.2)
+  crown_radius_b     m per m height (default 0.08)
+  smooth_sigma       Gaussian sigma in px/m (default 0.5)
+  crown_cap_factor   crown radius cap multiplier (default 1.5)
+  max_crown_area     m² hard cap per crown (default 250)
+  crown_geometry     polygon (default) | point
+  include_ortho      true (default) — 0.2 m RGBI spectra when covered
+  async              recommended for areas > ~50 ha
+Per-tree properties: tree_id (STABLE, location-derived: t_<E_dm>_<N_dm>,
+EPSG:3035 apex rounded to 1 dm — deterministic across re-runs and epochs),
+seq, apex_lon/apex_lat (the local maximum, for field navigation), height_m
+(raw nDSM at apex), crown_area_sqm, crown_radius_mean_m/max_m, is_edge
+(crown touches AOI boundary — exclude from density), dbh_est_cm +
+dbh_method (heuristic), volume_m3_est, leaf_type + leaf_type_conf,
+vitality (vital|stressed|dead|unknown) + vitality_conf (NDVI-based; only
+trustworthy when meta.nir_used=true), ndvi_mean/ndvi_p10/nir_mean/
+brightness_mean (when spectra available).
+Summary (explicit denominators): n_trees, n_trees_edge, area_ha_total,
+area_ha_canopy (nDSM >= min_tree_height), stems_per_ha_canopy,
+stems_per_ha_total (both non-edge only), h_mean_m, h_p50/p90/p95/max_m,
+h_dom_m (mean of 100 tallest per ha over TOTAL area; see h_dom_note),
+crown_area_total_sqm, crown_cover_pct_canopy, crown_cover_pct_total,
+height_histogram_2m (2 m bins), by_leaf_type, by_vitality,
+volume_m3_est_total.
+meta: tree_algo_version, params_hash (deterministic over effective params
+— same params → same result; invalidate caches when tree_algo_version
+changes), all effective parameters echoed.
+
+#### POST /api/v2/changes/trees
+Apex-matched change detection that survives re-segmentation.
+Matching: greedy nearest-neighbour on APEX points, radius
+max(match_radius_m, 0.75*r(h)). Raster veto: 'felled' requires max nDSM in
+3 m radius at date_b to have dropped >= felling_min_drop_m AND be < 40% of
+date_a height — otherwise the record is 'unmatched_a' (honest, not false
+felling). 'new' requires date_a nDSM < max(3 m, 30% of date_b height),
+else 'unmatched_b'.
+Statuses: stable | grown | shrunk | felled | new | unmatched_a | unmatched_b.
+Params: date_a, date_b, match_radius_m (default 3.0), felling_min_drop_m
+(default 5.0), growth_eps_m (default 0.3), min_patch_sqm (default 25),
+crown_geometry=point (default)|polygon, + all /api/v2/trees params.
+Per-record: tree_id (epoch-a id; tree_id_b when matched), status,
+height_a_m, height_b_m, height_change_m (null when not matched — never
+reused as a height), growth_cm_yr (normalised by real epoch day span),
+crown_area_a/b_sqm, ndsm_max_a/b_m (the raster evidence at the apex, for
+audit without re-downloading rasters), match_distance_m, match_confidence,
+apex_a_lon/lat, apex_b_lon/lat.
+Response also carries:
+  felling_patches    FeatureCollection of contiguous raw-nDSM-drop polygons
+                     (>= min_patch_sqm, despeckled) with area_sqm,
+                     drop_mean_m, drop_max_m, height_before_mean_m — the
+                     segmentation-independent disturbance product.
+  epoch_dates        {a, b, days}
+  summary            by_status, n_trees_a/b, felled_area_sqm,
+                     felled_volume_m3_est, growth_cm_yr_percentiles
+                     (p10/p25/p50/p75/p90).
+
+#### POST /api/v2/trees/by-polygons
+Per-stand batch inventory. Body: GeoJSON FeatureCollection of stand
+polygons (WGS84; reproject client-side from EPSG:32633 etc.). Computed
+ONCE on the union raster; trees assigned by apex containment (no double
+counting at stand boundaries).
+Params: key_property (stand id property name, default 'name'),
+include_trees=true to embed per-tree Features per stand, + all
+/api/v2/trees params. async strongly recommended.
+Response: {stands: [{key, summary, trees?}], summary: {n_stands,
+n_trees_total, n_trees_assigned, union_area_ha}, meta}.
+
 #### POST /api/v1/changes/summary
 Multi-epoch change summary (2022→2023→2024).
 
@@ -411,8 +492,40 @@ Async download: GET /api/v1/export/mbtiles/download/<task_id>
 
 ### Raw GeoTIFF Downloads (POST)
 
-  /api/v1/lidar/geotiff    DTM/DSM/nDSM as float32 GeoTIFF. Params: dataset, band (dtm|dsm|ndsm)
-  /api/v1/ortho/geotiff    Orthophoto RGBI GeoTIFF. Params: dataset, ortho_year
+  /api/v1/lidar/geotiff    DTM/DSM/nDSM float32 GeoTIFF. Params: dataset,
+                           band=dtm|dsm|ndsm|all (default all → 3-band stack
+                           b1=DTM b2=DSM b3=nDSM). Single-band requests
+                           return a 1-band file. NoData=-9999 set; band
+                           descriptions set.
+  /api/v1/ortho/geotiff    Orthophoto GeoTIFF, RGB + NIR (band 4) when an
+                           RGBI operate covers the AOI/year. Params: dataset,
+                           ortho_year (e.g. 2024), resolution (m/px, default
+                           1.0, min 0.2 = native; capped at 100 Mpx).
+
+### BEV source-data access (for local validation / offline work)
+
+ALS DTM/DSM (1 m, EPSG:3035, 50 km tiles, BigTIFF ~12 GB, HTTP
+range-requests supported — use GDAL /vsicurl/, no directory listing):
+  https://data.bev.gv.at/download/ALS/{DTM|DSM}/{epoch}/ALS_{DTM|DSM}_CRS3035RES50000mN{N}E{E}.tif
+  epochs: 20220915, 20230915, 20240915. Tile origin = lower-left corner in
+  EPSG:3035 metres, aligned to the 50 000 m grid, no zero-padding beyond the
+  natural 7 digits (e.g. N2650000E4700000). 55 tiles cover Austria; the
+  authoritative tile list is tile_index.py:TILE_COORDS in
+  https://github.com/ (this repo) — or derive: floor(coord/50000)*50000.
+  Example (covers the Kohlschwarz/WILHELM AOI at E4708478 N2682287):
+  https://data.bev.gv.at/download/ALS/DSM/20240915/ALS_DSM_CRS3035RES50000mN2650000E4700000.tif
+  nDSM is NOT published — compute DSM - DTM (clamp negatives to 0).
+
+DOP orthophoto RGB (0.2 m, EPSG:3035, same 50 km grid):
+  https://data.bev.gv.at/download/DOP/20220128/DOP_CRS3035RES50000mN{N}E{E}_20220128.tif
+RGBI operates (0.2 m RGB + separate NIR file, native Austrian GK CRS
+31254/31255/31256, per-operate footprints): series folders
+  https://data.bev.gv.at/download/DOP/{20221027|20240625|20250415}/
+Operate ids, bboxes and CRS per operate: see ortho_io.py:RGBI_OPERATES.
+No public directory listing or STAC; range requests work; no special
+headers required. Per-AOI epoch availability oracle:
+GET /api/v1/layers?bbox=w,s,e,n (authoritative; /api/v1/info now lists the
+same epochs statically).
 
 ### Shares
 

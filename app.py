@@ -11016,6 +11016,11 @@ def _get_params():
                 'top_n_classes', 'top_n_objects', 'min_height_m',
                 'layer', 'min_zoom', 'max_zoom',
                 'share_id',
+                'min_tree_height', 'crown_radius_a', 'crown_radius_b',
+                'smooth_sigma', 'crown_cap_factor', 'max_crown_area',
+                'match_radius_m', 'felling_min_drop_m', 'growth_eps_m',
+                'min_patch_sqm', 'crown_geometry', 'crown_min_area',
+                'key_property', 'include_trees',
                 'height_min', 'height_max', 'height_op'):
         val = request.args.get(key)
         if val is not None:
@@ -14049,12 +14054,12 @@ def _tree_task_worker(task_id, core_fn, features, params):
         _progress_error(task_id, str(e))
 
 
-def _tree_endpoint(core_fn):
+def _tree_endpoint(core_fn, geometry_fn=None):
     """Shared request handling for /trees and /changes/trees (sync + async)."""
     run_async = str(request.args.get('async',
                     request.form.get('async', 'false'))).lower() in ('true', '1', 'yes')
     try:
-        features = _get_geometry()
+        features = (geometry_fn or _get_geometry)()
         params = _get_params()
     except Exception as e:
         return _error(str(e))
@@ -14103,8 +14108,450 @@ def trees_inventory():
     crown_min_area (px, default 4), crown_geometry=point|polygon,
     include_ortho=true|false (spectral leaf-type support), async=true|false.
     Summary includes stems_per_ha, top_height_m (h_dom), crown_cover_pct.
+
+    NOTE for forestry consumers: /api/v2/trees is the apex-based inventory
+    with marker-controlled watershed, stable tree IDs and explicit
+    denominators — prefer it for stem density / height distributions.
     """
     return _tree_endpoint(_trees_core)
+
+
+# === SECTION: /api/v2 tree service (apex-based forestry inventory) ===
+# Contract from forestry-manager feedback (FEEDBACK-srtm-lidar-at-trees-v2):
+# variable-window local-maximum seeding, marker-controlled watershed with
+# crown radius caps, stable location-derived tree IDs, apex matching with
+# raster veto, felling patches, explicit summary denominators.
+
+_TREE_V2_DATE_FMT = '%Y%m%d'
+
+
+def _tree_v2_params(params):
+    """Extract + echo the effective v2 algorithm parameters."""
+    import tree_inventory as tv
+    eff = {
+        'min_tree_height': float(params.get('min_tree_height', tv.DEFAULT_MIN_TREE_HEIGHT)),
+        'crown_radius_a': float(params.get('crown_radius_a', tv.DEFAULT_CROWN_RADIUS_A)),
+        'crown_radius_b': float(params.get('crown_radius_b', tv.DEFAULT_CROWN_RADIUS_B)),
+        'smooth_sigma': float(params.get('smooth_sigma', tv.DEFAULT_SMOOTH_SIGMA)),
+        'crown_cap_factor': float(params.get('crown_cap_factor', tv.DEFAULT_CROWN_CAP_FACTOR)),
+        'max_crown_area': float(params.get('max_crown_area', tv.DEFAULT_MAX_CROWN_AREA)),
+    }
+    return eff
+
+
+def _tree_v2_inventory(data, eff, include_ortho, task_id):
+    """Shared: run apex inventory on a read_dtm_dsm() result dict."""
+    import tree_inventory as tv
+    rgb = nir = spectral = None
+    if include_ortho:
+        _progress_set(task_id, 'ortho', 'Reading orthophoto…')
+        try:
+            import ortho_io
+            rgb, nir = ortho_io.read_ortho_for_als(data)
+            spectral = ortho_io.compute_spectral_indices(rgb, nir)
+        except Exception as e:
+            log.warning("trees v2: ortho unavailable (%s), continuing LiDAR-only", e)
+    _progress_set(task_id, 'trees', 'Detecting tree apices + crowns…')
+    trees, labels, canopy = tv.build_inventory(
+        data['ndsm'], data['mask'], data['transform'],
+        min_height=eff['min_tree_height'],
+        a=eff['crown_radius_a'], b=eff['crown_radius_b'],
+        smooth_sigma=eff['smooth_sigma'], cap_factor=eff['crown_cap_factor'],
+        max_crown_area=eff['max_crown_area'],
+        spectral=spectral, nir=nir)
+    return trees, labels, canopy, (rgb is not None), (nir is not None)
+
+
+def _tree_v2_feature(t, geom_out):
+    props = {
+        'tree_id': t.tree_id, 'seq': t.seq,
+        'apex_lon': None, 'apex_lat': None,  # filled below
+        'height_m': t.height_m,
+        'crown_area_sqm': t.crown_area_sqm,
+        'crown_radius_mean_m': t.crown_radius_mean_m,
+        'crown_radius_max_m': t.crown_radius_max_m,
+        'is_edge': t.is_edge,
+        'dbh_est_cm': t.dbh_est_cm, 'dbh_method': 'heuristic_h_crown',
+        'volume_m3_est': t.volume_m3_est,
+        'leaf_type': t.leaf_type, 'leaf_type_conf': t.leaf_type_conf,
+        'vitality': t.vitality, 'vitality_conf': t.vitality_conf,
+    }
+    props.update(t.spectral)
+    apex_wgs = ti.geometry_from_3035(Point(t.apex_e, t.apex_n))
+    props['apex_lon'] = round(apex_wgs.x, 7)
+    props['apex_lat'] = round(apex_wgs.y, 7)
+    return {'type': 'Feature', 'properties': props, 'geometry': geom_out}
+
+
+def _trees_v2_core(task_id, features, params):
+    """POST /api/v2/trees — apex-based single-tree inventory."""
+    import tree_inventory as tv
+    t0 = time.time()
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+    crown_geometry = str(params.get('crown_geometry', 'polygon')).lower()
+    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+    eff = _tree_v2_params(params)
+
+    geom_3035 = _tree_geom_prepare(features)
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset}…')
+    data = raster_io.read_dtm_dsm(geom_3035, dataset=dataset)
+
+    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
+        data, eff, include_ortho, task_id)
+
+    crowns = {}
+    if crown_geometry == 'polygon' and trees:
+        _progress_set(task_id, 'crowns', 'Vectorising crown polygons…')
+        import object_classifier as oc
+        crowns = oc.crown_polygons(labels, data['transform'],
+                                   {t.label for t in trees})
+
+    tree_features = []
+    for t in trees:
+        geom_out = None
+        if crown_geometry == 'polygon':
+            g = crowns.get(t.label)
+            if g is not None:
+                geom_out = mapping(ti.geometry_from_3035(g))
+        if geom_out is None:
+            geom_out = mapping(ti.geometry_from_3035(Point(t.apex_e, t.apex_n)))
+        tree_features.append(_tree_v2_feature(t, geom_out))
+
+    summary = tv.summarise(trees, canopy, data['mask'], data['transform'],
+                           geom_3035.area)
+    eff_meta = dict(eff, dataset=dataset, crown_geometry=crown_geometry,
+                    include_ortho=include_ortho)
+    return {
+        'type': 'FeatureCollection', 'features': tree_features,
+        'summary': summary,
+        'meta': {
+            'tree_algo_version': tv.TREE_ALGO_VERSION,
+            'params_hash': tv.params_hash(eff_meta),
+            'algorithm': 'marker_watershed_variable_window',
+            'ortho_used': ortho_used, 'nir_used': nir_used,
+            'vitality_note': ('NDVI-based (real NIR)' if nir_used else
+                              'unknown — no NIR coverage for this AOI/epoch'),
+            'processing_time_s': round(time.time() - t0, 2),
+            **eff_meta,
+            **params.get('_geometry_meta', {}),
+        },
+    }
+
+
+def _tree_v2_rowcol(transform, e, n, shape):
+    """Apex E/N → clamped (row, col) on a raster grid."""
+    col, row = ~transform * (e, n)
+    return (int(min(max(row, 0), shape[0] - 1)),
+            int(min(max(col, 0), shape[1] - 1)))
+
+
+def _changes_trees_v2_core(task_id, features, params):
+    """POST /api/v2/changes/trees — apex matching + raster veto + patches."""
+    import tree_inventory as tv
+    import temporal_analysis as tca_mod
+    from datetime import datetime as _dt
+    t0 = time.time()
+    date_a = params.get('date_a', '20220915')
+    date_b = params.get('date_b', '20240915')
+    crown_geometry = str(params.get('crown_geometry', 'point')).lower()
+    include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
+    eff = _tree_v2_params(params)
+    match_radius_m = float(params.get('match_radius_m', tv.DEFAULT_MATCH_RADIUS_M))
+    felling_min_drop_m = float(params.get('felling_min_drop_m', tv.DEFAULT_FELLING_MIN_DROP_M))
+    growth_eps_m = float(params.get('growth_eps_m', tv.DEFAULT_GROWTH_EPS_M))
+    min_patch_sqm = float(params.get('min_patch_sqm', 25.0))
+
+    geom_3035 = _tree_geom_prepare(features)
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {date_a}…')
+    data_a = raster_io.read_dtm_dsm(geom_3035, dataset=date_a)
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {date_b}…')
+    data_b = raster_io.read_dtm_dsm(geom_3035, dataset=date_b)
+    data_a, data_b = tca_mod._align_grids(data_a, data_b)
+
+    trees_a, labels_a, canopy_a, _, _ = _tree_v2_inventory(data_a, eff, False, task_id)
+    trees_b, labels_b, canopy_b, ortho_used, nir_used = _tree_v2_inventory(
+        data_b, eff, include_ortho, task_id)
+
+    # Re-derive raster indices on the ALIGNED shared grid (transforms can
+    # differ by a pixel between epochs before alignment).
+    shape = data_a['shape']
+    for t in trees_a:
+        t.apex_row, t.apex_col = _tree_v2_rowcol(data_a['transform'], t.apex_e, t.apex_n, shape)
+    for t in trees_b:
+        t.apex_row, t.apex_col = _tree_v2_rowcol(data_b['transform'], t.apex_e, t.apex_n, shape)
+
+    _progress_set(task_id, 'match', 'Matching apices across epochs…')
+    recs = tv.match_trees(trees_a, trees_b, data_a['ndsm'], data_b['ndsm'],
+                          match_radius_m=match_radius_m,
+                          felling_min_drop_m=felling_min_drop_m,
+                          growth_eps_m=growth_eps_m,
+                          a=eff['crown_radius_a'], b=eff['crown_radius_b'])
+
+    days = None
+    try:
+        days = (_dt.strptime(date_b, _TREE_V2_DATE_FMT)
+                - _dt.strptime(date_a, _TREE_V2_DATE_FMT)).days
+    except Exception:
+        pass
+    years = (days / 365.25) if days else None
+
+    crowns_b = crowns_a = {}
+    if crown_geometry == 'polygon':
+        _progress_set(task_id, 'crowns', 'Vectorising crown polygons…')
+        import object_classifier as oc
+        want_b = {r['_tb'].label for r in recs if r['_tb'] is not None}
+        want_a = {r['_ta'].label for r in recs if r['_ta'] is not None and r['_tb'] is None}
+        if want_b:
+            crowns_b = oc.crown_polygons(labels_b, data_b['transform'], want_b)
+        if want_a:
+            crowns_a = oc.crown_polygons(labels_a, data_a['transform'], want_a)
+
+    tree_features = []
+    growth_rates = []
+    for r in recs:
+        ta, tb = r.pop('_ta'), r.pop('_tb')
+        props = {k: v for k, v in r.items() if k not in ('apex_a', 'apex_b')}
+        if years and r['status'] in ('grown', 'stable', 'shrunk') \
+                and r['height_change_m'] is not None:
+            g = 100.0 * r['height_change_m'] / years
+            props['growth_cm_yr'] = round(g, 1)
+            if r['status'] in ('grown', 'stable'):
+                growth_rates.append(g)
+        for key, pt in (('apex_a', r.get('apex_a')), ('apex_b', r.get('apex_b'))):
+            if pt is not None:
+                wgs = ti.geometry_from_3035(Point(*pt))
+                props[f'{key}_lon'] = round(wgs.x, 7)
+                props[f'{key}_lat'] = round(wgs.y, 7)
+        geom_out = None
+        if crown_geometry == 'polygon':
+            g = (crowns_b.get(tb.label) if tb is not None else None) or \
+                (crowns_a.get(ta.label) if ta is not None else None)
+            if g is not None:
+                geom_out = mapping(ti.geometry_from_3035(g))
+        if geom_out is None:
+            pt = r.get('apex_b') or r.get('apex_a')
+            geom_out = mapping(ti.geometry_from_3035(Point(*pt)))
+        tree_features.append({'type': 'Feature', 'properties': props,
+                              'geometry': geom_out})
+
+    _progress_set(task_id, 'patches', 'Extracting felling patches…')
+    shared_mask = data_a['mask'] & data_b['mask']
+    patches = tv.felling_patches(
+        data_a['ndsm'], data_b['ndsm'], shared_mask, data_a['transform'],
+        min_drop_m=felling_min_drop_m,
+        min_tree_height=eff['min_tree_height'], min_patch_sqm=min_patch_sqm)
+    patch_features = []
+    felled_area = 0.0
+    felled_volume = 0.0
+    for p in patches:
+        felled_area += p['area_sqm']
+        # rough standing volume estimate on the patch: mean canopy height
+        # before x area x 0.5 packing x 0.42 form → conservative m³
+        felled_volume += p['area_sqm'] * p['height_a_mean_m'] * 0.21 / 10.0
+        patch_features.append({'type': 'Feature', 'properties': {
+            'area_sqm': p['area_sqm'], 'drop_mean_m': p['drop_mean_m'],
+            'drop_max_m': p['drop_max_m'],
+            'height_before_mean_m': p['height_a_mean_m'],
+        }, 'geometry': mapping(ti.geometry_from_3035(p['geometry_3035']))})
+
+    by_status = {}
+    for f in tree_features:
+        s = f['properties']['status']
+        by_status[s] = by_status.get(s, 0) + 1
+
+    gr = np.array(growth_rates, dtype=np.float32)
+    growth_pct = {}
+    if len(gr):
+        growth_pct = {f'p{p}': round(float(np.percentile(gr, p)), 1)
+                      for p in (10, 25, 50, 75, 90)}
+
+    eff_meta = dict(eff, date_a=date_a, date_b=date_b,
+                    match_radius_m=match_radius_m,
+                    felling_min_drop_m=felling_min_drop_m,
+                    growth_eps_m=growth_eps_m, min_patch_sqm=min_patch_sqm,
+                    crown_geometry=crown_geometry)
+    return {
+        'type': 'FeatureCollection', 'features': tree_features,
+        'felling_patches': {'type': 'FeatureCollection',
+                            'features': patch_features},
+        'summary': {
+            'by_status': by_status,
+            'n_records': len(tree_features),
+            'n_trees_a': len(trees_a), 'n_trees_b': len(trees_b),
+            'felled_area_sqm': round(felled_area, 1),
+            'felled_volume_m3_est': round(felled_volume, 1),
+            'felled_note': ('felled requires raster veto: nDSM(3 m radius, '
+                            f'date_b) dropped >= {felling_min_drop_m} m AND '
+                            '< 40% of date_a height; failures are unmatched_a'),
+            'growth_cm_yr_percentiles': growth_pct,
+        },
+        'epoch_dates': {'a': date_a, 'b': date_b, 'days': days},
+        'meta': {
+            'tree_algo_version': tv.TREE_ALGO_VERSION,
+            'params_hash': tv.params_hash(eff_meta),
+            'ortho_used': ortho_used, 'nir_used': nir_used,
+            'processing_time_s': round(time.time() - t0, 2),
+            **eff_meta,
+            **params.get('_geometry_meta', {}),
+        },
+    }
+
+
+def _trees_v2_by_polygons_core(task_id, features, params):
+    """POST /api/v2/trees/by-polygons — per-stand batch inventory.
+
+    Computes the inventory ONCE on the union raster, then assigns trees to
+    stands by apex containment (no double counting at boundaries).
+    """
+    import tree_inventory as tv
+    from shapely.ops import unary_union
+    from shapely.strtree import STRtree
+    from rasterio.features import geometry_mask
+    t0 = time.time()
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+    include_trees = str(params.get('include_trees', 'false')).lower() in ('true', '1', 'yes')
+    key_prop = str(params.get('key_property', 'name'))
+    eff = _tree_v2_params(params)
+
+    if not features:
+        raise ValueError('No stand polygons provided')
+    stands = []
+    for i, f in enumerate(features):
+        props = f.get('properties', {}) or {}
+        key = str(props.get(key_prop) or props.get('name') or f'stand_{i+1}')
+        g3035 = ti.geometry_to_3035(f['geometry'])
+        stands.append({'key': key, 'geom': g3035, 'props': props})
+
+    union = unary_union([s['geom'] for s in stands])
+    _validate_area(union)
+
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset} '
+                                    f'({len(stands)} stands, union raster)…')
+    data = raster_io.read_dtm_dsm(union, dataset=dataset)
+    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
+        data, eff, include_ortho, task_id)
+
+    _progress_set(task_id, 'assign', 'Assigning trees to stands…')
+    stand_geoms = [s['geom'] for s in stands]
+    tree_pts = [Point(t.apex_e, t.apex_n) for t in trees]
+    tree_kd = STRtree(tree_pts) if tree_pts else None
+    assigned = {}
+    for si, s in enumerate(stands):
+        idxs = []
+        if tree_kd is not None:
+            for ti_ in tree_kd.query(s['geom']):
+                if s['geom'].contains(tree_pts[int(ti_)]):
+                    idxs.append(int(ti_))
+        assigned[si] = idxs
+
+    # per-stand canopy area from the shared canopy raster
+    results = []
+    for si, s in enumerate(stands):
+        smask = geometry_mask([mapping(s['geom'])], out_shape=data['shape'],
+                              transform=data['transform'], invert=True)
+        s_canopy = canopy & smask & data['mask']
+        s_trees = [trees[i] for i in assigned[si]]
+        summary = tv.summarise(s_trees, s_canopy, data['mask'],
+                               data['transform'], s['geom'].area)
+        entry = {'key': s['key'], 'summary': summary}
+        if include_trees:
+            entry['trees'] = [
+                _tree_v2_feature(t, mapping(ti.geometry_from_3035(
+                    Point(t.apex_e, t.apex_n))))
+                for t in s_trees]
+        results.append(entry)
+        _progress_set(task_id, 'assign',
+                      f'Summarised stand {si+1}/{len(stands)}…')
+
+    eff_meta = dict(eff, dataset=dataset, include_ortho=include_ortho)
+    return {
+        'stands': results,
+        'summary': {
+            'n_stands': len(stands),
+            'n_trees_total': len(trees),
+            'n_trees_assigned': sum(len(v) for v in assigned.values()),
+            'union_area_ha': round(union.area / 1e4, 3),
+        },
+        'meta': {
+            'tree_algo_version': tv.TREE_ALGO_VERSION,
+            'params_hash': tv.params_hash(eff_meta),
+            'key_property': key_prop,
+            'ortho_used': ortho_used, 'nir_used': nir_used,
+            'processing_time_s': round(time.time() - t0, 2),
+            **eff_meta,
+        },
+    }
+
+
+@app.route('/api/v2/trees', methods=['POST'])
+def trees_inventory_v2():
+    """Apex-based single-tree inventory (forestry-grade).
+
+    Marker-controlled watershed on smoothed nDSM with variable-window local
+    maxima (r(h) = crown_radius_a + crown_radius_b*h), crown radius caps and
+    stable location-derived tree IDs (t_<E_dm>_<N_dm>, EPSG:3035 apex @ 1 dm).
+    Params: dataset, min_tree_height, crown_radius_a/b, smooth_sigma,
+    crown_cap_factor, max_crown_area, crown_geometry=point|polygon,
+    include_ortho, async.
+    """
+    return _tree_endpoint(_trees_v2_core)
+
+
+@app.route('/api/v2/changes/trees', methods=['POST'])
+def changes_trees_v2():
+    """Apex-matched tree change detection with raster veto + felling patches.
+
+    Statuses: stable|grown|shrunk|felled|new|unmatched_a|unmatched_b.
+    'felled' and 'new' are gated by raw-nDSM evidence at the apex, so
+    segmentation churn produces honest 'unmatched' instead of false felling.
+    Params: date_a, date_b, match_radius_m, felling_min_drop_m, growth_eps_m,
+    min_patch_sqm, + all /api/v2/trees params.
+    """
+    return _tree_endpoint(_changes_trees_v2_core)
+
+
+def _get_geometry_multi():
+    """Like _get_geometry() but preserves individual features (no union).
+
+    Used by /api/v2/trees/by-polygons where each feature is a stand polygon
+    with its own key. Validates Austria bounds + repairs invalid rings.
+    """
+    if request.is_json:
+        body = request.get_json()
+        if 'geometry' in body:
+            geom_input = body['geometry']
+        elif 'type' in body:
+            geom_input = body
+        else:
+            raise ValueError("JSON body must contain 'geometry' or be a valid GeoJSON")
+        features = geo_parse.parse_input(geom_input)
+    elif 'file' in request.files:
+        features = geo_parse.parse_input(request.files['file'].read().decode('utf-8'))
+    elif request.form.get('geometry'):
+        features = geo_parse.parse_input(request.form['geometry'])
+    else:
+        data = request.get_data(as_text=True)
+        if not data:
+            raise ValueError("No geometry provided. Send a GeoJSON FeatureCollection of stand polygons.")
+        features = geo_parse.parse_input(data)
+    features = _repair_invalid_geometries(features)
+    for feat in features:
+        geo_parse.validate_austria_bounds(feat['geometry'])
+        geom = feat['geometry']
+        if geom.geom_type not in ('Polygon', 'MultiPolygon'):
+            feat['geometry'] = _non_polygon_to_polygon(geom)
+    return features
+
+
+@app.route('/api/v2/trees/by-polygons', methods=['POST'])
+def trees_by_polygons_v2():
+    """Per-stand batch inventory: FeatureCollection of stand polygons in,
+    per-polygon summaries out. Trees assigned by apex containment on a
+    single union raster (no double counting). Params: key_property (stand
+    id property, default 'name'), include_trees, + /api/v2/trees params.
+    """
+    return _tree_endpoint(_trees_v2_by_polygons_core, geometry_fn=_get_geometry_multi)
 
 
 # === SECTION: Multi-epoch summary ===
@@ -14612,11 +15059,19 @@ def hansen_overlay():
 
 @app.route('/api/v1/lidar/geotiff', methods=['POST'])
 def lidar_geotiff():
-    """Download nDSM as a georeferenced GeoTIFF."""
+    """Download DTM/DSM/nDSM as a georeferenced GeoTIFF.
+
+    Params: dataset, band=dtm|dsm|ndsm|all (default all → 3-band stack:
+    band 1 = DTM, band 2 = DSM, band 3 = nDSM). Single-band requests return
+    a 1-band file. NoData = -9999 (masked outside the AOI / BEV voids).
+    """
     try:
         geom_wgs84 = _extract_single_geom(_get_geometry())
         params = _get_params()
         dataset = params.get('dataset', '20240915')
+        band = str(params.get('band', request.args.get('band', 'all'))).lower()
+        if band not in ('all', 'dtm', 'dsm', 'ndsm'):
+            return _error(f"Unknown band {band!r}. Use dtm|dsm|ndsm|all.")
         geom_3035 = ti.geometry_to_3035(geom_wgs84)
         _validate_area(geom_3035)
 
@@ -14626,20 +15081,32 @@ def lidar_geotiff():
         dsm = data['dsm'] if 'dsm' in data else dtm + ndsm
         tf = data['transform']
         h, w = data['shape']
+        mask = data['mask']
+        NODATA = -9999.0
+
+        def _prep(arr):
+            a = arr.astype(np.float32)
+            a = np.where(mask & np.isfinite(a), a, NODATA)
+            return a
+
+        layers = {'dtm': ('DTM', _prep(dtm)), 'dsm': ('DSM', _prep(dsm)),
+                  'ndsm': ('nDSM', _prep(ndsm))}
+        selected = ['dtm', 'dsm', 'ndsm'] if band == 'all' else [band]
 
         tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
         with rasterio.open(tmp.name, 'w', driver='GTiff', width=w, height=h,
-                           count=3, dtype='float32', crs='EPSG:3035',
-                           transform=tf, compress='deflate') as dst:
-            dst.write(dtm.astype(np.float32), 1)
-            dst.write(dsm.astype(np.float32), 2)
-            dst.write(ndsm.astype(np.float32), 3)
-            dst.set_band_description(1, 'DTM')
-            dst.set_band_description(2, 'DSM')
-            dst.set_band_description(3, 'nDSM')
+                           count=len(selected), dtype='float32', crs='EPSG:3035',
+                           transform=tf, compress='deflate',
+                           nodata=NODATA) as dst:
+            for i, key in enumerate(selected, start=1):
+                name, arr = layers[key]
+                dst.write(arr, i)
+                dst.set_band_description(i, name)
 
+        fname = ('lidar_dtm_dsm_ndsm.tif' if band == 'all'
+                 else f'lidar_{band}_{dataset}.tif')
         return send_file(tmp.name, mimetype='image/tiff', as_attachment=True,
-                         download_name='lidar_dtm_dsm_ndsm.tif')
+                         download_name=fname)
     except Exception as e:
         log.error("lidar geotiff: %s", traceback.format_exc())
         return _error(str(e))
@@ -14647,19 +15114,36 @@ def lidar_geotiff():
 
 @app.route('/api/v1/ortho/geotiff', methods=['POST'])
 def ortho_geotiff():
-    """Download orthophoto as a georeferenced GeoTIFF (RGB + NIR if available)."""
+    """Download orthophoto as a georeferenced GeoTIFF (RGB + NIR if available).
+
+    Params: dataset, ortho_year (RGBI operate year, e.g. 2024),
+    resolution (m/px, default 1.0, min 0.2 = native DOP/RGBI GSD).
+    High-resolution requests are capped at 100 Mpx — shrink the AOI or
+    raise `resolution` if you hit the cap.
+    """
     try:
         import ortho_io
+        from rasterio.transform import from_origin as _from_origin
         geom_wgs84 = _extract_single_geom(_get_geometry())
         params = _get_params()
         dataset = params.get('dataset', '20240915')
+        year = params.get('ortho_year')
+        year = int(year) if year not in (None, '', 'null') else None
+        resolution = max(0.2, float(params.get('resolution', 1.0)))
         geom_3035 = ti.geometry_to_3035(geom_wgs84)
         _validate_area(geom_3035)
 
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
-        rgb, nir = ortho_io.read_ortho_for_als(data)
-        tf = data['transform']
-        h, w = data['shape']
+        min_e, min_n, max_e, max_n = geom_3035.bounds
+        w = int(np.ceil((max_e - min_e) / resolution))
+        h = int(np.ceil((max_n - min_n) / resolution))
+        if h * w > 100_000_000:
+            return _error(
+                f"Requested raster is {h}x{w} px ({h*w/1e6:.0f} Mpx) at "
+                f"{resolution} m — cap is 100 Mpx. Shrink the AOI or raise "
+                f"'resolution'.")
+        tf = _from_origin(min_e, max_n, resolution, resolution)
+        als_like = {'transform': tf, 'shape': (h, w), 'crs': 'EPSG:3035'}
+        rgb, nir = ortho_io.read_ortho_for_als(als_like, year=year)
 
         n_bands = 4 if nir is not None else 3
         tmp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
@@ -14905,6 +15389,26 @@ def ping():
     return jsonify({'pong': True, 'ts': _t.time()})
 
 
+def _ortho_datasets_info():
+    """Authoritative ortho epoch listing for /api/v1/info.
+
+    RGBI operates (0.2 m RGB+NIR) cover different regions per flight year;
+    per-AOI availability comes from /api/v1/layers?bbox=. The DOP 50 km RGB
+    tiles (20220128) are the Austria-wide fallback (no NIR).
+    """
+    import ortho_io
+    years = {}
+    for opid, info_ in ortho_io.RGBI_OPERATES.items():
+        years.setdefault(int(opid[:4]), 0)
+        years[int(opid[:4])] += 1
+    return {
+        "rgbi_operates": {str(y): f"{n} operate(s), 0.2m RGB+NIR, partial coverage"
+                          for y, n in sorted(years.items())},
+        "dop_rgb_tiles": {k: "0.2m RGB, Austria-wide, no NIR"
+                          for k in sorted(ortho_io.ORTHO_DATASETS)},
+    }
+
+
 @app.route('/api/v1/info', methods=['GET'])
 def info():
     return jsonify({
@@ -14917,7 +15421,10 @@ def info():
         "resolution_ortho": "0.2m (1m for analysis, 0.5m for GLCM texture)",
         "crs": "EPSG:3035",
         "datasets_als": {k: {"dtm": True, "dsm": True} for k in sorted(ti.DATASETS.keys())},
-        "datasets_ortho": ["20220128 (RGB 50km tiles)"],
+        "datasets_ortho": _ortho_datasets_info(),
+        "datasets_ortho_note": ("Per-AOI availability: GET /api/v1/layers?bbox= "
+                                 "is the authoritative oracle (RGBI operates "
+                                 "only cover parts of Austria per year)."),
         "tiles": len(ti.TILE_COORDS),
         "landscape_types": seg.OBJECT_TYPES,
         "data_sources": {
@@ -14936,6 +15443,9 @@ def info():
             "POST /api/v1/changes": "Temporal change detection (earthworks, trees, buildings, roads)",
             "POST /api/v1/changes/trees": "Per-tree growth / felling analysis (async + crown polygons)",
             "POST /api/v1/trees": "Single-date per-tree inventory (crowns, leaf type, stems/ha, h_dom)",
+            "POST /api/v2/trees": "Apex-based forestry inventory (stable tree IDs, explicit denominators)",
+            "POST /api/v2/changes/trees": "Apex-matched tree changes + raster veto + felling patches",
+            "POST /api/v2/trees/by-polygons": "Per-stand batch inventory (union raster, apex containment)",
             "POST /api/v1/changes/summary": "Multi-epoch change summary (2022→2023→2024)",
             "GET /api/v1/info": "This endpoint",
             "GET /api/v1/docs/llm.txt": "Machine-readable API reference",

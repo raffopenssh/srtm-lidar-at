@@ -16980,9 +16980,14 @@ def process_txt():
     #   hole+queued  parent bbox uncovered AND in retry_queue -> imminent
     #   hole         parent bbox uncovered -> auto-repicked by the
     #                pending sweep at next processor start (no action)
-    #   orphan       coverage OK (old-split residue / superseded block)
-    #                -> NEVER auto-repicked; cosmetic unless products
-    #                are wanted per-code (re-queue recipe in AGENTS.md)
+    #   orphan       coverage OK, code itself has no _json (old-split
+    #                residue / superseded block) -> NEVER auto-repicked;
+    #                cosmetic unless products are wanted per-code
+    #   orphan*      coverage OK *because this code's own _json exists*
+    #                but GPKG(s) missing -> the oracle prunes it from
+    #                every queue, so it will NEVER requeue on its own;
+    #                needs the manual re-queue recipe in AGENTS.md
+    #                (tombstone-aware POST /processing/queue)
     # ?stall=N rows (default 10, max 100, 0 = summary line only).
     try:
         _stall_lim = max(0, min(int(request.args.get('stall', 10)), 100))
@@ -17038,7 +17043,10 @@ def process_txt():
                     except Exception:
                         _cov_cache[parent] = True  # conservative: no noise
                 if _cov_cache[parent]:
-                    verdict = 'orphan'
+                    # 'json' present on THIS code => the oracle counts it
+                    # complete via its own json, so no sweep/queue will
+                    # ever repick it: manual requeue only -> asterisk.
+                    verdict = 'orphan*' if 'json' in g['p'] else 'orphan'
                 elif c in _rq or parent in _rq:
                     verdict = 'hole+queued'
                 else:
@@ -17063,20 +17071,25 @@ def process_txt():
         rows = _sv['rows']
         n_part = sum(1 for r in rows if r[0] == 'partial')
         n_stal = len(rows) - n_part
-        n_hole = sum(1 for r in rows if r[4] != 'orphan')
+        n_hole = sum(1 for r in rows if not r[4].startswith('orphan'))
         n_q = sum(1 for r in rows if r[4] == 'hole+queued')
         n_gap = sum(1 for r in rows if r[4] == 'GAP')
+        n_orph_manual = sum(1 for r in rows if r[4] == 'orphan*')
         out.append(
             f'zen_stall: done={_sv["done"]} partial={n_part} '
             f'stalled={n_stal} | holes={n_hole} ({n_q} queued, '
             f'{n_hole - n_q - n_gap} pending-sweep'
             + (f', {n_gap} GAP' if n_gap else '') + ') '
-            f'orphans={len(rows) - n_hole} (old-split residue)')
+            f'orphans={len(rows) - n_hole}'
+            + (f' ({n_orph_manual}* never-requeue, manual only)'
+               if n_orph_manual else ' (old-split residue)'))
         if _stall_lim and rows:
-            # partial first (active), then GAPs (need follow-up), then
-            # stalled newest-stale first.
+            # partial first (active), then GAPs and never-requeue
+            # orphan* rows (both need follow-up), then stalled
+            # newest-stale first.
             _ord = sorted(rows, key=lambda r: (
-                r[0] != 'partial', r[4] != 'GAP', -r[1]))
+                r[0] != 'partial', r[4] != 'GAP',
+                r[4] != 'orphan*', -r[1]))
             _now3 = _t.time()
             for kind, stale_at, c, miss, verdict in _ord[:_stall_lim]:
                 if kind == 'partial':

@@ -46,9 +46,11 @@ All forestry DOMAIN logic lives on THIS VM: your own DB, models, UI, reports.
   (async, ~2 min for 60 ha).
 - POST /api/v1/changes/trees {date_a,date_b} — per-tree growth/felling
   matching between ALS epochs (2022/2023/2024).
-- POST /api/v1/trees — single-epoch tree inventory with crown polygons and
-  leaf-type hint (NOTE: being added upstream; if it 404s, derive the epoch-1
-  inventory from /changes/trees output and the nDSM yourself, and flag it).
+- POST /api/v1/trees — single-epoch tree inventory: crown polygons
+  (crown_geometry=polygon), crown_shape, leaf-type hint (coniferous/broadleaf/
+  dead/unknown), and forestry summary (stems_per_ha, top_height_m, crown_cover_pct).
+  Supports async=true (poll /api/v1/segment/progress, fetch /segment/result).
+- POST /api/v1/changes/trees also supports async=true and crown_geometry=polygon.
 - POST /api/v1/terrain — slope/aspect/TRI/TPI/curvature (for windthrow risk,
   harvest accessibility).
 - POST /api/v1/changes — 20 change event types incl. forest_clearcut.
@@ -89,17 +91,14 @@ build ingestion. Show me the stand map for WILHELM as the first milestone.
 
 ---
 
-## API additions to make on THIS repo in support (tracked here)
+## API additions made on THIS repo in support (shipped)
 
-1. `POST /api/v1/trees` — single-date per-tree inventory. Thin wrapper around
-   `object_classifier.classify_objects` (same path `/changes/trees` already
-   uses per epoch). Params: `dataset`, `min_tree_height`, `crown_min_area`,
-   `crown_geometry=point|polygon`. Per tree: height_max, crown_area_sqm,
-   crown polygon, leaf-type hint (CIR NIR mean + NDVI harmonic amplitude over
-   the crown → conifer/broadleaf/unknown). Async support.
-2. `/changes/trees`: add `async=true` (reuse segment task framework) and
-   `crown_geometry=polygon`.
-3. Document both in `llm.txt` (`### Analysis` section).
+1. `POST /api/v1/trees` — single-date per-tree inventory: crown polygons,
+   crown_shape, leaf-type hint, stems/ha, top height (h_dom), crown cover.
+   Async-capable. Thin wrapper over `object_classifier.classify_objects`.
+2. `/changes/trees`: `async=true` (reuses segment task framework) and
+   `crown_geometry=polygon`, `min_tree_height` param.
+3. Both documented in `llm.txt` (`### Analysis` section).
 
 Rationale: tree detection stays canonical upstream; forestry domain logic
 (allometrics, stands, planning, UI) stays on the forestry VM. The fleet is

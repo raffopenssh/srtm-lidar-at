@@ -13229,47 +13229,52 @@ def _gpkg_core(features: list, params: dict, task_id: str = '') -> tuple:
                     ],
                 }
                 vec_path = tmp_path  # append to same GPKG
+                # Build all records first, then bulk-insert with writerecords().
+                # Per-record dst.write() into a GPKG that already contains
+                # raster tables is ~100x slower (25s vs 0.25s for 10k polys)
+                # because each write flushes against the multi-MB file.
+                records = []
+                for geom_dict, val in rasterize_shapes(
+                    label_int, mask=seg_mask, transform=tf,
+                    connectivity=4,
+                ):
+                    oid = int(val)
+                    obj = obj_map.get(oid)
+                    if obj is None:
+                        continue
+                    # Type-based color
+                    tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+                    hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+                    # Height-based viridis color (sqrt-scaled 0-45m)
+                    hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+                    hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+                    records.append({
+                        'geometry': geom_dict,
+                        'properties': {
+                            'id': oid,
+                            'type': obj.obj_type,
+                            'group_type': obj.group_type or '',
+                            'height_class': _height_class(obj.height_max),
+                            'height_max_m': round(obj.height_max, 2),
+                            'height_mean_m': round(obj.height_mean, 2),
+                            'area_sqm': round(obj.area_sqm, 1),
+                            'slope_mean_deg': round(obj.slope_mean, 1),
+                            'aspect_mean_deg': round(obj.aspect_mean, 1),
+                            'aspect_dominant': obj.aspect_dominant or 'flat',
+                            'elevation_mean_m': round(obj.elevation_mean, 2),
+                            'tri_mean': round(obj.tri_mean, 3),
+                            'terrain_class': obj.terrain_class or 'level',
+                            'confidence': round(obj.confidence, 2),
+                            'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                            'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
+                            'color': hex_type,
+                            'color_height': hex_height,
+                        },
+                    })
+                written = len(records)
                 with fiona.open(vec_path, 'w', driver='GPKG', layer='segments',
                                 schema=schema, crs=from_epsg(3035)) as dst:
-                    written = 0
-                    for geom_dict, val in rasterize_shapes(
-                        label_int, mask=seg_mask, transform=tf,
-                        connectivity=4,
-                    ):
-                        oid = int(val)
-                        obj = obj_map.get(oid)
-                        if obj is None:
-                            continue
-                        # Type-based color
-                        tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
-                        hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
-                        # Height-based viridis color (sqrt-scaled 0-45m)
-                        hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
-                        hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
-                        dst.write({
-                            'geometry': geom_dict,
-                            'properties': {
-                                'id': oid,
-                                'type': obj.obj_type,
-                                'group_type': obj.group_type or '',
-                                'height_class': _height_class(obj.height_max),
-                                'height_max_m': round(obj.height_max, 2),
-                                'height_mean_m': round(obj.height_mean, 2),
-                                'area_sqm': round(obj.area_sqm, 1),
-                                'slope_mean_deg': round(obj.slope_mean, 1),
-                                'aspect_mean_deg': round(obj.aspect_mean, 1),
-                                'aspect_dominant': obj.aspect_dominant or 'flat',
-                                'elevation_mean_m': round(obj.elevation_mean, 2),
-                                'tri_mean': round(obj.tri_mean, 3),
-                                'terrain_class': obj.terrain_class or 'level',
-                                'confidence': round(obj.confidence, 2),
-                                'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
-                                'ndvi_mean': round(obj.ndvi_mean, 3) if obj.ndvi_mean else 0.0,
-                                'color': hex_type,
-                                'color_height': hex_height,
-                            },
-                        })
-                        written += 1
+                    dst.writerecords(records)
                 table_count += 1
                 log.info("GPKG vector layer 'segments': %d polygons", written)
                 # Write QGIS layer_styles table for auto-rendering

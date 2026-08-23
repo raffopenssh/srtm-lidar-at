@@ -17042,7 +17042,19 @@ def process_txt():
                 elif c in _rq or parent in _rq:
                     verdict = 'hole+queued'
                 else:
-                    verdict = 'hole'
+                    # Non-queued hole: normally picked up by the pending
+                    # sweep (parent/blocks still schedulable). If the
+                    # split layout drifted so that every current-layout
+                    # block code is already in completed_codes while the
+                    # geometry has a hole, NOTHING will ever schedule it
+                    # and it's not in the queue for the director's
+                    # wedge-repair either -> label GAP (needs follow-up:
+                    # queue it so _repair_split_drift_wedges can act).
+                    try:
+                        _wed, _ = _split_drift_wedged(parent, real)
+                    except Exception:
+                        _wed = False
+                    verdict = 'GAP' if _wed else 'hole'
                 rows.append((kind, stale_at, c, miss, verdict))
             process_txt._stall_view = _sv = {
                 'mt': _mf_mt, 'ts': _t.time(), 'rows': rows,
@@ -17053,14 +17065,18 @@ def process_txt():
         n_stal = len(rows) - n_part
         n_hole = sum(1 for r in rows if r[4] != 'orphan')
         n_q = sum(1 for r in rows if r[4] == 'hole+queued')
+        n_gap = sum(1 for r in rows if r[4] == 'GAP')
         out.append(
             f'zen_stall: done={_sv["done"]} partial={n_part} '
             f'stalled={n_stal} | holes={n_hole} ({n_q} queued, '
-            f'{n_hole - n_q} pending-sweep) '
+            f'{n_hole - n_q - n_gap} pending-sweep'
+            + (f', {n_gap} GAP' if n_gap else '') + ') '
             f'orphans={len(rows) - n_hole} (old-split residue)')
         if _stall_lim and rows:
-            # partial first (active), then stalled newest-stale first.
-            _ord = sorted(rows, key=lambda r: (r[0] != 'partial', -r[1]))
+            # partial first (active), then GAPs (need follow-up), then
+            # stalled newest-stale first.
+            _ord = sorted(rows, key=lambda r: (
+                r[0] != 'partial', r[4] != 'GAP', -r[1]))
             _now3 = _t.time()
             for kind, stale_at, c, miss, verdict in _ord[:_stall_lim]:
                 if kind == 'partial':

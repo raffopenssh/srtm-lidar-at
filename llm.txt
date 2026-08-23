@@ -321,7 +321,39 @@ earthwork_fill/cut/grading/dam/trench/pond,
 road_new/resurfaced/widened, surface_change, unclassified_change.
 
 #### POST /api/v1/changes/trees
-Per-tree growth/felling analysis between dates.
+Per-tree growth/felling analysis between dates (matches trees across epochs by
+centroid proximity; statuses: grown, stable, felled, new).
+Params:
+  date_a, date_b     ALS dates (default: 20220915, 20240915)
+  min_tree_height    Min nDSM peak to count as a tree in metres (default: 3.0)
+  crown_geometry     point (default) | polygon — return crown outlines
+                     (after-date crown preferred, before-date for felled trees)
+  async              true → 202 {task_id, poll, result}; poll
+                     /api/v1/segment/progress, fetch /api/v1/segment/result.
+                     Recommended for areas > ~50 ha.
+Per-tree properties: tree_id, status, height_before_m, height_after_m,
+height_change_m, crown_area_before_sqm, crown_area_after_sqm.
+Summary: total_trees, by_status{count, height_change_mean_m}.
+
+#### POST /api/v1/trees
+Single-date per-tree inventory (crown detection on nDSM watershed + crown-shape
+analysis, optional orthophoto spectral support). Forestry-oriented.
+Params:
+  dataset            ALS date (default: 20240915)
+  min_tree_height    Min nDSM peak in metres (default: 3.0)
+  crown_min_area     Min crown footprint in pixels/m² (default: 4)
+  crown_geometry     point (default) | polygon — crown outline polygons (WGS84)
+  include_ortho      true (default) | false — use BEV ortho for NDVI/leaf type
+  async              true → 202 {task_id, poll, result} (same task framework
+                     as /segment). Recommended for areas > ~50 ha.
+Per-tree properties: tree_id, height_max_m, height_mean_m, height_p90_m,
+crown_area_sqm, crown_shape (conical|rounded|columnar|irregular),
+leaf_type (coniferous|broadleaf|dead|unknown — heuristic from crown shape +
+spectra; treat as a hint, not species truth), compactness, elongation,
+ndvi_mean (when ortho available).
+Summary: total_trees, stems_per_ha, by_leaf_type, height_mean_m, height_max_m,
+top_height_m (h_dom — mean of the 100 tallest stems per ha), crown_area_total_sqm,
+crown_cover_pct.
 
 #### POST /api/v1/changes/summary
 Multi-epoch change summary (2022→2023→2024).

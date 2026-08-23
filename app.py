@@ -5,6 +5,7 @@ Endpoints:
   2. POST /api/v1/terrain          — Terrain characterisation (slope, ruggedness, …)
   3. POST /api/v1/changes          — Temporal change detection between ALS dates
   6. POST /api/v1/changes/trees    — Per-tree growth / felling analysis
+  6b. POST /api/v1/trees           — Single-date per-tree inventory (forestry)
   7. POST /api/v1/changes/summary  — Multi-epoch change summary
   8. GET  /api/v1/info             — Datasets, object types, event types
   9. GET  /api/v1/docs/llm.txt     — Machine-readable API reference
@@ -13833,58 +13834,277 @@ def changes():
         return _error(f"Internal error: {e}", 500)
 
 
-# === SECTION: /api/v1/changes/trees endpoint ===
+# === SECTION: /api/v1/changes/trees + /api/v1/trees endpoints ===
 
-@app.route('/api/v1/changes/trees', methods=['POST'])
-def changes_trees():
-    """Per-tree growth / felling analysis between two dates."""
+def _tree_geom_prepare(features):
+    """Common geometry prep for the tree endpoints (buffer points, validate)."""
+    feat = features[0]
+    geom = feat['geometry']
+    geom_3035 = ti.geometry_to_3035(geom)
+    if geom.geom_type == 'Point':
+        geom_3035 = geom_3035.buffer(200)
+    _validate_area(geom_3035)
+    return geom_3035
+
+
+_LEAF_TYPE = {
+    'tree_coniferous': 'coniferous',
+    'tree_broadleaf': 'broadleaf',
+    'dead_tree': 'dead',
+}
+
+
+def _changes_trees_core(task_id, features, params):
+    """Per-tree growth / felling analysis between two dates (sync core)."""
+    t0 = time.time()
+    date_a = params.get('date_a', '20220915')
+    date_b = params.get('date_b', '20240915')
+    crown_geometry = str(params.get('crown_geometry', 'point')).lower()
+    min_tree_height = float(params.get('min_tree_height', 3.0))
+
+    geom_3035 = _tree_geom_prepare(features)
+
+    _progress_set(task_id, 'trees', f'Detecting trees for {date_a} vs {date_b}…')
+    tree_changes, rasters = tca.detect_tree_growth(
+        geom_3035, date_a, date_b,
+        min_tree_height=min_tree_height, return_rasters=True)
+
+    crowns_a = crowns_b = {}
+    if crown_geometry == 'polygon' and tree_changes:
+        _progress_set(task_id, 'crowns', 'Vectorising crown polygons…')
+        want_a = {tc.label_a for tc in tree_changes if tc.label_a}
+        want_b = {tc.label_b for tc in tree_changes if tc.label_b}
+        import object_classifier as oc
+        if want_a:
+            crowns_a = oc.crown_polygons(rasters['labels_a'], rasters['transform_a'], want_a)
+        if want_b:
+            crowns_b = oc.crown_polygons(rasters['labels_b'], rasters['transform_b'], want_b)
+
+    tree_features = []
+    for tc in tree_changes:
+        geom_out = None
+        if crown_geometry == 'polygon':
+            # Prefer the after-date crown (current state); fall back to before.
+            g = crowns_b.get(tc.label_b) or crowns_a.get(tc.label_a)
+            if g is not None:
+                geom_out = mapping(ti.geometry_from_3035(g))
+        if geom_out is None:
+            geom_out = mapping(ti.geometry_from_3035(Point(tc.centroid_e, tc.centroid_n)))
+        tree_features.append({"type": "Feature", "properties": {
+            "tree_id": tc.tree_id, "status": tc.status,
+            "height_before_m": tc.height_before, "height_after_m": tc.height_after,
+            "height_change_m": tc.height_change,
+            "crown_area_before_sqm": tc.crown_area_before,
+            "crown_area_after_sqm": tc.crown_area_after,
+        }, "geometry": geom_out})
+
+    by_status = {}
+    for tc in tree_changes:
+        by_status.setdefault(tc.status, {"count": 0, "mean_dh": []})
+        by_status[tc.status]["count"] += 1
+        by_status[tc.status]["mean_dh"].append(tc.height_change)
+    for v in by_status.values():
+        dh_list = v.pop("mean_dh")
+        v["height_change_mean_m"] = round(float(np.mean(dh_list)), 2) if dh_list else 0
+
+    return {
+        "type": "FeatureCollection", "features": tree_features,
+        "summary": {"total_trees": len(tree_changes), "by_status": by_status},
+        "meta": {"date_a": date_a, "date_b": date_b,
+                 "crown_geometry": crown_geometry,
+                 "min_tree_height_m": min_tree_height,
+                 "processing_time_s": round(time.time()-t0, 2),
+                 **params.get('_geometry_meta', {})},
+    }
+
+
+def _trees_core(task_id, features, params):
+    """Single-date per-tree inventory (sync core)."""
+    import object_classifier as oc
+    t0 = time.time()
+    dataset = params.get('dataset', ti.DEFAULT_DATASET)
+    crown_geometry = str(params.get('crown_geometry', 'point')).lower()
+    min_tree_height = float(params.get('min_tree_height', 3.0))
+    crown_min_area = int(params.get('crown_min_area', 4))
+    include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+
+    geom_3035 = _tree_geom_prepare(features)
+
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset}…')
+    data = raster_io.read_dtm_dsm(geom_3035, dataset=dataset)
+
+    rgb = nir = spectral = None
+    if include_ortho:
+        _progress_set(task_id, 'ortho', 'Reading orthophoto…')
+        try:
+            import ortho_io
+            rgb, nir = ortho_io.read_ortho_for_als(data)
+            spectral = ortho_io.compute_spectral_indices(rgb, nir)
+        except Exception as e:
+            log.warning("trees: ortho unavailable (%s), continuing LiDAR-only", e)
+
+    _progress_set(task_id, 'trees', 'Detecting trees…')
+    objects, labels = oc.classify_objects(
+        data['ndsm'], data['dtm'], data['mask'], data['transform'],
+        min_height=min_tree_height, min_area=crown_min_area,
+        dsm=data['dsm'], rgb=rgb, spectral=spectral, return_labels=True)
+
+    trees = [o for o in objects
+             if 'tree' in o.obj_type or o.obj_type == 'shrub_bush']
+    # shrub_bush only counts as a tree candidate if tall enough
+    trees = [o for o in trees
+             if o.obj_type != 'shrub_bush' or o.height_max >= min_tree_height]
+
+    crowns = {}
+    if crown_geometry == 'polygon' and trees:
+        _progress_set(task_id, 'crowns', 'Vectorising crown polygons…')
+        crowns = oc.crown_polygons(labels, data['transform'],
+                                   {o.label for o in trees if o.label})
+
+    tree_features = []
+    by_leaf = {}
+    heights = []
+    crown_area_total = 0.0
+    for o in trees:
+        leaf = _LEAF_TYPE.get(o.obj_type, 'unknown')
+        by_leaf[leaf] = by_leaf.get(leaf, 0) + 1
+        heights.append(o.height_max)
+        crown_area_total += o.area_sqm
+        geom_out = None
+        if crown_geometry == 'polygon':
+            g = crowns.get(o.label)
+            if g is not None:
+                geom_out = mapping(ti.geometry_from_3035(g))
+        if geom_out is None:
+            geom_out = mapping(ti.geometry_from_3035(Point(o.centroid_e, o.centroid_n)))
+        props = {
+            "tree_id": o.obj_id,
+            "height_max_m": o.height_max,
+            "height_mean_m": o.height_mean,
+            "height_p90_m": o.height_p90,
+            "crown_area_sqm": o.area_sqm,
+            "crown_shape": o.crown_shape,
+            "leaf_type": leaf,
+            "compactness": o.compactness,
+            "elongation": o.elongation,
+        }
+        if o.ndvi_mean:
+            props["ndvi_mean"] = o.ndvi_mean
+        tree_features.append({"type": "Feature", "properties": props,
+                              "geometry": geom_out})
+
+    area_ha = geom_3035.area / 1e4
+    hs = sorted(heights, reverse=True)
+    summary = {
+        "total_trees": len(trees),
+        "stems_per_ha": round(len(trees) / area_ha, 1) if area_ha > 0 else 0,
+        "by_leaf_type": by_leaf,
+        "height_mean_m": round(float(np.mean(heights)), 2) if heights else 0,
+        "height_max_m": round(max(heights), 2) if heights else 0,
+        # h_dom: mean height of the 100 tallest stems per ha (standard top height)
+        "top_height_m": round(float(np.mean(hs[:max(1, int(100 * area_ha))])), 2) if hs else 0,
+        "crown_area_total_sqm": round(crown_area_total, 1),
+        "crown_cover_pct": round(100.0 * crown_area_total / geom_3035.area, 1)
+        if geom_3035.area > 0 else 0,
+    }
+
+    return {
+        "type": "FeatureCollection", "features": tree_features,
+        "summary": summary,
+        "meta": {"dataset": dataset, "crown_geometry": crown_geometry,
+                 "min_tree_height_m": min_tree_height,
+                 "crown_min_area_px": crown_min_area,
+                 "ortho_used": rgb is not None,
+                 "area_ha": round(area_ha, 3),
+                 "processing_time_s": round(time.time()-t0, 2),
+                 **params.get('_geometry_meta', {})},
+    }
+
+
+def _tree_task_worker(task_id, core_fn, features, params):
+    """Queue-aware async worker shared by /trees and /changes/trees."""
+    global _TASK_QUEUE_SIZE
+    with _TASK_QUEUE_LOCK:
+        _TASK_QUEUE_SIZE += 1
+    _progress_set(task_id, 'queued', f'Waiting for slot ({_TASK_QUEUE_SIZE} in queue)…')
     try:
-        t0 = time.time()
+        acquired = _TASK_SEMAPHORE.acquire(timeout=300)
+        with _TASK_QUEUE_LOCK:
+            _TASK_QUEUE_SIZE = max(0, _TASK_QUEUE_SIZE - 1)
+        if not acquired:
+            _progress_error(task_id, 'Server busy — timed out waiting in queue. Try again later.')
+            return
+        try:
+            resp = core_fn(task_id, features, params)
+            _store_result(task_id, resp)
+            _progress_done(task_id)
+        except Exception as e:
+            log.error("Async tree task %s failed: %s", task_id, traceback.format_exc())
+            _progress_error(task_id, str(e))
+        finally:
+            _TASK_SEMAPHORE.release()
+    except Exception as e:
+        with _TASK_QUEUE_LOCK:
+            _TASK_QUEUE_SIZE = max(0, _TASK_QUEUE_SIZE - 1)
+        _progress_error(task_id, str(e))
+
+
+def _tree_endpoint(core_fn):
+    """Shared request handling for /trees and /changes/trees (sync + async)."""
+    run_async = str(request.args.get('async',
+                    request.form.get('async', 'false'))).lower() in ('true', '1', 'yes')
+    try:
         features = _get_geometry()
         params = _get_params()
-        date_a = params.get('date_a', '20220915')
-        date_b = params.get('date_b', '20240915')
+    except Exception as e:
+        return _error(str(e))
+    params['_geometry_meta'] = _geometry_meta()
+    if str(params.get('async', 'false')).lower() in ('true', '1', 'yes'):
+        run_async = True
 
-        feat = features[0]
-        geom = feat['geometry']
-        geom_3035 = ti.geometry_to_3035(geom)
-        if geom.geom_type == 'Point':
-            geom_3035 = geom_3035.buffer(200)
-        _validate_area(geom_3035)
+    if run_async:
+        task_id = request.args.get('task_id', '') or str(uuid.uuid4())
+        with _TASK_QUEUE_LOCK:
+            if _TASK_QUEUE_SIZE >= MAX_QUEUE_SIZE:
+                return _error('Server busy — too many tasks queued. Try again in a few minutes.', 503)
+        _progress_start(task_id)
+        _cleanup_old_results()
+        threading.Thread(target=_tree_task_worker,
+                         args=(task_id, core_fn, features, params),
+                         daemon=True).start()
+        return jsonify({"task_id": task_id, "status": "running",
+                        "poll": f"/api/v1/segment/progress?task_id={task_id}",
+                        "result": f"/api/v1/segment/result?task_id={task_id}"}), 202
 
-        tree_changes = tca.detect_tree_growth(geom_3035, date_a, date_b)
-
-        tree_features = []
-        for tc in tree_changes:
-            centroid_wgs = ti.geometry_from_3035(Point(tc.centroid_e, tc.centroid_n))
-            tree_features.append({"type": "Feature", "properties": {
-                "tree_id": tc.tree_id, "status": tc.status,
-                "height_before_m": tc.height_before, "height_after_m": tc.height_after,
-                "height_change_m": tc.height_change,
-                "crown_area_before_sqm": tc.crown_area_before,
-                "crown_area_after_sqm": tc.crown_area_after,
-            }, "geometry": mapping(centroid_wgs)})
-
-        by_status = {}
-        for tc in tree_changes:
-            by_status.setdefault(tc.status, {"count": 0, "mean_dh": []})
-            by_status[tc.status]["count"] += 1
-            by_status[tc.status]["mean_dh"].append(tc.height_change)
-        for v in by_status.values():
-            dh_list = v.pop("mean_dh")
-            v["height_change_mean_m"] = round(float(np.mean(dh_list)), 2) if dh_list else 0
-
-        return jsonify({
-            "type": "FeatureCollection", "features": tree_features,
-            "summary": {"total_trees": len(tree_changes), "by_status": by_status},
-            "meta": {"date_a": date_a, "date_b": date_b,
-                     "processing_time_s": round(time.time()-t0, 2), **_geometry_meta()},
-        })
+    try:
+        return jsonify(core_fn('', features, params))
     except ValueError as e:
         return _error(str(e))
     except Exception as e:
         log.error(traceback.format_exc())
         return _error(f"Internal error: {e}", 500)
+
+
+@app.route('/api/v1/changes/trees', methods=['POST'])
+def changes_trees():
+    """Per-tree growth / felling analysis between two dates.
+
+    Params: date_a, date_b, min_tree_height (default 3.0),
+    crown_geometry=point|polygon (default point), async=true|false.
+    """
+    return _tree_endpoint(_changes_trees_core)
+
+
+@app.route('/api/v1/trees', methods=['POST'])
+def trees_inventory():
+    """Single-date per-tree inventory with crown polygons + leaf-type hint.
+
+    Params: dataset (default 20240915), min_tree_height (default 3.0),
+    crown_min_area (px, default 4), crown_geometry=point|polygon,
+    include_ortho=true|false (spectral leaf-type support), async=true|false.
+    Summary includes stems_per_ha, top_height_m (h_dom), crown_cover_pct.
+    """
+    return _tree_endpoint(_trees_core)
 
 
 # === SECTION: Multi-epoch summary ===
@@ -14714,7 +14934,8 @@ def info():
             "POST /api/v1/terrain": "Terrain characterisation (slope, ruggedness, etc.)",
             "POST /api/v1/segment": "Watershed segmentation: 25 object types + 11 group types (Felzenszwalb+RAG)",
             "POST /api/v1/changes": "Temporal change detection (earthworks, trees, buildings, roads)",
-            "POST /api/v1/changes/trees": "Per-tree growth / felling analysis",
+            "POST /api/v1/changes/trees": "Per-tree growth / felling analysis (async + crown polygons)",
+            "POST /api/v1/trees": "Single-date per-tree inventory (crowns, leaf type, stems/ha, h_dom)",
             "POST /api/v1/changes/summary": "Multi-epoch change summary (2022→2023→2024)",
             "GET /api/v1/info": "This endpoint",
             "GET /api/v1/docs/llm.txt": "Machine-readable API reference",

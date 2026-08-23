@@ -325,6 +325,7 @@ class DetectedObject:
     temporal_std: float = 0.0       # mean std of nDSM across dates
     temporal_stable: bool = False   # True if object is temporally stable
     temporal_signal: str = ""       # "stable" / "growing" / "shrinking" / "new" / "removed"
+    label: int = 0                  # raster segment label (for crown polygon lookup)
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +944,7 @@ def classify_objects(
     temporal_std: np.ndarray | None = None,
     temporal_range: np.ndarray | None = None,
     n_temporal_dates: int = 1,
+    return_labels: bool = False,
 ) -> list[DetectedObject]:
     """Full pipeline: pixel classification → segmentation → object classification.
 
@@ -1115,11 +1117,43 @@ def classify_objects(
                 _temporal_signal_label(seg_temporal, h_max)
                 if seg_temporal else ""
             ),
+            label=int(reg.label),
         )
         objects.append(obj)
 
     log.info(f"Classified {len(objects)} objects")
+    if return_labels:
+        return objects, labels
     return objects
+
+
+def crown_polygons(
+    labels: np.ndarray,
+    transform,
+    wanted: set[int],
+    simplify_m: float = 0.5,
+) -> dict[int, "shapely.geometry.base.BaseGeometry"]:
+    """Vectorise segment label rasters into crown polygons (EPSG:3035).
+
+    Returns {label: shapely geometry} for labels in *wanted*.
+    Polygons are simplified with tolerance *simplify_m* metres.
+    """
+    from rasterio import features as rio_features
+    from shapely.geometry import shape as shp_shape
+    from shapely.ops import unary_union
+
+    out: dict[int, list] = {}
+    lab32 = labels.astype(np.int32)
+    mask = np.isin(lab32, list(wanted))
+    for geom, val in rio_features.shapes(lab32, mask=mask, transform=transform):
+        out.setdefault(int(val), []).append(shp_shape(geom))
+    result = {}
+    for lab, parts in out.items():
+        g = parts[0] if len(parts) == 1 else unary_union(parts)
+        if simplify_m:
+            g = g.simplify(simplify_m, preserve_topology=True)
+        result[lab] = g
+    return result
 
 
 def _spectral_from_rgb(rgb: np.ndarray) -> dict:

@@ -61,6 +61,8 @@ class TreeChange:
     crown_area_after: float    # sq m
     centroid_e: float
     centroid_n: float
+    label_a: int = 0           # segment label in date_a raster (0 = none)
+    label_b: int = 0           # segment label in date_b raster (0 = none)
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +750,7 @@ def detect_tree_growth(
     date_b: str,
     min_tree_height: float = 3.0,
     crown_min_area: int = 4,
+    return_rasters: bool = False,
 ) -> list[TreeChange]:
     """Per-tree change analysis between two dates.
 
@@ -777,16 +780,16 @@ def detect_tree_growth(
     data_b = raster_io.read_dtm_dsm(geom_3035, dataset=date_b)
 
     log.info("detect_tree_growth: classifying objects for date %s", date_a)
-    objs_a = oc.classify_objects(
+    objs_a, labels_a = oc.classify_objects(
         data_a["ndsm"], data_a["dtm"], data_a["mask"], data_a["transform"],
         min_height=min_tree_height, min_area=crown_min_area,
-        dsm=data_a["dsm"],
+        dsm=data_a["dsm"], return_labels=True,
     )
     log.info("detect_tree_growth: classifying objects for date %s", date_b)
-    objs_b = oc.classify_objects(
+    objs_b, labels_b = oc.classify_objects(
         data_b["ndsm"], data_b["dtm"], data_b["mask"], data_b["transform"],
         min_height=min_tree_height, min_area=crown_min_area,
-        dsm=data_b["dsm"],
+        dsm=data_b["dsm"], return_labels=True,
     )
 
     trees_a = [o for o in objs_a if "tree" in o.obj_type or o.obj_type == "shrub_bush"]
@@ -842,6 +845,8 @@ def detect_tree_growth(
                     centroid_n=round(
                         (ta.centroid_n + best_tb.centroid_n) / 2, 1
                     ),
+                    label_a=ta.label,
+                    label_b=best_tb.label,
                 )
             )
         else:
@@ -858,6 +863,7 @@ def detect_tree_growth(
                     crown_area_after=0.0,
                     centroid_e=round(ta.centroid_e, 1),
                     centroid_n=round(ta.centroid_n, 1),
+                    label_a=ta.label,
                 )
             )
 
@@ -876,6 +882,7 @@ def detect_tree_growth(
                     crown_area_after=round(tb.area_sqm, 1),
                     centroid_e=round(tb.centroid_e, 1),
                     centroid_n=round(tb.centroid_n, 1),
+                    label_b=tb.label,
                 )
             )
 
@@ -889,6 +896,11 @@ def detect_tree_growth(
             for s in sorted({c.status for c in changes})
         ),
     )
+    if return_rasters:
+        return changes, {
+        "labels_a": labels_a, "transform_a": data_a["transform"],
+        "labels_b": labels_b, "transform_b": data_b["transform"],
+        }
     return changes
 
 

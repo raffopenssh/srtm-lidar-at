@@ -149,6 +149,29 @@ Background processor (austria_processor.py, ~5100 lines) applies the full pipeli
 - {kg}_light.gpkg (~100MB): segment raster+vector, parcels with DTM heights, buildings with object heights, new buildings, infrastructure
 - {kg}.json (~1MB): area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
 
+#### GPKG segments layer — full per-object attribute schema (55 props)
+Present in {kg}_full.gpkg and {kg}_light.gpkg (layer 'segments',
+MultiPolygon EPSG:3035) and in app GPKG exports (onestop, /export/geopackage,
+share download). A companion 'segment_points' layer (Point EPSG:4326, 54
+props) carries the same attributes on object centroids.
+  Identity:       id, type, type_code, group_type, height_class
+  Shape:          area_sqm, perimeter_m, compactness, elongation, solidity, extent
+  Height:         height_max_m, height_mean_m, height_p90_m, height_std_m
+  Terrain:        slope_mean_deg, aspect_mean_deg, aspect_dominant, roughness,
+                  dsm_edge_strength, elevation_mean_m, elevation_min_m,
+                  elevation_max_m, tri_mean, tpi_mean, curvature_mean, terrain_class
+  Spectral:       ndvi_mean, ndvi_std, ndvi_fused, brightness_mean, nir_mean
+  Temporal:       height_change_m, dtm_change_m, temporal_stability,
+                  volume_change_m3, volume_change_abs_m3, dtm_change_max_m
+  Texture (GLCM): glcm_entropy, glcm_homogeneity, texture_complexity
+  SAR:            sar_vv, sar_vh
+  Phenology:      harm_amplitude, harm_phase, phenology_class
+  Classification: confidence, is_manmade, classifier (rf|rules|infra),
+                  rf_model (model hash), rf_type, rf_confidence
+  Rendering:      color (by type), color_height (viridis height ramp)
+  Observation:    obs_year
+A QGIS layer_styles table auto-renders both layers (colour by type).
+
 #### GPKG parcels layer — per-parcel terrain & AMS anchor fields
   elevation_min_m           float, min DTM elevation within parcel
   elevation_max_m           float, max DTM elevation within parcel
@@ -533,6 +556,9 @@ Params:
   height_max   Height filter: keep segments <= X metres
   height_op    gt | lt | between (inferred from min/max if omitted)
   color_mode   type | height (segment colouring)
+  include_segments_vector  true → add vector 'segments' (MultiPolygon,
+               EPSG:3035) + 'segment_points' (Point, EPSG:4326) layers with
+               the full 55-attribute schema (see "GPKG segments layer" above)
   async        true → 202 with {task_id}
 Async download: GET /api/v1/export/geopackage/download/<task_id>
 
@@ -1307,6 +1333,34 @@ Flow:
   2. Poll the poll_url (same endpoint + task_id) until status=done
   3. Final poll returns the file download (GPKG/KML) or JSON result
   Result is auto-saved as a share for later access (auto_share_id in response).
+
+GPKG contents (format=gpkg, defaults):
+  Raster tables: segment_type, segment_height (float32, EPSG:3035);
+    add include_dtm=true for DTM/DSM/nDSM; layers=... for ortho/overlays.
+  Vector layer 'segments' (MultiPolygon, EPSG:3035) — the FULL 55-attribute
+    schema, identical to the Zenodo {kg}_full/_light GPKGs (see
+    "GPKG segments layer" under Austria Processor above): identity
+    (type, type_code, group_type, height_class), shape (area_sqm,
+    perimeter_m, compactness, elongation, solidity, extent), height
+    (max/mean/p90/std), terrain (slope, aspect, roughness,
+    dsm_edge_strength, elevation min/mean/max, tri, tpi, curvature,
+    terrain_class), spectral (ndvi_mean/std/fused, brightness, nir),
+    temporal (height_change_m, dtm_change_m, temporal_stability,
+    volume_change_m3, volume_change_abs_m3, dtm_change_max_m), texture
+    (glcm_entropy, glcm_homogeneity, texture_complexity), SAR (sar_vv,
+    sar_vh), phenology (harm_amplitude, harm_phase, phenology_class),
+    classification provenance (confidence, is_manmade, classifier,
+    rf_model, rf_type, rf_confidence), rendering (color, color_height),
+    obs_year. Note: temporal/SAR/phenology fields are 0 unless
+    include_temporal / include_copernicus were set on the analysis.
+  Vector layer 'segment_points' (Point, EPSG:4326) — centroid per object,
+    same attributes (54 props, no height_std duplicate), mirrors the API
+    GeoJSON point features.
+  layer_styles table — QGIS auto-render styles for both vector layers.
+
+Already-processed KGs: if your bbox lies inside a processed KG, prefer the
+prebuilt Zenodo products — zenodo_light_gpkg_url / zenodo_full_gpkg_url from
+GET /api/v1/kg/<code> or /api/v1/query — over re-running onestop.
 
 Processing queue: max 2 concurrent tasks, 4 in queue. Returns 503 if full.
 

@@ -16983,11 +16983,20 @@ def process_txt():
     #   orphan       coverage OK, code itself has no _json (old-split
     #                residue / superseded block) -> NEVER auto-repicked;
     #                cosmetic unless products are wanted per-code
-    #   orphan*      coverage OK *because this code's own _json exists*
-    #                but GPKG(s) missing -> the oracle prunes it from
-    #                every queue, so it will NEVER requeue on its own;
-    #                needs the manual re-queue recipe in AGENTS.md
-    #                (tombstone-aware POST /processing/queue)
+    #   orphan*      coverage OK and this code's own _json is LOAD-
+    #                BEARING (excluding it leaves a coverage hole) but
+    #                GPKG(s) missing -> the oracle prunes it from every
+    #                queue, so it will NEVER requeue on its own; needs
+    #                the manual re-queue recipe in AGENTS.md
+    #                (tombstone-aware POST /processing/queue).
+    #                Codes whose own _json is REDUNDANT (parent bbox
+    #                still covered without it -> split-window-drift
+    #                residue, superseded by current-layout blocks) are
+    #                legitimate leftovers: counted as drift in the
+    #                summary, suppressed from the row list. Likewise
+    #                out_of_coverage jsons (block fully outside BEV
+    #                LiDAR, e.g. high-Alps border blocks): no GPKG will
+    #                ever exist by design -> counted as ooc, suppressed.
     # ?stall=N rows (default 10, max 100, 0 = summary line only).
     try:
         _stall_lim = max(0, min(int(request.args.get('stall', 10)), 100))
@@ -17043,10 +17052,37 @@ def process_txt():
                     except Exception:
                         _cov_cache[parent] = True  # conservative: no noise
                 if _cov_cache[parent]:
-                    # 'json' present on THIS code => the oracle counts it
-                    # complete via its own json, so no sweep/queue will
-                    # ever repick it: manual requeue only -> asterisk.
-                    verdict = 'orphan*' if 'json' in g['p'] else 'orphan'
+                    verdict = 'orphan'
+                    if 'json' in g['p']:
+                        # Own _json satisfies the oracle -> never
+                        # requeued automatically. Is that json load-
+                        # bearing, or drift residue superseded by the
+                        # current split layout? Re-run the oracle with
+                        # this code's _json excluded.
+                        try:
+                            _sans = dict(real)
+                            _sans.pop(c + '_json', None)
+                            _still, _ = _kg_coverage_complete(
+                                parent, _sans)
+                        except Exception:
+                            _still = False  # conservative: surface it
+                        if _still:
+                            verdict = 'drift'
+                        else:
+                            # Tiny json + out_of_coverage flag => block
+                            # entirely outside BEV LiDAR; GPKGs will
+                            # never exist. Legit, suppress as 'ooc'.
+                            verdict = 'orphan*'
+                            try:
+                                if int(real[c + '_json'].get('size')
+                                       or 0) < 20000:
+                                    _jd = json.loads(Path(
+                                        'data/austria_processor/json/'
+                                        f'{c}.json').read_text())
+                                    if _jd.get('out_of_coverage'):
+                                        verdict = 'ooc'
+                            except Exception:
+                                pass
                 elif c in _rq or parent in _rq:
                     verdict = 'hole+queued'
                 else:
@@ -17071,23 +17107,33 @@ def process_txt():
         rows = _sv['rows']
         n_part = sum(1 for r in rows if r[0] == 'partial')
         n_stal = len(rows) - n_part
-        n_hole = sum(1 for r in rows if not r[4].startswith('orphan'))
+        n_hole = sum(1 for r in rows
+                     if not r[4].startswith('orphan')
+                     and r[4] not in ('drift', 'ooc'))
         n_q = sum(1 for r in rows if r[4] == 'hole+queued')
         n_gap = sum(1 for r in rows if r[4] == 'GAP')
         n_orph_manual = sum(1 for r in rows if r[4] == 'orphan*')
+        n_drift = sum(1 for r in rows if r[4] == 'drift')
+        n_ooc = sum(1 for r in rows if r[4] == 'ooc')
         out.append(
             f'zen_stall: done={_sv["done"]} partial={n_part} '
             f'stalled={n_stal} | holes={n_hole} ({n_q} queued, '
             f'{n_hole - n_q - n_gap} pending-sweep'
             + (f', {n_gap} GAP' if n_gap else '') + ') '
-            f'orphans={len(rows) - n_hole}'
+            f'orphans={len(rows) - n_hole - n_drift - n_ooc}'
             + (f' ({n_orph_manual}* never-requeue, manual only)'
-               if n_orph_manual else ' (old-split residue)'))
+               if n_orph_manual else ' (old-split residue)')
+            + (f' drift={n_drift}' if n_drift else '')
+            + (f' ooc={n_ooc}' if n_ooc else '')
+            + (' (suppressed)' if n_drift or n_ooc else ''))
         if _stall_lim and rows:
             # partial first (active), then GAPs and never-requeue
             # orphan* rows (both need follow-up), then stalled
-            # newest-stale first.
-            _ord = sorted(rows, key=lambda r: (
+            # newest-stale first. drift rows (legit split-window
+            # residue) and ooc rows (outside BEV coverage) are
+            # suppressed entirely.
+            _vis = [r for r in rows if r[4] not in ('drift', 'ooc')]
+            _ord = sorted(_vis, key=lambda r: (
                 r[0] != 'partial', r[4] != 'GAP',
                 r[4] != 'orphan*', -r[1]))
             _now3 = _t.time()
@@ -17102,8 +17148,8 @@ def process_txt():
                 out.append(
                     f'  {kind:<7} {c:<18} miss={_miss_s:<12} '
                     f'{when:<18} {verdict}')
-            if len(rows) > _stall_lim:
-                out.append(f'  … +{len(rows) - _stall_lim} more '
+            if len(_vis) > _stall_lim:
+                out.append(f'  … +{len(_vis) - _stall_lim} more '
                            f'(?stall=N, max 100)')
     except Exception:
         log.exception('process.txt zen_stall block failed')

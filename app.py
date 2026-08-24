@@ -14089,6 +14089,9 @@ def _tree_v2_params(params):
                                                   tv.DEFAULT_MIN_APEX_PROMINENCE_M)),
         'leaf_type_min_conf': float(params.get('leaf_type_min_conf', 0.5)),
         'h_dom_basis': str(params.get('h_dom_basis', 'canopy')).lower(),
+        # v2.2 (FEEDBACK-3): ortho-fused detection
+        'detection_mode': str(params.get('detection_mode', 'fused')).lower(),
+        'ortho_seed_res_m': float(params.get('ortho_seed_res_m', 0.4)),
     }
     return eff
 
@@ -14129,8 +14132,66 @@ def _tree_v2_ortho_meta(data, year=None):
         return {'ortho_source': f'unknown ({e})'}
 
 
+def _tree_v2_hires_ortho(data, res_m, task_id):
+    """Read native-ish resolution ortho intensity for apex seeding (v2.2).
+
+    Returns (intensity, eff_res_m, source) or (None, None, reason). The
+    intensity grid is aligned to the 1 m ALS grid: shape (h*f, w*f) with
+    f = round(1/res). Pixel budget capped at 80 Mpx (the DoG seeding pass
+    peaks at ~4 float copies of the grid; srv runs under a 3 GB cap) —
+    res is coarsened for very large AOIs (seeding still helps at 0.5 m).
+    """
+    import ortho_io
+    from rasterio.transform import Affine
+    h, w = data['shape']
+    # integer zoom factor keeps the hi-res grid exactly aligned to 1 m px
+    f = max(1, int(round(1.0 / max(res_m, 0.2))))
+    while f > 1 and (h * f) * (w * f) > 80_000_000:
+        f -= 1
+    if f <= 1:
+        return None, None, 'aoi_too_large_for_hires_seeding'
+    res = 1.0 / f
+    tf = data['transform']
+    tf_hi = Affine(tf.a / f, tf.b, tf.c, tf.d, tf.e / f, tf.f)
+    als_like = {'transform': tf_hi, 'shape': (h * f, w * f), 'crs': 'EPSG:3035'}
+    _progress_set(task_id, 'ortho_seed',
+                  f'Reading {res:.2f} m ortho for apex seeding…')
+    try:
+        rgb_hi, nir_hi = ortho_io.read_ortho_for_als(als_like)
+    except Exception as e:
+        return None, None, f'hires_ortho_read_failed: {e}'
+    if rgb_hi is None:
+        return None, None, 'no_ortho_coverage'
+    if nir_hi is not None:
+        del rgb_hi
+        return nir_hi.astype(np.float32), res, 'nir'
+    lum = (0.35 * rgb_hi[0].astype(np.float32)
+           + 0.5 * rgb_hi[1].astype(np.float32)
+           + 0.15 * rgb_hi[2].astype(np.float32))
+    del rgb_hi
+    return lum, res, 'luminance'
+
+
+
+def _tree_v2_det_meta(det_meta, nir_used):
+    """v2.2 detection provenance block for response meta (FEEDBACK-3 §5)."""
+    used_for = []
+    if nir_used:
+        used_for.append('classification')
+    if det_meta.get('detection_mode') == 'fused':
+        used_for.append('detection' if det_meta.get('seed_band') == 'nir'
+                        else 'detection_luminance')
+    out = dict(det_meta)
+    out['nir_used_for'] = used_for
+    return out
+
 def _tree_v2_inventory(data, eff, include_ortho, task_id):
-    """Shared: run apex inventory on a read_dtm_dsm() result dict."""
+    """Shared: run apex inventory on a read_dtm_dsm() result dict.
+
+    Returns (trees, labels, canopy, ortho_used, nir_used, det_meta).
+    det_meta carries v2.2 detection provenance (mode actually used,
+    fallback reason, seed counts).
+    """
     import tree_inventory as tv
     rgb = nir = spectral = None
     if include_ortho:
@@ -14141,7 +14202,25 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
             spectral = ortho_io.compute_spectral_indices(rgb, nir)
         except Exception as e:
             log.warning("trees v2: ortho unavailable (%s), continuing LiDAR-only", e)
+
+    # v2.2: native-resolution ortho apex seeding (detection recall)
+    det_meta = {'detection_mode': 'ndsm_only'}
+    ortho_intensity = None
+    ortho_res = None
+    want_fused = eff.get('detection_mode', 'fused') == 'fused'
+    if want_fused and include_ortho:
+        ortho_intensity, ortho_res, why = _tree_v2_hires_ortho(
+            data, eff.get('ortho_seed_res_m', 0.4), task_id)
+        if ortho_intensity is not None:
+            det_meta['detection_mode'] = 'fused'
+            det_meta['seed_band'] = why  # 'nir' | 'luminance'
+        else:
+            det_meta['detection_fallback_reason'] = why
+    elif want_fused and not include_ortho:
+        det_meta['detection_fallback_reason'] = 'include_ortho=false'
+
     _progress_set(task_id, 'trees', 'Detecting tree apices + crowns…')
+    det_info = {}
     trees, labels, canopy = tv.build_inventory(
         data['ndsm'], data['mask'], data['transform'],
         min_height=eff['min_tree_height'],
@@ -14150,8 +14229,11 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
         max_crown_area=eff['max_crown_area'],
         min_apex_prominence=eff.get('min_apex_prominence_m', 0.0),
         leaf_type_min_conf=eff.get('leaf_type_min_conf', 0.5),
-        spectral=spectral, nir=nir)
-    return trees, labels, canopy, (rgb is not None), (nir is not None)
+        spectral=spectral, nir=nir,
+        ortho_intensity=ortho_intensity, ortho_res_m=ortho_res,
+        det_info=det_info)
+    det_meta.update(det_info)
+    return trees, labels, canopy, (rgb is not None), (nir is not None), det_meta
 
 
 def _tree_v2_feature(t, geom_out):
@@ -14167,7 +14249,10 @@ def _tree_v2_feature(t, geom_out):
         'volume_m3_est': t.volume_m3_est,
         'leaf_type': t.leaf_type, 'leaf_type_conf': t.leaf_type_conf,
         'leaf_type_prob_conifer': t.leaf_type_prob_conifer,
+        'species_hint': t.species_hint, 'species_conf': t.species_conf,
         'vitality': t.vitality, 'vitality_conf': t.vitality_conf,
+        'detection_source': t.detection_source,
+        'detection_conf': t.detection_conf,
     }
     props.update(t.spectral)
     apex_wgs = ti.geometry_from_3035(Point(t.apex_e, t.apex_n))
@@ -14189,7 +14274,7 @@ def _trees_v2_core(task_id, features, params):
     _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset}…')
     data = raster_io.read_dtm_dsm(geom_3035, dataset=dataset)
 
-    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
+    trees, labels, canopy, ortho_used, nir_used, det_meta = _tree_v2_inventory(
         data, eff, include_ortho, task_id)
 
     crowns = {}
@@ -14217,6 +14302,9 @@ def _trees_v2_core(task_id, features, params):
     acq = als_acquisition.lookup(geom_3035, dataset)
     eff_meta = dict(eff, dataset=dataset, crown_geometry=crown_geometry,
                     include_ortho=include_ortho)
+    # meta.detection_mode must reflect what actually RAN (det_meta), not the
+    # requested param — keep the request echo under a distinct key.
+    eff_meta['detection_mode_requested'] = eff_meta.pop('detection_mode', None)
     return {
         'type': 'FeatureCollection', 'features': tree_features,
         'summary': summary,
@@ -14226,6 +14314,7 @@ def _trees_v2_core(task_id, features, params):
             'algorithm': 'marker_watershed_variable_window',
             'acquisition': acq,
             'ortho_used': ortho_used, 'nir_used': nir_used,
+            **_tree_v2_det_meta(det_meta, nir_used),
             **(_tree_v2_ortho_meta(data) if ortho_used else {}),
             'vitality_note': ('NDVI anomaly within leaf-type population '
                               '(stressed = <= p10 in AOI); dead = absolute '
@@ -14258,6 +14347,13 @@ def _changes_trees_v2_core(task_id, features, params):
     crown_geometry = str(params.get('crown_geometry', 'point')).lower()
     include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
     eff = _tree_v2_params(params)
+    # Cross-epoch matching quality is bounded by the WORSE epoch's recall;
+    # mixing detector generations (fused epoch-b vs ndsm-only epoch-a) would
+    # surface recall deltas as bogus new/felled records (FEEDBACK-3 §5.6).
+    # Force symmetric nDSM-only detection for BOTH epochs — ortho (when
+    # include_ortho=true) still feeds vitality/leaf-type on epoch b, just
+    # not apex seeding.
+    eff = dict(eff, detection_mode='ndsm_only')
     match_radius_m = float(params.get('match_radius_m', tv.DEFAULT_MATCH_RADIUS_M))
     felling_min_drop_m = float(params.get('felling_min_drop_m', tv.DEFAULT_FELLING_MIN_DROP_M))
     growth_eps_m = float(params.get('growth_eps_m', tv.DEFAULT_GROWTH_EPS_M))
@@ -14270,8 +14366,8 @@ def _changes_trees_v2_core(task_id, features, params):
     data_b = raster_io.read_dtm_dsm(geom_3035, dataset=date_b)
     data_a, data_b = tca_mod._align_grids(data_a, data_b)
 
-    trees_a, labels_a, canopy_a, _, _ = _tree_v2_inventory(data_a, eff, False, task_id)
-    trees_b, labels_b, canopy_b, ortho_used, nir_used = _tree_v2_inventory(
+    trees_a, labels_a, canopy_a, _, _, det_meta_a = _tree_v2_inventory(data_a, eff, False, task_id)
+    trees_b, labels_b, canopy_b, ortho_used, nir_used, det_meta_b = _tree_v2_inventory(
         data_b, eff, include_ortho, task_id)
 
     # Re-derive raster indices on the ALIGNED shared grid (transforms can
@@ -14324,6 +14420,12 @@ def _changes_trees_v2_core(task_id, features, params):
     for r in recs:
         ta, tb = r.pop('_ta'), r.pop('_tb')
         props = {k: v for k, v in r.items() if k not in ('apex_a', 'apex_b')}
+        # FEEDBACK-3 §5.6: alias for recall-bounded unmatched pairs — the
+        # counterpart epoch had no detection but the canopy is intact, i.e.
+        # a detector-recall artefact, NOT a physical change.
+        if r['status'] in ('unmatched_a_canopy_intact',
+                           'unmatched_b_canopy_preexisting'):
+            props['match_status'] = 'unmatched_recall'
         if years and r['status'] in ('grown', 'stable', 'shrunk') \
                 and r['height_change_m'] is not None:
             g = 100.0 * r['height_change_m'] / years
@@ -14391,6 +14493,7 @@ def _changes_trees_v2_core(task_id, features, params):
                     felling_min_drop_m=felling_min_drop_m,
                     growth_eps_m=growth_eps_m, min_patch_sqm=min_patch_sqm,
                     crown_geometry=crown_geometry)
+    eff_meta['detection_mode_requested'] = eff_meta.pop('detection_mode', None)
     return {
         'type': 'FeatureCollection', 'features': tree_features,
         'felling_patches': {'type': 'FeatureCollection',
@@ -14445,6 +14548,7 @@ def _changes_trees_v2_core(task_id, features, params):
                                      'block Flugjahr from the BEV '
                                      '"Aktualitaet DGM - ALS" overlay')},
             'ortho_used': ortho_used, 'nir_used': nir_used,
+            **_tree_v2_det_meta(det_meta_b, nir_used),
             **(_tree_v2_ortho_meta(data_b) if ortho_used else {}),
             'processing_time_s': round(time.time() - t0, 2),
             **eff_meta,
@@ -14579,7 +14683,7 @@ def _trees_v2_by_polygons_core(task_id, features, params):
     _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {dataset} '
                                     f'({len(stands)} stands, union raster)…')
     data = raster_io.read_dtm_dsm(union, dataset=dataset)
-    trees, labels, canopy, ortho_used, nir_used = _tree_v2_inventory(
+    trees, labels, canopy, ortho_used, nir_used, det_meta = _tree_v2_inventory(
         data, eff, include_ortho, task_id)
 
     _progress_set(task_id, 'assign', 'Assigning trees to stands…')
@@ -14616,6 +14720,7 @@ def _trees_v2_by_polygons_core(task_id, features, params):
     acq = als_acquisition.lookup(union, dataset)
     eff_meta = dict(eff, dataset=dataset, include_ortho=include_ortho,
                     merge_by_key=merge_by_key)
+    eff_meta['detection_mode_requested'] = eff_meta.pop('detection_mode', None)
     return {
         'stands': results,
         'summary': {
@@ -14631,6 +14736,7 @@ def _trees_v2_by_polygons_core(task_id, features, params):
             'key_property': key_prop,
             'acquisition': acq,
             'ortho_used': ortho_used, 'nir_used': nir_used,
+            **_tree_v2_det_meta(det_meta, nir_used),
             **(_tree_v2_ortho_meta(data) if ortho_used else {}),
             'processing_time_s': round(time.time() - t0, 2),
             **eff_meta,
@@ -15388,9 +15494,12 @@ def ortho_geotiff():
     """Download orthophoto as a georeferenced GeoTIFF (RGB + NIR if available).
 
     Params: dataset, ortho_year (RGBI operate year, e.g. 2024),
-    resolution (m/px, default 1.0, min 0.2 = native DOP/RGBI GSD).
+    resolution (m/px, default 1.0, min 0.2 = native DOP/RGBI GSD) or
+    res=native|1m (v2.2 alias: native → 0.2 m).
     High-resolution requests are capped at 100 Mpx — shrink the AOI or
     raise `resolution` if you hit the cap.
+    GeoTIFF tags carry ortho provenance (ORTHO_RES_M, ORTHO_EPOCH,
+    ORTHO_OPERATE_ID) when an RGBI operate was read.
     """
     try:
         import ortho_io
@@ -15401,6 +15510,11 @@ def ortho_geotiff():
         year = params.get('ortho_year')
         year = int(year) if year not in (None, '', 'null') else None
         resolution = max(0.2, float(params.get('resolution', 1.0)))
+        res_alias = str(params.get('res', '')).lower()
+        if res_alias == 'native':
+            resolution = 0.2
+        elif res_alias in ('1m', '1'):
+            resolution = 1.0
         geom_3035 = ti.geometry_to_3035(geom_wgs84)
         _validate_area(geom_3035)
 
@@ -15430,6 +15544,18 @@ def ortho_geotiff():
             if nir is not None:
                 dst.write(nir, 4)
                 dst.set_band_description(4, 'NIR')
+            # v2.2 provenance tags (FEEDBACK-3 §5.4)
+            try:
+                meta_prov = _tree_v2_ortho_meta(
+                    {'transform': tf, 'shape': (h, w)}, year=year)
+                tags = {'ORTHO_RES_M': str(resolution)}
+                if meta_prov.get('ortho_epoch'):
+                    tags['ORTHO_EPOCH'] = str(meta_prov['ortho_epoch'])
+                if meta_prov.get('ortho_operate_id'):
+                    tags['ORTHO_OPERATE_ID'] = str(meta_prov['ortho_operate_id'])
+                dst.update_tags(**tags)
+            except Exception:
+                pass
 
         return send_file(tmp.name, mimetype='image/tiff', as_attachment=True,
                          download_name='orthophoto_rgbi.tif')

@@ -385,10 +385,16 @@ canopy ~2× and its summary uses the whole-AOI denominator.
 ### v2 tree service (apex-based, forestry-grade)
 
 #### POST /api/v2/trees
-Apex-based single-tree inventory. Variable-window local maxima on nDSM
+Apex-based single-tree inventory, v2.2 ORTHO-FUSED detection.
+Seeding is two-source: (1) variable-window local maxima on nDSM
 (smoothed sigma=smooth_sigma), window radius r(h) = crown_radius_a +
-crown_radius_b*h; marker-controlled watershed seeded by those apices;
-crown radius capped at r(h)*crown_cap_factor and max_crown_area.
+crown_radius_b*h; (2) native-resolution (0.2–0.5 m) RGBI ortho apex
+candidates — DoG band-pass crown-cap maxima (NIR preferred, RGB
+luminance fallback), height-gated on the nDSM (no stems below canopy)
+and restricted to locally CLOSED canopy (>=70% closure in 15 m) where
+the 1 m first-return gridding merges neighbouring tops. Both seed sets
+fuse into one marker-controlled watershed; crown radius capped at
+r(h)*crown_cap_factor and max_crown_area.
 Params:
   dataset            ALS date (default: 20240915)
   min_tree_height    m (default 3.0)
@@ -399,6 +405,12 @@ Params:
   max_crown_area     m² hard cap per crown (default 250)
   crown_geometry     polygon (default) | point
   include_ortho      true (default) — 0.2 m RGBI spectra when covered
+  detection_mode     fused (default) | ndsm_only — fused adds the
+                     native-res ortho seeding; falls back to ndsm_only
+                     automatically when no ortho covers the AOI (see
+                     meta.detection_mode + detection_fallback_reason)
+  ortho_seed_res_m   target seeding resolution (default 0.4; snapped to
+                     an integer divisor of 1 m, coarsened for huge AOIs)
   min_apex_prominence_m  m (default 0 = off) — filter apices by h-maxima
                      prominence; suppresses branch-level false apices
   leaf_type_min_conf 0..1 (default 0.5) — below this leaf_type='unknown'
@@ -411,12 +423,23 @@ seq, apex_lon/apex_lat (the local maximum, for field navigation), height_m
 (crown touches AOI boundary — exclude from density), dbh_est_cm +
 dbh_method (heuristic), volume_m3_est, leaf_type + leaf_type_conf +
 leaf_type_prob_conifer (raw probability — re-threshold client-side),
-vitality (vital|stressed|dead|unknown) + vitality_conf. Vitality is
-RELATIVE: 'stressed' = NDVI <= p10 within the AOI's same-leaf-type
-population (per-tree spectral.ndvi_percentile_in_aoi lets you re-cut);
-'dead' stays absolute (ndvi_mean<0.15 & ndvi_p10<0.10 & h>=5). Only
-trustworthy when meta.nir_used=true. Also ndvi_mean/ndvi_p10/nir_mean/
-brightness_mean (when spectra available).
+species_hint (spruce|larch|pine|conifer_unspecified|
+broadleaf_unspecified|unknown) + species_conf (capped 0.6 —
+ASSUMPTION-grade: relative within-AOI RGBI spectral position of the
+conifer population; spruce=dark crowns, larch=bright fresh-green
+deciduous conifer, pine=intermediate; needs >=10 conifers in AOI and
+leaf-on imagery — keep out of hard economic gates),
+vitality (vital|stressed|dead|unknown) + vitality_conf,
+detection_source (ndsm | ortho | fused) + detection_conf (0..1):
+'ndsm' = LiDAR local maximum (conf 0.75), 'fused' = nDSM apex
+independently confirmed by an ortho crown cap (conf 0.9), 'ortho' =
+recovered ONLY by native-res ortho seeding (conf 0.30–0.75 by seed
+strength — render differently, keep out of hard economic gates).
+Vitality is RELATIVE: 'stressed' = NDVI <= p10 within the AOI's
+same-leaf-type population (per-tree spectral.ndvi_percentile_in_aoi lets
+you re-cut); 'dead' stays absolute (ndvi_mean<0.15 & ndvi_p10<0.10 &
+h>=5). Only trustworthy when meta.nir_used=true. Also
+ndvi_mean/ndvi_p10/nir_mean/brightness_mean (when spectra available).
 Summary (explicit denominators): n_trees, n_trees_edge, area_ha_total,
 area_ha_canopy (nDSM >= min_tree_height), stems_per_ha_canopy,
 stems_per_ha_total (both non-edge only), h_mean_m, h_p50/p90/p95/p99/max_m,
@@ -430,12 +453,25 @@ plenter tests), canopy_gap_fraction (share of AOI pixels 2–10 m — where
 low stems are actually visible to first-return DSM), understory_detectable
 (always false: suppressed stems below dominant layer are invisible to a
 1 m first-return DSM — see detection_floor_note), by_leaf_type,
-by_vitality, volume_m3_est_total, volume_method (full allometry formula +
+by_vitality, by_species_hint, by_detection_source,
+recall_model {canopy_area_ha, crown_area_ha, unassigned_canopy_frac —
+self-reported residual under-detection: the share of canopy >= min
+height that belongs to no detected crown},
+volume_m3_est_total, volume_method (full allometry formula +
 known bias; generic spruce heuristic, NOT Pollanschütz — calibration
 against plot data available on request).
 meta: tree_algo_version, params_hash (deterministic over effective params
 — same params → same result; invalidate caches when tree_algo_version
-changes), acquisition (REAL flight years per BEV flight-block overlay:
+changes), detection_mode (fused | ndsm_only — what actually ran) +
+detection_fallback_reason when degraded, seed_band (nir | luminance),
+n_seeds_ndsm / n_seeds_ortho_candidates / n_seeds_ortho_added /
+n_seeds_ortho_pruned (added seeds whose final crown < 4 m² are treated
+as intra-crown branch texture, dropped, and the watershed re-run — no
+confetti crowns), detection_mode_requested (the param echo; meta.
+detection_mode is what actually ran),
+nir_used_for (list: classification / detection / detection_luminance —
+replaces the ambiguous nir_used flag, which is kept for compatibility),
+acquisition (REAL flight years per BEV flight-block overlay:
 blocks[{flugjahr, year_from/to, gebiet, coverage_frac}], effective_date —
 the folder date 20220915 etc. is a mosaic snapshot, NOT the flight date;
 e.g. Steiermark '20220915' was flown 2010), ortho_operates/ortho_epoch
@@ -459,6 +495,14 @@ of date_a height. Veto failures are SUB-CLASSIFIED, not lumped:
 unmatched_b_canopy_preexisting (apex churn, not a new tree).
 Statuses: stable | grown | shrunk | felled | new | unmatched_a_* |
 unmatched_b_canopy_preexisting.
+unmatched_a_canopy_intact and unmatched_b_canopy_preexisting records also
+carry match_status='unmatched_recall' — the counterpart epoch had no
+detection but the canopy is intact, i.e. a detector-recall artefact, NOT
+a physical change. Filter these out of loss/gain accounting.
+Detection here is FORCED symmetric ndsm_only for BOTH epochs (fused
+seeding disabled), so a recall difference between detector generations
+can never masquerade as new/felled records; ortho still feeds epoch-b
+vitality/leaf-type when include_ortho=true.
 Params: date_a, date_b, match_radius_m (default 3.0), felling_min_drop_m
 (default 5.0), growth_eps_m (default 0.3), min_patch_sqm (default 25),
 crown_geometry=point (default)|polygon, + all /api/v2/trees params.
@@ -592,7 +636,9 @@ Async download: GET /api/v1/export/mbtiles/download/<task_id>
   /api/v1/ortho/geotiff    Orthophoto GeoTIFF, RGB + NIR (band 4) when an
                            RGBI operate covers the AOI/year. Params: dataset,
                            ortho_year (e.g. 2024), resolution (m/px, default
-                           1.0, min 0.2 = native; capped at 100 Mpx).
+                           1.0, min 0.2 = native; capped at 100 Mpx), or
+                           res=native|1m alias (native → 0.2 m). GeoTIFF
+                           tags: ORTHO_RES_M, ORTHO_EPOCH, ORTHO_OPERATE_ID.
 
 ### BEV source-data access (for local validation / offline work)
 

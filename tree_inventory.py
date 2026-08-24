@@ -30,7 +30,7 @@ from scipy import ndimage
 log = logging.getLogger(__name__)
 
 #: Bump when the algorithm changes in a way that invalidates caches.
-TREE_ALGO_VERSION = "2.1.0"
+TREE_ALGO_VERSION = "2.2.0"
 
 # Defaults (spruce-oriented; all exposed as request params)
 DEFAULT_CROWN_RADIUS_A = 1.2    # m — base local-max window radius
@@ -47,6 +47,29 @@ DEFAULT_GROWTH_EPS_M = 0.3      # |dh| below this → stable
 # cross-epoch overlap this large is very unlikely for two different trees.
 CROWN_OVERLAP_MIN_FRAC = 0.3
 DEFAULT_MIN_APEX_PROMINENCE_M = 0.0  # m; 0 = off (Q3/Q10 request)
+
+# --- v2.2 ortho-fused detection (FEEDBACK-3 recall round) ---------------
+# Native-resolution apex seeding on the RGBI ortho: crown caps are bright
+# blobs at the 1-3 m scale; a DoG band-pass + local maxima recovers apices
+# the 1 m first-return gridding merged into one nDSM blob.
+ORTHO_SEED_SIGMA_SMALL_M = 0.6   # DoG inner scale (crown-cap highlight)
+ORTHO_SEED_SIGMA_LARGE_M = 2.4   # DoG outer scale (background canopy)
+ORTHO_SEED_MIN_SEP_M = 1.6       # min spacing between accepted seeds
+ORTHO_SEED_PCTL = 55.0           # response percentile threshold (positive
+                                 # band values within canopy)
+ORTHO_SEED_MAX_PER_CANOPY_HA = 1200  # sanity cap on added stems
+ORTHO_SEED_HEIGHT_GATE_R_PX = 2  # nDSM max within this radius must clear
+                                 # min_tree_height (kills ground FPs)
+ORTHO_SEED_MIN_CROWN_SQM = 4.0   # two-pass prune: an ortho-added seed
+                                 # whose FINAL watershed crown is smaller
+                                 # than this was intra-crown branch
+                                 # texture, not a merged sub-dominant top
+                                 # — drop it and re-run the watershed
+ORTHO_SEED_CLOSURE_WIN_M = 15    # local canopy-closure window (1 m grid)
+ORTHO_SEED_CLOSURE_MIN = 0.7     # only seed where canopy closure >= this
+                                 # (open stands are already nDSM-resolved;
+                                 # restricts ortho FPs to where recall is
+                                 # actually broken — closed fine canopy)
 
 #: Allometry provenance (Q5) — surfaced via volume_method in summaries.
 FORM_FACTOR = 0.42
@@ -111,6 +134,178 @@ def detect_apices(
         rr = np.array([p[0] for p in pts]); cc = np.array([p[1] for p in pts])
         apex[rr, cc] = True
     return apex, smooth, canopy
+
+
+def ortho_apex_candidates(
+    intensity: np.ndarray,
+    res_m: float,
+    canopy: np.ndarray,
+    smooth: np.ndarray,
+    min_height: float,
+    min_sep_m: float = ORTHO_SEED_MIN_SEP_M,
+    pctl: float = ORTHO_SEED_PCTL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Native-resolution apex seeding on ortho intensity (v2.2).
+
+    ``intensity`` is a 2-D float/uint8 array (NIR preferred, luminance
+    fallback) on a grid aligned with the 1 m detection grid: shape must be
+    ``(h*f, w*f)`` with ``f = round(1/res_m)``.  ``canopy``/``smooth`` are
+    the 1 m rasters from :func:`detect_apices`.
+
+    Returns ``(rows_1m, cols_1m, strength01)`` sorted strongest-first,
+    height-gated (nDSM max within ~2 px must clear ``min_height``) and
+    spaced at least ``min_sep_m`` apart.  Pure numpy/scipy — caller does
+    all I/O.
+    """
+    z = intensity.astype(np.float32)
+    hh, ww = z.shape
+    h1, w1 = canopy.shape
+    f = max(1, int(round(1.0 / max(res_m, 1e-6))))
+
+    band = (ndimage.gaussian_filter(z, ORTHO_SEED_SIGMA_SMALL_M / res_m)
+            - ndimage.gaussian_filter(z, ORTHO_SEED_SIGMA_LARGE_M / res_m))
+
+    # canopy mask on the hi-res grid (nearest-neighbour zoom via indexing)
+    ri = np.minimum(np.arange(hh) // f, h1 - 1)
+    ci = np.minimum(np.arange(ww) // f, w1 - 1)
+    canopy_hi = canopy[np.ix_(ri, ci)]
+    if not canopy_hi.any():
+        e = np.array([], dtype=np.int32)
+        return e, e.copy(), np.array([], dtype=np.float32)
+
+    pos = band[canopy_hi]
+    pos = pos[pos > 0]
+    if pos.size < 16:
+        e = np.array([], dtype=np.int32)
+        return e, e.copy(), np.array([], dtype=np.float32)
+    thr = float(np.percentile(pos, pctl))
+
+    # local maxima at ~half the min separation
+    rad_px = max(2, int(round(min_sep_m * 0.5 / res_m)))
+    mx = ndimage.maximum_filter(band, size=2 * rad_px + 1, mode="nearest")
+    peaks = canopy_hi & (band >= mx - 1e-6) & (band > thr)
+    pr, pc = np.nonzero(peaks)
+    if pr.size == 0:
+        e = np.array([], dtype=np.int32)
+        return e, e.copy(), np.array([], dtype=np.float32)
+    strength = band[pr, pc]
+
+    # height gate on the 1 m grid: smooth nDSM max within ~2 px
+    smax = ndimage.maximum_filter(smooth, size=2 * ORTHO_SEED_HEIGHT_GATE_R_PX + 1,
+                                  mode="nearest")
+    # closure gate: only seed inside locally CLOSED canopy — in open stands
+    # the 1 m nDSM already resolves every crown, and ortho highlights there
+    # are ground vegetation / branch glints, not missed trees.
+    closure = ndimage.uniform_filter(canopy.astype(np.float32),
+                                     size=int(ORTHO_SEED_CLOSURE_WIN_M),
+                                     mode="nearest")
+    r1 = np.minimum(pr // f, h1 - 1)
+    c1 = np.minimum(pc // f, w1 - 1)
+    ok = (smax[r1, c1] >= min_height) & \
+         (closure[r1, c1] >= ORTHO_SEED_CLOSURE_MIN)
+    r1, c1, strength = r1[ok], c1[ok], strength[ok]
+    if r1.size == 0:
+        e = np.array([], dtype=np.int32)
+        return e, e.copy(), np.array([], dtype=np.float32)
+
+    # greedy spacing (strongest-first) on a metre-bucket grid
+    order = np.argsort(strength)[::-1]
+    cell = max(min_sep_m, 1.0)
+    taken: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    keep = []
+    sep2 = min_sep_m * min_sep_m
+    cap = int(ORTHO_SEED_MAX_PER_CANOPY_HA * max(canopy.sum() / 1e4, 0.05))
+    for i in order:
+        y, x = float(r1[i]), float(c1[i])  # 1 m px == metres
+        ky, kx = int(y // cell), int(x // cell)
+        clash = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for (oy, ox) in taken.get((ky + dy, kx + dx), ()):
+                    if (y - oy) ** 2 + (x - ox) ** 2 < sep2:
+                        clash = True
+                        break
+                if clash:
+                    break
+            if clash:
+                break
+        if clash:
+            continue
+        taken.setdefault((ky, kx), []).append((y, x))
+        keep.append(i)
+        if len(keep) >= cap:
+            break
+    keep = np.array(keep, dtype=np.int64)
+    s = strength[keep]
+    # rank-normalised strength in (0, 1]
+    rk = np.argsort(np.argsort(s))
+    s01 = ((rk + 1.0) / max(len(rk), 1)).astype(np.float32)
+    return r1[keep].astype(np.int32), c1[keep].astype(np.int32), s01
+
+
+def fuse_apices(
+    apex: np.ndarray,
+    smooth: np.ndarray,
+    cand_r: np.ndarray,
+    cand_c: np.ndarray,
+    cand_s: np.ndarray,
+    a: float = DEFAULT_CROWN_RADIUS_A,
+    b: float = DEFAULT_CROWN_RADIUS_B,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge ortho seed candidates into the nDSM apex set (v2.2).
+
+    A candidate is added when it is farther than ``max(1.5, 0.6*r(h))``
+    metres from every existing apex (nDSM apices win ties; they carry
+    height evidence) AND sits near the top of its local canopy
+    (``smooth >= 0.75 * local 9 m max`` — a merged sub-dominant top is
+    nearly as tall as its dominant neighbour; a crown-flank highlight is
+    not).  Returns ``(apex_fused, source, ortho_strength)``
+    where ``source`` is an int8 raster (1 = ndsm, 2 = ortho-added) and
+    ``ortho_strength`` a float raster holding seed strength at added px.
+    """
+    src = np.zeros(apex.shape, np.int8)
+    src[apex] = 1
+    strength = np.zeros(apex.shape, np.float32)
+    if cand_r.size == 0:
+        return apex, src, strength
+    ar, ac = np.nonzero(apex)
+    from scipy.spatial import cKDTree
+    kd = cKDTree(np.column_stack([ar, ac])) if ar.size else None
+    local_max = ndimage.maximum_filter(smooth, size=9, mode="nearest")
+
+    fused = apex.copy()
+    cell = 3.0
+    taken: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for i in range(cand_r.size):
+        y, x = float(cand_r[i]), float(cand_c[i])
+        h = float(smooth[int(y), int(x)])
+        if h < 0.75 * float(local_max[int(y), int(x)]):
+            continue  # crown flank / gap-edge highlight, not a merged top
+        sep = max(1.5, 0.6 * (a + b * min(h, 60.0)))
+        if kd is not None:
+            d, _ = kd.query([y, x], k=1)
+            if d < sep:
+                continue
+        # also keep spacing among added seeds
+        ky, kx = int(y // cell), int(x // cell)
+        clash = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for (oy, ox) in taken.get((ky + dy, kx + dx), ()):
+                    if (y - oy) ** 2 + (x - ox) ** 2 < sep * sep:
+                        clash = True
+                        break
+                if clash:
+                    break
+            if clash:
+                break
+        if clash:
+            continue
+        taken.setdefault((ky, kx), []).append((y, x))
+        fused[int(y), int(x)] = True
+        src[int(y), int(x)] = 2
+        strength[int(y), int(x)] = float(cand_s[i])
+    return fused, src, strength
 
 
 def segment_crowns(
@@ -194,6 +389,10 @@ class Tree:
     leaf_type_prob_conifer: float = 0.5
     vitality: str = "unknown"
     vitality_conf: float = 0.0
+    detection_source: str = "ndsm"
+    detection_conf: float = 0.75
+    species_hint: str = "unknown"
+    species_conf: float = 0.0
     spectral: dict = field(default_factory=dict)
 
 
@@ -211,12 +410,66 @@ def build_inventory(
     leaf_type_min_conf: float = 0.5,
     spectral: dict | None = None,
     nir: np.ndarray | None = None,
+    ortho_intensity: np.ndarray | None = None,
+    ortho_res_m: float | None = None,
+    det_info: dict | None = None,
 ) -> tuple[list[Tree], np.ndarray, np.ndarray]:
-    """Full apex-based inventory. Returns (trees, labels, canopy_mask)."""
+    """Full apex-based inventory. Returns (trees, labels, canopy_mask).
+
+    v2.2: if ``ortho_intensity`` (hi-res NIR/luminance aligned to the 1 m
+    grid at ``ortho_res_m``) is given, native-resolution ortho seeds are
+    fused into the nDSM apex set before the watershed (recall recovery in
+    closed canopy).  ``det_info`` (optional dict) is filled with seeding
+    telemetry for the response meta.
+    """
     apex, smooth, canopy = detect_apices(ndsm, mask, min_height, a, b,
                                          smooth_sigma, min_apex_prominence)
+    n_ndsm = int(apex.sum())
+    src_raster = None
+    ortho_strength = None
+    cand_mask = None
+    if ortho_intensity is not None and ortho_res_m:
+        cr, cc, cs = ortho_apex_candidates(
+            ortho_intensity, ortho_res_m, canopy, smooth, min_height)
+        apex, src_raster, ortho_strength = fuse_apices(
+            apex, smooth, cr, cc, cs, a, b)
+        cand_mask = np.zeros(canopy.shape, bool)
+        if cr.size:
+            cand_mask[cr, cc] = True
+            cand_mask = ndimage.binary_dilation(cand_mask, iterations=2)
+        if det_info is not None:
+            det_info.update(
+                n_seeds_ndsm=n_ndsm,
+                n_seeds_ortho_candidates=int(cr.size),
+                n_seeds_ortho_added=int((src_raster == 2).sum()),
+                ortho_seed_res_m=round(float(ortho_res_m), 2))
+    elif det_info is not None:
+        det_info.update(n_seeds_ndsm=n_ndsm)
     labels, ar, ac, ah = segment_crowns(
         smooth, canopy, apex, ndsm, a, b, cap_factor, max_crown_area)
+
+    # v2.2 two-pass prune: an ortho-added seed that ends up with a
+    # sub-ORTHO_SEED_MIN_CROWN_SQM watershed crown was branch texture
+    # inside an existing crown, not a merged sub-dominant top. Drop those
+    # seeds and re-run the watershed so their pixels return to the real
+    # crown (keeps crown geometry honest — no 1–2 px confetti crowns).
+    if src_raster is not None and len(ar):
+        px_area0 = abs(transform.a * transform.e)
+        areas0 = np.bincount(labels.ravel(), minlength=len(ar) + 1)[1:] * px_area0
+        added = src_raster[ar, ac] == 2
+        bad = added & (areas0 < ORTHO_SEED_MIN_CROWN_SQM)
+        if bad.any():
+            apex2 = np.zeros_like(apex)
+            keep = ~bad
+            apex2[ar[keep], ac[keep]] = True
+            apex = apex2
+            src_raster[ar[bad], ac[bad]] = 0
+            if det_info is not None:
+                det_info['n_seeds_ortho_pruned'] = int(bad.sum())
+                det_info['n_seeds_ortho_added'] = int((src_raster == 2).sum())
+            labels, ar, ac, ah = segment_crowns(
+                smooth, canopy, apex, ndsm, a, b, cap_factor, max_crown_area)
+
     n = len(ar)
     if n == 0:
         return [], labels, canopy
@@ -288,6 +541,18 @@ def build_inventory(
         if conf < leaf_type_min_conf:
             leaf = "unknown"  # Q8: don't report coin flips as classifications
 
+        # v2.2 detection provenance
+        rr_i, cc_i = int(ar[i]), int(ac[i])
+        if src_raster is not None and src_raster[rr_i, cc_i] == 2:
+            det_src = "ortho"
+            det_conf = float(np.clip(0.35 + 0.4 * float(ortho_strength[rr_i, cc_i]), 0.3, 0.75))
+        elif cand_mask is not None and cand_mask[rr_i, cc_i]:
+            det_src = "fused"   # nDSM apex independently confirmed by ortho
+            det_conf = 0.9
+        else:
+            det_src = "ndsm"
+            det_conf = 0.75
+
         trees.append(Tree(
             tree_id=_stable_tree_id(e, np_), seq=i + 1, label=i + 1,
             apex_e=round(e, 2), apex_n=round(np_, 2),
@@ -299,6 +564,7 @@ def build_inventory(
             dbh_est_cm=dbh, volume_m3_est=vol,
             leaf_type=leaf, leaf_type_conf=round(conf, 2),
             leaf_type_prob_conifer=round(p_con, 3),
+            detection_source=det_src, detection_conf=round(det_conf, 2),
             spectral=spec,
         ))
 
@@ -340,6 +606,62 @@ def build_inventory(
                 else:
                     t.vitality = "vital"
                     t.vitality_conf = round(min(0.9, float(pct[j]) / 100.0 + 0.3), 2)
+
+    # --- Species hint (v2.2, FEEDBACK-3 side request) --------------------
+    # Coarse conifer species hint from single-epoch RGB+NIR ortho ONLY
+    # (deliberately no Sentinel/openEO dependency). Physically separable
+    # in a summer RGBI image:
+    #   * Norway spruce (Picea abies): dark crowns, low brightness & low
+    #     green_ratio within the conifer population, steep narrow crowns.
+    #   * European larch (Larix decidua): deciduous conifer — fresh light
+    #     green in leaf-on imagery → clearly higher NDVI/green_ratio +
+    #     brightness than spruce in the SAME scene.
+    #   * Pine (Pinus): intermediate brightness, flatter/rounder crowns.
+    # We use within-AOI percentiles (illumination-invariant), never
+    # absolute cuts. Confidence is capped at 0.6 — this is a HINT; real
+    # species ID needs multitemporal or hyperspectral data.
+    if has_real_ndvi and trees:
+        con = [i for i, t in enumerate(trees) if t.leaf_type == "coniferous"]
+        if len(con) >= 10:
+            br = np.array([trees[i].spectral.get("brightness_mean", np.nan)
+                           for i in con], dtype=np.float32)
+            gr = np.array([trees[i].spectral.get("green_ratio_mean", np.nan)
+                           for i in con], dtype=np.float32)
+            nd = np.array([trees[i].spectral.get("ndvi_mean", np.nan)
+                           for i in con], dtype=np.float32)
+
+            def _pctile(v):
+                ok = np.isfinite(v)
+                p = np.full(v.shape, 50.0, np.float32)
+                if ok.sum() > 1:
+                    r = np.argsort(np.argsort(v[ok]))
+                    p[ok] = (r + 0.5) / ok.sum() * 100.0
+                return p
+
+            br_p, gr_p, nd_p = _pctile(br), _pctile(gr), _pctile(nd)
+            for j, i in enumerate(con):
+                t = trees[i]
+                if t.vitality == "dead":
+                    continue
+                bright_and_green = float(min(br_p[j], gr_p[j], nd_p[j]))
+                dark = float(max(br_p[j], gr_p[j]))
+                if bright_and_green >= 75.0:
+                    t.species_hint = "larch"
+                    t.species_conf = round(min(0.6, 0.3 +
+                                               (bright_and_green - 75.0) / 100.0), 2)
+                elif dark <= 45.0:
+                    t.species_hint = "spruce"
+                    t.species_conf = round(min(0.6, 0.3 + (45.0 - dark) / 150.0), 2)
+                elif br_p[j] > 45.0 and gr_p[j] <= 60.0 and nd_p[j] <= 60.0:
+                    t.species_hint = "pine"
+                    t.species_conf = 0.3
+                else:
+                    t.species_hint = "conifer_unspecified"
+                    t.species_conf = 0.2
+        for t in trees:
+            if t.leaf_type == "broadleaf" and t.species_hint == "unknown":
+                t.species_hint = "broadleaf_unspecified"
+                t.species_conf = round(min(0.4, t.leaf_type_conf * 0.5), 2)
 
     return trees, labels, canopy
 
@@ -397,9 +719,13 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
 
     by_leaf: dict[str, int] = {}
     by_vitality: dict[str, int] = {}
+    by_species: dict[str, int] = {}
+    by_detection: dict[str, int] = {}
     for t in trees:
         by_leaf[t.leaf_type] = by_leaf.get(t.leaf_type, 0) + 1
         by_vitality[t.vitality] = by_vitality.get(t.vitality, 0) + 1
+        by_species[t.species_hint] = by_species.get(t.species_hint, 0) + 1
+        by_detection[t.detection_source] = by_detection.get(t.detection_source, 0) + 1
 
     # Q6: canopy gap fraction — share of AOI where an nDSM 2-10 m pixel is
     # NOT overtopped, i.e. where low stems are actually visible to a
@@ -451,6 +777,21 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
         "height_histogram_2m": hist,
         "by_leaf_type": by_leaf,
         "by_vitality": by_vitality,
+        "by_species_hint": by_species,
+        "species_hint_note": (
+            "single-epoch RGB+NIR ortho hint only (relative within-AOI "
+            "spectral position of conifers): spruce=dark, larch=bright "
+            "fresh-green deciduous conifer, pine=intermediate. Confidence "
+            "capped at 0.6 — treat as assumption-grade, not species ID."),
+        "by_detection_source": by_detection,
+        # FEEDBACK-3 §5.3: residual under-detection, self-reported
+        "recall_model": {
+            "canopy_area_ha": round(float(area_ha_canopy), 3),
+            "crown_area_ha": round(float(crown_area_total) / 1e4, 3),
+            "unassigned_canopy_frac": round(float(
+                max(0.0, 1.0 - crown_area_total / (area_ha_canopy * 1e4))), 4)
+            if area_ha_canopy > 0 else None,
+        },
         "volume_m3_est_total": round(sum(t.volume_m3_est for t in trees), 1),
         "dbh_method": "heuristic_h_crown (generic spruce; verify locally)",
         "volume_method": VOLUME_METHOD,

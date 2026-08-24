@@ -30,7 +30,7 @@ from scipy import ndimage
 log = logging.getLogger(__name__)
 
 #: Bump when the algorithm changes in a way that invalidates caches.
-TREE_ALGO_VERSION = "2.2.0"
+TREE_ALGO_VERSION = "2.3.0"
 
 # Defaults (spruce-oriented; all exposed as request params)
 DEFAULT_CROWN_RADIUS_A = 1.2    # m — base local-max window radius
@@ -70,6 +70,27 @@ ORTHO_SEED_CLOSURE_MIN = 0.7     # only seed where canopy closure >= this
                                  # (open stands are already nDSM-resolved;
                                  # restricts ortho FPs to where recall is
                                  # actually broken — closed fine canopy)
+
+# --- v2.3 non-forest suppression (buildings / crops / hard surfaces) ----
+# A local maximum on the nDSM is only a TREE if the surface under it behaves
+# like a crown. Roof ridges, hay/silage stacks, maize plateaus, masts and
+# rock outcrops all produce apices; they used to be reported as stems with
+# full DBH/volume (visible as bogus crowns over the farmhouse in the
+# forestry-manager map). Gates below are evidence-ordered: cadastre first
+# (authoritative), then spectral (NDVI), then surface geometry.
+BUILDING_DILATE_PX = 1        # cadastre footprints grow 1 m (eaves/roof overhang)
+BUILDING_FRAC_REJECT = 0.5    # crown pixel share inside a footprint → building
+BUILDING_FRAC_WEAK = 0.30     # partial overlap → building only if no foliage
+BUILDING_APEX_REJECT = True   # apex pixel itself inside a footprint → building
+NONVEG_NDVI_MAX = 0.10        # NDVI at/below this = no live foliage
+NONVEG_ROUGH_MAX = 0.60       # m; mean |Laplacian(nDSM)| — crowns are rough
+PLANAR_RESID_MAX = 0.35       # m; RMS residual of a best-fit plane over the crown
+PLANAR_ROUGH_MAX = 0.50       # m; planar AND smooth → man-made surface
+PLANAR_RELIEF_MAX = 2.0       # m; apex minus crown p10 — crowns have relief
+CROP_MAX_HEIGHT_M = 6.0       # tall field crops / hedgerow tops cap out here
+CROP_ROUGH_MAX = 0.35         # m; a crop canopy plateau is smoother than a crown
+CROP_MIN_AREA_SQM = 20.0      # and it is contiguous, not a 10 m² crown
+MIN_TREE_LIKELIHOOD = 0.35    # trees scoring below this are not reported
 
 #: Allometry provenance (Q5) — surfaced via volume_method in summaries.
 FORM_FACTOR = 0.42
@@ -352,6 +373,215 @@ def segment_crowns(
 
 
 # ---------------------------------------------------------------------------
+# Non-forest surface rejection (v2.3)
+# ---------------------------------------------------------------------------
+
+def classify_surfaces(
+    labels: np.ndarray,
+    ndsm: np.ndarray,
+    ar: np.ndarray,
+    ac: np.ndarray,
+    ah: np.ndarray,
+    px_area: float,
+    building_mask: np.ndarray | None = None,
+    ndvi: np.ndarray | None = None,
+    min_likelihood: float = MIN_TREE_LIKELIHOOD,
+) -> dict:
+    """Per-crown surface evidence: is this apex a tree, or a man-made /
+    agricultural surface that merely stands above the terrain?
+
+    Returns a dict of per-label (index = label-1) arrays:
+      ``surface_class`` (object array of str), ``tree_likelihood`` (float32),
+      ``keep`` (bool), plus the raw evidence columns
+      ``building_frac``, ``roughness_m``, ``planarity_m``, ``relief_m``,
+      ``ndvi_mean``.
+
+    Evidence, in order of authority:
+
+    1. **Cadastre** — crown mostly inside a building footprint (or its apex
+       on one) is a roof, full stop. Footprints are dilated by
+       ``BUILDING_DILATE_PX`` because BEV outlines are wall lines while the
+       DSM sees the eaves.
+    2. **NDVI** — no live foliage under a "crown" means it is not a crown.
+       Only decisive together with a smooth surface (a dead standing tree is
+       NDVI-poor but geometrically rough, and must stay a tree).
+    3. **Surface geometry** — a crown is a rough, radially-decaying blob;
+       roofs/silos/slabs are planar and smooth, crop plateaus are low, wide
+       and flat with almost no relief between apex and crown edge.
+
+    Geometry alone never overrides positive vegetation evidence: a crown with
+    NDVI >= 0.3 keeps a floor on its likelihood, so a broad-crowned solitary
+    oak on a lawn is not filed as a shed.
+    """
+    n = len(ar)
+    out = {
+        'surface_class': np.array(['tree'] * n, dtype=object),
+        'tree_likelihood': np.ones(n, np.float32),
+        'keep': np.ones(n, bool),
+        'building_frac': np.zeros(n, np.float32),
+        'roughness_m': np.zeros(n, np.float32),
+        'planarity_m': np.zeros(n, np.float32),
+        'relief_m': np.zeros(n, np.float32),
+        'ndvi_mean': np.full(n, np.nan, np.float32),
+    }
+    if n == 0:
+        return out
+    idx = np.arange(1, n + 1)
+    z = np.where(np.isfinite(ndsm), ndsm, 0.0).astype(np.float32)
+
+    # Surface-geometry stats are computed on the crown CORE (crown eroded by
+    # 1 px). The crown border sits on the height cliff between object and
+    # ground — a roof edge produces a huge Laplacian and a huge plane
+    # residual, which used to make every flat roof look 'rough' i.e.
+    # tree-like. Cores smaller than 4 px fall back to the full crown.
+    core = labels * ndimage.binary_erosion(
+        labels > 0, structure=np.ones((3, 3), bool)).astype(labels.dtype)
+    core_n = np.bincount(core.ravel(), minlength=n + 1)[1:]
+    stat_lab = np.where((core > 0) & (core_n[core - 1] >= 4), core, 0)
+    missing = np.bincount(stat_lab.ravel(), minlength=n + 1)[1:] == 0
+    if missing.any():
+        fill = missing[np.maximum(labels - 1, 0)] & (labels > 0)
+        stat_lab = np.where(fill, labels, stat_lab)
+
+    # --- roughness: median |Laplacian| inside the crown core --------------
+    # Median, not mean: robust to the single-pixel spikes an interpolated
+    # nDSM leaves behind on building ridges.
+    lap = np.abs(ndimage.laplace(z))
+    rough = np.asarray(ndimage.median(lap, stat_lab, idx), np.float32)
+
+    # --- relief: apex height minus crown 10th percentile ------------------
+    p10 = np.asarray(ndimage.labeled_comprehension(
+        z, stat_lab, idx,
+        lambda v: float(np.percentile(v, 10)) if v.size else 0.0, float, 0.0),
+        np.float32)
+    relief = np.asarray(ah, np.float32) - p10
+
+    # --- planarity: RMS residual of a least-squares plane per crown -------
+    # Sum-form normal equations, vectorised over labels via bincount: a plane
+    # z = c0 + c1*r + c2*c fitted per label, then RMS(z - fit).
+    rr, cc = np.nonzero(stat_lab > 0)
+    lb = stat_lab[rr, cc] - 1
+    zv = z[rr, cc].astype(np.float64)
+    rv = rr.astype(np.float64); cv = cc.astype(np.float64)
+    def _bc(v):
+        return np.bincount(lb, weights=v, minlength=n)
+    S1 = _bc(np.ones_like(zv)); Sr = _bc(rv); Sc = _bc(cv)
+    Srr = _bc(rv * rv); Scc = _bc(cv * cv); Src = _bc(rv * cv)
+    Sz = _bc(zv); Srz = _bc(rv * zv); Scz = _bc(cv * zv)
+    planar = np.zeros(n, np.float32)
+    A = np.empty((n, 3, 3)); B = np.empty((n, 3))
+    A[:, 0, 0] = S1;  A[:, 0, 1] = Sr;  A[:, 0, 2] = Sc
+    A[:, 1, 0] = Sr;  A[:, 1, 1] = Srr; A[:, 1, 2] = Src
+    A[:, 2, 0] = Sc;  A[:, 2, 1] = Src; A[:, 2, 2] = Scc
+    B[:, 0] = Sz; B[:, 1] = Srz; B[:, 2] = Scz
+    # ridge term keeps degenerate (collinear / tiny) crowns solvable
+    A += np.eye(3) * 1e-6
+    coef = np.full((n, 3), np.nan)
+    try:
+        coef = np.linalg.solve(A, B[..., None])[..., 0]
+    except np.linalg.LinAlgError:      # pragma: no cover - ridge makes this rare
+        for i in range(n):
+            try:
+                coef[i] = np.linalg.solve(A[i], B[i])
+            except np.linalg.LinAlgError:
+                coef[i] = (Sz[i] / max(S1[i], 1.0), 0.0, 0.0)
+    resid = zv - (coef[lb, 0] + coef[lb, 1] * rv + coef[lb, 2] * cv)
+    planar = np.sqrt(np.maximum(_bc(resid * resid) / np.maximum(S1, 1.0), 0.0)
+                     ).astype(np.float32)
+    areas = (np.bincount(labels.ravel(), minlength=n + 1)[1:]
+             * px_area).astype(np.float32)
+
+    # --- cadastre building overlap ---------------------------------------
+    bfrac = np.zeros(n, np.float32)
+    apex_on_building = np.zeros(n, bool)
+    if building_mask is not None and building_mask.shape == labels.shape:
+        bm = building_mask.astype(bool)
+        if BUILDING_DILATE_PX > 0:
+            bm = ndimage.binary_dilation(bm, iterations=BUILDING_DILATE_PX)
+        bfrac = np.asarray(ndimage.mean(bm.astype(np.float32), labels, idx),
+                           np.float32)
+        apex_on_building = bm[ar, ac]
+
+    # --- NDVI -------------------------------------------------------------
+    nd = np.full(n, np.nan, np.float32)
+    if ndvi is not None and ndvi.shape == labels.shape:
+        nd = np.asarray(ndimage.mean(np.nan_to_num(ndvi, nan=0.0), labels, idx),
+                        np.float32)
+
+    out['building_frac'] = np.round(bfrac, 3)
+    out['roughness_m'] = np.round(rough, 3)
+    out['planarity_m'] = np.round(planar, 3)
+    out['relief_m'] = np.round(relief, 2)
+    out['ndvi_mean'] = np.round(nd, 3)
+
+    has_ndvi = np.isfinite(nd)
+    veg = has_ndvi & (nd >= 0.30)
+    nonveg = has_ndvi & (nd <= NONVEG_NDVI_MAX)
+
+    cls = out['surface_class']
+    lik = out['tree_likelihood']
+    for i in range(n):
+        c, p = 'tree', 1.0
+        smooth_surface = rough[i] <= NONVEG_ROUGH_MAX
+        planar_surface = (planar[i] <= PLANAR_RESID_MAX
+                          and rough[i] <= PLANAR_ROUGH_MAX)
+        flat_top = relief[i] <= PLANAR_RELIEF_MAX
+        # 1. cadastre
+        if apex_on_building[i] and BUILDING_APEX_REJECT:
+            c, p = 'building', 0.02
+        elif bfrac[i] >= BUILDING_FRAC_REJECT:
+            c, p = 'building', 0.05
+        elif bfrac[i] >= BUILDING_FRAC_WEAK and not veg[i]:
+            # Crown straddles a roof edge (typ. 0.30-0.50 overlap). Trees
+            # genuinely do overhang farmhouses, so partial overlap alone must
+            # not reject; we only drop it when there is ALSO no positive
+            # foliage signal (NDVI < 0.30). Without ortho this rule is
+            # inactive by construction (veg is False everywhere), so it is
+            # gated on NDVI availability to stay conservative.
+            if has_ndvi[i]:
+                c, p = 'building', 0.25
+        # 2. no live foliage under the "crown" → it is not a crown.
+        # NDVI here comes from the BEV RGBI ortho at 0.2 m, so a value at or
+        # below NONVEG_NDVI_MAX over a whole crown means bare material
+        # (tile, metal, concrete, rock) — decisive on its own, INCLUDING
+        # rough surfaces like gable roofs and rock outcrops that the planar
+        # gate below cannot see. The one legitimate NDVI-poor tree is a dead
+        # standing stem: small, rough crown — kept and flagged, never
+        # silently dropped.
+        elif nonveg[i]:
+            if rough[i] >= 1.0 and areas[i] <= 60.0:
+                c, p = 'dead_tree_candidate', 0.60
+            else:
+                c, p = 'hard_surface', 0.10
+        # 3. geometry-only verdicts
+        elif planar_surface and flat_top:
+            # low planar plateau in the open = field crop / maize; anything
+            # taller is a man-made flat structure (roof, silo, container).
+            # Naming only — both are rejected. Crown radius caps mean the
+            # watershed footprint is much smaller than the real plateau, so
+            # area is a weak signal here; height is the honest one.
+            c, p = ('crop' if ah[i] <= CROP_MAX_HEIGHT_M
+                    else 'flat_structure'), 0.20
+        elif (ah[i] <= CROP_MAX_HEIGHT_M and rough[i] <= CROP_ROUGH_MAX
+              and areas[i] >= CROP_MIN_AREA_SQM and flat_top):
+            c, p = 'crop', 0.25
+        elif flat_top and smooth_surface:
+            c, p = 'uncertain', 0.45
+        # Positive vegetation evidence rescues geometry-only rejections: a
+        # broad flat-topped oak on a lawn must not be filed as a shed.
+        # It does NOT rescue 'crop' — maize and rape are the greenest
+        # things in the scene, so NDVI carries no information there; the
+        # height ceiling (<= CROP_MAX_HEIGHT_M) is what keeps real trees out.
+        if veg[i] and c in ('flat_structure', 'uncertain', 'hard_surface'):
+            p = max(p, 0.55)
+            c = 'tree'
+        cls[i] = c
+        lik[i] = p
+    out['keep'] = lik >= min_likelihood
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Per-tree record extraction
 # ---------------------------------------------------------------------------
 
@@ -393,7 +623,66 @@ class Tree:
     detection_conf: float = 0.75
     species_hint: str = "unknown"
     species_conf: float = 0.0
+    # v2.3 non-forest suppression evidence
+    surface_class: str = "tree"
+    tree_likelihood: float = 1.0
+    surface_evidence: dict = field(default_factory=dict)
     spectral: dict = field(default_factory=dict)
+
+
+def surface_filter_labels(
+    labels: np.ndarray,
+    ndsm: np.ndarray,
+    transform,
+    label_ids,
+    building_mask: np.ndarray | None = None,
+    ndvi: np.ndarray | None = None,
+    min_likelihood: float = MIN_TREE_LIKELIHOOD,
+) -> dict:
+    """Run the v2.3 non-forest surface engine over an ARBITRARY label raster.
+
+    :func:`classify_surfaces` needs apex row/col/height per crown, which the
+    apex-based v2 pipeline produces for free. Legacy detectors
+    (``object_classifier.classify_objects``, used by ``/api/v1/trees`` and
+    ``/api/v1/changes/trees``) only produce segments, so we derive the apex
+    here as the per-segment nDSM argmax and reuse the exact same evidence
+    chain. This is deliberate: roof/crop suppression quality must not depend
+    on which endpoint version the client happens to call.
+
+    Returns ``{label_id: {surface_class, tree_likelihood, keep, evidence}}``.
+    """
+    ids = [int(l) for l in label_ids if l]
+    if not ids:
+        return {}
+    z = np.where(np.isfinite(ndsm), ndsm, -1e9).astype(np.float32)
+    # compact relabel so classify_surfaces sees 1..n contiguous
+    lut = np.zeros(int(labels.max()) + 1, np.int32)
+    for k, l in enumerate(ids, start=1):
+        if l < lut.size:
+            lut[l] = k
+    comp = lut[np.clip(labels, 0, lut.size - 1)]
+    n = len(ids)
+    idx = np.arange(1, n + 1)
+    flat = np.asarray(ndimage.maximum_position(z, comp, idx))
+    if flat.ndim == 1:
+        flat = flat.reshape(-1, 2)
+    ar = flat[:, 0].astype(np.int32)
+    ac = flat[:, 1].astype(np.int32)
+    ah = z[ar, ac]
+    surf = classify_surfaces(
+        comp, ndsm, ar, ac, ah, abs(transform.a * transform.e),
+        building_mask=building_mask, ndvi=ndvi, min_likelihood=min_likelihood)
+    return {l: {
+        'surface_class': str(surf['surface_class'][i]),
+        'tree_likelihood': round(float(surf['tree_likelihood'][i]), 2),
+        'keep': bool(surf['keep'][i]),
+        'evidence': {
+            'building_frac': float(surf['building_frac'][i]),
+            'roughness_m': float(surf['roughness_m'][i]),
+            'planarity_m': float(surf['planarity_m'][i]),
+            'relief_m': float(surf['relief_m'][i]),
+        },
+    } for i, l in enumerate(ids)}
 
 
 def build_inventory(
@@ -412,6 +701,10 @@ def build_inventory(
     nir: np.ndarray | None = None,
     ortho_intensity: np.ndarray | None = None,
     ortho_res_m: float | None = None,
+    building_mask: np.ndarray | None = None,
+    reject_nonforest: bool = True,
+    surface_use_ndvi: bool = True,
+    min_tree_likelihood: float = MIN_TREE_LIKELIHOOD,
     det_info: dict | None = None,
 ) -> tuple[list[Tree], np.ndarray, np.ndarray]:
     """Full apex-based inventory. Returns (trees, labels, canopy_mask).
@@ -421,6 +714,12 @@ def build_inventory(
     fused into the nDSM apex set before the watershed (recall recovery in
     closed canopy).  ``det_info`` (optional dict) is filled with seeding
     telemetry for the response meta.
+
+    v2.3: with ``reject_nonforest`` (default on) every crown is checked by
+    :func:`classify_surfaces` against the cadastre building mask, NDVI and
+    its own surface geometry; apices sitting on roofs, silos, slabs or crop
+    plateaus are dropped instead of being reported as stems. Rejected
+    candidates are counted in ``det_info['rejected_by_surface']``.
     """
     apex, smooth, canopy = detect_apices(ndsm, mask, min_height, a, b,
                                          smooth_sigma, min_apex_prominence)
@@ -515,8 +814,45 @@ def build_inventory(
 
     has_real_ndvi = nir is not None and "ndvi_mean" in spec_stats
 
+    # --- v2.3: non-forest surface rejection ------------------------------
+    # Roofs, silos, slabs, rock and crop plateaus all produce nDSM apices.
+    # Judge each crown BEFORE it becomes a Tree record so no bogus stem
+    # ever carries a DBH/volume estimate downstream.
+    surf = classify_surfaces(
+        labels, ndsm, ar, ac, ah, px_area,
+        building_mask=building_mask,
+        ndvi=((spectral or {}).get('ndvi')
+              if (has_real_ndvi and surface_use_ndvi) else None),
+        min_likelihood=min_tree_likelihood)
+    if reject_nonforest:
+        keep_mask = surf['keep']
+    else:
+        keep_mask = np.ones(n, bool)
+    n_rej = int((~keep_mask).sum())
+    if det_info is not None:
+        rej_by = {}
+        for c in surf['surface_class'][~keep_mask]:
+            rej_by[str(c)] = rej_by.get(str(c), 0) + 1
+        det_info['rejected_by_surface'] = n_rej
+        det_info['rejected_by_surface_class'] = rej_by
+        det_info['nonforest_rejection'] = bool(reject_nonforest)
+        det_info['building_mask_used'] = building_mask is not None
+    if reject_nonforest and n_rej:
+        # drop rejected crowns from the label raster too, so crown
+        # vectorisation / canopy accounting never see them
+        drop = np.zeros(n + 1, bool)
+        drop[1:] = ~keep_mask
+        rejected_px = drop[labels]
+        labels = np.where(rejected_px, 0, labels).astype(np.int32)
+        # A roof or a maize plateau is not canopy: excluding it keeps
+        # stems_per_ha / crown_cover_pct denominators honest (a farmyard
+        # used to count as stocked area).
+        canopy = canopy & ~rejected_px
+
     trees: list[Tree] = []
     for i in range(n):
+        if not keep_mask[i]:
+            continue
         e, np_ = transform * (float(ac[i]) + 0.5, float(ar[i]) + 0.5)
         h = float(ah[i])
         area = float(areas[i])
@@ -554,7 +890,7 @@ def build_inventory(
             det_conf = 0.75
 
         trees.append(Tree(
-            tree_id=_stable_tree_id(e, np_), seq=i + 1, label=i + 1,
+            tree_id=_stable_tree_id(e, np_), seq=len(trees) + 1, label=i + 1,
             apex_e=round(e, 2), apex_n=round(np_, 2),
             apex_row=int(ar[i]), apex_col=int(ac[i]),
             height_m=round(h, 2), crown_area_sqm=round(area, 1),
@@ -565,6 +901,14 @@ def build_inventory(
             leaf_type=leaf, leaf_type_conf=round(conf, 2),
             leaf_type_prob_conifer=round(p_con, 3),
             detection_source=det_src, detection_conf=round(det_conf, 2),
+            surface_class=str(surf['surface_class'][i]),
+            tree_likelihood=round(float(surf['tree_likelihood'][i]), 2),
+            surface_evidence={
+                'building_frac': float(surf['building_frac'][i]),
+                'roughness_m': float(surf['roughness_m'][i]),
+                'planarity_m': float(surf['planarity_m'][i]),
+                'relief_m': float(surf['relief_m'][i]),
+            },
             spectral=spec,
         ))
 
@@ -721,11 +1065,13 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
     by_vitality: dict[str, int] = {}
     by_species: dict[str, int] = {}
     by_detection: dict[str, int] = {}
+    by_surface: dict[str, int] = {}
     for t in trees:
         by_leaf[t.leaf_type] = by_leaf.get(t.leaf_type, 0) + 1
         by_vitality[t.vitality] = by_vitality.get(t.vitality, 0) + 1
         by_species[t.species_hint] = by_species.get(t.species_hint, 0) + 1
         by_detection[t.detection_source] = by_detection.get(t.detection_source, 0) + 1
+        by_surface[t.surface_class] = by_surface.get(t.surface_class, 0) + 1
 
     # Q6: canopy gap fraction — share of AOI where an nDSM 2-10 m pixel is
     # NOT overtopped, i.e. where low stems are actually visible to a
@@ -784,6 +1130,18 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
             "fresh-green deciduous conifer, pine=intermediate. Confidence "
             "capped at 0.6 — treat as assumption-grade, not species ID."),
         "by_detection_source": by_detection,
+        # v2.3: surface verdict of the REPORTED stems. With
+        # reject_nonforest=true (default) this is all 'tree' plus any
+        # 'dead_tree_candidate'; with it off, the non-tree classes show how
+        # many apices are roofs / crops / hard surfaces.
+        "by_surface_class": by_surface,
+        "surface_class_note": (
+            "non-forest suppression: apices on cadastre building footprints, "
+            "on NDVI-dead planar surfaces, or on low smooth plateaus are "
+            "classified building / hard_surface / crop / flat_structure and "
+            "excluded from the inventory (and from the canopy denominator). "
+            "Pass reject_nonforest=false to receive them with a "
+            "tree_likelihood score instead."),
         # FEEDBACK-3 §5.3: residual under-detection, self-reported
         "recall_model": {
             "canopy_area_ha": round(float(area_ha_canopy), 3),

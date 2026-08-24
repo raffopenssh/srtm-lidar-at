@@ -900,6 +900,10 @@ def detect_tree_growth(
         return changes, {
         "labels_a": labels_a, "transform_a": data_a["transform"],
         "labels_b": labels_b, "transform_b": data_b["transform"],
+        # v2.3: the caller needs the height rasters to run the shared
+        # non-forest surface filter (tree_inventory.surface_filter_labels)
+        "ndsm_a": data_a["ndsm"], "ndsm_b": data_b["ndsm"],
+        "data_a": data_a, "data_b": data_b,
         }
     return changes
 

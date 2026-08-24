@@ -357,6 +357,14 @@ Params:
 Per-tree properties: tree_id, status, height_before_m, height_after_m,
 height_change_m, crown_area_before_sqm, crown_area_after_sqm.
 Summary: total_trees, by_status{count, height_change_mean_m}.
+v2.3: NON-FOREST SUPPRESSION also runs here (params reject_nonforest /
+include_cadastre / min_tree_likelihood, defaults as in /api/v1/trees).
+Load-bearing for change detection: without it a demolished barn is
+reported as 'felled' timber and a new shed as a 'new' tree. Objects are
+judged on the epoch where they exist (after-date crown if present, else
+before-date). Measured on a farmyard AOI: 95 → 51 changes, 44 rejected
+(29 building, 13 crop, 2 flat_structure). meta carries
+rejected_by_surface / rejected_by_surface_class / building_mask.
 
 #### POST /api/v1/trees
 Single-date per-tree inventory (crown detection on nDSM watershed + crown-shape
@@ -367,25 +375,82 @@ Params:
   crown_min_area     Min crown footprint in pixels/m² (default: 4)
   crown_geometry     point (default) | polygon — crown outline polygons (WGS84)
   include_ortho      true (default) | false — use BEV ortho for NDVI/leaf type
+  reject_nonforest   true (default) | false — v2.3 NON-FOREST SUPPRESSION,
+                     the SAME engine as /api/v2/trees (see there for the
+                     full evidence chain). v1's own building pixel class is
+                     geometry+spectral only and leaks badly: on a Waldviertel
+                     farmyard AOI it reported 175 trees, 85 of them standing
+                     on cadastre building footprints. With suppression on:
+                     69 trees, 2 on footprints (both genuine crowns
+                     overhanging a roof).
+  include_cadastre   true (default) | false — fetch BEV building footprints
+                     as authoritative non-tree evidence
+  min_tree_likelihood 0..1 (default 0.35) — reporting threshold
   async              true → 202 {task_id, poll, result} (same task framework
                      as /segment). Recommended for areas > ~50 ha.
 Per-tree properties: tree_id, height_max_m, height_mean_m, height_p90_m,
 crown_area_sqm, crown_shape (conical|rounded|columnar|irregular),
 leaf_type (coniferous|broadleaf|dead|unknown — heuristic from crown shape +
 spectra; treat as a hint, not species truth), compactness, elongation,
-ndvi_mean (when ortho available).
+ndvi_mean (when ortho available), surface_class + tree_likelihood (v2.3).
 Summary: total_trees, stems_per_ha, by_leaf_type, height_mean_m, height_max_m,
 top_height_m (h_dom — mean of the 100 tallest stems per ha), crown_area_total_sqm,
 crown_cover_pct.
+meta also carries rejected_by_surface / rejected_by_surface_class /
+building_mask / nonforest_rejection.
 
 NOTE: for forestry-grade stem density / height distributions prefer the
 /api/v2 tree service below — v1 watershed under-segments closed conifer
-canopy ~2× and its summary uses the whole-AOI denominator.
+canopy ~2x and its summary uses the whole-AOI denominator. Non-forest
+suppression quality is now IDENTICAL in both (shared engine), so the
+choice is purely about detection: v2 for inventory work, v1 only if you
+need its crown_shape / segment-based object semantics.
 
 ### v2 tree service (apex-based, forestry-grade)
 
 #### POST /api/v2/trees
-Apex-based single-tree inventory, v2.2 ORTHO-FUSED detection.
+Apex-based single-tree inventory, v2.3 (ortho-fused detection +
+NON-FOREST SUPPRESSION).
+
+NON-FOREST SUPPRESSION (v2.3, on by default). An nDSM local maximum is
+only reported as a stem when the surface under it behaves like a crown.
+Roof ridges, silos, containers, hay stacks, maize/rape plateaus, rock
+and road furniture all raise the DSM above terrain and used to be
+reported as trees with full DBH/volume (bogus crowns over farmyards and
+fields). Every crown is now judged on evidence, in order of authority:
+  1. CADASTRE — crown apex on, or >=50% of crown inside, a BEV building
+     footprint (dilated 1 m: outlines are wall lines, the DSM sees eaves)
+     => surface_class='building'.
+  2. NDVI (0.2 m BEV RGBI) — mean crown NDVI <= 0.10 means no live
+     foliage => 'hard_surface'. The one legitimate NDVI-poor tree, a
+     dead standing stem (small AND geometrically rough crown), is kept
+     as 'dead_tree_candidate' rather than silently dropped.
+  3. SURFACE GEOMETRY — plane-fit RMS residual, median |Laplacian|
+     roughness and apex-minus-crown-p10 relief, all measured on the
+     crown CORE (crown eroded 1 px, so the height cliff at the object
+     edge does not fake roughness). Planar + smooth + flat-topped =>
+     'crop' (<=6 m, i.e. field crops) or 'flat_structure' (taller);
+     borderline cases => 'uncertain'.
+Strong vegetation evidence (crown NDVI >= 0.30) overrides the
+geometry-only verdicts, so a broad flat-crowned solitary oak on a lawn
+stays a tree — but it does NOT override 'crop', because maize is the
+greenest thing in the scene; the 6 m height ceiling is what protects
+real trees there.
+Rejected crowns are removed from the label raster AND from the canopy
+mask, so stems_per_ha / crown_cover_pct denominators no longer count a
+farmyard or a maize field as stocked area.
+Every reported tree carries surface_class + tree_likelihood (0..1) +
+surface_building_frac / surface_roughness_m / surface_planarity_m /
+surface_relief_m, so a client can re-threshold or audit the verdict.
+Set reject_nonforest=false to receive ALL apices, classified but
+unfiltered (useful to see what was removed and why).
+Measured on a Waldviertel farmyard AOI (0.008° x 0.005°, 47 cadastre
+buildings, 5.8% of grid): 650 → 206 stems, apices on building
+footprints 317 → 4. On a forest-dominated hamlet AOI the filter is
+nearly a no-op (4829 → 4734, 95 rejected), i.e. it costs almost no
+recall where there is nothing to reject. Cost is ~0.1 s + one cached
+cadastre call.
+
 Seeding is two-source: (1) variable-window local maxima on nDSM
 (smoothed sigma=smooth_sigma), window radius r(h) = crown_radius_a +
 crown_radius_b*h; (2) native-resolution (0.2–0.5 m) RGBI ortho apex
@@ -398,6 +463,18 @@ r(h)*crown_cap_factor and max_crown_area.
 Params:
   dataset            ALS date (default: 20240915)
   min_tree_height    m (default 3.0)
+  reject_nonforest   true (default) | false — drop buildings/crops/hard
+                     surfaces (see NON-FOREST SUPPRESSION above)
+  include_cadastre   true (default) | false — fetch BEV building
+                     footprints as authoritative non-tree evidence.
+                     false skips the cadastre round-trip (faster, and
+                     the only option outside cadastre coverage); the
+                     NDVI + geometry gates still run. meta.building_mask
+                     reports what was actually used.
+  min_tree_likelihood 0..1 (default 0.35) — reporting threshold on the
+                     surface score. Raise to be stricter (0.6 keeps only
+                     crowns with no non-tree evidence at all), lower to
+                     recover borderline field trees.
   crown_radius_a     m, local-max window base (default 1.2)
   crown_radius_b     m per m height (default 0.08)
   smooth_sigma       Gaussian sigma in px/m (default 0.5)
@@ -454,6 +531,10 @@ low stems are actually visible to first-return DSM), understory_detectable
 (always false: suppressed stems below dominant layer are invisible to a
 1 m first-return DSM — see detection_floor_note), by_leaf_type,
 by_vitality, by_species_hint, by_detection_source,
+by_surface_class (+ surface_class_note) — surface verdict of the
+REPORTED stems; with reject_nonforest=false the non-tree classes
+(building / hard_surface / crop / flat_structure / uncertain) show how
+many apices are not trees,
 recall_model {canopy_area_ha, crown_area_ha, unassigned_canopy_frac —
 self-reported residual under-detection: the share of canopy >= min
 height that belongs to no detected crown},
@@ -469,6 +550,11 @@ n_seeds_ortho_pruned (added seeds whose final crown < 4 m² are treated
 as intra-crown branch texture, dropped, and the watershed re-run — no
 confetti crowns), detection_mode_requested (the param echo; meta.
 detection_mode is what actually ran),
+rejected_by_surface (count of apices dropped as non-forest) +
+rejected_by_surface_class ({building: N, crop: N, hard_surface: N, …}) +
+nonforest_rejection (bool, whether suppression was active) +
+building_mask (cadastre | unavailable | skipped… | error: …) +
+building_mask_px (footprint pixels on the AOI grid),
 nir_used_for (list: classification / detection / detection_luminance —
 replaces the ambiguous nir_used flag, which is kept for compatibility),
 acquisition (REAL flight years per BEV flight-block overlay:

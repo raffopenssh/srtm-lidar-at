@@ -13811,11 +13811,15 @@ _LEAF_TYPE = {
 
 def _changes_trees_core(task_id, features, params):
     """Per-tree growth / felling analysis between two dates (sync core)."""
+    import tree_inventory as tv
     t0 = time.time()
     date_a = params.get('date_a', '20220915')
     date_b = params.get('date_b', '20240915')
     crown_geometry = str(params.get('crown_geometry', 'point')).lower()
     min_tree_height = float(params.get('min_tree_height', 3.0))
+    reject_nonforest = str(params.get('reject_nonforest', 'true')).lower() in ('true', '1', 'yes')
+    include_cadastre = str(params.get('include_cadastre', 'true')).lower() in ('true', '1', 'yes')
+    min_tree_likelihood = float(params.get('min_tree_likelihood', tv.MIN_TREE_LIKELIHOOD))
 
     geom_3035 = _tree_geom_prepare(features)
 
@@ -13823,6 +13827,44 @@ def _changes_trees_core(task_id, features, params):
     tree_changes, rasters = tca.detect_tree_growth(
         geom_3035, date_a, date_b,
         min_tree_height=min_tree_height, return_rasters=True)
+
+    # v2.3 non-forest suppression — same engine as /api/v2/trees. Critical
+    # here because a demolished barn otherwise shows up as 'felled' timber
+    # and a new shed as a 'new' tree. Judge on the epoch where the object
+    # exists (after-date if present, else before-date).
+    surf_meta = {'nonforest_rejection': reject_nonforest}
+    if reject_nonforest and tree_changes:
+        _progress_set(task_id, 'surface', 'Checking surfaces (buildings/crops)…')
+        bmask_a = bmask_b = None
+        if include_cadastre:
+            # cadastre is a single current snapshot; the same mask applies to
+            # both epochs (grids are co-registered by raster_io)
+            bmask_b, bm_meta = _tree_v2_building_mask(rasters['data_b'], task_id)
+            bmask_a = (bmask_b if (bmask_b is not None
+                                   and bmask_b.shape == rasters['ndsm_a'].shape)
+                       else None)
+            surf_meta.update(bm_meta)
+        else:
+            surf_meta['building_mask'] = 'skipped (include_cadastre=false)'
+        vb = tv.surface_filter_labels(
+            rasters['labels_b'], rasters['ndsm_b'], rasters['transform_b'],
+            {tc.label_b for tc in tree_changes if tc.label_b},
+            building_mask=bmask_b, min_likelihood=min_tree_likelihood)
+        va = tv.surface_filter_labels(
+            rasters['labels_a'], rasters['ndsm_a'], rasters['transform_a'],
+            {tc.label_a for tc in tree_changes if tc.label_a and not tc.label_b},
+            building_mask=bmask_a, min_likelihood=min_tree_likelihood)
+        rej = {}
+        kept = []
+        for tc in tree_changes:
+            v = vb.get(tc.label_b) or va.get(tc.label_a)
+            if v is None or v['keep']:
+                kept.append(tc)
+            else:
+                rej[v['surface_class']] = rej.get(v['surface_class'], 0) + 1
+        surf_meta['rejected_by_surface'] = len(tree_changes) - len(kept)
+        surf_meta['rejected_by_surface_class'] = rej
+        tree_changes = kept
 
     crowns_a = crowns_b = {}
     if crown_geometry == 'polygon' and tree_changes:
@@ -13868,6 +13910,7 @@ def _changes_trees_core(task_id, features, params):
         "meta": {"date_a": date_a, "date_b": date_b,
                  "crown_geometry": crown_geometry,
                  "min_tree_height_m": min_tree_height,
+                 **surf_meta,
                  "processing_time_s": round(time.time()-t0, 2),
                  **params.get('_geometry_meta', {})},
     }
@@ -13876,12 +13919,16 @@ def _changes_trees_core(task_id, features, params):
 def _trees_core(task_id, features, params):
     """Single-date per-tree inventory (sync core)."""
     import object_classifier as oc
+    import tree_inventory as tv
     t0 = time.time()
     dataset = params.get('dataset', ti.DEFAULT_DATASET)
     crown_geometry = str(params.get('crown_geometry', 'point')).lower()
     min_tree_height = float(params.get('min_tree_height', 3.0))
     crown_min_area = int(params.get('crown_min_area', 4))
     include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
+    reject_nonforest = str(params.get('reject_nonforest', 'true')).lower() in ('true', '1', 'yes')
+    include_cadastre = str(params.get('include_cadastre', 'true')).lower() in ('true', '1', 'yes')
+    min_tree_likelihood = float(params.get('min_tree_likelihood', tv.MIN_TREE_LIKELIHOOD))
 
     geom_3035 = _tree_geom_prepare(features)
 
@@ -13909,6 +13956,44 @@ def _trees_core(task_id, features, params):
     # shrub_bush only counts as a tree candidate if tall enough
     trees = [o for o in trees
              if o.obj_type != 'shrub_bush' or o.height_max >= min_tree_height]
+
+    # v2.3 non-forest suppression, shared with /api/v2/trees. The v1
+    # detector has its own building pixel class, but it is geometry+spectral
+    # only and demonstrably leaks: on a Waldviertel farmyard AOI it reported
+    # 175 "trees", 85 of them sitting on cadastre building footprints.
+    # Running the same evidence engine here means both API versions get the
+    # cadastre-authoritative verdict instead of two different qualities.
+    surf_meta = {'nonforest_rejection': reject_nonforest}
+    if reject_nonforest and trees:
+        bmask = None
+        if include_cadastre:
+            bmask, bm_meta = _tree_v2_building_mask(data, task_id)
+            surf_meta.update(bm_meta)
+        else:
+            surf_meta['building_mask'] = 'skipped (include_cadastre=false)'
+        _progress_set(task_id, 'surface', 'Checking surfaces (buildings/crops)…')
+        verdicts = tv.surface_filter_labels(
+            labels, data['ndsm'], data['transform'],
+            [o.label for o in trees if o.label],
+            building_mask=bmask,
+            ndvi=(spectral or {}).get('ndvi') if nir is not None else None,
+            min_likelihood=min_tree_likelihood)
+        rej = {}
+        kept = []
+        for o in trees:
+            v = verdicts.get(o.label)
+            if v is None:
+                kept.append(o)
+                continue
+            o.surface_class = v['surface_class']
+            o.tree_likelihood = v['tree_likelihood']
+            if v['keep']:
+                kept.append(o)
+            else:
+                rej[v['surface_class']] = rej.get(v['surface_class'], 0) + 1
+        surf_meta['rejected_by_surface'] = len(trees) - len(kept)
+        surf_meta['rejected_by_surface_class'] = rej
+        trees = kept
 
     crowns = {}
     if crown_geometry == 'polygon' and trees:
@@ -13945,6 +14030,10 @@ def _trees_core(task_id, features, params):
         }
         if o.ndvi_mean:
             props["ndvi_mean"] = o.ndvi_mean
+        sc = getattr(o, 'surface_class', None)
+        if sc:
+            props["surface_class"] = sc
+            props["tree_likelihood"] = getattr(o, 'tree_likelihood', None)
         tree_features.append({"type": "Feature", "properties": props,
                               "geometry": geom_out})
 
@@ -13971,6 +14060,7 @@ def _trees_core(task_id, features, params):
                  "crown_min_area_px": crown_min_area,
                  "ortho_used": rgb is not None,
                  "area_ha": round(area_ha, 3),
+                 **surf_meta,
                  "processing_time_s": round(time.time()-t0, 2),
                  **params.get('_geometry_meta', {})},
     }
@@ -14092,6 +14182,13 @@ def _tree_v2_params(params):
         # v2.2 (FEEDBACK-3): ortho-fused detection
         'detection_mode': str(params.get('detection_mode', 'fused')).lower(),
         'ortho_seed_res_m': float(params.get('ortho_seed_res_m', 0.4)),
+        # v2.3: non-forest suppression (buildings / crops / hard surfaces)
+        'reject_nonforest': str(params.get('reject_nonforest', 'true')).lower()
+                            in ('true', '1', 'yes'),
+        'include_cadastre': str(params.get('include_cadastre', 'true')).lower()
+                            in ('true', '1', 'yes'),
+        'min_tree_likelihood': float(params.get('min_tree_likelihood',
+                                                tv.MIN_TREE_LIKELIHOOD)),
     }
     return eff
 
@@ -14185,6 +14282,35 @@ def _tree_v2_det_meta(det_meta, nir_used):
     out['nir_used_for'] = used_for
     return out
 
+def _tree_v2_building_mask(data, task_id):
+    """Cadastre building footprints rasterised on the ALS grid (v2.3).
+
+    Authoritative non-tree evidence: BEV cadastre outlines. Dilated inside
+    ``tree_inventory.classify_surfaces`` (wall line vs. eaves). Returns
+    (mask, meta) — mask is None when the cadastre is unavailable, and the
+    inventory then falls back to spectral + geometric gates only.
+    """
+    try:
+        import pyproj
+        tf = data['transform']; h, w = data['shape']; res = abs(tf.a)
+        min_e, max_n = tf.c, tf.f
+        max_e, min_n = min_e + w * res, max_n - h * res
+        tx = pyproj.Transformer.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
+        lon_min, lat_min = tx.transform(min_e, min_n)
+        lon_max, lat_max = tx.transform(max_e, max_n)
+        _progress_set(task_id, 'cadastre', 'Reading cadastre building footprints…')
+        import cadastre
+        m = cadastre.get_building_mask((lon_min, lat_min, lon_max, lat_max),
+                                       tf, (h, w))
+        if m is None:
+            return None, {'building_mask': 'unavailable'}
+        return m, {'building_mask': 'cadastre',
+                   'building_mask_px': int(m.sum())}
+    except Exception as e:
+        log.warning("trees v2: cadastre building mask unavailable (%s)", e)
+        return None, {'building_mask': f'error: {e}'}
+
+
 def _tree_v2_inventory(data, eff, include_ortho, task_id):
     """Shared: run apex inventory on a read_dtm_dsm() result dict.
 
@@ -14219,6 +14345,14 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
     elif want_fused and not include_ortho:
         det_meta['detection_fallback_reason'] = 'include_ortho=false'
 
+    # v2.3: cadastre building footprints (authoritative non-tree evidence)
+    building_mask = None
+    if eff.get('reject_nonforest', True) and eff.get('include_cadastre', True):
+        building_mask, bm_meta = _tree_v2_building_mask(data, task_id)
+        det_meta.update(bm_meta)
+    elif eff.get('reject_nonforest', True):
+        det_meta['building_mask'] = 'skipped (include_cadastre=false)'
+
     _progress_set(task_id, 'trees', 'Detecting tree apices + crowns…')
     det_info = {}
     trees, labels, canopy = tv.build_inventory(
@@ -14231,6 +14365,10 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
         leaf_type_min_conf=eff.get('leaf_type_min_conf', 0.5),
         spectral=spectral, nir=nir,
         ortho_intensity=ortho_intensity, ortho_res_m=ortho_res,
+        building_mask=building_mask,
+        reject_nonforest=eff.get('reject_nonforest', True),
+        min_tree_likelihood=eff.get('min_tree_likelihood',
+                                    tv.MIN_TREE_LIKELIHOOD),
         det_info=det_info)
     det_meta.update(det_info)
     return trees, labels, canopy, (rgb is not None), (nir is not None), det_meta
@@ -14253,6 +14391,10 @@ def _tree_v2_feature(t, geom_out):
         'vitality': t.vitality, 'vitality_conf': t.vitality_conf,
         'detection_source': t.detection_source,
         'detection_conf': t.detection_conf,
+        # v2.3 non-forest suppression (only 'tree' survives by default)
+        'surface_class': t.surface_class,
+        'tree_likelihood': t.tree_likelihood,
+        **{('surface_' + k): v for k, v in t.surface_evidence.items()},
     }
     props.update(t.spectral)
     apex_wgs = ti.geometry_from_3035(Point(t.apex_e, t.apex_n))

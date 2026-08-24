@@ -326,6 +326,10 @@ class DetectedObject:
     temporal_stable: bool = False   # True if object is temporally stable
     temporal_signal: str = ""       # "stable" / "growing" / "shrinking" / "new" / "removed"
     label: int = 0                  # raster segment label (for crown polygon lookup)
+    # --- v2.3 non-forest surface verdict (set by app._trees_core via
+    #     tree_inventory.surface_filter_labels; shared with /api/v2/trees) ---
+    surface_class: str = ""
+    tree_likelihood: float = 1.0
 
 
 # ---------------------------------------------------------------------------

@@ -1244,6 +1244,15 @@ def _sync_peer_data():
                         log.warning('Peer sync: failed to download %s from %s: %s', code, link, e)
 
                 # Collect manifest entries to merge (skip tombstoned keys unless newer)
+                # Re-read tombstones from disk NOW, not just at cycle start:
+                # this cycle may have been in flight for minutes (one HTTP
+                # round-trip per peer) while the sibling worker served a
+                # force-requeue POST that deleted manifest entries + stamped
+                # fresh tombstones. Gating on the cycle-start snapshot
+                # re-imported the peer's stale ``_json`` entries and reverted
+                # the requeue (Aug 2026 orphan* incident). Union-only + a few
+                # KB, so per-peer cost is negligible.
+                _reload_tombstones_from_disk()
                 for key, entry in peer_manifest.items():
                     if key in merged_manifest_entries:
                         continue
@@ -4697,25 +4706,27 @@ def processing_queue_get():
         if not _m:
             continue
         _kg = _m.group(1)
-        # Is this KG complete *right now* (coverage oracle, timestamp-
-        # ignoring)? Two reasons we ignore ts here rather than requiring
-        # ``newest_upload > tombstone``:
-        #   1. Split parents NEVER emit a parent ``<kg>_json`` -- they
-        #      complete via per-block ``_json`` products -- so the old
-        #      parent-``_json``-after-ts check left re-completed split
-        #      parents (40326/62013) tombstoned forever.
-        #   2. The ``<kg>_requeue`` tombstone self-perpetuates: it is
-        #      re-stamped to "now" on every director queue push, so a strict
-        #      ``newest_upload > ts`` check can NEVER fire for a KG whose
-        #      products were uploaded before the latest re-stamp -- the exact
-        #      reprocess loop this fix targets.
-        # Timestamp-ignoring "complete now" is the documented loop-breaker
-        # (mirrors the POST re-stamp guard's ``_kg_structurally_complete``
-        # OR-clause). It is safe because a *genuine* operator force-requeue
-        # DELETES the KG's manifest products first, so a real reprocess
-        # request is not "complete now" and is not cleared here.
+        # Cleared only when the KG *re-completed after the tombstone was
+        # stamped*: the coverage oracle with ``after_ts`` requires the
+        # newest covering ``_json`` to postdate the tombstone. This is
+        # split-parent-safe (blocks' ``_json`` products count toward
+        # coverage, and ``after_ts`` compares against the newest of them
+        # -- the old worry that parents never emit ``<kg>_json`` is
+        # handled inside ``_kg_coverage_complete``).
+        #
+        # History: this used to be timestamp-IGNORING ("complete now"),
+        # justified by (a) split parents and (b) ``_requeue`` being
+        # re-stamped on every director push. (a) is solved by the oracle,
+        # (b) no longer happens (idempotent re-push guard). And the
+        # ts-ignoring form was an active hole: a peer-sync manifest
+        # re-merge racing a force-requeue POST (stale in-memory
+        # tombstones on the sibling gunicorn worker) resurrected the
+        # just-deleted old ``_json`` entries, "complete now" fired, and
+        # this sweep dropped the fresh ``_requeue`` tombstones -- the
+        # Aug 2026 orphan* requeue silently reverted within 5 min.
         try:
-            _recompleted, _ = _kg_coverage_complete(_kg, _mf_entries)
+            _recompleted, _ = _kg_coverage_complete(
+                _kg, _mf_entries, after_ts=str(ts_val or ''))
         except Exception:
             _recompleted = False
         if _recompleted:
@@ -5033,12 +5044,27 @@ def processing_queue_add():
                 # in place lets the manifest-aware reuse engage on the next
                 # peer (entry newer than the original requeue tombstone), so it
                 # skips the rebuild, completes light+JSON, and the KG drains.
-                if mentries is not None and (
-                        _requeue_recompleted(c, _existing_rq, mentries)
-                        or _kg_structurally_complete(c, mentries)):
-                    # Already re-completed: drop this KG's _requeue + product
-                    # tombstones (memory AND disk) so the satisfied-tombstone
-                    # sweep / prune drops it from the queue.
+                # Drop tombstones ONLY on genuine re-completion: the newest
+                # covering ``_json`` must POSTDATE the requeue tombstone
+                # (``_requeue_recompleted``). The old timestamp-ignoring
+                # ``or _kg_structurally_complete(c, mentries)`` clause was
+                # the Aug 2026 requeue-revert hole: a peer-sync manifest
+                # re-merge (racing the force-requeue POST with stale
+                # in-memory tombstones on the other gunicorn worker)
+                # resurrected the just-deleted July ``_json`` entries
+                # within ~5 min, structural-complete saw "entry present"
+                # -> dropped the fresh tombstones -> GET prune evicted the
+                # 4 orphan* codes from the queue and the requeue silently
+                # reverted. Its two historical justifications are obsolete:
+                # split parents are handled by the coverage oracle (blocks
+                # count, with after_ts on the newest), and ``_requeue`` is
+                # no longer re-stamped on re-push (this very guard).
+                if mentries is not None and _requeue_recompleted(
+                        c, _existing_rq, mentries):
+                    # Genuinely re-completed since the requeue: drop this
+                    # KG's _requeue + product tombstones (memory AND disk)
+                    # so the satisfied-tombstone sweep / prune drops it
+                    # from the queue.
                     import re as _re_rq
                     _drop = [k for k in list(_MANIFEST_TOMBSTONES)
                              if _re_rq.match(

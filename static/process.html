@@ -1111,7 +1111,7 @@ const STEP_LBL = {cadastre:'Cadastre',lidar:'LiDAR',ortho:'Ortho',copernicus:'Co
 // ── Map ─────────────────────────────────────────────────────────
 function initMap() {
   map = L.map('kgMap', {zoomControl:true, attributionControl:false}).setView([47.5,13.5],7);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=cb1_2f4r_1_641ea85562265ec4220f53fc',
     {maxZoom:18, subdomains:'abcd'}).addTo(map);
   // Combined groups: tile dots = current + history; zenodo cache = cop + hansen.
   copLayer = L.layerGroup();

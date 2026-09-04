@@ -137,8 +137,9 @@ let selectedId = null;
 
 function initMap() {
   map = L.map('map', { zoomControl: true }).setView([47.7, 14.5], 7);
+  map.attributionControl.addAttribution('Daten: <a href="https://data.bev.gv.at">BEV</a> CC BY 4.0 (bearbeitet) · Contains modified Copernicus Sentinel data · <a href="/api/v1/attribution">Lizenzen</a>');
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-    { maxZoom: 19, attribution: 'OSM' });
+    { maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' });
   // ESRI World Imagery (free, no key) — great for visually verifying flags.
   const sat = L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -147,7 +148,7 @@ function initMap() {
   const basemapAt = L.tileLayer(
     'https://maps{s}.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg',
     { maxZoom: 20, subdomains: '1234',
-      attribution: 'basemap.at · BEV' });
+      attribution: '<a href="https://basemap.at">basemap.at</a> · BEV, CC BY 4.0' });
   const labels = L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
     { maxZoom: 19, attribution: '© Esri', opacity: 0.85 });

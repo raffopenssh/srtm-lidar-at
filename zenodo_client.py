@@ -22,6 +22,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+import attributions as _attr
 import hashlib
 import json
 import logging
@@ -225,10 +226,13 @@ def default_metadata(key: str, filename: str, version: str) -> Dict[str, Any]:
         "metadata": {
             "title": f"{key} ({filename})",
             "upload_type": "dataset",
-            "description": f"Auto-mirrored file <code>{filename}</code> for key <code>{key}</code>, version {version}.",
+            "description": (
+                f"Auto-mirrored file <code>{filename}</code> for key <code>{key}</code>, version {version}."
+                + _attr.zenodo_description_footer()
+            ),
             "creators": [{"name": "Automated Mirror"}],
             "access_right": "open",
-            "license": "cc-by-4.0",
+            "license": _attr.OUTPUT_LICENSE_ZENODO_ID,
             "version": version,
         }
     }
@@ -290,14 +294,18 @@ def landscape_metadata(
                 f"infrastructure analysis, terrain stats, NDVI, SAR, phenology.\n"
                 f"Format: {file_type}, version {version}."
                 f"{quality_line}\n"
-                f"Derived from BEV ALS LIDAR (DTM/DSM), Basemap.at orthophoto, "
-                f"Sentinel-2 NDVI, Sentinel-1 SAR, ESA WorldCover, Hansen GFC."
+                f"Derived from BEV ALS LIDAR (DTM/DSM), BEV DOP orthophoto, "
+                f"BEV cadastre, Sentinel-2 NDVI, Sentinel-1 SAR, ESA WorldCover, "
+                f"Hansen GFC, OpenStreetMap."
+                + _attr.zenodo_description_footer()
             ),
             "creators": [{"name": "SRTM-LIDAR Pipeline"}],
             "access_right": "restricted",
             "access_conditions": "Contact the dataset creator for access.",
+            "license": _attr.OUTPUT_LICENSE_ZENODO_ID,
+            "notes": _attr.attribution_text(),
             "version": version,
-            "keywords": [
+            "keywords": _attr.zenodo_keywords() + [
                 "austria",
                 "landscape",
                 "lidar",

@@ -11874,6 +11874,8 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         "meta": {
             "classifier": "watershed_v1",
             "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
+            "attribution": __import__('attributions').attribution_short(),
+            "license": __import__('attributions').OUTPUT_LICENSE,
             "dataset": dataset,
             "min_object_size": min_object_size,
             "felz_scale": felz_scale,
@@ -16001,6 +16003,12 @@ def info():
             "cadastre_footprints": "mm-precision building polygons (ground truth)",
         },
         "change_event_types": tca.EVENT_TYPES,
+        # Licence + attribution obligations for every source we redistribute
+        # (BEV CC BY 4.0, Copernicus, ESA WorldCover, Hansen, OSM ODbL).
+        "license": __import__('attributions').OUTPUT_LICENSE,
+        "license_url": __import__('attributions').OUTPUT_LICENSE_URL,
+        "attribution": __import__('attributions').attribution_dict(),
+        "attribution_short": __import__('attributions').attribution_short(),
         "endpoints": {
             "POST /api/v1/elevation": "Enrich features with DSM/DTM elevation",
             "POST /api/v1/terrain": "Terrain characterisation (slope, ruggedness, etc.)",
@@ -16013,6 +16021,7 @@ def info():
             "POST /api/v2/trees/by-polygons": "Per-stand batch inventory (union raster, apex containment)",
             "POST /api/v1/changes/summary": "Multi-epoch change summary (2022→2023→2024)",
             "GET /api/v1/info": "This endpoint",
+            "GET /api/v1/attribution": "Licence + attribution text for all data sources (CC BY 4.0 / ODbL)",
             "GET /api/v1/docs/llm.txt": "Machine-readable API reference",
         },
         "max_area_sqkm": MAX_AREA_SQM / 1e6,
@@ -16028,6 +16037,26 @@ def info():
         ],
         "capability_version": 1,
     })
+
+
+# === SECTION: /api/v1/attribution endpoint ===
+
+@app.route('/api/v1/attribution', methods=['GET'])
+def attribution_endpoint():
+    """Licence + attribution for every upstream data source.
+
+    ``?format=text`` returns the plain-text block suitable for a README /
+    map footer; default is structured JSON.  Wording is the single source
+    of truth in ``attributions.py`` (mirrored into Zenodo deposit metadata,
+    GPKG ``gpkg_metadata`` and KG JSON summaries).
+    """
+    import attributions as _attr
+    if request.args.get('format') == 'text':
+        return Response(_attr.attribution_text(), mimetype='text/plain; charset=utf-8')
+    d = _attr.attribution_dict()
+    d['short'] = _attr.attribution_short()
+    d['text'] = _attr.attribution_text()
+    return jsonify(d)
 
 
 # === SECTION: /api/v1/layers endpoint (layer availability check) ===

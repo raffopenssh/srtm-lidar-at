@@ -2984,6 +2984,17 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
             _add_style('Hansen_lossyear', '', 'Forest loss year', ly_qml,
                        'Hansen Global Forest: year of forest loss (1=2001 … 23=2023)')
 
+        # --- Licence / attribution (gpkg_metadata extension) ---
+        # Every GPKG we redistribute must carry the BEV / Copernicus / ESA /
+        # Hansen / OSM credits.  Single source of truth: attributions.py.
+        try:
+            import attributions as _attr
+            _all_layers = {r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents").fetchall()}
+            _attr.write_gpkg_metadata(conn, layers=_all_layers)
+        except Exception as _e:
+            log.warning("gpkg_metadata attribution write failed: %s", _e)
+
         conn.commit()
     finally:
         conn.close()
@@ -5231,6 +5242,8 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             "hansen": "Hansen GFC-2024-v1.12 (2000-2024)",
             "cadastre": "BEV INSPIRE cadastre (current)",
         },
+        # Licence + per-source attribution (CC BY 4.0 obligations; OSM ODbL).
+        "attribution": __import__('attributions').attribution_dict(year=obs_year),
     }
     # --- Area summary ---
     type_counts = Counter()

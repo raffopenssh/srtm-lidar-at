@@ -26,6 +26,39 @@ BEV Ortho URLs: data.bev.gv.at/download/DOP/{20220128,20221027,20240625,20250415
 Hansen URL: storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/
 All raster data accessed via GDAL /vsicurl/ (HTTP range requests) — no bulk downloads.
 
+## Licence & Attribution (READ before redistributing any output)
+
+Machine-readable: GET /api/v1/attribution (JSON) or ?format=text. Also
+embedded in every KG JSON (`attribution` key), every GPKG (`gpkg_metadata`
+table, dataset scope + per-layer ODbL flag) and every Zenodo deposit
+description/notes. Single source of truth: attributions.py.
+
+Our derivatives (API responses, Zenodo dumps, GPKG/GeoJSON exports) are
+**CC BY 4.0** (https://creativecommons.org/licenses/by/4.0/). When you
+re-use them you must carry forward these credits:
+
+| Source | Licence | Required credit |
+|---|---|---|
+| BEV ALS DTM/DSM, DOP orthophoto, Kataster | CC BY 4.0 (Open Government Data) | "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, <product>, Stichtag <date>, CC BY 4.0, bearbeitet" |
+| Copernicus Sentinel-1 / Sentinel-2 | Free, full & open (EU Reg. 377/2014; Del. Reg. 1159/2013) | "Contains modified Copernicus Sentinel data <year>" |
+| ESA WorldCover 2021 v200 | CC BY 4.0 | "© ESA WorldCover project 2021" + Zanaga et al. 2022, doi:10.5281/zenodo.7254221 |
+| Hansen GFC-2024-v1.12 | CC BY 4.0 | "Hansen/UMD/Google/USGS/NASA" + Hansen et al. 2013, Science 342:850–853 |
+| OpenStreetMap (roads/paths/water/landcover, power polygons) | **ODbL 1.0** (share-alike) | "© OpenStreetMap contributors" |
+| austria-power API (Austro Control, IG Windkraft, OSM) | mixed; per-feature `source` | "Austro Control, IG Windkraft, © OpenStreetMap contributors" |
+
+Obligations (CC BY 4.0): attribute, link the licence, indicate that the
+data was modified ("bearbeitet": re-projected to EPSG:3035, tiled,
+segmented, classified, enriched), and do not imply BEV/ESA/EU endorsement.
+Stichtag: ALS epochs 20220915/20230915/20240915 are mosaic snapshot dates —
+real flight years per block in meta.acquisition. DOP series
+20220128/20221027/20240625/20250415.
+
+OSM caveat: the `infrastructure` layer / JSON key contains OSM-derived
+(ODbL) data and is kept separate. Merging it into a redistributed database
+triggers ODbL share-alike for that database. Everything else is CC BY 4.0.
+No personal data: cadastre owner data is not in the open datasets nor in
+this API; EZ numbers are public cadastre attributes.
+
 ## Methods — Segmentation Pipeline
 
 Pipeline: fused gradient → Felzenszwalb over-segmentation → RAG merge → feature extraction → classification → grouping.
@@ -802,7 +835,13 @@ Data layer availability for a bounding box.
 Response: {ortho: {"2024": bool, ...}, cir: {...}, dtm: {...}, dsm: {...}, hansen: bool}
 
 #### GET /api/v1/info
-Server info: data sources, datasets, object types, endpoints.
+Server info: data sources, datasets, object types, endpoints, licence + attribution block.
+
+#### GET /api/v1/attribution
+Licence + attribution for all upstream sources (see "Licence & Attribution" above).
+Params: format=text → plain-text block. Default JSON: {license, license_url,
+modification_note, osm_derived_layers, sources{id:{name,provider,license,
+license_url,attribution,citation?,share_alike?,url}}, short, text}.
 
 #### POST /api/v1/parse-geometry
 Parse uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT).

@@ -687,7 +687,8 @@ function mkIcon(info,colorOvr){
 
 // ============ MAP ============
 const map=L.map('map').setView([47.137,15.117],14);
-const baseLayers={osm:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}),satellite:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles &copy; Esri',maxZoom:19})};
+map.attributionControl.addAttribution('Daten: <a href="https://data.bev.gv.at">BEV</a> CC BY 4.0 (bearbeitet) · Contains modified Copernicus Sentinel data · <a href="/api/v1/attribution">Lizenzen</a>');
+const baseLayers={osm:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',maxZoom:19}),satellite:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles &copy; Esri',maxZoom:19})};
 let baseLayer=baseLayers.osm.addTo(map);
 function switchBasemap(key){
   if(baseLayers[key]===baseLayer)return;

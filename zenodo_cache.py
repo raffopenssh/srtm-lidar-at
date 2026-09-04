@@ -58,6 +58,7 @@ Usage
 from __future__ import annotations
 
 import hashlib
+import attributions as _attr
 import io
 import json
 import logging
@@ -1045,10 +1046,14 @@ class ZenodoCache:
                     "Contains Copernicus (NDVI, SAR, WorldCover, NDVI harmonics) "
                     "at 0.1° resolution and Hansen Global Forest Change at 0.5° "
                     "resolution. ZIP archives with NPZ entries, one per grid cell."
+                    + _attr.zenodo_description_footer()
                 ),
                 "creators": [{"name": "SRTM-LiDAR Austria"}],
                 "access_right": "open",
-                "license": "cc-by-4.0",
+                "license": _attr.OUTPUT_LICENSE_ZENODO_ID,
+                "notes": _attr.attribution_text(
+                    ["copernicus_s2", "copernicus_s1", "esa_worldcover", "hansen_gfc"]),
+                "keywords": _attr.zenodo_keywords(),
             }
         }
         r = self._api("POST", "/api/deposit/depositions", json=meta)

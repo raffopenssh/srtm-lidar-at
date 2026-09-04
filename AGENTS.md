@@ -502,6 +502,7 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 | Zenodo persistent tile cache | `docs/zenodo-cache.md` | touching `zenodo_cache.py`, tile manifest, ZIP indices |
 | Cross-cutting concerns | `docs/cross-cutting-concerns.md` | adding object types, RF features, tile grid, credential pool, navigation cheatsheet |
 | Planned refactor + speed optimisation | `docs/planned-refactor.md` | next maintenance window work |
+| Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |
 
 ## Quick ops
@@ -555,6 +556,7 @@ tail -f /tmp/rf_train_4000kg.log
 | `hansen.py` | Hansen GFC (forest change) |
 | `osm_features.py` | OSM via Overpass |
 | `bev_retry.py` | Backoff + proxy rotation for `rasterio.open()` |
+| `attributions.py` | Licence/attribution single source of truth → `/api/v1/attribution`, Zenodo, GPKG `gpkg_metadata`, KG JSON. See `docs/attributions.md` |
 | `tile_index.py` | 55-tile grid, EPSG 4326 ↔ 3035 |
 | `tile_cache.py` | Grid-snapped 0.1° caches, Zenodo fallback |
 | `zenodo_cache.py` | Persistent tile cache on Zenodo. See `docs/zenodo-cache.md` |

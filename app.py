@@ -25,6 +25,7 @@ import re
 import tempfile
 import threading
 import time
+import math as _math
 import traceback
 import uuid
 from dataclasses import asdict
@@ -9491,6 +9492,113 @@ def api_kg_segments(kg_code):
         return jsonify(result)
     except Exception as e:
         log.warning('api_kg_segments %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
+# === SECTION: /api/v1/kg/<code>/heightfield — index-only gridded DTM estimate ===
+_HEIGHTFIELD_CACHE = {}          # (kg, cell) -> (ts, payload)
+_HEIGHTFIELD_CACHE_MAX = 400
+
+
+@app.route('/api/v1/kg/<kg_code>/heightfield')
+def api_kg_heightfield(kg_code):
+    """Fast (<100 ms) gridded terrain estimate for a KG — index only, no raster.
+
+    Interpolates (IDW, k nearest) the pre-indexed sample points from
+    `kg_parcels` (parcel centroid, elevation_m) and `kg_buildings`
+    (centroid_dtm_m — dense in settlements) onto a regular lon/lat grid
+    covering the KG bbox. Meant for game-style 2.5D relief (e.g.
+    siedler-oesterreich), NOT survey use: accuracy is ~parcel scale.
+
+    Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
+            k=N      IDW neighbours (default 8)
+    Returns {kg_code, bbox:[w,s,e,n], cell_m, cols, rows, elev_min, elev_max,
+             origin:'nw', rows_major_north_to_south:true,
+             z:[[…]]  (rows of floats, null where no data within 3 km),
+             samples:N, source}
+    """
+    try:
+        cell = max(20, min(500, int(request.args.get('cell', 50))))
+        k = max(1, min(32, int(request.args.get('k', 8))))
+        ck = (kg_code, cell, k)
+        hit = _HEIGHTFIELD_CACHE.get(ck)
+        if hit and time.time() - hit[0] < 3600:
+            return jsonify(hit[1])
+        idx = si.get_index()
+        c = idx._conn()
+        kg = c.execute('SELECT min_lon,min_lat,max_lon,max_lat,elevation_min_m,'
+                       'elevation_max_m,processed FROM kg WHERE kg_code=?',
+                       (kg_code,)).fetchone()
+        if not kg:
+            return jsonify({'error': f'unknown KG {kg_code}'}), 404
+        w, s, e, n, emin, emax, processed = kg
+        pts = c.execute('SELECT centroid_lon,centroid_lat,elevation_m FROM kg_parcels '
+                        'WHERE kg_code=? AND elevation_m IS NOT NULL', (kg_code,)).fetchall()
+        pts += c.execute('SELECT centroid_lon,centroid_lat,centroid_dtm_m FROM kg_buildings '
+                         'WHERE kg_code=? AND centroid_dtm_m IS NOT NULL', (kg_code,)).fetchall()
+        if len(pts) < 3:
+            return jsonify({'error': f'KG {kg_code} has no indexed elevation samples',
+                            'processed': bool(processed)}), 404
+        P = np.asarray(pts, dtype=np.float64)
+        lat0 = (s + n) / 2.0
+        mx = 111320.0 * _math.cos(_math.radians(lat0))   # m per deg lon
+        my = 110540.0                                  # m per deg lat
+        cols = int(_math.ceil((e - w) * mx / cell)) + 1
+        rows = int(_math.ceil((n - s) * my / cell)) + 1
+        if cols * rows > 250_000:
+            return jsonify({'error': 'grid too large; increase cell'}), 400
+        gx = w + (np.arange(cols) * cell) / mx
+        gy = n - (np.arange(rows) * cell) / my          # north → south
+        # sample coords in metres
+        sx = (P[:, 0] - w) * mx
+        sy = (n - P[:, 1]) * my
+        sz = P[:, 2]
+        GX, GY = np.meshgrid((gx - w) * mx, (n - gy) * my)
+        q = np.stack([GX.ravel(), GY.ravel()], axis=1)
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.stack([sx, sy], axis=1))
+            kk = min(k, len(sz))
+            d, i = tree.query(q, k=kk, distance_upper_bound=3000.0)
+            if kk == 1:
+                d = d[:, None]; i = i[:, None]
+            valid = np.isfinite(d)
+            i = np.where(valid, i, 0)
+            wgt = np.where(valid, 1.0 / (np.maximum(d, 1.0) ** 2), 0.0)
+            num = (wgt * sz[i]).sum(1)
+            den = wgt.sum(1)
+            z = np.where(den > 0, num / np.where(den > 0, den, 1), np.nan)
+        except ImportError:  # brute force fallback (fine for <10k samples)
+            d2 = ((q[:, None, 0] - sx[None]) ** 2 + (q[:, None, 1] - sy[None]) ** 2)
+            kk = min(k, len(sz))
+            i = np.argpartition(d2, kk - 1, axis=1)[:, :kk]
+            dd = np.take_along_axis(d2, i, 1)
+            wgt = 1.0 / np.maximum(dd, 1.0)
+            wgt[dd > 3000.0 ** 2] = 0
+            den = wgt.sum(1)
+            z = np.where(den > 0, (wgt * sz[i]).sum(1) / np.where(den > 0, den, 1), np.nan)
+        Z = z.reshape(rows, cols)
+        zr = np.round(Z, 1)
+        zl = [[None if not np.isfinite(v) else float(v) for v in row] for row in zr]
+        fin = Z[np.isfinite(Z)]
+        payload = {
+            'kg_code': kg_code, 'bbox': [w, s, e, n], 'cell_m': cell,
+            'cols': cols, 'rows': rows, 'origin': 'nw',
+            'rows_major_north_to_south': True,
+            'elev_min': float(fin.min()) if fin.size else None,
+            'elev_max': float(fin.max()) if fin.size else None,
+            'kg_elev_min': emin, 'kg_elev_max': emax,
+            'samples': int(len(sz)), 'k': k,
+            'source': 'IDW over indexed parcel centroids + building centroid DTM '
+                      '(BEV ALS DTM 1 m, CC BY 4.0, bearbeitet); parcel-scale accuracy',
+            'z': zl,
+        }
+        if len(_HEIGHTFIELD_CACHE) >= _HEIGHTFIELD_CACHE_MAX:
+            _HEIGHTFIELD_CACHE.pop(next(iter(_HEIGHTFIELD_CACHE)))
+        _HEIGHTFIELD_CACHE[ck] = (time.time(), payload)
+        return jsonify(payload)
+    except Exception as e:
+        log.warning('api_kg_heightfield %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
 
 

@@ -1391,6 +1391,34 @@ Detected new buildings not in cadastre (from light GPKG).
 Properties: type, area_sqm, max_height_m, stories_est, roof_type_hint, confidence.
 Params: bbox=w,s,e,n  limit=N  offset=N
 
+#### GET /api/v1/kg/<kg_code>/heightfield ← FAST (<100 ms) 2.5D terrain for games / viz
+Index-only gridded DTM estimate for a whole KG — no raster read, no GPKG.
+IDW (k nearest, 3 km cutoff) over the pre-indexed sample points: parcel
+centroids (`kg_parcels.elevation_m`, ~55 m spacing) + building centroids
+(`kg_buildings.centroid_dtm_m`, dense in settlements). Parcel-scale
+accuracy — fine for isometric relief / hillshade / extrusion offsets,
+NOT for survey use (use POST /api/v1/lidar/geotiff for real 1 m DTM).
+Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
+        k=N      IDW neighbours (default 8)
+Returns: {kg_code, bbox:[w,s,e,n], cell_m, cols, rows, origin:'nw',
+          rows_major_north_to_south:true, z:[[…]] (row 0 = north edge,
+          null = no sample within 3 km), elev_min, elev_max,
+          kg_elev_min, kg_elev_max (true DTM extremes from the KG index),
+          samples, source}
+Grid cell (r,c) → lon = w + c*cell/(111320*cos(lat)), lat = n - r*cell/110540.
+~90 KB at cell=50 for a typical KG; cached 1 h server-side.
+404 with processed:false for KGs not yet processed.
+
+Recipe — everything a 2.5D renderer needs for one KG, all <100 ms each:
+  /api/v1/kg/<kg>/heightfield?cell=50                    terrain grid
+  /api/v1/query/parcels?kg=<kg>&limit=5000               per-parcel elev/slope/aspect/ndsm_max/forested_fraction
+  /api/v1/buildings/search?kg=<kg>&limit=5000            building centroid, dtm, max_height, stories, roof type
+  /api/v1/query?segments=true&kg=<kg>&object_type=tree,hedge,mast,rock&sort=height_max_m&limit=50
+                                                         tallest objects per type with lon/lat/height
+AVOID for interactive use: query/parcels?bbox= (no spatial index, seconds),
+segments=true&bbox= (1–5 s), /kg/<kg>/segments|buildings (GPKG fetch),
+and every POST raster endpoint (10–60 s).
+
 #### GET /api/v1/buildings/search
 Fast building search across the index (no GPKG needed). Queries the kg_buildings table.
 Params:

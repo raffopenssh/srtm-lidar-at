@@ -190,7 +190,9 @@ def pixel_layers(g, window, *, ortho_year=None, cop_cache=None, hansen_cache=Non
     L["aspect"] = oseg._aspect(dtm0)
     L["tri"] = compute_tri(dtm0)
     L["tpi"] = compute_tpi(dtm0, radius=5)
-    L["curv"] = compute_curvature(dtm0)["profile_curvature"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        # curvature is undefined (0/0) on perfectly flat pixels — NaN is correct
+        L["curv"] = compute_curvature(dtm0)["profile_curvature"]
     L["dsm_rough"] = _local_std(dsm, 3)
     L["dtm_rough"] = _local_std(dtm, 3)
     d0 = np.nan_to_num(dsm)

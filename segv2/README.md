@@ -57,3 +57,25 @@ Grouped-KG CV on the same relabelled test folds: v2 must beat the v1 model
 by ≥ +0.05 macro-F1 **and** not lose > 0.02 F1 on any of tree/roof/grass/crop/
 water/road, with calibration (ECE) ≤ v1. Then: side-by-side visual QA on 5
 KGs (dashboard overlay), and a reprocessing cost estimate.
+
+## v2 product design notes (for the reprocessing pass)
+
+Requested: downstream services (trees v2 `tree_inventory`, terrain endpoints
+such as `/kg/<code>/heightfield`) must get much faster, **without** bloating
+the per-KG JSON. Plan — precompute once during reprocessing, store in the
+*GPKG* (cheap, range-readable) and keep only compact indexes in JSON:
+
+| Need | Today | v2 |
+|---|---|---|
+| Terrain grids (heightfield, slope/aspect) | IDW from index points, or full GPKG download (GB) | `terrain_coarse` layer: DTM/DSM/nDSM at **5 m** + slope/aspect/TRI (int16, ~1/25 the pixels) in **light** GPKG; plus 25 m summary grid in JSON (`terrain.grid25`: elev/slope int16 base64, ≤ 40 KB/KG). Heightfield endpoint reads that instead of IDW. |
+| Trees v2 | needs nDSM (full GPKG) + multi-date DSM | `tree_apices` vector layer (x, y, h, crown_r, dh_per_year, flight_year) in light GPKG; JSON keeps only per-parcel `top_trees` + KG-level histogram (already compact). Apex detection runs once on the same nDSM the segmenter used. |
+| Flight-date normalisation | recomputed per request | per-tile `als_meta` table in light GPKG (`dtm_year, dsm_year, ortho_year, eff_date, years_gap`) + `acquisition` block in JSON (a few hundred bytes). |
+| Segment lookup | full `segments` polygons | keep; add R-tree (GPKG standard `rtree_segments_geom`) so viewers/APIs range-read only what they need. |
+| Raster layers | one PNG tile pyramid level | write **overviews** (zoom 0..N) in full GPKG so the dashboard/QGIS can stream at any zoom via HTTP range instead of downloading the file. |
+
+JSON size budget stays ≈ today's (median 6 MB; 25 m terrain grid + acquisition
+block add < 50 KB). Everything heavier lives in the light GPKG (already
+downloaded by `GpkgCache` on demand and cached on the primary).
+
+Performance rule carried from the v1 post-mortem: every per-tile step masks to
+the KG's parcel union first; tiles with < 2 % KG coverage are skipped.

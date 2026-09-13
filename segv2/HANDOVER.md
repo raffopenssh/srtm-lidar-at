@@ -17,7 +17,37 @@ This file is the *state + next steps* for whoever continues.
 
 Build finished: 143 KGs ok, 9 errors (6× `no_full_gpkg`, 2× `no_parcels`, 1 pre-pyarrow-install). 1.10 M segments, 559 k pass the filter.
 
-Not started: v2 segmentation eval, promotion.
+## Harness results (full run, 5-fold GroupKFold by parent KG, 559 k rows / 119 KGs, 15 classes)
+
+| model | macro-F1 | weighted-F1 | acc | ECE |
+|---|---:|---:|---:|---:|
+| A v1 deployed RF | 0.240 | 0.641 | 0.666 | 0.151 |
+| P v1 pipeline output (Zenodo `v1_type`) | 0.198 | 0.555 | 0.533 | — |
+| B RF, v2 labels, 66 feats | 0.514 | 0.827 | 0.814 | 0.062 |
+| C LGBM, 66 feats | 0.544 | 0.850 | 0.848 | 0.060 |
+| **D LGBM, ALL_KEYS (+context)** | **0.655** | **0.883** | **0.888** | **0.056** |
+| E D + kNN neighbour proba | see `data/segv2/report.md` | | | |
+
+All of B/C/D pass the README promotion rule (Δmacro-F1 ≥ +0.05, no key class −0.02, ECE ≤ v1).
+Per-class D: tree .999 roof .999 road .952 rail .947 water .910 grass .863 garden .830
+crop .810 parking .668 vineyard .603 rock .445 shrub .286 earthwork .240 orchard .236 bare_soil .032.
+
+Caveats to carry forward:
+* **OSM-derived distance features ≈ label geometry.** `dist_road/rail/water/building`
+  are computed from the same OSM/footprint polygons that produce the road/rail/water/roof
+  labels, so D's ~0.95+ on those classes mostly measures "agrees with OSM". Not leakage
+  at inference (OSM + cadastre are available for every KG), but the honest independent
+  signal is C's numbers for those classes. Consider an ablation `D-minus-dist` in the report
+  before claiming recognition quality; and keep OSM as an *input*, not only a label source.
+* Weak classes: bare_soil (332 rows), orchard, shrub, earthwork, rock (rock drops B .745 → D .445 —
+  context features hurt; likely INVEKOS/cadastre alpine-pasture vs rock confusion, check confusion
+  matrix). More KGs in the alpine size bands + a Hansen/NDVI-based earthwork source would help.
+* `B` (same RF as v1, only relabelled) already gains +0.27 macro-F1 → the label fix alone is
+  the bulk of the win; the model/feature change adds another +0.14.
+* Final D model saved by `--save-final D` → `data/segv2/models/model_D.joblib` + `.meta.json`
+  (feature_keys=ALL_KEYS, nan_to_zero=False, merge excavation/fill→earthwork, hedge→shrub).
+
+Not started: v2 segmentation eval, promotion/wiring.
 
 ## Findings so far
 

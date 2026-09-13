@@ -172,3 +172,24 @@ python3 -c "import json;[print(json.loads(l).get('code'),json.loads(l).get('n_go
 python3 segv2/build_dataset.py 12105 --keep-gpkg    # single KG
 ```
 `data/segv2/dataset/*.parquet` and `data/invekos/` are gitignored (large); audit/build logs are committed.
+
+### ⏸ 2026-09-13 14:20 UTC — everything PAUSED for Zenodo recovery
+
+Zenodo posted a status notice (slowness / intermittent outages from bot & AI
+crawler traffic); our fetches were failing with HTTP 504 on every retry.
+Operator asked to pause all machinery so Zenodo can recover:
+
+* segv2 dataset rebuild: `tmux kill-session -t segv2build` (builder killed
+  mid-run; `build_log.jsonl` is append-only, resume by rerunning
+  `python3 segv2/build_dataset.py` for the codes not yet `done:`).
+* Fleet: `POST /api/v1/director/stop` → director `mode=paused`, `active=-`,
+  processors on at100/at106/at11/at68 hard-stopped (in-flight KGs 44206,
+  45410, 57310-northeast, 86041-south will be re-picked from tile
+  checkpoints when resumed).
+
+**To resume** (once https://zenodo.org is healthy again):
+```bash
+TOKEN=$(cat data/admin_token)
+curl -s -X POST -H "X-Admin-Token: $TOKEN" 'http://localhost:8000/api/v1/director/mode?mode=auto'
+# then optionally: tmux new-session -d -s segv2build 'python3 segv2/build_dataset.py ... 2>&1 | tee -a data/segv2/build_stdout.log'
+```

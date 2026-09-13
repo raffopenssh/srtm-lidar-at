@@ -13,7 +13,11 @@ This file is the *state + next steps* for whoever continues.
 | `segv2/features.py` | done. `pixel_layers()` (all layers from GPKG + harmonics from Zenodo tile cache, cache-only), `segment()` (v1 params; optional OSM hard edges), `extract()` → DataFrame with all 67 v1 `FEATURE_KEYS` + `V2_EXTRA_KEYS` (OSM distances, neighbour context, height distribution, NDWI/SAVI, flight-year gaps, per-year change). Vectorised (bincount/lexsort) — 1500² tile ≈ 5 s features, 11 s segmentation. |
 | `segv2/build_dataset.py` | done, **running in tmux session `segv2build`** (`--n 150 --seed 1`, stratified by size band + 1°×2° cell). Output `data/segv2/dataset/<code>.parquet` + `.meta.json`, progress in `data/segv2/build_log.jsonl`, stdout `data/segv2/build_stdout.log` (ends with `FINISHED`). ~3.5 min/KG. KG mask = cadastre parcel union; tiles < 2 % coverage skipped. Columns: features, `y` (v2 label mode), `y_purity`, `y_src`, `y_weight`, `v1_type` (deployed pipeline's answer on the same pixels), `kg`, `tile`, `centroid_e/n`. |
 
-Not started: `segv2/train.py` (the harness), v2 segmentation eval, promotion.
+| `segv2/train.py` | done (2026-09-13). Models A (v1 RF), P (v1_type on Zenodo), B (RF relabelled), C (LGBM FEATURE_KEYS), D (LGBM ALL_KEYS), E (D + kNN-neighbour OOF proba). GroupKFold by parent kg, macro/weighted F1, per-class, ECE, confusion, README promotion check. Report is rewritten after every model → `data/segv2/report.md|json`. `--save-final D` → `data/segv2/models/model_D.joblib`. **Full run in tmux `segv2train`**, log `data/segv2/train_full.log`, ends with `FINISHED`. Quick smoke (20 %, 2 folds): A macro-F1 0.307 / acc 0.67, P 0.246 / 0.54, C 0.621 / 0.86, ECE 0.153→0.079. Classes <300 rows dropped in the quick run (earthwork/water/rail/bare_soil/wetland/path/greenhouse) — the full run keeps earthwork/water/rail/bare_soil. |
+
+Build finished: 143 KGs ok, 9 errors (6× `no_full_gpkg`, 2× `no_parcels`, 1 pre-pyarrow-install). 1.10 M segments, 559 k pass the filter.
+
+Not started: v2 segmentation eval, promotion.
 
 ## Findings so far
 
@@ -26,7 +30,7 @@ Not started: `segv2/train.py` (the harness), v2 segmentation eval, promotion.
 
 ## Next steps (in order)
 
-1. **`segv2/train.py`** — the harness:
+1. ~~`segv2/train.py`~~ done — read `data/segv2/report.md`. Original spec kept for reference:
    * load all parquets; keep rows `y!='' & y_purity>=0.6 & kg_frac>=0.5`; sample weights `y_weight × purity`.
    * class merge for training: `hedge→shrub`? (decide by count), `greenhouse` keep if ≥300 rows, `wetland/glacier/rail` keep if ≥300 else drop.
    * folds: `GroupKFold(5)` by parent `kg` (so split blocks stay together).

@@ -71,11 +71,10 @@ add the outage length. Check: `grep -c "done:" data/segv2/build_stdout.log`.
 **Transient-failure retry** (added 14:05 UTC): `build_dataset.main()` now runs a
 second pass over every code whose meta had an `error` other than
 `no_parcels`/`no_tiles` (so a 504 storm exhausting the fetcher's 12 tries →
-`no_full_gpkg` is retried, not written off). The *currently running* build
-predates this, so tmux `segv2retry` (`segv2/retry_failed.sh`) waits for it to
-exit, then re-runs the errored codes from `build_log.jsonl` and appends
-`FINISHED_RETRY` to `build_stdout.log`. Wait for **that** marker before
-training. Zenodo was fully unreachable 12:34–≥14:05 UTC (34 KGs done at that
+`no_full_gpkg` is retried, not written off). The build was restarted at 14:06 UTC on the new code (`--skip-done` resumed
+from the 34 parquets; first run's stdout kept as `build_stdout_run1.log`), so
+the in-process retry pass applies; `FINISHED` is the final marker.
+`segv2/retry_failed.sh` is kept as a manual chained-retry tool. Zenodo was fully unreachable 12:34–≥14:05 UTC (34 KGs done at that
 point; 19713 and 22143 hit `no_full_gpkg` during the outage).
 
 ### After the build (next conversation)

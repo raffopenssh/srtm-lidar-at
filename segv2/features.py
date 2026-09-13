@@ -51,9 +51,13 @@ V2_EXTRA_KEYS = [
     # terrain extras
     "tri_mean", "tpi_mean", "curvature_mean", "elevation_mean", "aspect_sin", "aspect_cos",
     "dtm_range",
-    # acquisition (flight-date normalisation)
+    # acquisition (real flight dates via segv2.acquisition, NOT mosaic labels)
     "dsm_year", "dtm_year", "ortho_year", "ortho_lidar_gap", "years_span",
     "h_change_per_year", "dtm_change_per_year",
+    "dsm_age", "dtm_dsm_split", "nir_year", "nir_lidar_gap",
+    # multi-year BEV ortho spectral (real NIR years only)
+    "ndvi_y_first", "ndvi_y_last", "ndvi_trend_per_year", "ndvi_tstd", "ndvi_years_span",
+    "ndvi_ndsm_coherence",
     # shape extras
     "bbox_fill", "width_est", "length_est",
     # worldcover extras
@@ -183,7 +187,9 @@ def pixel_layers(g, window, *, ortho_year=None, cop_cache=None, hansen_cache=Non
     if mask.sum() < 100:
         return None
     L = {"dtm": dtm, "dsm": dsm, "mask": mask}
-    L["ndsm"] = np.clip(dsm - dtm, 0, None).astype(np.float32)
+    # DSM-DTM everywhere both are valid (the GPKG nDSM layer has ~7 % NaN where
+    # the writer dropped negative/edge pixels; a NaN hole would bias frac_* stats)
+    L["ndsm"] = np.where(mask, np.clip(dsm - dtm, 0, None), np.nan).astype(np.float32)
     L["transform"] = g.window_transform(window)
     dtm0 = np.where(mask, dtm, np.nanmean(dtm[mask]))
     L["slope"] = oseg._slope(dtm0)
@@ -198,29 +204,61 @@ def pixel_layers(g, window, *, ortho_year=None, cop_cache=None, hansen_cache=Non
     d0 = np.nan_to_num(dsm)
     L["dsm_edge"] = np.hypot(ndimage.sobel(d0, 1), ndimage.sobel(d0, 0)).astype(np.float32)
 
-    # --- ortho ---
-    rgb, nir, oy = g.read_ortho(ortho_year, window)
-    L["ortho_year"] = oy
+    # --- ortho (all years; NIR only from years that carry a CIR layer) ---
+    stack = g.read_ortho_stack(window)
+    L["ortho_stack_years"] = sorted(stack)
+    nir_years = [y for y in sorted(stack) if stack[y]["nir"] is not None]
+    L["nir_years"] = nir_years
+    # RGB from the newest year; NIR from the newest *real* NIR year.  Where the
+    # two differ (2024 RGB-only + 2023 RGBI) NDVI is computed from the NIR year's
+    # own red band so it is a true single-date index.
+    rgb_year = L["ortho_stack_years"][-1] if stack else None
+    nir_year = nir_years[-1] if nir_years else None
+    L["ortho_year"] = rgb_year
+    L["nir_year"] = nir_year
     spectral = None
-    if rgb is not None:
+    if rgb_year is not None:
+        rgb = stack[rgb_year]["rgb"]
         r, gg, b = (rgb[i].astype(np.float32) for i in range(3))
         s = r + gg + b
         spectral = {"red": r, "green": gg, "blue": b, "brightness": s / 3.0}
         with np.errstate(divide="ignore", invalid="ignore"):
             spectral["green_ratio"] = np.where(s > 0, gg / s, np.nan).astype(np.float32)
             spectral["rg_index"] = np.where(r + gg > 0, (r - gg) / (r + gg), np.nan).astype(np.float32)
-        if nir is not None:
-            n = nir.astype(np.float32)
+        if nir_year is not None:
+            n = stack[nir_year]["nir"].astype(np.float32)
+            rn = stack[nir_year]["rgb"][0].astype(np.float32)
+            gn = stack[nir_year]["rgb"][1].astype(np.float32)
             spectral["nir"] = n
             with np.errstate(divide="ignore", invalid="ignore"):
-                spectral["ndvi"] = np.where(n + r > 0, (n - r) / (n + r), np.nan).astype(np.float32)
-                spectral["ndwi"] = np.where(n + gg > 0, (gg - n) / (gg + n), np.nan).astype(np.float32)
-                spectral["savi"] = (1.5 * (n - r) / (n + r + 0.5 * 255)).astype(np.float32)
+                spectral["ndvi"] = np.where(n + rn > 0, (n - rn) / (n + rn), np.nan).astype(np.float32)
+                spectral["ndwi"] = np.where(n + gn > 0, (gn - n) / (gn + n), np.nan).astype(np.float32)
+                spectral["savi"] = (1.5 * (n - rn) / (n + rn + 0.5 * 255)).astype(np.float32)
+            black_n = (rn + gn + stack[nir_year]["rgb"][2]) == 0
+            for k in ("nir", "ndvi", "ndwi", "savi"):
+                spectral[k] = np.where(black_n, np.nan, spectral[k]).astype(np.float32)
         # no-data pixels in ortho are pure black
         black = s == 0
-        for k in spectral:
+        for k in ("red", "green", "blue", "brightness", "green_ratio", "rg_index"):
             spectral[k] = np.where(black, np.nan, spectral[k]).astype(np.float32)
     L["spectral"] = spectral
+    # per-year NDVI from every real-NIR year (temporal vegetation signal)
+    L["ndvi_years"] = {}
+    for y in nir_years:
+        rr = stack[y]["rgb"][0].astype(np.float32); nn = stack[y]["nir"].astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = np.where(nn + rr > 0, (nn - rr) / (nn + rr), np.nan).astype(np.float32)
+        L["ndvi_years"][y] = np.where(stack[y]["rgb"].sum(0) == 0, np.nan, v).astype(np.float32)
+    # real flight year of each ortho slot (operate id), for gap features
+    L["ortho_flight_years"] = {}
+    try:
+        import acquisition as _acq
+        wb = g.window_bounds(window)
+        for y in L["ortho_stack_years"]:
+            L["ortho_flight_years"][y] = _acq.ortho_flight_year(wb, y)
+    except Exception as e:  # noqa: BLE001
+        log.debug("ortho flight year lookup failed: %s", e)
+    del stack
 
     # --- copernicus (from GPKG) ---
     L["cop_ndvi"] = g.read("NDVI", window)
@@ -240,6 +278,14 @@ def pixel_layers(g, window, *, ortho_year=None, cop_cache=None, hansen_cache=Non
     # the default mosaic (DTM/DSM) is the newest (obs_year); add it as a date too
     L["dtm_dates"].setdefault(obs_year, dtm)
     L["dsm_dates"].setdefault(obs_year, dsm)
+    # real per-pixel flight years for every mosaic we have (segv2.acquisition)
+    L["als_years"] = {}
+    try:
+        import acquisition as _acq
+        for my in sorted(set(L["dtm_dates"]) | set(L["dsm_dates"])):
+            L["als_years"][my] = _acq.als_year_rasters(L["transform"], dtm.shape, my)
+    except Exception as e:  # noqa: BLE001
+        log.warning("ALS flight-year lookup failed: %s", e)
 
     # --- hansen (GPKG) ---
     tc = g.read("Hansen_treecover", window)
@@ -400,7 +446,7 @@ def extract(labels: np.ndarray, L: dict, *, context: dict | None = None,
     wc = L["worldcover"]
     if wc is not None:
         mode, _, _ = G.mode_frac(wc, 256)
-        F["esa_dominant_lc"] = mode
+        F["esa_dominant_lc"] = np.where((mode == 0) | (mode == 255), np.nan, mode)  # nodata → missing
         for k, code in (("esa_built_frac", 50), ("esa_tree_frac", 10), ("esa_crop_frac", 40),
                         ("esa_grass_frac", 30), ("esa_water_frac", 80), ("esa_shrub_frac", 20),
                         ("esa_bare_frac", 60), ("esa_snow_frac", 70), ("esa_wetland_frac", 90)):
@@ -410,43 +456,95 @@ def extract(labels: np.ndarray, L: dict, *, context: dict | None = None,
                   "esa_water_frac", "esa_shrub_frac", "esa_bare_frac", "esa_snow_frac", "esa_wetland_frac"):
             F[k] = np.zeros(G.n)
 
-    # temporal
+    # temporal — normalised by REAL flight dates (segv2.acquisition), not mosaic labels
     years = sorted(set(L["dtm_dates"]) & set(L["dsm_dates"]))
-    F["dsm_year"] = np.full(G.n, float(obs_year)); F["dtm_year"] = np.full(G.n, float(obs_year))
-    F["years_span"] = np.full(G.n, float(years[-1] - years[0]) if len(years) > 1 else 0.0)
+    als = L.get("als_years") or {}
+    def _yr(my, key):
+        r = als.get(my)
+        if r is None:
+            return np.full(G.n, np.nan)
+        a = r[key].astype(np.float32); a[a <= 0] = np.nan
+        return G.mean(a, fill=np.nan)
+    newest = years[-1] if years else obs_year
+    F["dsm_year"] = _yr(newest, "dsm_year"); F["dtm_year"] = _yr(newest, "dtm_year")
+    F["dsm_age"] = float(obs_year) - F["dsm_year"]
+    F["dtm_dsm_split"] = F["dsm_year"] - F["dtm_year"]
     if len(years) >= 2:
+        y0, y1 = years[0], years[-1]
+        # true span between the flights behind the oldest and newest mosaic, per segment
+        span = _yr(y1, "dsm_year") - _yr(y0, "dsm_year")
+        F["years_span"] = span
         stack = np.stack([np.clip(L["dsm_dates"][y] - L["dtm_dates"][y], 0, None) for y in years])
         with np.errstate(all="ignore"):
             tstd = np.nanstd(stack, 0)
             hch = stack[-1] - stack[0]
-        dch = L["dtm_dates"][years[-1]] - L["dtm_dates"][years[0]]
+        dch = L["dtm_dates"][y1] - L["dtm_dates"][y0]
         F["temporal_h_std"] = G.mean(tstd); F["h_change"] = G.mean(hch)
         F["dtm_change"] = G.mean(dch); F["dtm_change_abs"] = G.mean(np.abs(dch))
         F["volume_change_m3"] = G.sum(dch); F["volume_change_abs_m3"] = G.sum(np.abs(dch))
         F["dtm_change_max"] = G.max(np.abs(dch)); F["dtm_change_frac_03m"] = G.frac(np.nan_to_num(dch) > 0.3)
-        span = max(years[-1] - years[0], 1)
-        F["h_change_per_year"] = F["h_change"] / span; F["dtm_change_per_year"] = F["dtm_change"] / span
+        # same flight in both mosaics → "change" is resampling noise → missing, not 0
+        same = ~(span >= 1)
+        for k in ("temporal_h_std", "h_change", "dtm_change", "dtm_change_abs", "volume_change_m3",
+                  "volume_change_abs_m3", "dtm_change_max", "dtm_change_frac_03m"):
+            F[k] = np.where(same, np.nan, F[k])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            F["h_change_per_year"] = F["h_change"] / span; F["dtm_change_per_year"] = F["dtm_change"] / span
     else:
+        F["years_span"] = np.full(G.n, np.nan)
         for k in ("temporal_h_std", "h_change", "dtm_change", "dtm_change_abs", "volume_change_m3",
                   "volume_change_abs_m3", "dtm_change_max", "dtm_change_frac_03m", "h_change_per_year",
                   "dtm_change_per_year"):
-            F[k] = np.zeros(G.n)
-    F["stability"] = 1.0 / (1.0 + F["temporal_h_std"] + F["dtm_change_abs"])
-    F["ortho_year"] = np.full(G.n, float(L.get("ortho_year") or obs_year))
+            F[k] = np.full(G.n, np.nan)
+    F["stability"] = 1.0 / (1.0 + np.nan_to_num(F["temporal_h_std"]) + np.nan_to_num(F["dtm_change_abs"]))
+    ofy = L.get("ortho_flight_years") or {}
+    oy = L.get("ortho_year"); ny = L.get("nir_year")
+    F["ortho_year"] = np.full(G.n, float(ofy.get(oy) or oy or np.nan))
+    F["nir_year"] = np.full(G.n, float(ofy.get(ny) or ny or np.nan))
     F["ortho_lidar_gap"] = F["ortho_year"] - F["dsm_year"]
+    F["nir_lidar_gap"] = F["nir_year"] - F["dsm_year"]
 
-    # hansen
+    # multi-year BEV NDVI (only real-NIR years)
+    ny_all = sorted((L.get("ndvi_years") or {}))
+    if ny_all:
+        v0 = G.mean(L["ndvi_years"][ny_all[0]], fill=np.nan); v1 = G.mean(L["ndvi_years"][ny_all[-1]], fill=np.nan)
+        F["ndvi_y_first"] = v0; F["ndvi_y_last"] = v1
+        fy = [ofy.get(y) or y for y in ny_all]
+        sp_y = float(fy[-1] - fy[0])
+        F["ndvi_years_span"] = np.full(G.n, sp_y)
+        F["ndvi_trend_per_year"] = (v1 - v0) / sp_y if sp_y >= 1 else np.full(G.n, np.nan)
+        if len(ny_all) >= 2:
+            st = np.stack([L["ndvi_years"][y] for y in ny_all])
+            with np.errstate(all="ignore"):
+                F["ndvi_tstd"] = G.mean(np.nanstd(st, 0), fill=np.nan)
+        else:
+            F["ndvi_tstd"] = np.full(G.n, np.nan)
+    else:
+        for k in ("ndvi_y_first", "ndvi_y_last", "ndvi_years_span", "ndvi_trend_per_year", "ndvi_tstd"):
+            F[k] = np.full(G.n, np.nan)
+    # tall & green vs tall & not green (tree vs roof/dead) — per-pixel product, segment mean
+    if "ndvi" in sp:
+        F["ndvi_ndsm_coherence"] = G.mean(np.clip(sp["ndvi"], 0, 1) * np.clip(ndsm, 0, 30), fill=np.nan)
+    else:
+        F["ndvi_ndsm_coherence"] = np.full(G.n, np.nan)
+
+    # hansen — "recent" anchored on the DSM flight year (loss since the LiDAR was flown),
+    # falling back to obs_year where the flight year is unknown
     hz = L["hansen"]
     if hz is not None:
         ly = hz["loss_year"].astype(np.int16)
-        rs, re_ = max(obs_year - 2000 - 5, 1), min(obs_year - 2000, 24)
+        re_ = min(obs_year - 2000, 24)
         F["hansen_treecover2000"] = G.mean(hz["treecover2000"].astype(np.float32))
         F["hansen_loss_frac"] = G.frac(ly > 0)
-        F["hansen_recent_loss_frac"] = G.frac((ly >= rs) & (ly <= re_))
-        F["hansen_loss_3yr_frac"] = G.frac((ly >= max(obs_year - 2002, 1)) & (ly <= re_))
+        F["hansen_recent_loss_frac"] = G.frac((ly >= max(obs_year - 2005, 1)) & (ly <= re_))
         F["hansen_gain_frac"] = G.frac(hz["gain"])
         F["hansen_current_forest_frac"] = G.frac(hz["current_forest"])
         F["hansen_lossyear_max"] = G.max(ly.astype(np.float32))
+        # per-pixel anchor: DSM flight year raster (0 = unknown → obs_year)
+        r = als.get(newest)
+        anchor = (r["dsm_year"].astype(np.int16) if r is not None else np.zeros(ly.shape, np.int16))
+        anchor = np.where(anchor > 0, anchor, obs_year) - 2000
+        F["hansen_loss_3yr_frac"] = G.frac((ly > 0) & (ly >= anchor - 3) & (ly <= re_))
     else:
         for k in ("hansen_treecover2000", "hansen_loss_frac", "hansen_recent_loss_frac", "hansen_loss_3yr_frac",
                   "hansen_gain_frac", "hansen_current_forest_frac", "hansen_lossyear_max"):

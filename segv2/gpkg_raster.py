@@ -61,8 +61,23 @@ class FullGpkg:
                 arr[arr <= NODATA + 1] = np.nan
         return arr[0] if arr.shape[0] == 1 else arr
 
+    def ortho_years(self) -> list[int]:
+        return self.years("Ortho")
+
+    def nir_years(self) -> list[int]:
+        """Years whose Ortho_YYYY 4th band is *real* NIR.
+
+        Writer contract (austria_processor ``_stitch_ortho_for_year``): the
+        4-band Ortho_YYYY + a CIR_YYYY layer are written together iff NIR was
+        fetched from a BEV RGBI operate. Without CIR_YYYY the 4th band is a
+        GDAL alpha plane (constant 255) — must never be used as NIR."""
+        return [y for y in self.years("Ortho") if f"CIR_{y}" in self.layers]
+
     def read_ortho(self, year: int | None = None, window: Window | None = None):
-        """(rgb (3,h,w) uint8, nir (h,w) uint8 | None, year). Newest year by default."""
+        """(rgb (3,h,w) uint8, nir (h,w) uint8 | None, year).
+
+        Newest year by default. ``nir`` is None unless the year carries a
+        CIR layer (see :meth:`nir_years`)."""
         ys = self.years("Ortho")
         if not ys:
             return None, None, None
@@ -73,11 +88,23 @@ class FullGpkg:
         if arr.ndim == 2:
             arr = arr[None]
         rgb = arr[:3]
-        nir = arr[3] if arr.shape[0] >= 4 else None
-        if nir is None and f"CIR_{y}" in self.layers:
-            cir = self.read(f"CIR_{y}", window)
-            nir = cir[0] if cir is not None and cir.ndim == 3 else None
+        nir = None
+        if f"CIR_{y}" in self.layers:
+            if arr.shape[0] >= 4:
+                nir = arr[3]
+            else:
+                cir = self.read(f"CIR_{y}", window)
+                nir = cir[0] if cir is not None and cir.ndim == 3 else None
         return rgb, nir, y
+
+    def read_ortho_stack(self, window: Window | None = None) -> dict[int, dict]:
+        """Every ortho year → {'rgb', 'nir' (or None)} for the window."""
+        out = {}
+        for y in self.years("Ortho"):
+            rgb, nir, _ = self.read_ortho(y, window)
+            if rgb is not None:
+                out[y] = {"rgb": rgb, "nir": nir}
+        return out
 
     def read_segment_type(self, window: Window | None = None) -> np.ndarray:
         """v1 segment_type codes (uint8).

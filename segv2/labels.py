@@ -118,6 +118,16 @@ MAX_NDVI = {"road": 0.30, "path": 0.35, "parking": 0.30, "rail": 0.35, "bare_soi
 # keep them low).  Same rule is applied segment-wise in train.py for parquets
 # built before this veto existed (MIN_NDVI_SEG).
 MIN_NDVI = {"grass": 0.15, "tree": 0.20, "shrub": 0.15, "hedge": 0.20, "orchard": 0.10, "wetland": 0.10}
+# NOTE: the thresholds above were first derived on a build whose "NIR" was an
+# alpha plane (see HANDOVER 2026-09-13). train.py re-derives them from the real
+# NDVI distribution (MIN_NDVI_SEG) — treat these as the label-time floor only.
+
+# Label sources are *current* (INVEKOS 2024, cadastre + OSM live) while the
+# LiDAR behind a KG may be 2006-2024.  Classes whose surface changes on a
+# few-year horizon get their weight decayed with DSM age:
+#   w *= 1 / (1 + AGE_DECAY[ty] * dsm_age_years)
+AGE_DECAY = {"orchard": 0.12, "garden": 0.08, "earthwork": 0.15, "shrub": 0.10, "hedge": 0.10,
+             "crop": 0.03, "vineyard": 0.05, "parking": 0.05, "road": 0.03, "roof": 0.05}
 
 # OSM highway fclass → (type, half-width m). Widths are *pavement* half widths;
 # the cadastre legal parcel covers the rest.
@@ -326,8 +336,13 @@ class LabelContext:
         # codes should NOT paint their nominal type
         self._osm_zone = self.road_polys + self.path_polys + self.rail_polys + self.water_polys
 
-    def rasterize(self, transform, shape_hw, ndsm: np.ndarray | None, ndvi: np.ndarray | None):
-        """Returns (label u8, source u8, weight f32) arrays for the window."""
+    def rasterize(self, transform, shape_hw, ndsm: np.ndarray | None, ndvi: np.ndarray | None,
+                  dsm_age: np.ndarray | None = None):
+        """Returns (label u8, source u8, weight f32) arrays for the window.
+
+        ``ndvi`` must be a *real* NIR-derived index (gpkg_raster.nir_years);
+        ``dsm_age`` (years, per pixel) decays the weight of time-sensitive
+        classes (AGE_DECAY)."""
         h, w = shape_hw
         label = np.zeros((h, w), np.uint8)
         source = np.zeros((h, w), np.uint8)
@@ -387,6 +402,11 @@ class LabelContext:
             for ty, mn in MIN_NDVI.items():
                 bad = (label == TYPE_ID[ty]) & (ndvi < mn)
                 label[bad] = 0
+        if dsm_age is not None:
+            age = np.clip(np.nan_to_num(dsm_age, nan=0.0), 0, 20).astype(np.float32)
+            for ty, k in AGE_DECAY.items():
+                m = label == TYPE_ID[ty]
+                weight[m] /= (1.0 + k * age[m])
         source[label == 0] = 0
         weight[label == 0] = 0
         return label, source, weight

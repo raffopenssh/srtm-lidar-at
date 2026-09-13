@@ -17,6 +17,7 @@ on the same pixels), ``centroid_e/n``.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import json
 import logging
 import random
@@ -102,6 +103,18 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
         kg_mask_full = rfeatures.rasterize([(p, 1) for p in ctx.cad["parcels"]], out_shape=g.shape,
                                            transform=g.transform, fill=0, dtype=np.uint8).astype(bool)
         meta["kg_cover_frac"] = round(float(kg_mask_full.mean()), 3)
+        # --- metadata gate: real NIR + resolvable flight blocks, else skip loudly ---
+        import acquisition as ACQ
+        acq = ACQ.audit_kg((b.left, b.bottom, b.right, b.top))
+        meta["acquisition"] = acq
+        meta["nir_years"] = g.nir_years()
+        meta["ortho_years"] = g.ortho_years()
+        if not g.nir_years():
+            meta["error"] = "no_real_nir"
+            return meta
+        if not acq["ok"]:
+            meta["error"] = "als_flight_blocks_unknown"
+            return meta
         v1_full = g.read_segment_type()
         frames = []
         tiles_done = tiles_skipped = 0
@@ -127,7 +140,14 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
             if df.empty:
                 continue
             ndvi = L["spectral"].get("ndvi") if L["spectral"] else None
-            lab, src, wgt = ctx.rasterize(tf, shp, L["ndsm"], ndvi)
+            assert ndvi is None or not np.all(np.nan_to_num(L["spectral"]["nir"], nan=255) >= 254), \
+                "NIR is a constant alpha plane — writer contract violated"
+            dsm_age = None
+            newest = max(L["als_years"]) if L.get("als_years") else None
+            if newest is not None:
+                yr = L["als_years"][newest]["dsm_year"].astype(np.float32)
+                dsm_age = np.where(yr > 0, obs_year - yr, np.nan).astype(np.float32)
+            lab, src, wgt = ctx.rasterize(tf, shp, L["ndsm"], ndvi, dsm_age=dsm_age)
             s = L2.summarize(lab, src)
             for k in ("by_type", "by_source"):
                 for kk, v in s[k].items():
@@ -162,6 +182,9 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
                      "n_good": int(((out["y"] != "") & (out["y_purity"] >= MIN_PURITY)).sum()),
                      "tiles_done": tiles_done, "tiles_skipped": tiles_skipped,
                      "labels": lab_summary, "ortho_year": int(out["ortho_year"].iloc[0]),
+                     "nir_year": int(out["nir_year"].iloc[0]),
+                     "dsm_year_median": float(out["dsm_year"].median()),
+                     "years_span_median": float(out["years_span"].median()),
                      "dtm_years": g.years("DTM"), "layers": sorted(g.raster_layers),
                      "seconds": round(time.time() - t0, 1)})
         (OUT_DIR / f"{code}.meta.json").write_text(json.dumps(meta))
@@ -254,7 +277,11 @@ def main():
     ap.add_argument("--v2-edges", action="store_true")
     ap.add_argument("--keep-gpkg", action="store_true")
     ap.add_argument("--skip-done", action="store_true", default=True)
+    ap.add_argument("--out", default="", help="output dir (default data/segv2/dataset)")
     args = ap.parse_args()
+    global OUT_DIR
+    if args.out:
+        OUT_DIR = pathlib.Path(args.out)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("rasterio").setLevel(logging.WARNING)
     codes = list(args.codes) or (pick_alpine(args.alpine, args.seed) if args.alpine else pick_codes(args.n, args.seed))

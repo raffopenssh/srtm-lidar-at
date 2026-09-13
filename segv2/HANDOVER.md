@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-12)
+# segv2 — handover (2026-09-13)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -8,16 +8,107 @@ This file is the *state + next steps* for whoever continues.
 | File | Status |
 |---|---|
 | `segv2/gpkg_fetch.py` | done. `fetch(code,'full_gpkg')` → `/tmp/segv2_gpkg/…` (8-stream range dl, ~4.6 MB/s), audit → `data/segv2/audit.jsonl` (md5/size vs manifest, integrity_check, layer inventory, per-raster fill). `release()` deletes. |
-| `segv2/gpkg_raster.py` | done. `FullGpkg`: reads DTM/DSM/nDSM/DTM_YYYY/DSM_YYYY (nodata→NaN), Ortho_YYYY RGB(+NIR), NDVI, WorldCover, SAR_VV/VH, Hansen_*; `read_segment_type()` decodes the v1 palette PNG tiles (edge tiles are RGBA → mapped via SEGMENT_COLORS). |
+| `segv2/gpkg_raster.py` | done. `FullGpkg`: reads DTM/DSM/nDSM/DTM_YYYY/DSM_YYYY (nodata→NaN), Ortho_YYYY RGB(+NIR **only if `CIR_YYYY` exists** — `nir_years()`, `read_ortho_stack()`), NDVI, WorldCover, SAR_VV/VH, Hansen_*; `read_segment_type()` decodes the v1 palette PNG tiles. |
+| `segv2/acquisition.py` | done (2026-09-13). Real flight dates: `als_year_rasters(tf, shape, mosaic_year)` per-pixel DSM/DTM flight year from BEV flight blocks (handles `DTM:2019, DSM:2009`, ranges, multi-block tiles); `ortho_flight_year(bounds, slot)` via operate id; `audit_kg(bounds)` gate. |
 | `segv2/labels.py` | done. v2 label stack (see README). `LabelContext(kg, bbox3035)` fetches cadastre (export/geojson, gzip), OSM (`/osm/geometry?cat=road,rail,water,water_area`), INVEKOS (local GPKG `data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg`, 4.5 GB, EPSG:31287, bbox-indexed reads ~0.1 s). `rasterize(tf, shape, ndsm, ndvi)` → (label u8, source u8, weight f32) with height/NDVI vetoes. Verified visually on KG 19570 (roads = OSM pavement, verges → grass, fields = INVEKOS). |
 | `segv2/features.py` | done. `pixel_layers()` (all layers from GPKG + harmonics from Zenodo tile cache, cache-only), `segment()` (v1 params; optional OSM hard edges), `extract()` → DataFrame with all 67 v1 `FEATURE_KEYS` + `V2_EXTRA_KEYS` (OSM distances, neighbour context, height distribution, NDWI/SAVI, flight-year gaps, per-year change). Vectorised (bincount/lexsort) — 1500² tile ≈ 5 s features, 11 s segmentation. |
-| `segv2/build_dataset.py` | done, **running in tmux session `segv2build`** (`--n 150 --seed 1`, stratified by size band + 1°×2° cell). Output `data/segv2/dataset/<code>.parquet` + `.meta.json`, progress in `data/segv2/build_log.jsonl`, stdout `data/segv2/build_stdout.log` (ends with `FINISHED`). ~3.5 min/KG. KG mask = cadastre parcel union; tiles < 2 % coverage skipped. Columns: features, `y` (v2 label mode), `y_purity`, `y_src`, `y_weight`, `v1_type` (deployed pipeline's answer on the same pixels), `kg`, `tile`, `centroid_e/n`. |
+| `segv2/build_dataset.py` | done; **rebuild running in tmux `segv2build`** (see audit section). Flags: `--n N` stratified, `--alpine N`, `--out DIR`, `--v2-edges`, `--keep-gpkg`. Output `data/segv2/dataset/<code>.parquet` + `.meta.json`, progress in `data/segv2/build_log.jsonl`, stdout `data/segv2/build_stdout.log` (ends with `FINISHED`). ~3.5 min/KG. KG mask = cadastre parcel union; tiles < 2 % coverage skipped. Columns: features, `y` (v2 label mode), `y_purity`, `y_src`, `y_weight`, `v1_type` (deployed pipeline's answer on the same pixels), `kg`, `tile`, `centroid_e/n`. |
 
 | `segv2/train.py` | done (2026-09-13). Models A (v1 RF), P (v1_type on Zenodo), B (RF relabelled), C (LGBM FEATURE_KEYS), D (LGBM ALL_KEYS), E (D + kNN-neighbour OOF proba). GroupKFold by parent kg, macro/weighted F1, per-class, ECE, confusion, README promotion check. Report is rewritten after every model → `data/segv2/report.md|json`. `--save-final D` → `data/segv2/models/model_D.joblib`. **Full run in tmux `segv2train`**, log `data/segv2/train_full.log`, ends with `FINISHED`. Quick smoke (20 %, 2 folds): A macro-F1 0.307 / acc 0.67, P 0.246 / 0.54, C 0.621 / 0.86, ECE 0.153→0.079. Classes <300 rows dropped in the quick run (earthwork/water/rail/bare_soil/wetland/path/greenhouse) — the full run keeps earthwork/water/rail/bare_soil. |
 
-Build finished: 143 KGs ok, 9 errors (6× `no_full_gpkg`, 2× `no_parcels`, 1 pre-pyarrow-install). 1.10 M segments, 559 k pass the filter.
+v1 build (invalid, see below): 143 KGs ok, 9 errors. 1.10 M segments, 559 k passed the filter.
 
-## Harness results (full run, 5-fold GroupKFold by parent KG, 559 k rows / 119 KGs, 15 classes)
+## ⚠ 2026-09-13 audit: dataset v1 was invalid — full rebuild running
+
+Two defects were found in the first build (`data/segv2/dataset_v1_fakenir/`,
+kept for reference; the harness numbers below are from it and are **not** to
+be quoted):
+
+1. **Fake NIR in 109/143 KGs.** The full GPKG writes `Ortho_YYYY` as 4-band
+   only when NIR was fetched; otherwise band 4 is a GDAL alpha plane (255).
+   `Ortho_2024` has no `CIR_2024` for ~75 % of Austria (BEV 20250415 RGBI
+   series covers ~7 operates), so `read_ortho()` took alpha as NIR → `nir_mean`
+   saturated at 255 in 99.97 % of those segments; `ndvi/ndwi/savi/nir_*` were
+   `(255−R)/(255+R)`. The segmentation's fused gradient (ndvi .20 + nir .15
+   weight) was affected too, so segment shapes differ from the deployed
+   pipeline's. Fix: `gpkg_raster.nir_years()` (contract: real NIR iff
+   `CIR_YYYY` exists), `read_ortho_stack()`; features use RGB from the newest
+   year and NIR/NDVI from the newest *real* NIR year (`nir_year` feature).
+   Every KG has real NIR from ≥1 year (`CIR_2020` in 148/148, `CIR_2023` 70,
+   `CIR_2024` 34); the builder now hard-fails on `no_real_nir` and asserts NIR
+   is not constant.
+2. **Time was not factored in — and was wrong.** GPKG layer names are mosaic
+   labels, not flight dates. From the vendored BEV flight blocks
+   (`als_acquisition.py`, all 8440 KGs resolve): **64 % of KGs have the same
+   flight in all three mosaics** → `h_change`, `dtm_change*`, `temporal_h_std`,
+   `stability` (top-20 features in model C!) were resampling noise ÷ a
+   fictitious 2-yr span; the other 36 % have real spans of 1–15 yr; 106 KGs
+   have `DTM:2019, DSM:2009` splits; 1747 KGs straddle flight blocks. Ortho
+   "2020" is the 2018–2021 series. Fix: `segv2/acquisition.py` paints
+   per-pixel DSM/DTM flight years per mosaic, resolves the ortho operate's
+   flight year; features: `dsm_year/dtm_year` real, `dsm_age = 2024 −
+   flight`, `dtm_dsm_split`, `years_span` real, change features **NaN when
+   span == 0** (LightGBM treats as missing), `_per_year` rates by real span,
+   `ortho_lidar_gap`/`nir_lidar_gap` real, Hansen 3-yr loss anchored on the
+   DSM flight year. New multi-year BEV spectral: `ndvi_y_first/last`,
+   `ndvi_trend_per_year`, `ndvi_tstd`, `ndvi_years_span`,
+   `ndvi_ndsm_coherence` (tall∧green).
+
+Smaller fixes in the same pass: nDSM = clip(DSM−DTM) where both valid (GPKG
+nDSM layer has ~7 % NaN holes); WorldCover 0/255 → NaN; label weights of
+time-sensitive classes decay with `dsm_age` (`labels.AGE_DECAY`, since
+INVEKOS 2024 / live cadastre+OSM label 2006–2024 pixels); builder writes an
+`acquisition` audit block per KG and skips `als_flight_blocks_unknown`.
+
+**Rebuild** (tmux `segv2build`, `data/segv2/build_stdout.log`, ends with
+`FINISHED`; per-KG lines in `data/segv2/build_log.jsonl`): the 143 old codes +
+30 alpine (`--alpine`, lowest building-density T/S/V/K parents for rock /
+bare_soil support) = 173 codes in `data/segv2/rebuild_codes.txt`. ~3.5 min/KG
+when Zenodo is healthy → **~10 h**; Zenodo has been returning 504 since
+~07:57 UTC and the fetcher backs off (12 tries, ≤5 min each per range), so
+add the outage length. Check: `grep -c "done:" data/segv2/build_stdout.log`.
+
+### After the build (next conversation)
+1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and
+   `train.MIN_NDVI_SEG/MAX_NDVI_SEG` were calibrated on the fake NDVI. Take
+   ~5th percentile per vegetation class / 95th per sealed class of
+   `ndvi_mean` on the new parquets, then run `train.py`.
+2. `python3 segv2/train.py --models A,B,C,D,F,P --save-final D --report-suffix _v2`
+   (~1 h). **F = D minus `dist_*`** is the honest recognition-only number for
+   road/rail/water/roof (dist features share geometry with those labels). Also
+   run a `harm_*`-free variant: harmonics exist for ~20 % of KGs only (58
+   Zenodo cells) and will be missing at inference for most of Austria — don't
+   ship a model that quietly leans on them.
+3. Sanity on the new features before believing any number: `dsm_age` should
+   vary 0–18 across KGs, `years_span` should be 0 for ~64 % of rows and NaN
+   change features exactly there, `nir_mean` never ≥ 254 in bulk.
+
+### Data completeness for the later fleet-wide v2 pass (all processed GPKGs)
+* **No fetch needed for training.** Everything used is in the GPKG or local
+  (INVEKOS gpkg, flight blocks, operate index) or Zenodo tile cache.
+* **Harmonics**: real gap (crop/grass/orchard/vineyard phenology) but fetching
+  = openEO credits via the director's credential pool; not for this stream.
+  Keep NaN; measure the price with the harm-free variant.
+* **ALS 2025 mosaic (20250915)** is NOT in the GPKGs (`DEFAULT_DATASET=20240915`).
+  **794 KGs get a strictly newer flight in 2025** (e.g. Stmk 2009→2024) —
+  a real two-date pair and a 15-yr-fresher DSM. Plan for the reprocessing
+  pass: if `als_acquisition.lookup(bbox,'20250915')` is newer than 2024,
+  read DTM/DSM 2025 from BEV and add `DTM_2025/DSM_2025`; features already
+  handle arbitrary years/spans.
+* **NIR fallback**: if a GPKG has no CIR layer at all, `ortho_io.read_ortho_for_als`
+  can fetch RGBI live from BEV (opt-in `--fetch-gaps`, not default).
+* **INVEKOS 2020 (or 2016) Schläge** from data.gv.at (~4 GB) would label
+  old-flight KGs with contemporaneous field polygons — cheapest lever against
+  the label-age problem for orchard/vineyard/crop. Second build.
+* **`als_meta` table in the v2 GPKG is a must**, not a nice-to-have: the
+  current GPKGs carry zero acquisition metadata; everything above was
+  recoverable only from repo-vendored overlays.
+* Hansen `gain` (2000–2012) not worth adding. S2/S1 predate no LiDAR flight
+  problem is unfixable by fetching (S2 from 2015); `dsm_age` carries it.
+
+## Harness results from the INVALID v1 dataset (reference only)
+
+5-fold GroupKFold by parent KG, 559 k rows / 119 KGs, 15 classes:
 
 | model | macro-F1 | weighted-F1 | acc | ECE |
 |---|---:|---:|---:|---:|
@@ -25,29 +116,20 @@ Build finished: 143 KGs ok, 9 errors (6× `no_full_gpkg`, 2× `no_parcels`, 1 pr
 | P v1 pipeline output (Zenodo `v1_type`) | 0.198 | 0.555 | 0.533 | — |
 | B RF, v2 labels, 66 feats | 0.514 | 0.827 | 0.814 | 0.062 |
 | C LGBM, 66 feats | 0.544 | 0.850 | 0.848 | 0.060 |
-| **D LGBM, ALL_KEYS (+context)** | **0.655** | **0.883** | **0.888** | **0.056** |
-| E D + kNN neighbour proba | see `data/segv2/report.md` | | | |
+| D LGBM, ALL_KEYS (+context) | 0.655 | 0.883 | 0.888 | 0.056 |
+| E D + kNN neighbour proba | 0.658 | 0.886 | 0.889 | 0.061 |
 
-All of B/C/D pass the README promotion rule (Δmacro-F1 ≥ +0.05, no key class −0.02, ECE ≤ v1).
-Per-class D: tree .999 roof .999 road .952 rail .947 water .910 grass .863 garden .830
-crop .810 parking .668 vineyard .603 rock .445 shrub .286 earthwork .240 orchard .236 bare_soil .032.
+Quick 2-fold on v1 data with the 08:00 train.py changes (NDVI veto, sqrt
+weights): D .661, **F (no dist_*) .605** — road .95→.56, garden .83→.76,
+parking .66→.53; everything else within noise. So ~0.05 macro-F1 of D is
+"agrees with OSM geometry". Rock/grass confusion root cause: all 14.6 k rock
+rows came from 7 KGs (17 k from one), and ~5 % of alpine "grass" labels sat
+on scree — hence the alpine picker + vegetation NDVI veto.
 
-Caveats to carry forward:
-* **OSM-derived distance features ≈ label geometry.** `dist_road/rail/water/building`
-  are computed from the same OSM/footprint polygons that produce the road/rail/water/roof
-  labels, so D's ~0.95+ on those classes mostly measures "agrees with OSM". Not leakage
-  at inference (OSM + cadastre are available for every KG), but the honest independent
-  signal is C's numbers for those classes. Consider an ablation `D-minus-dist` in the report
-  before claiming recognition quality; and keep OSM as an *input*, not only a label source.
-* Weak classes: bare_soil (332 rows), orchard, shrub, earthwork, rock (rock drops B .745 → D .445 —
-  context features hurt; likely INVEKOS/cadastre alpine-pasture vs rock confusion, check confusion
-  matrix). More KGs in the alpine size bands + a Hansen/NDVI-based earthwork source would help.
-* `B` (same RF as v1, only relabelled) already gains +0.27 macro-F1 → the label fix alone is
-  the bulk of the win; the model/feature change adds another +0.14.
-* Final D model saved by `--save-final D` → `data/segv2/models/model_D.joblib` + `.meta.json`
-  (feature_keys=ALL_KEYS, nan_to_zero=False, merge excavation/fill→earthwork, hedge→shrub).
-
-Not started: v2 segmentation eval, promotion/wiring.
+`train.py` state: models A,B,C,D,E,F,P; `--class-weight sqrt|balanced`
+(default sqrt — `balanced` gave bare_soil 700× tree's weight);
+`--report-suffix`; `--save-final` supports B/C/D/F; ECE, per-class F1,
+confusion, README promotion check. `data/segv2/models/` not yet written.
 
 ## Findings so far
 
@@ -74,7 +156,8 @@ Not started: v2 segmentation eval, promotion/wiring.
 ## Ops
 
 ```bash
-tmux attach -t segv2build                 # builder
+tmux attach -t segv2build                 # builder (rebuild, 173 codes)
+grep -c "done:" data/segv2/build_stdout.log; tail -2 data/segv2/build_stdout.log
 tail -f data/segv2/build_stdout.log | grep segv2.build
 python3 -c "import json;[print(json.loads(l).get('code'),json.loads(l).get('n_good'),json.loads(l).get('error')) for l in open('data/segv2/build_log.jsonl')]"
 python3 segv2/build_dataset.py 12105 --keep-gpkg    # single KG

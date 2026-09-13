@@ -1239,9 +1239,47 @@ def _gc_peer_state(state: dict, dead_ids: set) -> int:
     return dropped
 
 
+# Operator-set director mode (auto | manual | paused) lives in its own
+# sidecar and is authoritative over whatever `mode` a director_state.json
+# snapshot carries. Reason (2026-09-13 incident): /director/stop ran in
+# gunicorn worker A and wrote mode=paused via A's stale state copy; the
+# director loop in worker B only re-reads mode at tick START, and any of
+# its ~16 mid-tick save_director_state() calls wrote its in-memory
+# mode='auto' straight back — the pause silently undid itself and the
+# fleet restarted within minutes. Every save now re-stamps mode from
+# this file, and every mode gate reads it directly.
+DIRECTOR_MODE_FILE = DATA_DIR / 'director_mode.json'
+_VALID_MODES = ('auto', 'manual', 'paused')
+
+
+def read_director_mode(default: str = 'auto') -> str:
+    try:
+        m = (json.loads(DIRECTOR_MODE_FILE.read_text()) or {}).get('mode')
+        if m in _VALID_MODES:
+            return m
+    except Exception:
+        pass
+    return default
+
+
+def write_director_mode(mode: str):
+    if mode not in _VALID_MODES:
+        raise ValueError(f'bad mode {mode!r}')
+    DIRECTOR_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DIRECTOR_MODE_FILE.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps({
+        'mode': mode,
+        'set_at': datetime.now(timezone.utc).isoformat(),
+    }))
+    os.replace(tmp, DIRECTOR_MODE_FILE)
+
+
 def save_director_state(state: dict):
     DIRECTOR_STATE.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
+    # Authoritative operator intent wins over any worker's snapshot.
+    if DIRECTOR_MODE_FILE.exists():
+        state['mode'] = read_director_mode(state.get('mode', 'auto'))
     fd, tmp = tempfile.mkstemp(dir=DIRECTOR_STATE.parent, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w') as f:
@@ -2118,7 +2156,12 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
     If *cache_only* is True, the peer is started with the ``--cache-only``
     flag so it refuses any Copernicus/Hansen API call.  Use *queue_whitelist*
     to send only KGs known to be fully cached.
+
+    Hard gate: refuses while the operator has the director paused
+    (sidecar ``director_mode.json``), whatever orchestrator called us.
     """
+    if read_director_mode() == 'paused':
+        return {'error': 'director paused', 'skipped': True}
     payload = {}
     if cache_only:
         payload['cache_only'] = True
@@ -4176,9 +4219,12 @@ class PeerDirector:
             return None
 
     def set_mode(self, mode: str):
+        write_director_mode(mode)  # sidecar first: authoritative
         with self._lock:
             self.state['mode'] = mode
             save_director_state(self.state)
+        _emit_director_event(f'director mode → {mode}', peer='director',
+                             level='warning' if mode == 'paused' else 'info')
 
     def set_active_peer(self, peer_id: str | None):
         """Manually set the active peer (for manual mode)."""
@@ -7302,7 +7348,8 @@ class PeerDirector:
     def _check_and_switch(self):
         """Check if we need to switch the active peer."""
         with self._lock:
-            mode = self.state.get('mode', 'auto')
+            mode = read_director_mode(self.state.get('mode', 'auto'))
+            self.state['mode'] = mode
             if mode == 'paused':
                 return
             if mode == 'manual':
@@ -9587,7 +9634,8 @@ class PeerDirector:
           * peer lacks the ``cred_subset_env`` capability (graceful upgrade)
         """
         with self._lock:
-            mode = self.state.get('mode', 'auto')
+            mode = read_director_mode(self.state.get('mode', 'auto'))
+            self.state['mode'] = mode
             cfg = self.cfg.copy()
             state_copy = self.state.copy()
         if mode == 'paused':
@@ -10819,7 +10867,8 @@ class PeerDirector:
             so they free their slot.
         """
         with self._lock:
-            mode = self.state.get('mode', 'auto')
+            mode = read_director_mode(self.state.get('mode', 'auto'))
+            self.state['mode'] = mode
             cfg = self.cfg.copy()
             state_copy = self.state.copy()
         if mode == 'paused':

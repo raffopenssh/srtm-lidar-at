@@ -289,19 +289,28 @@ def main():
     tile_cache.set_forbid_remote(True)
     cc = tile_cache.CopernicusTileCache()
     log.info("building %d KGs", len(codes))
-    for code in codes:
-        if args.skip_done and (OUT_DIR / f"{code}.parquet").exists():
-            continue
-        # unattended-run guards: stop before we starve gunicorn/director on the primary
-        import shutil, gc
-        free_gb = shutil.disk_usage("/tmp").free / 1e9
-        if free_gb < 6:
-            log.error("only %.1f GB free on /tmp — stopping", free_gb)
+    import shutil, gc
+    for pass_no in range(2):   # pass 1: retry every code that errored (e.g. Zenodo 504 storm → no_full_gpkg)
+        failed = []
+        for code in codes:
+            if args.skip_done and (OUT_DIR / f"{code}.parquet").exists():
+                continue
+            # unattended-run guards: stop before we starve gunicorn/director on the primary
+            free_gb = shutil.disk_usage("/tmp").free / 1e9
+            if free_gb < 6:
+                log.error("only %.1f GB free on /tmp — stopping", free_gb)
+                break
+            meta = build_kg(code, keep_gpkg=args.keep_gpkg, v2_edges=args.v2_edges, cop_cache=cc)
+            meta["pass"] = pass_no
+            gc.collect()
+            with open(OUT_DIR.parent / "build_log.jsonl", "a") as f:
+                f.write(json.dumps(meta) + "\n")
+            if meta.get("error") and meta["error"] not in ("no_parcels", "no_tiles"):
+                failed.append(code)
+        if not failed:
             break
-        meta = build_kg(code, keep_gpkg=args.keep_gpkg, v2_edges=args.v2_edges, cop_cache=cc)
-        gc.collect()
-        with open(OUT_DIR.parent / "build_log.jsonl", "a") as f:
-            f.write(json.dumps(meta) + "\n")
+        log.warning("retry pass: %d KGs errored: %s", len(failed), " ".join(failed))
+        codes = failed
 
 
 if __name__ == "__main__":

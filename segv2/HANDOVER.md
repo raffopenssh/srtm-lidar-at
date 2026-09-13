@@ -68,6 +68,16 @@ when Zenodo is healthy → **~10 h**; Zenodo has been returning 504 since
 ~07:57 UTC and the fetcher backs off (12 tries, ≤5 min each per range), so
 add the outage length. Check: `grep -c "done:" data/segv2/build_stdout.log`.
 
+**Transient-failure retry** (added 14:05 UTC): `build_dataset.main()` now runs a
+second pass over every code whose meta had an `error` other than
+`no_parcels`/`no_tiles` (so a 504 storm exhausting the fetcher's 12 tries →
+`no_full_gpkg` is retried, not written off). The *currently running* build
+predates this, so tmux `segv2retry` (`segv2/retry_failed.sh`) waits for it to
+exit, then re-runs the errored codes from `build_log.jsonl` and appends
+`FINISHED_RETRY` to `build_stdout.log`. Wait for **that** marker before
+training. Zenodo was fully unreachable 12:34–≥14:05 UTC (34 KGs done at that
+point; 19713 and 22143 hit `no_full_gpkg` during the outage).
+
 ### After the build (next conversation)
 1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and
    `train.MIN_NDVI_SEG/MAX_NDVI_SEG` were calibrated on the fake NDVI. Take

@@ -86,7 +86,7 @@ def download(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
         a, b = i * chunk, min(size, (i + 1) * chunk) - 1
         if a > b:
             return 0
-        for attempt in range(4):
+        for attempt in range(12):   # Zenodo 504 storms last 10-30 min; back off up to 5 min/try
             try:
                 r = requests.get(url, headers={**_headers(), "Range": f"bytes={a}-{b}"},
                                  timeout=900, stream=True)
@@ -103,7 +103,7 @@ def download(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
                 return n
             except Exception as e:  # noqa: BLE001
                 log.warning("range %d attempt %d failed: %s", i, attempt, e)
-                time.sleep(2 * (attempt + 1))
+                time.sleep(min(300, 5 * 2 ** attempt))
         raise RuntimeError(f"range {i} failed")
 
     with cf.ThreadPoolExecutor(n_streams) as ex:

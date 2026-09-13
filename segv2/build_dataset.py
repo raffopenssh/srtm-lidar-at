@@ -212,10 +212,44 @@ def pick_codes(n: int, seed: int = 0, max_mb: int = 900, min_mb: int = 150) -> l
     return out
 
 
+def pick_alpine(n: int, seed: int = 0, max_mb: int = 3000, min_mb: int = 150) -> list[str]:
+    """Pick N codes from sparsely built, large KGs in the alpine states (proxy for
+    high elevation: kg_list has no terrain). One block per parent KG, parents
+    already in the dataset excluded. Used to lift rock / bare_soil / earthwork /
+    alpine-shrub support, which the size×cell stratification under-samples."""
+    m = gpkg_fetch._manifest()
+    kgl = {k["kg_code"]: k for k in json.load(open(ROOT / "data/austria_processor/kg_list.json"))}
+    done = {f.name.split(".")[0].split("-")[0] for f in OUT_DIR.glob("*.parquet")}
+    alpine = {"Tirol", "Salzburg", "Vorarlberg", "Kärnten"}
+    by_parent: dict[str, list] = {}
+    density: dict[str, float] = {}
+    for k, e in m.items():
+        if not k.endswith("_full_gpkg"):
+            continue
+        code = k[: -len("_full_gpkg")]
+        parent = code.split("-")[0]
+        if parent in done or f"{code}_json" not in m or not (min_mb <= e["size"] / 1e6 <= max_mb):
+            continue
+        kg = kgl.get(parent, {})
+        area_km2 = (kg.get("total_area_sqm") or 0) / 1e6
+        if area_km2 < 8 or kg.get("state_name") not in alpine:
+            continue
+        dens = (kg.get("building_count") or 0) / area_km2
+        if dens > 4:
+            continue
+        by_parent.setdefault(parent, []).append(code)
+        density[parent] = dens
+    rnd = random.Random(seed)
+    # lowest building density first (≈ highest / wildest terrain); random block per parent
+    parents = sorted(by_parent, key=lambda p: (density[p], p))
+    return [rnd.choice(by_parent[p]) for p in parents[:n]]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("codes", nargs="*")
     ap.add_argument("--n", type=int, default=0, help="pick N stratified codes")
+    ap.add_argument("--alpine", type=int, default=0, help="pick N sparse alpine-state codes (rock/bare_soil support)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--v2-edges", action="store_true")
     ap.add_argument("--keep-gpkg", action="store_true")
@@ -223,7 +257,7 @@ def main():
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("rasterio").setLevel(logging.WARNING)
-    codes = list(args.codes) or pick_codes(args.n, args.seed)
+    codes = list(args.codes) or (pick_alpine(args.alpine, args.seed) if args.alpine else pick_codes(args.n, args.seed))
     import tile_cache
     tile_cache.set_forbid_remote(True)
     cc = tile_cache.CopernicusTileCache()

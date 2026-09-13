@@ -42,6 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from learned_classifier import FEATURE_KEYS, _downsample  # noqa: E402
 from features import ALL_KEYS, V2_EXTRA_KEYS  # noqa: E402
+from labels import MIN_NDVI as MIN_NDVI_SEG  # noqa: E402  segment-level replay of the label veto
 
 log = logging.getLogger("segv2.train")
 
@@ -49,6 +50,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "data/segv2/dataset"
 OUT_DIR = ROOT / "data/segv2"
 MODEL_DIR = OUT_DIR / "models"
+REPORT_SUFFIX = ""
 V1_MODEL = ROOT / "data/best_model/rf_model.joblib"
 V1_META = ROOT / "data/best_model/rf_meta.json"
 
@@ -62,6 +64,11 @@ MERGE = {                    # applied to y, v1_type and v1-model predictions
     "hedge": "shrub",        # 280 rows in the 143-KG build → too thin alone
 }
 MAX_PER_CLASS_TRAIN = 0       # 0 = no cap (operator OK'd full machine use); --cap N to limit
+MAX_NDVI_SEG = {"earthwork": 0.45}  # cadastre 84 (Abbau/Halden/Deponie) that has re-greened is not earthwork
+CLASS_WEIGHT = "sqrt"        # "balanced" (LGBM built-in) or "sqrt" (tempered: w_c ∝ (n_max/n_c)^0.5)
+# ALL_KEYS minus the OSM/cadastre distance features — the honest "recognition
+# only" ablation (dist_* share geometry with the road/rail/water/roof labels).
+NODIST_KEYS = [k for k in ALL_KEYS if not k.startswith("dist_")]
 KEY_CLASSES = ["tree", "roof", "grass", "crop", "water", "road"]  # promotion rule
 PROMO_MACRO_F1_GAIN = 0.05
 PROMO_MAX_KEY_LOSS = 0.02
@@ -103,21 +110,37 @@ def load_dataset(quick: bool = False, seed: int = 0) -> pd.DataFrame:
 
 def select_labelled(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict]:
     m = (df["y"] != "") & (df["y_purity"] >= MIN_PURITY) & (df["kg_frac"] >= MIN_KG_FRAC)
-    lab = df[m].copy()
+    # replay labels.MIN_NDVI / MAX_NDVI_SEG on the segment mean BEV NDVI so parquets
+    # built before the veto existed get the same treatment (alpine "grass" on scree, ...)
+    vet = np.zeros(len(df), dtype=bool)
+    for ty, mn in MIN_NDVI_SEG.items():
+        vet |= (df["y"] == ty) & (df["ndvi_mean"] < mn)
+    for ty, mx in MAX_NDVI_SEG.items():
+        vet |= (df["y"] == ty) & (df["ndvi_mean"] > mx)
+    n_vet = int((m & vet).sum())
+    lab = df[m & ~vet].copy()
     counts = lab["y"].value_counts()
     keep = sorted(c for c, n in counts.items() if n >= MIN_CLASS_ROWS)
     dropped = {c: int(n) for c, n in counts.items() if n < MIN_CLASS_ROWS}
     lab = lab[lab["y"].isin(keep)].copy()
     lab["w"] = (lab["y_weight"].fillna(1.0) * lab["y_purity"]).astype(np.float32)
+    if CLASS_WEIGHT == "sqrt":
+        # tempered balancing: LGBM's "balanced" gives bare_soil (332) ~700× the weight of
+        # tree (232k) which wrecks calibration on the majority classes; sqrt keeps the
+        # ordering but caps the spread at ~26×.
+        cw = {c: float(np.sqrt(counts.max() / counts[c])) for c in keep}
+        lab["w"] = (lab["w"] * lab["y"].map(cw).astype(np.float32)).astype(np.float32)
     info = {
         "n_rows_all": int(len(df)), "n_rows_labelled": int(len(lab)),
         "classes": keep, "class_counts": {c: int(counts[c]) for c in keep},
         "dropped_classes": dropped, "merge": MERGE,
         "filter": {"min_purity": MIN_PURITY, "min_kg_frac": MIN_KG_FRAC, "min_class_rows": MIN_CLASS_ROWS},
         "n_parent_kgs": int(lab.kg_parent.nunique()),
+        "n_ndvi_vetoed": n_vet, "min_ndvi_seg": MIN_NDVI_SEG, "max_ndvi_seg": MAX_NDVI_SEG,
+        "class_weight": CLASS_WEIGHT,
         "label_sources": {k: int(v) for k, v in lab["y_src"].value_counts().items()},
     }
-    log.info("labelled rows: %d, classes: %s, dropped: %s", len(lab), keep, dropped)
+    log.info("labelled rows: %d (ndvi-vetoed %d), classes: %s, dropped: %s", len(lab), n_vet, keep, dropped)
     return lab, keep, info
 
 
@@ -204,7 +227,10 @@ def make_model(kind: str):
         from sklearn.ensemble import RandomForestClassifier
         return RandomForestClassifier(**RF_PARAMS)
     import lightgbm as lgb
-    return lgb.LGBMClassifier(**LGBM_PARAMS)
+    params = dict(LGBM_PARAMS)
+    if CLASS_WEIGHT == "sqrt":
+        params["class_weight"] = None   # tempered weights are already in sample_weight
+    return lgb.LGBMClassifier(**params)
 
 
 MODEL_SPECS = {
@@ -213,6 +239,7 @@ MODEL_SPECS = {
     "C": ("LGBM FEATURE_KEYS", FEATURE_KEYS, False),
     "D": ("LGBM ALL_KEYS (+context)", ALL_KEYS, False),
     "E": ("LGBM ALL_KEYS + neighbour OOF proba (kNN stacking)", ALL_KEYS, False),
+    "F": ("LGBM ALL_KEYS minus dist_* (no OSM-geometry features)", NODIST_KEYS, False),
     "P": ("v1 pipeline output on Zenodo (v1_type column)", [], True),
 }
 
@@ -287,13 +314,15 @@ def _fmt(x):
 
 def write_report(res: dict, info: dict, classes: list[str]):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "report.json").write_text(json.dumps({"info": info, "classes": classes, "models": res}, indent=1))
-    order = [m for m in "ABCDEP" if m in res]
+    (OUT_DIR / f"report{REPORT_SUFFIX}.json").write_text(json.dumps({"info": info, "classes": classes, "models": res}, indent=1))
+    order = [m for m in "ABCDEFP" if m in res]
     L = ["# segv2 harness report", "",
          f"generated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} · {info['n_rows_labelled']:,} labelled "
          f"segments from {info['n_parent_kgs']} parent KGs · {info.get('folds')}-fold GroupKFold by parent KG",
          "", f"Filter: purity ≥ {MIN_PURITY}, kg_frac ≥ {MIN_KG_FRAC}, class ≥ {MIN_CLASS_ROWS} rows. "
-         f"Merged: {MERGE}. Dropped: {info['dropped_classes']}. Train cap {MAX_PER_CLASS_TRAIN or 'none'}/class/fold.", ""]
+         f"Merged: {MERGE}. Dropped: {info['dropped_classes']}. Train cap {MAX_PER_CLASS_TRAIN or 'none'}/class/fold. "
+         f"Segment NDVI veto (min {info.get('min_ndvi_seg')}, max {info.get('max_ndvi_seg')}) removed {info.get('n_ndvi_vetoed', 0):,} rows. "
+         f"Class weighting: {info.get('class_weight')}.", ""]
     L += ["## Class counts", "", "| class | rows |", "|---|---:|"]
     L += [f"| {c} | {n:,} |" for c, n in sorted(info["class_counts"].items(), key=lambda t: -t[1])]
     L += ["", "## Summary", "", "| model | macro-F1 | weighted-F1 | acc | ECE | mean conf | Δ macro-F1 vs A |", "|---|---:|---:|---:|---:|---:|---:|"]
@@ -326,8 +355,8 @@ def write_report(res: dict, info: dict, classes: list[str]):
         L += ["Confusion (rows = truth, cols = pred):", "", "| | " + " | ".join(classes) + " |", "|---|" + "---:|" * len(classes)]
         for i, c in enumerate(classes):
             L.append(f"| **{c}** | " + " | ".join(str(v) for v in r["metrics"]["confusion"][i]) + " |")
-    (OUT_DIR / "report.md").write_text("\n".join(L) + "\n")
-    log.info("wrote %s and report.json", OUT_DIR / "report.md")
+    (OUT_DIR / f"report{REPORT_SUFFIX}.md").write_text("\n".join(L) + "\n")
+    log.info("wrote %s and report%s.json", OUT_DIR / f"report{REPORT_SUFFIX}.md", REPORT_SUFFIX)
 
 
 def promotion_check(res: dict, classes: list[str]) -> dict:
@@ -335,7 +364,7 @@ def promotion_check(res: dict, classes: list[str]) -> dict:
         return {}
     a = res["A"]["metrics"]
     out = {}
-    for m in ("B", "C", "D", "E"):
+    for m in ("B", "C", "D", "E", "F"):
         if m not in res:
             continue
         mt = res[m]["metrics"]
@@ -352,9 +381,11 @@ def promotion_check(res: dict, classes: list[str]) -> dict:
 # === SECTION: main ===
 
 def main():
-    global MAX_PER_CLASS_TRAIN
+    global MAX_PER_CLASS_TRAIN, CLASS_WEIGHT, REPORT_SUFFIX
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default="A,B,C,D,E,P")
+    ap.add_argument("--models", default="A,B,C,D,F,P")
+    ap.add_argument("--class-weight", default=CLASS_WEIGHT, choices=["balanced", "sqrt"])
+    ap.add_argument("--report-suffix", default="", help="write report<suffix>.md/json instead of report.md")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--quick", action="store_true", help="20%% row subsample")
     ap.add_argument("--seed", type=int, default=0)
@@ -362,6 +393,8 @@ def main():
     ap.add_argument("--cap", type=int, default=MAX_PER_CLASS_TRAIN)
     a = ap.parse_args()
     MAX_PER_CLASS_TRAIN = a.cap
+    CLASS_WEIGHT = a.class_weight
+    REPORT_SUFFIX = a.report_suffix
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("lightgbm").setLevel(logging.WARNING)
 
@@ -413,7 +446,7 @@ def main():
         write_report(res, info, classes)  # incremental — survives a kill mid-run
 
     for m in [s.strip().upper() for s in a.save_final.split(",") if s.strip()]:
-        if m not in ("B", "C", "D"):
+        if m not in ("B", "C", "D", "F"):
             log.warning("--save-final only supports B/C/D (E needs stage-1 at inference); skipping %s", m)
             continue
         import joblib
@@ -426,7 +459,8 @@ def main():
         joblib.dump(mdl, MODEL_DIR / f"model_{m}.joblib")
         (MODEL_DIR / f"model_{m}.meta.json").write_text(json.dumps({
             "model": m, "classes": list(map(str, mdl.classes_)), "feature_keys": keys, "nan_to_zero": nan0,
-            "n_train": int(len(idx)), "merge": MERGE, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "n_train": int(len(idx)), "merge": MERGE, "class_weight": CLASS_WEIGHT,
+            "min_ndvi_seg": MIN_NDVI_SEG, "max_ndvi_seg": MAX_NDVI_SEG, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cv_metrics": res.get(m, {}).get("metrics", {}).get("macro_f1"),
         }, indent=1))
         log.info("saved final %s → %s", m, MODEL_DIR / f"model_{m}.joblib")

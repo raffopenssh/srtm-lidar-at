@@ -110,6 +110,14 @@ MIN_H = {"roof": 2.0, "tree": 3.0}
 # NDVI vetoes — sealed surfaces must not be green (BEV ortho NDVI, 1 m)
 MAX_NDVI = {"road": 0.30, "path": 0.35, "parking": 0.30, "rail": 0.35, "bare_soil": 0.30,
             "roof": 0.35, "water": 0.20, "glacier": 0.15, "rock": 0.30}
+# Vegetation must be green. Alpine INVEKOS "Almfutterfläche" / cadastre 52
+# (Alpen) polygons legally cover scree, snow beds and bare ridges; without this
+# veto ~5 % of "grass" rows sit on bare rock (BEV NDVI < 0.15, elev > 1500 m) and
+# the model learns rock→grass.  Thresholds are the ~5th percentile of the BEV
+# ortho NDVI per class in the 143-KG build (leaf-off spring flights are real, so
+# keep them low).  Same rule is applied segment-wise in train.py for parquets
+# built before this veto existed (MIN_NDVI_SEG).
+MIN_NDVI = {"grass": 0.15, "tree": 0.20, "shrub": 0.15, "hedge": 0.20, "orchard": 0.10, "wetland": 0.10}
 
 # OSM highway fclass → (type, half-width m). Widths are *pavement* half widths;
 # the cadastre legal parcel covers the rest.
@@ -375,6 +383,9 @@ class LabelContext:
         if ndvi is not None:
             for ty, mx in MAX_NDVI.items():
                 bad = (label == TYPE_ID[ty]) & (ndvi > mx)
+                label[bad] = 0
+            for ty, mn in MIN_NDVI.items():
+                bad = (label == TYPE_ID[ty]) & (ndvi < mn)
                 label[bad] = 0
         source[label == 0] = 0
         weight[label == 0] = 0

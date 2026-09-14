@@ -187,6 +187,16 @@ Operator asked to pause all machinery so Zenodo can recover:
   45410, 57310-northeast, 86041-south will be re-picked from tile
   checkpoints when resumed).
 
+**Resumed 2026-09-14 05:19 UTC** (Zenodo 200 but slow, ~14 s; range requests still
+see intermittent 504s — fetch retries absorb them). Director `mode=auto`;
+re-queued 23 oracle-incomplete hole KGs at position 0 (incl. the 4 interrupted
+at stop); builder restarted in tmux `segv2build` (codes are positional, not
+`--codes`), previous stdout kept as `build_stdout_run2.log`.
+Note: at123 has been disk-full (1.5 GB free, untracked by diskstat) since
+09-11 — predates 9240086; it exits `Processing complete` immediately when
+activated, director then hands strips to other frontiers. at117 0 GB free
+(json/ 4.4 GB role data).
+
 **To resume** (once https://zenodo.org is healthy again):
 ```bash
 TOKEN=$(cat data/admin_token)

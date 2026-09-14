@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13)
+# segv2 — handover (2026-09-13, status 2026-09-14 18:42 UTC: 166/173 parquets, retry pass over 6 KGs running)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -66,7 +66,7 @@ INVEKOS 2024 / live cadastre+OSM label 2006–2024 pixels); builder writes an
 bare_soil support) = 173 codes in `data/segv2/rebuild_codes.txt`. ~3.5 min/KG
 when Zenodo is healthy → **~10 h**; Zenodo has been returning 504 since
 ~07:57 UTC and the fetcher backs off (12 tries, ≤5 min each per range), so
-add the outage length. Check: `grep -c "done:" data/segv2/build_stdout.log`.
+add the outage length. **Check progress with** `ls data/segv2/dataset/*.parquet | wc -l` (target 173) — NOT `grep -c done: build_stdout.log`: stdout is rotated on every restart (`build_stdout_run1.log` 34, `run2.log` 105, current run 27+), so the per-file count plateaus. Per-KG time on the alpine/large KGs is 7–14 min, not 3.5.
 
 **Transient-failure retry** (added 14:05 UTC): `build_dataset.main()` now runs a
 second pass over every code whose meta had an `error` other than

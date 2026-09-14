@@ -101,15 +101,29 @@ def ortho_flight_year(bounds_3035, mosaic_year: int) -> int | None:
     return int(ops[0][:4])
 
 
-def audit_kg(bounds_3035) -> dict:
-    """Metadata completeness for one KG bbox — used by build_dataset as a gate."""
+def audit_kg(bounds_3035, mask_geoms=None) -> dict:
+    """Metadata completeness for one KG bbox — used by build_dataset as a gate.
+
+    ``mask_geoms`` (e.g. the KG's cadastre parcels, EPSG:3035): when given,
+    ``known_frac`` is measured over those geometries instead of the bbox.
+    Border KGs (32001 Burgenland/HU, 86019 Tirol/DE, 66302 Stmk/SI, …) have
+    bboxes that are 25-55 %% foreign territory with no BEV flight block; the
+    parcels themselves are fully covered."""
     from rasterio.transform import from_bounds
     x0, y0, x1, y1 = bounds_3035
     tf = from_bounds(x0, y0, x1, y1, 200, 200)
-    rep = {}
+    sel = None
+    if mask_geoms:
+        sel = rfeatures.rasterize([(g, 1) for g in mask_geoms], out_shape=(200, 200), transform=tf,
+                                  fill=0, dtype="uint8", all_touched=True).astype(bool)
+        if not sel.any():
+            sel = None
+    rep = {"known_frac_over": "parcels" if sel is not None else "bbox"}
     for my in (2022, 2023, 2024):
         r = als_year_rasters(tf, (200, 200), my)
-        rep[f"als_{my}"] = {"known_frac": round(r["known_frac"], 3), "blocks": r["blocks"][:4]}
+        kf = float((r["dsm_year"][sel] > 0).mean()) if sel is not None else r["known_frac"]
+        rep[f"als_{my}"] = {"known_frac": round(kf, 3), "known_frac_bbox": round(r["known_frac"], 3),
+                            "blocks": r["blocks"][:4]}
     for oy in (2024, 2023, 2020):
         rep[f"ortho_{oy}"] = ortho_flight_year(bounds_3035, oy)
     rep["ok"] = all(rep[f"als_{my}"]["known_frac"] >= 0.95 for my in (2022, 2023, 2024))

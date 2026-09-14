@@ -105,7 +105,7 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
         meta["kg_cover_frac"] = round(float(kg_mask_full.mean()), 3)
         # --- metadata gate: real NIR + resolvable flight blocks, else skip loudly ---
         import acquisition as ACQ
-        acq = ACQ.audit_kg((b.left, b.bottom, b.right, b.top))
+        acq = ACQ.audit_kg((b.left, b.bottom, b.right, b.top), mask_geoms=ctx.cad["parcels"])
         meta["acquisition"] = acq
         meta["nir_years"] = g.nir_years()
         meta["ortho_years"] = g.ortho_years()
@@ -140,8 +140,14 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
             if df.empty:
                 continue
             ndvi = L["spectral"].get("ndvi") if L["spectral"] else None
-            assert ndvi is None or not np.all(np.nan_to_num(L["spectral"]["nir"], nan=255) >= 254), \
-                "NIR is a constant alpha plane — writer contract violated"
+            if ndvi is not None and np.all(np.nan_to_num(L["spectral"]["nir"], nan=255) >= 254):
+                # Saturated NIR is legitimate on snow/glacier tiles (73301 Dössen tile 3: RGB is
+                # ~255 too). An alpha plane masquerading as NIR has *varied* RGB under it.
+                rgb, _, _ = g.read_ortho(L.get("nir_year"), win)
+                rgb_sat = float(np.mean(rgb >= 240)) if rgb is not None else 0.0
+                assert rgb_sat >= 0.5, \
+                    f"NIR is a constant alpha plane (rgb_sat={rgb_sat:.2f}) — writer contract violated"
+                log.warning("KG %s tile %d: NIR saturated on a bright tile (snow?) rgb_sat=%.2f", code, ti, rgb_sat)
             dsm_age = None
             newest = max(L["als_years"]) if L.get("als_years") else None
             if newest is not None:

@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-15 05:40 UTC: 168/173 parquets; 72321 full GPKG is gone from Zenodo (skip), last 3 KGs re-running in tmux `segv2build` → expect 172)
+# segv2 — handover (2026-09-13, status 2026-09-15 06:05 UTC: **BUILD COMPLETE** — every buildable code has a parquet (only 72321 missing: full GPKG gone from Zenodo). Next: "After the build" steps below)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -106,7 +106,7 @@ stale `_full_gpkg` entry should be dropped from the manifest (then it shows
 as a `stalled` triple in `/process.txt?stall=`) or the KG re-queued with the
 recipe in AGENTS.md. Worth a sweep: HEAD every `*_full_gpkg` bucket URL to
 find other silent 404s.
-Final expected count: **172** parquets.
+Build finished 06:04 UTC — all codes except 72321 have parquets.
 **Caveat for training**: rows from such tiles have NaN `nir_*`/`ndvi_*`
 (same as harmonics-missing rows) — LightGBM handles it; RF models A/B need
 their existing NaN→0 fill.

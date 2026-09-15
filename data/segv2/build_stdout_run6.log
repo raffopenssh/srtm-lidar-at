@@ -1,0 +1,181 @@
+2026-09-15 05:04:37,714 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:04:37,714 INFO segv2.build: building 5 KGs
+2026-09-15 05:04:50,298 INFO segv2.labels: KG 87102 cadastre: 1153 footprints, 3938 landuse polys, 1150 parcels
+2026-09-15 05:04:50,825 INFO segv2.labels: KG 87102 osm: 29 road, 0 rail, 172 water lines, 3 water areas; invekos: 924
+2026-09-15 05:04:53,688 INFO object_segmentation: NDVI fusion: BEV mean=0.072, Cop mean=0.632, Fused mean=0.632, offset mean=0.559
+2026-09-15 05:04:53,882 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:05:04,730 INFO object_segmentation:   elevated layer: 62654 px → 754 segments
+2026-09-15 05:05:19,528 INFO object_segmentation:   ground layer: 465607 px → 476 segments
+2026-09-15 05:05:21,294 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:05:21,294 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:05:21,746 INFO texture_features: Computed texture for 1013 segments
+2026-09-15 05:05:22,536 INFO segv2.build: KG 87102-north tile 0: 1230 segments, labelled 92%
+2026-09-15 05:05:24,921 INFO object_segmentation: NDVI fusion: BEV mean=0.132, Cop mean=0.619, Fused mean=0.619, offset mean=0.485
+2026-09-15 05:05:25,153 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:05:30,681 INFO object_segmentation:   elevated layer: 988233 px → 3970 segments
+2026-09-15 05:05:35,842 INFO object_segmentation:   ground layer: 1138856 px → 1869 segments
+2026-09-15 05:05:42,270 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:05:42,270 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:05:44,419 INFO texture_features: Computed texture for 4884 segments
+2026-09-15 05:05:46,141 INFO segv2.build: KG 87102-north tile 5: 5839 segments, labelled 90%
+2026-09-15 05:05:48,593 INFO object_segmentation: NDVI fusion: BEV mean=0.032, Cop mean=0.426, Fused mean=0.426, offset mean=0.394
+2026-09-15 05:05:48,879 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:05:54,089 INFO object_segmentation:   elevated layer: 203958 px → 2429 segments
+2026-09-15 05:06:22,892 INFO object_segmentation:   ground layer: 982280 px → 1595 segments
+2026-09-15 05:06:26,789 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:06:26,789 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:06:28,232 INFO texture_features: Computed texture for 3147 segments
+2026-09-15 05:06:29,410 INFO segv2.build: KG 87102-north tile 6: 4024 segments, labelled 99%
+2026-09-15 05:06:31,727 INFO object_segmentation: NDVI fusion: BEV mean=0.065, Cop mean=0.552, Fused mean=0.552, offset mean=0.487
+2026-09-15 05:06:31,971 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:06:42,605 INFO object_segmentation:   elevated layer: 25320 px → 332 segments
+2026-09-15 05:07:13,454 INFO object_segmentation:   ground layer: 176053 px → 270 segments
+2026-09-15 05:07:14,202 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:07:14,202 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:07:14,423 INFO texture_features: Computed texture for 483 segments
+2026-09-15 05:07:14,996 INFO segv2.build: KG 87102-north tile 7: 602 segments, labelled 100%
+2026-09-15 05:07:17,276 INFO object_segmentation: NDVI fusion: BEV mean=0.249, Cop mean=0.796, Fused mean=0.796, offset mean=0.545
+2026-09-15 05:07:17,496 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:07:24,210 INFO object_segmentation:   elevated layer: 1581752 px → 3824 segments
+2026-09-15 05:07:31,534 INFO object_segmentation:   ground layer: 563844 px → 1403 segments
+2026-09-15 05:07:37,725 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:07:37,725 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:07:39,810 INFO texture_features: Computed texture for 4703 segments
+2026-09-15 05:07:41,607 INFO segv2.build: KG 87102-north tile 10: 5227 segments, labelled 80%
+2026-09-15 05:07:43,994 INFO object_segmentation: NDVI fusion: BEV mean=0.243, Cop mean=0.758, Fused mean=0.758, offset mean=0.513
+2026-09-15 05:07:44,249 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:07:50,215 INFO object_segmentation:   elevated layer: 1457138 px → 4348 segments
+2026-09-15 05:07:56,050 INFO object_segmentation:   ground layer: 746139 px → 1791 segments
+2026-09-15 05:08:02,667 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:08:02,667 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:08:05,109 INFO texture_features: Computed texture for 5426 segments
+2026-09-15 05:08:07,097 INFO segv2.build: KG 87102-north tile 11: 6139 segments, labelled 90%
+2026-09-15 05:08:09,494 INFO object_segmentation: NDVI fusion: BEV mean=0.100, Cop mean=0.530, Fused mean=0.530, offset mean=0.429
+2026-09-15 05:08:09,747 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:08:14,945 INFO object_segmentation:   elevated layer: 472604 px → 3038 segments
+2026-09-15 05:08:20,223 INFO object_segmentation:   ground layer: 1325695 px → 1578 segments
+2026-09-15 05:08:25,322 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:08:25,322 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:08:27,046 INFO texture_features: Computed texture for 3696 segments
+2026-09-15 05:08:28,534 INFO segv2.build: KG 87102-north tile 12: 4616 segments, labelled 98%
+2026-09-15 05:08:30,825 INFO object_segmentation: NDVI fusion: BEV mean=0.004, Cop mean=0.226, Fused mean=0.225, offset mean=0.222
+2026-09-15 05:08:31,063 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:08:31,101 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 05:08:37,824 INFO object_segmentation:   elevated layer: 112920 px → 1675 segments
+2026-09-15 05:08:59,156 INFO object_segmentation:   ground layer: 591070 px → 1062 segments
+2026-09-15 05:09:01,725 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 05:09:01,725 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 05:09:02,693 INFO texture_features: Computed texture for 2087 segments
+2026-09-15 05:09:03,584 INFO segv2.build: KG 87102-north tile 13: 2737 segments, labelled 99%
+2026-09-15 05:09:03,744 INFO object_segmentation: NDVI fusion: BEV mean=0.276, Cop mean=0.787, Fused mean=0.784, offset mean=0.507
+2026-09-15 05:09:03,778 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:09:03,830 INFO object_segmentation:   elevated layer: 4303 px → 64 segments
+2026-09-15 05:09:03,836 INFO object_segmentation:   ground layer: 1409 px → 22 segments
+2026-09-15 05:09:04,035 INFO texture_features: Using pre-loaded grey image for texture (1500x5)
+2026-09-15 05:09:04,035 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x5)
+2026-09-15 05:09:04,066 INFO texture_features: Computed texture for 76 segments
+2026-09-15 05:09:04,117 INFO segv2.build: KG 87102-north tile 15: 86 segments, labelled 88%
+2026-09-15 05:09:04,277 INFO object_segmentation: NDVI fusion: BEV mean=0.305, Cop mean=0.847, Fused mean=0.841, offset mean=0.519
+2026-09-15 05:09:04,311 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:09:04,360 INFO object_segmentation:   elevated layer: 473 px → 7 segments
+2026-09-15 05:09:04,374 INFO object_segmentation:   ground layer: 31 px → 1 segments
+2026-09-15 05:09:04,462 INFO texture_features: Using pre-loaded grey image for texture (1500x5)
+2026-09-15 05:09:04,462 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x5)
+2026-09-15 05:09:04,465 INFO texture_features: Computed texture for 7 segments
+2026-09-15 05:09:04,538 INFO segv2.build: KG 87102-north tile 16: 8 segments, labelled 100%
+2026-09-15 05:09:04,721 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 05:09:04,757 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 05:09:05,107 INFO object_segmentation:   ground layer: 560 px → 1 segments
+2026-09-15 05:09:05,200 INFO texture_features: Using pre-loaded grey image for texture (1500x5)
+2026-09-15 05:09:05,200 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x5)
+2026-09-15 05:09:05,201 INFO texture_features: Computed texture for 1 segments
+2026-09-15 05:09:05,284 INFO segv2.build: KG 87102-north tile 18: 1 segments, labelled 100%
+2026-09-15 05:09:05,489 INFO segv2.build: KG 87102-north done: 30509 segs, 27999 labelled (21502 good) in 268s
+2026-09-15 05:09:06,229 WARNING segv2.fetch: range 3 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,230 WARNING segv2.fetch: range 0 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,229 WARNING segv2.fetch: range 6 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,230 WARNING segv2.fetch: range 4 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,231 WARNING segv2.fetch: range 2 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,235 WARNING segv2.fetch: range 5 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,236 WARNING segv2.fetch: range 7 attempt 0 failed: HTTP 404
+2026-09-15 05:09:06,240 WARNING segv2.fetch: range 1 attempt 0 failed: HTTP 404
+2026-09-15 05:09:11,843 WARNING segv2.fetch: range 0 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,845 WARNING segv2.fetch: range 4 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,865 WARNING segv2.fetch: range 3 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,867 WARNING segv2.fetch: range 6 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,880 WARNING segv2.fetch: range 2 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,882 WARNING segv2.fetch: range 5 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,888 WARNING segv2.fetch: range 1 attempt 1 failed: HTTP 404
+2026-09-15 05:09:11,895 WARNING segv2.fetch: range 7 attempt 1 failed: HTTP 404
+2026-09-15 05:09:22,430 WARNING segv2.fetch: range 0 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,454 WARNING segv2.fetch: range 4 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,465 WARNING segv2.fetch: range 5 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,472 WARNING segv2.fetch: range 6 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,475 WARNING segv2.fetch: range 7 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,479 WARNING segv2.fetch: range 3 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,476 WARNING segv2.fetch: range 2 attempt 2 failed: HTTP 404
+2026-09-15 05:09:22,486 WARNING segv2.fetch: range 1 attempt 2 failed: HTTP 404
+2026-09-15 05:09:43,033 WARNING segv2.fetch: range 0 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,039 WARNING segv2.fetch: range 4 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,074 WARNING segv2.fetch: range 3 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,083 WARNING segv2.fetch: range 2 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,088 WARNING segv2.fetch: range 7 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,092 WARNING segv2.fetch: range 5 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,097 WARNING segv2.fetch: range 1 attempt 3 failed: HTTP 404
+2026-09-15 05:09:43,218 WARNING segv2.fetch: range 6 attempt 3 failed: HTTP 404
+2026-09-15 05:10:23,619 WARNING segv2.fetch: range 0 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,622 WARNING segv2.fetch: range 4 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,641 WARNING segv2.fetch: range 7 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,649 WARNING segv2.fetch: range 5 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,657 WARNING segv2.fetch: range 1 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,663 WARNING segv2.fetch: range 3 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,753 WARNING segv2.fetch: range 6 attempt 4 failed: HTTP 404
+2026-09-15 05:10:23,790 WARNING segv2.fetch: range 2 attempt 4 failed: HTTP 404
+2026-09-15 05:11:44,210 WARNING segv2.fetch: range 0 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,214 WARNING segv2.fetch: range 4 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,217 WARNING segv2.fetch: range 1 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,222 WARNING segv2.fetch: range 5 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,232 WARNING segv2.fetch: range 3 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,236 WARNING segv2.fetch: range 7 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,287 WARNING segv2.fetch: range 6 attempt 5 failed: HTTP 404
+2026-09-15 05:11:44,314 WARNING segv2.fetch: range 2 attempt 5 failed: HTTP 404
+2026-09-15 05:14:24,766 WARNING segv2.fetch: range 4 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,788 WARNING segv2.fetch: range 3 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,798 WARNING segv2.fetch: range 5 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,807 WARNING segv2.fetch: range 0 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,824 WARNING segv2.fetch: range 1 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,826 WARNING segv2.fetch: range 7 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,834 WARNING segv2.fetch: range 6 attempt 6 failed: HTTP 404
+2026-09-15 05:14:24,837 WARNING segv2.fetch: range 2 attempt 6 failed: HTTP 404
+2026-09-15 05:19:25,301 WARNING segv2.fetch: range 4 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,332 WARNING segv2.fetch: range 3 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,350 WARNING segv2.fetch: range 5 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,375 WARNING segv2.fetch: range 0 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,399 WARNING segv2.fetch: range 1 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,414 WARNING segv2.fetch: range 7 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,420 WARNING segv2.fetch: range 6 attempt 7 failed: HTTP 404
+2026-09-15 05:19:25,521 WARNING segv2.fetch: range 2 attempt 7 failed: HTTP 404
+2026-09-15 05:24:25,865 WARNING segv2.fetch: range 4 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,866 WARNING segv2.fetch: range 3 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,895 WARNING segv2.fetch: range 5 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,907 WARNING segv2.fetch: range 0 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,924 WARNING segv2.fetch: range 1 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,961 WARNING segv2.fetch: range 6 attempt 8 failed: HTTP 404
+2026-09-15 05:24:25,964 WARNING segv2.fetch: range 7 attempt 8 failed: HTTP 404
+2026-09-15 05:24:26,054 WARNING segv2.fetch: range 2 attempt 8 failed: HTTP 404
+2026-09-15 05:29:26,450 WARNING segv2.fetch: range 3 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,456 WARNING segv2.fetch: range 5 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,460 WARNING segv2.fetch: range 4 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,465 WARNING segv2.fetch: range 0 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,476 WARNING segv2.fetch: range 1 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,510 WARNING segv2.fetch: range 6 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,603 WARNING segv2.fetch: range 2 attempt 9 failed: HTTP 404
+2026-09-15 05:29:26,855 WARNING segv2.fetch: range 7 attempt 9 failed: HTTP 404
+2026-09-15 05:34:27,039 WARNING segv2.fetch: range 0 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,044 WARNING segv2.fetch: range 5 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,052 WARNING segv2.fetch: range 3 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,067 WARNING segv2.fetch: range 6 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,071 WARNING segv2.fetch: range 1 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,074 WARNING segv2.fetch: range 4 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,136 WARNING segv2.fetch: range 2 attempt 10 failed: HTTP 404
+2026-09-15 05:34:27,409 WARNING segv2.fetch: range 7 attempt 10 failed: HTTP 404

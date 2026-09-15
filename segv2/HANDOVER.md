@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-15 05:05 UTC: 167/173 parquets; two builder bugs fixed, last 5 KGs re-running in tmux `segv2build`)
+# segv2 — handover (2026-09-13, status 2026-09-15 05:40 UTC: 168/173 parquets; 72321 full GPKG is gone from Zenodo (skip), last 3 KGs re-running in tmux `segv2build` → expect 172)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -95,6 +95,18 @@ NDVI, NaN downstream); the builder check now looks at finite NIR pixels
 only and rgb_sat over covered pixels only. 73301-east verified (80 k segs,
 361 s). Remaining 5 re-running in tmux `segv2build` (`build_stdout.log`,
 ends `FINISHED`; older stdouts `build_stdout_run3..5.log`). Expect 173.
+**72321 cannot be built**: its manifest `72321_full_gpkg` points at depo
+20492929, which has **0 files** on Zenodo (404; `_json` 20543435 and
+`_light_gpkg` 20494960 are fine). The fetcher used to retry a 404 like a 504
+(12 tries × ≤5 min × 8 ranges ≈ 1 h wasted per pass); now 403/404/410 raise
+`FileNotFoundError` → builder meta `error: gpkg_gone`, excluded from the
+retry pass. **Fleet-side follow-up (not segv2)**: the coverage oracle only
+looks at `_json`, so 72321 is "complete" and will never be re-picked; the
+stale `_full_gpkg` entry should be dropped from the manifest (then it shows
+as a `stalled` triple in `/process.txt?stall=`) or the KG re-queued with the
+recipe in AGENTS.md. Worth a sweep: HEAD every `*_full_gpkg` bucket URL to
+find other silent 404s.
+Final expected count: **172** parquets.
 **Caveat for training**: rows from such tiles have NaN `nir_*`/`ndvi_*`
 (same as harmonics-missing rows) — LightGBM handles it; RF models A/B need
 their existing NaN→0 fill.

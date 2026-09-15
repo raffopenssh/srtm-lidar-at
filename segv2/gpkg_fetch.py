@@ -90,6 +90,10 @@ def download(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
             try:
                 r = requests.get(url, headers={**_headers(), "Range": f"bytes={a}-{b}"},
                                  timeout=900, stream=True)
+                if r.status_code in (403, 404, 410):
+                    # file gone from the bucket (e.g. 72321_full.gpkg: deposit 20492929
+                    # has 0 files) — retrying for an hour won't bring it back
+                    raise FileNotFoundError(f"HTTP {r.status_code}")
                 if r.status_code not in (200, 206):
                     raise RuntimeError(f"HTTP {r.status_code}")
                 n = 0
@@ -101,6 +105,8 @@ def download(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
                 if n != b - a + 1:
                     raise RuntimeError(f"short range {n} != {b-a+1}")
                 return n
+            except FileNotFoundError:
+                raise
             except Exception as e:  # noqa: BLE001
                 log.warning("range %d attempt %d failed: %s", i, attempt, e)
                 time.sleep(min(300, 5 * 2 ** attempt))
@@ -185,6 +191,10 @@ def fetch(kg_code: str, product: str = "full_gpkg", *, force: bool = False,
         except Exception as ex:  # noqa: BLE001
             rec["error"] = f"download: {ex}"
             _append_audit(rec)
+            if isinstance(ex, FileNotFoundError):
+                log.error("%s %s is GONE from Zenodo (%s) — manifest entry stale, depo %s",
+                          kg_code, product, ex, e.get("depo_id"))
+                raise
             return None
         rec["md5_ok"] = rec["md5"] == rec["manifest_md5"]
         rec["size_ok"] = rec["bytes"] == e["size"]

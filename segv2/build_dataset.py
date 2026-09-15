@@ -87,7 +87,11 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
     t0 = time.time()
     out_path = OUT_DIR / f"{code}.parquet"
     meta: dict = {"code": code, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    path = gpkg_fetch.fetch(code, "full_gpkg")
+    try:
+        path = gpkg_fetch.fetch(code, "full_gpkg")
+    except FileNotFoundError as ex:
+        meta["error"] = f"gpkg_gone: {ex}"      # permanent; not retried by the pass-2 loop
+        return meta
     if path is None:
         meta["error"] = "no_full_gpkg"
         return meta
@@ -314,7 +318,8 @@ def main():
             gc.collect()
             with open(OUT_DIR.parent / "build_log.jsonl", "a") as f:
                 f.write(json.dumps(meta) + "\n")
-            if meta.get("error") and meta["error"] not in ("no_parcels", "no_tiles"):
+            if meta.get("error") and meta["error"] not in ("no_parcels", "no_tiles") \
+                    and not str(meta["error"]).startswith("gpkg_gone"):
                 failed.append(code)
         if not failed:
             break

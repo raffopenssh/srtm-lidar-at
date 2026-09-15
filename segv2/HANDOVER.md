@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-15 06:05 UTC: **BUILD COMPLETE** — every buildable code has a parquet (only 72321 missing: full GPKG gone from Zenodo). Next: "After the build" steps below)
+# segv2 — handover (2026-09-13, status 2026-09-15 07:30 UTC: build complete (171 parquets; 72321 unbuildable), NDVI vetoes re-derived, **full train running** in tmux `segv2train` → `data/segv2/report_v2.md`)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -110,6 +110,48 @@ Build finished 06:04 UTC — all codes except 72321 have parquets.
 **Caveat for training**: rows from such tiles have NaN `nir_*`/`ndvi_*`
 (same as harmonics-missing rows) — LightGBM handles it; RF models A/B need
 their existing NaN→0 fill.
+
+### 2026-09-15 07:30 UTC — NDVI vetoes re-derived, full train running
+* **Real NDVI distribution** (1.29 M labelled segments, purity ≥ .6): veg classes
+  are left-truncated by the label-time floor but tail *off* into it (grass
+  q05 .17 / median .28; tree q05 .24 / .38; shrub q05 .19 / .35; orchard q05
+  .13 / .32); sealed classes: rock q95 .21 (q99 .26 — alpine grass in "rock"
+  parcels), roof q95 .11, road .19, parking .20, water .15, glacier −.05,
+  bare_soil .25, earthwork q95 .40. `labels.MIN_NDVI` left unchanged (no
+  rebuild needed). **`train.py` now derives the segment veto from the data**
+  (`derive_ndvi_vetoes`: veg q05 floors clamped ≥ label floor, sealed q95
+  ceilings; `--ndvi-veto derived|fixed|none`; values + per-class stats land in
+  `report*.json → info.min/max_ndvi_seg / ndvi_veto_stats` and in the model
+  meta). Removes 53 k rows (rock 17.8 k, grass 15.8 k, tree 12.4 k, …).
+* **NIR-less tiles wrote zeros, not NaN** (features.py `_m` fallback):
+  17.7 k labelled rows (57004-west, 16108) had `ndvi_mean=nir_mean=0` and
+  would have been vetoed as "grass below 0.17". `load_dataset` now NaNs the
+  BEV-NIR features (`train.NIR_KEYS`) where `nir_mean==ndvi_mean==0`.
+* **Memory**: 2.66 M rows × 128 float64 OOM-killed the 7 GB primary. Loader now
+  float32 + drops unlabelled / low-purity rows per file (1.29 M rows, ~1 GB);
+  `del df` after `select_labelled`; RF (model B) gets `max_samples=300k`.
+* Sanity per step 3 below, checked: `nir_mean ≥ 254` in 0.000 % of rows;
+  `dsm_age` 1–17 (median 5); `years_span==0` in 62.4 % of rows with
+  `h_change` NaN exactly there (100 % / 0.1 %).
+* **Run**: tmux `segv2train` → `data/segv2/train_v2.log` (ends `FINISHED`),
+  `--models A,B,C,D,F,P --save-final D --report-suffix _v2`. Model A on the
+  real data: macro-F1 **0.220**, acc 0.50 (v1 deployed RF). Report is rewritten
+  after every model: `data/segv2/report_v2.md`.
+* **INVEKOS API wired** (`labels.fetch_invekos_api`, API-first, local 2024-1
+  GPKG fallback): `https://farm-subsidies-austria.exe.xyz/api/v1/invekos/…`
+  implements `INVEKOS_API_SPEC.md` — `/years` (2022–2026, stored EPSG:3035,
+  7850 KGs, cross-year geometry dedup), `/schlaege?bbox=&nearest_to=<flight
+  year>` (`X-Invekos-Year` header; verified 67 polys for 19570 vs 68 from the
+  local GPKG, ~0.7 s cold / 50 ms cached), `/kg/<code>`, `/stats`, `/snar_codes`,
+  `/hofstellen?kg=`, `/changes?kg=&from=&to=` (adjacent years only), and
+  **`/toponyms?kg=|bbox=[&layer=ried]`** (BEV DLM-Namen 2025-03-25: Riednamen,
+  Siedlungsnamen … as points with kg/gemeinde codes). `build_dataset` passes
+  `acquisition.dsm_flight_year(bbox)` as `nearest_to`, so a 2009-flight KG now
+  gets 2022 fields instead of 2024 (still 13 yr off — earlier years are not
+  on data.gv.at). **The current parquets were built from the local 2024-1
+  GPKG**; the API path applies from the next build. Toponyms are not used yet
+  — candidate weak features/labels (Ried names such as "Weingarten"/"Au"/
+  "Moos" → vineyard/riparian/wetland priors) for a later build.
 
 ### After the build (next conversation)
 1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and

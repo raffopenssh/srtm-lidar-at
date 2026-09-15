@@ -42,7 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from learned_classifier import FEATURE_KEYS, _downsample  # noqa: E402
 from features import ALL_KEYS, V2_EXTRA_KEYS  # noqa: E402
-from labels import MIN_NDVI as MIN_NDVI_SEG  # noqa: E402  segment-level replay of the label veto
+from labels import MIN_NDVI as LABEL_MIN_NDVI  # noqa: E402  label-time (pixel) floor — segment veto is derived from data
 
 log = logging.getLogger("segv2.train")
 
@@ -64,7 +64,31 @@ MERGE = {                    # applied to y, v1_type and v1-model predictions
     "hedge": "shrub",        # 280 rows in the 143-KG build → too thin alone
 }
 MAX_PER_CLASS_TRAIN = 0       # 0 = no cap (operator OK'd full machine use); --cap N to limit
-MAX_NDVI_SEG = {"earthwork": 0.45}  # cadastre 84 (Abbau/Halden/Deponie) that has re-greened is not earthwork
+# --- segment-level NDVI veto -----------------------------------------------------
+# Derived at train time from the *real* BEV-NIR distribution of the parquets
+# (`derive_ndvi_vetoes`), replacing the hand-set values that were calibrated on
+# the fake-NIR build (HANDOVER 2026-09-13).  Rule: vegetation classes lose their
+# lowest VETO_VEG_Q quantile of `ndvi_mean` (floored at the label-time pixel veto
+# labels.MIN_NDVI — the parquet distribution is already left-truncated there, so
+# the quantile is an upper-tail-of-noise trim, not a mode cut); sealed / bare
+# classes lose their top VETO_SEALED_Q quantile (roof/road/rock labelled on
+# canopy overhang, re-greened cadastre-84 spoil, alpine grass in "rock" parcels).
+# Rows with no real NIR (NaN ndvi_mean) are exempt.  --ndvi-veto fixed|derived|none.
+VETO_VEG = ["grass", "tree", "shrub", "orchard", "wetland"]
+VETO_SEALED = ["roof", "road", "parking", "rail", "water", "rock", "glacier", "bare_soil", "earthwork"]
+VETO_VEG_Q = 0.05
+VETO_SEALED_Q = 0.95
+NDVI_VETO_MODE = "derived"
+# 2026-09-15 values derived from the 171-KG real-NIR build (1.29 M labelled segments);
+# used verbatim when --ndvi-veto fixed, and as the fallback for classes too thin to derive.
+MIN_NDVI_SEG = {"grass": 0.17, "tree": 0.24, "shrub": 0.19, "orchard": 0.13, "wetland": 0.12}
+MAX_NDVI_SEG = {"roof": 0.11, "road": 0.19, "parking": 0.20, "rail": 0.14, "water": 0.15,
+                "rock": 0.21, "glacier": -0.05, "bare_soil": 0.25, "earthwork": 0.40}
+# BEV-NIR-derived features that are 0 (not NaN) in tiles without a real NIR year
+# (features.py `_m` fallback).  Turned into NaN at load so GBMs see "missing" and
+# the veto does not fire on them.
+NIR_KEYS = ["ndvi_mean", "ndvi_std", "ndvi_max", "ndvi_p10", "ndvi_p90", "nir_mean", "nir_std",
+            "nir_brightness_ratio", "nir_red_ratio", "ndwi_mean", "savi_mean", "ndvi_ndsm_coherence"]
 CLASS_WEIGHT = "sqrt"        # "balanced" (LGBM built-in) or "sqrt" (tempered: w_c ∝ (n_max/n_c)^0.5)
 # ALL_KEYS minus the OSM/cadastre distance features — the honest "recognition
 # only" ablation (dist_* share geometry with the road/rail/water/roof labels).
@@ -79,7 +103,8 @@ LGBM_PARAMS = dict(
     class_weight="balanced", n_jobs=2, verbose=-1, random_state=42, max_bin=127,
 )
 RF_PARAMS = dict(n_estimators=200, max_depth=20, min_samples_leaf=5,
-                 class_weight="balanced", n_jobs=2, random_state=42)
+                 class_weight="balanced", n_jobs=2, random_state=42,
+                 max_samples=300_000)  # memory guard: 1.2 M-row folds × 200 depth-20 trees would exceed 7 GB
 KNN_K = 8
 
 
@@ -90,11 +115,20 @@ def load_dataset(quick: bool = False, seed: int = 0) -> pd.DataFrame:
     if not files:
         raise SystemExit(f"no parquet files under {DATASET_DIR}")
     parts = []
+    n_all = 0
     for f in files:
         d = pd.read_parquet(f)
+        n_all += len(d)
+        # memory: 2.7 M rows × 128 float64 cols OOMs a 7 GB box → float32 + drop
+        # unlabelled rows here (they are never used downstream; n_rows_all keeps the count)
+        d = d[(d["y"].fillna("") != "") & (d["y_purity"] >= MIN_PURITY) & (d["kg_frac"] >= MIN_KG_FRAC)]
+        fcols = d.select_dtypes(include="float64").columns
+        d = d.astype({c: np.float32 for c in fcols})
         if len(d):
             parts.append(d)
     df = pd.concat(parts, ignore_index=True)
+    del parts
+    df.attrs["n_rows_all"] = n_all
     df["kg_parent"] = df["kg"].astype(str).str.split("-").str[0]
     df["y"] = df["y"].fillna("").replace(MERGE)
     df["v1_type"] = df["v1_type"].fillna("").replace(MERGE)
@@ -102,22 +136,58 @@ def load_dataset(quick: bool = False, seed: int = 0) -> pd.DataFrame:
     hk = [k for k in ALL_KEYS if k.startswith("harm_")]
     miss = (df[hk].abs().sum(axis=1) == 0)
     df.loc[miss, hk] = np.nan
+    # no real NIR in the tile → features.py wrote zeros; make them missing
+    nk = [k for k in NIR_KEYS if k in df.columns]
+    nomir = (df["nir_mean"] == 0) & (df["ndvi_mean"] == 0)
+    df.loc[nomir, nk] = np.nan
+    log.info("rows without real NIR (BEV-NIR features → NaN): %d", int(nomir.sum()))
     if quick:
         df = df.sample(frac=0.2, random_state=seed).reset_index(drop=True)
-    log.info("loaded %d rows from %d files (%d parent KGs)", len(df), len(files), df.kg_parent.nunique())
+    log.info("loaded %d labelled rows (of %d) from %d files (%d parent KGs)", len(df), n_all, len(files), df.kg_parent.nunique())
     return df
+
+
+def derive_ndvi_vetoes(df: pd.DataFrame, m: np.ndarray) -> tuple[dict, dict, dict]:
+    """Per-class quantiles of segment-mean BEV NDVI on the filtered labelled rows.
+
+    Returns (min_by_class, max_by_class, stats).  Vegetation floors are clamped to
+    ≥ labels.MIN_NDVI (label-time pixel veto), everything rounded to 0.01; classes
+    with < MIN_CLASS_ROWS finite rows fall back to the fixed table."""
+    mn, mx, st = {}, {}, {}
+    for ty in VETO_VEG + VETO_SEALED:
+        s = df.loc[m & (df["y"] == ty), "ndvi_mean"].dropna()
+        st[ty] = {"n": int(len(s))}
+        if len(s) < MIN_CLASS_ROWS:
+            if ty in MIN_NDVI_SEG: mn[ty] = MIN_NDVI_SEG[ty]
+            if ty in MAX_NDVI_SEG: mx[ty] = MAX_NDVI_SEG[ty]
+            st[ty]["fallback"] = True
+            continue
+        q = s.quantile([0.01, 0.05, 0.5, 0.95, 0.99])
+        st[ty].update({f"q{int(k*100):02d}": round(float(v), 3) for k, v in q.items()})
+        if ty in VETO_VEG:
+            mn[ty] = round(max(float(s.quantile(VETO_VEG_Q)), LABEL_MIN_NDVI.get(ty, -1.0)), 2)
+        else:
+            mx[ty] = round(float(s.quantile(VETO_SEALED_Q)), 2)
+    return mn, mx, st
 
 
 def select_labelled(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict]:
     m = (df["y"] != "") & (df["y_purity"] >= MIN_PURITY) & (df["kg_frac"] >= MIN_KG_FRAC)
-    # replay labels.MIN_NDVI / MAX_NDVI_SEG on the segment mean BEV NDVI so parquets
-    # built before the veto existed get the same treatment (alpine "grass" on scree, ...)
+    # segment-level NDVI veto (label-noise trim) on the real BEV NDVI; NaN → exempt
+    if NDVI_VETO_MODE == "derived":
+        vmin, vmax, vstats = derive_ndvi_vetoes(df, m)
+    elif NDVI_VETO_MODE == "fixed":
+        vmin, vmax, vstats = dict(MIN_NDVI_SEG), dict(MAX_NDVI_SEG), {}
+    else:
+        vmin, vmax, vstats = {}, {}, {}
     vet = np.zeros(len(df), dtype=bool)
-    for ty, mn in MIN_NDVI_SEG.items():
-        vet |= (df["y"] == ty) & (df["ndvi_mean"] < mn)
-    for ty, mx in MAX_NDVI_SEG.items():
-        vet |= (df["y"] == ty) & (df["ndvi_mean"] > mx)
+    for ty, v in vmin.items():
+        vet |= (df["y"] == ty) & (df["ndvi_mean"] < v)
+    for ty, v in vmax.items():
+        vet |= (df["y"] == ty) & (df["ndvi_mean"] > v)
     n_vet = int((m & vet).sum())
+    vet_by = {c: int(n) for c, n in df.loc[m & vet, "y"].value_counts().items()}
+    log.info("ndvi veto (%s): min=%s max=%s → removed %d rows %s", NDVI_VETO_MODE, vmin, vmax, n_vet, vet_by)
     lab = df[m & ~vet].copy()
     counts = lab["y"].value_counts()
     keep = sorted(c for c, n in counts.items() if n >= MIN_CLASS_ROWS)
@@ -131,12 +201,14 @@ def select_labelled(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict]:
         cw = {c: float(np.sqrt(counts.max() / counts[c])) for c in keep}
         lab["w"] = (lab["w"] * lab["y"].map(cw).astype(np.float32)).astype(np.float32)
     info = {
-        "n_rows_all": int(len(df)), "n_rows_labelled": int(len(lab)),
+        "n_rows_all": int(df.attrs.get("n_rows_all", len(df))), "n_rows_labelled": int(len(lab)),
         "classes": keep, "class_counts": {c: int(counts[c]) for c in keep},
         "dropped_classes": dropped, "merge": MERGE,
         "filter": {"min_purity": MIN_PURITY, "min_kg_frac": MIN_KG_FRAC, "min_class_rows": MIN_CLASS_ROWS},
         "n_parent_kgs": int(lab.kg_parent.nunique()),
-        "n_ndvi_vetoed": n_vet, "min_ndvi_seg": MIN_NDVI_SEG, "max_ndvi_seg": MAX_NDVI_SEG,
+        "n_ndvi_vetoed": n_vet, "ndvi_vetoed_by_class": vet_by, "ndvi_veto_mode": NDVI_VETO_MODE,
+        "min_ndvi_seg": vmin, "max_ndvi_seg": vmax, "ndvi_veto_stats": vstats,
+        "label_min_ndvi": LABEL_MIN_NDVI,
         "class_weight": CLASS_WEIGHT,
         "label_sources": {k: int(v) for k, v in lab["y_src"].value_counts().items()},
     }
@@ -321,7 +393,8 @@ def write_report(res: dict, info: dict, classes: list[str]):
          f"segments from {info['n_parent_kgs']} parent KGs · {info.get('folds')}-fold GroupKFold by parent KG",
          "", f"Filter: purity ≥ {MIN_PURITY}, kg_frac ≥ {MIN_KG_FRAC}, class ≥ {MIN_CLASS_ROWS} rows. "
          f"Merged: {MERGE}. Dropped: {info['dropped_classes']}. Train cap {MAX_PER_CLASS_TRAIN or 'none'}/class/fold. "
-         f"Segment NDVI veto (min {info.get('min_ndvi_seg')}, max {info.get('max_ndvi_seg')}) removed {info.get('n_ndvi_vetoed', 0):,} rows. "
+         f"Segment NDVI veto ({info.get('ndvi_veto_mode')}; min {info.get('min_ndvi_seg')}, max {info.get('max_ndvi_seg')}) "
+         f"removed {info.get('n_ndvi_vetoed', 0):,} rows {info.get('ndvi_vetoed_by_class')}. "
          f"Class weighting: {info.get('class_weight')}.", ""]
     L += ["## Class counts", "", "| class | rows |", "|---|---:|"]
     L += [f"| {c} | {n:,} |" for c, n in sorted(info["class_counts"].items(), key=lambda t: -t[1])]
@@ -381,7 +454,7 @@ def promotion_check(res: dict, classes: list[str]) -> dict:
 # === SECTION: main ===
 
 def main():
-    global MAX_PER_CLASS_TRAIN, CLASS_WEIGHT, REPORT_SUFFIX
+    global MAX_PER_CLASS_TRAIN, CLASS_WEIGHT, REPORT_SUFFIX, NDVI_VETO_MODE
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="A,B,C,D,F,P")
     ap.add_argument("--class-weight", default=CLASS_WEIGHT, choices=["balanced", "sqrt"])
@@ -391,8 +464,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-final", default="", help="model letter(s) to refit on all rows → data/segv2/models/")
     ap.add_argument("--cap", type=int, default=MAX_PER_CLASS_TRAIN)
+    ap.add_argument("--ndvi-veto", default=NDVI_VETO_MODE, choices=["derived", "fixed", "none"],
+                    help="segment NDVI veto: derived from the data (default), the fixed table, or off")
     a = ap.parse_args()
     MAX_PER_CLASS_TRAIN = a.cap
+    NDVI_VETO_MODE = a.ndvi_veto
     CLASS_WEIGHT = a.class_weight
     REPORT_SUFFIX = a.report_suffix
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -400,6 +476,8 @@ def main():
 
     df = load_dataset(a.quick, a.seed)
     lab, classes, info = select_labelled(df)
+    del df  # ~1 GB; only `lab` is used from here on
+    import gc; gc.collect()
     info["folds"] = a.folds
     y = lab["y"].to_numpy()
     w = lab["w"].to_numpy()
@@ -460,7 +538,7 @@ def main():
         (MODEL_DIR / f"model_{m}.meta.json").write_text(json.dumps({
             "model": m, "classes": list(map(str, mdl.classes_)), "feature_keys": keys, "nan_to_zero": nan0,
             "n_train": int(len(idx)), "merge": MERGE, "class_weight": CLASS_WEIGHT,
-            "min_ndvi_seg": MIN_NDVI_SEG, "max_ndvi_seg": MAX_NDVI_SEG, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ndvi_veto_mode": NDVI_VETO_MODE, "min_ndvi_seg": info["min_ndvi_seg"], "max_ndvi_seg": info["max_ndvi_seg"], "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cv_metrics": res.get(m, {}).get("metrics", {}).get("macro_f1"),
         }, indent=1))
         log.info("saved final %s → %s", m, MODEL_DIR / f"model_{m}.joblib")

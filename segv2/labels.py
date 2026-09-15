@@ -26,6 +26,7 @@ EPSG:31287). No BEV / openEO traffic.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -41,6 +42,10 @@ log = logging.getLogger("segv2.labels")
 ROOT = Path(__file__).resolve().parent.parent
 CADASTRE_BASE = "https://cadastre-process-api.exe.xyz/api/v1"
 INVEKOS_GPKG = ROOT / "data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg"
+# INVEKOS Schläge API (farm-subsidies-austria VM; years 2022-2026, stored EPSG:3035,
+# `nearest_to=<flight year>` picks the release closest to the LiDAR flight).
+# Spec: segv2/INVEKOS_API_SPEC.md.  Local GPKG above is the offline fallback.
+INVEKOS_API = os.environ.get("INVEKOS_API", "https://farm-subsidies-austria.exe.xyz/api/v1/invekos")
 
 _T_4326_3035 = Transformer.from_crs(4326, 3035, always_xy=True)
 _T_31287_3035 = Transformer.from_crs(31287, 3035, always_xy=True)
@@ -118,9 +123,12 @@ MAX_NDVI = {"road": 0.30, "path": 0.35, "parking": 0.30, "rail": 0.35, "bare_soi
 # keep them low).  Same rule is applied segment-wise in train.py for parquets
 # built before this veto existed (MIN_NDVI_SEG).
 MIN_NDVI = {"grass": 0.15, "tree": 0.20, "shrub": 0.15, "hedge": 0.20, "orchard": 0.10, "wetland": 0.10}
-# NOTE: the thresholds above were first derived on a build whose "NIR" was an
-# alpha plane (see HANDOVER 2026-09-13). train.py re-derives them from the real
-# NDVI distribution (MIN_NDVI_SEG) — treat these as the label-time floor only.
+# NOTE: these are the label-time (pixel) floors.  On the real-NIR 171-KG build
+# (2026-09-15) the per-class segment-mean NDVI distribution sits well above them
+# (5th pct: grass .17, tree .24, shrub .19, orchard .13; the histogram tails off
+# into the floor rather than piling up at it), so they are left as-is — a rebuild
+# is not needed.  train.py derives the tighter *segment-level* veto (vegetation
+# q05 floors + sealed-class q95 ceilings) from the data at train time.
 
 # Label sources are *current* (INVEKOS 2024, cadastre + OSM live) while the
 # LiDAR behind a KG may be 2006-2024.  Classes whose surface changes on a
@@ -269,8 +277,38 @@ def fetch_osm(bbox_wgs: tuple[float, float, float, float]) -> dict:
     return out
 
 
-def fetch_invekos(bbox_3035: tuple[float, float, float, float]) -> list[tuple]:
-    """[(geom3035, type, snar_name)] from the local AMA Schläge GPKG."""
+def fetch_invekos_api(bbox_3035, nearest_to: int | None = None, year: int | None = None) -> tuple[list[tuple], int] | None:
+    """([(geom3035, type, snar_name)], year_used) from the INVEKOS API, or None on failure."""
+    params = {"bbox": ",".join(f"{v:.1f}" for v in bbox_3035), "crs": "3035"}
+    if year:
+        params["year"] = int(year)
+    elif nearest_to:
+        params["nearest_to"] = int(nearest_to)
+    d = _get_json(f"{INVEKOS_API}/schlaege", params, timeout=120)
+    if not d or d.get("truncated") or "features" not in d:
+        return None
+    out = []
+    for f in d["features"]:
+        g = f.get("geometry")
+        if not g:
+            continue
+        name = (f.get("properties") or {}).get("snar")
+        ty = invekos_type(name)
+        if ty:
+            geom = shape(g)
+            if not geom.is_empty:
+                out.append((geom, ty, name))
+    return out, int(d.get("year") or 0)
+
+
+def fetch_invekos(bbox_3035: tuple[float, float, float, float], nearest_to: int | None = None) -> list[tuple]:
+    """[(geom3035, type, snar_name)] — INVEKOS API (year nearest the flight) first,
+    local 2024-1 GPKG as fallback."""
+    r = fetch_invekos_api(bbox_3035, nearest_to=nearest_to)
+    if r is not None:
+        log.info("invekos api: %d polys, year %s (nearest_to=%s)", len(r[0]), r[1], nearest_to)
+        return r[0]
+    log.warning("invekos api unavailable → local GPKG 2024-1")
     if not INVEKOS_GPKG.exists():
         return []
     import pyogrio
@@ -309,9 +347,11 @@ def _paint(label, source, weight, mask, ty, src, w=1.0):
 class LabelContext:
     """Fetched vector inputs for one KG; can rasterise any tile window."""
 
-    def __init__(self, kg_code: str, bbox_3035: tuple[float, float, float, float]):
+    def __init__(self, kg_code: str, bbox_3035: tuple[float, float, float, float],
+                 flight_year: int | None = None):
         self.kg = kg_code
         self.bbox_3035 = bbox_3035
+        self.flight_year = flight_year
         x0, y0, x1, y1 = bbox_3035
         pts = [_T_3035_4326.transform(x, y) for x, y in ((x0, y0), (x1, y1), (x0, y1), (x1, y0))]
         lons, lats = zip(*pts)
@@ -319,7 +359,7 @@ class LabelContext:
         self.bbox_wgs = (min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad)
         self.cad = fetch_cadastre(kg_code)
         self.osm = fetch_osm(self.bbox_wgs)
-        self.inv = fetch_invekos(bbox_3035)
+        self.inv = fetch_invekos(bbox_3035, nearest_to=flight_year)
         log.info("KG %s osm: %d road, %d rail, %d water lines, %d water areas; invekos: %d",
                  kg_code, len(self.osm["road"]), len(self.osm["rail"]),
                  len(self.osm["water_line"]), len(self.osm["water_area"]), len(self.inv))

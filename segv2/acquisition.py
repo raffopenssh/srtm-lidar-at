@@ -101,6 +101,16 @@ def ortho_flight_year(bounds_3035, mosaic_year: int) -> int | None:
     return int(ops[0][:4])
 
 
+def dsm_flight_year(bounds_3035, mosaic_year: int = 2024) -> int | None:
+    """Median DSM flight year over the bbox for a mosaic — the year the INVEKOS
+    labels should be matched to (labels.LabelContext(flight_year=...))."""
+    from rasterio.transform import from_bounds
+    x0, y0, x1, y1 = bounds_3035
+    r = als_year_rasters(from_bounds(x0, y0, x1, y1, 100, 100), (100, 100), mosaic_year)
+    yrs = r["dsm_year"][r["dsm_year"] > 0]
+    return int(np.median(yrs)) if yrs.size else None
+
+
 def audit_kg(bounds_3035, mask_geoms=None) -> dict:
     """Metadata completeness for one KG bbox — used by build_dataset as a gate.
 

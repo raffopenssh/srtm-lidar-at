@@ -100,7 +100,10 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
         g = FullGpkg(path)
         parent = code.split("-")[0]
         b = g.bounds
-        ctx = L2.LabelContext(parent, (b.left, b.bottom, b.right, b.top))
+        import acquisition as ACQ
+        fy = ACQ.dsm_flight_year((b.left, b.bottom, b.right, b.top))
+        meta["invekos_nearest_to"] = fy
+        ctx = L2.LabelContext(parent, (b.left, b.bottom, b.right, b.top), flight_year=fy)
         if not ctx.cad["parcels"]:
             meta["error"] = "no_parcels"
             return meta

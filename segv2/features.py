@@ -580,7 +580,7 @@ def extract(labels: np.ndarray, L: dict, *, context: dict | None = None,
     # neighbourhood
     a, b = _adjacency(labels)
     pos = {int(l): i for i, l in enumerate(G.ids)}
-    ai = np.array([pos.get(int(x), -1) for x in a]); bi = np.array([pos.get(int(x), -1) for x in b])
+    ai = np.array([pos.get(int(x), -1) for x in a], dtype=np.int64); bi = np.array([pos.get(int(x), -1) for x in b], dtype=np.int64)
     ok = (ai >= 0) & (bi >= 0); ai, bi = ai[ok], bi[ok]
     wgt = F["area"][bi]
     nb_w = np.bincount(ai, wgt, G.n)

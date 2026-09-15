@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-14 18:42 UTC: 166/173 parquets, retry pass over 6 KGs running)
+# segv2 — handover (2026-09-13, status 2026-09-15 03:25 UTC: 166/173 parquets; run 3 FINISHED, 6 KGs failed on a features.py bug (fixed), re-running them in tmux `segv2build`)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -76,6 +76,17 @@ from the 34 parquets; first run's stdout kept as `build_stdout_run1.log`), so
 the in-process retry pass applies; `FINISHED` is the final marker.
 `segv2/retry_failed.sh` is kept as a manual chained-retry tool. Zenodo was fully unreachable 12:34–≥14:05 UTC (34 KGs done at that
 point; 19713 and 22143 hit `no_full_gpkg` during the outage).
+
+### 2026-09-15 03:20 UTC — run 3 finished, 6 KGs crashed, fix + re-run
+Run 3 (`build_stdout_run3.log`) ended `FINISHED` with 166/173 parquets. The
+6 missing (`73301-east 87102-north 72321 57004-west 73505-west 72010-south`)
+all died in `features.extract` with `IndexError: arrays used as indices must
+be of integer type` at `wgt = F["area"][bi]`: a tile with a single segment
+has an empty adjacency list → `np.array([])` is float64. Fixed by forcing
+`dtype=np.int64` on `ai`/`bi` (features.py:583); the in-process retry pass
+re-hit the same bug so it could not help. Re-run of just those 6 codes is in
+tmux `segv2build` (`build_stdout.log`, ends `FINISHED`). Expect 173 parquets
+(or fewer if some of them legitimately have `no_parcels`/`no_tiles`).
 
 ### After the build (next conversation)
 1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and

@@ -140,11 +140,14 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
             if df.empty:
                 continue
             ndvi = L["spectral"].get("ndvi") if L["spectral"] else None
-            if ndvi is not None and np.all(np.nan_to_num(L["spectral"]["nir"], nan=255) >= 254):
+            _nir = L["spectral"]["nir"] if L["spectral"] and "nir" in L["spectral"] else None
+            _fin = np.isfinite(_nir) if _nir is not None else np.zeros(1, bool)
+            if ndvi is not None and _fin.any() and np.all(_nir[_fin] >= 254):
                 # Saturated NIR is legitimate on snow/glacier tiles (73301 Dössen tile 3: RGB is
                 # ~255 too). An alpha plane masquerading as NIR has *varied* RGB under it.
                 rgb, _, _ = g.read_ortho(L.get("nir_year"), win)
-                rgb_sat = float(np.mean(rgb >= 240)) if rgb is not None else 0.0
+                _cov = rgb.astype(np.uint16).sum(0) > 0 if rgb is not None else None
+                rgb_sat = float(np.mean(rgb[:, _cov] >= 240)) if rgb is not None and _cov.any() else 0.0
                 assert rgb_sat >= 0.5, \
                     f"NIR is a constant alpha plane (rgb_sat={rgb_sat:.2f}) — writer contract violated"
                 log.warning("KG %s tile %d: NIR saturated on a bright tile (snow?) rgb_sat=%.2f", code, ti, rgb_sat)

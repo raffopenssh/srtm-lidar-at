@@ -207,7 +207,14 @@ def pixel_layers(g, window, *, ortho_year=None, cop_cache=None, hansen_cache=Non
     # --- ortho (all years; NIR only from years that carry a CIR layer) ---
     stack = g.read_ortho_stack(window)
     L["ortho_stack_years"] = sorted(stack)
-    nir_years = [y for y in sorted(stack) if stack[y]["nir"] is not None]
+    # A CIR layer may cover only part of the KG (e.g. CIR_2023 over one
+    # operate); in this window a year only counts as a NIR year if it has
+    # real ortho coverage (>1 % non-black RGB) — else the newest year would
+    # be all nodata / a few border pixels here and the tile would carry no
+    # usable NIR (73301-east tile 3 tripped the alpha-plane assertion so).
+    nir_years = [y for y in sorted(stack)
+                 if stack[y]["nir"] is not None
+                 and float(np.mean(stack[y]["rgb"].astype(np.uint16).sum(0) > 0)) > 0.01]
     L["nir_years"] = nir_years
     # RGB from the newest year; NIR from the newest *real* NIR year.  Where the
     # two differ (2024 RGB-only + 2023 RGBI) NDVI is computed from the NIR year's

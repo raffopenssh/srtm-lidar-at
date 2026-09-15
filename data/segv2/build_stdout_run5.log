@@ -1,0 +1,84 @@
+2026-09-15 04:39:22,127 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:39:22,127 INFO segv2.build: building 6 KGs
+2026-09-15 04:42:08,193 INFO segv2.fetch: downloaded 73301-east_full.gpkg: 1900 MB in 163s (11.6 MB/s)
+2026-09-15 04:42:10,229 INFO segv2.labels: KG 73301 cadastre: 971 footprints, 2096 landuse polys, 477 parcels
+2026-09-15 04:42:10,858 INFO segv2.labels: KG 73301 osm: 0 road, 0 rail, 195 water lines, 22 water areas; invekos: 514
+2026-09-15 04:42:13,889 INFO object_segmentation: NDVI fusion: BEV mean=0.189, Cop mean=0.723, Fused mean=0.722, offset mean=0.531
+2026-09-15 04:42:14,115 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:42:14,163 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 04:42:20,708 INFO object_segmentation:   elevated layer: 1152318 px → 5176 segments
+2026-09-15 04:42:25,289 INFO object_segmentation:   ground layer: 914635 px → 2472 segments
+2026-09-15 04:42:32,698 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:42:32,698 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:42:35,474 INFO texture_features: Computed texture for 6351 segments
+2026-09-15 04:42:37,647 INFO segv2.build: KG 73301-east tile 0: 7648 segments, labelled 84%
+2026-09-15 04:42:39,982 INFO object_segmentation: NDVI fusion: BEV mean=-0.021, Cop mean=0.254, Fused mean=0.251, offset mean=0.298
+2026-09-15 04:42:40,221 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:42:40,258 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 04:42:48,682 INFO object_segmentation:   elevated layer: 151584 px → 2855 segments
+2026-09-15 04:42:55,580 INFO object_segmentation:   ground layer: 1641973 px → 1770 segments
+2026-09-15 04:43:00,685 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:43:00,685 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:43:02,317 INFO texture_features: Computed texture for 3519 segments
+2026-09-15 04:43:03,768 INFO segv2.build: KG 73301-east tile 1: 4625 segments, labelled 88%
+2026-09-15 04:43:06,025 INFO object_segmentation: NDVI fusion: BEV mean=-0.052, Cop mean=0.009, Fused mean=0.002, offset mean=0.061
+2026-09-15 04:43:06,264 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:43:06,303 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 04:43:11,665 INFO object_segmentation:   elevated layer: 47804 px → 962 segments
+2026-09-15 04:43:24,471 INFO object_segmentation:   ground layer: 477876 px → 522 segments
+2026-09-15 04:43:26,061 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:43:26,061 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:43:26,567 INFO texture_features: Computed texture for 1108 segments
+2026-09-15 04:43:27,136 INFO segv2.build: KG 73301-east tile 2: 1484 segments, labelled 100%
+2026-09-15 04:43:27,449 INFO object_segmentation: NDVI fusion: BEV mean=0.000, Cop mean=0.000, Fused mean=0.000, offset mean=0.000
+2026-09-15 04:43:27,482 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:43:27,520 INFO zenodo_cache: Fetching ZIP index from https://zenodo.org/api/records/19650075/draft/files/copernicus_harmonics_cell_47.0_48.0_12.0_14.0.zip/content
+2026-09-15 04:43:28,345 INFO object_segmentation:   ground layer: 4080 px → 2 segments
+2026-09-15 04:43:28,415 INFO texture_features: Using pre-loaded grey image for texture (130x1500)
+2026-09-15 04:43:28,415 INFO texture_features: Computing per-segment GLCM texture at 0.50m (130x1500)
+2026-09-15 04:43:28,417 INFO texture_features: Computed texture for 2 segments
+2026-09-15 04:43:28,431 ERROR segv2.build: KG 73301-east failed
+Traceback (most recent call last):
+  File "/home/exedev/srtm-lidar/segv2/build_dataset.py", line 148, in build_kg
+    assert rgb_sat >= 0.5, \
+           ^^^^^^^^^^^^^^
+AssertionError: NIR is a constant alpha plane (rgb_sat=0.00) — writer contract violated
+2026-09-15 04:46:51,941 INFO segv2.fetch: downloaded 87102-north_full.gpkg: 1903 MB in 201s (9.5 MB/s)
+2026-09-15 04:46:56,391 INFO segv2.labels: KG 87102 cadastre: 1153 footprints, 3938 landuse polys, 1150 parcels
+2026-09-15 04:46:57,007 INFO segv2.labels: KG 87102 osm: 29 road, 0 rail, 172 water lines, 3 water areas; invekos: 924
+2026-09-15 04:46:59,552 INFO object_segmentation: NDVI fusion: BEV mean=0.072, Cop mean=0.632, Fused mean=0.632, offset mean=0.559
+2026-09-15 04:46:59,731 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:47:10,300 INFO object_segmentation:   elevated layer: 62654 px → 754 segments
+2026-09-15 04:47:24,885 INFO object_segmentation:   ground layer: 465607 px → 476 segments
+2026-09-15 04:47:26,389 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:47:26,389 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:47:26,844 INFO texture_features: Computed texture for 1013 segments
+2026-09-15 04:47:27,647 INFO segv2.build: KG 87102-north tile 0: 1230 segments, labelled 92%
+2026-09-15 04:47:30,107 INFO object_segmentation: NDVI fusion: BEV mean=0.132, Cop mean=0.619, Fused mean=0.619, offset mean=0.485
+2026-09-15 04:47:30,345 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:47:35,622 INFO object_segmentation:   elevated layer: 988233 px → 3970 segments
+2026-09-15 04:47:40,557 INFO object_segmentation:   ground layer: 1138856 px → 1869 segments
+2026-09-15 04:47:46,701 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:47:46,701 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:47:48,862 INFO texture_features: Computed texture for 4884 segments
+2026-09-15 04:47:50,558 INFO segv2.build: KG 87102-north tile 5: 5839 segments, labelled 90%
+2026-09-15 04:47:52,878 INFO object_segmentation: NDVI fusion: BEV mean=0.032, Cop mean=0.426, Fused mean=0.426, offset mean=0.394
+2026-09-15 04:47:53,156 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:47:58,467 INFO object_segmentation:   elevated layer: 203958 px → 2429 segments
+2026-09-15 04:48:26,877 INFO object_segmentation:   ground layer: 982280 px → 1595 segments
+2026-09-15 04:48:30,728 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:48:30,729 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:48:32,175 INFO texture_features: Computed texture for 3147 segments
+2026-09-15 04:48:33,346 INFO segv2.build: KG 87102-north tile 6: 4024 segments, labelled 99%
+2026-09-15 04:48:35,667 INFO object_segmentation: NDVI fusion: BEV mean=0.065, Cop mean=0.552, Fused mean=0.552, offset mean=0.487
+2026-09-15 04:48:35,913 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:48:46,724 INFO object_segmentation:   elevated layer: 25320 px → 332 segments
+2026-09-15 04:49:17,690 INFO object_segmentation:   ground layer: 176053 px → 270 segments
+2026-09-15 04:49:18,505 INFO texture_features: Using pre-loaded grey image for texture (1500x1500)
+2026-09-15 04:49:18,505 INFO texture_features: Computing per-segment GLCM texture at 0.50m (1500x1500)
+2026-09-15 04:49:18,746 INFO texture_features: Computed texture for 483 segments
+2026-09-15 04:49:19,317 INFO segv2.build: KG 87102-north tile 7: 602 segments, labelled 100%
+2026-09-15 04:49:21,618 INFO object_segmentation: NDVI fusion: BEV mean=0.249, Cop mean=0.796, Fused mean=0.796, offset mean=0.545
+2026-09-15 04:49:21,857 INFO tile_cache: tile_cache: forbid_remote=True (cache-only mode)
+2026-09-15 04:49:28,487 INFO object_segmentation:   elevated layer: 1581752 px → 3824 segments
+2026-09-15 04:49:35,687 INFO object_segmentation:   ground layer: 563844 px → 1403 segments

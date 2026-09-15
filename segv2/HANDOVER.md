@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-15 03:25 UTC: 166/173 parquets; run 3 FINISHED, 6 KGs failed on a features.py bug (fixed), re-running them in tmux `segv2build`)
+# segv2 — handover (2026-09-13, status 2026-09-15 05:05 UTC: 167/173 parquets; two builder bugs fixed, last 5 KGs re-running in tmux `segv2build`)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -84,9 +84,20 @@ all died in `features.extract` with `IndexError: arrays used as indices must
 be of integer type` at `wgt = F["area"][bi]`: a tile with a single segment
 has an empty adjacency list → `np.array([])` is float64. Fixed by forcing
 `dtype=np.int64` on `ai`/`bi` (features.py:583); the in-process retry pass
-re-hit the same bug so it could not help. Re-run of just those 6 codes is in
-tmux `segv2build` (`build_stdout.log`, ends `FINISHED`). Expect 173 parquets
-(or fewer if some of them legitimately have `no_parcels`/`no_tiles`).
+re-hit the same bug so it could not help. After that fix the same 6 KGs failed on a **second** bug (runs 4/5):
+`AssertionError: NIR is a constant alpha plane (rgb_sat=0.00)` on a tile
+where the only CIR year (2020) has zero ortho coverage (73301-east tile 3:
+Ortho_2020 fully black there, Ortho_2024 present) — the all-NaN NIR passed
+the `nan_to_num(nan=255) >= 254` test and the rgb_sat was computed over the
+black pixels. Fixes: `features.pixel_layers` only counts a year as a NIR year
+for the window if >1 % of its RGB is non-black (else the tile has no NIR /
+NDVI, NaN downstream); the builder check now looks at finite NIR pixels
+only and rgb_sat over covered pixels only. 73301-east verified (80 k segs,
+361 s). Remaining 5 re-running in tmux `segv2build` (`build_stdout.log`,
+ends `FINISHED`; older stdouts `build_stdout_run3..5.log`). Expect 173.
+**Caveat for training**: rows from such tiles have NaN `nir_*`/`ndvi_*`
+(same as harmonics-missing rows) — LightGBM handles it; RF models A/B need
+their existing NaN→0 fill.
 
 ### After the build (next conversation)
 1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and

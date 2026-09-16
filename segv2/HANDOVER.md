@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-16 04:40 UTC: build complete (171 parquets; 72321 unbuildable), **full train v2 FINISHED** → `data/segv2/report_v2.md`, `models/model_D.joblib`; harmonics-free variants G/H running in tmux `segv2train` → `report_v2_noharm.md`)
+# segv2 — handover (2026-09-13, status 2026-09-16 04:40 UTC: build complete (171 parquets; 72321 unbuildable), **train v2 + harmonics-free G/H FINISHED** → `report_v2.md`, `report_v2_noharm.md`; **ship candidate = G** (`models/model_G.joblib`))
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -185,8 +185,25 @@ load-bearing for phenology classes and the fleet pass needs a harmonics decision
 "Harmonics" bullet). **If G ≈ D, ship G, not D** — never ship a model that leans on a feature
 that is missing for 80 % of Austria at inference.
 
-### Next steps after G/H (in order)
-1. Read `report_v2_noharm.md`; pick the ship candidate (G expected). Record the choice here.
+### 2026-09-16 07:40 UTC — G/H FINISHED (`train_v2_noharm.log`, `report_v2_noharm.md|json`)
+
+| model | macro-F1 | wF1 | acc | ECE |
+|---|---:|---:|---:|---:|
+| G = D − `harm_*` | **0.670** | 0.892 | 0.901 | 0.057 |
+| H = G − `dist_*` | 0.595 | 0.883 | 0.891 | 0.055 |
+
+* **G ≈ D (−0.002)**; per class every Δ ≤ 0.02 except path (.379→.329, 349 rows, noise).
+  crop .876 / vineyard .512 / orchard .154 unchanged → harmonics carry **nothing** at this
+  coverage. **Ship candidate: G** — `data/segv2/models/model_G.joblib` (45 MB) +
+  `model_G.meta.json`. No openEO harmonics needed for the v2 pass; drop `harm_*` from the
+  v2 feature contract (keep the columns NaN in the parquet for a later experiment).
+* H (0.595) ≈ F (0.587): the honest recognition floor is stable; `dist_*` adds +0.075.
+* Fix in the same commit: `write_report` had a hard-coded `"ABCDEFP"` model order so G/H were
+  silently missing from the markdown (JSON was complete) — now `"ABCDEFGHP"`; the md was
+  regenerated from the JSON.
+
+### Next steps (in order)
+1. ~~Pick ship candidate~~ → **G**.
 2. Class-set decision for v2 products (needs operator): merge `bare_soil→rock`? drop
    `earthwork`/`path` to rule-based only? keep `glacier` (F1 .55 but zero false positives
    outside alpine KGs — check confusion: predicted-glacier rows are 5.6 k glacier + 3.6 k

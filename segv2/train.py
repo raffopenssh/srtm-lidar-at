@@ -394,7 +394,7 @@ def _fmt(x):
 def write_report(res: dict, info: dict, classes: list[str]):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / f"report{REPORT_SUFFIX}.json").write_text(json.dumps({"info": info, "classes": classes, "models": res}, indent=1))
-    order = [m for m in "ABCDEFP" if m in res]
+    order = [m for m in "ABCDEFGHP" if m in res]
     L = ["# segv2 harness report", "",
          f"generated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} · {info['n_rows_labelled']:,} labelled "
          f"segments from {info['n_parent_kgs']} parent KGs · {info.get('folds')}-fold GroupKFold by parent KG",

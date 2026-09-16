@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-15 07:30 UTC: build complete (171 parquets; 72321 unbuildable), NDVI vetoes re-derived, **full train running** in tmux `segv2train` → `data/segv2/report_v2.md`)
+# segv2 — handover (2026-09-13, status 2026-09-16 04:40 UTC: build complete (171 parquets; 72321 unbuildable), **full train v2 FINISHED** → `data/segv2/report_v2.md`, `models/model_D.joblib`; harmonics-free variants G/H running in tmux `segv2train` → `report_v2_noharm.md`)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -152,6 +152,51 @@ their existing NaN→0 fill.
   GPKG**; the API path applies from the next build. Toponyms are not used yet
   — candidate weak features/labels (Ried names such as "Weingarten"/"Au"/
   "Moos" → vineyard/riparian/wetland priors) for a later build.
+
+### 2026-09-15 11:45 UTC — full train v2 FINISHED (`train_v2.log`, `report_v2.md|json`)
+1,238,131 labelled segments / 146 parent KGs / 17 classes, 5-fold GroupKFold by parent.
+Same row set and folds in every run below (seed 0) — numbers are comparable.
+
+| model | macro-F1 | wF1 | acc | ECE | promotion |
+|---|---:|---:|---:|---:|---|
+| A v1 deployed RF | 0.220 | 0.479 | 0.501 | 0.089 | — |
+| P v1 pipeline output on Zenodo | 0.144 | 0.387 | 0.372 | — | — |
+| B RF, v2 labels, FEATURE_KEYS | 0.555 | 0.829 | 0.816 | 0.089 | fail (ECE not < A) |
+| C LGBM FEATURE_KEYS | 0.579 | 0.873 | 0.879 | 0.045 | PASS |
+| **D LGBM ALL_KEYS** | **0.672** | 0.893 | 0.903 | 0.057 | PASS |
+| F = D − `dist_*` | 0.587 | 0.881 | 0.890 | 0.055 | PASS |
+
+`--save-final D` wrote `data/segv2/models/model_D.joblib` (45 MB) + `model_D.meta.json`
+(classes, feature_keys, NDVI vetoes, merge table). Per-fold spread D .632–.698.
+
+**Reading the per-class table** (D, then F where different):
+* Solid: tree .998, roof 1.00, rock .94, grass .91, crop .88, garden .86 (.77), water .95 (.76), road .95 (.66), rail .98 (.58), parking .73 (.60).
+* `dist_*` buys ≈ +0.085 macro-F1, almost all of it in road/rail/water/parking/garden — i.e. "agrees with OSM/cadastre geometry". F is the honest recognition number; D is what we'd ship *if* OSM+cadastre are fetched at inference (they are today — labels.py's `LabelContext` already pulls both per KG, so this is fine for the fleet pass, but it means road/rail/water are largely *copied labels*, not recognised).
+* **Weak, and label-driven**: bare_soil .08 (16.7 k of 24.9 k → rock; NS-62 "vegetationsarme Flächen" is alpine scree/gravel, indistinguishable from NS rock at 1 m — consider merging bare_soil→rock or restricting bare_soil to non-alpine rows), glacier .55 (50 % → rock: snow-free glacier ice/firn vs rock in RGB+NIR; multi-year DSM drop would help but span==0 for 62 % of rows), earthwork .09 (1.6 k rows, → parking/rock/grass; NS-84 pits/dumps are polygons of *land use*, most of the area is not disturbed ground), orchard .13 (4.4 k, → grass/crop; INVEKOS Streuobst = grass with sparse trees, the segment is grass), path .38 (349 rows), shrub .48 (→ grass 26 k: cadastre 3 m height threshold is the label; shrub vs tall grass at nDSM 1–3 m is intrinsically fuzzy), vineyard .52 (→ crop/grass 4 k; harmonics missing for most vineyard KGs).
+* Top-20 D features are context + terrain + SAR (`elevation_mean`, `dist_parcel_edge`, `dist_water`, aspect, `nb_*`, `sar_*`, `ndvi_trend_per_year`, `ndvi_tstd`) — the new multi-year BEV spectral features are pulling weight; no `harm_*` in D's or F's top 20 (expected: harmonics are NaN for ~80 % of KGs).
+
+**Running now (tmux `segv2train`, `data/segv2/train_v2_noharm.log`, ends `FINISHED`,
+~80 min per model → done ≈ 07:30 UTC)**: `--models A,G,H --save-final G --report-suffix _v2_noharm`.
+New in `train.py`: **G** = D − `harm_*` (inference-realistic: harmonics only exist in the
+Zenodo tile cache for ~20 % of KGs and are NOT fetched from openEO in the v2 pass),
+**H** = D − `harm_*` − `dist_*` (deploy-honest floor). `--save-final` accepts F/G/H too.
+Expect G ≈ D (−0.00…−0.02); if G loses > 0.02 on crop/vineyard/orchard the harmonics *are*
+load-bearing for phenology classes and the fleet pass needs a harmonics decision (README
+"Harmonics" bullet). **If G ≈ D, ship G, not D** — never ship a model that leans on a feature
+that is missing for 80 % of Austria at inference.
+
+### Next steps after G/H (in order)
+1. Read `report_v2_noharm.md`; pick the ship candidate (G expected). Record the choice here.
+2. Class-set decision for v2 products (needs operator): merge `bare_soil→rock`? drop
+   `earthwork`/`path` to rule-based only? keep `glacier` (F1 .55 but zero false positives
+   outside alpine KGs — check confusion: predicted-glacier rows are 5.6 k glacier + 3.6 k
+   rock, nothing else)? Re-run only the chosen model after the merge (≈80 min).
+3. `segv2/model_v2.py` — `predict(df)` mirroring `LearnedClassifier.predict_batch`, loading
+   `models/model_<X>.joblib` + meta (feature order from meta, NaN passthrough for LGBM,
+   apply `min/max_ndvi_seg` vetoes as post-hoc overrides the same way train.py did pre-fit).
+   Feature-importance + SHAP summary → report.
+4. Segmentation v2 eval (HANDOVER "Next steps" item 3) — `--v2-edges` on 20 KGs, `--out` dir.
+5. Visual QA on 5 KGs side by side (README promotion step), then the wiring conversation.
 
 ### After the build (next conversation)
 1. **Re-derive NDVI vetoes** from the real distribution: `labels.MIN_NDVI` and

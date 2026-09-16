@@ -13,6 +13,9 @@ Models
   E  LGBM+ctx+nb   D + second stage: mean OOF class-proba of the k nearest
                    segments (centroid kNN within the same kg/tile — adjacency
                    is not stored in the parquet, so kNN is the proxy)
+  F  LGBM ALL_KEYS minus dist_* (OSM-geometry-free recognition number)
+  G  LGBM ALL_KEYS minus harm_* (harmonics exist for ~20 % of KGs only)
+  H  LGBM ALL_KEYS minus harm_* and dist_* (deploy-honest floor)
   P  v1 pipeline   `v1_type` column = what the deployed processor wrote on the
                    same pixels (no training, reference for "what is on Zenodo")
 
@@ -93,6 +96,8 @@ CLASS_WEIGHT = "sqrt"        # "balanced" (LGBM built-in) or "sqrt" (tempered: w
 # ALL_KEYS minus the OSM/cadastre distance features — the honest "recognition
 # only" ablation (dist_* share geometry with the road/rail/water/roof labels).
 NODIST_KEYS = [k for k in ALL_KEYS if not k.startswith("dist_")]
+NOHARM_KEYS = [k for k in ALL_KEYS if not k.startswith("harm_")]
+NOHARM_NODIST_KEYS = [k for k in NOHARM_KEYS if not k.startswith("dist_")]
 KEY_CLASSES = ["tree", "roof", "grass", "crop", "water", "road"]  # promotion rule
 PROMO_MACRO_F1_GAIN = 0.05
 PROMO_MAX_KEY_LOSS = 0.02
@@ -312,6 +317,8 @@ MODEL_SPECS = {
     "D": ("LGBM ALL_KEYS (+context)", ALL_KEYS, False),
     "E": ("LGBM ALL_KEYS + neighbour OOF proba (kNN stacking)", ALL_KEYS, False),
     "F": ("LGBM ALL_KEYS minus dist_* (no OSM-geometry features)", NODIST_KEYS, False),
+    "G": ("LGBM ALL_KEYS minus harm_* (no openEO harmonics — inference-realistic)", NOHARM_KEYS, False),
+    "H": ("LGBM ALL_KEYS minus harm_* and dist_* (recognition-only, inference-realistic)", NOHARM_NODIST_KEYS, False),
     "P": ("v1 pipeline output on Zenodo (v1_type column)", [], True),
 }
 
@@ -524,8 +531,8 @@ def main():
         write_report(res, info, classes)  # incremental — survives a kill mid-run
 
     for m in [s.strip().upper() for s in a.save_final.split(",") if s.strip()]:
-        if m not in ("B", "C", "D", "F"):
-            log.warning("--save-final only supports B/C/D (E needs stage-1 at inference); skipping %s", m)
+        if m not in ("B", "C", "D", "F", "G", "H"):
+            log.warning("--save-final only supports B/C/D/F/G/H (E needs stage-1 at inference); skipping %s", m)
             continue
         import joblib
         _, keys, nan0 = MODEL_SPECS[m]

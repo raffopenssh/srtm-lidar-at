@@ -438,6 +438,19 @@ class HTTPRangeFile:
         return result
 
 
+class _RemoteFileLost(Exception):
+    """Raised by ``_upload_file`` when the previous copy of a ZIP was
+    deleted from the deposit but the replacement upload did not (verifiably)
+    land. The caller must tombstone the manifest entry — otherwise the
+    fleet keeps range-reading a URL that 404s (Sep 2026: five dead
+    strip/cell entries, 38k 404s in 3 h on the primary alone)."""
+
+    def __init__(self, filename: str, cause: BaseException):
+        super().__init__(f"{filename}: {cause}")
+        self.filename = filename
+        self.cause = cause
+
+
 class _StaleOffsetError(Exception):
     """Raised when a ZIP entry's cached header_offset points at the
     wrong byte in the remote ZIP — typically because another peer
@@ -1171,6 +1184,10 @@ class ZenodoCache:
                     )
                     r.raise_for_status()
                 break
+            except requests.HTTPError as e:
+                # Non-transient: the old file is already deleted above, so
+                # the manifest entry (if any) now points at nothing.
+                raise _RemoteFileLost(filename, e)
             except (requests.ConnectionError, requests.Timeout,
                     requests.exceptions.SSLError,
                     requests.exceptions.ChunkedEncodingError) as e:
@@ -1188,11 +1205,21 @@ class ZenodoCache:
                             attempt + 1, max_attempts)
                 time.sleep(wait)
         else:
-            raise last_exc if last_exc else RuntimeError("upload failed")
+            raise _RemoteFileLost(filename, last_exc or RuntimeError("upload failed"))
 
         result = r.json()
+        # Post-upload verification: Zenodo must report the byte size we
+        # sent. A short/failed PUT that still answered 2xx would otherwise
+        # become a manifest entry pointing at a truncated ZIP.
+        local_size = local_path.stat().st_size
+        remote_size = result.get("size")
+        if remote_size is not None and int(remote_size) != local_size:
+            raise _RemoteFileLost(
+                filename, RuntimeError(
+                    f"size mismatch after upload: remote {remote_size} "
+                    f"!= local {local_size}"))
         log.info("Uploaded %s to deposit %d (%.1f MB)",
-                 filename, depo_id, local_path.stat().st_size / 1e6)
+                 filename, depo_id, local_size / 1e6)
         return result
 
     def _file_download_url(self, zip_name: str) -> Optional[str]:
@@ -1524,6 +1551,16 @@ class ZenodoCache:
                     idx_cache = _ZIP_INDEX_CACHE_DIR / f"{hashlib.md5(self.manifest.get_file(zip_name)['url'].encode()).hexdigest()[:12]}.json"
                     idx_cache.unlink(missing_ok=True)
                     stats["zips_uploaded"] += 1
+                except _RemoteFileLost as e:
+                    log.error("Failed to upload %s and the previous copy is "
+                              "gone — tombstoning manifest entry: %s",
+                              zip_name, e)
+                    try:
+                        self.manifest.tombstone(zip_name, f"upload failed: {e.cause}")
+                        self.manifest.save()
+                    except Exception:
+                        pass
+                    self._zip_indices.pop(zip_name, None)
                 except Exception as e:
                     log.error("Failed to upload %s: %s", zip_name, e)
 
@@ -1880,6 +1917,15 @@ class ZenodoCache:
                 self.manifest.save()
                 self._zip_indices.pop(zip_name, None)
                 stats["zips_rebuilt"] += 1
+            except _RemoteFileLost as exc:
+                log.error("Failed to upload rebuilt %s (old copy deleted) — "
+                          "tombstoning: %s", zip_name, exc)
+                try:
+                    self.manifest.tombstone(zip_name, f"rebuild upload failed: {exc.cause}")
+                    self.manifest.save()
+                except Exception:
+                    pass
+                self._zip_indices.pop(zip_name, None)
             except Exception as exc:
                 log.error("Failed to upload rebuilt %s: %s", zip_name, exc)
 

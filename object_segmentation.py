@@ -19,6 +19,7 @@ References:
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
@@ -46,6 +47,7 @@ OBJECT_TYPES = {
     "hedge": 4,          # elongated shrub (length/width>4)        [linear veg]
     # ---- Water (very low NDVI + low NIR + flat) ----
     "water": 5,          # ESA water class, very low NDVI+NIR      [GW 70,71,96]
+    "wetland": 6,        # v2 (cadastre NS 61 Feuchtgebiete)        [segv2]
     # ---- Infrastructure: buildings (elevated+smooth+low NDVI) ----
     "roof": 10,          # compact elevated, smooth DSM, low NDVI  [B(Geb) 42]
     "greenhouse": 11,    # roof-like but high NIR transmittance     [B(Gwh) 45]
@@ -61,6 +63,7 @@ OBJECT_TYPES = {
     "path": 21,          # narrower road (<3m effective width)      [V(Weg) 74]
     "parking": 22,       # smooth, large, compact, low NDVI        [B(bf) 41]
     "bridge": 23,        # elevated road/path over gap              [Br 75]
+    "rail": 24,          # v2 (OSM rail / cadastre NS 92)           [segv2]
     # ---- Agricultural (ground + NDVI + ESA prior) ----
     "crop": 30,          # flat, seasonal NDVI, ESA cropland        [A 51,62]
     "orchard": 31,       # regular tree spacing, <10m height        [OG 65]
@@ -69,6 +72,7 @@ OBJECT_TYPES = {
     # ---- Terrain (slope + roughness + low NDVI) ----
     "bare_soil": 40,     # low NDVI, flat-moderate slope            [Öd 59,90]
     "rock": 41,          # steep + very rough DTM + low NDVI        [Fe 83,84]
+    "glacier": 42,       # v2 (cadastre NS 88 Gletscher)            [segv2]
     # ---- Disturbance (DTM temporal change) ----
     "excavation": 50,    # DTM lowered between dates                [Ab 80,93]
     "fill": 51,          # DTM raised between dates                 [Dep 81]
@@ -115,7 +119,7 @@ _COMPAT_MAP = {
     # Agricultural
     "crop": 8, "orchard": 7, "vineyard": 8, "garden": 8,
     # Terrain
-    "bare_soil": 9, "rock": 9,
+    "bare_soil": 9, "rock": 9, "glacier": 9, "wetland": 8, "rail": 1,
     # Disturbance
     "excavation": 3, "fill": 4, "tree_loss": 10, "construction": 10,
     "earthwork": 3,
@@ -1882,8 +1886,19 @@ def segment_and_classify(
     features_only: bool = False,
     infra_lookup=None,
     mark_uncertain: bool = False,
+    model: str | None = None,
+    v2_context=None,
+    parcels=None,
+    footprints=None,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
+
+    ``model``: ``'v1'`` (deployed RF, default) or ``'v2'`` (segv2 LightGBM on
+    the same segments; falls back to v1 when the v2 model is unavailable).
+    Default from ``SEG_MODEL_VERSION`` env.  In v2 mode ``v2_context``
+    (``segv2.inference.Context``, shareable across tiles of one KG) or
+    ``parcels``/``footprints`` (shapely EPSG:3035) feed the OSM/cadastre/
+    INVEKOS context features; without them the context is fetched per tile.
 
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
@@ -1913,6 +1928,7 @@ def segment_and_classify(
     dict with: objects, labels, gradient, stats, evaluation
     """
     h, w = dtm.shape
+    model = (model or os.environ.get("SEG_MODEL_VERSION", "v1")).lower()
     ndsm = np.clip(dsm - dtm, 0, None).astype(np.float32)
     has_spectral = spectral is not None and spectral.get("ndvi") is not None
     log.info("segment_and_classify: %dx%d, valid=%d px, spectral=%s",
@@ -1982,6 +1998,46 @@ def segment_and_classify(
     except Exception as e:
         log.warning("Step 3b: Texture computation failed: %s", e)
 
+    # --- Step 3c (v2 only): segv2 LightGBM features + classification on the same segments ---
+    v2_results = {}   # label -> (type_name, type_code, conf, is_mm, source, extras)
+    _v2_model_hash = ""
+    if model == "v2" and not features_only:
+        try:
+            import sys as _sys
+            _sv2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segv2")
+            if _sv2 not in _sys.path:
+                _sys.path.insert(0, _sv2)
+            import inference as _v2inf
+            from model_v2 import get_model as _v2_get_model, MANMADE as _V2_MANMADE
+            _m2 = _v2_get_model()
+            _v2_model_hash = _m2.model_hash
+            _ctx = v2_context
+            if _ctx is None:
+                _ctx = _v2inf.Context(_v2inf._bounds(transform, (h, w)), parcels=parcels, footprints=footprints)
+            df2 = _v2inf.run(labels, dtm, dsm, mask, transform, spectral=spectral, cop=cop_resampled,
+                             dtm_dates=dtm_dates, dsm_dates=dsm_dates, hansen=hansen,
+                             obs_year=int(observation_year or 2024), ortho_year=ortho_year,
+                             context=_ctx, model=_m2, texture=False)
+            if df2 is not None and len(df2):
+                for row in df2.itertuples(index=False):
+                    t = str(row.v2_type)
+                    if t not in OBJECT_TYPES:
+                        continue
+                    extras = {"invekos_type": getattr(row, "invekos_type", ""),
+                              "invekos_snar": getattr(row, "invekos_snar", ""),
+                              "invekos_frac": float(getattr(row, "invekos_frac", 0.0) or 0.0),
+                              "v2_type2": str(row.v2_type2), "v2_conf2": float(row.v2_conf2),
+                              "dsm_year": float(row.dsm_year) if np.isfinite(row.dsm_year) else None,
+                              "dist_road": float(row.dist_road), "dist_building": float(row.dist_building),
+                              "dist_water": float(row.dist_water), "dist_parcel_edge": float(row.dist_parcel_edge)}
+                    v2_results[int(row.label)] = (t, OBJECT_TYPES[t], float(row.v2_conf), t in _V2_MANMADE,
+                                                  str(row.v2_source), extras)
+            log.info("Step 3c: segv2 classified %d/%d segments (model %s)", len(v2_results), len(features), _v2_model_hash)
+        except Exception as e:
+            log.warning("Step 3c: segv2 inference failed (%s) — falling back to v1 RF", e)
+            v2_results = {}
+            model = "v1"
+
     # Free heavy intermediates before classification
     del cop_resampled
     import gc; gc.collect()
@@ -2017,7 +2073,19 @@ def segment_and_classify(
 
     # Batch RF prediction (much faster than per-segment)
     rf_results = {}  # label -> (type_name, type_code, conf, is_mm)
-    if use_rf:
+    _rf_src_by_label = {}
+    if v2_results:
+        use_rf = True
+        _rf_model_hash = "v2:" + _v2_model_hash
+        for lbl, (tn, tc, cf, mm, srcv, extras) in v2_results.items():
+            rf_results[lbl] = (tn, tc, cf, mm)
+            _rf_src_by_label[lbl] = srcv
+        for feat in features:
+            ex = v2_results.get(feat["label"])
+            if ex:
+                feat.update(ex[5])
+        log.info("Step 4: Object classification (segv2 LightGBM, hash=%s)", _v2_model_hash)
+    elif use_rf:
         import warnings as _w
         from learned_classifier import classify_with_rf_batch
         with _w.catch_warnings():
@@ -2043,7 +2111,7 @@ def segment_and_classify(
         _rf_conf = 0.0
         if use_rf and feat["label"] in rf_results:
             type_name, type_code, conf, is_mm = rf_results[feat["label"]]
-            _cls_source = "rf"
+            _cls_source = _rf_src_by_label.get(feat["label"], "rf")
             _rf_type = type_name    # save before any override
             _rf_conf = conf
             # Even with RF result, check infrastructure for dropped classes
@@ -2186,6 +2254,8 @@ def segment_and_classify(
             log.info("Cadastre eval: skipped (%s)", evaluation.get("error", "no data"))
 
     stats = _compute_stats(objects)
+    stats["model"] = "v2" if v2_results else "v1"
+    stats["classifier"] = ("lgbm_v2:" + _v2_model_hash) if v2_results else ("rf_v1:" + _rf_model_hash if use_rf else "rules")
     log.info("Done: %d objects (%d man-made, %d natural), %d groups",
              len(objects),
              sum(1 for o in objects if o.is_manmade),
@@ -2313,7 +2383,9 @@ def _compute_stats(objects: list[SegmentedObject]) -> dict:
             100 * sum(o.area_sqm for o in objects if o.is_manmade) / max(total_area, 1), 1),
         "mean_confidence": round(
             sum(o.confidence for o in objects) / max(len(objects), 1), 3),
-        "rf_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'rf'),
+        "rf_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') in ('rf', 'v2', 'v2+invekos')),
+        "v2_classified": sum(1 for o in objects if str(getattr(o, 'classifier_source', '')).startswith('v2')),
+        "v2_invekos_override": sum(1 for o in objects if getattr(o, 'classifier_source', '') == 'v2+invekos'),
         "rules_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'rules'),
         "infra_classified": sum(1 for o in objects if getattr(o, 'classifier_source', 'rules') == 'infra'),
         "rf_diverged": sum(1 for o in objects if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type),

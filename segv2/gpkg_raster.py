@@ -59,6 +59,10 @@ class FullGpkg:
             if ds.dtypes[0].startswith("float"):
                 arr = arr.astype(np.float32)
                 arr[arr <= NODATA + 1] = np.nan
+            elif arr.shape[0] == 4 and not layer.startswith(("Ortho", "CIR")):
+                # single-band uint8 tables (WorldCover, Hansen_*, segment_*) come
+                # back RGBA-expanded from GDAL's PNG tiles: R=G=B=value, A=255
+                arr = arr[:1]
         return arr[0] if arr.shape[0] == 1 else arr
 
     def ortho_years(self) -> list[int]:

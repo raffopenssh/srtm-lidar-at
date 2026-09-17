@@ -49,7 +49,13 @@ from shapely.ops import transform as shapely_transform
 
 CADASTRE_BASE = "https://cadastre-process-api.exe.xyz/api/v1"
 ZENODO_TOKEN = "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
-VERSION = "v1"
+# Product/model version.  ``SEG_MODEL_VERSION=v2`` switches the classifier to
+# the segv2 LightGBM (object_segmentation.segment_and_classify(model="v2")),
+# stamps products "v2" and adds the v2-only JSON/GPKG extras (parcel outline
+# elevation profiles, model block).  Peers stay on v1 until the env is flipped
+# in the processor unit (see segv2/HANDOVER.md → wiring).
+MODEL_VERSION = os.environ.get("SEG_MODEL_VERSION", "v1").lower()
+VERSION = "v2" if MODEL_VERSION == "v2" else "v1"
 
 DATA_DIR = Path("data/austria_processor")
 MANIFEST_PATH = DATA_DIR / "zenodo_manifest.json"
@@ -2055,6 +2061,7 @@ SEGMENT_COLORS = {
     "grass":        (124, 252, 0, 150),
     "hedge":        (46, 139, 87, 170),
     "water":        (30, 144, 255, 180),
+    "wetland":      (0, 168, 150, 170),
     "roof":         (220, 20, 60, 200),
     "greenhouse":   (255, 105, 180, 180),
     "solar_panel":  (65, 105, 225, 200),
@@ -2067,12 +2074,14 @@ SEGMENT_COLORS = {
     "path":         (169, 169, 169, 150),
     "parking":      (105, 105, 105, 160),
     "bridge":       (112, 128, 144, 170),
+    "rail":         (90, 60, 110, 180),
     "crop":         (218, 165, 32, 160),
     "orchard":      (107, 142, 35, 170),
     "vineyard":     (147, 112, 219, 170),
     "garden":       (60, 179, 113, 160),
     "bare_soil":    (210, 180, 140, 140),
     "rock":         (139, 134, 130, 160),
+    "glacier":      (200, 235, 255, 180),
     "excavation":   (139, 0, 0, 200),
     "fill":         (255, 140, 0, 200),
     "tree_loss":    (255, 0, 255, 200),
@@ -4565,7 +4574,8 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
-                           obs_year=0, mark_uncertain=False, label_remap=None):
+                           obs_year=0, mark_uncertain=False, label_remap=None,
+                           outline_profiler=None):
     """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
     import rasterio, fiona
     import rasterio.transform
@@ -5087,6 +5097,19 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
     _fix_gpkg_raster_crs(out_path)
 
+    # v2: parcel outline elevation profiles (attribute table, ~8 B/point)
+    if outline_profiler is not None:
+        try:
+            import sys as _sys
+            _sv2 = str(Path(__file__).resolve().parent / "segv2")
+            if _sv2 not in _sys.path:
+                _sys.path.insert(0, _sv2)
+            import parcel_elevation as _pe
+            n = _pe.write_gpkg_table(out_path, outline_profiler.gpkg_rows())
+            log.info("  LIGHT_GPKG: %s written (%d parcels)", _pe.GPKG_TABLE, n)
+        except Exception as e:
+            log.warning("Light GPKG parcel_outline_z failed: %s", e)
+
     return out_path
 
 
@@ -5235,8 +5258,17 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                              cadastre_data, terrain_stats, spectral_info,
                              copernicus_info, hansen_info, new_buildings,
                              infrastructure, obs_year, n_tiles=1, tile_km=1.5,
-                             total_seg_pixels=0, tile_data_availability=None):
-    """Build JSON summary from tiled segmentation results."""
+                             total_seg_pixels=0, tile_data_availability=None,
+                             outline_profiler=None, classifier_used=None):
+    """Build JSON summary from tiled segmentation results.
+
+    ``outline_profiler`` (v2): ``segv2.parcel_elevation.ParcelOutlineProfiler``
+    already sampled in the tile loop; parcels still missing samples (tiles
+    restored from checkpoints) are topped up here from the lazy tile cache.
+    Each parcel detail then carries ``outline_z`` (compact DTM/nDSM profile
+    along the outline — see ``segv2/parcel_elevation.py`` for the encoding).
+    ``classifier_used``: {classifier string: n_tiles} → ``summary["model"]``.
+    """
     import tile_index as ti
     objects = all_objects
     summary = {
@@ -5777,6 +5809,26 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 tr["bounds_3035"], ly, tr["transform"], tr["shape"]
             ))
 
+    # --- Per-parcel outline elevation profiles (v2) ---
+    _outline_recs = {}
+    if outline_profiler is not None:
+        try:
+            _missing_before = outline_profiler.summary()["missing"]
+            if _missing_before:
+                for _ti_idx, _tr in enumerate(tile_seg_results):
+                    _td = _js_load_tile(_ti_idx, _tr)
+                    if _td is not None:
+                        outline_profiler.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
+                    if outline_profiler.summary()["missing"] == 0:
+                        break
+            _outline_recs = outline_profiler.records()
+            _sm = outline_profiler.summary()
+            log.info("JSON: parcel outline profiles: %d parcels, %d points, %d missing (%d before top-up)",
+                     _sm["parcels"], _sm["points"], _sm["missing"], _missing_before)
+        except Exception as e:
+            log.warning("JSON: parcel outline profiles failed: %s", e)
+            _outline_recs = {}
+
     # --- Per-parcel detail ---
     parcel_details = []
     n_parcel_no_tile = 0
@@ -6119,6 +6171,9 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                     pd['top_trees'] = p_top_tree
         except Exception as e:
             log.debug("JSON: per-parcel top items failed for %s: %s", p.get("parcel_id"), e)
+        _oz = _outline_recs.get(str(p.get("parcel_id")))
+        if _oz:
+            pd["outline_z"] = _oz
         parcel_details.append(pd)
     if n_parcel_no_tile > 0:
         log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",
@@ -6127,6 +6182,15 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "count": len(cadastre_data["parcels"]),
         "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
         "details": parcel_details}
+    if _outline_recs:
+        summary["parcels"]["outline_z_encoding"] = {
+            "z": "int16 LE decimetres DTM, base64", "zs": "int16 LE decimetres nDSM (DSM-DTM), base64",
+            "nodata": -32768, "points": "exterior ring of the cadastre parcel walked from vertex 0 at 'sp' metres "
+            "(segv2.parcel_elevation.outline_points); p0 = first point EPSG:3035"}
+    if classifier_used:
+        _cu = sorted(classifier_used.items(), key=lambda kv: -kv[1])
+        summary["model"] = {"version": VERSION, "classifier": _cu[0][0],
+                            "classifier_by_tile": dict(_cu) if len(_cu) > 1 else None}
     # --- Per-building detail ---
     # Build spatial lookup for address points → join to footprints
     _addr_list = cadastre_data.get("building_addresses", [])
@@ -7021,6 +7085,22 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # For blocks, fetch cadastre using parent KG code
         _parent_code = kg.get("_parent_kg_code", kg_code)
         cadastre_data = fetch_cadastre_data(_parent_code)
+        _v2_ctx = None            # segv2.inference.Context (v2 only, built on first tile)
+        _v2_ctx_failed = False
+        _outline_prof = None      # segv2.parcel_elevation.ParcelOutlineProfiler (v2 only)
+        if MODEL_VERSION == "v2" and cadastre_data.get("parcels"):
+            try:
+                import sys as _sys
+                _sv2 = str(Path(__file__).resolve().parent / "segv2")
+                if _sv2 not in _sys.path:
+                    _sys.path.insert(0, _sv2)
+                import parcel_elevation as _pe
+                _outline_prof = _pe.ParcelOutlineProfiler(
+                    (p["parcel_id"], p["geometry"]) for p in cadastre_data["parcels"] if p.get("geometry") is not None)
+                log.info("KG %s: parcel outline profiler: %d parcels", kg_code, len(_outline_prof))
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: parcel outline profiler unavailable: %s", kg_code, _e)
+        _classifier_used: dict = {}   # classifier string -> #tiles (→ JSON "model" block)
 
         # --- 1.5. Abort + requeue on transient cadastre-API failure ---
         # The cadastre-process-api can be briefly overloaded (503/timeout).
@@ -7785,6 +7865,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 pass
 
             _report_step("segment", f"{tile_label} — classify")
+            # v2: one OSM/cadastre/INVEKOS context per KG (parcels + footprints
+            # come from the cadastre_data we already hold; OSM + INVEKOS are
+            # fetched once for the KG bbox and rasterised per tile).
+            if MODEL_VERSION == "v2" and _v2_ctx is None and not _v2_ctx_failed:
+                try:
+                    import sys as _sys
+                    _sv2 = str(Path(__file__).resolve().parent / "segv2")
+                    if _sv2 not in _sys.path:
+                        _sys.path.insert(0, _sv2)
+                    import inference as _v2inf
+                    _kgb = transform_to_3035(box(full_west, full_south, full_east, full_north)).bounds
+                    _v2_ctx = _v2inf.Context(
+                        _kgb,
+                        parcels=[p["geometry"] for p in cadastre_data.get("parcels", []) if p.get("geometry") is not None],
+                        footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", []) if b.get("geometry") is not None])
+                    tile_avail["v2_context"] = True
+                except Exception as _e:  # noqa: BLE001
+                    _v2_ctx_failed = True
+                    log.warning("KG %s: v2 context failed (%s) — tiles fall back to per-tile context", kg_code, _e)
             try:
                 seg_result = oc.segment_and_classify(
                     tdata["dtm"], tdata["dsm"], t_mask, t_transform,
@@ -7795,7 +7894,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     observation_year=obs_year,
                     infra_lookup=infra,
                     mark_uncertain=mark_uncertain,
+                    model=MODEL_VERSION,
+                    v2_context=_v2_ctx,
+                    parcels=[p["geometry"] for p in cadastre_data.get("parcels", [])] if MODEL_VERSION == "v2" else None,
+                    footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", [])] if MODEL_VERSION == "v2" else None,
                 )
+                _st = seg_result.get("stats") or {}
+                if _st.get("classifier"):
+                    _classifier_used[_st["classifier"]] = _classifier_used.get(_st["classifier"], 0) + 1
             except Exception as e:
                 log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
                 tile_data_availability.append(tile_avail)
@@ -7804,6 +7910,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             t_objects = seg_result["objects"]
             t_labels = seg_result["labels"]
             tile_avail["segmentation"] = True
+            if _outline_prof is not None:
+                try:
+                    _outline_prof.sample(tdata["dtm"], tdata.get("dsm"), t_transform)
+                except Exception as _e:  # noqa: BLE001
+                    log.debug("KG %s %s: outline sampling failed: %s", kg_code, tile_label, _e)
             tile_avail["n_objects"] = len(t_objects)
 
             # Remap obj_ids to global unique range
@@ -8478,6 +8589,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except Exception as _ckpt_e:
                 log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
 
+        # --- 5b. v2: top up parcel outline profiles for tiles restored from
+        # checkpoints (they never went through the tile loop's sampler) ---
+        if _outline_prof is not None and _outline_prof.summary()["missing"]:
+            try:
+                for _ti_idx, _tr in enumerate(tile_seg_results):
+                    if not _outline_prof.summary()["missing"]:
+                        break
+                    _td = _read_dtm_for_tile(_tr, kg_code=kg_code, tile_idx=_ti_idx)
+                    _outline_prof.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
+                log.info("KG %s: outline profiles topped up: %s", kg_code, _outline_prof.summary())
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: outline profile top-up failed: %s", kg_code, _e)
+
         # --- 6. Build light GPKG ---
         result["step"] = "gpkg_light"
         _report_step("gpkg_light", f"{len(cadastre_data['parcels'])} parcels, {len(all_new_buildings)} new bldg")
@@ -8485,7 +8609,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
             obs_year=obs_year, mark_uncertain=mark_uncertain,
-            label_remap=_boundary_remap)
+            label_remap=_boundary_remap, outline_profiler=_outline_prof)
         result["files"]["light_gpkg"] = light_gpkg
 
         # --- 6b. Validate light GPKG ---
@@ -8560,7 +8684,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             all_new_buildings, all_infrastructure, obs_year,
             n_tiles=n_tiles, tile_km=tile_km,
             total_seg_pixels=total_seg_pixels,
-            tile_data_availability=tile_data_availability)
+            tile_data_availability=tile_data_availability,
+            outline_profiler=_outline_prof, classifier_used=_classifier_used)
 
         # Store quality info in result for logging / Zenodo
         dq = json_summary.get("data_quality", {})

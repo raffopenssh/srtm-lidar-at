@@ -33,6 +33,7 @@ TYPE_LETTER = {
     'garden': 'a', 'bare_soil': 'B', 'rock': 'K', 'excavation': 'E',
     'fill': 'L', 'tree_loss': 'l', 'construction': 'C',
     'earthwork': 'e', 'unclassified': 'u',
+    'rail': 'i', 'glacier': 'I', 'wetland': 'm',  # v2 classes
 }
 
 LETTER_TYPE = {v: k for k, v in TYPE_LETTER.items()}

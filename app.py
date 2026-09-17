@@ -11729,6 +11729,10 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
     mark_uncertain = str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes')
+    # classifier: 'v1' (deployed RF) | 'v2' (segv2 LightGBM); default from env
+    seg_model = str(params.get('model', os.environ.get('SEG_MODEL_VERSION', 'v1'))).lower()
+    if seg_model not in ('v1', 'v2'):
+        seg_model = 'v1'
     type_filter = params.get('types', None)
     if isinstance(type_filter, str):
         type_filter = [t.strip() for t in type_filter.split(',')]
@@ -11836,6 +11840,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             observation_year=obs_year,
             infra_lookup=_infra_lookup,
             mark_uncertain=mark_uncertain,
+            model=seg_model,
         )
 
         objects = result['objects']
@@ -11943,6 +11948,15 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "rf_type": obj.rf_type,
             "rf_confidence": obj.rf_confidence,
         }
+        if seg_model == 'v2':
+            _f = obj.features or {}
+            if _f.get("invekos_type"):
+                props["invekos_type"] = _f["invekos_type"]
+                props["invekos_snar"] = _f.get("invekos_snar", "")
+                props["invekos_frac"] = round(float(_f.get("invekos_frac", 0.0)), 3)
+            if _f.get("v2_type2"):
+                props["type2"] = _f["v2_type2"]
+                props["type2_confidence"] = round(float(_f.get("v2_conf2", 0.0)), 3)
         if include_ortho or include_copernicus:
             props["ndvi_mean"] = obj.ndvi_mean
             props["ndvi_fused"] = obj.ndvi_fused
@@ -11981,6 +11995,8 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         "stats": all_stats,
         "meta": {
             "classifier": "watershed_v1",
+            "model": (result.get('stats') or {}).get('model', 'v1'),
+            "model_classifier": (result.get('stats') or {}).get('classifier', ''),
             "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
             "attribution": __import__('attributions').attribution_short(),
             "license": __import__('attributions').OUTPUT_LICENSE,
@@ -12191,6 +12207,7 @@ SEGMENT_COLORS = {
     "grass":        (124, 252, 0, 150),
     "hedge":        (46, 139, 87, 170),
     "water":        (30, 144, 255, 180),
+    "wetland":      (0, 168, 150, 170),
     "roof":         (220, 20, 60, 200),
     "greenhouse":   (255, 105, 180, 180),
     "solar_panel":  (65, 105, 225, 200),
@@ -12203,12 +12220,14 @@ SEGMENT_COLORS = {
     "path":         (169, 169, 169, 150),
     "parking":      (105, 105, 105, 160),
     "bridge":       (112, 128, 144, 170),
+    "rail":         (90, 60, 110, 180),
     "crop":         (218, 165, 32, 160),
     "orchard":      (107, 142, 35, 170),
     "vineyard":     (147, 112, 219, 170),
     "garden":       (60, 179, 113, 160),
     "bare_soil":    (210, 180, 140, 140),
     "rock":         (139, 134, 130, 160),
+    "glacier":      (200, 235, 255, 180),
     "excavation":   (139, 0, 0, 200),
     "fill":         (255, 140, 0, 200),
     "tree_loss":    (255, 0, 255, 200),
@@ -12377,6 +12396,9 @@ def segment_overlay():
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
         mark_uncertain = str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes')
+        seg_model = str(params.get('model', os.environ.get('SEG_MODEL_VERSION', 'v1'))).lower()
+        if seg_model not in ('v1', 'v2'):
+            seg_model = 'v1'
         type_filter_str = params.get('types', None)
         type_filter = None
         if type_filter_str:
@@ -12546,6 +12568,7 @@ def segment_overlay():
             observation_year=obs_year,
             infra_lookup=_infra_lookup,
             mark_uncertain=mark_uncertain,
+            model=seg_model,
         )
 
         objects = result['objects']

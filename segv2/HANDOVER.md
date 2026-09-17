@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-17 06:30 UTC: **final 14-class G training in tmux `segv2train`** (fold 2/5, ETA ≈ 08:45 UTC); **v2 wiring done behind `SEG_MODEL_VERSION` (default v1)** — inference.py, parcel_elevation.py, processor/app/object_segmentation gated branches, fleet rolled to c2cfd86; **next: WILHELM v1-vs-v2 live test** (new conversation); earlier: build complete, train v2 + G/H FINISHED, ship candidate = G)
+# segv2 — handover (2026-09-13, status 2026-09-17 19:45 UTC: **14-class G final model shipped on disk** (CV macro-F1 0.781); **WILHELM v1-vs-v2 live test done** → `?share=WILHELM` vs `?share=WILHELMv2`; live-path bugs fixed (segment 500 on every include_copernicus request, Zenodo dead-strip 404 storm); **next: 4 more KGs visual QA, then processor v2 dry run on one peer**)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -314,12 +314,49 @@ changes for v1 output except three new (unused by v1) type ids/colours.
 * `import app` in a script spawns the peer-sync threads (Zenodo 404 spam) — test the app path
   through the running server, not in-process.
 
+### 2026-09-17 19:45 UTC — final 14-class G on disk, WILHELM live test, live-path bugs fixed
+
+* `train_v2_final.log` FINISHED 06:45 UTC. **G (14 classes): macro-F1 0.781 / wF1 0.921 / acc
+  0.925 / ECE 0.040** (A on the same set 0.283). `model_G.joblib` (36 MB, hash `7089ca645ff5`)
+  + `.meta.json` (`classes` = the 14, `drop_classes` earthwork/path). `report_model_v2.md`
+  regenerated: top gain `ndvi_ndsm_coherence` 13 %, `dist_building` 9.6 %, `elevation_mean` 9.4 %.
+* **WILHELM (62 ha, 19570 area) live test**: `python3 segv2/seg_live.py v2|v1` (script now in
+  repo; handles the sync seg_cache hit). Wall time ≈ 45–55 s for both models — v2 inference is
+  3.9 s of that (context fetch 1 s + LightGBM); the rest is v1's shared DTM/DSM/ortho/Copernicus/
+  segmentation/texture path. v1: tree 1242 / grass 99 / crop 70 / tree_loss 55 / shrub 53 /
+  hedge 18. v2: tree 803 / grass 414 / shrub 149 / rock 123 / garden 20 / tree_loss 15 / crop 13
+  (10 INVEKOS overrides). Shares: **`/?share=WILHELM`** (v1, Aug) vs **`/?share=WILHELMv2`**
+  (v2; legend shows `Model: v2 lgbm_v2:<hash> · trained · CV macro-F1`). Response `meta` carries
+  `model`, `model_classifier`, `v2_trained_at/n_train/cv_macro_f1/classes`.
+* **Bugs found by the live test (all fixed, rolled out):**
+  1. `app._segment_core` — `copernicus_data` was `del`'d for memory (cdfe92d, Apr) but read again
+     at the end for the "not in cache" warning → `UnboundLocalError` → **every
+     `include_copernicus=true` request 500'd after doing the full 45 s compute** (v1 and v2).
+     The async progress endpoint reported `step=error`; old seg_live.py only looked at `status`
+     so it polled until timeout — that was the perceived "v2 is slow". Fixed with a
+     `copernicus_missing` flag.
+  2. Zenodo tile-cache dead entries: `cache_manifest.json` listed 5 ZIPs that 404 on Zenodo
+     (`copernicus_ndvi_strip_48.0_48.5.zip` updated 08:51 today; 2 harmonics, 1 sar, 1 worldcover
+     cell). `ZipIndex._load_or_fetch` re-fetched the central directory on **every** `has_entry`
+     → 38 k 404s in 3 h on the primary alone. Fixes in `zenodo_cache.py`: `ZipIndex` negative
+     cache (30 min on 403/404/410, 3 min on transient); `CacheManifest.get_file` hides size-0
+     **tombstones** and `CacheManifest.tombstone()` writes them (a plain pop was resurrected by
+     the peer-sync `updated_at` merge); `_upload_file` raises `_RemoteFileLost` on non-transient
+     HTTP error / retry exhaustion / **post-upload size mismatch** after it has already deleted
+     the old copy, and both flush + rebuild callers tombstone the entry instead of leaving a URL
+     that 404s. The 5 dead entries were tombstoned by hand (`tombstone_reason` field). Root cause
+     of how they went dead is still open — candidates: DELETE-then-failed-PUT (now covered), or a
+     peer's 09-17 08:51 rewrite of the NDVI strip racing another upload. **segv2 itself never
+     writes to the tile cache** (no `set_file`/flush anywhere under `segv2/`).
+* Model provenance in the UI: `static/index.html` meta line shows the v2 model when
+  `meta.model==='v2'` instead of the stale v1 `RF model: … OOB 0.6991`.
+
 ### Next steps (in order) — updated
 1. Wait for `FINISHED` in `data/segv2/train_v2_final.log` (fold 2/5 at 06:30; ~15–35 min/fold);
    read `report_v2_final.md`; `python3 segv2/model_v2.py` → `report_model_v2.md`. Sanity:
    `model_G.meta.json` `classes` = the 14 (crop garden glacier grass orchard parking rail road
    rock roof shrub tree vineyard water).
-2. **WILHELM v1 vs v2 live test (new conversation).** Script ready at `/tmp/seg_live.py`
+2. ~~WILHELM v1 vs v2 live test~~ done (see 19:45 entry). Script at `segv2/seg_live.py`
    (`python3 /tmp/seg_live.py v2` / `v1`: POSTs `/api/v1/segment` with the WILHELM geometry
    from `data/shares/WILHELM.json.gz` `state.geometry`, all layers on, `async`, polls progress,
    dumps `/tmp/wilhelm_<m>.json` + type/source counts). Then save the v2 result as share

@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-17 05:05 UTC: **final 14-class G training in tmux `segv2train`**, model_v2.py done, processor new-building/cadastre-fast-path fixes; earlier: build complete (171 parquets; 72321 unbuildable), **train v2 + harmonics-free G/H FINISHED** → `report_v2.md`, `report_v2_noharm.md`; **ship candidate = G** (`models/model_G.joblib`))
+# segv2 — handover (2026-09-13, status 2026-09-17 06:30 UTC: **final 14-class G training in tmux `segv2train`** (fold 2/5, ETA ≈ 08:45 UTC); **v2 wiring done behind `SEG_MODEL_VERSION` (default v1)** — inference.py, parcel_elevation.py, processor/app/object_segmentation gated branches, fleet rolled to c2cfd86; **next: WILHELM v1-vs-v2 live test** (new conversation); earlier: build complete, train v2 + G/H FINISHED, ship candidate = G)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -237,47 +237,105 @@ esa_* 14.8 %, harm_* 0.0 %; top SHAP ndvi_mean, elevation_mean, ndsm_frac_gt2, d
   overhang). Logged as `new buildings: skipped N roof segment(s) outside the KG parcel union`.
   Needs the usual commit → push → `restart srv` to roll out (director auto-rollout).
 
+### 2026-09-17 06:30 UTC — v2 wired behind a switch (commits 9c8b5f0, c2cfd86), fleet rolled
+
+**Fleet**: `5e1594a` (cadastre fast path + new-building KG gate) and `c2cfd86` were
+pushed + `restart srv`; director target = `c2cfd86`, wave rollout in progress
+(check `versions:` in `/process.txt`). **Peers stay v1**: every v2 path is gated on
+`SEG_MODEL_VERSION=v2` (env, default `v1`) or `model=v2` request param. Nothing
+changes for v1 output except three new (unused by v1) type ids/colours.
+
+**New files**
+* `segv2/inference.py` — live-path adapter. `layers_from_arrays(dtm, dsm, mask, transform,
+  spectral=, cop=, dtm_dates=, dsm_dates=, hansen=, obs_year=, ortho_year=)` builds the `L`
+  dict `features.extract` expects from the processor/app in-memory arrays (indices recomputed
+  from bands with black→NaN; date keys `'20220915'`→2022; real flight years via `acquisition`;
+  `harmonics=None`). `Context(bbox_3035, flight_year=, parcels=, footprints=)` fetches OSM
+  (`labels.fetch_osm`), INVEKOS (`labels.fetch_invekos_api(nearest_to=flight)`, local GPKG
+  fallback only if present), cadastre via `/spatial/parcels|footprints` fast path when not
+  passed; `.rasters(tf, shape)` → `dist_*` context rasters + `invekos_idx` (int32 polygon
+  index, shrunk 1 m) + `invekos_types` + `osm_edges`. `add_invekos_columns` (sparse per-segment
+  mode → `invekos_type/snar/frac`), `classify(df)` = `ModelV2.predict` + **INVEKOS post-hoc**
+  (frac ≥ 0.7, Schlag type ∈ crop/grass/vineyard/orchard/garden, model said veg-like, `h_p90 ≤
+  labels.MAX_H[type]` → take Schlag type, conf ≥ 0.9, source `v2+invekos`), `run(labels, …)`
+  chains everything for one tile (~2 s / 1500² tile excl. texture).
+  **Feature parity verified** on KG 19570 vs the training path (`features.pixel_layers`): all
+  non-harm keys match when the live path gets the same NIR year (RGB + NIR must come from the
+  same ortho year — the processor does that; the GPKG path uses newest-RGB/newest-real-NIR which
+  differ only when 2024 has no CIR). Multi-year NDVI features (`ndvi_y_first`, `ndvi_tstd`,
+  `ndvi_years_span`) are single-year at inference (span 0 → trend/tstd NaN) — the model saw
+  such rows in training (KGs with one CIR year), acceptable.
+* `segv2/parcel_elevation.py` — **parcel-outline elevation profiles** (operator request: keep
+  elevation along parcel outlines, compact, so terrain/building ideas can be improved later
+  and exposed via the API). Deterministic sampling of each parcel's exterior ring from vertex 0
+  at `sp` m (`choose_spacing`: 5 m base, 8–120 pts) → DTM + nDSM at the 1 m pixel, int16
+  decimetres, `-32768` nodata. `ParcelOutlineProfiler(parcels).sample(dtm, dsm, tf)` per tile
+  (any order, first value wins), `.records()` → JSON per parcel `outline_z = {n, sp, p0, miss,
+  z(base64), zs(base64)}` (~550 B/parcel, gz ~190 B), `.gpkg_rows()` + `write_gpkg_table()` →
+  light-GPKG attribute table `parcel_outline_z` (registered in `gpkg_contents`). `decode(rec)`
+  → float arrays; `outline_points(geom, sp, n)` re-derives xy from the cadastre polygon (xy is
+  not stored). Tested on 19570 (43 parcels, 3665 pts, 0 missing, 0.1 s).
+
+**Wiring**
+* `object_segmentation.segment_and_classify(model=None, v2_context=None, parcels=None,
+  footprints=None)` — `model` defaults to env `SEG_MODEL_VERSION`. v2 branch = **Step 3c**
+  after v1 feature extraction: `segv2.inference.run` on the same `labels`; results replace
+  `rf_results` (so infra override / NDVI override / cadastre calibration / grouping run
+  unchanged); `classifier_source` = `v2` | `v2+invekos`; `rf_model_hash = "v2:<hash>"`;
+  per-object `features` gain `invekos_type/snar/frac`, `v2_type2/v2_conf2`, `dsm_year`,
+  `dist_road/building/water/parcel_edge`. Falls back to v1 RF with a warning if v2 fails.
+  `stats` gains `model`, `classifier` (`lgbm_v2:<hash>` / `rf_v1:<hash>`), `v2_classified`,
+  `v2_invekos_override`. Tested end-to-end on a 19570 tile: v1 6.7 s / v2 5.6 s, 144 objects,
+  v2 144 classified, 2 INVEKOS overrides.
+* New `OBJECT_TYPES`: `wetland=6`, `rail=24`, `glacier=42`; colours in `app.py` +
+  `austria_processor.py` `SEGMENT_COLORS`, `static/index.html` `TYPE_SHAPES` + `TYPE_COLORS`;
+  `parcel_compact.TYPE_LETTER` `rail='i', glacier='I', wetland='m'`. Sync asserted.
+* `austria_processor`: `MODEL_VERSION = env SEG_MODEL_VERSION`, `VERSION = "v2"` iff v2
+  (stamps manifest/JSON/Zenodo metadata). In v2: one `inference.Context` per KG (KG bbox,
+  parcels + footprints from `cadastre_data`; OSM + INVEKOS fetched once) passed to every tile;
+  `ParcelOutlineProfiler` sampled per tile, topped up after the tile loop from raster sidecars
+  (`_read_dtm_for_tile`) and again in `build_json_summary_tiled` from the lazy tile cache (for
+  checkpoint-restored tiles); JSON `parcels.details[].outline_z` + `parcels.outline_z_encoding`
+  + `summary["model"] = {version, classifier, classifier_by_tile}`; light GPKG gets the
+  `parcel_outline_z` table. All v2-only, `None`-guarded in v1.
+* `app.py /api/v1/segment`: `model=v1|v2` param (default env). Response `meta.model`,
+  `meta.model_classifier`; per-feature props in v2: `invekos_type/snar/frac`, `type2`,
+  `type2_confidence`.
+* `segv2/gpkg_raster.read`: single-band uint8 tables (WorldCover, Hansen_*, segment_*) come
+  back RGBA-expanded (4, h, w) from GDAL's PNG tiles → now returns band 0. (Training read
+  values via flat indexing so parquets are unaffected; the live e2e test tripped on it.)
+
+**Not done / caveats**
+* `_write_light_gpkg` validator (`validate_kg_outputs`) ignores attribute tables — fine.
+* The v2 model currently on disk is still the **17-class G** (`model_G.joblib`, 2026-09-16);
+  the 14-class fit overwrites it when `train_v2_final.log` says `FINISHED`. `ModelV2` reads
+  classes from the joblib, so no code change; `bare_soil`/`earthwork`/`path` then stop being
+  predicted (rule-only). Regenerate `python3 segv2/model_v2.py` afterwards.
+* `import app` in a script spawns the peer-sync threads (Zenodo 404 spam) — test the app path
+  through the running server, not in-process.
+
 ### Next steps (in order) — updated
-1. Wait for `FINISHED` in `train_v2_final.log`; read `report_v2_final.md`; regenerate
-   `python3 segv2/model_v2.py`. Sanity: meta `classes` must be the 14 above.
-2. **`segv2/inference.py` (not started)** — the live-path adapter so v2 can run in the app
-   and processor without GPKGs:
-   * `layers_from_arrays(dtm, dsm, mask, transform, spectral, cop_resampled, dtm_dates,
-     dsm_dates, hansen, obs_year, ortho_year)` → the `L` dict `features.extract()` expects
-     (mirror `features.pixel_layers`: nDSM=clip(dsm−dtm), slope/aspect/tri/tpi/curv,
-     rough/edge, spectral with black→NaN and brightness/green_ratio/rg_index/ndwi/savi
-     recomputed from bands, `ndvi_years={ortho_year: ndvi}` so `ndvi_y_first/last` match
-     training, `als_years` via `acquisition.als_year_rasters`, `ortho_flight_years` via
-     `acquisition.ortho_flight_year`, date keys `int(str(k)[:4])`, `harmonics=None`).
-   * `Context(bbox_3035, flight_year, parcels=None, footprints=None)`: OSM via
-     `labels.fetch_osm`, footprints via cadastre fast path, parcels via
-     `/spatial/parcels` fast path (processor passes its already-fetched cadastre_data),
-     INVEKOS via `labels.fetch_invekos_api(nearest_to=flight_year)`; `.rasters(transform,
-     shape)` → `dist_*` context dict (same as `build_dataset._context_rasters`) + an
-     INVEKOS polygon-index raster (→ per-segment mode gives `invekos_type`, `invekos_snar`,
-     `invekos_frac`) + `osm_edges` for the v2 segmentation.
-   * `classify(df, …)`: `ModelV2.predict` → then **INVEKOS post-hoc**: if `invekos_frac ≥ 0.7`
-     and the INVEKOS type ∈ {crop, grass, vineyard, orchard, garden} and the physical veto
-     holds (`labels.MAX_H` on `h_p90`: crop 2.5, grass 2.0, vineyard 3.5, garden 3.0,
-     orchard 8) and the model said an agri/veg class → take the INVEKOS type, conf ≥ 0.9,
-     `classifier_source="v2+invekos"`. Write `invekos_*` into the feat dict so they reach
-     the products. (INVEKOS was the label source, so this is the best available answer
-     and it is cheap: one API call per bbox, ~0.7 s.)
-3. **Wiring behind a switch (default v1):** `object_segmentation.segment_and_classify(model=None)`
-   → `model or os.environ.get("SEG_MODEL_VERSION","v1")`; in the `v2` branch, after Step 3,
-   run `segv2.inference` on the same `labels`, replace `rf_results`, keep infra override /
-   cadastre calibration / grouping; meta `classifier="lgbm_v2"`. Add `OBJECT_TYPES`
-   `rail=24`, `glacier=42`, `wetland=6` + colours in `app.py`, `austria_processor.py`,
-   `static/index.html` (docs/cross-cutting-concerns.md). `austria_processor`: pass `model`,
-   `VERSION="v2"` products when v2 (manifest `version` field). `app.py /api/v1/segment`:
-   `model=v1|v2` request param (default env). **Peers stay v1** until the env is flipped.
-4. Seg-v2 edge eval: `build_dataset.py --v2-edges --out data/segv2/dataset_v2edges` on 20
-   KGs (tmux, ~1.5 h, Zenodo permitting); compare mean `y_purity` and segment count vs the
-   plain build for the same codes.
-5. Visual QA: `data/shares/WILHELM.json.gz` (`state.geometry`, endpoint `segment`,
-   47.138 N 15.118 E) → POST `/api/v1/segment` with `model=v2` and the same state, save as
-   share **`WILHELMv2`** (`/api/v1/share`, name field) so `?share=WILHELM` vs `?share=WILHELMv2`
-   can be compared side by side; then 4 more KGs.
+1. Wait for `FINISHED` in `data/segv2/train_v2_final.log` (fold 2/5 at 06:30; ~15–35 min/fold);
+   read `report_v2_final.md`; `python3 segv2/model_v2.py` → `report_model_v2.md`. Sanity:
+   `model_G.meta.json` `classes` = the 14 (crop garden glacier grass orchard parking rail road
+   rock roof shrub tree vineyard water).
+2. **WILHELM v1 vs v2 live test (new conversation).** Script ready at `/tmp/seg_live.py`
+   (`python3 /tmp/seg_live.py v2` / `v1`: POSTs `/api/v1/segment` with the WILHELM geometry
+   from `data/shares/WILHELM.json.gz` `state.geometry`, all layers on, `async`, polls progress,
+   dumps `/tmp/wilhelm_<m>.json` + type/source counts). Then save the v2 result as share
+   **`WILHELMv2`** (`/api/v1/share`, name field, same `state` with `model:'v2'`) so
+   `?share=WILHELM` vs `?share=WILHELMv2` compare side by side; then 4 more KGs. Watch
+   `journalctl -u srv` for `Step 3c` lines / `segv2 inference failed` warnings.
+3. Processor v2 dry run on ONE parked/idle peer or the primary's processor in single-KG mode
+   with `SEG_MODEL_VERSION=v2` (systemd drop-in `Environment=SEG_MODEL_VERSION=v2` on the
+   processor unit, **not** in `srv`): check JSON `model` block, `parcels.details[].outline_z`,
+   light GPKG `parcel_outline_z`, manifest `version: v2`. Needs the `model_G.joblib` on that
+   peer (`data/segv2/models/` is gitignored → copy or fetch; decide: commit the 45 MB model
+   to a Zenodo deposit and download on first use in `ModelV2.load`).
+4. Seg-v2 edge eval: `build_dataset.py --v2-edges --out data/segv2/dataset_v2edges` on 20 KGs
+   (compare mean `y_purity` and segment count vs the plain build).
+5. Expose `outline_z` in the API (`/api/v1/kg/<code>`, `/parcel/<id>/detail`) once v2 JSONs
+   exist — decode helper is `segv2.parcel_elevation.decode`.
 
 ### Next steps (in order)
 1. ~~Pick ship candidate~~ → **G**.

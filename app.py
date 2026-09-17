@@ -11748,6 +11748,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     all_shape = None
     all_mask = None
     hansen_evaluation = None
+    copernicus_missing = False  # set per feature below (copernicus_data is del'd early)
 
     for feat in features:
         geom = feat['geometry']
@@ -11847,6 +11848,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         labels = result['labels']
 
         # Free heavy intermediates that segment_and_classify already consumed
+        copernicus_missing = copernicus_data is None
         del dtm_dates, dsm_dates, spectral, copernicus_data, building_footprints
         import gc; gc.collect()
 
@@ -12020,7 +12022,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         resp["cadastre_evaluation"] = all_evaluation
     if hansen_evaluation:
         resp["hansen_evaluation"] = hansen_evaluation
-    if include_copernicus and copernicus_data is None and _is_processor_running():
+    if include_copernicus and copernicus_missing and _is_processor_running():
         resp.setdefault('warnings', []).append(
             'Copernicus data not in cache — served without Sentinel-2/SAR (processor running)')
 

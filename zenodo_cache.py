@@ -322,8 +322,39 @@ class CacheManifest:
             }
 
     def get_file(self, zip_name: str) -> Optional[Dict]:
+        """Return the manifest entry, or None if absent **or tombstoned**.
+
+        A tombstone is an entry with ``size == 0`` (same convention the
+        chkpt registry uses). We tombstone rather than pop because the
+        manifest is merged primary<->peers by ``updated_at`` (last writer
+        wins) — a plain pop is resurrected by the next peer sync, and the
+        dead URL then gets re-probed for every tile lookup (Sep 2026:
+        38k 404s in 3 h against one vanished NDVI strip).
+        """
         with self._lock:
-            return self._data.get("files", {}).get(zip_name)
+            e = self._data.get("files", {}).get(zip_name)
+        if e is not None and not e.get("size", 0):
+            return None
+        return e
+
+    def tombstone(self, zip_name: str, reason: str = "") -> bool:
+        """Mark a ZIP as gone on Zenodo (size=0, fresh updated_at) so the
+        deletion survives peer-sync merging. Returns True if changed."""
+        from datetime import datetime, timezone
+        with self._lock:
+            files = self._data.setdefault("files", {})
+            e = files.get(zip_name)
+            if e is not None and not e.get("size", 0):
+                return False
+            files[zip_name] = {
+                "url": (e or {}).get("url", ""),
+                "size": 0,
+                "checksum": "",
+                "tile_count": 0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "tombstone_reason": reason,
+            }
+        return True
 
     def all_files(self) -> Dict[str, Dict]:
         with self._lock:
@@ -431,6 +462,14 @@ class ZipIndex:
         self._entries: Optional[Dict[str, zipfile.ZipInfo]] = None
         self._cache_key = hashlib.md5(url.encode()).hexdigest()[:12]
         self._index_path = cache_dir / f"{self._cache_key}.json"
+        # Negative cache: (monotonic deadline, exception). Without it every
+        # has_entry() on a strip whose remote file vanished re-fetched the
+        # central directory -> 404 -> swallowed by the caller -> next tile.
+        self._fail_until: float = 0.0
+        self._fail_exc: Optional[BaseException] = None
+
+    FAIL_TTL_404_S = 1800.0   # file gone: don't re-probe for 30 min
+    FAIL_TTL_OTHER_S = 180.0  # transient (5xx / timeout): 3 min
 
     def _load_or_fetch(self) -> Dict[str, zipfile.ZipInfo]:
         """Return dict of entry_name → ZipInfo."""
@@ -467,11 +506,27 @@ class ZipIndex:
             except Exception:
                 self._index_path.unlink(missing_ok=True)
 
+        # Negative cache — re-raise the remembered failure without I/O.
+        if self._fail_exc is not None:
+            if time.monotonic() < self._fail_until:
+                raise self._fail_exc
+            self._fail_exc = None
+
         # Fetch central directory from remote ZIP
         log.info("Fetching ZIP index from %s", self.url)
-        hrf = HTTPRangeFile(self.url, session=self._session)
-        with zipfile.ZipFile(hrf) as zf:
-            entries = {zi.filename: zi for zi in zf.infolist()}
+        try:
+            hrf = HTTPRangeFile(self.url, session=self._session)
+            with zipfile.ZipFile(hrf) as zf:
+                entries = {zi.filename: zi for zi in zf.infolist()}
+        except Exception as exc:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            ttl = (self.FAIL_TTL_404_S if code in (403, 404, 410)
+                   else self.FAIL_TTL_OTHER_S)
+            self._fail_exc = exc
+            self._fail_until = time.monotonic() + ttl
+            log.warning("ZIP index fetch failed for %s (%s); suppressing "
+                        "re-probes for %ds", self.url, exc, int(ttl))
+            raise
 
         # Cache locally
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +568,8 @@ class ZipIndex:
         more tiles merged in).
         """
         self._entries = None
+        self._fail_exc = None
+        self._fail_until = 0.0
         try:
             self._index_path.unlink(missing_ok=True)
         except Exception:
@@ -1307,9 +1364,8 @@ class ZenodoCache:
                             "Zenodo cache: stale manifest entry for %s (404), "
                             "dropping and uploading fresh", zip_name)
                         try:
-                            with self.manifest._lock:
-                                self.manifest._data.get("files", {}).pop(
-                                    zip_name, None)
+                            # Tombstone (not pop): survives peer-sync merge.
+                            self.manifest.tombstone(zip_name, "404 on upload")
                             self.manifest.save()
                         except Exception:
                             pass

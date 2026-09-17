@@ -11176,6 +11176,24 @@ def _error(msg, code=400):
     return jsonify({"error": str(msg)}), code
 
 
+def _v2_model_meta(model: str) -> dict:
+    """segv2 model provenance for response meta (only when model == 'v2')."""
+    if model != 'v2':
+        return {}
+    try:
+        from segv2.model_v2 import get_model
+        m = get_model().meta or {}
+        cv = m.get('cv_metrics')
+        return {
+            "v2_trained_at": m.get('trained_at'),
+            "v2_n_train": m.get('n_train'),
+            "v2_cv_macro_f1": round(cv, 3) if isinstance(cv, (int, float)) else cv,
+            "v2_classes": m.get('classes'),
+        }
+    except Exception:
+        return {}
+
+
 def _rf_model_meta() -> dict:
     """Return RF model version info for response metadata."""
     try:
@@ -11999,6 +12017,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "classifier": "watershed_v1",
             "model": (result.get('stats') or {}).get('model', 'v1'),
             "model_classifier": (result.get('stats') or {}).get('classifier', ''),
+            **_v2_model_meta((result.get('stats') or {}).get('model', 'v1')),
             "pipeline": "Sobel→Felzenszwalb→RAG→classify→group",
             "attribution": __import__('attributions').attribution_short(),
             "license": __import__('attributions').OUTPUT_LICENSE,

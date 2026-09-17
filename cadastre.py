@@ -120,11 +120,55 @@ def _find_kgs_for_bbox(bbox_wgs84: tuple[float, float, float, float]) -> list[st
         return []
 
 
+def fetch_footprints_viewport(
+    bbox_wgs84: tuple[float, float, float, float],
+    *,
+    limit: int = 20000,
+    retries: int = 2,
+    timeout: float = 20.0,
+) -> Optional[dict]:
+    """Cadastre FAST PATH: ``GET /spatial/footprints`` (R-tree viewport read,
+    single-digit ms server-side, all KGs in the bbox in one call).
+
+    Returns a GeoJSON-like FeatureCollection (WGS84 polygons) or ``None`` when
+    the API is unreachable, the viewport is ``truncated`` (> limit rows) or the
+    per-KG caches are still warming (``ready: false`` after ``retries``).  The
+    caller then falls back to the per-KG export path.
+    """
+    west, south, east, north = bbox_wgs84
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(
+                f"{CADASTRE_BASE}/spatial/footprints",
+                params={"west": west, "south": south, "east": east, "north": north,
+                        "limit": limit},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            d = resp.json()
+        except Exception as e:  # noqa: BLE001
+            log.warning("spatial/footprints failed (%s)", e)
+            return None
+        if d.get("truncated"):
+            log.info("spatial/footprints truncated at %d rows → export fallback", limit)
+            return None
+        if d.get("ready", True):
+            feats = [{"type": "Feature", "geometry": f.get("geometry"),
+                      "properties": {k: v for k, v in f.items() if k != "geometry"}}
+                     for f in d.get("footprints", []) if f.get("geometry")]
+            return {"type": "FeatureCollection", "features": feats, "_fast_path": True}
+        # KG caches warming — the API queued them; give it a moment
+        time.sleep(1.5 * (attempt + 1))
+    log.info("spatial/footprints not ready after %d retries → export fallback", retries)
+    return None
+
+
 def fetch_building_footprints(
     bbox_wgs84: tuple[float, float, float, float],
     *,
     use_cache: bool = True,
     limit: int = MAX_PER_REQUEST,
+    fast_path: bool = True,
 ) -> Optional[list]:
     """Fetch building footprint POLYGONS from the Austrian Cadastre API.
 
@@ -155,7 +199,17 @@ def fetch_building_footprints(
     if use_cache:
         geojson = _load_cached(bbox_wgs84)
 
-    # --- HTTP fetch: export/geojson with building_footprints layer ---
+    # --- HTTP fetch, fast path: one R-tree viewport call for all KGs ---
+    if geojson is None and fast_path:
+        t0 = time.time()
+        geojson = fetch_footprints_viewport(bbox_wgs84)
+        if geojson is not None:
+            log.info("spatial/footprints fast path: %d footprints in %.2fs",
+                     len(geojson.get("features", [])), time.time() - t0)
+            if use_cache:
+                _save_cache(bbox_wgs84, geojson)
+
+    # --- HTTP fetch, slow path: export/geojson per KG ---
     if geojson is None:
         kg_codes = _find_kgs_for_bbox(bbox_wgs84)
         if not kg_codes:

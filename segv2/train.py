@@ -65,7 +65,16 @@ MERGE = {                    # applied to y, v1_type and v1-model predictions
     "excavation": "earthwork",
     "fill": "earthwork",
     "hedge": "shrub",        # 280 rows in the 143-KG build → too thin alone
+    # 2026-09-17 class-set decision (HANDOVER "Next steps" 2): NS-62 "vegetationsarme
+    # Flächen" is alpine scree/gravel — 16.7 k of 24.9 k bare_soil rows went to rock
+    # in model D/G (F1 .08). One class at 1 m.
+    "bare_soil": "rock",
 }
+# Classes removed from the trained class set (rows → unlabelled).  They stay in
+# the product taxonomy but are produced by rules only (v1 `classify_object` /
+# `_classify_infrastructure`), never by the v2 model: earthwork (NS-84 pits/dumps
+# are land-*use* polygons, F1 .09) and path (349 rows, F1 .33–.38).
+DROP_CLASSES = {"earthwork", "path"}
 MAX_PER_CLASS_TRAIN = 0       # 0 = no cap (operator OK'd full machine use); --cap N to limit
 # --- segment-level NDVI veto -----------------------------------------------------
 # Derived at train time from the *real* BEV-NIR distribution of the parquets
@@ -137,6 +146,9 @@ def load_dataset(quick: bool = False, seed: int = 0) -> pd.DataFrame:
     df["kg_parent"] = df["kg"].astype(str).str.split("-").str[0]
     df["y"] = df["y"].fillna("").replace(MERGE)
     df["v1_type"] = df["v1_type"].fillna("").replace(MERGE)
+    n_drop = int(df["y"].isin(DROP_CLASSES).sum())
+    df.loc[df["y"].isin(DROP_CLASSES), "y"] = ""
+    log.info("dropped classes %s → %d rows unlabelled", sorted(DROP_CLASSES), n_drop)
     # harmonics: 0 means "not available" for most KGs → NaN so GBMs treat it as missing
     hk = [k for k in ALL_KEYS if k.startswith("harm_")]
     miss = (df[hk].abs().sum(axis=1) == 0)
@@ -208,7 +220,7 @@ def select_labelled(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict]:
     info = {
         "n_rows_all": int(df.attrs.get("n_rows_all", len(df))), "n_rows_labelled": int(len(lab)),
         "classes": keep, "class_counts": {c: int(counts[c]) for c in keep},
-        "dropped_classes": dropped, "merge": MERGE,
+        "dropped_classes": dropped, "merge": MERGE, "drop_classes": sorted(DROP_CLASSES),
         "filter": {"min_purity": MIN_PURITY, "min_kg_frac": MIN_KG_FRAC, "min_class_rows": MIN_CLASS_ROWS},
         "n_parent_kgs": int(lab.kg_parent.nunique()),
         "n_ndvi_vetoed": n_vet, "ndvi_vetoed_by_class": vet_by, "ndvi_veto_mode": NDVI_VETO_MODE,
@@ -399,7 +411,7 @@ def write_report(res: dict, info: dict, classes: list[str]):
          f"generated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} · {info['n_rows_labelled']:,} labelled "
          f"segments from {info['n_parent_kgs']} parent KGs · {info.get('folds')}-fold GroupKFold by parent KG",
          "", f"Filter: purity ≥ {MIN_PURITY}, kg_frac ≥ {MIN_KG_FRAC}, class ≥ {MIN_CLASS_ROWS} rows. "
-         f"Merged: {MERGE}. Dropped: {info['dropped_classes']}. Train cap {MAX_PER_CLASS_TRAIN or 'none'}/class/fold. "
+         f"Merged: {MERGE}. Rule-only (removed): {info.get('drop_classes')}. Dropped (thin): {info['dropped_classes']}. Train cap {MAX_PER_CLASS_TRAIN or 'none'}/class/fold. "
          f"Segment NDVI veto ({info.get('ndvi_veto_mode')}; min {info.get('min_ndvi_seg')}, max {info.get('max_ndvi_seg')}) "
          f"removed {info.get('n_ndvi_vetoed', 0):,} rows {info.get('ndvi_vetoed_by_class')}. "
          f"Class weighting: {info.get('class_weight')}.", ""]
@@ -544,7 +556,8 @@ def main():
         joblib.dump(mdl, MODEL_DIR / f"model_{m}.joblib")
         (MODEL_DIR / f"model_{m}.meta.json").write_text(json.dumps({
             "model": m, "classes": list(map(str, mdl.classes_)), "feature_keys": keys, "nan_to_zero": nan0,
-            "n_train": int(len(idx)), "merge": MERGE, "class_weight": CLASS_WEIGHT,
+            "n_train": int(len(idx)), "merge": MERGE, "drop_classes": sorted(DROP_CLASSES), "class_weight": CLASS_WEIGHT,
+            "class_counts": info["class_counts"], "cv_per_class": res.get(m, {}).get("metrics", {}).get("per_class"),
             "ndvi_veto_mode": NDVI_VETO_MODE, "min_ndvi_seg": info["min_ndvi_seg"], "max_ndvi_seg": info["max_ndvi_seg"], "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cv_metrics": res.get(m, {}).get("metrics", {}).get("macro_f1"),
         }, indent=1))

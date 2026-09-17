@@ -1,4 +1,4 @@
-# segv2 — handover (2026-09-13, status 2026-09-16 04:40 UTC: build complete (171 parquets; 72321 unbuildable), **train v2 + harmonics-free G/H FINISHED** → `report_v2.md`, `report_v2_noharm.md`; **ship candidate = G** (`models/model_G.joblib`))
+# segv2 — handover (2026-09-13, status 2026-09-17 05:05 UTC: **final 14-class G training in tmux `segv2train`**, model_v2.py done, processor new-building/cadastre-fast-path fixes; earlier: build complete (171 parquets; 72321 unbuildable), **train v2 + harmonics-free G/H FINISHED** → `report_v2.md`, `report_v2_noharm.md`; **ship candidate = G** (`models/model_G.joblib`))
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes).
 This file is the *state + next steps* for whoever continues.
@@ -201,6 +201,83 @@ that is missing for 80 % of Austria at inference.
 * Fix in the same commit: `write_report` had a hard-coded `"ABCDEFP"` model order so G/H were
   silently missing from the markdown (JSON was complete) — now `"ABCDEFGHP"`; the md was
   regenerated from the JSON.
+
+
+### 2026-09-17 05:05 UTC — class-set decided, final G training, model_v2.py, processor fixes
+
+**Class-set decision (operator OK):** `bare_soil→rock` merged (`train.MERGE`), `earthwork` +
+`path` removed from the trained set (`train.DROP_CLASSES`, rows → unlabelled; both stay
+rule-only in the product taxonomy). Glacier kept. → 14 classes: crop garden glacier grass
+orchard parking rail road rock roof shrub tree vineyard water.
+
+**Running now: tmux `segv2train`** → `data/segv2/train_v2_final.log` (ends `FINISHED`),
+`--models A,G --save-final G --report-suffix _v2_final` → overwrites
+`data/segv2/models/model_G.joblib` + `.meta.json` (meta now also carries `drop_classes`,
+`class_counts`, `cv_per_class`). A on the new class set: macro-F1 0.283. Expect G ≈ 0.72+
+(the two weakest classes are gone). ETA ≈ 06:40 UTC (A 37 s, G ~80 min CV + ~15 min final fit).
+
+**`segv2/model_v2.py` done** — `ModelV2.load(letter|path)` (env `SEG_V2_MODEL`, default G),
+`predict(df) → (types, conf, raw_proba)` with feature order from meta, NaN passthrough,
+post-hoc NDVI vetoes as class masks on the proba matrix (rows without real NIR exempt),
+`top2()`, `get_model()` singleton, `report(df)` → `data/segv2/report_model_v2.md`
+(gain importances, family shares, TreeSHAP via LightGBM `pred_contrib`, top-5 per class).
+Run `python3 segv2/model_v2.py` after the final fit to regenerate the report for the
+14-class model (the current file is from the 17-class G: dist_* 22.7 % gain, ndvi_* 22.8 %,
+esa_* 14.8 %, harm_* 0.0 %; top SHAP ndvi_mean, elevation_mean, ndsm_frac_gt2, dist_building).
+
+**Processor/app fixes shipped in the same commit (v1-safe, no behaviour change to classes):**
+* `cadastre.fetch_footprints_viewport()` + `fetch_building_footprints(fast_path=True)`:
+  cadastre FAST PATH `GET /spatial/footprints?west..` (R-tree, ~0.1 s for all KGs in the
+  bbox) replaces `_find_kgs_for_bbox` + per-KG `export/geojson` (falls back on
+  `truncated` / not `ready`). The app's `/api/v1/segment` cadastre step uses it now.
+* `austria_processor`: per tile the building mask is KG footprints ∪ viewport footprints
+  (neighbour KGs' buildings inside the tile), and `vectorise_unmatched_buildings(kg_mask=…)`
+  skips roof segments with < 50 % of pixels inside the KG parcel-union raster. Fixes the
+  "new building" false positives that were just buildings outside the current KG (tile-grid
+  overhang). Logged as `new buildings: skipped N roof segment(s) outside the KG parcel union`.
+  Needs the usual commit → push → `restart srv` to roll out (director auto-rollout).
+
+### Next steps (in order) — updated
+1. Wait for `FINISHED` in `train_v2_final.log`; read `report_v2_final.md`; regenerate
+   `python3 segv2/model_v2.py`. Sanity: meta `classes` must be the 14 above.
+2. **`segv2/inference.py` (not started)** — the live-path adapter so v2 can run in the app
+   and processor without GPKGs:
+   * `layers_from_arrays(dtm, dsm, mask, transform, spectral, cop_resampled, dtm_dates,
+     dsm_dates, hansen, obs_year, ortho_year)` → the `L` dict `features.extract()` expects
+     (mirror `features.pixel_layers`: nDSM=clip(dsm−dtm), slope/aspect/tri/tpi/curv,
+     rough/edge, spectral with black→NaN and brightness/green_ratio/rg_index/ndwi/savi
+     recomputed from bands, `ndvi_years={ortho_year: ndvi}` so `ndvi_y_first/last` match
+     training, `als_years` via `acquisition.als_year_rasters`, `ortho_flight_years` via
+     `acquisition.ortho_flight_year`, date keys `int(str(k)[:4])`, `harmonics=None`).
+   * `Context(bbox_3035, flight_year, parcels=None, footprints=None)`: OSM via
+     `labels.fetch_osm`, footprints via cadastre fast path, parcels via
+     `/spatial/parcels` fast path (processor passes its already-fetched cadastre_data),
+     INVEKOS via `labels.fetch_invekos_api(nearest_to=flight_year)`; `.rasters(transform,
+     shape)` → `dist_*` context dict (same as `build_dataset._context_rasters`) + an
+     INVEKOS polygon-index raster (→ per-segment mode gives `invekos_type`, `invekos_snar`,
+     `invekos_frac`) + `osm_edges` for the v2 segmentation.
+   * `classify(df, …)`: `ModelV2.predict` → then **INVEKOS post-hoc**: if `invekos_frac ≥ 0.7`
+     and the INVEKOS type ∈ {crop, grass, vineyard, orchard, garden} and the physical veto
+     holds (`labels.MAX_H` on `h_p90`: crop 2.5, grass 2.0, vineyard 3.5, garden 3.0,
+     orchard 8) and the model said an agri/veg class → take the INVEKOS type, conf ≥ 0.9,
+     `classifier_source="v2+invekos"`. Write `invekos_*` into the feat dict so they reach
+     the products. (INVEKOS was the label source, so this is the best available answer
+     and it is cheap: one API call per bbox, ~0.7 s.)
+3. **Wiring behind a switch (default v1):** `object_segmentation.segment_and_classify(model=None)`
+   → `model or os.environ.get("SEG_MODEL_VERSION","v1")`; in the `v2` branch, after Step 3,
+   run `segv2.inference` on the same `labels`, replace `rf_results`, keep infra override /
+   cadastre calibration / grouping; meta `classifier="lgbm_v2"`. Add `OBJECT_TYPES`
+   `rail=24`, `glacier=42`, `wetland=6` + colours in `app.py`, `austria_processor.py`,
+   `static/index.html` (docs/cross-cutting-concerns.md). `austria_processor`: pass `model`,
+   `VERSION="v2"` products when v2 (manifest `version` field). `app.py /api/v1/segment`:
+   `model=v1|v2` request param (default env). **Peers stay v1** until the env is flipped.
+4. Seg-v2 edge eval: `build_dataset.py --v2-edges --out data/segv2/dataset_v2edges` on 20
+   KGs (tmux, ~1.5 h, Zenodo permitting); compare mean `y_purity` and segment count vs the
+   plain build for the same codes.
+5. Visual QA: `data/shares/WILHELM.json.gz` (`state.geometry`, endpoint `segment`,
+   47.138 N 15.118 E) → POST `/api/v1/segment` with `model=v2` and the same state, save as
+   share **`WILHELMv2`** (`/api/v1/share`, name field) so `?share=WILHELM` vs `?share=WILHELMv2`
+   can be compared side by side; then 4 more KGs.
 
 ### Next steps (in order)
 1. ~~Pick ship candidate~~ → **G**.

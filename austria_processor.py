@@ -1603,8 +1603,15 @@ def _segment_touches_edge(seg_mask: np.ndarray) -> bool:
 def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
                                   mask: np.ndarray, transform,
                                   cadastre_fp_mask: np.ndarray,
-                                  ndsm: np.ndarray) -> list[dict]:
-    """Find roof/building segments that don't overlap cadastre footprints."""
+                                  ndsm: np.ndarray,
+                                  kg_mask: np.ndarray | None = None) -> list[dict]:
+    """Find roof/building segments that don't overlap cadastre footprints.
+
+    ``kg_mask`` (bool raster of this KG's parcel union): segments with less
+    than half their pixels inside it are skipped — they are outside the KG
+    (tile grid overhang) and would otherwise be reported as "new" merely
+    because the KG export carries no footprints there.
+    """
     from rasterio.features import shapes as rasterize_shapes
 
     results = []
@@ -1617,6 +1624,7 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
 
     building_ids = {o.obj_id for o in building_objs}
     label_int = labels.astype(np.int32)
+    n_outside_kg = 0
 
     for geom_dict, val in rasterize_shapes(
         label_int, mask=mask & np.isin(label_int, list(building_ids)),
@@ -1629,6 +1637,11 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
 
         # Check overlap with cadastre footprints
         seg_mask = labels == oid
+        if kg_mask is not None:
+            _n_seg = int(np.sum(seg_mask))
+            if _n_seg == 0 or np.sum(seg_mask & kg_mask) / _n_seg < 0.5:
+                n_outside_kg += 1
+                continue  # outside this KG's parcels → neighbour's building
         if cadastre_fp_mask is not None:
             overlap = np.sum(seg_mask & cadastre_fp_mask)
             total = np.sum(seg_mask)
@@ -1671,6 +1684,8 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
         except Exception:
             continue
 
+    if n_outside_kg:
+        log.info("new buildings: skipped %d roof segment(s) outside the KG parcel union", n_outside_kg)
     return results
 
 
@@ -7716,19 +7731,49 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _report_step("segment", f"{tile_label} — rasterise cadastre")
 
             building_fp_mask = None
-            if cadastre_data["building_footprints"]:
+            # KG footprints (products) ∪ neighbour-KG footprints inside this
+            # tile (cadastre fast path /spatial/footprints, ~0.1 s).  The KG
+            # export only carries *this* KG's buildings, so roofs just across
+            # the KG line used to have no footprint and were emitted as
+            # "new buildings" (2026-09-17).  The viewport set is used ONLY for
+            # the raster mask (calibration + new-building matching), never
+            # written to the buildings layer.
+            _fp_pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
+                         if not b["geometry"].is_empty]
+            try:
+                import cadastre as _cad_mod
+                _vp = _cad_mod.fetch_building_footprints((tw, ts, te, tn), use_cache=False)
+                if _vp:
+                    _fp_pairs.extend((g, 1) for g in _vp if not g.is_empty)
+                    tile_avail["cadastre_buildings_viewport"] = True
+            except Exception as _e:  # noqa: BLE001
+                log.debug("KG %s %s: viewport footprints skipped: %s", kg_code, tile_label, _e)
+            if _fp_pairs:
                 try:
                     from rasterio.features import rasterize as rio_rasterize
-                    pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
-                             if not b["geometry"].is_empty]
-                    if pairs:
-                        building_fp_mask = rio_rasterize(
-                            pairs, out_shape=(th, tw_), transform=t_transform,
-                            fill=0, dtype=np.uint8, all_touched=True,
-                        ).astype(bool)
-                        tile_avail["cadastre_buildings"] = True
+                    building_fp_mask = rio_rasterize(
+                        _fp_pairs, out_shape=(th, tw_), transform=t_transform,
+                        fill=0, dtype=np.uint8, all_touched=True,
+                    ).astype(bool)
+                    tile_avail["cadastre_buildings"] = bool(cadastre_data["building_footprints"])
                 except Exception:
                     pass
+            # KG parcel-union mask: new-building candidates must lie (mostly)
+            # inside this KG's parcels — anything outside belongs to the
+            # neighbouring KG's run.
+            kg_parcel_mask = None
+            if cadastre_data.get("parcels"):
+                try:
+                    from rasterio.features import rasterize as rio_rasterize
+                    _pp = [(p["geometry"], 1) for p in cadastre_data["parcels"]
+                           if p.get("geometry") is not None and not p["geometry"].is_empty]
+                    if _pp:
+                        kg_parcel_mask = rio_rasterize(
+                            _pp, out_shape=(th, tw_), transform=t_transform,
+                            fill=0, dtype=np.uint8, all_touched=True,
+                        ).astype(bool)
+                except Exception as _e:  # noqa: BLE001
+                    log.debug("KG %s %s: parcel mask skipped: %s", kg_code, tile_label, _e)
 
             infra = None
             try:
@@ -7825,7 +7870,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             try:
                 _tile_nb = vectorise_unmatched_buildings(
                     t_objects, t_labels, t_mask, t_transform,
-                    building_fp_mask, t_ndsm)
+                    building_fp_mask, t_ndsm, kg_mask=kg_parcel_mask)
                 all_new_buildings.extend(_tile_nb)
             except Exception as e:
                 log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)

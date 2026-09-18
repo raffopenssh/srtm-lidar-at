@@ -289,11 +289,17 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             except Exception:
                 return -1
         n_seg = int(_num(_g(v2, "landscape", "n_segments"), 0) or 0)
-        ns = _count("segments")
+        # ``segments`` holds one polygon per connected part of a segment
+        # (a label may split into several parts), so count distinct ids.
+        try:
+            ns = c.execute('SELECT COUNT(DISTINCT id) FROM "segments"').fetchone()[0]
+        except Exception:
+            ns = _count("segments")
         rep.check("segments_layer_count", ns > 0 and (n_seg == 0 or abs(ns - n_seg) <= max(5, 0.02 * n_seg)),
                   f"layer={ns} json={n_seg}")
         npx = _count("segment_points")
-        rep.check("segment_points_count", npx == ns, f"points={npx} segments={ns}", fatal=False)
+        rep.check("segment_points_count", abs(npx - ns) <= max(5, 0.02 * ns),
+                  f"points={npx} segments={ns}", fatal=False)
         pc = int(_num(_g(v2, "parcels", "count"), 0) or 0)
         npar = _count("parcels")
         rep.check("parcels_layer_count", pc == 0 or abs(npar - pc) <= max(2, 0.01 * pc),

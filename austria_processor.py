@@ -6947,6 +6947,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # never be restored into a v2 run (or vice versa) — see
             # _load_tile_checkpoint.
             "model_version": MODEL_VERSION,
+            "classifier": _last_tile_classifier[0],   # → JSON "model" block on restore
         }
         tmp = _tile_ckpt_dir / f"tile_{tile_idx}.pkl.tmp"
         dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
@@ -7165,6 +7166,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except Exception as _e:  # noqa: BLE001
                 log.warning("KG %s: parcel outline profiler unavailable: %s", kg_code, _e)
         _classifier_used: dict = {}   # classifier string -> #tiles (→ JSON "model" block)
+        _last_tile_classifier = [None]  # set per tile, persisted in the tile checkpoint
 
         # --- 1.5. Abort + requeue on transient cadastre-API failure ---
         # The cadastre-process-api can be briefly overloaded (503/timeout).
@@ -7377,6 +7379,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _tile_progress[0] = tile_idx + 1
             tile_label = f"tile {tile_idx+1}/{n_tiles}"
             _subtile_progress[0] = None
+            _last_tile_classifier[0] = None
             result["step"] = f"tile_{tile_idx+1}"
             # Track tile centroid + status for dashboard map
             _tile_lat = (ts + tn) / 2
@@ -7390,6 +7393,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             cached_tile = _load_tile_checkpoint(tile_idx)
             if cached_tile is not None:
                 log.info("KG %s %s: restored from checkpoint", kg_code, tile_label)
+                if cached_tile.get("classifier"):
+                    _classifier_used[cached_tile["classifier"]] = _classifier_used.get(cached_tile["classifier"], 0) + 1
                 if cached_tile["seg_result"] is not None:
                     tile_seg_results.append(cached_tile["seg_result"])
                 all_objects.extend(cached_tile.get("core_objects", []))
@@ -7997,6 +8002,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", [])] if MODEL_VERSION == "v2" else None,
                 )
                 _st = seg_result.get("stats") or {}
+                _last_tile_classifier[0] = _st.get("classifier") or None
                 if _st.get("classifier"):
                     _classifier_used[_st["classifier"]] = _classifier_used.get(_st["classifier"], 0) + 1
             except Exception as e:

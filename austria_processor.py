@@ -8856,6 +8856,32 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             if _rep["ok"]:
                 log.info("KG %s: %s", kg_code, _vmsg)
                 _relay_info(_vmsg, "v2_verify")
+            elif not _v2_upgrade:
+                # Fresh KG: the gate is advisory for *completion*.  Before
+                # 2026-09-18 a FAIL here discarded everything incl. the
+                # legacy ``_json`` completion marker, so the frontier
+                # re-picked the same KG and re-failed it every ~1 h (45410-
+                # north / -northwest / 45631-northeast looped for 9 h, zero
+                # fleet completions).  Now: drop only the v2 products, keep
+                # ``_json`` (+ the already-uploaded full GPKG) so the KG
+                # completes as v1-shaped; the code stays upgrade-eligible
+                # (``_json`` + ``_full_gpkg``, no ``_json_v2``) so the
+                # cache-only upgrade path regenerates light_v2/json_v2 from
+                # the full GPKG under its own strike budget.  The parent
+                # records one strike so a systematically failing code does
+                # not spin there either.
+                log.error("KG %s: %s — dropping v2 products, completing with legacy json only "
+                          "(upgrade path retries light_v2/json_v2)", kg_code, _vmsg)
+                for _pth in (json_v2_path, light_gpkg):
+                    try:
+                        if _pth and os.path.exists(_pth):
+                            os.unlink(_pth)
+                    except OSError:
+                        pass
+                result["files"] = {k: v for k, v in result["files"].items()
+                                   if k not in ("json_v2", _light_key)}
+                result["v2_verify_degraded"] = _vmsg
+                _light_size = 0
             else:
                 log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
                 for _pth in (json_v2_path, json_path, light_gpkg):
@@ -9800,16 +9826,31 @@ def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
             if sc in (403, 404, 410):
                 raise FileNotFoundError(f"{code}_json HTTP {sc}") from e
             raise RuntimeError(f"{code}_json download: {e}") from e
-    with open(jpath) as f:
-        v1_doc = json.load(f)
+    try:
+        with open(jpath) as f:
+            v1_doc = json.load(f)
+        if not isinstance(v1_doc, dict):
+            raise ValueError("not a JSON object")
+    except (ValueError, OSError) as _je:
+        # A corrupt / truncated v1 JSON must not block the upgrade: the
+        # full GPKG is the real input and the bbox can come from the kg
+        # dict.  Verify then runs without a baseline (absolute checks only).
+        log.warning("KG %s: v1 JSON unreadable (%s) — upgrading without baseline", code, _je)
+        v1_doc = {}
+        try:
+            jpath.unlink()
+        except OSError:
+            pass
     bb = v1_doc.get("bbox") or {}
     if all(k in bb for k in ("min_lon", "min_lat", "max_lon", "max_lat")):
         kg["bbox"] = {k: float(bb[k]) for k in ("min_lon", "min_lat", "max_lon", "max_lat")}
-    elif "bbox" not in kg:
-        raise RuntimeError(f"{code}: v1 JSON has no bbox")
+    elif not kg.get("bbox"):
+        raise FileNotFoundError(f"{code}: v1 JSON has no bbox and none known for the kg")
     for k in ("kg_name", "state", "gemeinde", "district"):
         if v1_doc.get(k) and not kg.get(k):
             kg[k] = v1_doc[k]
+    if not v1_doc:
+        v1_doc = None
 
     # 2) full GPKG (the big one) — disk-checked, few streams.
     eg = manifest.get(f"{code}_full_gpkg")
@@ -11728,6 +11769,18 @@ def main():
             # Stop step monitor
             _step_monitor_stop.set()
             step_thread.join(timeout=3)
+
+            if result is not None and result.get("v2_verify_degraded"):
+                # Fresh v2 KG whose v2 products failed the gate: it completes
+                # as legacy json (+ full GPKG) and stays upgrade-eligible.
+                # One strike so the upgrade path has exactly one more try
+                # before it stops re-dispatching a systematically bad code.
+                _n_strk = _record_v2_upgrade_failed(kg_code, str(result["v2_verify_degraded"]))
+                progress.add_log("warning",
+                                 f"v2verify: {kg_code} fresh FAIL — completed legacy-only, "
+                                 f"v2 products left to upgrade path (strike {_n_strk}/"
+                                 f"{V2_UPGRADE_MAX_STRIKES}) — {str(result['v2_verify_degraded'])[:160]}",
+                                 kg_code)
 
             if kg.get("_v2_upgrade"):
                 # The downloaded GPKG is per-unit; never keep it around

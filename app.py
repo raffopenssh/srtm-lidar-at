@@ -1665,6 +1665,22 @@ def _peer_status_push_loop():
                 status['proxy_pool'] = _bp.summary()
             except Exception:
                 pass
+            # v2 upgrade strikes (peer-local v2_upgrade_failed.json) so the
+            # director can union them fleet-wide — otherwise a code that
+            # failed verify on peer A is re-dispatched to peer B. Full
+            # pushes only (dropped from the slim heartbeat below); ~40 B
+            # per struck code, capped.
+            try:
+                _vf = Path('data/austria_processor/v2_upgrade_failed.json')
+                if _vf.exists():
+                    _vd = json.loads(_vf.read_text())
+                    if isinstance(_vd, dict):
+                        status['v2_strikes'] = {
+                            str(c): int((e or {}).get('n', 0))
+                            for c, e in list(_vd.items())[:500]
+                            if int((e or {}).get('n', 0)) > 0}
+            except Exception:
+                pass
             try:
                 peer_id = (self_info or {}).get('id') or ''
             except Exception:
@@ -7065,6 +7081,39 @@ def _combined_log_compute():
     except Exception:
         pass
     return payload
+
+
+def _combined_log_ticker():
+    """Keep the 24h merged-log ring fed even when no browser has
+    ``process.html`` open.
+
+    Until 2026-09-18 ``_combined_log_compute`` (the only writer of
+    ``data/combined_log_24h.jsonl``) ran solely from the dashboard's
+    ``/director/proxy/combined_log`` poll. Close the last browser tab and
+    the ring — and with it ``/process.txt?q=…``, the per-day archive and
+    the ``kg_log`` history fold — silently stopped (observed: ring frozen
+    at 10:40, five hours of fleet ``v2up:`` / ``gpkg_full`` lines lost).
+
+    Runs in every gunicorn worker (peer pushes land on either worker's
+    in-memory ``_PEER_PUSH``; the persist step dedups cross-process via
+    the file-tail watermark), but only while this VM is the director.
+    Skips when the dashboard poll refreshed the cache recently.
+    """
+    import time as _time
+    _time.sleep(60)
+    while True:
+        try:
+            if _is_director_local():
+                age = _time.time() - _COMBINED_LOG_CACHE.get('ts', 0)
+                if age >= 25.0 and not _COMBINED_LOG_CACHE.get('refreshing'):
+                    _combined_log_compute()
+        except Exception as _e:
+            log.debug('combined_log ticker: %s', _e)
+        _time.sleep(30)
+
+
+threading.Thread(target=_combined_log_ticker, daemon=True,
+                 name='combined-log-ticker').start()
 
 
 @app.route('/api/v1/director/log/history')
@@ -19004,6 +19053,10 @@ def process_txt():
             _v2l += (f" · dispatch={len(_dsp.get('assigned') or [])}"
                      f"/{_dsp.get('candidates_total', 0)}cand"
                      f" (fill<{_dsp.get('fill_below_ready')} ready, cap {_dsp.get('max_peers')})")
+            _fs = _dsp.get('fleet_strikes') or {}
+            if _fs.get('codes'):
+                _v2l += (f" · strikes_fleet={_fs.get('codes')}codes"
+                         f" struck_out={_fs.get('struck_out')} peers={_fs.get('peers')}")
         out.append(_v2l)
     except Exception as _e:
         out.append(f'v2: unavailable ({_e})')

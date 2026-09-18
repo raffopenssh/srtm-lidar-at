@@ -1558,6 +1558,68 @@ _PEER_PUSH_LOCK = threading.Lock()
 _STICKY_SYSTEM_FIELDS = ('host',)
 
 
+# --- v2 upgrade strikes, fleet-wide union -------------------------------
+# Peers ship their local ``v2_upgrade_failed.json`` as ``status.v2_strikes``
+# ({code: n}) on every full push. The director folds them into one file so
+# ``_compute_v2_upgrade_candidates`` can skip codes whose strikes *summed
+# across peers* reached V2_UPGRADE_MAX_STRIKES (a fresh-KG verify FAIL on
+# the frontier + one upgrade FAIL on a cache peer = struck out). File, not
+# memory: peer pushes land on either gunicorn worker; the director loop
+# runs in one of them. flock'd read-merge-write, only when a peer's map
+# actually changed (a few writes/day fleet-wide).
+V2_FLEET_STRIKES_FILE = DATA_DIR / 'v2_strikes_fleet.json'
+V2_UPGRADE_MAX_STRIKES = 2      # mirror austria_processor.V2_UPGRADE_MAX_STRIKES
+
+
+def _v2_fleet_strikes_merge(peer_id: str, strikes: dict) -> None:
+    import fcntl as _fcntl
+    try:
+        V2_FLEET_STRIKES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(V2_FLEET_STRIKES_FILE.with_suffix('.lock'), 'w') as lk:
+            _fcntl.flock(lk, _fcntl.LOCK_EX)
+            try:
+                d = json.loads(V2_FLEET_STRIKES_FILE.read_text()) if V2_FLEET_STRIKES_FILE.exists() else {}
+                if not isinstance(d, dict):
+                    d = {}
+            except Exception:
+                d = {}
+            now = time.time()
+            # drop this peer's stale entries, then write the fresh map
+            for code in list(d.keys()):
+                pe = d[code]
+                if isinstance(pe, dict) and peer_id in pe and str(code) not in strikes:
+                    pe.pop(peer_id, None)
+                    if not pe:
+                        d.pop(code, None)
+            for code, n in strikes.items():
+                d.setdefault(str(code), {})[peer_id] = {'n': int(n), 'ts': now}
+            tmp = V2_FLEET_STRIKES_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(d, separators=(',', ':')))
+            tmp.replace(V2_FLEET_STRIKES_FILE)
+    except Exception as e:
+        log.debug('v2 fleet strikes merge (%s): %s', peer_id, e)
+
+
+def v2_fleet_strikes() -> dict:
+    """{code: {peer_id: {n, ts}}} — the union of every peer's strikes."""
+    try:
+        if V2_FLEET_STRIKES_FILE.exists():
+            d = json.loads(V2_FLEET_STRIKES_FILE.read_text())
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def v2_fleet_struck_out(threshold: int = V2_UPGRADE_MAX_STRIKES) -> set:
+    """Codes whose strikes summed over peers reached *threshold*."""
+    out = set()
+    for code, pe in v2_fleet_strikes().items():
+        if isinstance(pe, dict) and sum(int((e or {}).get('n', 0)) for e in pe.values()) >= threshold:
+            out.add(str(code))
+    return out
+
+
 def record_peer_push(peer_id: str, status: dict,
                      bandwidth: dict | None = None) -> None:
     """Record a peer-pushed status payload. Called from the HTTP handler.
@@ -1589,6 +1651,10 @@ def record_peer_push(peer_id: str, status: dict,
             'status': status,
             'bandwidth': bandwidth,
         }
+        _new_strikes = status.get('v2_strikes')
+        _old_strikes = prev_status.get('v2_strikes')
+    if isinstance(_new_strikes, dict) and _new_strikes != _old_strikes:
+        _v2_fleet_strikes_merge(peer_id, _new_strikes)
 
 
 def get_pushed_status(peer_id: str) -> dict | None:
@@ -4874,6 +4940,12 @@ class PeerDirector:
                 'candidates_total': cc.get('total', 0),
                 'fill_below_ready': V2_UPGRADE_FILL_BELOW_READY,
                 'max_peers': MAX_V2_UPGRADE_PEERS,
+            }
+            _fs = v2_fleet_strikes()
+            out['dispatch']['fleet_strikes'] = {
+                'codes': len(_fs),
+                'struck_out': len(v2_fleet_struck_out()),
+                'peers': len({p for pe in _fs.values() if isinstance(pe, dict) for p in pe}),
             }
         except Exception:
             pass
@@ -9536,6 +9608,10 @@ class PeerDirector:
                 import v2_ingest as _v2i
                 skip = {c for c, st in _v2i.failed().items()
                         if int(st.get('n', 0)) >= _v2i.MAX_FAILS}
+            except Exception:
+                pass
+            try:
+                skip |= v2_fleet_struck_out()
             except Exception:
                 pass
             ranked = []

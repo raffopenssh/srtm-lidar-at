@@ -157,12 +157,23 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     n_seg = int(_num(_g(v2, "landscape", "n_segments"), 0) or 0)
     rep.check("segments_present", n_seg > 0, f"n_segments={n_seg}")
 
-    # tile stitching — every LiDAR tile segmented
+    # tile stitching — every LiDAR tile segmented.  A v1 baseline that
+    # itself carried gaps (unsegmented tiles, upstream-failed tiles, DTM
+    # holes) caps what an upgrade regenerated from that same full GPKG can
+    # achieve, so against a baseline these are *non-regression* checks;
+    # without one (fresh KG) they are advisory — v1 completed such KGs as
+    # "partial" too, and a fatal gate here would only loop the KG.
     lidar, seg, bad = _active_tiles(v2)
-    rep.check("tiles_all_segmented", lidar > 0 and seg == lidar,
-              f"{seg}/{lidar} lidar tiles segmented; unsegmented={bad[:10]}")
+    l1, s1, _ = _active_tiles(v1) if v1 is not None else (0, 0, [])
     n_up = int(_num(_g(v2, "data_quality", "n_upstream_failed_tiles"), 0) or 0)
-    rep.check("no_upstream_failed_tiles", n_up == 0, f"{n_up} upstream-failed tile(s)")
+    n_up1 = int(_num(_g(v1, "data_quality", "n_upstream_failed_tiles"), 0) or 0) if v1 else 0
+    rep.check("tiles_segmented", lidar > 0 and seg > 0, f"{seg}/{lidar} lidar tiles segmented")
+    rep.check("tiles_all_segmented", seg == lidar,
+              f"{seg}/{lidar} lidar tiles segmented; unsegmented={bad[:10]}",
+              fatal=(v1 is not None and seg < s1))
+    rep.check("no_upstream_failed_tiles", n_up == 0,
+              f"{n_up} upstream-failed tile(s)" + (f" (v1: {n_up1})" if v1 else ""),
+              fatal=(v1 is not None and n_up > n_up1))
 
     # parcels
     pd = _g(v2, "parcels", "details", default=[]) or []
@@ -178,12 +189,23 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
         rep.check("parcel_outline_z", with_geom == 0 or with_oz >= TOL["outline_z_min_frac"] * with_geom,
                   f"{with_oz}/{with_geom} parcels carry outline_z", fatal=False)
         n_elev = sum(1 for p in pd if _num(p.get("elevation_m")) is not None)
-        rep.check("parcel_elevations", n_elev >= 0.9 * len(pd), f"{n_elev}/{len(pd)} parcels with elevation")
+        pd1 = (_g(v1, "parcels", "details", default=[]) or []) if v1 else []
+        n_elev1 = sum(1 for p in pd1 if isinstance(p, dict) and _num(p.get("elevation_m")) is not None)
+        _elev_ok = n_elev >= 0.9 * len(pd)
+        # fatal: below half, or regressed vs a v1 baseline that had them
+        _elev_fatal = n_elev < 0.5 * len(pd) or (pd1 and n_elev < 0.9 * n_elev1)
+        rep.check("parcel_elevations", _elev_ok,
+                  f"{n_elev}/{len(pd)} parcels with elevation" + (f" (v1: {n_elev1}/{len(pd1)})" if pd1 else ""),
+                  fatal=bool(_elev_fatal))
 
     cov = _g(v2, "coverage", default={}) or {}
+    cov1 = (_g(v1, "coverage", default={}) or {}) if v1 else {}
     for k in ("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct"):
         v = _num(cov.get(k))
-        rep.check(f"coverage.{k}", v is not None and v > 0, f"{k}={v}")
+        v1v = _num(cov1.get(k)) if v1 else None
+        # a baseline that had 0 / no coverage figure cannot be regressed
+        rep.check(f"coverage.{k}", v is not None and v > 0, f"{k}={v}",
+                  fatal=not (v1 is not None and not v1v))
 
     if v1 is None:
         return
@@ -204,7 +226,6 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     if sa is not None and sb and sb > 0:
         rep.check("segmented_area_ge_v1", sa >= (1 - TOL["seg_area_rel"]) * sb,
                   f"v2={sa:.0f} v1={sb:.0f} m²")
-    l1, s1, _ = _active_tiles(v1)
     rep.check("lidar_tiles_ge_v1", lidar >= l1, f"v2={lidar} v1={l1} lidar tiles")
     n1 = int(_num(_g(v1, "landscape", "n_segments"), 0) or 0)
     if n1 > 0:
@@ -295,8 +316,22 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             ns = c.execute('SELECT COUNT(DISTINCT id) FROM "segments"').fetchone()[0]
         except Exception:
             ns = _count("segments")
-        rep.check("segments_layer_count", ns > 0 and (n_seg == 0 or abs(ns - n_seg) <= max(5, 0.02 * n_seg)),
+        # The polygon layer is vectorised from the *stitched* label raster
+        # inside the KG mask, so objects whose pixels were overwritten in a
+        # tile overlap (or clipped by the block mask) have a JSON row and a
+        # ``segment_points`` row but no polygon.  That is a v1-era trait, not
+        # a v2 defect: 45410-east (v1, 2026-09-18) drops 2.0 %, fresh v2
+        # blocks 2.3–2.7 %.  A 2 % fatal tolerance therefore failed every
+        # fresh v2 KG fleet-wide on 2026-09-18 (files discarded, no ``_json``,
+        # KG re-picked in a loop).  Fatal only past 10 %; 2–10 % is a
+        # non-fatal drift warning so the rate stays visible in the log.
+        _d = abs(ns - n_seg)
+        rep.check("segments_layer_count", ns > 0 and (n_seg == 0 or _d <= max(20, 0.10 * n_seg)),
                   f"layer={ns} json={n_seg}")
+        if n_seg and ns > 0 and _d > max(5, 0.02 * n_seg):
+            rep.check("segments_layer_drift", False,
+                      f"layer={ns} json={n_seg} ({100.0 * _d / n_seg:.1f}% objects without polygon)",
+                      fatal=False)
         npx = _count("segment_points")
         rep.check("segment_points_count", abs(npx - ns) <= max(5, 0.02 * ns),
                   f"points={npx} segments={ns}", fatal=False)
@@ -324,8 +359,16 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             rep.check("segment_type_raster_area", nz >= 0.95 * sa,
                       f"nonzero px={nz} json segmented m²={sa:.0f}")
         if hole is not None:
+            # Holes are expected when the doc itself declares a gap (an
+            # unsegmented or upstream-failed tile) — inherited from the v1
+            # baseline / its full GPKG; fatal only for an *undeclared* hole.
+            _l, _s, _ = _active_tiles(v2)
+            _nup = int(_num(_g(v2, "data_quality", "n_upstream_failed_tiles"), 0) or 0)
+            _declared_gap = (_s < _l) or _nup > 0
             rep.check("segment_type_no_holes", hole <= TOL["raster_hole_frac"],
-                      f"{100*hole:.2f}%% of parcel union has no segment class")
+                      f"{100*hole:.2f}%% of parcel union has no segment class"
+                      + (" (declared tile gap)" if _declared_gap else ""),
+                      fatal=not _declared_gap)
         rep["segment_type_nonzero_px"] = nz
         rep["segment_type_hole_frac"] = hole
     except Exception as e:  # noqa: BLE001

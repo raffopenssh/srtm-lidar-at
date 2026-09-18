@@ -54,8 +54,32 @@ ZENODO_TOKEN = "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
 # stamps products "v2" and adds the v2-only JSON/GPKG extras (parcel outline
 # elevation profiles, model block).  Peers stay on v1 until the env is flipped
 # in the processor unit (see segv2/HANDOVER.md → wiring).
-MODEL_VERSION = os.environ.get("SEG_MODEL_VERSION", "v1").lower()
+# Default (since the v2 rollout, 2026-09): v2 whenever the model + lightgbm are
+# usable on this host (segv2.model_v2.available()), else v1.  Explicit env
+# always wins (``SEG_MODEL_VERSION=v1`` forces the legacy RF).
+def _default_model_version() -> str:
+    env = os.environ.get("SEG_MODEL_VERSION", "").strip().lower()
+    if env in ("v1", "v2"):
+        return env
+    try:
+        import sys as _sys
+        _sv2 = str(Path(__file__).resolve().parent / "segv2")
+        if _sv2 not in _sys.path:
+            _sys.path.insert(0, _sv2)
+        import model_v2 as _mv2
+        return "v2" if _mv2.available() else "v1"
+    except Exception:
+        return "v1"
+
+
+MODEL_VERSION = _default_model_version()
 VERSION = "v2" if MODEL_VERSION == "v2" else "v1"
+# v2 upgrade mode: re-classify already-processed v1 KGs from their own
+# Zenodo full GPKG (no BEV / openEO traffic).  Set by ``--v2-upgrade`` or
+# env ``V2_UPGRADE=1`` (the director passes it in the start payload).
+V2_UPGRADE_FAILED_FILE = Path("data/austria_processor") / "v2_upgrade_failed.json"
+V2_GPKG_DIR = Path(os.environ.get("V2_UPGRADE_GPKG_DIR", "data/austria_processor/v2_source"))
+V2_UPGRADE_STREAMS = int(os.environ.get("V2_UPGRADE_STREAMS", "4"))
 
 DATA_DIR = Path("data/austria_processor")
 MANIFEST_PATH = DATA_DIR / "zenodo_manifest.json"
@@ -3524,11 +3548,13 @@ def _merge_boundary_segments(
         'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
         'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation'}
 
-    try:
-        from learned_classifier import get_classifier
-        rf = get_classifier()
-    except Exception:
-        rf = None
+    rf = None
+    if MODEL_VERSION != "v2":
+        try:
+            from learned_classifier import get_classifier
+            rf = get_classifier()
+        except Exception:
+            rf = None
 
     n_reclassified = 0
     n_anchor_weak = 0
@@ -3601,7 +3627,11 @@ def _merge_boundary_segments(
         new_type = None
         new_conf = survivor.confidence
         _has_spec = bool(survivor.ndvi_mean)
-        if rf and rf.model is not None:
+        if MODEL_VERSION == "v2":
+            # v2: members were compatible by _MERGE_RULES; keep the survivor's
+            # LightGBM type instead of re-classifying with the v1 RF / rules.
+            new_type = current_type
+        elif rf and rf.model is not None:
             try:
                 _pred, _conf = rf.predict(feat)
                 if _pred and _conf >= 0.4:
@@ -4575,13 +4605,16 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
                            obs_year=0, mark_uncertain=False, label_remap=None,
-                           outline_profiler=None):
-    """Light GPKG: stitched segment rasters + enriched cadastre vectors."""
+                           outline_profiler=None, out_path=None):
+    """Light GPKG: stitched segment rasters + enriched cadastre vectors.
+
+    ``out_path`` defaults to ``<code>_light.gpkg``; v2 passes
+    ``<code>_light_v2.gpkg`` (product key ``_light_gpkg_v2``)."""
     import rasterio, fiona
     import rasterio.transform
     from fiona.crs import from_epsg
 
-    out_path = str(GPKG_DIR / f"{kg_code}_light.gpkg")
+    out_path = str(out_path or (GPKG_DIR / f"{kg_code}_light.gpkg"))
     _purge_stale_gpkg(out_path)
 
     table_count = 0
@@ -6828,8 +6861,17 @@ def _stitch_copernicus_subtiles(
 
 
 def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
-                   mark_uncertain: bool = False) -> dict:
+                   mark_uncertain: bool = False, source_gpkg: str = None,
+                   v1_doc: dict = None) -> dict:
     """Process a single KG with tiled segmentation for full coverage.
+
+    ``source_gpkg`` (v2 upgrade mode): path to this KG's own v1 *full* GPKG.
+    All per-tile raster reads are served from it via ``v2_source`` (with
+    per-layer health checks + real-source fallback), the full GPKG build and
+    its upload are skipped, and the products are ``<code>_light_v2.gpkg`` +
+    ``<code>_v2.json.gz`` only (the legacy ``_json`` / ``_light_gpkg`` /
+    ``_full_gpkg`` stay untouched on Zenodo).  ``v1_doc`` is the parsed v1
+    JSON, used by ``v2_verify`` to check the v2 product is at least as good.
 
     The full KG is divided into overlapping 1.5km tiles.  Each tile
     undergoes the full pipeline (multi-date LiDAR, ortho, Copernicus,
@@ -6901,6 +6943,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             "copernicus_accum": cop_accum,      # partial copernicus_info entries
             "hansen_accum": hansen_accum,        # partial hansen_info entries
             "seg_pixels": seg_pixels,
+            # Model that produced the classified objects.  A v1 pickle must
+            # never be restored into a v2 run (or vice versa) — see
+            # _load_tile_checkpoint.
+            "model_version": MODEL_VERSION,
         }
         tmp = _tile_ckpt_dir / f"tile_{tile_idx}.pkl.tmp"
         dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
@@ -6922,7 +6968,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             return None
         try:
             with open(dst, "rb") as f:
-                return _pkl.load(f)
+                ck = _pkl.load(f)
+            if ck.get("model_version", "v1") != MODEL_VERSION:
+                log.info("KG %s: discarding tile %d checkpoint (model %s != %s)",
+                         kg_code, tile_idx, ck.get("model_version", "v1"), MODEL_VERSION)
+                dst.unlink(missing_ok=True)
+                return None
+            return ck
         except Exception:
             dst.unlink(missing_ok=True)
             return None
@@ -7021,6 +7073,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
     _subtile_progress = [None]  # [dict | None] — set when processing a sub-tile
     _tile_statuses = []  # [{lat, lng, status, issues, subtile_info}] — per-tile dots for map
+
+    def _relay_info(msg, step=""):
+        """Mirror an INFO line into subprocess_warnings.jsonl so the parent
+        step-monitor relays it into progress.add_log (merged fleet log)."""
+        try:
+            import json as _json_ri
+            with open(_warnings_file, "a") as _wf:
+                _wf.write(_json_ri.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info", "msg": msg, "step": step}) + "\n")
+        except Exception:
+            pass
 
     def _report_step(step, detail=""):
         try:
@@ -7223,6 +7287,32 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         else:
             log.info("KG %s: block mode — using fixed bbox (no expansion)", kg_code)
 
+        # --- 1c. v2 upgrade: serve rasters from the KG's own v1 full GPKG ---
+        _v2_upgrade = bool(source_gpkg)
+        _v2_union_3035 = None
+        if _v2_upgrade:
+            if MODEL_VERSION != "v2":
+                result["error"] = "v2 upgrade requested but MODEL_VERSION != v2 (lightgbm / model missing?)"
+                result["step"] = "aborted_v2_unavailable"
+                return result
+            result["step"] = "v2_source"
+            _report_step("v2_source", f"installing GPKG source {Path(source_gpkg).name}")
+            try:
+                from shapely.ops import unary_union as _uu_v2
+                _geoms_v2 = [p["geometry"] for p in cadastre_data.get("parcels", [])
+                             if p.get("geometry") is not None]
+                _geoms_v2 += [b["geometry"] for b in cadastre_data.get("building_footprints", [])
+                              if b.get("geometry") is not None]
+                if _geoms_v2:
+                    _v2_union_3035 = _uu_v2([g if g.is_valid else g.buffer(0) for g in _geoms_v2])
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: v2 union failed (%s) — health checks use whole windows", kg_code, _e)
+            import v2_source as _v2src
+            _inv = _v2src.install(source_gpkg, union_3035=_v2_union_3035, proc_globals=globals())
+            result["v2_source_inventory"] = {k: v for k, v in _inv.items() if k != "path"}
+            log.info("KG %s: v2 upgrade from %s (%d layers, ortho %s, CIR %s)", kg_code,
+                     Path(source_gpkg).name, len(_inv["layers"]), _inv["ortho_years"], _inv["cir_years"])
+
         # --- 2. Compute tile grid ---
         tile_km = max_km if max_km is not None else MAX_KG_AREA_KM
         base_tiles_wgs = _compute_tile_grid(
@@ -7248,7 +7338,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # data is NOT wasted: the tile_cache + Zenodo cache are keyed by
         # geographic 0.1° cells, so the blocks re-read the exact same
         # cached cells any earlier whole-KG attempt already fetched.
-        if not _is_block:
+        if not _is_block and not _v2_upgrade:
             from kg_splitter import runtime_tile_limit, force_split
             _rt_limit = runtime_tile_limit()
             if n_tiles > _rt_limit:
@@ -7683,6 +7773,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         # Update circuit breaker
                         if copernicus_data:
                             c_breaker["consecutive_failures"] = 0
+                        elif _v2_upgrade:
+                            # Upgrade mode: the v1 GPKG carried no Copernicus
+                            # layers for this tile and the tile cache has none
+                            # either.  v1 was built without them here too, so
+                            # proceed (v2_verify enforces coverage >= v1).
+                            log.warning("KG %s %s: no Copernicus layers in GPKG/cache — "
+                                        "tile proceeds without (as v1 did)", kg_code, tile_label)
                         else:
                             c_breaker["consecutive_failures"] += 1
                             c_breaker["last_failure"] = time.time()
@@ -8295,299 +8392,310 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             log.warning("  Cache eviction failed: %s", _ev_e)
 
         # --- 5. Build full GPKG ---
-        result["step"] = "gpkg_full"
-        _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
-        # Reuse the full GPKG from a previous attempt if it survived
-        # on disk (subprocess restart between gpkg_full and upload).
-        # The boundary remap is only used to renumber light-GPKG /
-        # JSON labels so they match the full-GPKG raster; if we skip
-        # the rebuild we also skip remap and tile labels stay as-is
-        # — acceptable since the canonical labels live in the full
-        # GPKG that we reuse verbatim.
-        _existing_full = str(GPKG_DIR / f"{kg_code}_full.gpkg")
-        _reuse_full = False
-        _full_already_on_zenodo = False
-        try:
-            if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
-                # Integrity gate before reuse. A stuck-KG hard restart
-                # (SIGKILL mid-build) leaves a structurally incomplete
-                # GPKG — possibly with a hot -wal/-journal — and blind
-                # reuse would upload a corrupt product. Cheap checks:
-                # GPKG magic application_id + SQLite quick_check + the
-                # expected final layers (segment vectors are written
-                # near the end of the build, so their presence implies
-                # the build ran to completion).
-                _reuse_full = _gpkg_reuse_ok(_existing_full)
-                if _reuse_full:
-                    full_gpkg = _existing_full
-                    _boundary_remap = {}
-                    log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
-                            kg_code, os.path.getsize(_existing_full) / 1e6)
-                    _report_step("gpkg_full",
-                                 f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
-                else:
-                    log.warning("KG %s: existing full GPKG failed integrity/completeness "
-                                "check (likely interrupted build) — purging and rebuilding",
-                                kg_code)
-                    _purge_stale_gpkg(_existing_full)
-        except Exception:
-            _reuse_full = False
-        # Manifest-aware reuse: a prior run (possibly on another peer)
-        # streamed the full GPKG to Zenodo early -- to free disk -- and then
-        # deleted the local file. Without this check a fresh peer that picks
-        # the KG up rebuilds the full GPKG from scratch AND replaces the
-        # Zenodo file (a 1-15 GB re-upload) every retry. If the run then gets
-        # interrupted before the JSON step (big KGs frequently do -- auto-park
-        # on throughput collapse, cred rotation, role eviction), the KG never
-        # produces a ``_json`` entry, never drains from the priority queue,
-        # and the rebuild+re-upload loops indefinitely (KG 40016, Jun 2026).
-        # If the manifest already has a non-error ``{kg}_full_gpkg`` entry,
-        # skip BOTH the rebuild and the re-upload and proceed straight to
-        # light + JSON so the run can actually complete and the KG drains.
-        # A genuine operator force-requeue deletes the manifest entry, so a
-        # real rebuild is unaffected (no entry -> falls through to build).
-        if not _reuse_full:
-            try:
-                _mf_raw = json.loads(MANIFEST_PATH.read_text()) if MANIFEST_PATH.exists() else {}
-                _mf_entries = _mf_raw.get("entries", _mf_raw) or {}
-                _fe = _mf_entries.get(f"{kg_code}_full_gpkg")
-                _fe_ok = (isinstance(_fe, dict) and (_fe.get("size") or 0) > 0
-                          and "error" not in (_fe.get("status", "") or ""))
-                # Timestamp guard against an operator force-requeue. The
-                # requeue handler (app.py) DELETES the manifest entry AND
-                # stamps a PRODUCT-level tombstone ``{kg_code}_full_gpkg`` at
-                # the requeue instant. The entry deletion is the primary
-                # rebuild signal (propagates via peer-sync -> no entry ->
-                # rebuild); the product tombstone is the secondary defence for
-                # the window where the tombstone has propagated but the
-                # deletion hasn't. Reuse ONLY when the entry's upload is
-                # strictly newer than its product tombstone (== genuine
-                # re-completion after the last invalidation). Same semantics as
-                # app.py peer-sync's ``entry_ts <= tombstone_ts`` gate.
-                #
-                # CRUCIAL: do NOT gate on the ``_requeue`` tombstone. That one
-                # is re-stamped to ``now`` on every queue push (the documented
-                # force-requeue self-perpetuation), so an entry would always
-                # look older than it and we'd rebuild forever -- recreating the
-                # exact loop this fix removes. Split blocks are covered because
-                # a parent requeue tombstones each block's OWN product key.
-                if _fe_ok:
-                    _entry_ts = str(_fe.get("uploaded_at", "") or "")
-                    _tomb_ts = ""
-                    try:
-                        _tp = DATA_DIR / "manifest_tombstones.json"
-                        if _tp.exists():
-                            _td = json.loads(_tp.read_text())
-                            if isinstance(_td, dict):
-                                _tomb_ts = str(_td.get(f"{kg_code}_full_gpkg", "") or "")
-                        # Drop journal wins over a stale product tombstone
-                        # (see the completed_codes gate in main()): a dropped
-                        # tombstone must not force a 1-15 GB GPKG rebuild.
-                        _dp2 = DATA_DIR / "manifest_tombstone_drops.json"
-                        if _tomb_ts and _dp2.exists():
-                            _dj2 = json.loads(_dp2.read_text())
-                            _d2 = (str(_dj2.get(f"{kg_code}_full_gpkg", "") or "")
-                                   if isinstance(_dj2, dict) else "")
-                            if _d2 and not _tomb_ts > _d2:
-                                _tomb_ts = ""
-                    except Exception:
-                        _tomb_ts = ""
-                    if _tomb_ts and not (_entry_ts and _entry_ts > _tomb_ts):
-                        log.info("KG %s: full GPKG on Zenodo but product "
-                                 "tombstone (%s) >= entry (%s) -- rebuilding",
-                                 kg_code, _tomb_ts, _entry_ts or "<none>")
-                        _fe_ok = False
-                if _fe_ok:
-                    _full_already_on_zenodo = True
-                    full_gpkg = ""
-                    _boundary_remap = {}
-                    log.info("KG %s: full GPKG already on Zenodo (depo=%s, %.0f MB) -- "
-                             "skipping rebuild + re-upload",
-                             kg_code, _fe.get("depo_id"), (_fe.get("size") or 0) / 1e6)
-                    _report_step("gpkg_full",
-                                 f"already on Zenodo ({(_fe.get('size') or 0) / 1e6:.0f} MB) -- skip")
-            except Exception as _mfe:
-                log.warning("KG %s: manifest reuse check failed: %s", kg_code, _mfe)
-                _full_already_on_zenodo = False
-        try:
-            if not _reuse_full and not _full_already_on_zenodo:
-                full_gpkg, _boundary_remap = build_full_gpkg_tiled(
-                    kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
-        except Exception as _bge:
-            from tile_cache import CacheMissError as _CacheMissError
-            if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
-                # Cache-only peer hit a missing tile while building the full
-                # GPKG (e.g. tiles restored from checkpoint did not re-fetch
-                # Copernicus/Hansen, and those layers were not in the local
-                # or Zenodo cache).  Abort so the director re-queues the KG
-                # for the frontier (primary) peer.
-                log.warning("KG %s: cache-only mode hit a miss during gpkg_full \u2014 aborting (%s)",
-                            kg_code, _bge)
-                result["cache_incomplete"] = True
-                result["success"] = False
-                result["error"] = str(_bge)
-                result["step"] = "aborted_cache_incomplete_gpkg_full"
-                return result
-            raise
-        result["files"]["full_gpkg"] = full_gpkg
-
-        # If the full GPKG was already on Zenodo (manifest reuse above), it is
-        # neither rebuilt nor re-uploaded. Signal the parent to reload the
-        # manifest and skip its own upload attempt -- exactly as for the
-        # subprocess early-upload path.
-        if _full_already_on_zenodo:
-            result["_full_gpkg_uploaded"] = True
-            result["files"]["full_gpkg"] = ""
-
-        # --- 5b. Validate full GPKG, then stream to Zenodo ---
-        _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
-        if _full_size > 0:
-            _report_step("validate_full_gpkg", "checking full GPKG")
-            _full_issues = validate_kg_outputs(kg_code, {"full_gpkg": full_gpkg})
-            if _full_issues:
-                for _fi in _full_issues:
-                    log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _fi)
-            else:
-                log.info("KG %s: full GPKG validated OK (%.0f MB)", kg_code, _full_size / 1e6)
-        # Stream full GPKG to Zenodo immediately.  For large KGs the
-        # full GPKG can be 4-15 GB.  Upload it now and delete the local
-        # copy BEFORE building the light GPKG, so both products never
-        # coexist on disk simultaneously.
-        if _full_size > 0:
-            if THROTTLE_FILE.exists():
-                _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
-                log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
-                         kg_code, _full_size / 1e6)
-                try:
-                    os.unlink(full_gpkg)
-                except OSError:
-                    pass
-                result["_full_gpkg_uploaded"] = True
-            else:
-                _report_step("upload_full_gpkg",
-                             f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
-                try:
-                    from zenodo_client import Client as _ZClient, landscape_metadata as _lm
-                    _zclient = _ZClient(token=ZENODO_TOKEN)
-                    _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
-                        _qs=0, _qg="": \
-                        _lm(_kg, _name, v, "gpkg")
-                    from zenodo_client import Manifest as _ZManifest
-                    _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
-                    def _sub_upload_cb(sent, total):
-                        pct = round(100 * sent / total) if total else 0
-                        _report_step("upload_full_gpkg",
-                                     f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
-                    _zclient.upload_stream(
-                        f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
-                        _zmanifest, delete_after=True,
-                        progress_callback=_sub_upload_cb)
-                    log.info("  Full GPKG streamed to Zenodo and deleted locally")
-                    # Mark as already uploaded so upload_kg_to_zenodo skips it
-                    result["_full_gpkg_uploaded"] = True
-                except Exception as _ue:
-                    log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
-                    # Signal Zenodo problem to the parent process so it can
-                    # pause + switch peers.  Keep the local full GPKG on
-                    # disk so the parent can re-upload later.  We still
-                    # let light GPKG + JSON build complete so we don't
-                    # waste an hour of compute; if Zenodo recovers in the
-                    # meantime the parent uploads everything together.
-                    _reason = _classify_zenodo_error(_ue)
-                    try:
-                        ZENODO_PAUSE_FILE.write_text(json.dumps({
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "kg": kg_code,
-                            "step": "upload_full_gpkg",
-                            "reason": _reason,
-                            "error": str(_ue),
-                        }))
-                    except Exception:
-                        pass
-                    result["zenodo_failed"] = True
-                    result["zenodo_error"] = str(_ue)
-                    result["zenodo_reason"] = _reason
-        gc.collect()
-
-        # --- 5c. Free tile checkpoints now that full GPKG is written ---
-        # The full GPKG (or its upload) is the last step that needs raster
-        # data from the tile results.  Deleting checkpoints here lets the
-        # retry path skip all tiles if it only timed out during the GPKG
-        # build phase.
-        #
-        # SKIP this cleanup if the early full-GPKG upload failed:
-        # the parent will re-queue the KG and a fresh subprocess will
-        # then need the tile checkpoints to skip the tile loop (and
-        # the rebuilt full GPKG step is skipped via our reuse path).
-        if result.get("zenodo_failed"):
-            # Keep metadata pickles (needed for the next attempt's tile loop
-            # restore) but ALWAYS drop raster sidecars — they cost the most
-            # disk and the GPKG was rebuilt successfully or will be re-built
-            # by the same code path. If the rasters are missing on retry
-            # the GPKG step falls back to the existing BEV re-read.
-            try:
-                import tile_raster_sidecar as _trs
-                _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
-            except Exception:
-                pass
-            log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
-                     kg_code)
-        elif result.get("_full_gpkg_uploaded") and n_tiles >= PRE_JSON_CHKPT_PUBLISH_MIN_TILES:
-            # Full GPKG is already on Zenodo but the JSON product hasn't
-            # landed yet: we are entering the "gpkg(s)-present, json-missing"
-            # limbo window (see 7fed914 / f59511d). The light + json builds
-            # below can still be interrupted before the early json upload
-            # (big split blocks take ~30 min to build json and a frontier
-            # peer auto-parks / rotates a credential / is role-evicted every
-            # couple of hours), and those interruptions are SIGKILLs — no
-            # cleanup handler runs, so we get exactly ONE chance to preserve
-            # cross-peer recoverability, and it is HERE.
-            #
-            # At this point ALL tiles have valid checkpoints on disk (they
-            # were just used to build the full GPKG). Publish the COMPLETE
-            # bundle to the cross-peer registry now so the next peer can
-            # restore every tile and finish light + json with ZERO
-            # Copernicus — completable on a cache-only peer instead of
-            # being reprocessed as frontier work that burns a credential
-            # slot. Without this we rmtree'd the checkpoints the instant
-            # the full GPKG was uploaded, so the only bundle left for the
-            # next peer was whatever a PRIOR interrupted attempt happened
-            # to publish — e.g. 90013-northwest: a stale 12/20-tile bundle,
-            # forcing tiles 13-20 to be re-fetched via NDVI/SAR on at42
-            # (Jun 2026). Keep the metadata pickles for the same-subprocess
-            # json build; release only the heavy raster sidecars (the
-            # registry is metadata-only anyway). On the happy path the
-            # "done" step clears them locally and the parent evicts the
-            # registry bundle, so this only costs a one-off ~metadata-sized
-            # PUT that is reclaimed on completion.
-            try:
-                import tile_raster_sidecar as _trs
-                _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
-            except Exception:
-                pass
-            try:
-                # NB: ``progress`` (main()'s ProgressTracker) is NOT in scope
-                # in this subprocess; the upload still surfaces fleet-wide via
-                # the cache_manifest mirror + chkpt_registry log line.
-                _publish_checkpoints_to_registry(kg_code)
-                log.info("KG %s: publishing complete checkpoint bundle before "
-                         "json (full GPKG on Zenodo, json pending) so an "
-                         "interrupted finish stays cache-only-completable",
-                         kg_code)
-            except Exception as _pe:
-                log.warning("KG %s: pre-json checkpoint publish failed: %s",
-                            kg_code, _pe)
+        # Skipped entirely in v2 upgrade mode: the rasters are identical to
+        # the v1 full GPKG we are reading from, so there is nothing new to
+        # write or upload.  The light GPKG runs the boundary merge itself
+        # when label_remap is None.
+        if _v2_upgrade:
+            _boundary_remap = None
+            full_gpkg = None
+            _light_size = 0
+            _report_step("gpkg_full", "skipped (v2 upgrade — rasters unchanged)")
         else:
+            # --- 5. Build full GPKG ---
+            result["step"] = "gpkg_full"
+            _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
+            # Reuse the full GPKG from a previous attempt if it survived
+            # on disk (subprocess restart between gpkg_full and upload).
+            # The boundary remap is only used to renumber light-GPKG /
+            # JSON labels so they match the full-GPKG raster; if we skip
+            # the rebuild we also skip remap and tile labels stay as-is
+            # — acceptable since the canonical labels live in the full
+            # GPKG that we reuse verbatim.
+            _existing_full = str(GPKG_DIR / f"{kg_code}_full.gpkg")
+            _reuse_full = False
+            _full_already_on_zenodo = False
             try:
-                import shutil as _shutil_ckpt
-                _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
-                if _ckpt_dir.exists():
-                    _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
-                    _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
-                    log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
-                             _ckpt_sz / 1e6)
-            except Exception as _ckpt_e:
-                log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
+                if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
+                    # Integrity gate before reuse. A stuck-KG hard restart
+                    # (SIGKILL mid-build) leaves a structurally incomplete
+                    # GPKG — possibly with a hot -wal/-journal — and blind
+                    # reuse would upload a corrupt product. Cheap checks:
+                    # GPKG magic application_id + SQLite quick_check + the
+                    # expected final layers (segment vectors are written
+                    # near the end of the build, so their presence implies
+                    # the build ran to completion).
+                    _reuse_full = _gpkg_reuse_ok(_existing_full)
+                    if _reuse_full:
+                        full_gpkg = _existing_full
+                        _boundary_remap = {}
+                        log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
+                                kg_code, os.path.getsize(_existing_full) / 1e6)
+                        _report_step("gpkg_full",
+                                     f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
+                    else:
+                        log.warning("KG %s: existing full GPKG failed integrity/completeness "
+                                    "check (likely interrupted build) — purging and rebuilding",
+                                    kg_code)
+                        _purge_stale_gpkg(_existing_full)
+            except Exception:
+                _reuse_full = False
+            # Manifest-aware reuse: a prior run (possibly on another peer)
+            # streamed the full GPKG to Zenodo early -- to free disk -- and then
+            # deleted the local file. Without this check a fresh peer that picks
+            # the KG up rebuilds the full GPKG from scratch AND replaces the
+            # Zenodo file (a 1-15 GB re-upload) every retry. If the run then gets
+            # interrupted before the JSON step (big KGs frequently do -- auto-park
+            # on throughput collapse, cred rotation, role eviction), the KG never
+            # produces a ``_json`` entry, never drains from the priority queue,
+            # and the rebuild+re-upload loops indefinitely (KG 40016, Jun 2026).
+            # If the manifest already has a non-error ``{kg}_full_gpkg`` entry,
+            # skip BOTH the rebuild and the re-upload and proceed straight to
+            # light + JSON so the run can actually complete and the KG drains.
+            # A genuine operator force-requeue deletes the manifest entry, so a
+            # real rebuild is unaffected (no entry -> falls through to build).
+            if not _reuse_full:
+                try:
+                    _mf_raw = json.loads(MANIFEST_PATH.read_text()) if MANIFEST_PATH.exists() else {}
+                    _mf_entries = _mf_raw.get("entries", _mf_raw) or {}
+                    _fe = _mf_entries.get(f"{kg_code}_full_gpkg")
+                    _fe_ok = (isinstance(_fe, dict) and (_fe.get("size") or 0) > 0
+                              and "error" not in (_fe.get("status", "") or ""))
+                    # Timestamp guard against an operator force-requeue. The
+                    # requeue handler (app.py) DELETES the manifest entry AND
+                    # stamps a PRODUCT-level tombstone ``{kg_code}_full_gpkg`` at
+                    # the requeue instant. The entry deletion is the primary
+                    # rebuild signal (propagates via peer-sync -> no entry ->
+                    # rebuild); the product tombstone is the secondary defence for
+                    # the window where the tombstone has propagated but the
+                    # deletion hasn't. Reuse ONLY when the entry's upload is
+                    # strictly newer than its product tombstone (== genuine
+                    # re-completion after the last invalidation). Same semantics as
+                    # app.py peer-sync's ``entry_ts <= tombstone_ts`` gate.
+                    #
+                    # CRUCIAL: do NOT gate on the ``_requeue`` tombstone. That one
+                    # is re-stamped to ``now`` on every queue push (the documented
+                    # force-requeue self-perpetuation), so an entry would always
+                    # look older than it and we'd rebuild forever -- recreating the
+                    # exact loop this fix removes. Split blocks are covered because
+                    # a parent requeue tombstones each block's OWN product key.
+                    if _fe_ok:
+                        _entry_ts = str(_fe.get("uploaded_at", "") or "")
+                        _tomb_ts = ""
+                        try:
+                            _tp = DATA_DIR / "manifest_tombstones.json"
+                            if _tp.exists():
+                                _td = json.loads(_tp.read_text())
+                                if isinstance(_td, dict):
+                                    _tomb_ts = str(_td.get(f"{kg_code}_full_gpkg", "") or "")
+                            # Drop journal wins over a stale product tombstone
+                            # (see the completed_codes gate in main()): a dropped
+                            # tombstone must not force a 1-15 GB GPKG rebuild.
+                            _dp2 = DATA_DIR / "manifest_tombstone_drops.json"
+                            if _tomb_ts and _dp2.exists():
+                                _dj2 = json.loads(_dp2.read_text())
+                                _d2 = (str(_dj2.get(f"{kg_code}_full_gpkg", "") or "")
+                                       if isinstance(_dj2, dict) else "")
+                                if _d2 and not _tomb_ts > _d2:
+                                    _tomb_ts = ""
+                        except Exception:
+                            _tomb_ts = ""
+                        if _tomb_ts and not (_entry_ts and _entry_ts > _tomb_ts):
+                            log.info("KG %s: full GPKG on Zenodo but product "
+                                     "tombstone (%s) >= entry (%s) -- rebuilding",
+                                     kg_code, _tomb_ts, _entry_ts or "<none>")
+                            _fe_ok = False
+                    if _fe_ok:
+                        _full_already_on_zenodo = True
+                        full_gpkg = ""
+                        _boundary_remap = {}
+                        log.info("KG %s: full GPKG already on Zenodo (depo=%s, %.0f MB) -- "
+                                 "skipping rebuild + re-upload",
+                                 kg_code, _fe.get("depo_id"), (_fe.get("size") or 0) / 1e6)
+                        _report_step("gpkg_full",
+                                     f"already on Zenodo ({(_fe.get('size') or 0) / 1e6:.0f} MB) -- skip")
+                except Exception as _mfe:
+                    log.warning("KG %s: manifest reuse check failed: %s", kg_code, _mfe)
+                    _full_already_on_zenodo = False
+            try:
+                if not _reuse_full and not _full_already_on_zenodo:
+                    full_gpkg, _boundary_remap = build_full_gpkg_tiled(
+                        kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+            except Exception as _bge:
+                from tile_cache import CacheMissError as _CacheMissError
+                if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
+                    # Cache-only peer hit a missing tile while building the full
+                    # GPKG (e.g. tiles restored from checkpoint did not re-fetch
+                    # Copernicus/Hansen, and those layers were not in the local
+                    # or Zenodo cache).  Abort so the director re-queues the KG
+                    # for the frontier (primary) peer.
+                    log.warning("KG %s: cache-only mode hit a miss during gpkg_full \u2014 aborting (%s)",
+                                kg_code, _bge)
+                    result["cache_incomplete"] = True
+                    result["success"] = False
+                    result["error"] = str(_bge)
+                    result["step"] = "aborted_cache_incomplete_gpkg_full"
+                    return result
+                raise
+            result["files"]["full_gpkg"] = full_gpkg
+
+            # If the full GPKG was already on Zenodo (manifest reuse above), it is
+            # neither rebuilt nor re-uploaded. Signal the parent to reload the
+            # manifest and skip its own upload attempt -- exactly as for the
+            # subprocess early-upload path.
+            if _full_already_on_zenodo:
+                result["_full_gpkg_uploaded"] = True
+                result["files"]["full_gpkg"] = ""
+
+            # --- 5b. Validate full GPKG, then stream to Zenodo ---
+            _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
+            if _full_size > 0:
+                _report_step("validate_full_gpkg", "checking full GPKG")
+                _full_issues = validate_kg_outputs(kg_code, {"full_gpkg": full_gpkg})
+                if _full_issues:
+                    for _fi in _full_issues:
+                        log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _fi)
+                else:
+                    log.info("KG %s: full GPKG validated OK (%.0f MB)", kg_code, _full_size / 1e6)
+            # Stream full GPKG to Zenodo immediately.  For large KGs the
+            # full GPKG can be 4-15 GB.  Upload it now and delete the local
+            # copy BEFORE building the light GPKG, so both products never
+            # coexist on disk simultaneously.
+            if _full_size > 0:
+                if THROTTLE_FILE.exists():
+                    _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
+                    log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
+                             kg_code, _full_size / 1e6)
+                    try:
+                        os.unlink(full_gpkg)
+                    except OSError:
+                        pass
+                    result["_full_gpkg_uploaded"] = True
+                else:
+                    _report_step("upload_full_gpkg",
+                                 f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
+                    try:
+                        from zenodo_client import Client as _ZClient, landscape_metadata as _lm
+                        _zclient = _ZClient(token=ZENODO_TOKEN)
+                        _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                            _qs=0, _qg="": \
+                            _lm(_kg, _name, v, "gpkg")
+                        from zenodo_client import Manifest as _ZManifest
+                        _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
+                        def _sub_upload_cb(sent, total):
+                            pct = round(100 * sent / total) if total else 0
+                            _report_step("upload_full_gpkg",
+                                         f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
+                        _zclient.upload_stream(
+                            f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
+                            _zmanifest, delete_after=True,
+                            progress_callback=_sub_upload_cb)
+                        log.info("  Full GPKG streamed to Zenodo and deleted locally")
+                        # Mark as already uploaded so upload_kg_to_zenodo skips it
+                        result["_full_gpkg_uploaded"] = True
+                    except Exception as _ue:
+                        log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
+                        # Signal Zenodo problem to the parent process so it can
+                        # pause + switch peers.  Keep the local full GPKG on
+                        # disk so the parent can re-upload later.  We still
+                        # let light GPKG + JSON build complete so we don't
+                        # waste an hour of compute; if Zenodo recovers in the
+                        # meantime the parent uploads everything together.
+                        _reason = _classify_zenodo_error(_ue)
+                        try:
+                            ZENODO_PAUSE_FILE.write_text(json.dumps({
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "kg": kg_code,
+                                "step": "upload_full_gpkg",
+                                "reason": _reason,
+                                "error": str(_ue),
+                            }))
+                        except Exception:
+                            pass
+                        result["zenodo_failed"] = True
+                        result["zenodo_error"] = str(_ue)
+                        result["zenodo_reason"] = _reason
+            gc.collect()
+
+            # --- 5c. Free tile checkpoints now that full GPKG is written ---
+            # The full GPKG (or its upload) is the last step that needs raster
+            # data from the tile results.  Deleting checkpoints here lets the
+            # retry path skip all tiles if it only timed out during the GPKG
+            # build phase.
+            #
+            # SKIP this cleanup if the early full-GPKG upload failed:
+            # the parent will re-queue the KG and a fresh subprocess will
+            # then need the tile checkpoints to skip the tile loop (and
+            # the rebuilt full GPKG step is skipped via our reuse path).
+            if result.get("zenodo_failed"):
+                # Keep metadata pickles (needed for the next attempt's tile loop
+                # restore) but ALWAYS drop raster sidecars — they cost the most
+                # disk and the GPKG was rebuilt successfully or will be re-built
+                # by the same code path. If the rasters are missing on retry
+                # the GPKG step falls back to the existing BEV re-read.
+                try:
+                    import tile_raster_sidecar as _trs
+                    _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+                except Exception:
+                    pass
+                log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
+                         kg_code)
+            elif result.get("_full_gpkg_uploaded") and n_tiles >= PRE_JSON_CHKPT_PUBLISH_MIN_TILES:
+                # Full GPKG is already on Zenodo but the JSON product hasn't
+                # landed yet: we are entering the "gpkg(s)-present, json-missing"
+                # limbo window (see 7fed914 / f59511d). The light + json builds
+                # below can still be interrupted before the early json upload
+                # (big split blocks take ~30 min to build json and a frontier
+                # peer auto-parks / rotates a credential / is role-evicted every
+                # couple of hours), and those interruptions are SIGKILLs — no
+                # cleanup handler runs, so we get exactly ONE chance to preserve
+                # cross-peer recoverability, and it is HERE.
+                #
+                # At this point ALL tiles have valid checkpoints on disk (they
+                # were just used to build the full GPKG). Publish the COMPLETE
+                # bundle to the cross-peer registry now so the next peer can
+                # restore every tile and finish light + json with ZERO
+                # Copernicus — completable on a cache-only peer instead of
+                # being reprocessed as frontier work that burns a credential
+                # slot. Without this we rmtree'd the checkpoints the instant
+                # the full GPKG was uploaded, so the only bundle left for the
+                # next peer was whatever a PRIOR interrupted attempt happened
+                # to publish — e.g. 90013-northwest: a stale 12/20-tile bundle,
+                # forcing tiles 13-20 to be re-fetched via NDVI/SAR on at42
+                # (Jun 2026). Keep the metadata pickles for the same-subprocess
+                # json build; release only the heavy raster sidecars (the
+                # registry is metadata-only anyway). On the happy path the
+                # "done" step clears them locally and the parent evicts the
+                # registry bundle, so this only costs a one-off ~metadata-sized
+                # PUT that is reclaimed on completion.
+                try:
+                    import tile_raster_sidecar as _trs
+                    _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+                except Exception:
+                    pass
+                try:
+                    # NB: ``progress`` (main()'s ProgressTracker) is NOT in scope
+                    # in this subprocess; the upload still surfaces fleet-wide via
+                    # the cache_manifest mirror + chkpt_registry log line.
+                    _publish_checkpoints_to_registry(kg_code)
+                    log.info("KG %s: publishing complete checkpoint bundle before "
+                             "json (full GPKG on Zenodo, json pending) so an "
+                             "interrupted finish stays cache-only-completable",
+                             kg_code)
+                except Exception as _pe:
+                    log.warning("KG %s: pre-json checkpoint publish failed: %s",
+                                kg_code, _pe)
+            else:
+                try:
+                    import shutil as _shutil_ckpt
+                    _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+                    if _ckpt_dir.exists():
+                        _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
+                        _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
+                        log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
+                                 _ckpt_sz / 1e6)
+                except Exception as _ckpt_e:
+                    log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
 
         # --- 5b. v2: top up parcel outline profiles for tiles restored from
         # checkpoints (they never went through the tile loop's sampler) ---
@@ -8603,14 +8711,20 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 log.warning("KG %s: outline profile top-up failed: %s", kg_code, _e)
 
         # --- 6. Build light GPKG ---
+        # v2 (fresh or upgrade) writes ``<code>_light_v2.gpkg`` under the
+        # product key ``light_gpkg_v2``; the legacy ``_light_gpkg`` is never
+        # produced by v2 (the triple-done logic accepts either).
         result["step"] = "gpkg_light"
         _report_step("gpkg_light", f"{len(cadastre_data['parcels'])} parcels, {len(all_new_buildings)} new bldg")
+        _is_v2 = MODEL_VERSION == "v2"
+        _light_key = "light_gpkg_v2" if _is_v2 else "light_gpkg"
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
             cadastre_data, all_new_buildings, all_infrastructure,
             obs_year=obs_year, mark_uncertain=mark_uncertain,
-            label_remap=_boundary_remap, outline_profiler=_outline_prof)
-        result["files"]["light_gpkg"] = light_gpkg
+            label_remap=_boundary_remap, outline_profiler=_outline_prof,
+            out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None)
+        result["files"][_light_key] = light_gpkg
 
         # --- 6b. Validate light GPKG ---
         _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
@@ -8630,9 +8744,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 os.unlink(light_gpkg)
             except OSError:
                 pass
-            result["files"]["light_gpkg"] = ""  # prevent parent upload attempt
+            result["files"][_light_key] = ""  # prevent parent upload attempt
         elif _light_size > 0 and result.get("_full_gpkg_uploaded") \
-                and not result.get("zenodo_failed"):
+                and not result.get("zenodo_failed") and not _is_v2:
             # --- 6c. Early light GPKG upload (ordering invariant) ---
             # The _json product is the canonical completion marker; the
             # coverage oracle treats a KG as done the moment json is on
@@ -8696,18 +8810,122 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["n_upstream_failed_tiles"] = dq.get("n_upstream_failed_tiles", 0)
         result["upstream_failed_tiles"] = dq.get("upstream_failed_tiles", [])
 
-        json_path = str(JSON_DIR / f"{kg_code}.json")
-        with open(json_path, 'w') as f:
-            json.dump(json_summary, f, indent=2, default=str)
-        result["files"]["json"] = json_path
+        if _is_v2:
+            # --- 7a. v2 products: kgjson/2 blob (+ compact legacy json for
+            # fresh KGs, which stays the fleet-wide completion marker) ---
+            import kg_json_v2 as _kgj2
+            if _v2_upgrade:
+                try:
+                    json_summary.setdefault("data_quality", {})["v2_source"] = _v2src.summary()
+                except Exception:  # noqa: BLE001
+                    pass
+                json_summary["upgraded_from"] = {
+                    "source": "zenodo_full_gpkg_v1",
+                    "v1_version": (v1_doc or {}).get("version"),
+                    "v1_generated_at": (v1_doc or {}).get("generated_at"),
+                }
+            json_v2_path = str(JSON_DIR / f"{kg_code}_v2.json.gz")
+            _n_v2 = _kgj2.dump(json_summary, json_v2_path)
+            result["files"]["json_v2"] = json_v2_path
+            log.info("KG %s: kgjson/2 written (%.2f MB gz)", kg_code, _n_v2 / 1e6)
+            json_path = ""
+            if not _v2_upgrade:
+                json_path = str(JSON_DIR / f"{kg_code}.json")
+                with open(json_path, 'w') as f:
+                    json.dump(json_summary, f, separators=(",", ":"), default=str)
+                result["files"]["json"] = json_path
+
+            # --- 7b. v2 verification gate: nothing uploads unless it passes ---
+            _report_step("v2_verify", "integrity + improvement checks")
+            import v2_verify as _v2v
+            _rep = _v2v.verify_before_upload(
+                kg_code, json_v2_path,
+                light_gpkg if (_light_size > 0 and os.path.exists(light_gpkg)) else None,
+                v1_doc, expected_parcels=len(cadastre_data.get("parcels", [])),
+                union_geom_3035=_v2_union_3035)
+            result["v2_verify"] = {"ok": bool(_rep["ok"]), "summary": _rep.summary(),
+                                   "errors": list(_rep.get("errors", []))[:10],
+                                   "warnings": list(_rep.get("warnings", []))[:10]}
+            _vmsg = f"v2verify: {kg_code} {_rep.summary()}"
+            if _rep["ok"]:
+                log.info("KG %s: %s", kg_code, _vmsg)
+                _relay_info(_vmsg, "v2_verify")
+            else:
+                log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
+                for _pth in (json_v2_path, json_path, light_gpkg):
+                    try:
+                        if _pth and os.path.exists(_pth):
+                            os.unlink(_pth)
+                    except OSError:
+                        pass
+                result["files"] = {k: v for k, v in result["files"].items()
+                                   if k not in ("json_v2", "json", _light_key)}
+                result["success"] = False
+                result["v2_verify_failed"] = True
+                result["error"] = _vmsg
+                result["step"] = "aborted_v2_verify_failed"
+                return result
+        else:
+            json_path = str(JSON_DIR / f"{kg_code}.json")
+            with open(json_path, 'w') as f:
+                json.dump(json_summary, f, indent=2, default=str)
+            result["files"]["json"] = json_path
 
         # --- 7b. Validate JSON ---
-        _json_issues = validate_kg_outputs(kg_code, {"json": json_path})
+        _json_issues = validate_kg_outputs(kg_code, {"json": json_path}) if json_path else []
         if _json_issues:
             for _ji in _json_issues:
                 log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _ji)
-        else:
+        elif json_path:
             log.info("KG %s: JSON validated OK", kg_code)
+
+        # --- 7b'. v2 ordered in-subprocess upload ---
+        # light_gpkg_v2 → json_v2 → json (fresh only).  ``_json`` stays the
+        # completion marker and MUST land last; a failure stops the chain
+        # and the parent uploads the rest in the same order.  In upgrade
+        # mode nothing else is on Zenodo yet for this KG, so this is the
+        # whole upload.  Fresh v2 additionally has the early full GPKG
+        # upload above (gate: it must have landed).
+        if _is_v2 and not THROTTLE_FILE.exists() and not result.get("zenodo_failed") \
+                and (_v2_upgrade or result.get("_full_gpkg_uploaded")):
+            result.setdefault("_uploaded_keys", [])
+            try:
+                from zenodo_client import (Client as _ZClientV, landscape_metadata as _lmV,
+                                            Manifest as _ZManifestV)
+                from zenodo_lock import zenodo_upload_lock as _zul
+                _zclientV = _ZClientV(token=ZENODO_TOKEN)
+                _zmanifestV = _ZManifestV(str(DATA_DIR / "zenodo_manifest.json"))
+                _qsV, _qgV = result.get("quality_score", 0), result.get("quality_grade", "")
+                _alV, _mlV = result.get("available_layers") or [], result.get("missing_layers") or []
+                with _zul(purpose="kg_upload_v2", kg=kg_code):
+                    for _fk in ("light_gpkg_v2", "json_v2", "json"):
+                        _fp = result["files"].get(_fk)
+                        if not _fp or not os.path.exists(_fp) or os.path.getsize(_fp) == 0:
+                            continue
+                        _ftV = "gpkg" if "gpkg" in _fk else "json"
+                        _metaV = lambda k, fn, v, _ft=_ftV: _lmV(
+                            kg_code, kg.get("kg_name", ""), v, _ft, quality_score=_qsV,
+                            quality_grade=_qgV, available_layers=_alV, missing_layers=_mlV)
+                        _szV = os.path.getsize(_fp)
+                        def _cbV(sent, total, _lab=_fk):
+                            _report_step(f"upload_{_lab}",
+                                         f"{total / 1e6:.0f} MB — {round(100 * sent / total) if total else 0}%")
+                        _report_step(f"upload_{_fk}", f"streaming {_szV / 1e6:.1f} MB to Zenodo")
+                        _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp, VERSION, _metaV, _zmanifestV,
+                                                delete_after=(_ftV == "gpkg"), progress_callback=_cbV)
+                        result["_uploaded_keys"].append(_fk)
+                        if _ftV == "gpkg":
+                            result["files"][_fk] = ""
+                        if _fk == "json":
+                            result["_json_uploaded"] = True
+                        try:
+                            _push_manifest_entry_to_director(f"{kg_code}_{_fk}", _zmanifestV)
+                        except Exception:
+                            pass
+                        log.info("KG %s: %s streamed to Zenodo (%.1f MB)", kg_code, _fk, _szV / 1e6)
+            except Exception as _vue:  # noqa: BLE001
+                log.warning("KG %s: v2 in-subprocess upload stopped (%s) — parent uploads the rest "
+                            "in order", kg_code, _vue)
 
         # --- 7c. Early JSON upload (interruption resilience) ---
         # The ``_json`` product is the canonical completion marker: a KG only
@@ -8740,9 +8958,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             and (result.get("_light_gpkg_uploaded") or _light_size == 0)
             and not result.get("zenodo_failed")
         )
-        if THROTTLE_FILE.exists():
+        if THROTTLE_FILE.exists() or _is_v2:
             # Throttle mode never uploads json (matches parent behaviour);
-            # leave it for the parent's throttle handling.
+            # leave it for the parent's throttle handling.  v2 handled its
+            # ordered upload in 7b' above.
             pass
         elif not _gpkgs_on_zenodo:
             # GPKG(s) not yet on Zenodo -- defer json to the parent so it is
@@ -9347,7 +9566,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             log.info("KG %s: skipping upload for %s (empty file)", kg_code, file_key)
             continue
 
-        if THROTTLE_FILE.exists() and file_key.endswith('gpkg'):
+        if THROTTLE_FILE.exists() and 'gpkg' in file_key:
             log.info("KG %s: throttle mode \u2014 skipping %s upload", kg_code, file_key)
             # Still delete local GPKG to free disk
             if local_path and os.path.exists(local_path):
@@ -9356,7 +9575,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             continue
 
         zenodo_key = f"{kg_code}_{file_key}"
-        file_type = "gpkg" if file_key.endswith("gpkg") else "json"
+        file_type = "gpkg" if "gpkg" in file_key else "json"   # light_gpkg_v2 / json_v2
 
         meta_func = lambda k, fn, v, _kg=kg_code, _name=kg_name, _ft=file_type, \
             _qs=quality_score, _qg=quality_grade, _al=_avail, _ml=_miss: \
@@ -9369,7 +9588,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             # Stream upload: file is read from disk in chunks, never fully
             # loaded into memory.  GPKGs are deleted immediately after
             # upload to free disk for the next product.
-            delete_local = (file_key != "json")
+            delete_local = not file_key.startswith("json")
             _file_cb = None
             if progress_callback:
                 _file_label = file_key
@@ -9451,6 +9670,194 @@ def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "complet
         os.rename(tmp, str(TILE_HISTORY_FILE))
     except Exception as e:
         log.warning("Failed to save tile history for %s: %s", kg_code, e)
+
+
+# === SECTION: v2 upgrade — re-classify v1 KGs from their own Zenodo full GPKG ===
+#
+# An "upgrade unit" is a code (parent or split block) that already has
+# ``_json`` + ``_full_gpkg`` on Zenodo but no ``_json_v2``.  The parent
+# downloads the v1 JSON (bbox + verify baseline) and the full GPKG (all
+# rasters) into V2_GPKG_DIR, runs ``process_one_kg(source_gpkg=…)`` — the
+# subprocess installs ``v2_source`` so every tile read is served from the
+# GPKG with health checks — and deletes the GPKG afterwards.  No BEV, no
+# openEO, no credential: any idle cache-only peer can do it.  Codes that
+# cannot be upgraded (GPKG gone from Zenodo, verify failed twice, …) are
+# recorded in ``v2_upgrade_failed.json`` so they are not re-picked forever.
+
+def _load_v2_upgrade_failed() -> dict:
+    try:
+        if V2_UPGRADE_FAILED_FILE.exists():
+            d = json.loads(V2_UPGRADE_FAILED_FILE.read_text())
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False) -> int:
+    """Bump the per-code strike counter.  Returns the new count.  ``fatal``
+    (GPKG gone / no v1 product) jumps straight to the give-up threshold."""
+    d = _load_v2_upgrade_failed()
+    e = d.get(code) or {"n": 0}
+    e["n"] = int(e.get("n", 0)) + (V2_UPGRADE_MAX_STRIKES if fatal else 1)
+    e["reason"] = str(reason)[:300]
+    e["ts"] = datetime.now(timezone.utc).isoformat()
+    d[code] = e
+    try:
+        tmp = V2_UPGRADE_FAILED_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        tmp.replace(V2_UPGRADE_FAILED_FILE)
+    except Exception as ex:
+        log.warning("could not persist v2_upgrade_failed: %s", ex)
+    return e["n"]
+
+
+V2_UPGRADE_MAX_STRIKES = 2
+
+
+def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool:
+    """True iff *code* has committed v1 products, no ``_json_v2`` yet and has
+    not struck out."""
+    if manifest.get(f"{code}_json_v2") is not None:
+        return False
+    ej = manifest.get(f"{code}_json")
+    eg = manifest.get(f"{code}_full_gpkg")
+    if ej is None or eg is None or not getattr(eg, "size", 0):
+        return False
+    if failed is None:
+        failed = _load_v2_upgrade_failed()
+    return int((failed.get(code) or {}).get("n", 0)) < V2_UPGRADE_MAX_STRIKES
+
+
+def _v2_upgrade_units(codes: list, manifest, kg_index: dict) -> list:
+    """Build processor kg-dicts for the eligible *codes* (whitelist order).
+    ``kg_index`` maps parent code → kg dict from get_all_kgs().  The bbox is
+    filled from the v1 JSON at fetch time (blocks carry their own bbox)."""
+    from kg_splitter import is_block_code, parent_kg_code
+    failed = _load_v2_upgrade_failed()
+    units, seen = [], set()
+    for code in codes:
+        if code in seen or not v2_upgrade_eligible(code, manifest, failed):
+            continue
+        seen.add(code)
+        parent = parent_kg_code(code) if is_block_code(code) else code
+        base = kg_index.get(parent) or {"kg_code": parent, "kg_name": parent}
+        unit = {k: v for k, v in base.items() if not k.startswith("_")}
+        unit["kg_code"] = code
+        unit.pop("bbox", None)          # from the v1 JSON, see _v2_fetch_inputs
+        if is_block_code(code):
+            unit["_parent_kg_code"] = parent
+            unit["_block_label"] = code.split("-", 1)[1]
+            unit["kg_name"] = f"{base.get('kg_name', parent)} ({unit['_block_label']})"
+        unit["_v2_upgrade"] = True
+        units.append(unit)
+    return units
+
+
+def _v2_free_gb() -> float:
+    import shutil as _sh
+    return _sh.disk_usage("/").free / (1024 ** 3)
+
+
+def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
+    """Download the v1 JSON + full GPKG for an upgrade unit.
+
+    Returns ``(gpkg_path, v1_doc)``.  Raises ``FileNotFoundError`` when a
+    product is gone from Zenodo (fatal for this code), ``RuntimeError`` on
+    disk pressure / transient download failure (retry later)."""
+    import sys as _sys
+    _sv2 = str(Path(__file__).resolve().parent / "segv2")
+    if _sv2 not in _sys.path:
+        _sys.path.insert(0, _sv2)
+    import gpkg_fetch as _gf
+    from zenodo_client import Client as _ZC
+    code = kg["kg_code"]
+    V2_GPKG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _step(detail):
+        if progress is not None:
+            progress.set_step("v2_fetch", detail)
+            progress.save()
+
+    # 1) v1 JSON (small) — bbox + verify baseline.
+    ej = manifest.get(f"{code}_json")
+    if ej is None:
+        raise FileNotFoundError(f"{code}: no _json in manifest")
+    _step(f"v1 json {ej.size / 1e6:.1f} MB")
+    jdir = V2_GPKG_DIR / "v1json"
+    jpath = jdir / ej.filename
+    if not (jpath.exists() and jpath.stat().st_size == ej.size):
+        try:
+            _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest)
+        except Exception as e:  # noqa: BLE001
+            sc = int(getattr(e, "status_code", 0) or 0)
+            if sc in (403, 404, 410):
+                raise FileNotFoundError(f"{code}_json HTTP {sc}") from e
+            raise RuntimeError(f"{code}_json download: {e}") from e
+    with open(jpath) as f:
+        v1_doc = json.load(f)
+    bb = v1_doc.get("bbox") or {}
+    if all(k in bb for k in ("min_lon", "min_lat", "max_lon", "max_lat")):
+        kg["bbox"] = {k: float(bb[k]) for k in ("min_lon", "min_lat", "max_lon", "max_lat")}
+    elif "bbox" not in kg:
+        raise RuntimeError(f"{code}: v1 JSON has no bbox")
+    for k in ("kg_name", "state", "gemeinde", "district"):
+        if v1_doc.get(k) and not kg.get(k):
+            kg[k] = v1_doc[k]
+
+    # 2) full GPKG (the big one) — disk-checked, few streams.
+    eg = manifest.get(f"{code}_full_gpkg")
+    if eg is None or not eg.size:
+        raise FileNotFoundError(f"{code}: no _full_gpkg in manifest")
+    gpath = V2_GPKG_DIR / eg.filename
+    if gpath.exists() and gpath.stat().st_size == eg.size:
+        log.info("KG %s: reusing downloaded %s (%.0f MB)", code, gpath.name, eg.size / 1e6)
+        return str(gpath), v1_doc
+    need_gb = eg.size / (1024 ** 3) + V2_UPGRADE_MIN_FREE_GB
+    free = _v2_free_gb()
+    if free < need_gb:
+        # Drop stale downloads from earlier units first.
+        for old in V2_GPKG_DIR.glob("*.gpkg*"):
+            if old.name != eg.filename:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        free = _v2_free_gb()
+        if free < need_gb:
+            raise RuntimeError(f"{code}: disk {free:.1f} GB free < {need_gb:.1f} GB needed for GPKG")
+    _step(f"full GPKG {eg.size / 1e6:.0f} MB ({V2_UPGRADE_STREAMS} streams)")
+    entry = {"bucket_url": eg.bucket_url, "filename": eg.filename, "size": eg.size,
+             "checksum": eg.checksum}
+    t0 = time.time()
+    try:
+        rec = _gf.download(entry, gpath, n_streams=V2_UPGRADE_STREAMS)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"{code}_full_gpkg gone from Zenodo: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"{code}_full_gpkg download: {e}") from e
+    want = (eg.checksum or "").replace("md5:", "")
+    if want and rec.get("md5") != want:
+        gpath.unlink(missing_ok=True)
+        raise RuntimeError(f"{code}_full_gpkg md5 mismatch ({rec.get('md5')} != {want})")
+    log.info("KG %s: v2 inputs ready — %s %.0f MB in %.0fs (%.1f MB/s)", code, gpath.name,
+             eg.size / 1e6, time.time() - t0, eg.size / 1e6 / max(time.time() - t0, 1e-3))
+    return str(gpath), v1_doc
+
+
+def _v2_release_inputs(kg: dict) -> None:
+    """Delete the downloaded GPKG (+ v1 JSON) of an upgrade unit."""
+    code = kg.get("kg_code", "")
+    try:
+        for f in V2_GPKG_DIR.glob(f"{code}_full.gpkg*"):
+            f.unlink(missing_ok=True)
+        for f in (V2_GPKG_DIR / "v1json").glob(f"{code}.json*"):
+            f.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("v2 release %s: %s", code, e)
+
+
+V2_UPGRADE_MIN_FREE_GB = float(os.environ.get("V2_UPGRADE_MIN_FREE_GB", "3"))
 
 
 # === SECTION: main() — KG iteration, retry loop, subprocess management ===
@@ -10282,6 +10689,11 @@ def main():
                              "process KGs whose tiles are fully present in the "
                              "local + Zenodo cache.  Cache misses re-queue the "
                              "KG for the frontier (primary) peer.")
+    parser.add_argument("--v2-upgrade", action="store_true",
+                        help="Also upgrade whitelisted KGs that already have v1 "
+                             "products on Zenodo to v2, from their own full GPKG "
+                             "(no BEV/openEO). With --kg: upgrade that single code. "
+                             "Env V2_UPGRADE=1 is equivalent.")
     parser.add_argument("--peers", nargs='*', default=[],
                         help="Peer instance URLs for coordination (e.g. https://srtm-lidar-at.exe.xyz:8000)")
     parser.add_argument("--instance-id", default=None,
@@ -10359,9 +10771,16 @@ def main():
         _tc.set_forbid_remote(True)
         log.info("🔒 Cache-only mode: will refuse Copernicus/Hansen API fetches")
     peer_urls = args.peers or []
+    v2_upgrade = bool(args.v2_upgrade or os.environ.get("V2_UPGRADE", "") == "1")
+    if v2_upgrade and MODEL_VERSION != "v2":
+        log.error("--v2-upgrade requested but MODEL_VERSION=%s (lightgbm or "
+                  "data/segv2/models/model_G.joblib missing?) — disabling upgrade mode",
+                  MODEL_VERSION)
+        v2_upgrade = False
 
     log.info("=" * 70)
-    log.info("🇦🇹 Austria Landscape Processor starting (instance=%s)", _instance_id)
+    log.info("🇦🇹 Austria Landscape Processor starting (instance=%s, model=%s%s)",
+             _instance_id, MODEL_VERSION, ", v2-upgrade" if v2_upgrade else "")
     if peer_urls:
         log.info("Peers: %s", peer_urls)
     log.info("=" * 70)
@@ -10807,6 +11226,30 @@ def main():
         log.info("Pending starts with %d priority KGs, then %d nearest-neighbor",
                  len(priority_kgs), len(non_priority))
 
+    # --- v2 upgrade units ---
+    # Whitelisted codes that are v1-complete on Zenodo (json + full GPKG)
+    # and have no _json_v2 yet.  They were filtered OUT of ``pending``
+    # above (they are in completed_codes), so add them back here as
+    # upgrade units in whitelist order.  With --kg the single code is
+    # upgraded regardless of the whitelist.
+    _v2_units = []
+    if v2_upgrade:
+        _kg_index = {k["kg_code"]: k for k in kgs}
+        if args.kg:
+            _v2_codes = [args.kg]
+        else:
+            _v2_codes = list(_read_retry_queue())
+        _v2_units = _v2_upgrade_units(_v2_codes, manifest, _kg_index)
+        if _v2_units:
+            _pend_codes = {k["kg_code"] for k in pending}
+            _v2_units = [u for u in _v2_units if u["kg_code"] not in _pend_codes]
+            pending = pending + _v2_units
+            log.info("v2 upgrade: %d unit(s) appended after %d fresh KG(s): %s",
+                     len(_v2_units), len(pending) - len(_v2_units),
+                     [u["kg_code"] for u in _v2_units[:10]])
+        else:
+            log.info("v2 upgrade: no eligible units in whitelist (%d codes)", len(_v2_codes))
+
     log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
              len(kgs), len(completed_codes), len(failed_kgs), len(pending))
 
@@ -10917,6 +11360,31 @@ def main():
         progress.save()
 
         IN_PROGRESS_FILE.write_text(kg_code)
+
+        # --- v2 upgrade unit: pull the v1 JSON + full GPKG from Zenodo ---
+        _v2_source_gpkg = None
+        _v2_v1_doc = None
+        if kg.get("_v2_upgrade"):
+            try:
+                _v2_source_gpkg, _v2_v1_doc = _v2_fetch_inputs(kg, manifest, progress)
+                progress.add_log("info", f"v2up: {kg_code} inputs ready "
+                                 f"({os.path.getsize(_v2_source_gpkg) / 1e6:.0f} MB GPKG)", kg_code)
+            except FileNotFoundError as _fe:
+                log.error("KG %s: v2 upgrade impossible — %s", kg_code, _fe)
+                progress.add_log("warning", f"v2up: {kg_code} skipped — {_fe}", kg_code)
+                _record_v2_upgrade_failed(kg_code, str(_fe), fatal=True)
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
+            except Exception as _fe:  # noqa: BLE001
+                log.warning("KG %s: v2 inputs unavailable (%s) — skipping for now", kg_code, _fe)
+                progress.add_log("warning", f"v2up: {kg_code} deferred — {str(_fe)[:120]}", kg_code)
+                _record_v2_upgrade_failed(kg_code, str(_fe))
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
 
         # Truncate stale subprocess warnings so the monitor thread
         # doesn't replay errors from a previous KG / run.
@@ -11092,7 +11560,9 @@ def main():
                     async_result = pool.apply_async(
                         process_one_kg, args=(kg,),
                         kwds={"include_copernicus": include_cop,
-                              "mark_uncertain": mark_uncertain})
+                              "mark_uncertain": mark_uncertain,
+                              "source_gpkg": _v2_source_gpkg,
+                              "v1_doc": _v2_v1_doc})
                     try:
                         _timeout = KG_TIMEOUT_SECONDS if attempt_idx == 0 else KG_RETRY_TIMEOUT_SECONDS
                         # Poll with 5s slices so we can detect postpone signal
@@ -11253,6 +11723,18 @@ def main():
             _step_monitor_stop.set()
             step_thread.join(timeout=3)
 
+            if kg.get("_v2_upgrade"):
+                # The downloaded GPKG is per-unit; never keep it around
+                # (multi-GB).  Verify failures strike the code so a
+                # systematically bad input is not re-tried forever.
+                _v2_release_inputs(kg)
+                if result is not None and result.get("v2_verify_failed"):
+                    _n_strk = _record_v2_upgrade_failed(kg_code, result.get("error", "verify"))
+                    progress.add_log("warning",
+                                     f"v2up: {kg_code} verify FAILED (strike {_n_strk}/"
+                                     f"{V2_UPGRADE_MAX_STRIKES}) — {str(result.get('error', ''))[:160]}",
+                                     kg_code)
+
             if result is None:
                 # All retries exhausted or permanent failure — already logged
                 pass
@@ -11304,7 +11786,8 @@ def main():
                 # the entry and don't try to re-upload a deleted file.
                 if (result.get("_full_gpkg_uploaded")
                         or result.get("_light_gpkg_uploaded")
-                        or result.get("_json_uploaded")):
+                        or result.get("_json_uploaded")
+                        or result.get("_uploaded_keys")):
                     manifest = Manifest(str(MANIFEST_PATH))
                     log.info("KG %s: subprocess pre-uploaded product(s) — manifest reloaded",
                              kg_code)
@@ -11318,6 +11801,9 @@ def main():
                 if result.get("_json_uploaded"):
                     _upload_files = {k: v for k, v in result["files"].items()
                                      if k != "json"}
+                if result.get("_uploaded_keys"):
+                    _upload_files = {k: v for k, v in _upload_files.items()
+                                     if k not in set(result["_uploaded_keys"])}
 
                 upload_stats = upload_kg_to_zenodo(
                     kg_code, kg_name, _upload_files, manifest,
@@ -11431,15 +11917,25 @@ def main():
                     )
                     _qg = result.get('quality_grade', '')
                     _qs = result.get('quality_score', 0)
-                    progress.add_log(
-                        "success",
-                        f"KG {kg_code} done in {elapsed_kg:.0f}s "
-                        f"({result.get('n_segments', 0)} segs, "
-                        f"{result.get('n_parcels', 0)} par, "
-                        f"{result.get('n_buildings', 0)} bldg, "
-                        f"quality={_qs:.0%} {_qg})",
-                        kg_code,
-                    )
+                    if kg.get("_v2_upgrade"):
+                        with progress._lock:
+                            progress._state["v2_upgraded"] = int(progress._state.get("v2_upgraded", 0)) + 1
+                        _v2s = (result.get("v2_verify") or {}).get("summary", "")
+                        progress.add_log(
+                            "success",
+                            f"v2up: KG {kg_code} upgraded to v2 in {elapsed_kg:.0f}s "
+                            f"({result.get('n_segments', 0)} segs, {_v2s})",
+                            kg_code)
+                    else:
+                        progress.add_log(
+                            "success",
+                            f"KG {kg_code} done in {elapsed_kg:.0f}s "
+                            f"({result.get('n_segments', 0)} segs, "
+                            f"{result.get('n_parcels', 0)} par, "
+                            f"{result.get('n_buildings', 0)} bldg, "
+                            f"quality={_qs:.0%} {_qg})",
+                            kg_code,
+                        )
                     # Persist tile dots for completed KG
                     with progress._lock:
                         _ckg = progress._state.get("current_kg") or {}
@@ -11547,6 +12043,19 @@ def main():
                     # Proactively flush tile cache to Zenodo so tiles
                     # survive disk cleanup between KGs.
                     flush_tile_cache_to_zenodo()
+            elif result.get("v2_verify_failed") or result.get("step") == "aborted_v2_unavailable":
+                # v2 upgrade gate tripped: nothing was uploaded, the code was
+                # struck in v2_upgrade_failed.json above.  This is NOT a v1
+                # failure — never touch failed_kgs / failure_counts.  Drop it
+                # from the whitelist so the peer moves on; the director
+                # re-dispatches (or not) based on the strike file.
+                log.warning("KG %s: v2 upgrade not completed — %s", kg_code,
+                            str(result.get("error", ""))[:200])
+                _remove_from_retry_queue(kg_code)
+                with progress._lock:
+                    _ckg = progress._state.get("current_kg") or {}
+                    _ts = _ckg.get("tile_statuses", [])
+                _save_tile_history(kg_code, _ts, "v2_verify_failed")
             else:
                 # --- Copernicus credits exhausted? Don't mark as permanently failed ---
                 is_credits_issue = (result.get("copernicus_exhausted")

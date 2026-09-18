@@ -249,7 +249,13 @@ def _walk_paths(doc: dict, path: tuple, fn):
 
 def to_v2_dict(doc: dict) -> dict:
     """Return a v2 container dict (no compression) — deep-copies via JSON."""
-    out = json.loads(json.dumps(doc, separators=(",", ":"), allow_nan=True))
+    # Deep copy + normalise in one pass: live processor docs carry numpy
+    # scalars / datetimes (v1 wrote them with ``default=str``) and NaN/inf
+    # floats (v1 wrote bare ``NaN`` tokens).  NaN/inf → null so the compact
+    # output is strict JSON.
+    out = json.loads(json.dumps(doc, separators=(",", ":"), allow_nan=True,
+                                default=_json_default),
+                     parse_constant=lambda _c: None)
 
     def _tab(parent, key):
         v = parent.get(key)
@@ -292,6 +298,20 @@ def encode(doc: dict, level: int = GZIP_LEVEL) -> bytes:
     return gzip.compress(raw, compresslevel=level, mtime=0)
 
 
+def _json_default(o: Any):
+    try:
+        import numpy as _np
+        if isinstance(o, _np.generic):
+            return o.item()
+        if isinstance(o, _np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    return str(o)
+
+
 def decode(blob: bytes | bytearray | dict | str) -> dict:
     """gzip'd v2 bytes / plain v2 JSON bytes / v2 dict → v1-shape dict.
 
@@ -322,9 +342,23 @@ def dump(doc: dict, path: str | Path) -> int:
     return len(data)
 
 
+def _strip_none(o: Any) -> Any:
+    """Drop None-valued dict keys recursively.  The columnar codec stores
+    None as *absent* (a null cell decodes to a missing key), so equality
+    is defined modulo ``None ≡ absent`` — every consumer reads records
+    with ``.get``."""
+    if isinstance(o, dict):
+        return {k: _strip_none(v) for k, v in o.items() if v is not None}
+    if isinstance(o, list):
+        return [_strip_none(v) for v in o]
+    return o
+
+
 def _normalise(o: Any) -> Any:
-    """JSON-normalise for equality (tuples→lists, -0.0→0.0, NaN→None)."""
-    return json.loads(json.dumps(o, separators=(",", ":"), allow_nan=True))
+    """JSON-normalise for equality (tuples→lists, -0.0→0.0, NaN→None→absent)."""
+    return _strip_none(json.loads(json.dumps(o, separators=(",", ":"), allow_nan=True,
+                                             default=_json_default),
+                                  parse_constant=lambda _c: None))
 
 
 def roundtrip_ok(doc: dict) -> tuple[bool, str]:

@@ -448,6 +448,31 @@ class _GitBusy(RuntimeError):
 _GIT_SYNC_LOCK_PATH = '/tmp/srtm_git_sync.lock'
 
 
+def _ensure_v2_deps(sp, timeout: int = 600) -> str:
+    """Make sure ``lightgbm`` imports (segv2 model runtime). The processor
+    picks MODEL_VERSION=v2 iff ``model_v2.available()`` — which requires
+    lightgbm — so a peer without it silently keeps producing v1. Called
+    from admin_update after the git pull (both immediate + deferred
+    paths). pip as the srv user (exedev) with --user; idempotent."""
+    try:
+        import importlib
+        importlib.import_module('lightgbm')
+        return 'present'
+    except Exception:
+        pass
+    try:
+        r = sp.run([sys.executable, '-m', 'pip', 'install', '--user', '-q',
+                    '--break-system-packages', 'lightgbm'],
+                   capture_output=True, text=True, timeout=timeout)
+        ok = r.returncode == 0
+        log.info('v2 deps: pip install lightgbm rc=%s %s', r.returncode,
+                 (r.stderr or '')[-300:] if not ok else '')
+        return 'installed' if ok else f'pip_failed_rc{r.returncode}'
+    except Exception as e:
+        log.warning('v2 deps: pip install lightgbm failed: %s', e)
+        return f'error: {e}'
+
+
 def _safe_git_sync(repo: str, sp):
     """Robust git pull for `/admin/update` and the deferred-update path.
 
@@ -7608,6 +7633,10 @@ def admin_update():
                         _safe_git_sync(repo, sp)
                     except Exception:
                         pass
+                    try:
+                        _ensure_v2_deps(sp)
+                    except Exception:
+                        pass
                     sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
                 _th.Thread(target=_deferred_update, daemon=True).start()
                 return jsonify({
@@ -7630,6 +7659,11 @@ def admin_update():
             return jsonify({'error': 'another update in progress', 'detail': str(_gb)}), 409
         except Exception as _ge:
             return jsonify({'error': f'git sync failed: {_ge}'}), 500
+        # segv2 runtime dep (no-op when already importable)
+        try:
+            _ensure_v2_deps(sp)
+        except Exception:
+            pass
         # Ensure traceroute is available (needed for region detection)
         if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
             sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
@@ -16297,6 +16331,40 @@ def info():
 
 # === SECTION: /api/v1/attribution endpoint ===
 
+@app.route('/api/v1/model/v2', methods=['GET'])
+def model_v2_info():
+    """segv2 model card: meta.json (classes, CV metrics, feature list,
+    trained_at) + local availability + primary-side rollout counters
+    (``v2_ingest.status()``). Cheap; meta is a 3 KB file."""
+    out = {'model_version': 'v2'}
+    try:
+        from segv2 import model_v2 as _mv2
+        mp, metap = _mv2._resolve(_mv2.DEFAULT_MODEL)
+        out.update({
+            'model': _mv2.DEFAULT_MODEL, 'path': str(mp),
+            'present': mp.exists() and metap.exists(),
+            'available': _mv2.available(),
+            'zenodo': _mv2.MODEL_ZENODO.get(str(_mv2.DEFAULT_MODEL)),
+            'size': mp.stat().st_size if mp.exists() else None,
+        })
+        if metap.exists():
+            out['meta'] = json.loads(metap.read_text())
+    except Exception as e:
+        out['error'] = str(e)
+    try:
+        import lightgbm as _lgb
+        out['lightgbm'] = _lgb.__version__
+    except Exception:
+        out['lightgbm'] = None
+    if request.args.get('rollout') in ('1', 'true'):
+        try:
+            import v2_ingest as _v2i
+            out['rollout'] = _v2i.status()
+        except Exception as e:
+            out['rollout'] = {'error': str(e)}
+    return jsonify(out)
+
+
 @app.route('/api/v1/attribution', methods=['GET'])
 def attribution_endpoint():
     """Licence + attribution for every upstream data source.
@@ -18886,6 +18954,14 @@ def process_txt():
             )
     except Exception:
         log.exception('process.txt fleet_proxy line failed')
+
+    # v2 rollout line (primary-local: kg_v2_store + manifest + json dir).
+    # See v2_ingest.text_line(); structured twin at director/status.v2.
+    try:
+        import v2_ingest as _v2i
+        out.append(_v2i.text_line(_v2i.status(total_kgs=8440)))
+    except Exception as _e:
+        out.append(f'v2: unavailable ({_e})')
 
     # Cross-peer tile checkpoint registry (Zenodo-backed metadata pickles
     # uploaded by aborting peers, downloaded by the next peer to pick

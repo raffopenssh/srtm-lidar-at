@@ -4117,6 +4117,7 @@ class PeerDirector:
             # 5-min TTL'd — cheap on hot status recomputes.
             'bw_learn': self._bw_learn_summary(state, cfg),
             'fleet_proxy': self._fleet_proxy_summary_with_history(peers_status),
+            'v2': self._v2_status(),
             'fleet_proxy_history': (
                 list(self._proxy_history)
                 if getattr(self, '_lock_fd', None) is not None
@@ -4840,6 +4841,16 @@ class PeerDirector:
             'observed_cap_gb_median': round(cap_med, 2) if cap_med is not None else None,
             'next_renew_in_days': soonest_days,
         }
+
+    def _v2_status(self) -> dict:
+        """v2 rollout counters (upgraded/fresh/verify_fail/store/kg_log).
+        Primary-local data — on a non-primary director the store is
+        empty and only the manifest-derived counters are meaningful."""
+        try:
+            import v2_ingest
+            return v2_ingest.status()
+        except Exception as e:  # noqa: BLE001
+            return {'error': str(e)}
 
     def _fleet_proxy_summary_with_history(self, peers_status: list[dict]) -> dict:
         """Compute the current fleet_proxy summary AND maintain the

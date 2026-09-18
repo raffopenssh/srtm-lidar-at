@@ -17,3 +17,4 @@ scikit-image==0.26.0
 scikit-learn==1.8.0
 scipy==1.17.1
 shapely==2.1.2
+lightgbm>=4.5  # segv2 LightGBM classifier (v2 product); auto-installed by admin_update

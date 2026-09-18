@@ -94,6 +94,11 @@
 
 <div class="grid" id="cards"></div>
 
+<div class="section" id="v2Section">
+  <div class="section-title">segv2 LightGBM model (v2 product)</div>
+  <div class="card" id="v2card" style="font-size:13px;line-height:1.5">loading /api/v1/model/v2 …</div>
+</div>
+
 <div class="section">
   <div class="section-title">OOB Learning Curve</div>
   <div class="chart-container"><canvas id="chart"></canvas></div>
@@ -629,6 +634,29 @@ function showDeployedModal() {
   document.getElementById('deployedModalBody').innerHTML = h;
   document.getElementById('deployedModal').classList.add('open');
 }
+
+async function renderV2() {
+  const el = document.getElementById('v2card');
+  try {
+    const r = await fetch('/api/v1/model/v2?rollout=1');
+    const d = await r.json();
+    const m = d.meta || {};
+    const ro = d.rollout || {};
+    const st = ro.store || {};
+    const f1 = typeof m.cv_metrics === 'number' ? (m.cv_metrics*100).toFixed(1)+'%' : '—';
+    const mb = d.size ? (d.size/1048576).toFixed(0)+' MB' : '—';
+    let h = `<div><b>model_${d.model || 'G'}.joblib</b> · ${mb} · lightgbm ${d.lightgbm || '<span style="color:var(--red)">missing</span>'} · ${d.available ? '<span style="color:var(--green)">available</span>' : '<span style="color:var(--red)">unavailable</span>'}</div>`;
+    h += `<div>trained ${m.trained_at || '—'} · n_train ${fmt(m.n_train)} · ${(m.classes||[]).length} classes · ${(m.feature_keys||[]).length} features · 5-fold GroupKFold macro-F1 <b>${f1}</b> (v1 RF on same rows: 28.3%)</div>`;
+    h += `<div style="color:var(--dim)">classes: ${(m.classes||[]).join(', ')}</div>`;
+    if (ro.upgraded_parents != null) {
+      h += `<div style="margin-top:6px">rollout: <b>${fmt(ro.upgraded_parents)}</b>/${fmt(ro.total)} KGs upgraded (${ro.upgraded_pct}%) · +${ro.upgraded_24h}/24h · fresh v2 ${fmt(ro.fresh_v2)} · verify fail ${ro.verify_fail} · pending ingest ${ro.pending ?? '—'}`;
+      h += ` · store ${fmt(st.codes)} docs / ${st.db_bytes ? (st.db_bytes/1048576).toFixed(1)+' MB' : '—'} · v1 JSON freed ${st.v1_bytes_freed ? (st.v1_bytes_freed/1073741824).toFixed(2)+' GB' : '0'} · json files left ${fmt(ro.json_files)}</div>`;
+    }
+    h += `<div style="color:var(--dim);margin-top:4px">Docs: <a href="/docs#cls-v2" style="color:var(--blue)">classifier v2</a> · <a href="/docs#processor-outputs" style="color:var(--blue)">kgjson/2 products</a> · <a href="/api/v1/model/v2" style="color:var(--blue)">model card JSON</a></div>`;
+    el.innerHTML = h;
+  } catch(e) { el.textContent = 'model/v2 unavailable: ' + e; }
+}
+renderV2(); setInterval(renderV2, 120000);
 
 async function poll() {
   try {

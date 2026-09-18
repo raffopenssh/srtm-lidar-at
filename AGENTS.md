@@ -502,6 +502,7 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 | Zenodo persistent tile cache | `docs/zenodo-cache.md` | touching `zenodo_cache.py`, tile manifest, ZIP indices |
 | Cross-cutting concerns | `docs/cross-cutting-concerns.md` | adding object types, RF features, tile grid, credential pool, navigation cheatsheet |
 | Planned refactor + speed optimisation | `docs/planned-refactor.md` | next maintenance window work |
+| v2 rollout (segv2 LightGBM product, upgrade-from-GPKG, primary blob store, ingest) | `docs/v2-upgrade.md` | touching `v2_ingest.py`, `kg_v2_store.py`, `kg_docs.py`, `kg_log_harvest.py`, `v2_verify.py`, `--v2-upgrade`, `_v2_upgrade_fill`; reading the `v2:` line |
 | Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |
 

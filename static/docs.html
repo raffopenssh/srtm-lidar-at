@@ -300,6 +300,7 @@ td code { font-size: 12px; }
     <a href="#methods-classification">Classification</a>
     <div class="nav-sub">
       <a href="#cls-rf">Random Forest</a>
+      <a href="#cls-v2">LightGBM v2 (segv2)</a>
       <a href="#cls-rules">Rule-Based Fallback</a>
       <a href="#cls-grouping">Hierarchical Grouping</a>
     </div>
@@ -2246,6 +2247,30 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
   split back at inference using DTM change direction.
 </p>
 
+<h3 id="cls-v2">LightGBM v2 Classifier (segv2) <a class="anchor-link" href="#cls-v2">#</a></h3>
+
+<p>
+  Since September 2026 the default per-object classifier is a <strong>LightGBM</strong> model
+  (<code>data/segv2/models/model_G.joblib</code>, card at <a href="/api/v1/model/v2"><code>/api/v1/model/v2</code></a>)
+  trained on 1.23 M segments from 146 KGs with labels derived from the cadastre nutzung
+  codes, OSM pavement/rail/water and INVEKOS field blocks matched to the ALS flight year.
+  It predicts 14 classes (<code>crop garden glacier grass orchard parking rail road rock roof
+  shrub tree vineyard water</code>; <code>bare_soil</code> is merged into <code>rock</code>,
+  <code>earthwork</code>/<code>path</code> stay rule-only) on the v1 feature set plus
+  geometry context (<code>dist_road/rail/water/building/parcel_edge</code>, neighbour height /
+  NDVI, multi-year NDVI, flight-year gaps) — 117 features. 5-fold GroupKFold by KG:
+  macro-F1 0.78 / weighted-F1 0.92 / accuracy 0.925 (the v1 RF scores 0.28 macro-F1 on the same rows).
+  Post-hoc NDVI class vetoes and an INVEKOS override (field-block type wins when ≥70 % of the
+  segment lies in one Schlag and the segment is low vegetation) are applied before the shared
+  infrastructure / cadastre / grouping steps.
+</p>
+<p>
+  <code>/api/v1/segment</code> accepts <code>model=v1|v2</code> (default v2 when the model is
+  present); the response carries <code>meta.model</code>, <code>meta.model_classifier</code>
+  (<code>lgbm_v2:&lt;hash&gt;</code>) and per-feature <code>type2</code> / <code>type2_confidence</code> /
+  <code>invekos_type</code>. KG products record the classifier in <code>summary.model</code>.
+</p>
+
 <h3 id="cls-rules">Rule-Based Fallback Classifier <a class="anchor-link" href="#cls-rules">#</a></h3>
 
 <p>
@@ -2702,12 +2727,31 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
     </tr>
     <tr>
       <td><code>{kg}.json</code></td>
-      <td>JSON summary: area statistics, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score</td>
+      <td>JSON summary: area statistics, height distributions, landscape characterisation, top objects/trees, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score. Also the fleet-wide completion marker (<code>_json</code>).</td>
       <td>~1 MB</td>
+    </tr>
+    <tr>
+      <td><code>{kg}_v2.json.gz</code></td>
+      <td><strong>v2 product</strong> (<code>kgjson/2</code>): the same document, LightGBM-classified, with <code>model</code> block and <code>parcels.details[].outline_z</code> (parcel-outline DTM/nDSM profiles), in a compact column-oriented gzip container (18–22× smaller than pretty v1). Served decoded at <code>/api/v1/kg/{kg}</code>, raw with <code>?raw=1</code>; processing history at <code>/api/v1/kg/{kg}/history</code>.</td>
+      <td>~50 KB</td>
+    </tr>
+    <tr>
+      <td><code>{kg}_light_v2.gpkg</code></td>
+      <td><strong>v2 product</strong>: light GeoPackage with v2 types + <code>parcel_outline_z</code> table. Rasters are unchanged, so no <code>_full_v2</code> exists — the v1 <code>{kg}_full.gpkg</code> stays the raster source.</td>
+      <td>~100 MB</td>
     </tr>
   </tbody>
 </table>
 </div>
+<p>
+  Already-processed v1 KGs are <em>upgraded</em> in place by idle cache-only peers: the peer
+  downloads the KG's own full GPKG from Zenodo (no BEV / openEO traffic), re-runs
+  segmentation + LightGBM, verifies the result against the v1 document (37 checks) and uploads
+  <code>_light_gpkg_v2</code> then <code>_json_v2</code>. v1 files on Zenodo are never touched.
+  Search-index rows carry <code>product_version</code> and <code>_links.zenodo_json_v2</code> /
+  <code>zenodo_light_gpkg_v2</code>. Rollout progress: the <code>v2:</code> line on
+  <code>/process.txt</code>.
+</p>
 
 <h3 id="processor-zenodo">Zenodo Integration <a class="anchor-link" href="#processor-zenodo">#</a></h3>
 

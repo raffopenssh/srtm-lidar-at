@@ -11183,10 +11183,17 @@ class PeerDirector:
         # completed-block guard would otherwise drop them).
         v2_codes = self._v2_upgrade_fill(whitelist, cfg)
         if v2_codes:
-            log.info('v2 upgrade: %d cache-ready KGs < %d — adding %d upgrade '
-                     'unit(s) (%d candidates)', len(whitelist),
-                     V2_UPGRADE_FILL_BELOW_READY, len(v2_codes),
-                     (self.state.get('_v2_cand_cache') or {}).get('total', 0))
+            # Log on change or every 10 min — this runs every ~35 s tick.
+            _sig = (len(whitelist), len(v2_codes))
+            _now = time.time()
+            if (_sig != getattr(self, '_v2_fill_last_sig', None)
+                    or _now - getattr(self, '_v2_fill_last_log', 0) > 600):
+                self._v2_fill_last_sig = _sig
+                self._v2_fill_last_log = _now
+                log.info('v2 upgrade: %d cache-ready KGs < %d — adding %d upgrade '
+                         'unit(s) (%d candidates)', len(whitelist),
+                         V2_UPGRADE_FILL_BELOW_READY, len(v2_codes),
+                         (self.state.get('_v2_cand_cache') or {}).get('total', 0))
         if not whitelist and not v2_codes:
             # Nothing to do for cache-only peers.  Stop any that are
             # running (they'd otherwise idle-loop a fresh subprocess).

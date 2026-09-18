@@ -2808,17 +2808,19 @@ const ZEN_STALE_MS = 48 * 3600 * 1000;  // first-file age past which an
 // suffix (50017 vs 50017-west) because each block uploads its own triple.
 function _zenEntryParts(e) {
   const key = String((e && e.key) || '');
-  let m = key.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_(full_gpkg|light_gpkg|json)$/);
+  // _light_gpkg_v2 is the light leg of a fresh-v2 triple (no legacy
+  // _light_gpkg is written); _json_v2 is an add-on and ignored here.
+  let m = key.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_(full_gpkg|light_gpkg|light_gpkg_v2|json)$/);
   if (m) {
     return { code: m[1],
              product: m[2] === 'full_gpkg' ? 'full'
-                    : m[2] === 'light_gpkg' ? 'light' : 'json' };
+                    : (m[2] === 'light_gpkg' || m[2] === 'light_gpkg_v2') ? 'light' : 'json' };
   }
   // Fallback: derive from filename (e.g. 50017_full.gpkg / 50017.json).
   const fn = String((e && e.filename) || '');
   m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_full\.gpkg$/i);
   if (m) return { code: m[1], product: 'full' };
-  m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_light\.gpkg$/i);
+  m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)_light(?:_v2)?\.gpkg$/i);
   if (m) return { code: m[1], product: 'light' };
   m = fn.match(/^(\d+(?:-[a-z][-a-z0-9]*)?)\.json$/i);
   if (m) return { code: m[1], product: 'json' };

@@ -1164,10 +1164,8 @@ class SearchIndex:
             if ga:
                 return ga
             try:
-                # mtime as ISO8601 so it sorts lexicographically
-                import datetime as _dt
-                return _dt.datetime.utcfromtimestamp(
-                    path.stat().st_mtime).isoformat()
+                import kg_docs as _kd2
+                return _kd2.timestamp(code, jdir)
             except Exception:
                 return ''
 
@@ -1195,30 +1193,25 @@ class SearchIndex:
             # superseded it.
             return bool(err_ts) and err_ts > ok_ts
 
+        # Documents come from the v2 blob store first, legacy files second
+        # (kg_docs). ``plain_path`` is kept as a truthy marker for callers.
+        import kg_docs as _kd
         plain_path = jdir / f'{parent_code}.json'
         plain_data = None; plain_ts = ''
-        if plain_path.exists() and not _is_errored(parent_code):
-            try:
-                plain_data = json.loads(plain_path.read_text())
+        _plain_present, _block_codes = _kd.codes_for_parent(parent_code, jdir)
+        if _plain_present and not _is_errored(parent_code):
+            plain_data = _kd.load(parent_code, jdir)
+            if plain_data is not None:
                 plain_ts = _ts_for(parent_code, plain_path, plain_data)
-            except Exception:
-                plain_data = None
-        try:
-            blocks_iter = sorted(jdir.glob(f'{parent_code}-*.json'))
-        except Exception:
-            blocks_iter = []
         block_entries = []   # (ts, path, code, data)
-        for bp in blocks_iter:
-            stem = bp.stem
-            if not stem.startswith(f'{parent_code}-'):
-                continue
+        for stem in _block_codes:
             if _is_errored(stem):
                 continue
-            try:
-                d = json.loads(bp.read_text())
-                block_entries.append((_ts_for(stem, bp, d), bp, stem, d))
-            except Exception:
+            d = _kd.load(stem, jdir)
+            if d is None:
                 continue
+            bp = jdir / f'{stem}.json'
+            block_entries.append((_ts_for(stem, bp, d), bp, stem, d))
 
         # If the manifest has *_json evidence on only one side, that side
         # wins outright — the other side's local files are stale leftovers
@@ -1985,8 +1978,16 @@ class SearchIndex:
     # ════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def _kg_json_docs(kg_code):
+        """Yield ``(code, doc)`` for the parent + any split blocks, reading
+        the v2 blob store first and legacy files second (``kg_docs``)."""
+        import kg_docs as _kd
+        yield from _kd.iter_docs(kg_code)
+
+    @staticmethod
     def _kg_json_paths(kg_code):
         """Return all local JSON files for a KG (parent + any split blocks).
+        Legacy (file-only) — prefer ``_kg_json_docs``.
 
         Split KGs (>22 tiles) live in `<code>-<block>.json`, never `<code>.json`.
         Both the parent and the block files are returned in deterministic order
@@ -2013,14 +2014,13 @@ class SearchIndex:
             return None
         result = {'kg': kg, 'parcel_id': parcel_id, 'parcel_detail': None}
         # Search parent JSON + any split-block JSONs for this kg_code.
-        for jp in self._kg_json_paths(kg_code):
+        for _code, data in self._kg_json_docs(kg_code):
             try:
-                data = json.loads(jp.read_text())
                 for p in data.get('parcels', {}).get('details', []):
                     if p.get('parcel_id') == parcel_id:
                         result['parcel_detail'] = p
-                        if jp.stem != kg_code:
-                            result['source_block'] = jp.stem
+                        if _code != kg_code:
+                            result['source_block'] = _code
                         return result
             except Exception:
                 continue
@@ -2617,14 +2617,9 @@ class SearchIndex:
             if len(results) >= limit + offset:
                 break
             kg_code = kg_row['kg_code']
-            for jp in self._kg_json_paths(kg_code):
+            for _code, data in self._kg_json_docs(kg_code):
                 if len(results) >= limit + offset:
                     break
-                try:
-                    data = json.loads(jp.read_text())
-                except Exception as e:
-                    log.warning('query_parcels_by_type_confidence read %s: %s', jp, e)
-                    continue
                 for p in data.get('parcels', {}).get('details', []):
                     cls = p.get('classification', {})
                     bt = cls.get('by_type', {}).get(object_type)
@@ -2683,12 +2678,7 @@ class SearchIndex:
         sort_key = 'height_m'
         for kg_row in kg_rows:
             kg_code = kg_row['kg_code']
-            for jp in self._kg_json_paths(kg_code):
-                try:
-                    data = json.loads(jp.read_text())
-                except Exception as e:
-                    log.warning('query_top_features %s %s: %s', feature_type, jp, e)
-                    continue
+            for _code, data in self._kg_json_docs(kg_code):
                 if feature_type == 'trees':
                     items = data.get('top_10_trees', [])
                     sort_key = 'height_m'

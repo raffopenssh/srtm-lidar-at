@@ -3449,6 +3449,16 @@ def processing_start():
         args.append('--no-copernicus')
     if cache_only:
         args.append('--cache-only')
+    # v2 upgrade: whitelisted codes that are v1-complete on Zenodo are
+    # re-classified from their own full GPKG (no BEV / openEO).  The
+    # director sets this for cache-only peers it fills with upgrade
+    # candidates; harmless when the whitelist has none.
+    v2_upgrade = (
+        request.args.get('v2_upgrade', '').lower() in ('1', 'true', 'yes')
+        or bool(body.get('v2_upgrade'))
+    )
+    if v2_upgrade:
+        args.append('--v2-upgrade')
 
     # Pass peer URLs so the subprocess can de-dup against peers' current
     # KGs (block-aware via parent_kg_code). Without this, two cache-only
@@ -4228,7 +4238,12 @@ def _read_bbox_cheap(code, json_dir=None):
         with open(Path(jd) / f'{code}.json', 'r') as f:
             head = f.read(4096)
     except OSError:
-        return None
+        # v1 file gone after v2 ingest → indexed bbox column in the store.
+        try:
+            import kg_v2_store as _kvs
+            return _kvs.get_bbox(code)
+        except Exception:
+            return None
     m = _COV_BBOX_RE.search(head)
     if not m:
         return None
@@ -4529,7 +4544,7 @@ def _repair_split_drift(code, plan, *, dry_run=False):
     except Exception:
         return []
     mentries = mdata.get('entries', mdata) or {}
-    suffixes = ('_json', '_full_gpkg', '_light_gpkg')
+    suffixes = ('_json', '_full_gpkg', '_light_gpkg', '_json_v2', '_light_gpkg_v2')
     dropped = [b + s for b in plan for s in suffixes if (b + s) in mentries]
     if not dropped or dry_run:
         return dropped
@@ -4956,11 +4971,11 @@ def processing_queue_add():
             # both: ``c_<suffix>`` AND ``c-<dir>_<suffix>``.
             partial_keys = []
             if mentries is not None:
-                suffixes = ('_full_gpkg', '_light_gpkg', '_json')
+                suffixes = ('_full_gpkg', '_light_gpkg', '_json', '_light_gpkg_v2', '_json_v2')
                 for key in mentries:
                     if not any(key.endswith(s) for s in suffixes):
                         continue
-                    code = key.rsplit('_', 2)[0] if key.endswith('_full_gpkg') or key.endswith('_light_gpkg') else key.rsplit('_', 1)[0]
+                    code = key
                     # Strip suffix more reliably: split off the trailing
                     # _full_gpkg / _light_gpkg / _json.
                     for s in suffixes:
@@ -4988,7 +5003,7 @@ def processing_queue_add():
             # invalidated: re-running the parent supersedes them.
             if partial_keys and mentries is not None:
                 def _code_of(k):
-                    for s in ('_full_gpkg', '_light_gpkg', '_json'):
+                    for s in ('_full_gpkg', '_light_gpkg', '_json', '_light_gpkg_v2', '_json_v2'):
                         if k.endswith(s):
                             return k[:-len(s)]
                     return k
@@ -6711,6 +6726,17 @@ def _archive_lines(lines):
             else datetime.now(timezone.utc).date().isoformat()
         by_day.setdefault(day, []).append(line if line.endswith('\n') else line + '\n')
     written = 0
+    # Fold the evicted lines into the per-KG history rings
+    # (kg_v2_store.kg_log) at the moment they leave the live ring — the
+    # one place every merged-log line passes exactly once.  Primary only
+    # (the store is primary state; the shadow receives archive days via
+    # PUT /director/log_archive and folds them lazily on promotion).
+    try:
+        if _is_keep_role_data():
+            import kg_log_harvest as _klh
+            _klh.fold_lines(lines)
+    except Exception as _e:
+        log.debug('kg_log fold on prune: %s', _e)
     try:
         _COMBINED_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as _e:
@@ -9307,18 +9333,48 @@ def api_kg(kg_code):
     # flat index row that only carries one block's data.
     json_path = Path(f'data/austria_processor/json/{kg_code}.json')
     use_idx = bool(request.args.get('index_only'))
+    want_hist = request.args.get('history', '').lower() in ('1', 'true', 'yes')
     try:
         idx = si.get_index()
     except Exception as e:
         log.warning('index get %s: %s', kg_code, e)
         idx = None
+    # v2 blob-store fast-path (the v1 file is deleted after ingest): serve
+    # the decoded doc; ``?raw=1`` streams the kgjson/2 gzip blob as-is.
+    if not use_idx:
+        try:
+            import kg_v2_store as _kvs
+            if _kvs.has(kg_code):
+                if request.args.get('raw', '').lower() in ('1', 'true', 'yes'):
+                    _blob = _kvs.get_blob(kg_code)
+                    _r = Response(_blob, mimetype='application/gzip')
+                    _r.headers['Content-Disposition'] = f'attachment; filename="{kg_code}_v2.json.gz"'
+                    _r.headers['X-KG-Doc-Source'] = 'store'
+                    return _r
+                _doc = _kvs.get(kg_code)
+                if _doc is not None:
+                    if want_hist:
+                        import copy as _cp
+                        _doc = _cp.copy(_doc)
+                        _doc['history'] = _kvs.get_log(kg_code)
+                    _r = jsonify(_doc)
+                    _r.headers['X-KG-Doc-Source'] = 'store'
+                    return _r
+        except Exception as e:
+            log.warning('kg store %s: %s', kg_code, e)
     # Plain file fast-path: skip merge work when the parent JSON exists.
-    if json_path.exists() and not use_idx:
+    if json_path.exists() and not use_idx and not want_hist:
         return send_file(str(json_path), mimetype='application/json')
     if not use_idx and idx is not None:
         try:
             merged = idx.merged_kg_json(kg_code)
             if merged is not None:
+                if want_hist:
+                    try:
+                        import kg_docs as _kd
+                        merged['history'] = _kd.history(kg_code)
+                    except Exception:
+                        pass
                 # Annotate Zenodo links on the merged dict so the dashboard
                 # can surface freshest URLs without a second round-trip.
                 row = idx.query_kg(kg_code)
@@ -9341,6 +9397,22 @@ def api_kg(kg_code):
         except Exception as e:
             log.warning('index query_kg %s: %s', kg_code, e)
     return jsonify({'error': f'KG {kg_code} not found'}), 404
+
+
+@app.route('/api/v1/kg/<kg_code>/history')
+def api_kg_history(kg_code):
+    """Per-KG processing history: merged-log lines mentioning this code
+    (starts, one row per tile, warnings/errors, uploads, v2 upgrade +
+    verify verdicts), flattened into a bounded ring in the primary's blob
+    store (``kg_v2_store.kg_log``) from the live 24h ring + the long-term
+    archive.  ``?limit=N`` newest rows; blocks of a parent are merged."""
+    try:
+        limit = int(request.args.get('limit', '0') or 0) or None
+    except ValueError:
+        limit = None
+    import kg_docs as _kd
+    rows = _kd.history(kg_code, limit=limit)
+    return jsonify({'kg_code': kg_code, 'count': len(rows), 'history': rows})
 
 
 @app.route('/api/v1/parcel/<path:parcel_id>')
@@ -18491,14 +18563,20 @@ def process_txt():
                 _t.time() - _sv.get('ts', 0) > 300:
             import re as _re
             _PRODS = ('json', 'full_gpkg', 'light_gpkg')
+            # v2 products: a fresh v2 KG writes _light_gpkg_v2 instead of
+            # _light_gpkg (rasters identical, so no second full GPKG) —
+            # accept it as the light leg of the triple. _json_v2 is an
+            # add-on (upgrade or fresh), never part of the triple.
             _rx = _re.compile(
-                r'^(\d+(?:-[a-z][-a-z0-9]*)?)_(json|full_gpkg|light_gpkg)$')
+                r'^(\d+(?:-[a-z][-a-z0-9]*)?)_(json|full_gpkg|light_gpkg|light_gpkg_v2)$')
             _trip = {}
             for k, e in real.items():
                 m = _rx.match(k)
                 if not m:
                     continue
                 c, prod = m.groups()
+                if prod == 'light_gpkg_v2':
+                    prod = 'light_gpkg'
                 g = _trip.setdefault(c, {'p': set(), 'first': None})
                 g['p'].add(prod)
                 ts = e.get('uploaded_at')

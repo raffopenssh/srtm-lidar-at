@@ -565,6 +565,16 @@ def scan_json(json_path) -> dict:
     return res
 
 
+def scan_doc(data: dict, kg_code: str) -> dict:
+    """Like ``scan_json`` but for an in-memory document (v2 blob store)."""
+    res = scan_kg_data(data, kg_code)
+    import feedback_db
+    feedback_db.write_objects_and_flags(res['objects'], res['flags'], RULE_VERSION)
+    log.info('quality_flags: %s (store) → %d objects, %d flags',
+             kg_code, len(res['objects']), len(res['flags']))
+    return res
+
+
 def scan_all(json_dir: Path = JSON_DIR) -> dict:
     n_obj = 0; n_flag = 0
     for jp in sorted(json_dir.glob('*.json')):

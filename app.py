@@ -3514,8 +3514,18 @@ def processing_start():
         request.args.get('v2_upgrade', '').lower() in ('1', 'true', 'yes')
         or bool(body.get('v2_upgrade'))
     )
+    _v2_marker = Path('data/austria_processor/v2_upgrade_mode')
     if v2_upgrade:
         args.append('--v2-upgrade')
+        # Marker read by processing_queue_get: upgrade codes are "complete"
+        # by every v1 oracle and would otherwise be pruned from the
+        # whitelist the director just PUT, before the processor reads it.
+        try:
+            _v2_marker.write_text(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+        except Exception:
+            pass
+    else:
+        _v2_marker.unlink(missing_ok=True)
 
     # Pass peer URLs so the subprocess can de-dup against peers' current
     # KGs (block-aware via parent_kg_code). Without this, two cache-only
@@ -4828,9 +4838,22 @@ def processing_queue_get():
         except Exception:
             return False
 
+    # v2 upgrade mode (marker written by /processing/start {v2_upgrade}):
+    # whitelisted codes that are v1-complete but lack ``_json_v2`` are
+    # legitimate work for the local processor — keep them.
+    _v2_keep = set()
+    if (data_dir / 'v2_upgrade_mode').exists():
+        for c in codes:
+            e_j = _mf_entries.get(f'{c}_json')
+            e_g = _mf_entries.get(f'{c}_full_gpkg')
+            if (isinstance(e_j, dict) and isinstance(e_g, dict)
+                    and int(e_g.get('size') or 0) > 0
+                    and f'{c}_json_v2' not in _mf_entries):
+                _v2_keep.add(c)
     dirty = len(codes)
     codes = [c for c in codes if
-             (c not in completed and not _parent_fully_done(c)) or c in tombstoned_kgs]
+             (c not in completed and not _parent_fully_done(c))
+             or c in tombstoned_kgs or c in _v2_keep]
     if len(codes) < dirty:
         # Persist the cleaned list
         try:
@@ -18959,7 +18982,13 @@ def process_txt():
     # See v2_ingest.text_line(); structured twin at director/status.v2.
     try:
         import v2_ingest as _v2i
-        out.append(_v2i.text_line(_v2i.status(total_kgs=8440)))
+        _v2l = _v2i.text_line(_v2i.status(total_kgs=8440))
+        _dsp = ((d.get('v2') or {}).get('dispatch') or {})
+        if _dsp:
+            _v2l += (f" · dispatch={len(_dsp.get('assigned') or [])}"
+                     f"/{_dsp.get('candidates_total', 0)}cand"
+                     f" (fill<{_dsp.get('fill_below_ready')} ready, cap {_dsp.get('max_peers')})")
+        out.append(_v2l)
     except Exception as _e:
         out.append(f'v2: unavailable ({_e})')
 

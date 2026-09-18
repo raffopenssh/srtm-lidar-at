@@ -187,6 +187,19 @@ MIN_RESERVE_PEERS = 0
 # from spinning up an absurd number of peers if min_reserve is misset.
 MAX_CACHE_ONLY_PEERS = 64
 
+# === v2 upgrade backfill (segv2 rollout) ===
+# When the cache-ready whitelist runs low, idle cache-only peers are fed
+# *upgrade* units: KGs that are v1-complete on Zenodo (``_json`` +
+# ``_full_gpkg``) and have no ``_json_v2`` yet. The peer re-classifies
+# them from their own full GPKG (no BEV / openEO traffic, no credential)
+# and uploads ``_light_gpkg_v2`` + ``_json_v2``; the primary ingests the
+# blob (``v2_ingest``). Only the processor decides per code (needs
+# ``--v2-upgrade`` → start payload ``v2_upgrade:true``).
+V2_UPGRADE_FILL_BELOW_READY = 40   # inject when cache_ready_kgs < this
+MAX_V2_UPGRADE_PEERS = 24          # ≈ concurrent full-GPKG downloads (codes injected/tick)
+V2_UPGRADE_ZEN_WARN_MAX = 2.0      # fleet Zenodo warns/min above which we inject nothing
+V2_UPGRADE_CAND_TTL_S = 300
+
 # === Frontier cell pre-warm (Fix #2) ===
 # A frontier only fetches the handful of 0.1° tiles its KG needs, so the
 # shared Zenodo cache never fills densely enough for a cache-only peer to
@@ -2146,7 +2159,8 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                          *, cache_only: bool = False,
                          queue_whitelist: list | None = None,
                          cred_indices: list | None = None,
-                         lat_strips: list | None = None) -> dict:
+                         lat_strips: list | None = None,
+                         v2_upgrade: bool = False) -> dict:
     """Start the processor on a peer.
 
     For remote peers, syncs the local priority queue first so the peer
@@ -2165,6 +2179,8 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
     payload = {}
     if cache_only:
         payload['cache_only'] = True
+    if v2_upgrade:
+        payload['v2_upgrade'] = True
     if cred_indices is not None:
         payload['cred_indices'] = list(cred_indices)
     if lat_strips is not None:
@@ -4848,9 +4864,20 @@ class PeerDirector:
         empty and only the manifest-derived counters are meaningful."""
         try:
             import v2_ingest
-            return v2_ingest.status()
+            out = dict(v2_ingest.status())
         except Exception as e:  # noqa: BLE001
-            return {'error': str(e)}
+            out = {'error': str(e)}
+        try:
+            cc = self.state.get('_v2_cand_cache') or {}
+            out['dispatch'] = {
+                'assigned': list(self.state.get('v2_upgrade_assigned') or []),
+                'candidates_total': cc.get('total', 0),
+                'fill_below_ready': V2_UPGRADE_FILL_BELOW_READY,
+                'max_peers': MAX_V2_UPGRADE_PEERS,
+            }
+        except Exception:
+            pass
+        return out
 
     def _fleet_proxy_summary_with_history(self, peers_status: list[dict]) -> dict:
         """Compute the current fleet_proxy summary AND maintain the
@@ -9487,6 +9514,74 @@ class PeerDirector:
         except Exception as e:
             log.debug('prewarm flag write failed: %s', e)
 
+    def _compute_v2_upgrade_candidates(self, max_n: int = 400) -> list[str]:
+        """Product codes (parents AND split blocks, straight from the
+        manifest) that are v1-complete (committed ``_json`` + ``_full_gpkg``)
+        and have no ``_json_v2`` yet. Smallest full GPKG first (cheapest
+        download, quickest fleet-wide feedback). Cached 5 min. Peer-local
+        strikes (``v2_upgrade_failed.json``) are honoured on the peer; the
+        director additionally skips codes whose primary ingest struck out.
+        """
+        now = time.time()
+        cached = self.state.get('_v2_cand_cache') or {}
+        if cached.get('codes') is not None and (now - cached.get('at', 0)) < V2_UPGRADE_CAND_TTL_S:
+            return cached['codes']
+        codes: list[str] = []
+        try:
+            mf_path = DATA_DIR / 'zenodo_manifest.json'
+            raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+            ent = raw.get('entries', raw) or {}
+            skip = set()
+            try:
+                import v2_ingest as _v2i
+                skip = {c for c, st in _v2i.failed().items()
+                        if int(st.get('n', 0)) >= _v2i.MAX_FAILS}
+            except Exception:
+                pass
+            ranked = []
+            for k, e in ent.items():
+                if not k.endswith('_json') or not isinstance(e, dict):
+                    continue
+                if 'error' in str(e.get('status', '')):
+                    continue
+                code = k[:-5]
+                if code in skip or f'{code}_json_v2' in ent:
+                    continue
+                g = ent.get(f'{code}_full_gpkg')
+                if not isinstance(g, dict) or int(g.get('size') or 0) <= 0 \
+                        or not g.get('uploaded_at'):
+                    continue
+                ranked.append((int(g.get('size') or 0), code))
+            ranked.sort()
+            codes = [c for _, c in ranked[:max_n]]
+        except Exception as e:
+            log.warning('v2 upgrade candidates: %s', e)
+        with self._lock:
+            self.state['_v2_cand_cache'] = {'codes': codes, 'at': now,
+                                            'total': len(codes)}
+        return codes
+
+    def _v2_upgrade_fill(self, whitelist: list, cfg: dict) -> list[str]:
+        """Upgrade codes to append to the cache-only whitelist this tick
+        (empty when disabled, whitelist not low, or Zenodo is unhappy)."""
+        if not cfg.get('v2_upgrade', True):
+            return []
+        if len(whitelist) >= int(cfg.get('v2_upgrade_fill_below_ready',
+                                         V2_UPGRADE_FILL_BELOW_READY)):
+            return []
+        try:
+            zen_rate = float((self._capacity_components.get('rates') or {}).get('zenodo') or 0.0)
+        except Exception:
+            zen_rate = 0.0
+        if zen_rate > V2_UPGRADE_ZEN_WARN_MAX:
+            log.info('v2 upgrade: Zenodo warns %.2f/min > %.1f — no upgrade '
+                     'units this tick', zen_rate, V2_UPGRADE_ZEN_WARN_MAX)
+            return []
+        cap = int(cfg.get('max_v2_upgrade_peers', MAX_V2_UPGRADE_PEERS))
+        cands = self._compute_v2_upgrade_candidates()
+        wl = set(whitelist)
+        return [c for c in cands if c not in wl][:max(0, cap)]
+
     def _compute_cache_ready_kgs(self, max_kgs: int = 200) -> list[str]:
         """Return KG codes that are fully present in the local+Zenodo cache.
 
@@ -11081,7 +11176,18 @@ class PeerDirector:
 
         # Compute cache-ready whitelist (cheap due to caching).
         whitelist = self._compute_cache_ready_kgs()
-        if not whitelist:
+        # v2 upgrade backfill: when the fleet is starved of cache-ready
+        # work, hand idle peers v1-complete KGs to re-classify from their
+        # own full GPKG. Kept separate from ``whitelist`` until after
+        # block expansion (these are already product codes, and the
+        # completed-block guard would otherwise drop them).
+        v2_codes = self._v2_upgrade_fill(whitelist, cfg)
+        if v2_codes:
+            log.info('v2 upgrade: %d cache-ready KGs < %d — adding %d upgrade '
+                     'unit(s) (%d candidates)', len(whitelist),
+                     V2_UPGRADE_FILL_BELOW_READY, len(v2_codes),
+                     (self.state.get('_v2_cand_cache') or {}).get('total', 0))
+        if not whitelist and not v2_codes:
             # Nothing to do for cache-only peers.  Stop any that are
             # running (they'd otherwise idle-loop a fresh subprocess).
             # Use a graceful stop so the peer finishes its current KG
@@ -11259,7 +11365,8 @@ class PeerDirector:
                 pass
         # Filter the whitelist before partitioning.
         whitelist = [k for k in whitelist if k not in in_progress]
-        if not whitelist:
+        v2_codes = [k for k in v2_codes if k not in in_progress]
+        if not whitelist and not v2_codes:
             log.info('Cache-only orchestrate: whitelist drained after excluding '
                      '%d in-progress KGs', len(in_progress))
             return
@@ -11345,11 +11452,15 @@ class PeerDirector:
                          'blocks (%d → %d codes) for cross-peer distribution',
                          n_split, len(whitelist), len(expanded))
             whitelist = expanded
-            if not whitelist:
+            if not whitelist and not v2_codes:
                 log.info('Cache-only orchestrate: whitelist empty after block expansion')
                 return
         except Exception as e:
             log.warning('Block expansion failed (continuing with parent codes): %s', e)
+        if v2_codes:
+            whitelist = whitelist + [c for c in v2_codes if c not in set(whitelist)]
+            if not whitelist:
+                return
 
         # --- Complexity-weighted, capacity-aware LPT partition.
         #
@@ -11462,7 +11573,8 @@ class PeerDirector:
                      len(whitelist))
             try:
                 start_peer_processor(p.get('url'), cache_only=True,
-                                     queue_whitelist=chunk)
+                                     queue_whitelist=chunk,
+                                     v2_upgrade=bool(cfg.get('v2_upgrade', True)))
             except Exception as e:
                 log.warning('Start cache-only on %s failed: %s', p['id'], e)
 
@@ -11494,6 +11606,7 @@ class PeerDirector:
             self.state['cache_only_active'] = list(set(
                 running_cache_only + [p['id'] for p in to_start]))
             self.state['cache_only_assigned'] = new_assigned
+            self.state['v2_upgrade_assigned'] = sorted(v2_codes)
             save_director_state(self.state)
 
     # Split-layout-drift wedge repair: how many parents to unwedge per

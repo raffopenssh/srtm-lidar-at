@@ -1479,6 +1479,22 @@ def _v2_ingest_thread():
 threading.Thread(target=_v2_ingest_thread, daemon=True, name='v2-ingest').start()
 
 
+def _v2_deps_startup_thread():
+    """One-shot: make lightgbm importable on this VM. admin_update only
+    pip-installs on the *next* rollout wave (the pip step is itself part
+    of the new code), so peers that just pulled the v2 commit would keep
+    producing v1 until another commit lands. ~20 s, once per srv start."""
+    time.sleep(45)
+    try:
+        import subprocess as _sp
+        res = _ensure_v2_deps(_sp)
+        if res != 'present':
+            log.info('v2 deps at startup: %s', res)
+    except Exception as e:
+        log.debug('v2 deps startup: %s', e)
+threading.Thread(target=_v2_deps_startup_thread, daemon=True, name='v2-deps').start()
+
+
 # === SECTION: Status push to director ===
 #
 # Every peer pushes its /processing/status payload to the director

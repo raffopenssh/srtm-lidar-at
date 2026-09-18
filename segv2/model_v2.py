@@ -45,6 +45,70 @@ MANMADE = {"road", "path", "parking", "roof", "wall", "fence", "mast", "greenhou
            "bridge", "excavation", "fill", "construction", "substation", "wind_turbine", "rail"}
 
 
+# Fleet distribution: ``data/segv2/models/`` is gitignored (36 MB binary), so
+# peers fetch the model from our Zenodo mirror on first use.  Draft deposits
+# need the token (same one austria_processor uses for every product).
+MODEL_ZENODO = {
+    "G": {
+        "joblib": {"depo_id": 22824068, "filename": "model_G.joblib", "size": 36104198,
+                   "sha1": "7089ca645ff5d0a2d78df012e7f622118c13df7d"},
+        "meta": {"depo_id": 22824064, "filename": "model_G.meta.json", "size": 3201,
+                 "sha1": "60118955dca4ddd3ef8f7297829763d5964a130e"},
+    },
+}
+_ZENODO_TOKEN = os.environ.get("ZENODO_TOKEN") or "2dnLSA2YYTc8jt3a1X0qDZUBb1hyOIpGJ44UoJr8N69wdePODgq4cjbJ0DJa"
+_dl_lock = threading.Lock()
+
+
+def _zenodo_url(spec: dict) -> str:
+    return (f"https://zenodo.org/api/records/{spec['depo_id']}/draft/files/"
+            f"{spec['filename']}/content?access_token={_ZENODO_TOKEN}")
+
+
+def ensure_model(model: str | None = None, timeout: float = 600.0) -> tuple[Path, Path]:
+    """Make sure ``model_<X>.joblib`` + meta exist locally; download from
+    Zenodo (sha1-verified, atomic rename) if not.  Returns (joblib, meta)."""
+    import requests
+    letter = str(model or DEFAULT_MODEL)
+    mp, metap = _resolve(letter)
+    spec = MODEL_ZENODO.get(letter)
+    if (mp.exists() and metap.exists()) or spec is None:
+        return mp, metap
+    with _dl_lock:
+        if mp.exists() and metap.exists():
+            return mp, metap
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        for target, key in ((metap, "meta"), (mp, "joblib")):
+            if target.exists():
+                continue
+            sp = spec[key]
+            log.info("ModelV2: downloading %s (%.1f MB) from Zenodo", sp["filename"], sp["size"] / 1e6)
+            tmp = target.with_suffix(target.suffix + ".part")
+            h = hashlib.sha1()
+            with requests.get(_zenodo_url(sp), stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk); h.update(chunk)
+            if h.hexdigest() != sp["sha1"] or tmp.stat().st_size != sp["size"]:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(f"ModelV2: checksum mismatch downloading {sp['filename']}")
+            tmp.replace(target)
+    return mp, metap
+
+
+def available(model: str | None = None) -> bool:
+    """True if the v2 model is usable here (present locally or fetchable) AND
+    lightgbm imports.  Cheap; used by austria_processor to pick VERSION."""
+    try:
+        import lightgbm  # noqa: F401
+    except Exception:
+        return False
+    letter = str(model or DEFAULT_MODEL)
+    mp, metap = _resolve(letter)
+    return (mp.exists() and metap.exists()) or letter in MODEL_ZENODO
+
+
 def _resolve(model: str | os.PathLike) -> tuple[Path, Path]:
     p = Path(model)
     if p.suffix == ".joblib" and p.exists():
@@ -72,6 +136,11 @@ class ModelV2:
     def load(cls, model: str | os.PathLike | None = None) -> "ModelV2":
         import joblib
         mp, metap = _resolve(model or DEFAULT_MODEL)
+        if not mp.exists():
+            try:
+                mp, metap = ensure_model(model or DEFAULT_MODEL)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ModelV2: Zenodo fetch failed: %s", e)
         if not mp.exists():
             raise FileNotFoundError(f"v2 model not found: {mp}")
         meta = json.loads(metap.read_text()) if metap.exists() else {}

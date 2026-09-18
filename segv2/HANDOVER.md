@@ -1,4 +1,4 @@
-# segv2 — handover (state as of 2026-09-17 19:45 UTC)
+# segv2 — handover (state as of 2026-09-18 05:45 UTC)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes). This file is
 **current state + open work only**. The chronological log (dataset audit, fake-NIR / flight-
@@ -7,8 +7,9 @@ date defects, harness runs A–H, class-set decision, live-test bug hunt) lives 
 
 ## Where we are
 
-* **Model shipped on disk**: `data/segv2/models/model_G.joblib` (36 MB, hash `7089ca645ff5`,
-  gitignored) + `model_G.meta.json`. LightGBM, ALL_KEYS minus `harm_*`, 14 classes
+* **Model shipped IN THE REPO**: `data/segv2/models/model_G.joblib` (36 MB, sha1 `7089ca645ff5…`)
+  + `model_G.meta.json` — committed 2026-09-18 so every peer / new client gets it via `git pull`.
+  Zenodo mirror as fallback (`model_v2.MODEL_ZENODO`, depo 22824068/22824064, `ensure_model()`). LightGBM, ALL_KEYS minus `harm_*`, 14 classes
   (crop garden glacier grass orchard parking rail road rock roof shrub tree vineyard water;
   `bare_soil→rock` merged, `earthwork`/`path` rule-only). 5-fold GroupKFold by parent KG on
   1.23 M segments / 146 KGs: **macro-F1 0.781 / wF1 0.921 / acc 0.925 / ECE 0.040** (v1 RF on
@@ -68,7 +69,44 @@ date defects, harness runs A–H, class-set decision, live-test bug hunt) lives 
   (20492929); the coverage oracle only checks `_json`, so it will not be re-picked on its own.
   Worth a HEAD sweep over all `*_full_gpkg` bucket URLs.
 
-## Next steps (in order)
+## v2 rollout work-stream (started 2026-09-18, IN PROGRESS — see `docs/v2-upgrade.md` once written)
+
+Goal: v2 = the product. Fresh KGs processed with v2; already-done v1 KGs *upgraded* from their
+own Zenodo full GPKG (no BEV/openEO traffic, no credential → any idle peer can do it); v1 files
+stay on Zenodo untouched; primary keeps v2 docs in a blob DB and drops the 22 GB of v1 JSON files.
+
+**Decided design**
+* Products: `_json_v2` = `<code>_v2.json.gz` (kgjson/2), `_light_gpkg_v2` = `<code>_light_v2.gpkg`.
+  `_full_gpkg` unchanged (rasters identical; only fresh KGs write it). Fresh v2 KGs ALSO upload the
+  legacy `_json` (compact, v2 content) — `_json` stays the fleet-wide completion marker (44 call
+  sites depend on it; do not rename). Upgrades never touch `_json`/`_light_gpkg`/`_full_gpkg`.
+* Triple-done logic (`app.py` zen_stall, ~4532/4959/18493) must accept `_light_gpkg_v2` as light.
+* Primary: `data/kg_v2_store.db` (separate from the rebuildable search index) holds verified
+  gz blobs; `search_index._select_kg_files_for_parent` reads the store first; then the v1
+  `json/<code>.json` is deleted and `v1_bytes_freed` recorded (→ `process.txt` `v2:` line).
+* Dispatch: upgrade candidates (v1 done, no `_json_v2`) fill the cache-only whitelist when
+  `ready_kgs` is low; processor decides per KG (has `_json`+`_full_gpkg`, no `_json_v2` → upgrade).
+  Peer downloads the full GPKG (few streams, disk-checked), runs `process_one_kg(source_gpkg=…)`,
+  skips gpkg_full + early uploads, verifies, uploads light_v2 then json_v2, deletes the GPKG.
+
+**Done (committed)**
+| File | Status |
+|---|---|
+| `kg_json_v2.py` | codec; lossless round trip verified on 4 KGs; 21.6 MB pretty → 0.99 MB gz (18–22×) |
+| `kg_v2_store.py` | primary blob store (WAL SQLite, stats(), v1_bytes_freed) |
+| `v2_source.py` | GPKG raster shim: monkeypatches `raster_io.read_dtm_dsm`, `ortho_io.read_ortho_for_als/pick_rgbi_year_for_als`, processor globals `_fetch_copernicus_for_tile`/`_get_hansen_cache`; per-tile per-layer health check vs cadastre union (thresholds `THRESH`), fallback to BEV / cache-only tile cache; `summary()` → JSON `data_quality.v2_source`. Smoke-tested on `/tmp/segv2_gpkg/19570_full.gpkg`. |
+| `v2_verify.py` | `verify_before_upload` (peer: codec, sections, model, tile stitching, parcels vs cadastre+v1, coverage ≥ v1, unclassified ≤ v1, light GPKG integrity/layers/counts, segment_type holes in union) + `verify_for_ingest` (primary). Not yet exercised on a real v2 product. |
+| `segv2/model_v2.py` | `ensure_model()` / `available()` (Zenodo fallback) |
+
+**Not done (next, in order)**
+1. `austria_processor.py`: `MODEL_VERSION` default v2 when `model_v2.available()`; `process_one_kg(source_gpkg=, v1_doc=)` → install shim after cadastre (union_3035), skip oversize guard, skip gpkg_full + early uploads, write `_v2.json.gz` + `_light_v2.gpkg` (fresh v2: compact `<code>.json` too), run `v2_verify`, files `{"light_gpkg_v2","json_v2"}`; `upload_kg_to_zenodo` file_type `"gpkg" in key`, `delete_local = not key.startswith("json")`; `--v2-upgrade` arg / env → main(): completed = codes with `_json_v2`, pending = whitelist ∩ (has `_json`+`_full_gpkg`), kg dicts from v1 JSON bbox (block codes carry `_parent_kg_code`), GPKG download (Zenodo, disk check, ≤4 streams) then cleanup.
+2. `app.py`: `/processing/start {v2_upgrade:true}`; peer-sync skips `_json` download when `_json_v2` present; v2 ingest thread (download blob → `verify_for_ingest` → `search_index.update_kg` from store → delete v1 file(s) → `kg_v2_store.put`); `process.txt` `v2:` line (`upgraded=N/8440 rate eta · fresh_v2=N · verify_fail=N · primary json_files=N disk=GB freed=GB avg/kg`); `/api/v1/model/v2`; `admin_update` pip-installs lightgbm if missing.
+3. `search_index.py`: store-first in `_select_kg_files_for_parent`, `_kg_json_paths` users (3 sites) → data iterator; `product_version`, `zenodo_json_v2_url`, `zenodo_light_gpkg_v2_url` columns; `_by_parent` includes store parents.
+4. `peer_director.py`: upgrade candidates into cache-only whitelist (cap `MAX_V2_UPGRADE_PEERS`, Zenodo Z-warn throttle), pass `v2_upgrade` in start payload.
+5. Models page (`static/training.html`) + `static/docs.html` v2 section + kgjson/2 spec; `docs/v2-upgrade.md`; AGENTS.md link; `requirements.txt` + lightgbm.
+6. Dry run one KG on an idle peer, then let the director roll out.
+
+## Next steps (previous list, still valid after the above)
 
 1. **Visual QA on 4 more KGs** (alpine, vineyard, urban, riparian): run `/api/v1/segment` with
    `model=v2` (adapt `seg_live.py`), POST result to `/api/v1/share` with `state.model='v2'`,

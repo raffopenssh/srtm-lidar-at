@@ -1189,6 +1189,14 @@ def _sync_peer_data():
                         if not entry_ts or entry_ts <= tombstone_ts:
                             continue
                     code = key.replace('_json', '')
+                    # v2 rollout: once the code's v2 blob is in the primary
+                    # store the v1 file is gone on purpose — never re-fetch.
+                    try:
+                        import kg_v2_store as _kvs
+                        if _kvs.has(code):
+                            continue
+                    except Exception:
+                        pass
                     local_path = json_dir / f'{code}.json'
                     needs_dl = True
                     if local_path.exists():
@@ -1420,6 +1428,30 @@ def _sync_peer_data():
         time.sleep(300)  # Every 5 minutes
 
 threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
+
+
+# --- v2 ingest: fleet _json_v2 products → data/kg_v2_store.db (primary only) ---
+# Single-flight across the two gunicorn workers via an fcntl lock on the
+# store's sidecar; see v2_ingest.py for the per-tick contract.
+def _v2_ingest_thread():
+    import fcntl as _fcntl
+    import v2_ingest as _v2i
+    lock_path = Path('data/kg_v2_store.ingest.lock')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, 'w')
+    try:
+        _fcntl.flock(fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except OSError:
+        return   # sibling worker owns the ingest loop
+    def _should_run():
+        if os.environ.get('V2_INGEST', '') == '0':
+            return False
+        try:
+            return _is_primary_self() or os.environ.get('V2_INGEST') == '1'
+        except Exception:
+            return False
+    _v2i.loop(_should_run)
+threading.Thread(target=_v2_ingest_thread, daemon=True, name='v2-ingest').start()
 
 
 # === SECTION: Status push to director ===

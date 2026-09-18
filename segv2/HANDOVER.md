@@ -1,4 +1,4 @@
-# segv2 — handover (state as of 2026-09-18 06:40 UTC)
+# segv2 — handover (state as of 2026-09-18 06:55 UTC)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes). This file is
 **current state + open work only**. The chronological log (dataset audit, fake-NIR / flight-
@@ -69,51 +69,38 @@ date defects, harness runs A–H, class-set decision, live-test bug hunt) lives 
   (20492929); the coverage oracle only checks `_json`, so it will not be re-picked on its own.
   Worth a HEAD sweep over all `*_full_gpkg` bucket URLs.
 
-## v2 rollout work-stream (started 2026-09-18, IN PROGRESS — see `docs/v2-upgrade.md` once written)
+## v2 rollout work-stream (2026-09-18 — ROLLED OUT, see `docs/v2-upgrade.md`)
 
-Goal: v2 = the product. Fresh KGs processed with v2; already-done v1 KGs *upgraded* from their
-own Zenodo full GPKG (no BEV/openEO traffic, no credential → any idle peer can do it); v1 files
-stay on Zenodo untouched; primary keeps v2 docs in a blob DB and drops the 22 GB of v1 JSON files.
+`docs/v2-upgrade.md` is the canonical description (products, fleet/director/primary sides,
+telemetry, ops, invariants). Status at 06:55 UTC, commit `8b18805`+1 on all 6 reachable peers:
 
-**Decided design**
-* Products: `_json_v2` = `<code>_v2.json.gz` (kgjson/2), `_light_gpkg_v2` = `<code>_light_v2.gpkg`.
-  `_full_gpkg` unchanged (rasters identical; only fresh KGs write it). Fresh v2 KGs ALSO upload the
-  legacy `_json` (compact, v2 content) — `_json` stays the fleet-wide completion marker (44 call
-  sites depend on it; do not rename). Upgrades never touch `_json`/`_light_gpkg`/`_full_gpkg`.
-* Triple-done logic (`app.py` zen_stall, ~4532/4959/18493) must accept `_light_gpkg_v2` as light.
-* Primary: `data/kg_v2_store.db` (separate from the rebuildable search index) holds verified
-  gz blobs; `search_index._select_kg_files_for_parent` reads the store first; then the v1
-  `json/<code>.json` is deleted and `v1_bytes_freed` recorded (→ `process.txt` `v2:` line).
-* Dispatch: upgrade candidates (v1 done, no `_json_v2`) fill the cache-only whitelist when
-  `ready_kgs` is low; processor decides per KG (has `_json`+`_full_gpkg`, no `_json_v2` → upgrade).
-  Peer downloads the full GPKG (few streams, disk-checked), runs `process_one_kg(source_gpkg=…)`,
-  skips gpkg_full + early uploads, verifies, uploads light_v2 then json_v2, deletes the GPKG.
+* **Fresh KGs are v2 fleet-wide**: `MODEL_VERSION` defaults to v2 iff lightgbm + model; lightgbm
+  is pip-installed by the `_v2_deps_startup_thread` (45 s after srv start) and by `admin_update`.
+  at11/at68/at100 confirmed `model=v2` (`segv2.inference: context …` in their logs).
+* **Upgrades dispatched**: director injects 24 upgrade codes/tick into the cache-only whitelist
+  (`dispatch=24/400cand` on the `v2:` line) — but the fleet is 5 busy frontiers + at123 (3 GB
+  disk) so no cache-only peer has run an upgrade yet. First `_light_gpkg_v2`/`_json_v2` from a
+  *peer* upgrade is still unverified in production (the 19570 dry run was on the primary).
+* **Primary ingest live**: `v2_ingest` thread ingested 19570 (PASS 23/23, v1 file deleted,
+  468 KB freed); `kg_log` archive backfill 1 day/5 min (116 days left ≈ 10 h).
+* Index: `kg.product_version`, `zenodo_json_v2_url/size`, `zenodo_light_gpkg_v2_url/size`,
+  `_links.zenodo_json_v2/zenodo_light_gpkg_v2/product_version` (migration applied on open).
 
-**Done (committed)**
-| File | Status |
-|---|---|
-| `kg_json_v2.py` | codec; lossless (None≡absent, NaN/numpy-safe); 18–22× smaller than pretty v1 |
-| `kg_v2_store.py` | primary blob store `data/kg_v2_store.db`: `kg_v2` (blob + `bbox`,`generated_at` cols, LRU decoded-doc cache, `get_bbox/timestamp`), `kg_log` per-code history rings (gz flattened `[ts,peer,lvl,msg]`, cap 600, `append_log/get_log/log_stats`), `meta` kv |
-| `kg_docs.py` | **the** doc access layer: `load/exists/bbox/timestamp/codes_for_parent/iter_docs/history` — store first, `json/<code>.json` second |
-| `kg_log_harvest.py` | folds merged log → `kg_log` rings. Heartbeats collapsed to ONE row per (code,peer,tile) `"tile 3/16 ▶ lidar"`. `fold_lines` is **hooked into `app._archive_lines`** (ring-prune = every line folded once); `harvest_archive_step(max_days)` backfills the 118-day archive (≈1 KB/code, 0.03 s/day); `harvest_live` incremental watermark. Tested on scratch store. |
-| `v2_source.py` | GPKG raster shim w/ per-layer health checks + real-source fallback; `summary()` → JSON `data_quality.v2_source` |
-| `v2_verify.py` | peer gate `verify_before_upload` (37 checks; segments counted `DISTINCT id`) + primary gate `verify_for_ingest` |
-| `austria_processor.py` | **DONE step 1.** `MODEL_VERSION` defaults v2 iff `model_v2.available()` (env wins). `process_one_kg(source_gpkg, v1_doc)`: shim after cadastre union, no oversize guard, no gpkg_full/early uploads, `<code>_light_v2.gpkg` (key `light_gpkg_v2`) + `<code>_v2.json.gz` (key `json_v2`) [+ compact `<code>.json` for fresh v2], verify gate → `aborted_v2_verify_failed` (files deleted, no failed_kgs), ordered in-subprocess upload light_v2→json_v2→json under fleet lock, `_uploaded_keys` → parent skips. Tile ckpts carry `model_version` (v1 pickles discarded in v2) + per-tile `classifier`. Boundary merge keeps LGBM types. `--v2-upgrade`/`V2_UPGRADE=1`: `_v2_upgrade_units` (whitelist ∩ has `_json`+`_full_gpkg`, no `_json_v2`, <2 strikes in `v2_upgrade_failed.json`), `_v2_fetch_inputs` (v1 JSON → bbox/verify baseline, full GPKG 4 streams, disk-checked, md5) into `data/austria_processor/v2_source/`, released after KG. `progress.v2_upgraded`, log `v2up:`. |
-| `app.py` (partial) | `/processing/start {v2_upgrade}` → `--v2-upgrade`; requeue/tombstone drops include `_json_v2`/`_light_gpkg_v2`; zen_stall triple accepts `_light_gpkg_v2` as light (also `process.html _zenEntryParts`); `/api/v1/kg/<code>` store-first (`?raw=1` gz blob, `?history=1`), `/api/v1/kg/<code>/history`; `_read_bbox_cheap` → store bbox; `_archive_lines` folds into kg_log |
-| `search_index.py` | `_select_kg_files_for_parent` reads via `kg_docs` (store ∪ files); `_kg_json_docs` replaces the 3 `_kg_json_paths` file iterations |
-| `quality_flags.scan_doc` | flags for in-memory store docs |
+**Watch next** (hours): `curl -s localhost:8000/process.txt?roster=0&log=0 | grep ^v2:` —
+`fresh_v2` should rise as at11/at12/at68/at100/at106 finish their current KGs;
+`?q=v2up` / `?q=v2verify` / `?q=v2_ingest` in the merged log. Then run the AGENTS.md GPKG
+validity check on a fleet `_light_gpkg_v2` (expect `parcel_outline_z` table, 9 gpkg_contents).
 
-**Dry run PASSED (2026-09-18 06:12)**: `/tmp/v2dry` scratch copy, `python3 austria_processor.py --kg 19570 --v2-upgrade --cache-only` → 158 s, `v2verify PASS 37/37`, `19570_light_gpkg_v2` (12.7 MB) + `19570_json_v2` (39 KB, v1 was 479 KB) on Zenodo, manifest pushed to primary. v1 road 119k m² → v2 14k m² (check in visual QA). Recipe: rsync repo w/o data → copy manifest+kg_list+admin_token, symlink `data/{segv2/models,invekos,als_acquisition,best_model}`.
-
-**NOT pushed / srv not restarted** — nothing rolled out. Untracked analysis `*.md`/`*.txt`/`*.py` in repo root are from another conversation; leave them.
-
-**Not done (next, in order)**
-1. `v2_ingest.py` + thread in `app.py` (primary/keep-role only, every 5 min, ≤N/tick): for each manifest `_json_v2` not in store → download blob → `v2_verify.verify_for_ingest(code, blob, v1_doc=kg_docs.load(code), manifest)` → `si.get_index().update_kg(code, manifest=…)` (selector reads store once `kg_v2_store.put` done — so put FIRST, then update_kg, then delete `json/<code>.json`, `add_freed`) → `quality_flags.scan_doc` → `kg_log_harvest.harvest_live()` + `harvest_archive_step(1)` per tick. Failed ingests → `meta` key `ingest_failed` json {code:{n,reason}}. Peer-sync (`_sync_peer_data` ~L1180): skip `_json` download when `kg_v2_store.has(code)`.
-2. `process.txt` `v2:` line: `upgraded=N/8440 (+24h) rate eta · fresh_v2=N · verify_fail=N · store=MB freed=GB avg/kg · json_files=N disk=GB · kg_log codes/rows/KB archive_remaining=D`; structured `/api/v1/director/status.v2`; `/api/v1/model/v2` (meta.json); `admin_update` pip-installs lightgbm if import fails.
-3. `search_index`: columns `product_version`, `zenodo_json_v2_url/size`, `zenodo_light_gpkg_v2_url/size` (add to the suffix loops at ~L631/709/1853 + `_build_links`).
-4. `peer_director.py`: fill cache-only whitelist with upgrade candidates when `ready_kgs` low (`v2_upgrade_eligible` logic: has `_json`+`_full_gpkg`, no `_json_v2`, not in peers' `v2_upgrade_failed`), cap `MAX_V2_UPGRADE_PEERS`, pass `v2_upgrade:true` in start payload, Zenodo Z-warn throttle.
-5. Docs: `static/training.html` models page + `static/docs.html` v2/kgjson-2 section, `docs/v2-upgrade.md`, AGENTS.md link, `requirements.txt` lightgbm.
-6. Commit → `git push` → `sudo systemctl restart srv` → watch `versions:`/`rollout:` in `/process.txt`; first fleet v2 products appear hours later — run the GPKG validity check from AGENTS.md on a `_light_gpkg_v2`.
+**Known gaps / follow-ups**
+1. Peer-local `v2_upgrade_failed.json` strikes are not fleet-wide: a code that fails verify on
+   peer A is re-dispatched to peer B (2 strikes each). Cheap fix: peers report the file in
+   `peer_status`, director unions it into `_compute_v2_upgrade_candidates` skip set.
+2. Fresh v2 KGs still write `_full_gpkg` + legacy `_json`; upgrades need a peer with
+   `gpkg_size + 3 GB` free (`V2_UPGRADE_MIN_FREE_GB`) — at123-style 3 GB peers never qualify.
+3. `_v2_status()` is primary-local; on a non-primary director the store counters read 0.
+4. `kg_log_harvest.harvest_for_code` is not called at ingest (60-day gz scan ≈ seconds); rings
+   fill from the archive backfill instead.
+5. The `v2:` line's `eta` is meaningless until upgrades flow (rate from `_json_v2` uploads/24h).
 
 ## Next steps (previous list, still valid after the above)
 

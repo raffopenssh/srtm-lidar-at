@@ -173,7 +173,13 @@ class SearchIndex:
                 zenodo_light_gpkg_size INTEGER,
                 zenodo_full_gpkg_url TEXT,
                 zenodo_full_gpkg_size INTEGER,
-                zenodo_depo_id INTEGER
+                zenodo_depo_id INTEGER,
+                -- v2 products (segv2 upgrade / fresh v2 KGs)
+                product_version TEXT,
+                zenodo_json_v2_url TEXT,
+                zenodo_json_v2_size INTEGER,
+                zenodo_light_gpkg_v2_url TEXT,
+                zenodo_light_gpkg_v2_size INTEGER
             )''',
             # === Per-type landcover breakdown ===
             '''CREATE TABLE IF NOT EXISTS kg_landcover (
@@ -426,6 +432,18 @@ class SearchIndex:
                 c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
             except Exception:
                 pass  # column already exists
+        # v2 product columns (idempotent)
+        for col, ctype in [
+            ('product_version', 'TEXT'),
+            ('zenodo_json_v2_url', 'TEXT'),
+            ('zenodo_json_v2_size', 'INTEGER'),
+            ('zenodo_light_gpkg_v2_url', 'TEXT'),
+            ('zenodo_light_gpkg_v2_size', 'INTEGER'),
+        ]:
+            try:
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}')
+            except Exception:
+                pass  # column already exists
         # Re-run indexes that may have failed before ALTER TABLE
         for s in self._schema_stmts():
             if 'CREATE INDEX' in s:
@@ -630,6 +648,8 @@ class SearchIndex:
                 zj = manifest.get(f'{code}_json', {})
                 zl = manifest.get(f'{code}_light_gpkg', {})
                 zf = manifest.get(f'{code}_full_gpkg', {})
+                zj2 = manifest.get(f'{code}_json_v2', {})
+                zl2 = manifest.get(f'{code}_light_gpkg_v2', {})
 
                 kg_rows.append((
                     code, kg.get('kg_name', ''), gc, kg.get('gemeinde_name', ''),
@@ -659,6 +679,9 @@ class SearchIndex:
                     _zenodo_url(zl), zl.get('size'),
                     _zenodo_url(zf), zf.get('size'),
                     zj.get('depo_id') or zl.get('depo_id') or zf.get('depo_id'),
+                    _product_version(zj, zj2),
+                    _zenodo_url(zj2), zj2.get('size'),
+                    _zenodo_url(zl2), zl2.get('size'),
                 ))
                 fts_rows.append((code,
                     self._normalize_name(kg.get('kg_name', '')),
@@ -671,7 +694,7 @@ class SearchIndex:
 
             c.executemany(
                 '''INSERT OR REPLACE INTO kg VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ''', kg_rows)
             c.executemany('INSERT INTO fts_kg VALUES (?,?,?,?,?)', fts_rows)
             c.executemany('INSERT INTO kg_rtree VALUES (?,?,?,?,?)', rtree_rows)
@@ -704,23 +727,7 @@ class SearchIndex:
                         # Write freshest Zenodo URLs across plain + blocks.
                         _codes = [parent_code] + [bc for bc, _ in block_list
                                                    if bc != parent_code]
-                        for suffix, col_url, col_size in [
-                            ('_json', 'zenodo_json_url', 'zenodo_json_size'),
-                            ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
-                            ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
-                        ]:
-                            best = None; best_ts = ''
-                            for cc in _codes:
-                                e = manifest.get(f'{cc}{suffix}')
-                                if not isinstance(e, dict):
-                                    continue
-                                ts = e.get('uploaded_at') or ''
-                                if best is None or ts > best_ts:
-                                    best, best_ts = e, ts
-                            if best:
-                                c.execute(
-                                    f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
-                                    (_zenodo_url(best), best.get('size'), parent_code))
+                        _write_zenodo_links(c, parent_code, _codes, manifest)
                         n_processed += 1
                     except Exception as e:
                         log.warning('enrich %s: %s', parent_code, e)
@@ -1841,24 +1848,7 @@ class SearchIndex:
                                             if bc != _target_code]
                 if not _codes:
                     _codes = [kg_code]
-                for suffix, col_url, col_size in [
-                    ('_json', 'zenodo_json_url', 'zenodo_json_size'),
-                    ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
-                    ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
-                ]:
-                    best = None
-                    best_ts = ''
-                    for cc in _codes:
-                        e = manifest.get(f'{cc}{suffix}')
-                        if not isinstance(e, dict):
-                            continue
-                        ts = e.get('uploaded_at') or ''
-                        if best is None or ts > best_ts:
-                            best, best_ts = e, ts
-                    if best:
-                        url = _zenodo_url(best)
-                        c.execute(f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
-                                  (url, best.get('size'), _target_code))
+                _write_zenodo_links(c, _target_code, _codes, manifest)
             c.commit()
 
     # ════════════════════════════════════════════════════════════════
@@ -1963,6 +1953,12 @@ class SearchIndex:
             links['zenodo_light_gpkg'] = d['zenodo_light_gpkg_url']
         if d.get('zenodo_full_gpkg_url'):
             links['zenodo_full_gpkg'] = d['zenodo_full_gpkg_url']
+        if d.get('zenodo_json_v2_url'):
+            links['zenodo_json_v2'] = d['zenodo_json_v2_url']
+        if d.get('zenodo_light_gpkg_v2_url'):
+            links['zenodo_light_gpkg_v2'] = d['zenodo_light_gpkg_v2_url']
+        if d.get('product_version'):
+            links['product_version'] = d['product_version']
         # segment/terrain are geometry-driven, not KG-driven: they work on any
         # Austrian geometry regardless of whether this KG has precomputed
         # aggregates. Always advertise them, and flag the on-demand case so a
@@ -3606,6 +3602,52 @@ class SearchIndex:
                     d[k] = round(v, 2)
         d['_links'] = self._build_links(d)
         return d
+
+
+def _product_version(zj, zj2) -> str | None:
+    """'v2' when a committed ``_json_v2`` exists or the ``_json`` entry was
+    written by a v2 processor; 'v1' when only v1 products; None if none."""
+    if isinstance(zj2, dict) and zj2.get('size'):
+        return 'v2'
+    if isinstance(zj, dict) and zj:
+        return 'v2' if zj.get('version') == 'v2' else 'v1'
+    return None
+
+
+_ZENODO_LINK_COLS = [
+    ('_json', 'zenodo_json_url', 'zenodo_json_size'),
+    ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
+    ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
+    ('_json_v2', 'zenodo_json_v2_url', 'zenodo_json_v2_size'),
+    ('_light_gpkg_v2', 'zenodo_light_gpkg_v2_url', 'zenodo_light_gpkg_v2_size'),
+]
+
+
+def _write_zenodo_links(c, target_code, codes, manifest):
+    """Write the freshest Zenodo URL per product kind across the parent +
+    its accepted block codes (so a split parent links to the most recently
+    uploaded artefact), plus ``product_version``."""
+    best_j = best_j2 = None
+    for suffix, col_url, col_size in _ZENODO_LINK_COLS:
+        best = None
+        best_ts = ''
+        for cc in codes:
+            e = manifest.get(f'{cc}{suffix}')
+            if not isinstance(e, dict):
+                continue
+            ts = e.get('uploaded_at') or ''
+            if best is None or ts > best_ts:
+                best, best_ts = e, ts
+        if best:
+            c.execute(f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
+                      (_zenodo_url(best), best.get('size'), target_code))
+        if suffix == '_json':
+            best_j = best
+        elif suffix == '_json_v2':
+            best_j2 = best
+    pv = _product_version(best_j, best_j2)
+    if pv:
+        c.execute('UPDATE kg SET product_version=? WHERE kg_code=?', (pv, target_code))
 
 
 def _zenodo_url(entry):

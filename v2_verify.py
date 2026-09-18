@@ -356,8 +356,24 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
         nz, hole = _segment_type_nonzero(path, union_geom_3035)
         sa = _num(_g(v2, "coverage", "total_segmented_area_sqm"))
         if sa and sa > 0:
-            rep.check("segment_type_raster_area", nz >= 0.95 * sa,
-                      f"nonzero px={nz} json segmented m²={sa:.0f}")
+            # ``total_segmented_area_sqm`` is Σ per-tile valid px over the
+            # *overlapping* 1.5 km grid (0.1 km overlap, see
+            # ``_compute_tile_grid``) — every seam strip is counted twice,
+            # while the stitched raster holds each px once.  For an n×m grid
+            # the deduped/summed ratio tends to (1.4/1.5)² ≈ 0.87, so a flat
+            # 0.95 floor failed every multi-tile fresh v2 KG on 2026-09-18
+            # (45631-northeast 4 tiles → 0.934, 72010-north → 0.90) while
+            # single-tile 19570 sat at 0.99999.  Real stitching gaps are
+            # caught by ``segment_type_no_holes`` below; here fatal only
+            # below the overlap-corrected floor, non-fatal drift above it.
+            _nt = int(_num(_g(v2, "coverage", "n_tiles"), 1) or 1)
+            _floor = 0.95 * ((1.4 / 1.5) ** 2 if _nt > 1 else 1.0)
+            _r = nz / sa
+            rep.check("segment_type_raster_area", _r >= _floor,
+                      f"nonzero px={nz} json segmented m²={sa:.0f} ratio={_r:.3f} floor={_floor:.3f} tiles={_nt}")
+            if _floor <= _r < 0.95:
+                rep.check("segment_type_raster_area_drift", False,
+                          f"ratio={_r:.3f} (tile-overlap double count, {_nt} tiles)", fatal=False)
         if hole is not None:
             # Holes are expected when the doc itself declares a gap (an
             # unsegmented or upstream-failed tile) — inherited from the v1

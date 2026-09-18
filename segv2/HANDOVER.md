@@ -1,4 +1,4 @@
-# segv2 — handover (state as of 2026-09-18 06:55 UTC)
+# segv2 — handover (state as of 2026-09-18 07:05 UTC)
 
 Read `segv2/README.md` first (fleet-safety contract, why-v2, product notes). This file is
 **current state + open work only**. The chronological log (dataset audit, fake-NIR / flight-
@@ -85,6 +85,12 @@ telemetry, ops, invariants). Status at 06:55 UTC, commit `8b18805`+1 on all 6 re
   468 KB freed); `kg_log` archive backfill 1 day/5 min (116 days left ≈ 10 h).
 * Index: `kg.product_version`, `zenodo_json_v2_url/size`, `zenodo_light_gpkg_v2_url/size`,
   `_links.zenodo_json_v2/zenodo_light_gpkg_v2/product_version` (migration applied on open).
+
+**Health check at 07:05 UTC** (`process.txt?roster=0&log=0`): `health: OK · 3462/8440 @0.8/h · kg_fail=0.0/h`;
+`versions: 523431f=7 (target=523431f)` — whole reachable fleet on the final commit, rollout idle;
+`v2: upgraded=1 · fresh_v2=0 · verify_fail=0 pending=0 · store=1codes · kg_log=45codes/389rows
+archive_remaining=115d · dispatch=24/400cand`. No `v2up`/`v2verify` peer lines yet (frontiers
+still mid-KG on their first v2 run). No self-wake scheduled — operator re-invokes.
 
 **Watch next** (hours): `curl -s localhost:8000/process.txt?roster=0&log=0 | grep ^v2:` —
 `fresh_v2` should rise as at11/at12/at68/at100/at106 finish their current KGs;

@@ -17481,24 +17481,17 @@ def api_feedback_events():
 def api_flag_object(obj_ref):
     """Return the object record + all its flags + any feedback."""
     feedback_db.ensure_schema()
-    import sqlite3
-    c = sqlite3.connect(feedback_db.DB_PATH); c.row_factory = sqlite3.Row
-    obj = c.execute('SELECT * FROM objects WHERE obj_ref=?', (obj_ref,)).fetchone()
+    # Objects live in the KG document (JSON / v2 store), not in feedback.sqlite.
+    obj = feedback_db.get_object(obj_ref)
     if not obj:
-        c.close()
         return jsonify({'error': 'unknown obj_ref'}), 404
     obj = dict(obj)
-    if obj.get('attrs_json'):
-        try: obj['attrs'] = json.loads(obj.pop('attrs_json'))
-        except Exception: obj.pop('attrs_json', None)
-    flags = feedback_db.list_flags(kg_code=obj['kg_code'], limit=200)
-    flags = [f for f in flags if f['obj_ref'] == obj_ref]
+    flags = feedback_db.list_flags(obj_ref=obj_ref, limit=200)
     fb = feedback_db.list_feedback(obj_ref=obj_ref, limit=50)
     overrides = feedback_db.effective_overrides([obj_ref])
     agg = feedback_db.object_aggregates([obj_ref]).get(obj_ref)
     flag_events = feedback_db.list_flag_events(obj_ref=obj_ref, limit=50)
     fb_events = feedback_db.list_feedback_events(obj_ref=obj_ref, limit=50)
-    c.close()
     return jsonify({'object': obj, 'flags': flags, 'feedback': fb,
                     'override': overrides.get(obj_ref),
                     'aggregate': agg,

@@ -208,7 +208,18 @@ def _create_schema(c: sqlite3.Connection):
 
 def ensure_schema(force: bool = False):
     global _initialised, _legacy_schema
-    if _initialised and not force: return
+    if _initialised and not force:
+        if not _legacy_schema: return
+        # Legacy mode was decided at boot; `feedback_db.py rebuild` swaps the
+        # file underneath a running gunicorn, so re-probe (one sqlite_master
+        # lookup) until we observe the v2 layout -- otherwise every query
+        # keeps joining the now-dropped `objects` table until a restart.
+        with _LOCK, _conn_ctx() as c:
+            if is_legacy_schema(c): return
+            _legacy_schema = False
+            log.info('feedback_db: v2 schema detected at %s (rebuild landed) -- '
+                     'leaving legacy compatibility mode', DB_PATH)
+        return
     with _LOCK, _conn_ctx() as c:
         if is_legacy_schema(c):
             # v1 layout. Don't migrate in-place (rewriting a 30 GB file at

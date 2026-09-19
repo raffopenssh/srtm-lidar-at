@@ -1985,6 +1985,44 @@ def _is_keep_role_data() -> bool:
     return False
 
 
+def _shrink_feedback_db_after_purge() -> dict:
+    """Drop the *derived* bulk of ``data/feedback.sqlite`` on a peer that
+    just lost keep-role.
+
+    The flags table (and, on legacy v1 files, the fat ``objects`` mirror)
+    is regenerable from the KG JSONs — which we have just deleted — so
+    keeping it on a 24.5 GB peer disk is pure waste. Sep 2026: at117
+    (shadow) carried an 11 GB legacy feedback.sqlite from an earlier
+    director stint and hit ``Disk critically low`` while the eviction
+    policy reported it clean. ``feedback`` / ``feedback_events`` are the
+    only primary rows; ``feedback_db.rebuild`` carries them over into a
+    fresh slim file (json dir is empty → instant), and we drop the
+    ``.v1.bak`` it leaves behind because the whole point is disk.
+    """
+    out = {'feedback_db_before_mb': 0.0, 'feedback_db_after_mb': 0.0}
+    try:
+        p = feedback_db.DB_PATH
+        if not p.exists():
+            return out
+        before = p.stat().st_size
+        out['feedback_db_before_mb'] = round(before / (1024 ** 2), 1)
+        if before < 64 * 1024 ** 2:
+            out['feedback_db_after_mb'] = out['feedback_db_before_mb']
+            return out
+        feedback_db.rebuild()
+        for bak in (p.with_suffix('.sqlite.v1.bak'),
+                    Path(str(p.with_suffix('.sqlite.v1.bak')) + '-wal'),
+                    Path(str(p.with_suffix('.sqlite.v1.bak')) + '-shm')):
+            bak.unlink(missing_ok=True)
+        out['feedback_db_after_mb'] = round(p.stat().st_size / (1024 ** 2), 1)
+        log.warning('Role-data eviction: feedback.sqlite shrunk %.1f → %.1f MB',
+                    out['feedback_db_before_mb'], out['feedback_db_after_mb'])
+    except Exception as e:
+        log.warning('Role-data eviction: feedback.sqlite shrink failed: %s', e)
+        out['feedback_db_err'] = str(e)
+    return out
+
+
 def _role_data_eviction_tick() -> dict:
     """Single tick of the role-data eviction policy. Returns a status dict."""
     # Keep promotion stamp current FIRST so _index_build_deferred() reflects
@@ -2060,6 +2098,7 @@ def _role_data_eviction_tick() -> dict:
     log.warning('Role-data eviction: purged %d JSONs + index (%.1f MB freed)',
                 n_purged, purged_bytes / (1024 ** 2))
     status['purged'] = True
+    status.update(_shrink_feedback_db_after_purge())
     status['purged_count'] = n_purged
     status['purged_mb'] = round(purged_bytes / (1024 ** 2), 1)
     return status
@@ -8910,7 +8949,8 @@ def admin_role_evict():
             except Exception:
                 pass
         return jsonify({'ok': True, 'forced': True, 'purged_count': n,
-                        'purged_mb': round(bytes_freed / (1024 ** 2), 1)})
+                        'purged_mb': round(bytes_freed / (1024 ** 2), 1),
+                        **_shrink_feedback_db_after_purge()})
     return jsonify({'ok': True, 'tick': _role_data_eviction_tick()})
 
 

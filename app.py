@@ -11798,7 +11798,11 @@ def _get_params():
                 'match_radius_m', 'felling_min_drop_m', 'growth_eps_m',
                 'min_patch_sqm', 'crown_geometry', 'crown_min_area',
                 'key_property', 'include_trees',
-                'height_min', 'height_max', 'height_op'):
+                'height_min', 'height_max', 'height_op',
+                # v2/v3 tree service
+                'fallback_live', 'stand_context', 'min_tree_likelihood',
+                'detection_mode', 'reject_nonforest', 'merge_by_key',
+                'include_records', 'h_dom_basis', 'min_apex_prominence_m'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -15896,6 +15900,337 @@ def changes_trees_by_polygons_v2():
                           geometry_fn=_get_geometry_multi)
 
 
+# === SECTION: /api/v3 tree service (product-backed: tree_apices + grid25) ===
+# v3 answers from the frozen 2.1 products (``tree_apices`` in the light GPKG,
+# ``landcover.grid25`` in the store) and only falls back to the live v2
+# detector for AOI parts without a 2.1 product.  See trees_v3.py and
+# docs/v2.1-product-spec.md.
+
+def _tree_v3_params(params):
+    eff = _tree_v2_params(params)
+    # product apices are ndsm_only; keep the live fallback symmetric
+    eff['detection_mode'] = 'ndsm_only'
+    eff['fallback_live'] = str(params.get('fallback_live', 'true')).lower() in ('true', '1', 'yes')
+    eff['dataset'] = params.get('dataset', ti.DEFAULT_DATASET)
+    eff['min_tree_likelihood'] = float(params.get('min_tree_likelihood', 0.0))
+    eff['stand_context'] = [s.strip() for s in str(params.get('stand_context', '')).split(',') if s.strip()]
+    return eff
+
+
+def _tree_v3_filter_rows(rows, eff):
+    """Apply the request filters (height / likelihood / stand_context) to
+    product + live rows alike."""
+    mh = eff['min_tree_height']; ml = eff['min_tree_likelihood']; sc = eff['stand_context']
+    out = []
+    for r in rows:
+        if (r.get('h_m') or 0.0) < mh:
+            continue
+        tl = r.get('tree_likelihood')
+        if ml > 0 and (tl if tl is not None else 1.0) < ml:
+            continue
+        if sc and (r.get('stand_context') or 'none') not in sc:
+            continue
+        out.append(r)
+    return out
+
+
+def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
+    """Shared: coverage → product apices (+ live fallback, deduped).
+
+    Returns (rows, canopy_grid, meta, live_canopy_m2, live_geom)."""
+    import trees_v3 as t3
+    from shapely.ops import unary_union
+    from shapely.prepared import prep
+    _progress_set(task_id, 'coverage', 'Resolving product coverage…')
+    cov = t3.resolve_coverage(geom_3035)
+    rows, used, failed = t3.collect_product_trees(
+        cov, geom_3035, progress=lambda m: _progress_set(task_id, 'product', m))
+    grid = t3.CanopyGrid(used, geom_3035)
+    live_rows, live_canopy_m2, live_meta = [], 0.0, {}
+    live_geom = cov['live_geom']
+    # product codes whose GPKG we could not read fall back to live too
+    if failed:
+        fb = unary_union([p['bbox_3035'] for p in cov['product'] if p['code'] in failed])
+        live_geom = live_geom.union(fb.intersection(geom_3035))
+    n_dropped = 0
+    live_ran = False
+    if eff['fallback_live'] and not live_geom.is_empty and live_geom.area >= t3.LIVE_MIN_AREA_M2:
+        live_ran = True
+        _progress_set(task_id, 'lidar', f"Live fallback: reading DTM/DSM for {eff['dataset']} "
+                                        f"({live_geom.area / 1e4:.1f} ha without 2.1 product)…")
+        data = raster_io.read_dtm_dsm(live_geom, dataset=eff['dataset'])
+        trees, labels, canopy, ortho_used, nir_used, det_meta = _tree_v2_inventory(
+            data, eff, include_ortho, task_id)
+        pl = prep(live_geom)
+        live_rows = [t3.live_tree_to_row(t) for t in trees if pl.contains(Point(t.apex_e, t.apex_n))]
+        live_rows, n_dropped = t3.dedupe_live(rows, live_rows)
+        px = abs(data['transform'].a * data['transform'].e)
+        from rasterio.features import geometry_mask
+        lmask = geometry_mask([mapping(live_geom)], out_shape=data['shape'],
+                              transform=data['transform'], invert=True)
+        live_canopy_m2 = float((canopy & lmask & data['mask']).sum()) * px
+        live_meta = {**_tree_v2_det_meta(det_meta, nir_used), 'ortho_used': ortho_used,
+                     'nir_used': nir_used, 'dataset': eff['dataset']}
+    rows = _tree_v3_filter_rows(rows + live_rows, eff)
+    meta = {
+        'source_mix': {'product': used, 'live': sorted(set(cov['live_parents']) | set(failed))},
+        'product_codes_failed': failed,
+        'parents': cov['parents'],
+        'coverage': {'product_frac': cov['product_frac'],
+                     'live_area_ha': round(live_geom.area / 1e4, 3),
+                     'live_ran': live_ran,
+                     'live_deduped': n_dropped,
+                     'note': ('coverage from product footprints; '
+                              'live part = AOI minus the classified grid25 footprint of every 2.1 '
+                              'product (bbox when no grid25), deduped against product apices within '
+                              f'{t3.LIVE_DEDUPE_M} m')},
+        'grid25_codes': grid.codes,
+        'live': live_meta,
+    }
+    return rows, grid, meta, live_canopy_m2, live_geom
+
+
+def _tree_v3_meta(eff, meta, t0):
+    import tree_inventory as tv
+    import trees_v3 as t3
+    eff_meta = {k: v for k, v in eff.items() if k != 'detection_mode'}
+    return {
+        'tree_algo_version': t3.ALGO_VERSION,
+        'product_algo_version': tv.TREE_ALGO_VERSION,
+        'product_version': '2.1',
+        'algorithm': 'product tree_apices (ndsm_only marker watershed, cadastre '
+                     'building mask) + landcover.grid25 denominators; live v2 '
+                     'fallback for uncovered parts',
+        'params_hash': tv.params_hash(eff_meta),
+        **meta, **eff_meta,
+        'processing_time_s': round(time.time() - t0, 2),
+    }
+
+
+def _trees_v3_core(task_id, features, params):
+    """POST /api/v3/trees — product-backed single-tree inventory."""
+    import trees_v3 as t3
+    t0 = time.time()
+    eff = _tree_v3_params(params)
+    include_trees = str(params.get('include_trees', 'true')).lower() in ('true', '1', 'yes')
+    geom_3035 = _tree_geom_prepare(features)
+    rows, grid, meta, live_canopy_m2, live_geom = _tree_v3_collect(task_id, geom_3035, eff)
+    _progress_set(task_id, 'summary', 'Summarising…')
+    canopy = grid.canopy(geom_3035) if grid.available else None
+    summary = t3.summarise(rows, geom_3035.area, canopy, live_canopy_m2, live_geom.area)
+    if not grid.available and meta['source_mix']['product']:
+        summary['canopy_denominator_note'] += (' — WARNING: no landcover.grid25 for the covering '
+                                               'products (monster KG?); canopy area from live part only')
+    feats = [t3.row_to_feature(r) for r in rows] if include_trees else []
+    return {
+        'type': 'FeatureCollection', 'features': feats,
+        'summary': summary,
+        'meta': {**_tree_v3_meta(eff, meta, t0), 'include_trees': include_trees,
+                 **params.get('_geometry_meta', {})},
+    }
+
+
+def _trees_v3_by_polygons_core(task_id, features, params):
+    """POST /api/v3/trees/by-polygons — per-stand product-backed inventory."""
+    import trees_v3 as t3
+    from shapely.strtree import STRtree
+    from shapely.prepared import prep
+    t0 = time.time()
+    eff = _tree_v3_params(params)
+    include_trees = str(params.get('include_trees', 'false')).lower() in ('true', '1', 'yes')
+    warnings = []
+    stands, union, key_prop, merge_by_key, diag = _tree_v2_prepare_stands(features, params, warnings)
+    _validate_area(union)
+    rows, grid, meta, live_canopy_m2, live_geom = _tree_v3_collect(task_id, union, eff)
+
+    _progress_set(task_id, 'assign', 'Assigning trees to stands…')
+    pts = [Point(r['e'], r['n']) for r in rows]
+    kd = STRtree(pts) if pts else None
+    results = []
+    n_assigned = 0
+    for s in stands:
+        idxs = []
+        if kd is not None:
+            pg = prep(s['geom'])
+            idxs = [int(i) for i in kd.query(s['geom']) if pg.contains(pts[int(i)])]
+        s_rows = [rows[i] for i in idxs]
+        n_assigned += len(idxs)
+        canopy = grid.canopy(s['geom']) if grid.available else None
+        s_live_area = s_live_canopy = 0.0
+        if not live_geom.is_empty and live_geom.area > 0:
+            s_live_area = s['geom'].intersection(live_geom).area
+            # live canopy per stand: proportional share of the union's live canopy
+            s_live_canopy = live_canopy_m2 * (s_live_area / live_geom.area)
+        summary = t3.summarise(s_rows, s['geom'].area, canopy, s_live_canopy, s_live_area)
+        entry = {'key': s['key'], 'feature_index': s['feature_index'], 'summary': summary}
+        if s.get('n_parts', 1) > 1:
+            entry['n_parts'] = s['n_parts']
+        if s.get('key_is_duplicate'):
+            entry['key_is_duplicate'] = True
+        if include_trees:
+            entry['trees'] = [t3.row_to_feature(r) for r in s_rows]
+        results.append(entry)
+    return {
+        'stands': results,
+        'summary': {'n_stands': len(stands), 'n_trees_total': len(rows),
+                    'n_trees_assigned': n_assigned, **diag},
+        'warnings': warnings,
+        'meta': {**_tree_v3_meta(eff, meta, t0), 'key_property': key_prop,
+                 'merge_by_key': merge_by_key, 'include_trees': include_trees},
+    }
+
+
+def _changes_trees_v3_core(task_id, features, params):
+    """POST /api/v3/changes/trees — epoch a = product apices, epoch b = live nDSM."""
+    import tree_inventory as tv
+    import trees_v3 as t3
+    import als_acquisition
+    import kg_v2_store
+    from shapely.ops import unary_union
+    from datetime import date as _date
+    t0 = time.time()
+    eff = _tree_v3_params(params)
+    eff['fallback_live'] = False          # epoch a must be the product
+    date_b = params.get('date_b', params.get('dataset', ti.DEFAULT_DATASET))
+    eff['dataset'] = date_b
+    include_ortho = str(params.get('include_ortho', 'false')).lower() in ('true', '1', 'yes')
+    match_radius_m = float(params.get('match_radius_m', tv.DEFAULT_MATCH_RADIUS_M))
+    felling_min_drop_m = float(params.get('felling_min_drop_m', tv.DEFAULT_FELLING_MIN_DROP_M))
+    growth_eps_m = float(params.get('growth_eps_m', tv.DEFAULT_GROWTH_EPS_M))
+
+    geom_3035 = _tree_geom_prepare(features)
+    rows, grid, meta, _, _ = _tree_v3_collect(task_id, geom_3035, eff)
+    if not meta['source_mix']['product']:
+        raise ValueError('No 2.1 product covers this AOI — use /api/v2/changes/trees '
+                         '(live two-epoch) instead')
+    boxes = [t3._bbox_wgs_to_3035(bb) for bb in
+             (kg_v2_store.get_bbox(c) for c in meta['source_mix']['product']) if bb]
+    prod_geom = unary_union(boxes).intersection(geom_3035) if boxes else geom_3035
+    if prod_geom.is_empty:
+        prod_geom = geom_3035
+
+    _progress_set(task_id, 'lidar', f'Reading DTM/DSM for {date_b}…')
+    data_b = raster_io.read_dtm_dsm(prod_geom, dataset=date_b)
+    trees_b, labels_b, canopy_b, ortho_used, nir_used, det_meta_b = _tree_v2_inventory(
+        data_b, eff, include_ortho, task_id)
+    for t in trees_b:
+        t.apex_row, t.apex_col = _tree_v2_rowcol(data_b['transform'], t.apex_e, t.apex_n, data_b['shape'])
+    trees_a = t3.rows_to_trees(rows, data_b['transform'], data_b['shape'])
+    ndsm_a = t3.crown_proxy_ndsm(rows, data_b['transform'], data_b['shape'])
+
+    _progress_set(task_id, 'match', 'Matching product apices against live epoch…')
+    recs = tv.match_trees(trees_a, trees_b, ndsm_a, np.nan_to_num(data_b['ndsm'], nan=0.0),
+                          match_radius_m=match_radius_m, felling_min_drop_m=felling_min_drop_m,
+                          growth_eps_m=growth_eps_m, a=eff['crown_radius_a'], b=eff['crown_radius_b'])
+
+    year_a = t3.product_als_year(rows)
+    acq_b = als_acquisition.lookup(prod_geom, date_b)
+    years = None
+    if year_a and acq_b.get('known'):
+        years = (_date.fromisoformat(acq_b['effective_date']) - _date(year_a, 7, 1)).days / 365.25
+    same_flight_epoch = years is not None and abs(years) < 0.5
+
+    by_status = {}
+    growth_rates = []
+    feats = []
+    for r in recs:
+        r.pop('_ta'); r.pop('_tb')
+        props = {k: v for k, v in r.items() if k not in ('apex_a', 'apex_b')}
+        if r['status'] in ('unmatched_a_canopy_intact', 'unmatched_b_canopy_preexisting'):
+            props['match_status'] = 'unmatched_recall'
+        if years and years > 0.5 and r['status'] in ('grown', 'stable', 'shrunk') \
+                and r.get('height_change_m') is not None:
+            gcy = 100.0 * r['height_change_m'] / years
+            props['growth_cm_yr'] = round(gcy, 1)
+            if r['status'] in ('grown', 'stable'):
+                growth_rates.append(gcy)
+        for key, pt in (('apex_a', r.get('apex_a')), ('apex_b', r.get('apex_b'))):
+            if pt is not None:
+                wgs = ti.geometry_from_3035(Point(*pt))
+                props[f'{key}_lon'] = round(wgs.x, 7); props[f'{key}_lat'] = round(wgs.y, 7)
+        pt = r.get('apex_b') or r.get('apex_a')
+        feats.append({'type': 'Feature', 'properties': props,
+                      'geometry': mapping(ti.geometry_from_3035(Point(*pt)))})
+        by_status[r['status']] = by_status.get(r['status'], 0) + 1
+    gr = np.array(growth_rates, np.float32)
+    growth_pct = ({f'p{p}': round(float(np.percentile(gr, p)), 1) for p in (10, 25, 50, 75, 90)}
+                  if gr.size else {})
+    felled_volume = round(sum((f['properties'].get('volume_m3_est') or 0.0)
+                              for f in feats if f['properties']['status'] == 'felled'), 1)
+    eff_meta = dict(eff, date_b=date_b, match_radius_m=match_radius_m,
+                    felling_min_drop_m=felling_min_drop_m, growth_eps_m=growth_eps_m)
+    if same_flight_epoch:
+        growth_note = ('WARNING: product epoch (als_year) and date_b flight year coincide — '
+                       'height changes are processing noise, not growth')
+    elif years is None:
+        growth_note = 'growth_cm_yr omitted: product als_year or date_b flight year unknown'
+    elif years <= 0.5:
+        growth_note = (f'growth_cm_yr omitted: date_b flight year ({acq_b.get("effective_date")}) '
+                       f'is not later than the product epoch (als_year {year_a})')
+    else:
+        growth_note = (f'normalised by {years:.2f} years between product als_year {year_a} '
+                       f'(mid-year) and date_b effective date {acq_b.get("effective_date")}')
+    return {
+        'type': 'FeatureCollection', 'features': feats,
+        'felling_patches': None,
+        'felling_patches_note': ('not computed: the product carries no epoch-a 1 m raster '
+                                 '(disk rule); use /api/v2/changes/trees for nDSM-drop patches'),
+        'summary': {
+            'by_status': by_status, 'n_records': len(feats),
+            'n_trees_a': len(trees_a), 'n_trees_b': len(trees_b),
+            'felled_volume_m3_est': felled_volume,
+            'growth_cm_yr_percentiles': growth_pct,
+            'growth_cm_yr_is_nominal': years is None,
+            'growth_cm_yr_note': growth_note,
+            'epoch_a_note': ('epoch a = frozen 2.1 product apices; 3 m apex evidence uses a '
+                             'crown-disc proxy (h_m painted over crown_r_m), so '
+                             'unmatched_a sub-classes are coarser than the live v2 engine; '
+                             'crown-overlap (pass 2) matching is unavailable'),
+        },
+        'epoch_dates': {'a': f'product als_year {year_a}' if year_a else 'product (als_year unknown)',
+                        'b': date_b,
+                        'years_effective': round(years, 2) if years is not None else None,
+                        'same_flight_epoch': same_flight_epoch},
+        'meta': {
+            **_tree_v3_meta(eff_meta, meta, t0),
+            'acquisition': {'a': {'als_year': year_a,
+                                  'source': 'product tree_apices.als_year (median)'},
+                            'b': acq_b},
+            'ortho_used': ortho_used, 'nir_used': nir_used,
+            **_tree_v2_det_meta(det_meta_b, nir_used),
+            **params.get('_geometry_meta', {}),
+        },
+    }
+
+
+@app.route('/api/v3/trees', methods=['POST'])
+def trees_inventory_v3():
+    """Product-backed single-tree inventory (2.1 ``tree_apices`` + grid25).
+
+    Reads apices from the frozen light GPKG products covering the AOI — no
+    live detection unless part of the AOI has no 2.1 product
+    (``fallback_live``, default true). Params: min_tree_height,
+    min_tree_likelihood, stand_context=tree,orchard,… (filter),
+    include_trees (default true), fallback_live, dataset (live part), async.
+    """
+    return _tree_endpoint(_trees_v3_core)
+
+
+@app.route('/api/v3/trees/by-polygons', methods=['POST'])
+def trees_by_polygons_v3():
+    """Per-stand product-backed inventory. Params: key_property, merge_by_key,
+    include_trees (default false), + /api/v3/trees params."""
+    return _tree_endpoint(_trees_v3_by_polygons_core, geometry_fn=_get_geometry_multi)
+
+
+@app.route('/api/v3/changes/trees', methods=['POST'])
+def changes_trees_v3():
+    """Epoch a = product apices, epoch b = live nDSM at ``date_b``.
+    Params: date_b, match_radius_m, felling_min_drop_m, growth_eps_m,
+    include_ortho, + /api/v2/trees detector params for epoch b."""
+    return _tree_endpoint(_changes_trees_v3_core)
+
+
 # === SECTION: Multi-epoch summary ===
 
 @app.route('/api/v1/changes/summary', methods=['POST'])
@@ -16814,6 +17149,9 @@ def info():
             "POST /api/v2/trees": "Apex-based forestry inventory (stable tree IDs, explicit denominators)",
             "POST /api/v2/changes/trees": "Apex-matched tree changes + raster veto + felling patches",
             "POST /api/v2/trees/by-polygons": "Per-stand batch inventory (union raster, apex containment)",
+            "POST /api/v3/trees": "Product-backed inventory from 2.1 tree_apices + grid25 (no live detection where covered)",
+            "POST /api/v3/trees/by-polygons": "Per-stand product-backed inventory",
+            "POST /api/v3/changes/trees": "Product apices (epoch a) vs live nDSM (epoch b)",
             "POST /api/v1/changes/summary": "Multi-epoch change summary (2022→2023→2024)",
             "GET /api/v1/info": "This endpoint",
             "GET /api/v1/attribution": "Licence + attribution text for all data sources (CC BY 4.0 / ODbL)",

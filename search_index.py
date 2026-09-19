@@ -3700,9 +3700,25 @@ class GpkgCache:
             return str(p)
         return None
 
-    def download(self, kg_code, variant, url):
-        """Download a GPKG from Zenodo. Returns local path or None."""
+    def download(self, kg_code, variant, url, headers=None, expected_size=0):
+        """Download a GPKG from Zenodo. Returns local path or None.
+
+        Zenodo *bucket* URLs (``https://zenodo.org/api/files/<uuid>/<fn>``)
+        belong to draft depositions and 403 without the owner token, so a
+        Bearer header is added for them automatically (cf. ``v2_ingest._link``);
+        ``headers`` may override.  ``expected_size`` > 0 rejects truncated
+        bodies so a half-downloaded GPKG never enters the cache.
+        """
         import urllib.request
+        hdr = {'User-Agent': 'srtm-lidar/1.0'}
+        if url.startswith('https://zenodo.org/api/files/') and 'access_token=' not in url:
+            try:
+                from zenodo_client import DEFAULT_TOKEN
+                hdr['Authorization'] = f'Bearer {DEFAULT_TOKEN}'
+            except Exception:
+                pass
+        if headers:
+            hdr.update(headers)
         with self._lock:
             # Double-check after lock
             existing = self.get(kg_code, variant)
@@ -3713,13 +3729,17 @@ class GpkgCache:
             tmp = dest.with_suffix('.gpkg.tmp')
             try:
                 log.info('gpkg_cache: downloading %s %s from %s', kg_code, variant, url[:80])
-                req = urllib.request.Request(url, headers={'User-Agent': 'srtm-lidar/1.0'})
-                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as f:
+                req = urllib.request.Request(url, headers=hdr)
+                n = 0
+                with urllib.request.urlopen(req, timeout=300) as resp, open(tmp, 'wb') as f:
                     while True:
                         chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
+                        n += len(chunk)
+                if expected_size and n != expected_size:
+                    raise RuntimeError(f'size mismatch: got {n} want {expected_size}')
                 tmp.rename(dest)
                 log.info('gpkg_cache: cached %s (%d MB)', dest.name, dest.stat().st_size // (1024*1024))
                 return str(dest)

@@ -948,3 +948,28 @@ don’t crash. To make a peer the new director:
 ---
 
 *See `AGENTS.md` for the project map.*
+
+
+## Start-path gates vs. rollout (Sep 2026)
+
+Every processor *start* path (cache-only, parallel frontier) refuses peers for which
+`_peer_is_stale_idle(pid, status)` is true — reachable, idle (`stopped/idle/complete/paused`)
+and on a commit behind `_LOCAL_GIT_COMMIT` (not ahead). Such a peer gets a hard update from
+`_orchestrate_stale_peer_updates` after `STALE_UPDATE_GRACE_S` (90 s, was 600). Before this
+gate the director re-started idle peers on the old commit during the grace window, converting a
+60 s hard restart into a graceful restart at the next KG boundary — a fleet rollout took hours
+instead of ~5 min. Log lines: `cache-only: skipping N idle stale peer(s)` /
+`Parallel frontier: skipping <id> — idle on a stale commit`.
+
+Related fixes from the same incident:
+* The active-frontier continuation gate now includes `'complete'` (processor exhausted its
+  pending list or exited via disk-pressure pause). at123 held the active slot + 2 creds idle for
+  5 days because only `idle`/`stopped` triggered a restart.
+* `_maintain_shadow` adds +5 to the score of peers that are running, the active frontier, a
+  parallel frontier, or hold a `frontier_cred_plan` entry — the shadow is role-parked for 2 h, so
+  electing a busy peer discards its work (at202 was started as frontier and elected shadow 30 s
+  later).
+* Director identity push carries `peer_urls` (enabled fleet minus the receiver); peers rewrite
+  `peer_urls.txt` on drift. Stale lists cost a 10 s timeout per dead URL on every claim poll.
+* Peer push refreshes `system.disk_free_gb` live via statvfs; progress.json only carries it
+  while the processor runs, so idle peers pushed a frozen value (bogus "disk pressure" rows).

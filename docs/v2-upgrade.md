@@ -52,6 +52,14 @@ join the LPT partition. Config keys in `director_config`: `v2_upgrade` (bool, de
 upgrade-eligible codes while the `v2_upgrade_mode` marker exists — otherwise the whitelist the
 director just PUT would be pruned before the processor read it.
 
+**Peer-claim check is in-progress-only for upgrade units.** The processor's per-KG
+`_get_peer_claimed_kgs` folds every reachable peer's manifest-derived `completed` list into the
+claimed set. An upgrade unit is v1-complete *by definition*, so with that check every unit was
+skipped as "claimed by peer" and the peer exited seconds after start; the director then re-issued
+the same 24 codes every tick (Sep 2026, right after the fleet doubled — the new peers were the
+first reachable ones advertising the full completed set). Units tagged `_v2_upgrade` now only
+honour live `blocks` / `parents_unsplit` claims. Fresh-KG semantics are unchanged.
+
 ## Primary side
 
 * `kg_v2_store.py` — `data/kg_v2_store.db` (WAL). `kg_v2` (verified gz blob per code, `bbox`,

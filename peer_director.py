@@ -4943,7 +4943,7 @@ class PeerDirector:
             cc = self.state.get('_v2_cand_cache') or {}
             out['dispatch'] = {
                 'assigned': list(self.state.get('v2_upgrade_assigned') or []),
-                'priority': list(self.state.get('v2_priority') or []),
+                'priority': self._load_v2_priority(),
                 'candidates_total': cc.get('total', 0),
                 'fill_below_ready': V2_UPGRADE_FILL_BELOW_READY,
                 'max_peers': MAX_V2_UPGRADE_PEERS,
@@ -9651,7 +9651,7 @@ class PeerDirector:
             return []
         if len(whitelist) >= int(cfg.get('v2_upgrade_fill_below_ready',
                                          V2_UPGRADE_FILL_BELOW_READY)) \
-                and not self.state.get('v2_priority'):
+                and not self._load_v2_priority():
             return []
         try:
             zen_rate = float((self._capacity_components.get('rates') or {}).get('zenodo') or 0.0)
@@ -9669,11 +9669,28 @@ class PeerDirector:
         return (pri + rest)[:max(0, cap)]
 
     # --- Operator-pinned v2 upgrade priority (``POST /api/v1/director/v2/priority``)
+    # Kept in its own file (not director_state.json) because the POST lands
+    # on whichever gunicorn worker Flask picks, while the director loop
+    # runs in the other one with its own in-memory ``self.state``.
+    _V2_PRIORITY_FILE = DATA_DIR / 'v2_priority.json'
+
+    def _load_v2_priority(self) -> list[str]:
+        try:
+            v = json.loads(self._V2_PRIORITY_FILE.read_text())
+            return [str(c) for c in v] if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def _save_v2_priority(self, codes: list[str]) -> None:
+        tmp = self._V2_PRIORITY_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(codes))
+        tmp.replace(self._V2_PRIORITY_FILE)
+
     def v2_priority_codes(self) -> list[str]:
         """Operator-pinned product codes to upgrade *first*. Pruned
         automatically once ``_json_v2`` lands (or the code is no longer
-        v1-complete). Persisted in ``director_state.json['v2_priority']``."""
-        codes = list(self.state.get('v2_priority') or [])
+        v1-complete)."""
+        codes = self._load_v2_priority()
         if not codes:
             return []
         try:
@@ -9694,29 +9711,22 @@ class PeerDirector:
                 continue
             keep.append(c)
         if keep != codes:
-            with self._lock:
-                self.state['v2_priority'] = keep
-                save_director_state(self.state)
+            self._save_v2_priority(keep)
         return keep
 
     def set_v2_priority(self, codes: list, replace: bool = False) -> list[str]:
-        cur = [] if replace else list(self.state.get('v2_priority') or [])
+        cur = [] if replace else self._load_v2_priority()
         for c in codes:
             c = str(c).strip()
             if c and c not in cur:
                 cur.append(c)
-        with self._lock:
-            self.state['v2_priority'] = cur
-            self.state['_v2_cand_cache'] = {}   # force refill next tick
-            save_director_state(self.state)
+        self._save_v2_priority(cur)
         return cur
 
     def remove_v2_priority(self, codes: list) -> list[str]:
         drop = {str(c).strip() for c in codes}
-        cur = [c for c in (self.state.get('v2_priority') or []) if c not in drop]
-        with self._lock:
-            self.state['v2_priority'] = cur
-            save_director_state(self.state)
+        cur = [c for c in self._load_v2_priority() if c not in drop]
+        self._save_v2_priority(cur)
         return cur
 
     def _compute_cache_ready_kgs(self, max_kgs: int = 200) -> list[str]:
@@ -11630,7 +11640,7 @@ class PeerDirector:
         weights = _kg_weights(whitelist)
         # Operator-pinned v2 priority codes sort first (and hence land at
         # the head of their peer's queue).
-        for _c in (self.state.get('v2_priority') or []):
+        for _c in self._load_v2_priority():
             if _c in weights:
                 weights[_c] = weights[_c] + 1e6
         capacities = {pid: _peer_cpu_capacity(pid) for pid in all_workers}

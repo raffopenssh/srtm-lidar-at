@@ -289,12 +289,15 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
     up_24h = 0
     first_up = ""
     fresh_v2 = 0
+    v21_codes = 0
     for k, e in entries.items():
         if not _committed(e):
             continue
         if k.endswith("_json_v2"):
             code = k[:-8]
             upgraded.add(code.split("-", 1)[0])
+            if str(e.get("version") or "") == "v2.1":
+                v21_codes += 1
             ts = e.get("uploaded_at") or ""
             if ts > day_ago:
                 up_24h += 1
@@ -325,7 +328,7 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
         "upgraded_pct": round(100.0 * len(upgraded) / max(total_kgs, 1), 2),
         "upgraded_24h": up_24h, "rate_per_h": round(rate_h, 2), "eta_days": eta_d,
         "first_upload": first_up or None,
-        "fresh_v2": fresh_v2,
+        "fresh_v2": fresh_v2, "v21_codes": v21_codes,
         "verify_fail": len(fl), "verify_fail_codes": sorted(fl)[:20],
         "pending": pend,
         "store": st, "kg_log": ls, "archive_days_remaining": arch_remaining,
@@ -355,11 +358,13 @@ def text_line(v: dict | None = None) -> str:
     ls = v["kg_log"]
     parts = [
         f"v2: upgraded={v['upgraded_parents']}/{v['total']} ({v['upgraded_pct']}%) "
-        f"+{v['upgraded_24h']}/24h @{v['rate_per_h']}/h eta={eta}",
+        f"+{v['upgraded_24h']}/24h @{v['rate_per_h']}/h eta={eta} v2.1={v.get('v21_codes', 0)}codes",
         f"fresh_v2={v['fresh_v2']}",
         f"verify_fail={v['verify_fail']}" + ("" if v["pending"] is None else f" pending={v['pending']}"),
         f"store={n}codes/{_fmt_b(st.get('db_bytes'))} freed={_fmt_b(st.get('v1_bytes_freed'))} "
-        f"avg/kg={_fmt_b(avg)}",
+        f"avg/kg={_fmt_b(avg)}"
+        + (f" v2.1={(st.get('product_versions') or {}).get('2.1', 0)}"
+           f"/grid25={_fmt_b(st.get('grid25_bytes'))}" if n else ""),
         f"json_files={v['json_files']} disk={_fmt_b(v['json_bytes'])}",
         f"kg_log={ls.get('codes', 0)}codes/{ls.get('rows', 0)}rows/{_fmt_b(ls.get('bytes'))}"
         + (f" archive_remaining={v['archive_days_remaining']}d"

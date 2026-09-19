@@ -74,6 +74,16 @@ def _default_model_version() -> str:
 
 MODEL_VERSION = _default_model_version()
 VERSION = "v2" if MODEL_VERSION == "v2" else "v1"
+# Product version of the v2 products (``_json_v2`` / ``_light_gpkg_v2``).
+# ``product_version`` in the kgjson/2 doc; the manifest entry's ``version``
+# carries ``v2.1`` so eligibility (re-upgrade when < current) works without
+# decoding blobs.  See docs/v2.1-product-spec.md.
+from v21_products import PRODUCT_VERSION, MANIFEST_VERSION as V2_PRODUCT_MANIFEST_VERSION  # noqa: E402
+
+
+def _product_upload_version(file_key: str) -> str:
+    """Manifest/Zenodo ``version`` for a product file key."""
+    return V2_PRODUCT_MANIFEST_VERSION if file_key in ("json_v2", "light_gpkg_v2") else VERSION
 # v2 upgrade mode: re-classify already-processed v1 KGs from their own
 # Zenodo full GPKG (no BEV / openEO traffic).  Set by ``--v2-upgrade`` or
 # env ``V2_UPGRADE=1`` (the director passes it in the start payload).
@@ -4610,11 +4620,19 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
                            obs_year=0, mark_uncertain=False, label_remap=None,
-                           outline_profiler=None, out_path=None):
+                           outline_profiler=None, out_path=None, v21_out=None,
+                           report_step=None):
     """Light GPKG: stitched segment rasters + enriched cadastre vectors.
 
     ``out_path`` defaults to ``<code>_light.gpkg``; v2 passes
-    ``<code>_light_v2.gpkg`` (product key ``_light_gpkg_v2``)."""
+    ``<code>_light_v2.gpkg`` (product key ``_light_gpkg_v2``).
+
+    ``v21_out`` (dict, v2 only): receives the product-2.1 JSON sections
+    (``terrain_grid25``, ``landcover_grid25``, ``acquisition``, ``n_apices``,
+    ``det_mode`` …) computed from the stitched arrays; the matching heavy
+    layers (``tree_apices`` points + R-tree, ``terrain_coarse_*`` 5 m
+    rasters) are written into this GPKG.  See docs/v2.1-product-spec.md."""
+    _rs = report_step or (lambda *a, **k: None)
     import rasterio, fiona
     import rasterio.transform
     from fiona.crs import from_epsg
@@ -4780,6 +4798,42 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             except Exception as e:
                 log.warning("Light GPKG boundary merge failed: %s", e)
 
+        # --- v2.1: coarse indexes + apex inventory on the stitched arrays ---
+        _v21_coarse = None
+        _v21_apex_rows = None
+        if v21_out is not None:
+            try:
+                import v21_products as _v21
+                _t21 = time.time()
+                _rs("gpkg_light", "v2.1 terrain grid25")
+                _v21_coarse = _v21.stitch_coarse(tile_seg_results)
+                _tg = _v21.terrain_grid25(_v21_coarse) if _v21_coarse else None
+                if _tg:
+                    v21_out["terrain_grid25"] = _tg
+                    _lc = _v21.landcover_grid25(seg_type_full, full_left, full_top, res, _v21_coarse)
+                    if _lc:
+                        v21_out["landcover_grid25"] = _lc
+                _acq = _v21.acquisition_section(tile_seg_results)
+                if _acq:
+                    v21_out["acquisition"] = _acq
+                _rs("gpkg_light", f"v2.1 tree apices ({full_h * full_w / 1e6:.0f} Mpx nDSM)")
+                _bg = [b["geometry"] for b in cadastre_data.get("building_footprints", [])
+                       if b.get("geometry") is not None and not b["geometry"].is_empty]
+                _di = {}
+                _v21_apex_rows = _v21.build_tree_apices(
+                    seg_height_full, full_tf, seg_type_full, labels_full, all_objects,
+                    tile_seg_results, _bg, det_info=_di)
+                v21_out["n_apices"] = len(_v21_apex_rows)
+                v21_out["det_mode"] = "ndsm_only"
+                v21_out["det_info"] = _di
+                v21_out["apex_seconds"] = round(time.time() - _t21, 1)
+                log.info("  v2.1: grid25 %s, %d tree apices in %.0fs (%s)",
+                         f"{_tg['cols']}x{_tg['rows']}" if _tg else "n/a",
+                         len(_v21_apex_rows), time.time() - _t21, _di)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("  v2.1 index/apex build failed: %s", _e, exc_info=True)
+                _v21_apex_rows = None
+
         # Write stitched segment rasters
         _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
                       descs=['Object type code'])
@@ -4799,6 +4853,23 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             except Exception as e:
                 log.warning("Light GPKG segment vectors failed: %s", e)
         del labels_full
+
+        # --- v2.1 heavy layers: terrain_coarse_* (5 m) + tree_apices (R-tree) ---
+        if v21_out is not None:
+            try:
+                import v21_products as _v21
+                if _v21_coarse:
+                    _rs("gpkg_light", "v2.1 terrain_coarse rasters")
+                    v21_out["terrain_coarse_tables"] = _v21.write_terrain_coarse(out_path, _v21_coarse)
+                if _v21_apex_rows:
+                    _rs("gpkg_light", f"v2.1 tree_apices ({len(_v21_apex_rows)} pts)")
+                    v21_out["n_apices_written"] = _v21.write_tree_apices(out_path, _v21_apex_rows)
+                    log.info("  v2.1: wrote %d tree_apices + %d terrain_coarse tables",
+                             v21_out.get("n_apices_written", 0), len(v21_out.get("terrain_coarse_tables") or []))
+            except Exception as _e:  # noqa: BLE001
+                log.warning("  v2.1 layer write failed: %s", _e, exc_info=True)
+            _v21_coarse = None
+            _v21_apex_rows = None
 
     # --- Lazy DTM loading with LRU eviction for GPKG parcel/building enrichment ---
     # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
@@ -5297,7 +5368,8 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                              copernicus_info, hansen_info, new_buildings,
                              infrastructure, obs_year, n_tiles=1, tile_km=1.5,
                              total_seg_pixels=0, tile_data_availability=None,
-                             outline_profiler=None, classifier_used=None):
+                             outline_profiler=None, classifier_used=None,
+                             v21_extras=None):
     """Build JSON summary from tiled segmentation results.
 
     ``outline_profiler`` (v2): ``segv2.parcel_elevation.ParcelOutlineProfiler``
@@ -6398,6 +6470,37 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             "Sentinel-2 L2A 10m NDVI (openEO)", "ESA WorldCover 10m",
             "Sentinel-1 SAR IW GRD 10m (openEO)", "Hansen GFC-2024-v1.12 30m",
             "Austrian Cadastre (BEV INSPIRE)", "Austria Power Infrastructure API"]}
+    # --- v2.1 coarse indexes (docs/v2.1-product-spec.md) ---------------
+    # Fixed-size 25 m grids + a < 1 KB acquisition block; the per-tree /
+    # per-5 m data lives in the light GPKG only (disk rule).
+    if v21_extras is not None and MODEL_VERSION == "v2":
+        summary["product_version"] = PRODUCT_VERSION
+        if v21_extras.get("terrain_grid25"):
+            summary.setdefault("terrain", {})["grid25"] = v21_extras["terrain_grid25"]
+        if v21_extras.get("landcover_grid25"):
+            summary["landcover"] = {"grid25": v21_extras["landcover_grid25"]}
+        if v21_extras.get("acquisition"):
+            summary["acquisition"] = v21_extras["acquisition"]
+        try:
+            import tree_inventory as _tv
+            _algo = _tv.TREE_ALGO_VERSION
+        except Exception:  # noqa: BLE001
+            _algo = None
+        ts_ = summary.setdefault("tree_stats", {})
+        ts_["apices_layer"] = "tree_apices" if v21_extras.get("n_apices_written") else None
+        ts_["n_apices"] = int(v21_extras.get("n_apices_written") or 0)
+        ts_["det_mode"] = v21_extras.get("det_mode") or "skipped"
+        ts_["algo_version"] = _algo
+        _di = v21_extras.get("det_info") or {}
+        if _di:
+            ts_["apex_rejected_by_surface"] = int(_di.get("rejected_by_surface", 0) or 0)
+        summary["methods"]["tree_apices"] = (
+            "tree_inventory.build_inventory on the stitched 1 m nDSM (variable-window "
+            "local maxima + marker watershed, cadastre roof mask, v2 segment stand context); "
+            "points in _light_v2.gpkg layer tree_apices (EPSG:3035, R-tree)")
+        summary["methods"]["grid25"] = (
+            "25 m block means of the 1 m DTM/slope (terrain.grid25) and dominant v2 segment "
+            "class (landcover.grid25); 5 m terrain_coarse_* rasters in _light_v2.gpkg")
     return summary
 
 
@@ -7654,6 +7757,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _report_step("ortho", tile_label)
             spectral = None
             _ortho_last_exc = None
+            _ortho_year_used = None
             import ortho_io  # noqa: lazy import (subprocess boundary)
             _ORTHO_TIMEOUTS = [300, 600, 900]  # 5m, 10m, 15m — escalating
             for _ortho_attempt, _ortho_timeout in enumerate(_ORTHO_TIMEOUTS, 1):
@@ -7674,6 +7778,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             # find it in ``_stitch_ortho_for_year``.
                             try:
                                 _yr_used = ortho_io.pick_rgbi_year_for_als(tdata)
+                                _ortho_year_used = _yr_used
                                 if _yr_used is not None and rgb is not None:
                                     import tile_raster_sidecar as _trs
                                     _trs.persist_ortho(
@@ -8055,6 +8160,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 "hansen_loss_year": hansen_data.get("loss_year") if hansen_data else None,
             })
             total_seg_pixels += tvalid
+            # v2.1: per-tile coarse terrain + tree evidence from the SAME
+            # arrays the segmenter used (no second raster read); pickled with
+            # the tile checkpoint.  See docs/v2.1-product-spec.md.
+            if MODEL_VERSION == "v2":
+                try:
+                    import v21_products as _v21
+                    tile_seg_results[-1]["v21"] = _v21.tile_coarse(
+                        tdata, dsm_dates=dsm_dates, dtm_dates=dtm_dates,
+                        dataset=ti.DEFAULT_DATASET, spectral=spectral,
+                        geom_3035=tile_geom_3035, ortho_year=_ortho_year_used)
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("KG %s %s: v2.1 tile evidence failed: %s", kg_code, tile_label, _e)
 
             # Filter objects: keep only those whose centroid is inside
             # the non-overlap core of this tile (avoid double-counting
@@ -8308,6 +8425,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             for tr in tile_seg_results:
                 for key in ("labels", "ndsm", "mask"):
                     arr = tr.pop(key, None)
+                    if arr is not None:
+                        _freed_bytes += arr.nbytes
+                # v2.1 per-tree evidence rasters (no apex inventory without
+                # the stitched nDSM anyway); keep the tiny coarse5 + acq so
+                # terrain grid25 / terrain_coarse still get written.
+                for key in ("dh_cm", "ndvi_i8", "nir_u8"):
+                    arr = (tr.get("v21") or {}).pop(key, None)
                     if arr is not None:
                         _freed_bytes += arr.nbytes
             gc.collect()
@@ -8721,6 +8845,24 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             except Exception as _e:  # noqa: BLE001
                 log.warning("KG %s: outline profile top-up failed: %s", kg_code, _e)
 
+        # --- 5c. v2.1: top up per-tile coarse evidence for tiles restored
+        # from pre-2.1 checkpoints (sidecar-first read; dates/spectral n/a) ---
+        _v21_extras = None
+        if MODEL_VERSION == "v2":
+            _v21_extras = {}
+            _missing_v21 = [i for i, _tr in enumerate(tile_seg_results) if not _tr.get("v21")]
+            if _missing_v21:
+                try:
+                    import v21_products as _v21
+                    for _ti_idx in _missing_v21:
+                        _tr = tile_seg_results[_ti_idx]
+                        _td = _read_dtm_for_tile(_tr, kg_code=kg_code, tile_idx=_ti_idx)
+                        _tr["v21"] = _v21.tile_coarse(_td, dataset=ti.DEFAULT_DATASET)
+                    log.info("KG %s: v2.1 tile evidence topped up for %d restored tile(s)",
+                             kg_code, len(_missing_v21))
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("KG %s: v2.1 tile evidence top-up failed: %s", kg_code, _e)
+
         # --- 6. Build light GPKG ---
         # v2 (fresh or upgrade) writes ``<code>_light_v2.gpkg`` under the
         # product key ``light_gpkg_v2``; the legacy ``_light_gpkg`` is never
@@ -8734,8 +8876,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             cadastre_data, all_new_buildings, all_infrastructure,
             obs_year=obs_year, mark_uncertain=mark_uncertain,
             label_remap=_boundary_remap, outline_profiler=_outline_prof,
-            out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None)
+            out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None,
+            v21_out=_v21_extras, report_step=_report_step)
         result["files"][_light_key] = light_gpkg
+        if _v21_extras:
+            result["v21"] = {k: v for k, v in _v21_extras.items()
+                             if k in ("n_apices", "det_mode", "terrain_coarse_tables", "apex_seconds")}
 
         # --- 6b. Validate light GPKG ---
         _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
@@ -8810,7 +8956,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             n_tiles=n_tiles, tile_km=tile_km,
             total_seg_pixels=total_seg_pixels,
             tile_data_availability=tile_data_availability,
-            outline_profiler=_outline_prof, classifier_used=_classifier_used)
+            outline_profiler=_outline_prof, classifier_used=_classifier_used,
+            v21_extras=_v21_extras)
 
         # Store quality info in result for logging / Zenodo
         dq = json_summary.get("data_quality", {})
@@ -8948,7 +9095,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             _report_step(f"upload_{_lab}",
                                          f"{total / 1e6:.0f} MB — {round(100 * sent / total) if total else 0}%")
                         _report_step(f"upload_{_fk}", f"streaming {_szV / 1e6:.1f} MB to Zenodo")
-                        _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp, VERSION, _metaV, _zmanifestV,
+                        _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp, _product_upload_version(_fk),
+                                                _metaV, _zmanifestV,
                                                 delete_after=(_ftV == "gpkg"), progress_callback=_cbV)
                         result["_uploaded_keys"].append(_fk)
                         if _ftV == "gpkg":
@@ -9632,7 +9780,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                 def _file_cb(sent, total, _label=_file_label):
                     progress_callback(_label, sent, total)
             client.upload_stream(
-                zenodo_key, local_path, VERSION, meta_func, manifest,
+                zenodo_key, local_path, _product_upload_version(file_key), meta_func, manifest,
                 delete_after=delete_local,
                 progress_callback=_file_cb)
 
@@ -9752,10 +9900,19 @@ def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False) -> in
 V2_UPGRADE_MAX_STRIKES = 2
 
 
+def v2_product_is_current(entry) -> bool:
+    """A ``_json_v2`` manifest entry (Entry or dict) is current iff its
+    ``version`` equals the running product version (``v2.1``)."""
+    if entry is None:
+        return False
+    v = entry.get("version") if isinstance(entry, dict) else getattr(entry, "version", "")
+    return str(v or "") == V2_PRODUCT_MANIFEST_VERSION
+
+
 def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool:
-    """True iff *code* has committed v1 products, no ``_json_v2`` yet and has
-    not struck out."""
-    if manifest.get(f"{code}_json_v2") is not None:
+    """True iff *code* has committed v1 products, no *current* ``_json_v2``
+    (none, or one from a product version < %s) and has not struck out.""" % PRODUCT_VERSION
+    if v2_product_is_current(manifest.get(f"{code}_json_v2")):
         return False
     ej = manifest.get(f"{code}_json")
     eg = manifest.get(f"{code}_full_gpkg")

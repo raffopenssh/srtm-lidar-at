@@ -4969,12 +4969,14 @@ def processing_queue_get():
     # legitimate work for the local processor — keep them.
     _v2_keep = set()
     if (data_dir / 'v2_upgrade_mode').exists():
+        from v21_products import MANIFEST_VERSION as _V21
         for c in codes:
             e_j = _mf_entries.get(f'{c}_json')
             e_g = _mf_entries.get(f'{c}_full_gpkg')
+            _j2 = _mf_entries.get(f'{c}_json_v2')
             if (isinstance(e_j, dict) and isinstance(e_g, dict)
                     and int(e_g.get('size') or 0) > 0
-                    and f'{c}_json_v2' not in _mf_entries):
+                    and not (isinstance(_j2, dict) and str(_j2.get('version') or '') == _V21)):
                 _v2_keep.add(c)
     dirty = len(codes)
     codes = [c for c in codes if
@@ -9982,6 +9984,142 @@ _HEIGHTFIELD_CACHE = {}          # (kg, cell) -> (ts, payload)
 _HEIGHTFIELD_CACHE_MAX = 400
 
 
+def _grid25_for_kg(kg_code):
+    """Decoded product-2.1 ``grid25`` sections for a parent KG (one entry per
+    product code — split KGs have several blocks).  Reads only the small
+    ``grid25`` store column (no document decode).  [] when none is 2.1."""
+    import kg_v2_store as _kvs
+    import v21_products as _v21
+    out = []
+    for code in _kvs.codes_for_parent(kg_code) or []:
+        g = _kvs.get_grid25(code)
+        if not g or not g.get('terrain'):
+            continue
+        try:
+            t = _v21.decode_terrain_grid25(g['terrain'])
+            lc = _v21.decode_landcover_grid25(g['landcover']) if g.get('landcover') else None
+        except Exception as e:  # noqa: BLE001
+            log.warning('grid25 decode %s: %s', code, e)
+            continue
+        out.append({'code': code, 'terrain': t, 'landcover': lc})
+    return out
+
+
+def _grid25_sample(grid, E, N, *, bilinear=True):
+    """Sample a decoded grid25 array dict at EPSG:3035 coords (arrays).
+    Bilinear on the cell centres with nearest fallback where a neighbour is
+    nodata; NaN outside the grid."""
+    a = grid['elev'] if 'elev' in grid else grid['cls']
+    cell = grid['cell_m']
+    rows, cols = a.shape
+    fx = (E - grid['x0']) / cell - 0.5          # cell-centre coordinates
+    fy = (grid['y0'] - N) / cell - 0.5
+    inside = (fx > -0.5) & (fx < cols - 0.5) & (fy > -0.5) & (fy < rows - 0.5)
+    out = np.full(E.shape, np.nan, np.float32)
+    if not inside.any():
+        return out
+    ci = np.clip(np.round(fx).astype(int), 0, cols - 1)
+    ri = np.clip(np.round(fy).astype(int), 0, rows - 1)
+    nearest = a[ri, ci].astype(np.float32)
+    out[inside] = nearest[inside]
+    if bilinear and a.dtype.kind == 'f':
+        c0 = np.clip(np.floor(fx).astype(int), 0, cols - 1); c1 = np.clip(c0 + 1, 0, cols - 1)
+        r0 = np.clip(np.floor(fy).astype(int), 0, rows - 1); r1 = np.clip(r0 + 1, 0, rows - 1)
+        wx = np.clip(fx - c0, 0, 1); wy = np.clip(fy - r0, 0, 1)
+        v00, v01, v10, v11 = a[r0, c0], a[r0, c1], a[r1, c0], a[r1, c1]
+        bil = (v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy)
+               + v10 * (1 - wx) * wy + v11 * wx * wy)
+        ok = inside & np.isfinite(bil)
+        out[ok] = bil[ok]
+    return out
+
+
+def _heightfield_from_grid25(kg_code, grids, w, s, e, n, cell, want_landcover):
+    """Product-2.1 fast path: resample ``terrain.grid25`` (EPSG:3035, 25 m)
+    onto the lon/lat output grid the IDW path uses.  Returns payload or None."""
+    import pyproj
+    cell = max(25, cell)
+    lat0 = (s + n) / 2.0
+    mx = 111320.0 * _math.cos(_math.radians(lat0))
+    my = 110540.0
+    cols = int(_math.ceil((e - w) * mx / cell)) + 1
+    rows = int(_math.ceil((n - s) * my / cell)) + 1
+    if cols * rows > 250_000:
+        return {'error': 'grid too large; increase cell'}, 400
+    gx = w + (np.arange(cols) * cell) / mx
+    gy = n - (np.arange(rows) * cell) / my
+    LON, LAT = np.meshgrid(gx, gy)
+    tx = pyproj.Transformer.from_crs('EPSG:4326', 'EPSG:3035', always_xy=True)
+    E, N = tx.transform(LON.ravel(), LAT.ravel())
+    E = np.asarray(E); N = np.asarray(N)
+    Z = np.full(E.shape, np.nan, np.float32)
+    LC = np.zeros(E.shape, np.int16) if want_landcover else None
+    for g in grids:
+        z = _grid25_sample(g['terrain'], E, N)
+        fill = np.isnan(Z) & np.isfinite(z)
+        Z[fill] = z[fill]
+        if want_landcover and g.get('landcover'):
+            c = _grid25_sample(g['landcover'], E, N, bilinear=False)
+            f2 = (LC == 0) & np.isfinite(c)
+            LC[f2] = c[f2].astype(np.int16)
+    Z = Z.reshape(rows, cols)
+    zr = np.round(Z, 1)
+    zl = [[None if not np.isfinite(v) else float(v) for v in row] for row in zr]
+    fin = Z[np.isfinite(Z)]
+    payload = {
+        'kg_code': kg_code, 'bbox': [w, s, e, n], 'cell_m': cell,
+        'cols': cols, 'rows': rows, 'origin': 'nw', 'rows_major_north_to_south': True,
+        'elev_min': float(fin.min()) if fin.size else None,
+        'elev_max': float(fin.max()) if fin.size else None,
+        'samples': int(sum(int(np.isfinite(g['terrain']['elev']).sum()) for g in grids)),
+        'product_codes': [g['code'] for g in grids],
+        'source': 'dtm_grid25_v2.1',
+        'source_detail': '25 m block means of BEV ALS DTM 1 m (CC BY 4.0, bearbeitet), '
+                         'bilinear-resampled from the v2.1 product terrain.grid25',
+        'null_cells': int(np.isnan(Z).sum()),
+        'z': zl,
+    }
+    if want_landcover:
+        legend = {}
+        for g in grids:
+            if g.get('landcover'):
+                legend.update(g['landcover']['legend'])
+        payload['landcover'] = [[int(v) for v in row] for row in LC.reshape(rows, cols)]
+        payload['landcover_legend'] = legend
+        payload['landcover_source'] = 'dominant v2 segment class per 25 m cell (landcover.grid25), nearest'
+    return payload, 200
+
+
+@app.route('/api/v1/kg/<kg_code>/landcover')
+def api_kg_landcover(kg_code):
+    """Product-2.1 ``landcover.grid25`` for a KG — the dominant v2 segment
+    class per 25 m cell, native EPSG:3035 grid, one block per product code.
+
+    Returns ``{kg_code, product_version:"2.1", grids:[{code, x0, y0, cell_m,
+    cols, rows, origin:'nw', crs:'EPSG:3035', legend:{code:type},
+    cls:[[int]], cover_frac:[[0..1]]}]}``; 404 when the KG has no 2.1
+    product yet (``?fallback`` is deliberately absent — use
+    ``/heightfield?landcover=1`` for a lon/lat grid).  Data: BEV ALS/DOP
+    (CC BY 4.0, bearbeitet) + Copernicus + cadastre via the v2 segmenter."""
+    try:
+        grids = _grid25_for_kg(kg_code)
+        grids = [g for g in grids if g.get('landcover')]
+        if not grids:
+            return jsonify({'error': f'KG {kg_code} has no product-2.1 landcover grid yet'}), 404
+        out = []
+        for g in grids:
+            lc = g['landcover']
+            out.append({'code': g['code'], 'x0': lc['x0'], 'y0': lc['y0'], 'cell_m': lc['cell_m'],
+                        'cols': lc['cols'], 'rows': lc['rows'], 'origin': 'nw', 'crs': 'EPSG:3035',
+                        'legend': lc['legend'], 'cls': lc['cls'].tolist(),
+                        'cover_frac': np.round(lc['cover_frac'], 2).tolist()})
+        return jsonify({'kg_code': kg_code, 'product_version': '2.1', 'grids': out,
+                        'source': 'landcover.grid25 — dominant v2 segment class per 25 m cell'})
+    except Exception as e:
+        log.warning('api_kg_landcover %s: %s', kg_code, e)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/kg/<kg_code>/heightfield')
 def api_kg_heightfield(kg_code):
     """Fast (<100 ms) gridded terrain estimate for a KG — index only, no raster.
@@ -9993,16 +10131,24 @@ def api_kg_heightfield(kg_code):
     siedler-oesterreich), NOT survey use: accuracy is ~parcel scale.
 
     Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
-            k=N      IDW neighbours (default 8)
+            k=N      IDW neighbours (default 8; IDW path only)
+            landcover=1  also return ``landcover:[[code]]`` + legend (2.1 only)
     Returns {kg_code, bbox:[w,s,e,n], cell_m, cols, rows, elev_min, elev_max,
              origin:'nw', rows_major_north_to_south:true,
              z:[[…]]  (rows of floats, null where no data within 3 km),
              samples:N, source}
+
+    **Product 2.1 fast path**: when the primary store holds ``terrain.grid25``
+    for the KG (``source:"dtm_grid25_v2.1"``) the field is a bilinear resample
+    of true 25 m DTM block means — no nulls inside the KG, forest/alpine
+    included; ``cell`` is floored at 25.  Otherwise the legacy IDW estimate
+    over indexed parcel/building centroids (``source:"idw_index"``).
     """
     try:
         cell = max(20, min(500, int(request.args.get('cell', 50))))
         k = max(1, min(32, int(request.args.get('k', 8))))
-        ck = (kg_code, cell, k)
+        want_lc = request.args.get('landcover', '').lower() in ('1', 'true', 'yes')
+        ck = (kg_code, cell, k, want_lc)
         hit = _HEIGHTFIELD_CACHE.get(ck)
         if hit and time.time() - hit[0] < 3600:
             return jsonify(hit[1])
@@ -10014,6 +10160,20 @@ def api_kg_heightfield(kg_code):
         if not kg:
             return jsonify({'error': f'unknown KG {kg_code}'}), 404
         w, s, e, n, emin, emax, processed = kg
+        try:
+            grids = _grid25_for_kg(kg_code)
+        except Exception as _ge:  # noqa: BLE001
+            log.warning('heightfield grid25 %s: %s', kg_code, _ge)
+            grids = []
+        if grids:
+            payload, status = _heightfield_from_grid25(kg_code, grids, w, s, e, n, cell, want_lc)
+            if status != 200:
+                return jsonify(payload), status
+            payload['kg_elev_min'] = emin; payload['kg_elev_max'] = emax
+            if len(_HEIGHTFIELD_CACHE) >= _HEIGHTFIELD_CACHE_MAX:
+                _HEIGHTFIELD_CACHE.pop(next(iter(_HEIGHTFIELD_CACHE)))
+            _HEIGHTFIELD_CACHE[ck] = (time.time(), payload)
+            return jsonify(payload)
         pts = c.execute('SELECT centroid_lon,centroid_lat,elevation_m FROM kg_parcels '
                         'WHERE kg_code=? AND elevation_m IS NOT NULL', (kg_code,)).fetchall()
         pts += c.execute('SELECT centroid_lon,centroid_lat,centroid_dtm_m FROM kg_buildings '
@@ -10071,8 +10231,9 @@ def api_kg_heightfield(kg_code):
             'elev_max': float(fin.max()) if fin.size else None,
             'kg_elev_min': emin, 'kg_elev_max': emax,
             'samples': int(len(sz)), 'k': k,
-            'source': 'IDW over indexed parcel centroids + building centroid DTM '
-                      '(BEV ALS DTM 1 m, CC BY 4.0, bearbeitet); parcel-scale accuracy',
+            'source': 'idw_index',
+            'source_detail': 'IDW over indexed parcel centroids + building centroid DTM '
+                             '(BEV ALS DTM 1 m, CC BY 4.0, bearbeitet); parcel-scale accuracy',
             'z': zl,
         }
         if len(_HEIGHTFIELD_CACHE) >= _HEIGHTFIELD_CACHE_MAX:

@@ -9621,22 +9621,35 @@ class PeerDirector:
                 skip |= v2_fleet_struck_out()
             except Exception:
                 pass
+            # rank key: (already has an older-product _json_v2?, full GPKG
+            # size) — never-upgraded codes first, then product<2.1 re-upgrades
+            # (docs/v2.1-product-spec.md → Eligibility / versioning).
+            from v21_products import MANIFEST_VERSION as _V21
             ranked = []
+            n_reup = 0
             for k, e in ent.items():
                 if not k.endswith('_json') or not isinstance(e, dict):
                     continue
                 if 'error' in str(e.get('status', '')):
                     continue
                 code = k[:-5]
-                if code in skip or f'{code}_json_v2' in ent:
+                if code in skip:
                     continue
+                j2 = ent.get(f'{code}_json_v2')
+                if isinstance(j2, dict):
+                    if str(j2.get('version') or '') == _V21:
+                        continue
+                    n_reup += 1
                 g = ent.get(f'{code}_full_gpkg')
                 if not isinstance(g, dict) or int(g.get('size') or 0) <= 0 \
                         or not g.get('uploaded_at'):
                     continue
-                ranked.append((int(g.get('size') or 0), code))
+                ranked.append((1 if isinstance(j2, dict) else 0, int(g.get('size') or 0), code))
             ranked.sort()
-            codes = [c for _, c in ranked[:max_n]]
+            codes = [c for _, _, c in ranked[:max_n]]
+            if n_reup:
+                log.debug('v2 upgrade candidates: %d product<%s re-upgrade(s) queued after '
+                          'never-upgraded codes', n_reup, _V21)
         except Exception as e:
             log.warning('v2 upgrade candidates: %s', e)
         with self._lock:
@@ -9700,9 +9713,11 @@ class PeerDirector:
         except Exception:
             return codes
         keep = []
+        from v21_products import MANIFEST_VERSION as _V21
         for c in codes:
-            if f'{c}_json_v2' in ent:
-                log.info('v2 priority: %s upgraded — dropping from priority list', c)
+            j2 = ent.get(f'{c}_json_v2')
+            if isinstance(j2, dict) and str(j2.get('version') or '') == _V21:
+                log.info('v2 priority: %s upgraded to %s — dropping from priority list', c, _V21)
                 continue
             g = ent.get(f'{c}_full_gpkg')
             if f'{c}_json' not in ent or not isinstance(g, dict) \

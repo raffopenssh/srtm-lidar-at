@@ -77,6 +77,13 @@ LOG_RING_MAX = 600          # rows kept per code (oldest dropped)
 _MIGRATIONS = [
     ("bbox", "ALTER TABLE kg_v2 ADD COLUMN bbox TEXT"),
     ("generated_at", "ALTER TABLE kg_v2 ADD COLUMN generated_at TEXT"),
+    # product 2.1: ``product_version`` ("2" for pre-2.1 blobs) and the
+    # ``grid25`` column = gzip'd JSON {terrain, landcover} of the two 25 m
+    # index sections, REMOVED from ``blob`` before storing (disk-neutral;
+    # re-attached by get()) so heightfield/landcover read ~15 KB instead of
+    # decoding the whole document.  See docs/v2.1-product-spec.md.
+    ("product_version", "ALTER TABLE kg_v2 ADD COLUMN product_version TEXT"),
+    ("grid25", "ALTER TABLE kg_v2 ADD COLUMN grid25 BLOB"),
 ]
 _DOC_CACHE_MAX = 24
 _doc_cache: dict[str, tuple[str, dict]] = {}   # code -> (sha256, decoded doc)
@@ -135,10 +142,46 @@ def all_parents() -> set[str]:
 
 
 def get_blob(code: str) -> bytes | None:
+    """The kgjson/2 gzip blob, with the grid25 sections re-attached (so a
+    ``?raw=1`` download equals the uploaded product)."""
     if not STORE_PATH.exists():
         return None
-    r = _conn().execute("SELECT blob FROM kg_v2 WHERE code=?", (code,)).fetchone()
-    return bytes(r[0]) if r else None
+    r = _conn().execute("SELECT blob, grid25 FROM kg_v2 WHERE code=?", (code,)).fetchone()
+    if not r:
+        return None
+    if not r[1]:
+        return bytes(r[0])
+    try:
+        import v21_products
+        doc = v21_products.attach_grid25(kg_json_v2.decode(bytes(r[0])), bytes(r[1]))
+        return kg_json_v2.encode(doc)
+    except Exception as e:  # noqa: BLE001
+        log.warning("kg_v2_store: grid25 re-attach failed for %s: %s", code, e)
+        return bytes(r[0])
+
+
+def get_grid25(code: str) -> dict | None:
+    """{terrain: sec|None, landcover: sec|None} from the small column — the
+    heightfield / landcover fast path.  None when the code is absent or
+    pre-2.1."""
+    if not STORE_PATH.exists():
+        return None
+    r = _conn().execute("SELECT grid25 FROM kg_v2 WHERE code=?", (code,)).fetchone()
+    if not r or not r[0]:
+        return None
+    try:
+        import v21_products
+        return v21_products.grid25_payload(bytes(r[0]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("kg_v2_store: grid25 undecodable for %s: %s", code, e)
+        return None
+
+
+def product_version(code: str) -> str | None:
+    if not STORE_PATH.exists():
+        return None
+    r = _conn().execute("SELECT product_version FROM kg_v2 WHERE code=?", (code,)).fetchone()
+    return (r[0] or "2") if r else None
 
 
 def get(code: str) -> dict | None:
@@ -148,7 +191,7 @@ def get(code: str) -> dict | None:
     MUST NOT mutate the returned dict (use ``copy.deepcopy`` if needed)."""
     if not STORE_PATH.exists():
         return None
-    r = _conn().execute("SELECT sha256, blob FROM kg_v2 WHERE code=?", (code,)).fetchone()
+    r = _conn().execute("SELECT sha256, blob, grid25 FROM kg_v2 WHERE code=?", (code,)).fetchone()
     if not r:
         return None
     sha = r[0]
@@ -159,6 +202,9 @@ def get(code: str) -> dict | None:
             return hit[1]
     try:
         d = kg_json_v2.decode(bytes(r[1]))
+        if r[2]:
+            import v21_products
+            d = v21_products.attach_grid25(d, bytes(r[2]))
     except Exception as e:  # noqa: BLE001
         log.error("kg_v2_store: blob for %s undecodable: %s", code, e)
         return None
@@ -201,7 +247,8 @@ def get_meta(code: str) -> dict | None:
     c = _conn()
     c.row_factory = sqlite3.Row
     r = c.execute("SELECT code,parent,size,sha256,version,model,uploaded_at,"
-                  "ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at "
+                  "ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at,"
+                  "product_version,LENGTH(grid25) AS grid25_bytes "
                   "FROM kg_v2 WHERE code=?",
                   (code,)).fetchone()
     c.row_factory = None
@@ -213,10 +260,13 @@ def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
         v1_bytes_freed: int = 0, source: str = "zenodo", doc: dict | None = None) -> dict:
     """Persist a verified blob.  Idempotent (REPLACE); keeps the larger of
     the stored / supplied ``v1_bytes_freed`` so a re-ingest never zeroes
-    the saving already accounted for."""
+    the saving already accounted for.
+
+    Product 2.1: the ``terrain.grid25`` / ``landcover.grid25`` sections are
+    split out of the stored blob into the ``grid25`` column (the blob is
+    re-encoded without them; ``sha256`` is of the *stored* blob)."""
     if blob[:2] != b"\x1f\x8b":
         raise ValueError("blob is not gzip (kgjson/2 containers are gzip'd)")
-    sha = hashlib.sha256(blob).hexdigest()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     bbox_s, gen_at = None, None
     if doc is None:
@@ -224,6 +274,19 @@ def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
             doc = kg_json_v2.decode(blob)
         except Exception:
             doc = None
+    grid25_payload = None
+    prod_ver = None
+    if isinstance(doc, dict):
+        prod_ver = str(doc.get("product_version") or "2")
+        try:
+            import v21_products
+            slim, grid25_payload = v21_products.split_grid25(doc)
+            if grid25_payload:
+                blob = kg_json_v2.encode(slim)
+        except Exception as e:  # noqa: BLE001
+            log.warning("kg_v2_store: grid25 split failed for %s (storing whole blob): %s", code, e)
+            grid25_payload = None
+    sha = hashlib.sha256(blob).hexdigest()
     if isinstance(doc, dict):
         bb = doc.get("bbox") or {}
         try:
@@ -244,13 +307,16 @@ def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
         freed = max(int(v1_bytes_freed or 0), int(prev[0]) if prev else 0)
         c.execute(
             "INSERT OR REPLACE INTO kg_v2(code,parent,blob,size,sha256,version,model,"
-            "uploaded_at,ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "uploaded_at,ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at,"
+            "product_version,grid25) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (code, parent_of(code), sqlite3.Binary(blob), len(blob), sha, version, model,
-             uploaded_at, now, freed, n_parcels, source, bbox_s, gen_at))
+             uploaded_at, now, freed, n_parcels, source, bbox_s, gen_at, prod_ver,
+             sqlite3.Binary(grid25_payload) if grid25_payload else None))
         c.commit()
         _doc_cache.pop(code, None)
-    return {"code": code, "size": len(blob), "sha256": sha, "v1_bytes_freed": freed}
+    return {"code": code, "size": len(blob), "sha256": sha, "v1_bytes_freed": freed,
+            "product_version": prod_ver, "grid25_bytes": len(grid25_payload or b"")}
 
 
 def add_freed(code: str, nbytes: int) -> None:
@@ -274,7 +340,8 @@ def stats() -> dict:
     """Aggregate for ``/process.txt`` and ``/api/v1/director/status``."""
     if not STORE_PATH.exists():
         return {"codes": 0, "parents": 0, "bytes": 0, "v1_bytes_freed": 0,
-                "db_bytes": 0, "last_ingested_at": None, "ingested_24h": 0}
+                "db_bytes": 0, "last_ingested_at": None, "ingested_24h": 0,
+                "product_versions": {}, "grid25_codes": 0, "grid25_bytes": 0}
     c = _conn()
     r = c.execute("SELECT COUNT(*), COUNT(DISTINCT parent), COALESCE(SUM(size),0), "
                   "COALESCE(SUM(v1_bytes_freed),0), MAX(ingested_at) FROM kg_v2").fetchone()
@@ -285,8 +352,17 @@ def stats() -> dict:
         p = Path(str(STORE_PATH) + suf)
         if p.exists():
             db_bytes += p.stat().st_size
+    pv = {}
+    try:
+        for v, n in c.execute("SELECT COALESCE(product_version,'2'), COUNT(*) FROM kg_v2 "
+                              "GROUP BY 1"):
+            pv[str(v)] = int(n)
+        g = c.execute("SELECT COUNT(grid25), COALESCE(SUM(LENGTH(grid25)),0) FROM kg_v2").fetchone()
+    except Exception:  # noqa: BLE001
+        g = (0, 0)
     return {"codes": r[0], "parents": r[1], "bytes": r[2], "v1_bytes_freed": r[3],
-            "db_bytes": db_bytes, "last_ingested_at": r[4], "ingested_24h": n24}
+            "db_bytes": db_bytes, "last_ingested_at": r[4], "ingested_24h": n24,
+            "product_versions": pv, "grid25_codes": int(g[0]), "grid25_bytes": int(g[1])}
 
 
 def recent(limit: int = 10) -> list[dict]:

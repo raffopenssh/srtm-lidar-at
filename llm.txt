@@ -1399,12 +1399,36 @@ centroids (`kg_parcels.elevation_m`, ~55 m spacing) + building centroids
 accuracy — fine for isometric relief / hillshade / extrusion offsets,
 NOT for survey use (use POST /api/v1/lidar/geotiff for real 1 m DTM).
 Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
-        k=N      IDW neighbours (default 8)
+        k=N      IDW neighbours (default 8; IDW path only)
+        landcover=1  also return landcover:[[type_code]] + landcover_legend
+                 (product 2.1 KGs only; 0 = no segment)
 Returns: {kg_code, bbox:[w,s,e,n], cell_m, cols, rows, origin:'nw',
           rows_major_north_to_south:true, z:[[…]] (row 0 = north edge,
           null = no sample within 3 km), elev_min, elev_max,
           kg_elev_min, kg_elev_max (true DTM extremes from the KG index),
-          samples, source}
+          samples, source, source_detail}
+source = "dtm_grid25_v2.1"  → product-2.1 fast path: bilinear resample of
+          true 25 m DTM block means (terrain.grid25 in the v2.1 KG JSON,
+          read from the primary store). No nulls inside the KG, forest and
+          alpine cells included; cell is floored at 25. product_codes lists
+          the blocks used for split KGs.
+source = "idw_index"        → legacy IDW estimate (KG not yet on product 2.1).
+
+#### GET /api/v1/kg/<kg_code>/landcover  (product 2.1)
+Dominant v2 segment class per 25 m cell, native EPSG:3035 grid, one block
+per product code: {kg_code, product_version:"2.1", grids:[{code, x0, y0,
+cell_m:25, cols, rows, origin:'nw', crs:'EPSG:3035', legend:{code:type},
+cls:[[int]], cover_frac:[[0..1]]}]}. Cell (r,c) centre = (x0 + (c+0.5)*25,
+y0 - (r+0.5)*25). 404 until the KG has a 2.1 product; use
+/heightfield?landcover=1 for a lon/lat grid instead.
+
+Product 2.1 (docs/v2.1-product-spec.md) also puts a `tree_apices` point
+layer (EPSG:3035, R-tree; tree_id, h_m, crown_r_m, crown_area_m2,
+detection_source/conf, surface_class, tree_likelihood, stand_context,
+segment_type(_conf), dh_per_year_m, als_year, ndvi, leaf_type_hint) and
+`terrain_coarse_{dtm,dsm,ndsm,slope,aspect}` 5 m float32 rasters into
+<code>_light_v2.gpkg on Zenodo, plus `acquisition.tiles` (flight years)
+and `tree_stats.{n_apices,det_mode,algo_version}` in the JSON.
 Grid cell (r,c) → lon = w + c*cell/(111320*cos(lat)), lat = n - r*cell/110540.
 ~90 KB at cell=50 for a typical KG; cached 1 h server-side.
 404 with processed:false for KGs not yet processed.

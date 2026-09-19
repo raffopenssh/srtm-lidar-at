@@ -47,6 +47,11 @@ REQUIRED_SECTIONS = ("version", "kg_code", "bbox", "area_summary", "landscape", 
 LIGHT_LAYERS_REQUIRED = ("segments", "segment_points", "parcels", "buildings",
                          "segment_type", "segment_height")
 LIGHT_LAYERS_V2 = ("parcel_outline_z",)
+# product 2.1 (docs/v2.1-product-spec.md) — checked by check_v21_document /
+# check_v21_light_gpkg; product_version is fatal, the 5 m / apex layers are
+# fatal only when the JSON claims them.
+PRODUCT_VERSION = "2.1"
+LIGHT_LAYERS_V21 = ("terrain_coarse_dtm", "terrain_coarse_slope")
 
 TOL = {
     "parcel_count_rel": 0.01,      # cadastre may change a little between runs
@@ -198,6 +203,8 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
                   f"{n_elev}/{len(pd)} parcels with elevation" + (f" (v1: {n_elev1}/{len(pd1)})" if pd1 else ""),
                   fatal=bool(_elev_fatal))
 
+    check_v21_document(v2, rep)
+
     cov = _g(v2, "coverage", default={}) or {}
     cov1 = (_g(v1, "coverage", default={}) or {}) if v1 else {}
     for k in ("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct"):
@@ -238,6 +245,96 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     rep["delta"] = {"n_segments": n_seg - n1, "unclassified_pp": round(u2 - u1, 2),
                     "new_buildings": nb2 - nb1,
                     "seg_area_rel": round(sa / sb, 4) if sa is not None and sb else None}
+
+
+def _bbox_3035(v2: dict):
+    bb = v2.get("bbox") or {}
+    try:
+        from pyproj import Transformer
+        t = Transformer.from_crs(4326, 3035, always_xy=True)
+        xs, ys = zip(*[t.transform(x, y) for x, y in (
+            (bb["min_lon"], bb["min_lat"]), (bb["max_lon"], bb["min_lat"]),
+            (bb["min_lon"], bb["max_lat"]), (bb["max_lon"], bb["max_lat"]))])
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def check_v21_document(v2: dict, rep: Report) -> None:
+    """Product-2.1 JSON checks (JSON subset — also run on the primary)."""
+    pv = str(v2.get("product_version") or "")
+    rep.check("product_version", pv == PRODUCT_VERSION, f"product_version={pv!r}")
+    g = _g(v2, "terrain", "grid25")
+    if not rep.check("grid25_present", isinstance(g, dict) and bool(g.get("elev")),
+                     "terrain.grid25 missing (tile arrays freed?)", fatal=False):
+        return
+    try:
+        import v21_products as v21
+        d = v21.decode_terrain_grid25(g)
+    except Exception as e:  # noqa: BLE001
+        rep.check("grid25_decodes", False, str(e)[:160])
+        return
+    rep.check("grid25_decodes", True)
+    cell = d["cell_m"]
+    cols, rows = d["cols"], d["rows"]
+    bb = _bbox_3035(v2)
+    if bb:
+        # the grid is built from the (overlapping, bbox-overshooting) tile
+        # rectangles snapped to 25 m, so it must COVER the bbox and may
+        # exceed it by up to ~1 tile (1.6 km) per side — not "±1 cell".
+        x0, y0 = d["x0"], d["y0"]
+        x1, y1 = x0 + cols * cell, y0 - rows * cell
+        covers = (x0 <= bb[0] + cell and y1 <= bb[1] + cell
+                  and x1 >= bb[2] - cell and y0 >= bb[3] - cell)
+        slack = 1700.0
+        sane = (bb[0] - x0 <= slack and x1 - bb[2] <= slack
+                and bb[1] - y1 <= slack and y0 - bb[3] <= slack)
+        rep.check("grid25_dims", covers and sane,
+                  f"grid {cols}x{rows}@{cell:.0f}m x[{x0:.0f},{x1:.0f}] y[{y1:.0f},{y0:.0f}] "
+                  f"vs bbox x[{bb[0]:.0f},{bb[2]:.0f}] y[{bb[1]:.0f},{bb[3]:.0f}]")
+    n_valid = int(np.isfinite(d["elev"]).sum())
+    frac = n_valid / max(cols * rows, 1)
+    rep.check("grid25_finite", frac >= 0.4, f"{n_valid}/{cols * rows} cells valid ({100 * frac:.0f}%%)")
+    emin, emax = _num(_g(v2, "terrain", "elevation_min_m")), _num(_g(v2, "terrain", "elevation_max_m"))
+    if n_valid and emin is not None and emax is not None:
+        gmin, gmax = float(np.nanmin(d["elev"])), float(np.nanmax(d["elev"]))
+        ok5 = gmin >= emin - 5 and gmax <= emax + 5
+        rep.check("grid25_range", gmin >= emin - 50 and gmax <= emax + 50,
+                  f"grid {gmin:.0f}..{gmax:.0f} m vs terrain {emin:.0f}..{emax:.0f} m")
+        if not ok5:
+            rep.check("grid25_range_drift", False,
+                      f"grid {gmin:.0f}..{gmax:.0f} m outside terrain ±5 m", fatal=False)
+    lc = _g(v2, "landcover", "grid25")
+    if isinstance(lc, dict):
+        rep.check("landcover_grid25_dims", int(lc.get("cols", 0)) == cols and int(lc.get("rows", 0)) == rows,
+                  f"landcover {lc.get('cols')}x{lc.get('rows')} vs terrain {cols}x{rows}")
+    ts = _g(v2, "tree_stats", default={}) or {}
+    rep.check("tree_stats_v21", "n_apices" in ts and "det_mode" in ts,
+              f"keys={sorted(ts)[:8]}", fatal=False)
+
+
+def check_v21_light_gpkg(c: sqlite3.Connection, layers: dict, v2: dict, rep: Report) -> None:
+    """Product-2.1 light GPKG checks (peer only; *c* is an open ro connection)."""
+    missing = [l for l in LIGHT_LAYERS_V21 if l not in layers]
+    has_grid = bool(_g(v2, "terrain", "grid25"))
+    rep.check("terrain_coarse_layers", not missing, "missing: " + ",".join(missing),
+              fatal=has_grid)
+    ts = _g(v2, "tree_stats", default={}) or {}
+    n_ap = int(_num(ts.get("n_apices"), 0) or 0)
+    claims = ts.get("apices_layer") == "tree_apices"
+    if "tree_apices" not in layers:
+        rep.check("apices_layer", not claims and n_ap == 0,
+                  f"tree_apices layer missing (json n_apices={n_ap})", fatal=claims)
+        return
+    try:
+        n = c.execute('SELECT COUNT(*) FROM "tree_apices"').fetchone()[0]
+    except Exception as e:  # noqa: BLE001
+        rep.check("apices_layer", False, str(e)[:120])
+        return
+    rtree = c.execute("SELECT COUNT(*) FROM gpkg_extensions WHERE table_name='tree_apices' "
+                      "AND extension_name='gpkg_rtree_index'").fetchone()[0] > 0
+    rep.check("apices_layer", rtree and (n_ap == 0 or abs(n - n_ap) <= 0.2 * n_ap),
+              f"layer={n} json={n_ap} rtree={rtree}")
 
 
 # --------------------------------------------------------------------------
@@ -343,6 +440,10 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
         nbl = _count("buildings")
         rep.check("buildings_layer_count", nb == 0 or abs(nbl - nb) <= max(2, 0.01 * nb),
                   f"layer={nbl} json={nb}")
+        try:
+            check_v21_light_gpkg(c, layers, v2, rep)
+        except Exception as e:  # noqa: BLE001
+            rep.check("v21_gpkg_checks", False, str(e)[:160], fatal=False)
         try:
             n_styles = c.execute("SELECT COUNT(DISTINCT f_table_name) FROM layer_styles").fetchone()[0]
             rep.check("layer_styles", n_styles >= len(LIGHT_LAYERS_REQUIRED) - 1,

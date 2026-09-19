@@ -141,6 +141,13 @@ def _v1_row(code: str) -> dict | None:
     try:
         import search_index as si
         from kg_splitter import parent_kg_code
+        if parent_kg_code(code) != code:
+            # The index row is the *parent* aggregate (sum over sibling
+            # blocks).  Comparing a single block's parcel/segment count
+            # against it is meaningless — 45306-south struck out on
+            # `parcels_vs_v1_row: v2=1906 v1=975` (the row then held only
+            # the -southwest sibling).  Blocks have no v1 baseline.
+            return None
         r = si.get_index()._conn().execute(
             "SELECT parcel_count, n_segments FROM kg WHERE kg_code=?",
             (parent_kg_code(code),)).fetchone()

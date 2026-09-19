@@ -202,6 +202,58 @@ def _enforce_admin_token():
                     'hint': 'set X-Admin-Token header'}), 401
 
 
+# === SECTION: response compression + conditional GET ===
+# process.html polls a handful of JSON endpoints every 5-15 s; before this
+# hook they went out uncompressed (director/status alone was 1.6 MB/15 s,
+# proxy/status 1.6 MB/5 s → hundreds of MB/h per open tab). We gzip any
+# text/JSON body ≥ 1 KiB when the client accepts it, and answer
+# If-None-Match with 304 so unchanged polls cost ~0 bytes. Static files
+# are handled by Flask's send_file (already conditional); streamed /
+# passthrough responses are left alone.
+_GZIP_MIN_BYTES = 1024
+_GZIP_TYPES = ('application/json', 'text/plain', 'text/html', 'text/csv',
+               'application/javascript', 'text/css', 'application/geo+json')
+
+
+@app.after_request
+def _compress_and_etag(resp):
+    try:
+        if request.method != 'GET' or resp.status_code != 200:
+            return resp
+        if resp.direct_passthrough or resp.is_streamed:
+            return resp
+        ct = (resp.content_type or '').split(';')[0].strip().lower()
+        if ct not in _GZIP_TYPES:
+            return resp
+        if resp.headers.get('Content-Encoding'):
+            return resp
+        body = resp.get_data()
+        if not body or len(body) < _GZIP_MIN_BYTES:
+            return resp
+        # Weak ETag over the *uncompressed* body — same value whether or
+        # not the client negotiated gzip.
+        etag = 'W/"' + hashlib.md5(body).hexdigest()[:20] + '"'
+        inm = request.headers.get('If-None-Match', '')
+        if inm and etag in [t.strip() for t in inm.split(',')]:
+            resp.status_code = 304
+            resp.set_data(b'')
+            resp.headers['ETag'] = etag
+            resp.headers.pop('Content-Length', None)
+            return resp
+        resp.headers['ETag'] = etag
+        resp.headers.add('Vary', 'Accept-Encoding')
+        ae = request.headers.get('Accept-Encoding', '')
+        if 'gzip' in ae.lower():
+            gz = gzip.compress(body, compresslevel=5)
+            if len(gz) < len(body):
+                resp.set_data(gz)
+                resp.headers['Content-Encoding'] = 'gzip'
+                resp.headers['Content-Length'] = str(len(gz))
+        return resp
+    except Exception:
+        return resp
+
+
 @app.route('/api/v1/admin/token', methods=['GET'])
 def admin_token_bootstrap():
     """Loopback-only endpoint: returns the admin token.
@@ -1722,6 +1774,9 @@ def _peer_status_push_loop():
                 _slim = {
                     'state': status.get('state'),
                     'cache_only': status.get('cache_only'),
+                    'model_version': status.get('model_version'),
+                    'v2_upgrade': status.get('v2_upgrade'),
+                    'v2_upgraded': status.get('v2_upgraded'),
                     'git_commit': status.get('git_commit'),
                     'region': status.get('region'),
                     'instance': status.get('instance'),
@@ -5556,6 +5611,22 @@ def processing_manifest():
         from zenodo_client import DEFAULT_TOKEN
         data = json.loads(manifest_path.read_text())
         entries = data.get('entries', {})
+        # ``?summary=1``: header-only view for the dashboard's Zenodo
+        # badge (polled continuously). The full ~5 MB body — with a
+        # tokenised download_url per entry — is only needed while the
+        # manifest panel is open.
+        if request.args.get('summary', '') in ('1', 'true', 'yes'):
+            by_suffix: dict[str, int] = {}
+            total = 0
+            for k, e in entries.items():
+                if k.endswith('_error'):
+                    by_suffix['error'] = by_suffix.get('error', 0) + 1
+                    continue
+                total += int((e or {}).get('size') or 0)
+                suf = k.split('_', 1)[1] if '_' in k else '?'
+                by_suffix[suf] = by_suffix.get(suf, 0) + 1
+            return jsonify({'count': len(entries), 'total_size_bytes': total,
+                            'by_product': by_suffix, 'summary': True})
         # Add authenticated download URLs for the dashboard
         for e in entries.values():
             depo_id = e.get('depo_id')
@@ -5791,11 +5862,63 @@ def api_bandwidth():
     return jsonify(bw)
 
 
+def _slim_director_status(status: dict) -> dict:
+    """Dashboard-sized view of ``get_status()``.
+
+    The full payload is ~1.6 MB: ``ip_pools_history`` (1440 samples,
+    ~1 MB) and 107 credentials × 168 hourly usage buckets (~800 KB) —
+    neither is rendered at that resolution by process.html. Drops the
+    ring, compacts each credential's ``usage`` to the 4 scalars +
+    non-zero buckets (``bucket_h0``/``bucket_n`` let the client keep the
+    168-wide sparkline), and strips per-peer ``canary`` sample arrays.
+    Everything else passes through untouched. Result: ~80 KB raw,
+    ~15 KB gzipped.
+    """
+    out = dict(status)
+    out.pop('ip_pools_history', None)
+    out['_slim'] = True
+    creds = []
+    for c in status.get('credentials') or []:
+        c2 = dict(c)
+        u = c.get('usage') or {}
+        if isinstance(u, dict):
+            u2 = {k: u.get(k) for k in ('success_7d', 'error_7d', 'rotated_7d',
+                                         'last_use', 'last_error', 'last_success',
+                                         'success', 'error', 'rotated') if k in u}
+            b = u.get('buckets') or []
+            if b:
+                h0 = b[0].get('h')
+                u2['bucket_h0'] = h0
+                u2['bucket_n'] = len(b)
+                u2['buckets'] = [x for x in b
+                                 if (x.get('s') or x.get('e') or x.get('r'))]
+            c2['usage'] = u2
+        creds.append(c2)
+    out['credentials'] = creds
+    peers = []
+    for p in status.get('peers') or []:
+        p2 = dict(p)
+        cn = p.get('canary')
+        if isinstance(cn, dict):
+            p2['canary'] = {k: v for k, v in cn.items()
+                            if not isinstance(v, (list, tuple)) or len(v) <= 8}
+        peers.append(p2)
+    out['peers'] = peers
+    return out
+
+
 @app.route('/api/v1/director/status')
 def director_status():
-    """Full director status: mode, active peer, bandwidth per peer."""
+    """Full director status: mode, active peer, bandwidth per peer.
+
+    ``?slim=1`` returns the dashboard view (see ``_slim_director_status``);
+    agents and forensic tooling keep the full payload by default.
+    """
     d = pd.get_director()
-    return jsonify(d.get_status())
+    st = d.get_status()
+    if request.args.get('slim', '') in ('1', 'true', 'yes'):
+        return jsonify(_slim_director_status(st))
+    return jsonify(st)
 
 
 @app.route('/api/v1/director/mode', methods=['POST'])
@@ -6446,19 +6569,28 @@ def director_proxy_status():
     d = pd.get_director()
     status = d.get_status()
     active_id = status.get('active_peer')
+    # process.html polls this every 5 s and never reads ``_director``
+    # (it has /api/v1/director/status?slim=1 for that); embedding the
+    # full 1.9 MB director status here was the single biggest
+    # bandwidth sink on the dashboard. Opt back in with ``?director=1``.
+    _want_dir = request.args.get('director', '') in ('1', 'true', 'yes')
+    _dir_view = status if _want_dir else {
+        'active_peer': active_id, 'mode': status.get('mode'),
+        'self_id': status.get('self_id'), '_omitted': 'pass ?director=1',
+    }
     # Start from the primary's enriched status so the dashboard keeps
     # its rate / ETA / DB totals / sparkline / tile history even when
     # a remote peer is the frontier.
     base = processing_status().get_json() or {}
     if not active_id:
-        base['_director'] = status
+        base['_director'] = _dir_view
         if not base.get('state'):
             base['state'] = 'no_active_peer'
         return jsonify(base)
     cfg = pd.load_peers_config()
     peer = pd.get_peer_by_id(cfg, active_id)
     if not peer:
-        base['_director'] = status
+        base['_director'] = _dir_view
         base['state'] = 'peer_not_found'
         return jsonify(base)
     ps = pd.get_peer_status(peer.get('url')) or {}
@@ -6476,7 +6608,7 @@ def director_proxy_status():
     for k in LIVE_KEYS:
         if k in ps and ps[k] is not None:
             base[k] = ps[k]
-    base['_director'] = status
+    base['_director'] = _dir_view
     base['_active_peer_id'] = active_id
     base['_active_peer_url'] = peer.get('url')
     for p in status.get('peers', []):
@@ -6579,6 +6711,14 @@ def _all_status_compute():
                     ps = r.json() or {}
                 except Exception as e:
                     ps = {'state': 'unreachable', 'error': str(e)}
+            # The peer carousel reads current_kg / state / last_kg_* /
+            # system / warning_rates / v2 fields. tile_history alone is
+            # ~30 KB per peer and is only ever rendered for the primary
+            # (via /processing/status), so drop the bulk here.
+            for _k in ('tile_history', '_completed_parent_codes',
+                       'kg_centroids', 'recent_log', 'failed_kgs',
+                       'manifest_daily_completions'):
+                ps.pop(_k, None)
             ps['_peer_id'] = pid
             ps['_peer_url'] = url
             ps['_is_active'] = is_active

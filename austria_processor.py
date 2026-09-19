@@ -799,11 +799,16 @@ class ProgressTracker:
         with self._lock:
             self._state.update(kwargs)
 
-    def set_current_kg(self, kg_code: str, kg_name: str, state: str, step: str):
+    def set_current_kg(self, kg_code: str, kg_name: str, state: str, step: str,
+                       v2_upgrade: bool = False):
         with self._lock:
             self._state["current_kg"] = {
                 "code": kg_code, "name": kg_name, "state": state,
                 "step": step, "started_at": datetime.now(timezone.utc).isoformat(),
+                # Dashboard: distinguishes an upgrade unit (re-classify from
+                # own full GPKG, no BEV/openEO) from a fresh KG.
+                "v2_upgrade": bool(v2_upgrade),
+                "model_version": MODEL_VERSION,
             }
 
     def set_step(self, step: str, detail: str = ""):
@@ -11322,6 +11327,11 @@ def main():
         started_at=datetime.now(timezone.utc).isoformat(),
         pending_blocks=len(pending),
         cache_only=bool(args.cache_only),
+        # v2 telemetry for /api/v1/processing/status → process.html peer
+        # badges. ``v2_upgraded`` is bumped per successful upgrade unit.
+        model_version=MODEL_VERSION,
+        v2_upgrade=bool(v2_upgrade and MODEL_VERSION == "v2"),
+        v2_upgraded=0,
     )
     progress.save()
 
@@ -11402,7 +11412,8 @@ def main():
             log.error("Disk critically low after cleanup — pausing")
             break
 
-        progress.set_current_kg(kg_code, kg_name, kg_state, "starting")
+        progress.set_current_kg(kg_code, kg_name, kg_state, "starting",
+                                v2_upgrade=bool(kg.get("_v2_upgrade")))
         progress.add_log("info", f"Starting KG {kg_code} ({kg_name})", kg_code)
         progress.save()
 

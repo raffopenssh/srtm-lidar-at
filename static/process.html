@@ -411,6 +411,9 @@
   .pm-tag.t-offline  { color: var(--dim); opacity: 0.6; }
   .pm-tag.t-int      { color: var(--yellow); }   /* interrupted KG (was running, now isn't) */
   .pm-tag.t-pool     { color: #d24c4c; }          /* bev_pool_park / canary auto_park */
+  .pm-tag.t-v2up     { color: #d2a8ff; }          /* cache-only peer running v2 upgrade units */
+  .pm-v2 { flex-shrink:0; font-size:8px; font-weight:700; padding:0 3px; border-radius:2px;
+           color:#d2a8ff; border:1px solid #d2a8ff; opacity:0.85; margin-right:3px; line-height:1.3; }
   /* Default: single-line compact strip; details collapsed.
      Desktop packs multiple peers per row via auto-fill; mobile is 1-up.
      Min strip width chosen so KG name + step + elapsed are readable. */
@@ -650,6 +653,13 @@
     <div class="bar" id="cZenBar" style="display:none"><div class="bar-fill" id="cZenBarFill" style="width:0;background:var(--cyan)"></div></div>
     <div class="det" id="cZenBarLbl" style="display:none;color:var(--cyan)"></div>
     <div class="det" id="cZenDet">—</div>
+  </div>
+  <div class="card" id="cV2" title="segv2 (LightGBM) rollout: fresh KGs are written as v2; v1-complete KGs are re-classified from their own full GPKG by cache-only peers (upgrade units) and ingested into the primary's kg_v2_store. Click to filter the log to v2 lines.">
+    <div class="lb">v2 Rollout <span id="cV2Tag" style="font-weight:400;color:var(--dim)"></span></div>
+    <div class="val" id="cV2Val">—</div>
+    <div class="bar"><div class="bar-fill" id="cV2Bar" style="width:0;background:#d2a8ff"></div></div>
+    <div class="det" id="cV2Det">—</div>
+    <div class="det" id="cV2Det2" style="opacity:0.8;margin-top:2px"></div>
   </div>
   <div class="card" id="cBwRecov">
     <div class="lb">BW Recovery</div>
@@ -1614,6 +1624,71 @@ function updateCards(d) {
 // gunicorn workers and post-handover directors expose identically via
 // /api/v1/director/status (the same endpoint used by the rest of the
 // dashboard), so it is handover-safe with no backend changes.
+// ── v2 rollout card ─────────────────────────────────────────────
+// Mirrors the `v2:` line in /process.txt (director/status.v2, built by
+// v2_ingest.status()). upgraded = codes with _json_v2 on Zenodo (fresh v2
+// + upgrades); store = primary's kg_v2_store ingest; dispatch = upgrade
+// units the director currently has assigned to cache-only peers.
+function renderV2(v) {
+  const card = document.getElementById('cV2');
+  if (!card) return;
+  const val = document.getElementById('cV2Val');
+  const bar = document.getElementById('cV2Bar');
+  const det = document.getElementById('cV2Det');
+  const det2 = document.getElementById('cV2Det2');
+  const tag = document.getElementById('cV2Tag');
+  if (!v || typeof v !== 'object' || v.error) {
+    val.textContent = '—';
+    det.textContent = v && v.error ? 'unavailable: ' + v.error : 'no v2 telemetry (director offline?)';
+    det2.textContent = '';
+    bar.style.width = '0';
+    return;
+  }
+  const total = v.total || 8440;
+  const up = v.upgraded_parents != null ? v.upgraded_parents : (v.upgraded || 0);
+  const pct = total ? (up / total * 100) : 0;
+  val.innerHTML = fmt(up) + ' <span style="font-size:12px;color:var(--dim)">/ ' + fmt(total) + ' · ' + pct.toFixed(pct < 10 ? 2 : 1) + '%</span>';
+  bar.style.width = Math.min(100, pct).toFixed(2) + '%';
+  const rate = +(v.rate_per_h || 0);
+  const eta = v.eta_days;
+  let etaTxt = '';
+  if (eta != null && isFinite(eta)) etaTxt = eta > 365 ? (eta/365).toFixed(1) + 'y' : eta.toFixed(0) + 'd';
+  const parts = [];
+  parts.push('+' + fmt(v.upgraded_24h||0) + '/24h @' + rate.toFixed(2) + '/h' + (etaTxt ? ' · eta ' + etaTxt : ''));
+  parts.push('fresh v2: ' + fmt(v.fresh_v2||0));
+  const vf = v.verify_fail || 0, pend = v.pending || 0;
+  parts.push('<span style="color:' + (vf ? 'var(--yellow)' : 'inherit') + '">verify_fail ' + vf + '</span>'
+             + (pend ? ' · pending ' + pend : ''));
+  det.innerHTML = parts.join(' · ');
+  const st = v.store || {};
+  const dsp = v.dispatch || {};
+  const nAssigned = (dsp.assigned || []).length;
+  const kl = v.kg_log || {};
+  const d2 = [];
+  d2.push('store ' + fmt(st.codes||0) + ' codes/' + fmtB(st.db_bytes||st.bytes||0)
+          + (st.v1_bytes_freed ? ' · freed ' + fmtB(st.v1_bytes_freed) : '')
+          + (st.ingested_24h ? ' · ingested ' + st.ingested_24h + '/24h' : ''));
+  if (v.json_files != null) d2.push('v1 json files ' + fmt(v.json_files) + (v.json_bytes ? ' (' + fmtB(v.json_bytes) + ')' : ''));
+  if (dsp.max_peers != null) {
+    const fs = dsp.fleet_strikes || {};
+    d2.push('dispatch <b>' + nAssigned + '</b>/' + fmt(dsp.candidates_total||0) + ' cand (cap ' + dsp.max_peers + ')'
+            + (fs.codes ? ' · strikes ' + fs.codes + (fs.struck_out ? ' (' + fs.struck_out + ' out)' : '') : ''));
+  }
+  if (kl.rows) d2.push('kg_log ' + fmt(kl.codes||0) + ' codes');
+  det2.innerHTML = d2.join(' · ');
+  const stLast = st.last_ingested_at ? new Date(st.last_ingested_at) : null;
+  tag.textContent = stLast ? '· last ingest ' + _fmtElapsedShort(stLast.toISOString()) + ' ago' : '';
+  card.style.cursor = 'pointer';
+  card.onclick = () => {
+    const inp = document.getElementById('logSearch');
+    if (!inp) return;
+    inp.value = inp.value.trim().toLowerCase() === 'v2' ? '' : 'v2';
+    inp.dispatchEvent(new Event('input', {bubbles: true}));
+    const la = document.getElementById('logArea');
+    if (la && inp.value) la.scrollIntoView({behavior: 'smooth', block: 'start'});
+  };
+}
+
 function renderBwRecovery() {
   const dd = (typeof _directorData !== 'undefined' && _directorData) ? _directorData : null;
   const valEl = document.getElementById('cBwRecovVal');
@@ -1853,8 +1928,11 @@ function updateKgCard(d, peerMeta) {
   if (peerMeta && peerMeta.id) {
     peerTag.style.display = '';
     let label = peerMeta.id;
+    const _ck = (d && d.current_kg) || {};
     if (peerMeta.is_active) label += ' · frontier';
+    else if (_ck.v2_upgrade) label += ' · v2 upgrade';
     else if (peerMeta.cache_only) label += ' · cache-only';
+    if (_ck.model_version) label += ' · ' + _ck.model_version;
     peerTag.textContent = label;
     let tip = peerMeta.id;
     if (peerMeta.url) tip += '\n' + peerMeta.url;
@@ -2689,14 +2767,30 @@ function renderTileOverlays(d) {
 let lastManFetch = 0;
 let _lastManData = null;
 
-async function fetchManifestData() {
-  // Fetch manifest JSON and cache it; update summary always
-  if (Date.now() - lastManFetch < 10000) return _lastManData;
+let _lastManSummary = null;
+let _lastManSummaryFetch = 0;
+async function fetchManifestData(full) {
+  // Full manifest (~5 MB raw, ~10.5k entries each with a tokenised
+  // download_url) is only pulled while the Zenodo panel is open, at
+  // most every 30 s (browser revalidates via ETag → 304 when unchanged).
+  // The always-on badge uses ?summary=1 (~200 B) every 60 s.
+  if (!full) {
+    if (Date.now() - _lastManSummaryFetch < 60000) return _lastManSummary;
+    _lastManSummaryFetch = Date.now();
+    try {
+      const r = await fetch('/api/v1/processing/manifest?summary=1');
+      if (r.ok) _lastManSummary = await r.json();
+    } catch(e) { console.error('manifest summary:', e); }
+    return _lastManSummary;
+  }
+  if (Date.now() - lastManFetch < 30000) return _lastManData;
   lastManFetch = Date.now();
   try {
     const r = await fetch('/api/v1/processing/manifest');
     if (!r.ok) return _lastManData;
     _lastManData = await r.json();
+    _lastManSummary = {count: _lastManData.count, total_size_bytes: _lastManData.total_size_bytes};
+    _lastManSummaryFetch = Date.now();
   } catch(e) { console.error('manifest:', e); }
   return _lastManData;
 }
@@ -2704,10 +2798,13 @@ async function fetchManifestData() {
 let _zenAutoOpened = false;
 async function fetchManifestSummary() {
   // Called on every poll — updates summary badge regardless of panel state
-  const d = await fetchManifestData();
+  const d = await fetchManifestData(false);
   if (!d) return;
+  const bp = d.by_product || {};
+  const v2n = (bp.json_v2 || 0);
   document.getElementById('zenSummary').textContent =
-    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
+    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0)
+    + (v2n ? ' · v2: ' + fmt(v2n) + ' json + ' + fmt(bp.light_gpkg_v2||0) + ' light' : '');
   // Auto-expand once when entries first appear
   if (!_zenAutoOpened && (d.count||0) > 0) {
     _zenAutoOpened = true;
@@ -2883,7 +2980,7 @@ function _zenManifestRow(e) {
 
 async function fetchManifest() {
   // Called when panel is open — updates summary + full table
-  const d = await fetchManifestData();
+  const d = await fetchManifestData(true);
   if (!d) return;
   document.getElementById('zenSummary').textContent =
     fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
@@ -4549,11 +4646,15 @@ let _lastStatus = null;  // last /api/v1/processing/status response
 
 async function fetchDirectorStatus() {
   try {
-    const r = await _fetchTimeout('/api/v1/director/status', {}, 8000);
+    // ?slim=1: drops ip_pools_history (1 MB) + per-credential hourly
+    // buckets (~800 KB) that this page never renders at full
+    // resolution. ~80 KB raw / ~15 KB gzipped instead of 1.6 MB.
+    const r = await _fetchTimeout('/api/v1/director/status?slim=1', {}, 8000);
     if (!r.ok) return;
     _directorData = await r.json();
     try { localStorage.setItem('srtm_last_director', JSON.stringify(_directorData)); } catch(_) {}
     renderDirector(_directorData);
+    try { renderV2(_directorData.v2 || null); } catch(e) { console.error('v2:', e); }
     renderCapacityHistory();
     renderFleetHistory();
     try { renderBwRecovery(); } catch(e) { console.error('bwRecov:', e); }
@@ -4962,6 +5063,9 @@ function _peerRoleTag(p, ctx) {
   // check we'd mislabel that peer as PRIMARY (split-brain look-alike).
   if (p.id === 'primary') return {cls: 't-primary', txt: 'PRIMARY'};
   if (ctx.isActive)  return {cls: 't-frontier', txt: 'FRONTIER'};
+  // Cache-only peer currently on a v2 upgrade unit (re-classifying a
+  // v1-complete KG from its own full GPKG; no BEV / openEO).
+  if (ctx.isRunning && p.current_kg_v2_upgrade) return {cls: 't-v2up', txt: 'V2-UP'};
   if (ctx.isRunning && p.cache_only_run) return {cls: 't-cache', txt: 'CACHE'};
   if (ctx.isRunning) return {cls: 't-frontier', txt: 'FRONTIER'};
   // Parked-by-pool peers are visually distinct from clean STOPPED/IDLE.
@@ -5107,6 +5211,16 @@ function _peerMobileBlock(p, ctx) {
     h += '<span class="pm-ver' + (_stale ? ' stale' : '') + '"'
        + ' title="git ' + esc(_commit) + (_stale ? ' (stale vs ' + esc(_localCommit) + ')' : '') + '">'
        + esc(_commit) + '</span>';
+  }
+  // Model badge: v2 = segv2 LightGBM classifier active on this peer
+  // (fresh KGs written as v2; eligible for upgrade units). Peers on
+  // the v2 commit *without* the badge are missing lightgbm.
+  if (p.model_version === 'v2') {
+    h += '<span class="pm-v2" title="segv2 classifier active'
+       + (p.v2_upgrade_mode ? ' · upgrade mode (' + (p.v2_upgraded||0) + ' upgraded this run)' : '')
+       + '">v2' + (p.v2_upgrade_mode ? '↑' : '') + '</span>';
+  } else if (p.model_version === 'v1' && ctx.isRunning) {
+    h += '<span class="pm-v2" style="color:var(--yellow);border-color:var(--yellow)" title="segv2 unavailable on this peer (lightgbm / model missing) — running legacy v1 classifier">v1</span>';
   }
   // The progress bar (with role tag + KG info baked in)
   h += '<div class="' + barCls + '" title="' + esc(tip) + '">';
@@ -5634,7 +5748,10 @@ function renderUsageCell(u) {
     const t = (b.s||0) + (b.e||0) + (b.r||0);
     if (t > max) max = t;
   }
-  const SVG_W = Math.max(1, buckets.length || 168);
+  // Slim director status ships only the non-zero buckets plus
+  // bucket_h0/bucket_n; position bars by hour offset in that case.
+  const h0 = u.bucket_h0 || null;
+  const SVG_W = Math.max(1, u.bucket_n || buckets.length || 168);
   const SVG_H = 18;
   let svgRects = '';
   let __i = -1;
@@ -5650,14 +5767,14 @@ function renderUsageCell(u) {
     const rH = Math.round((rc / t) * h);
     const eH = Math.max(0, h - sH - rH);
     let y = SVG_H - h;
-    const x = __i;
+    const x = (h0 && b.h) ? Math.max(0, Math.min(SVG_W - 1, b.h - h0)) : __i;
     const titleEl = '<title>' + tip.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</title>';
     if (eH > 0) { svgRects += '<rect x="' + x + '" y="' + y + '" width="1" height="' + eH + '" fill="#f44">' + titleEl + '</rect>'; y += eH; }
     if (rH > 0) { svgRects += '<rect x="' + x + '" y="' + y + '" width="1" height="' + rH + '" fill="#cc0">' + titleEl + '</rect>'; y += rH; }
     if (sH > 0) { svgRects += '<rect x="' + x + '" y="' + y + '" width="1" height="' + sH + '" fill="#3c5">' + titleEl + '</rect>'; }
   }
   const bars = '<svg viewBox="0 0 ' + SVG_W + ' ' + SVG_H + '" preserveAspectRatio="none" style="width:100%;height:18px;display:block;min-width:40px;background:rgba(255,255,255,0.03)">' + svgRects + '</svg>';
-  if (total === 0 && buckets.length === 0) {
+  if (total === 0 && buckets.length === 0 && !u.bucket_n) {
     return '<span style="color:var(--dim)">no traffic</span>';
   }
   // Last activity timestamp
@@ -6097,6 +6214,7 @@ try {
   if (_seedDir) {
     _directorData = _seedDir;
     try { renderDirector(_seedDir); } catch(_) {}
+    try { renderV2(_seedDir.v2 || null); } catch(_) {}
   }
 } catch(_) {}
 // Fire status + director + prio queue together; each is independent

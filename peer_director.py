@@ -3938,6 +3938,12 @@ class PeerDirector:
                 'current_kg_step': (ps.get('current_kg') or {}).get('step'),
                 'current_kg_tile': (ps.get('current_kg') or {}).get('current_tile'),
                 'current_kg_n_tiles': (ps.get('current_kg') or {}).get('n_tiles'),
+                # v2 rollout telemetry (progress.json fields written by
+                # austria_processor main(); dashboard peer badges).
+                'current_kg_v2_upgrade': bool((ps.get('current_kg') or {}).get('v2_upgrade')),
+                'model_version': ps.get('model_version'),
+                'v2_upgrade_mode': bool(ps.get('v2_upgrade')),
+                'v2_upgraded': int(ps.get('v2_upgraded') or 0),
                 'completed': ps.get('completed', 0),
                 'bandwidth': bw,
                 'online': proc_status != 'unreachable',

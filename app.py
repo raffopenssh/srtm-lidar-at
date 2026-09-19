@@ -6549,6 +6549,50 @@ def director_throttle():
     return jsonify({'status': 'propagated', 'throttle': enabled, 'peers': results})
 
 
+@app.route('/api/v1/director/v2/priority', methods=['GET', 'POST', 'DELETE'])
+def director_v2_priority():
+    """Operator-pinned v2 upgrade priority list.
+
+    GET → ``{priority:[codes]}``. POST ``{kgs:[codes], replace?:bool}``
+    (or ``?kg=<code|name>``) pins product codes (parent ``63330`` or block
+    ``49006-north``) so the director hands them to cache-only peers as
+    upgrade units *before* the smallest-first candidate ranking — and
+    regardless of the cache-ready-low gate. KG names are resolved via
+    ``kg_list.json``. Codes auto-drop once ``_json_v2`` is committed.
+    DELETE ``{kgs:[…]}`` unpins."""
+    d = pd.get_director()
+    if request.method == 'GET':
+        return jsonify({'priority': d.v2_priority_codes()})
+    body = request.get_json(silent=True) or {}
+    raw = list(body.get('kgs') or [])
+    if request.args.get('kg'):
+        raw.append(request.args['kg'])
+    if not raw:
+        return jsonify({'error': 'kgs required'}), 400
+    codes, unknown = [], []
+    kg_list = None
+    for r in raw:
+        r = str(r).strip()
+        if r and (r.split('-', 1)[0].isdigit()):
+            codes.append(r)
+            continue
+        if kg_list is None:
+            try:
+                kg_list = json.loads(Path('data/austria_processor/kg_list.json').read_text())
+            except Exception:
+                kg_list = []
+        hits = [k['kg_code'] for k in kg_list
+                if str(k.get('kg_name', '')).lower() == r.lower()]
+        if hits:
+            codes.extend(hits)
+        else:
+            unknown.append(r)
+    if request.method == 'DELETE':
+        return jsonify({'priority': d.remove_v2_priority(codes), 'unknown': unknown})
+    cur = d.set_v2_priority(codes, replace=bool(body.get('replace')))
+    return jsonify({'priority': cur, 'added': codes, 'unknown': unknown})
+
+
 @app.route('/api/v1/director/peer_status', methods=['POST'])
 def director_peer_status():
     """Peer pushes its own /processing/status payload here.

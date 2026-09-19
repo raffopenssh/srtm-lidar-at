@@ -4943,6 +4943,7 @@ class PeerDirector:
             cc = self.state.get('_v2_cand_cache') or {}
             out['dispatch'] = {
                 'assigned': list(self.state.get('v2_upgrade_assigned') or []),
+                'priority': list(self.state.get('v2_priority') or []),
                 'candidates_total': cc.get('total', 0),
                 'fill_below_ready': V2_UPGRADE_FILL_BELOW_READY,
                 'max_peers': MAX_V2_UPGRADE_PEERS,
@@ -9649,7 +9650,8 @@ class PeerDirector:
         if not cfg.get('v2_upgrade', True):
             return []
         if len(whitelist) >= int(cfg.get('v2_upgrade_fill_below_ready',
-                                         V2_UPGRADE_FILL_BELOW_READY)):
+                                         V2_UPGRADE_FILL_BELOW_READY)) \
+                and not self.state.get('v2_priority'):
             return []
         try:
             zen_rate = float((self._capacity_components.get('rates') or {}).get('zenodo') or 0.0)
@@ -9662,7 +9664,60 @@ class PeerDirector:
         cap = int(cfg.get('max_v2_upgrade_peers', MAX_V2_UPGRADE_PEERS))
         cands = self._compute_v2_upgrade_candidates()
         wl = set(whitelist)
-        return [c for c in cands if c not in wl][:max(0, cap)]
+        pri = [c for c in self.v2_priority_codes() if c not in wl]
+        rest = [c for c in cands if c not in wl and c not in set(pri)]
+        return (pri + rest)[:max(0, cap)]
+
+    # --- Operator-pinned v2 upgrade priority (``POST /api/v1/director/v2/priority``)
+    def v2_priority_codes(self) -> list[str]:
+        """Operator-pinned product codes to upgrade *first*. Pruned
+        automatically once ``_json_v2`` lands (or the code is no longer
+        v1-complete). Persisted in ``director_state.json['v2_priority']``."""
+        codes = list(self.state.get('v2_priority') or [])
+        if not codes:
+            return []
+        try:
+            mf_path = DATA_DIR / 'zenodo_manifest.json'
+            raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+            ent = raw.get('entries', raw) or {}
+        except Exception:
+            return codes
+        keep = []
+        for c in codes:
+            if f'{c}_json_v2' in ent:
+                log.info('v2 priority: %s upgraded — dropping from priority list', c)
+                continue
+            g = ent.get(f'{c}_full_gpkg')
+            if f'{c}_json' not in ent or not isinstance(g, dict) \
+                    or int(g.get('size') or 0) <= 0:
+                log.warning('v2 priority: %s not v1-complete — dropping', c)
+                continue
+            keep.append(c)
+        if keep != codes:
+            with self._lock:
+                self.state['v2_priority'] = keep
+                save_director_state(self.state)
+        return keep
+
+    def set_v2_priority(self, codes: list, replace: bool = False) -> list[str]:
+        cur = [] if replace else list(self.state.get('v2_priority') or [])
+        for c in codes:
+            c = str(c).strip()
+            if c and c not in cur:
+                cur.append(c)
+        with self._lock:
+            self.state['v2_priority'] = cur
+            self.state['_v2_cand_cache'] = {}   # force refill next tick
+            save_director_state(self.state)
+        return cur
+
+    def remove_v2_priority(self, codes: list) -> list[str]:
+        drop = {str(c).strip() for c in codes}
+        cur = [c for c in (self.state.get('v2_priority') or []) if c not in drop]
+        with self._lock:
+            self.state['v2_priority'] = cur
+            save_director_state(self.state)
+        return cur
 
     def _compute_cache_ready_kgs(self, max_kgs: int = 200) -> list[str]:
         """Return KG codes that are fully present in the local+Zenodo cache.
@@ -11573,6 +11628,11 @@ class PeerDirector:
         if not all_workers:
             return
         weights = _kg_weights(whitelist)
+        # Operator-pinned v2 priority codes sort first (and hence land at
+        # the head of their peer's queue).
+        for _c in (self.state.get('v2_priority') or []):
+            if _c in weights:
+                weights[_c] = weights[_c] + 1e6
         capacities = {pid: _peer_cpu_capacity(pid) for pid in all_workers}
         load: dict[str, float] = {pid: 0.0 for pid in all_workers}
         slices: dict[str, list] = {pid: [] for pid in all_workers}

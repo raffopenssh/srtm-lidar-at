@@ -8847,7 +8847,7 @@ def admin_diskstat():
         deep = {}
         for root in roots:
             try:
-                res = _sp.run(['du', '-xk', '--max-depth=1', root],
+                res = _sp.run(['du', '-xak', '--max-depth=1', root],
                               capture_output=True, text=True, timeout=90)
                 rows = []
                 for ln in res.stdout.splitlines():

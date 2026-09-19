@@ -8831,6 +8831,38 @@ def admin_diskstat():
         except Exception as e:
             sizes[k] = f'err:{e}'
     out['sizes_mb'] = sizes
+    # ?deep=1 — `du` breakdown of the usual suspects so a remote operator
+    # can find the ~18 GB that the fixed `paths` list above doesn't cover
+    # (venv, /tmp scratch, journal, stray data/ subdirs). Bounded by a
+    # 90 s timeout per root; entries below `min_mb` (default 50) are
+    # dropped to keep the payload small.
+    if request.args.get('deep') in ('1', 'true', 'yes'):
+        import subprocess as _sp
+        try:
+            min_mb = float(request.args.get('min_mb') or 50)
+        except ValueError:
+            min_mb = 50.0
+        roots = ['/', '/home/exedev', '/home/exedev/srtm-lidar', '/tmp', '/var',
+                 '/var/log', 'data', 'data/austria_processor']
+        deep = {}
+        for root in roots:
+            try:
+                res = _sp.run(['du', '-xk', '--max-depth=1', root],
+                              capture_output=True, text=True, timeout=90)
+                rows = []
+                for ln in res.stdout.splitlines():
+                    try:
+                        kb, p = ln.split('\t', 1)
+                        mb = int(kb) / 1024
+                    except ValueError:
+                        continue
+                    if mb >= min_mb:
+                        rows.append([round(mb, 1), p])
+                rows.sort(reverse=True)
+                deep[root] = rows[:25]
+            except Exception as e:
+                deep[root] = f'err:{e}'
+        out['deep_mb'] = deep
     try:
         out['role'] = _role_data_eviction_tick()
     except Exception as e:

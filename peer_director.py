@@ -10659,6 +10659,11 @@ class PeerDirector:
                          'update pending (waiting for git pull + srv '
                          'restart on peer)', pid)
                 continue
+            if self._peer_is_stale_idle(pid, cand.get('status')
+                                        or get_peer_status(peer.get('url'))):
+                log.info('Parallel frontier: skipping %s — idle on a stale '
+                         'commit, letting the hard update land first', pid)
+                continue
             log.info('Parallel frontier: starting %s with creds=%s strips=%s%s',
                      pid, creds, strips_for,
                      (' (excluding ' + ','.join(sorted(par_excl)) + ')')
@@ -10741,7 +10746,11 @@ class PeerDirector:
     # an immediate update once the peer has been idle for >10 min. After
     # a second failed retry, surface the peer as needing a manual update
     # in the dashboard.
-    STALE_UPDATE_GRACE_S = 600          # 10 min idle before first auto-retry
+    # First hard update fires this soon after a peer is seen idle+stale.
+    # Was 600 s: with start paths now refusing to respawn idle stale peers
+    # (``_peer_is_stale_idle``) a long grace only idles the fleet. 90 s
+    # still covers a peer whose own git pull + srv restart is in flight.
+    STALE_UPDATE_GRACE_S = 90
     STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
     STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
     # Hard ceiling on how long a "manual update needed" verdict
@@ -10800,6 +10809,30 @@ class PeerDirector:
         # ``_orchestrate_stale_peer_updates`` for re-firing graceful
         # updates.
         return (time.time() - ts) < max(self.STALE_UPDATE_RETRY_GAP_S, 1800.0)
+
+    def _peer_is_stale_idle(self, pid: str, ps: dict | None) -> bool:
+        """True iff *pid* is reachable, idle and on a commit behind ours.
+
+        Gate for every *start* path (cache-only, parallel frontier). An
+        idle stale peer is about to receive a hard update from
+        ``_orchestrate_stale_peer_updates`` (within
+        ``STALE_UPDATE_GRACE_S``); starting it on the old commit first
+        turns a 60 s hard restart into a graceful restart at the *next
+        KG boundary* — hours later — and the whole fleet lags the target
+        by one KG per peer (Sep 2026: 6 idle peers were re-started on
+        75ff5b2 every tick while the rollout waited for them to go idle).
+        """
+        if not pid or not ps:
+            return False
+        st = ps.get('state', 'unknown')
+        if st not in ('stopped', 'idle', 'complete', 'paused'):
+            return False
+        commit = (ps.get('git_commit') or '').strip()
+        if not commit or _LOCAL_GIT_COMMIT == 'unknown':
+            return False
+        if commit == _LOCAL_GIT_COMMIT or _peer_commit_is_ahead_or_equal(commit):
+            return False
+        return True
 
     def _orchestrate_stale_peer_updates(self, statuses: dict):
         """Re-trigger update on peers stuck on an old commit while idle.
@@ -11220,7 +11253,7 @@ class PeerDirector:
                 running_cache_only.append(pid)
             candidates.append({'peer': p, 'role': role, 'state': st,
                                'is_cache_only_run': is_cache_only_run,
-                               'stale': stale})
+                               'stale': stale, 'status': ps})
 
         # If we're over the cap (e.g. capacity factor dropped, or peers
         # were started before the cap shrank), gracefully stop the
@@ -11438,6 +11471,7 @@ class PeerDirector:
         # the stale-peer orchestrator.
         to_start = []
         _skipped_pending: list[str] = []
+        _skipped_stale: list[str] = []
         for c in idle_cache_only + idle_frontier:
             if len(to_start) >= max_add:
                 break
@@ -11445,11 +11479,18 @@ class PeerDirector:
             if pid and self._has_pending_graceful_update(pid):
                 _skipped_pending.append(pid)
                 continue
+            if pid and self._peer_is_stale_idle(pid, c.get('status')):
+                _skipped_stale.append(pid)
+                continue
             to_start.append(c['peer'])
         if _skipped_pending:
             log.info('cache-only: skipping %d peer(s) with pending graceful '
                      'update (waiting for git pull + srv restart): %s',
                      len(_skipped_pending), ','.join(_skipped_pending))
+        if _skipped_stale:
+            log.info('cache-only: skipping %d idle stale peer(s) — letting the '
+                     'hard update land first: %s',
+                     len(_skipped_stale), ','.join(_skipped_stale))
 
         # --- Build claimed-KG set so no two cache-only peers (and not
         # the frontier) target the same KG.  We pull each peer's current
@@ -12941,6 +12982,18 @@ class PeerDirector:
             # steal pool is a poor failover target; weight it down.
             score = (_peer_noise_score(p['id'], self.state)
                      + ((1.0 / _peer_cpu_capacity(p['id'])) - 1.0))
+            # The elected shadow is role-parked (2 h rolling) — electing
+            # a peer that is mid-KG (or the frontier we just handed
+            # credentials to) throws that work away. Prefer idle peers;
+            # a busy one is only chosen when nothing idle qualifies
+            # (Sep 2026: at202 was started as parallel frontier and
+            # elected shadow 30 s later, then stopped as "non-active").
+            busy = (ps.get('state') in ('running', 'processing')
+                    or p['id'] == self.state.get('active_peer')
+                    or p['id'] in (self.state.get('parallel_frontiers_active') or [])
+                    or p['id'] in (self.state.get('frontier_cred_plan') or {}))
+            if busy:
+                score += 5.0
             candidates.append((score, p))
         if not candidates:
             # Log only when set changes to avoid spam.

@@ -1686,6 +1686,20 @@ def _peer_status_push_loop():
                 # failover.
                 _host = _ht.host_profile()
                 _sysd = dict(status.get('system') or {})
+                # Disk is only written into progress.json while the
+                # processor runs, so an idle peer would push the value
+                # frozen at its last KG (at123 showed 3.0 GB "disk
+                # pressure" for days while actually at 14.9 GB). Refresh
+                # it live on every push; statvfs is ~free.
+                try:
+                    _st = os.statvfs('/')
+                    _fg = (_st.f_bavail * _st.f_frsize) / (1024 ** 3)
+                    _tg = (_st.f_blocks * _st.f_frsize) / (1024 ** 3)
+                    _sysd['disk_free_gb'] = round(_fg, 1)
+                    if _tg:
+                        _sysd['disk_used_pct'] = round(100 * (1 - _fg / _tg), 1)
+                except Exception:
+                    pass
                 if _snap:
                     _sysd.setdefault('cpu_user', _snap['user'])
                     _sysd.setdefault('cpu_system', _snap['system'])
@@ -1750,7 +1764,7 @@ def _peer_status_push_loop():
             # seconds via current_kg.step_detail).
             _state_now = (status.get('state') or '').strip().lower()
             _idle_states = (
-                'idle', 'stopped', 'parked',
+                'idle', 'stopped', 'parked', 'complete',
                 'paused_zenodo', 'paused_copernicus', 'paused_disk',
             )
             _now = time.time()

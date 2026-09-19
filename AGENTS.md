@@ -835,6 +835,16 @@ python3 -c "import json,app; me=json.load(open('data/austria_processor/zenodo_ma
   introducing new logical groupings.
 - **Keep this file short.** New deep content → new file in `docs/` and link
   it here. Aim: AGENTS.md fits in a single screen of indexed content.
+- **Dashboard bandwidth budget** (`static/process.html`): the page polls
+  every 5–15 s from possibly several open tabs, so every polled endpoint
+  must stay small. `app._compress_and_etag` gzips JSON ≥1 KiB and answers
+  `If-None-Match` with 304, but *don't rely on it* — use the slim views:
+  `director/status?slim=1` (no `ip_pools_history`, sparse credential
+  buckets), `director/proxy/status` (no embedded `_director` unless
+  `?director=1`), `processing/manifest?summary=1` (full 5 MB body only
+  while the Zenodo panel is open). Sep 2026 baseline: ~15 MB/h per tab
+  (was ~3 GB/h). Before adding a new poll, measure with
+  `curl -s -H 'Accept-Encoding: gzip' -o /dev/null -w '%{size_download}' localhost:8000/<ep>`.
 - **Restart discipline**: changes to `austria_processor.py` need a processor
   restart at the next KG boundary (or kill it). Changes to `app.py` /
   `peer_director.py` need `sudo systemctl restart srv` (the director thread

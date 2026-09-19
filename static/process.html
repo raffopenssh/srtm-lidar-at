@@ -2982,9 +2982,12 @@ async function fetchManifest() {
   // Called when panel is open — updates summary + full table
   const d = await fetchManifestData(true);
   if (!d) return;
-  document.getElementById('zenSummary').textContent =
-    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0);
   const entries = d.entries || {};
+  let _nJ2 = 0, _nL2 = 0;
+  for (const k in entries) { if (k.endsWith('_json_v2')) _nJ2++; else if (k.endsWith('_light_gpkg_v2')) _nL2++; }
+  document.getElementById('zenSummary').textContent =
+    fmt(d.count||0) + ' entries · ' + fmtB(d.total_size_bytes||0)
+    + (_nJ2 ? ' · v2: ' + fmt(_nJ2) + ' json + ' + fmt(_nL2) + ' light' : '');
   // Hide error placeholders (depo_id=0, empty filename) from the table —
   // they're internal retry markers, not actual Zenodo files.
   const keys = Object.keys(entries)

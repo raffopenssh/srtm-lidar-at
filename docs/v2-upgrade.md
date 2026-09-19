@@ -82,6 +82,15 @@ v2: upgraded=N/8440 (p%) +N/24h @r/h eta=Dd · fresh_v2=N · verify_fail=N pendi
 Structured: `/api/v1/director/status.v2`, `/api/v1/model/v2?rollout=1`. Grep the merged log
 for `v2up:` (peers), `v2verify` (gate verdicts), `v2_ingest` (primary).
 
+`/process.html` mirrors this as the **v2 Rollout** card (`renderV2`, fed by
+`director/status?slim=1 → .v2`; click the card to filter the Live Log to `v2`). Per-peer:
+progress.json carries `model_version` / `v2_upgrade` / `v2_upgraded` and `current_kg.v2_upgrade`
+(written in `austria_processor.main()` / `set_current_kg`); `peer_director.get_status` forwards
+them as `model_version`, `v2_upgrade_mode`, `v2_upgraded`, `current_kg_v2_upgrade`. The peer strip
+shows a `v2` badge (`v2↑` = upgrade mode; yellow `v1` = running peer without lightgbm) and a
+`V2-UP` role tag while a peer is on an upgrade unit. The Zenodo badge appends `v2: N json + M light`
+(from `/processing/manifest?summary=1 → by_product`).
+
 ## Ops
 
 ```bash

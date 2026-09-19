@@ -7725,7 +7725,15 @@ class PeerDirector:
                         self.state['active_peer'] = None
                         active_id = None
                 # ------------------------------------------------------
-                if active_id and proc_state in ('idle', 'stopped'):
+                # 'complete' is the processor's clean terminal state when
+                # it exhausts its pending list (every other idle gate in
+                # this file already treats it as idle). It was missing
+                # here, so an active frontier that ran out of work — or
+                # exited via the disk-pressure pause path — sat as the
+                # designated active peer with its credentials held and
+                # was never restarted (at123: 'complete' since 2026-09-14,
+                # 5 days of the primary frontier slot idle).
+                if active_id and proc_state in ('idle', 'stopped', 'complete'):
                     # Processor stopped (finished a KG or was stopped externally)
                     # Check if it should continue
                     bw = state_copy.get('peer_bandwidth', {}).get(active_id, {})

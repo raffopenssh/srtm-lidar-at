@@ -12640,14 +12640,22 @@ class PeerDirector:
             if not r.ok:
                 return
             d = r.json() or {}
+            # Fleet roster for the peer's peer_urls.txt: every enabled
+            # peer except the receiver itself (self-claims would block
+            # its own work).
+            want_urls = sorted({p['url'].rstrip('/') for p in peers
+                                if p.get('enabled', True)
+                                and p['url'].rstrip('/') != peer['url'].rstrip('/')})
+            have_urls = sorted(str(u).rstrip('/') for u in (d.get('peer_urls') or []))
             needs = (not d.get('director_url')) or (d.get('director_url') != my_url) \
-                or (d.get('id') != peer['id'])
+                or (d.get('id') != peer['id']) \
+                or ('peer_urls' in d and have_urls != want_urls)
             if not needs:
                 return
             requests.post(
                 peer['url'].rstrip('/') + '/api/v1/director/identity',
                 json={'id': peer['id'], 'url': peer['url'],
-                      'director_url': my_url},
+                      'director_url': my_url, 'peer_urls': want_urls},
                 headers=_admin_headers(), timeout=PEER_TIMEOUT_CONTROL,
             )
             log.info('director identity pushed to %s', peer['id'])

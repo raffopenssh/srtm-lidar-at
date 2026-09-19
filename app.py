@@ -9324,6 +9324,7 @@ def director_identity():
     import director_ha as dha
     if request.method == 'GET':
         return jsonify({**dha.load_self(),
+                        'peer_urls': sorted(_get_peer_urls() or []),
                         'is_director': dha.IS_DIRECTOR_FLAG.exists(),
                         'stepped_down': dha.STEPPED_DOWN_FLAG.exists(),
                         'watchdog': dha.watchdog_state()})
@@ -9376,6 +9377,27 @@ def director_identity():
                 _ht.mark_host_profile_unsent()
         except Exception:
             pass
+    # Fleet roster push: the director ships the current peer URL list so
+    # this peer's ``peer_urls.txt`` (consumed by the processor's
+    # ``--peers`` claim check and the data-sync thread) doesn't rot.
+    # Stale lists (decommissioned at10/at13/at14 on at11, Sep 2026) cost a
+    # 10 s timeout per dead URL on every claim poll.
+    pu = body.get('peer_urls')
+    if isinstance(pu, list):
+        urls = sorted({str(u).strip().rstrip('/') for u in pu
+                       if isinstance(u, str) and u.strip().startswith('http')})
+        try:
+            pf = Path('data/austria_processor/peer_urls.txt')
+            cur_urls = sorted(_get_peer_urls() or [])
+            if urls != cur_urls:
+                pf.parent.mkdir(parents=True, exist_ok=True)
+                tmp = pf.with_suffix('.tmp')
+                tmp.write_text('\n'.join(urls) + ('\n' if urls else ''))
+                tmp.replace(pf)
+                log.info('director_identity: peer_urls.txt updated (%d → %d urls)',
+                         len(cur_urls), len(urls))
+        except Exception as e:
+            log.warning('director_identity: peer_urls.txt write failed: %s', e)
     out = dict(cur)
     if rejected:
         out['_rejected'] = rejected

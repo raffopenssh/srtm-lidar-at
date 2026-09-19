@@ -11540,7 +11540,18 @@ def main():
 
         # --- Peer coordination: skip if a peer has claimed this KG ---
         if peer_urls:
-            peer_claimed = _get_peer_claimed_kgs(peer_urls)
+            if kg.get("_v2_upgrade"):
+                # A v2 upgrade unit is *by definition* v1-complete, so every
+                # reachable peer advertises it in ``completed`` — the flat
+                # claimed-set would block every upgrade forever (Sep 2026:
+                # fleet doubled, new peers reachable → every cache-only
+                # start exited with "claimed by peer" and the director
+                # re-started the same 24 codes every tick). Only a live
+                # in-progress claim on another peer counts here.
+                _d = _get_peer_claims_detailed(peer_urls)
+                peer_claimed = _d['blocks'] | _d['parents_unsplit']
+            else:
+                peer_claimed = _get_peer_claimed_kgs(peer_urls)
             if kg_code in peer_claimed:
                 log.info("Skipping KG %s — claimed by peer", kg_code)
                 i += 1

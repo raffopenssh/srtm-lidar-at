@@ -30,7 +30,7 @@ from scipy import ndimage
 log = logging.getLogger(__name__)
 
 #: Bump when the algorithm changes in a way that invalidates caches.
-TREE_ALGO_VERSION = "2.3.0"
+TREE_ALGO_VERSION = "2.4.0"
 
 # Defaults (spruce-oriented; all exposed as request params)
 DEFAULT_CROWN_RADIUS_A = 1.2    # m — base local-max window radius
@@ -685,6 +685,129 @@ def surface_filter_labels(
     } for i, l in enumerate(ids)}
 
 
+def assign_vitality(trees: list, has_real_ndvi: bool = True) -> None:
+    """Vitality from per-crown ortho NDVI (in place; idempotent).
+
+    Callable on ANY population (a chunk, a KG, an AOI): ``dead`` is an
+    absolute cut, ``stressed`` / ``vital`` and ``ndvi_percentile_in_aoi`` are
+    ranked within the given list per leaf class — callers re-rank over the
+    population they report (v21_products KG-wide, trees_v3 per AOI).
+    """
+    if not (has_real_ndvi and trees):
+        return
+    for t in trees:
+        if t.vitality != "dead":
+            t.vitality, t.vitality_conf = "unknown", 0.0
+    # 'dead' keeps the absolute threshold (it validated well); 'stressed'
+    # is an ANOMALY within the population + same leaf class: NDVI <= p10 of
+    # its leaf-type population. Raw percentile is shipped per tree so
+    # clients can re-threshold (ndvi_percentile_in_aoi).
+    nd_all = np.array([t.spectral.get("ndvi_mean", np.nan) for t in trees], dtype=np.float32)
+    for t, nd in zip(trees, nd_all):
+        nd_p10 = t.spectral.get("ndvi_p10", nd)
+        if np.isfinite(nd) and nd < 0.15 and nd_p10 < 0.10 and t.height_m >= 5.0:
+            t.vitality = "dead"
+            t.vitality_conf = round(min(0.95, 0.6 + (0.15 - float(nd)) * 2), 2)
+            t.leaf_type = "dead"
+            t.leaf_type_conf = t.vitality_conf
+    for cls in ("coniferous", "broadleaf", "unknown"):
+        sel = [i for i, t in enumerate(trees)
+               if t.vitality != "dead"
+               and (t.leaf_type == cls or (cls == "unknown" and t.leaf_type
+                                           not in ("coniferous", "broadleaf", "dead")))
+               and np.isfinite(nd_all[i])]
+        if not sel:
+            continue
+        vals = nd_all[sel]
+        order = np.argsort(np.argsort(vals))
+        pct = (order + 0.5) / len(vals) * 100.0
+        p10 = float(np.percentile(vals, 10))
+        p50 = float(np.median(vals))
+        for j, i in enumerate(sel):
+            t = trees[i]
+            t.spectral["ndvi_percentile_in_aoi"] = round(float(pct[j]), 1)
+            # anomaly = in the bottom decile AND strictly below the population
+            # centre (ties at the mode must not flag a whole flat stand)
+            if vals[j] <= p10 and vals[j] < p50:
+                t.vitality = "stressed"
+                t.vitality_conf = round(min(0.8, 0.4 + (p10 - float(vals[j])) * 3), 2)
+            else:
+                t.vitality = "vital"
+                t.vitality_conf = round(min(0.9, float(pct[j]) / 100.0 + 0.3), 2)
+
+
+def assign_species_hint(trees: list, has_real_ndvi: bool = True) -> None:
+    """Coarse conifer species hint from single-epoch RGB+NIR ortho ONLY
+    (deliberately no Sentinel/openEO dependency), ranked within the given
+    population (in place). Physically separable in a summer RGBI image:
+      * Norway spruce: dark crowns, low brightness & green_ratio, steep.
+      * European larch: deciduous conifer — fresh light green → higher
+        NDVI/green_ratio + brightness than spruce in the SAME scene.
+      * Pine: intermediate brightness, flatter/rounder crowns.
+    Within-population percentiles (illumination-invariant), never absolute
+    cuts. Confidence capped at 0.6 — a HINT; real species ID needs
+    multitemporal or hyperspectral data.
+    """
+    if not (has_real_ndvi and trees):
+        return
+    for t in trees:
+        t.species_hint, t.species_conf = "unknown", 0.0
+    con = [i for i, t in enumerate(trees) if t.leaf_type == "coniferous"]
+    if len(con) >= 10:
+        br = np.array([trees[i].spectral.get("brightness_mean", np.nan) for i in con], dtype=np.float32)
+        gr = np.array([trees[i].spectral.get("green_ratio_mean", np.nan) for i in con], dtype=np.float32)
+        nd = np.array([trees[i].spectral.get("ndvi_mean", np.nan) for i in con], dtype=np.float32)
+
+        def _pctile(v):
+            ok = np.isfinite(v)
+            p = np.full(v.shape, 50.0, np.float32)
+            if ok.sum() > 1:
+                r = np.argsort(np.argsort(v[ok]))
+                p[ok] = (r + 0.5) / ok.sum() * 100.0
+            return p
+
+        br_p, gr_p, nd_p = _pctile(br), _pctile(gr), _pctile(nd)
+        for j, i in enumerate(con):
+            t = trees[i]
+            if t.vitality == "dead":
+                continue
+            bright_and_green = float(min(br_p[j], gr_p[j], nd_p[j]))
+            dark = float(max(br_p[j], gr_p[j]))
+            if bright_and_green >= 75.0:
+                t.species_hint = "larch"
+                t.species_conf = round(min(0.6, 0.3 + (bright_and_green - 75.0) / 100.0), 2)
+            elif dark <= 45.0:
+                t.species_hint = "spruce"
+                t.species_conf = round(min(0.6, 0.3 + (45.0 - dark) / 150.0), 2)
+            elif br_p[j] > 45.0 and gr_p[j] <= 60.0 and nd_p[j] <= 60.0:
+                t.species_hint = "pine"
+                t.species_conf = 0.3
+            else:
+                t.species_hint = "conifer_unspecified"
+                t.species_conf = 0.2
+    for t in trees:
+        if t.leaf_type == "broadleaf" and t.species_hint == "unknown":
+            t.species_hint = "broadleaf_unspecified"
+            t.species_conf = round(min(0.4, t.leaf_type_conf * 0.5), 2)
+
+
+def legacy_tree_id(e_true: float, n_true: float, aoi_bounds_3035, pad: float = 5.0) -> str:
+    """The pre-2026-09-20 ``tree_id`` a live v2 call over *aoi_bounds_3035*
+    would have produced for the apex at the grid-true centre (e_true, n_true).
+
+    Old convention: the raster origin was the fractional padded AOI corner
+    while the pixel data were floored onto the BEV grid, so every apex was
+    reported shifted by ``+frac(min_e - pad)`` E and ``-(ceil(max_n + pad) -
+    (max_n + pad))`` N. Lets clients migrate stored IDs (FEEDBACK-5 §1).
+    """
+    min_e, _, _, max_n = aoi_bounds_3035
+    c_old = min_e - pad
+    f_old = max_n + pad
+    de = c_old - np.floor(c_old)
+    dn = np.ceil(f_old) - f_old
+    return _stable_tree_id(e_true + float(de), n_true - float(dn))
+
+
 def build_inventory(
     ndsm: np.ndarray,
     mask: np.ndarray,
@@ -912,100 +1035,8 @@ def build_inventory(
             spectral=spec,
         ))
 
-    # --- Vitality (Q7): relative NDVI anomaly, not a fixed cut ------------
-    # 'dead' keeps the absolute threshold (it validated well); 'stressed'
-    # is now an ANOMALY within the AOI + same leaf class: NDVI <= p10 of
-    # its leaf-type population. Raw percentile is shipped per tree so
-    # clients can re-threshold (ndvi_percentile_in_aoi).
-    if has_real_ndvi and trees:
-        nd_all = np.array([t.spectral.get("ndvi_mean", np.nan) for t in trees],
-                          dtype=np.float32)
-        # dead first (absolute)
-        for t, nd in zip(trees, nd_all):
-            nd_p10 = t.spectral.get("ndvi_p10", nd)
-            if np.isfinite(nd) and nd < 0.15 and nd_p10 < 0.10 and t.height_m >= 5.0:
-                t.vitality = "dead"
-                t.vitality_conf = round(min(0.95, 0.6 + (0.15 - float(nd)) * 2), 2)
-                t.leaf_type = "dead"
-                t.leaf_type_conf = t.vitality_conf
-        # percentile within leaf-type population (excluding dead)
-        for cls in ("coniferous", "broadleaf", "unknown"):
-            sel = [i for i, t in enumerate(trees)
-                   if t.vitality != "dead"
-                   and (t.leaf_type == cls or (cls == "unknown" and t.leaf_type
-                                               not in ("coniferous", "broadleaf", "dead")))
-                   and np.isfinite(nd_all[i])]
-            if not sel:
-                continue
-            vals = nd_all[sel]
-            order = np.argsort(np.argsort(vals))
-            pct = (order + 0.5) / len(vals) * 100.0
-            p10 = float(np.percentile(vals, 10))
-            for j, i in enumerate(sel):
-                t = trees[i]
-                t.spectral["ndvi_percentile_in_aoi"] = round(float(pct[j]), 1)
-                if vals[j] <= p10:
-                    t.vitality = "stressed"
-                    t.vitality_conf = round(min(0.8, 0.4 + (p10 - float(vals[j])) * 3), 2)
-                else:
-                    t.vitality = "vital"
-                    t.vitality_conf = round(min(0.9, float(pct[j]) / 100.0 + 0.3), 2)
-
-    # --- Species hint (v2.2, FEEDBACK-3 side request) --------------------
-    # Coarse conifer species hint from single-epoch RGB+NIR ortho ONLY
-    # (deliberately no Sentinel/openEO dependency). Physically separable
-    # in a summer RGBI image:
-    #   * Norway spruce (Picea abies): dark crowns, low brightness & low
-    #     green_ratio within the conifer population, steep narrow crowns.
-    #   * European larch (Larix decidua): deciduous conifer — fresh light
-    #     green in leaf-on imagery → clearly higher NDVI/green_ratio +
-    #     brightness than spruce in the SAME scene.
-    #   * Pine (Pinus): intermediate brightness, flatter/rounder crowns.
-    # We use within-AOI percentiles (illumination-invariant), never
-    # absolute cuts. Confidence is capped at 0.6 — this is a HINT; real
-    # species ID needs multitemporal or hyperspectral data.
-    if has_real_ndvi and trees:
-        con = [i for i, t in enumerate(trees) if t.leaf_type == "coniferous"]
-        if len(con) >= 10:
-            br = np.array([trees[i].spectral.get("brightness_mean", np.nan)
-                           for i in con], dtype=np.float32)
-            gr = np.array([trees[i].spectral.get("green_ratio_mean", np.nan)
-                           for i in con], dtype=np.float32)
-            nd = np.array([trees[i].spectral.get("ndvi_mean", np.nan)
-                           for i in con], dtype=np.float32)
-
-            def _pctile(v):
-                ok = np.isfinite(v)
-                p = np.full(v.shape, 50.0, np.float32)
-                if ok.sum() > 1:
-                    r = np.argsort(np.argsort(v[ok]))
-                    p[ok] = (r + 0.5) / ok.sum() * 100.0
-                return p
-
-            br_p, gr_p, nd_p = _pctile(br), _pctile(gr), _pctile(nd)
-            for j, i in enumerate(con):
-                t = trees[i]
-                if t.vitality == "dead":
-                    continue
-                bright_and_green = float(min(br_p[j], gr_p[j], nd_p[j]))
-                dark = float(max(br_p[j], gr_p[j]))
-                if bright_and_green >= 75.0:
-                    t.species_hint = "larch"
-                    t.species_conf = round(min(0.6, 0.3 +
-                                               (bright_and_green - 75.0) / 100.0), 2)
-                elif dark <= 45.0:
-                    t.species_hint = "spruce"
-                    t.species_conf = round(min(0.6, 0.3 + (45.0 - dark) / 150.0), 2)
-                elif br_p[j] > 45.0 and gr_p[j] <= 60.0 and nd_p[j] <= 60.0:
-                    t.species_hint = "pine"
-                    t.species_conf = 0.3
-                else:
-                    t.species_hint = "conifer_unspecified"
-                    t.species_conf = 0.2
-        for t in trees:
-            if t.leaf_type == "broadleaf" and t.species_hint == "unknown":
-                t.species_hint = "broadleaf_unspecified"
-                t.species_conf = round(min(0.4, t.leaf_type_conf * 0.5), 2)
+    assign_vitality(trees, has_real_ndvi)
+    assign_species_hint(trees, has_real_ndvi)
 
     return trees, labels, canopy
 

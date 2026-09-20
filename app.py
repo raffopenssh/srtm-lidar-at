@@ -11838,7 +11838,8 @@ def _get_params():
                 # v2/v3 tree service
                 'fallback_live', 'stand_context', 'min_tree_likelihood',
                 'detection_mode', 'reject_nonforest', 'merge_by_key',
-                'include_records', 'h_dom_basis', 'min_apex_prominence_m'):
+                'include_records', 'h_dom_basis', 'min_apex_prominence_m',
+                'legacy_ids', 'tree_id_v2', 'include_edge', 'date_b'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
@@ -15289,6 +15290,7 @@ def _trees_v2_core(task_id, features, params):
         crowns = oc.crown_polygons(labels, data['transform'],
                                    {t.label for t in trees})
 
+    legacy_ids = str(params.get('legacy_ids', params.get('tree_id_v2', 'false'))).lower() in ('true', '1', 'yes')
     tree_features = []
     for t in trees:
         geom_out = None
@@ -15298,7 +15300,10 @@ def _trees_v2_core(task_id, features, params):
                 geom_out = mapping(ti.geometry_from_3035(g))
         if geom_out is None:
             geom_out = mapping(ti.geometry_from_3035(Point(t.apex_e, t.apex_n)))
-        tree_features.append(_tree_v2_feature(t, geom_out))
+        f = _tree_v2_feature(t, geom_out)
+        if legacy_ids:
+            f['properties']['tree_id_v2'] = tv.legacy_tree_id(t.apex_e, t.apex_n, geom_3035.bounds)
+        tree_features.append(f)
 
     summary = tv.summarise(trees, canopy, data['mask'], data['transform'],
                            geom_3035.area, ndsm=data['ndsm'],
@@ -15317,6 +15322,10 @@ def _trees_v2_core(task_id, features, params):
             'tree_algo_version': tv.TREE_ALGO_VERSION,
             'params_hash': tv.params_hash(eff_meta),
             'algorithm': 'marker_watershed_variable_window',
+            'grid_anchor': raster_io.GRID_ANCHOR,
+            'tree_id_note': ('since tree_algo_version 2.4.0 the raster grid is anchored to the '
+                             'integer-metre BEV grid, so tree_id is AOI-independent and equal to the '
+                             'v3 product id; legacy_ids=1 adds tree_id_v2 = the pre-2.4.0 id for this AOI'),
             'acquisition': acq,
             'ortho_used': ortho_used, 'nir_used': nir_used,
             **_tree_v2_det_meta(det_meta, nir_used),
@@ -15944,12 +15953,18 @@ def changes_trees_by_polygons_v2():
 
 def _tree_v3_params(params):
     eff = _tree_v2_params(params)
-    # product apices are ndsm_only; keep the live fallback symmetric
-    eff['detection_mode'] = 'ndsm_only'
+    # product apices are ndsm_only; the live fallback stays symmetric unless
+    # the client opts into detection_mode=fused (whole-AOI live v2.3 fusion
+    # enriched with product fields — v2 cost, FEEDBACK-5 §2)
+    eff['detection_mode'] = 'fused' if str(params.get('detection_mode', 'ndsm_only')).lower() == 'fused' \
+        else 'ndsm_only'
     eff['fallback_live'] = str(params.get('fallback_live', 'true')).lower() in ('true', '1', 'yes')
     eff['dataset'] = params.get('dataset', ti.DEFAULT_DATASET)
     eff['min_tree_likelihood'] = float(params.get('min_tree_likelihood', 0.0))
     eff['stand_context'] = [s.strip() for s in str(params.get('stand_context', '')).split(',') if s.strip()]
+    eff['crown_geometry'] = str(params.get('crown_geometry', 'point')).lower()
+    eff['legacy_ids'] = str(params.get('legacy_ids', params.get('tree_id_v2', 'false'))).lower() in ('true', '1', 'yes')
+    eff['include_edge'] = str(params.get('include_edge', 'true')).lower() in ('true', '1', 'yes')
     return eff
 
 
@@ -15966,21 +15981,71 @@ def _tree_v3_filter_rows(rows, eff):
             continue
         if sc and (r.get('stand_context') or 'none') not in sc:
             continue
+        if not eff.get('include_edge', True) and r.get('_is_edge'):
+            continue
         out.append(r)
     return out
+
+
+_PRODUCT_CARRY_FIELDS = ('stand_context', 'segment_type', 'segment_type_conf', 'dh_per_year_m',
+                         'als_year', 'product_code', 'product_version', 'tree_id_product')
+
+
+def _tree_v3_acquisition(codes, geom_3035, dataset):
+    """``meta.acquisition`` — per-product flight blocks (from the product JSON
+    ``acquisition`` section) + the fleet-wide roll-up + the live dataset's
+    ``als_acquisition`` lookup (FEEDBACK-5 §7)."""
+    import kg_v2_store
+    import als_acquisition
+    per = {}
+    years, gaps = [], []
+    for c in codes:
+        try:
+            doc = kg_v2_store.get(c) or {}
+        except Exception:  # noqa: BLE001
+            doc = {}
+        acq = (doc.get('acquisition') or {})
+        summ = acq.get('summary') or {}
+        if summ:
+            per[c] = {**summ, 'n_tiles': summ.get('n_tiles'),
+                      'flight_dates': sorted({t.get('eff_date') for t in (acq.get('tiles') or [])
+                                              if t.get('eff_date')})}
+            if summ.get('als_year_min'):
+                years.append(int(summ['als_year_min']))
+            if summ.get('als_year_max'):
+                years.append(int(summ['als_year_max']))
+            if summ.get('years_gap_median'):
+                gaps.append(float(summ['years_gap_median']))
+    try:
+        live = als_acquisition.lookup(geom_3035, dataset)
+    except Exception as e:  # noqa: BLE001
+        live = {'known': False, 'error': str(e)[:120]}
+    return {
+        'note': ('meta.dataset names the BEV mosaic release; the per-tree als_year and the '
+                 'blocks below are the actual ALS flight years the heights come from'),
+        'product': per,
+        'als_year_min': min(years) if years else None,
+        'als_year_max': max(years) if years else None,
+        'years_gap_median': round(float(np.median(gaps)), 2) if gaps else None,
+        'dataset': {'name': dataset, **live},
+    }
 
 
 def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
     """Shared: coverage → product apices (+ live fallback, deduped).
 
-    Returns (rows, canopy_grid, meta, live_canopy_m2, live_geom)."""
+    Returns (rows, canopy_grid, meta, live_canopy_m2, live_geom).  ``meta``
+    also carries ``_gpkg_paths`` (for crown polygons) and ``_labels`` when a
+    live run happened."""
     import trees_v3 as t3
     from shapely.ops import unary_union
     from shapely.prepared import prep
     _progress_set(task_id, 'coverage', 'Resolving product coverage…')
     cov = t3.resolve_coverage(geom_3035)
+    failed_reasons, versions, paths = {}, {}, {}
     rows, used, failed = t3.collect_product_trees(
-        cov, geom_3035, progress=lambda m: _progress_set(task_id, 'product', m))
+        cov, geom_3035, progress=lambda m: _progress_set(task_id, 'product', m),
+        failed_reasons=failed_reasons, product_versions=versions, gpkg_paths=paths)
     grid = t3.CanopyGrid(used, geom_3035)
     live_rows, live_canopy_m2, live_meta = [], 0.0, {}
     live_geom = cov['live_geom']
@@ -15990,10 +16055,49 @@ def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
         live_geom = live_geom.union(fb.intersection(geom_3035))
     n_dropped = 0
     live_ran = False
-    if eff['fallback_live'] and not live_geom.is_empty and live_geom.area >= t3.LIVE_MIN_AREA_M2:
+    fused = eff.get('detection_mode') == 'fused'
+    n_enriched = 0
+    if fused:
+        # whole-AOI live v2.3 fused run; product rows are matched by tree_id
+        # (identical grid anchor) and their product-only fields carried over
+        live_ran = True
+        _progress_set(task_id, 'lidar', f"detection_mode=fused: reading DTM/DSM for {eff['dataset']} "
+                                        f"({geom_3035.area / 1e4:.1f} ha, live ortho fusion)…")
+        data = raster_io.read_dtm_dsm(geom_3035, dataset=eff['dataset'])
+        trees, labels, canopy, ortho_used, nir_used, det_meta = _tree_v2_inventory(
+            data, eff, True, task_id)
+        pl = prep(geom_3035)
+        by_id = {r['tree_id']: r for r in rows}
+        fused_rows = []
+        for t in trees:
+            if not pl.contains(Point(t.apex_e, t.apex_n)):
+                continue
+            r = t3.live_tree_to_row(t, source='live_fused')
+            pr = by_id.pop(t.tree_id, None)
+            if pr is not None:
+                for k in _PRODUCT_CARRY_FIELDS:
+                    if pr.get(k) is not None:
+                        r[k] = pr[k]
+                r['_source'] = 'fused_product'
+                n_enriched += 1
+            fused_rows.append(r)
+        # product apices the fused run did not reproduce (within 1.5 m) stay
+        rest, n_dropped = t3.dedupe_live(fused_rows, list(by_id.values()))
+        # nearest-neighbour carry for product rows that sit within 1.5 m of a
+        # fused apex but got a different pixel (sub-metre apex jitter)
+        rows = fused_rows + rest
+        live_rows = []
+        px = abs(data['transform'].a * data['transform'].e)
+        live_canopy_m2 = float((canopy & data['mask']).sum()) * px
+        live_geom = geom_3035
+        live_meta = {**_tree_v2_det_meta(det_meta, nir_used), 'ortho_used': ortho_used,
+                     'nir_used': nir_used, 'dataset': eff['dataset'],
+                     'product_rows_enriched': n_enriched, 'product_rows_unmatched_kept': len(rest)}
+        grid = t3.CanopyGrid([], geom_3035)       # canopy from the live 1 m mask
+    elif eff['fallback_live'] and not live_geom.is_empty and live_geom.area >= t3.LIVE_MIN_AREA_M2:
         live_ran = True
         _progress_set(task_id, 'lidar', f"Live fallback: reading DTM/DSM for {eff['dataset']} "
-                                        f"({live_geom.area / 1e4:.1f} ha without 2.1 product)…")
+                                        f"({live_geom.area / 1e4:.1f} ha without 2.1+ product)…")
         data = raster_io.read_dtm_dsm(live_geom, dataset=eff['dataset'])
         trees, labels, canopy, ortho_used, nir_used, det_meta = _tree_v2_inventory(
             data, eff, include_ortho, task_id)
@@ -16007,38 +16111,94 @@ def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
         live_canopy_m2 = float((canopy & lmask & data['mask']).sum()) * px
         live_meta = {**_tree_v2_det_meta(det_meta, nir_used), 'ortho_used': ortho_used,
                      'nir_used': nir_used, 'dataset': eff['dataset']}
-    rows = _tree_v3_filter_rows(rows + live_rows, eff)
+    all_rows = rows + live_rows
+    n_edge = t3.mark_edge(all_rows, geom_3035)
+    t3.rank_vitality_in_aoi(all_rows)
+    if eff.get('legacy_ids'):
+        import tree_inventory as tv
+        for r in all_rows:
+            r['tree_id_v2'] = tv.legacy_tree_id(r['e'], r['n'], geom_3035.bounds)
+    rows = _tree_v3_filter_rows(all_rows, eff)
     meta = {
         'source_mix': {'product': used, 'live': sorted(set(cov['live_parents']) | set(failed))},
         'product_codes_failed': failed,
+        'product_codes_failed_reasons': failed_reasons,
+        'product_versions': versions,
         'parents': cov['parents'],
         'coverage': {'product_frac': cov['product_frac'],
                      'live_area_ha': round(live_geom.area / 1e4, 3),
                      'live_ran': live_ran,
                      'live_deduped': n_dropped,
                      'note': ('coverage from product footprints; '
-                              'live part = AOI minus the classified grid25 footprint of every 2.1 '
+                              'live part = AOI minus the classified grid25 footprint of every 2.1+ '
                               'product (bbox when no grid25), deduped against product apices within '
                               f'{t3.LIVE_DEDUPE_M} m')},
         'grid25_codes': grid.codes,
         'live': live_meta,
+        'n_edge': n_edge,
+        'grid_anchor': raster_io.GRID_ANCHOR,
+        'tree_id_note': ('tree_id names the BEV source pixel (integer-metre EPSG:3035 grid, pixel '
+                         'centre) identically for products and live calls; tree_id_product = the id a '
+                         '2.1 product stored before re-anchoring; tree_id_v2 (legacy_ids=1) = the id a '
+                         'pre-2026-09-20 live v2 call over THIS AOI reported'),
+        'acquisition': _tree_v3_acquisition(used, geom_3035, eff['dataset']),
+        '_gpkg_paths': paths,
     }
     return rows, grid, meta, live_canopy_m2, live_geom
+
+
+def _tree_v3_crowns(rows, meta, eff, task_id):
+    """{tree_id: Polygon 3035} for ``crown_geometry=polygon`` from the 2.2
+    ``tree_crowns`` layers of the products used (live rows: none — the live
+    label raster is not kept; use /api/v2/trees for live crowns)."""
+    import trees_v3 as t3
+    if eff.get('crown_geometry') != 'polygon' or not rows:
+        return {}
+    _progress_set(task_id, 'crowns', 'Reading crown polygons…')
+    crowns = {}
+    by_code = {}
+    for r in rows:
+        if r.get('product_code'):
+            by_code.setdefault(r['product_code'], set()).add(r['tree_id_product'] if r.get('tree_id_product') else r['tree_id'])
+    for code, ids in by_code.items():
+        path = (meta.get('_gpkg_paths') or {}).get(code)
+        if not path:
+            continue
+        try:
+            got = t3.read_crowns(path, ids)
+        except Exception as e:  # noqa: BLE001
+            log.warning('trees_v3: crowns %s: %s', code, e)
+            continue
+        crowns.update(got)
+    # crowns are keyed by the id stored in the product; map to the canonical id
+    out = {}
+    for r in rows:
+        key = r.get('tree_id_product') or r['tree_id']
+        g = crowns.get(key)
+        if g is not None:
+            out[r['tree_id']] = g
+    return out
 
 
 def _tree_v3_meta(eff, meta, t0):
     import tree_inventory as tv
     import trees_v3 as t3
+    import v21_products
     eff_meta = {k: v for k, v in eff.items() if k != 'detection_mode'}
+    pub = {k: v for k, v in meta.items() if not k.startswith('_')}
     return {
         'tree_algo_version': t3.ALGO_VERSION,
         'product_algo_version': tv.TREE_ALGO_VERSION,
-        'product_version': '2.1',
+        'product_version': v21_products.PRODUCT_VERSION,
+        'product_versions_readable': list(v21_products.READABLE_MANIFEST_VERSIONS),
+        'detection_mode': eff.get('detection_mode', 'ndsm_only'),
         'algorithm': 'product tree_apices (ndsm_only marker watershed, cadastre '
-                     'building mask) + landcover.grid25 denominators; live v2 '
-                     'fallback for uncovered parts',
+                     'building mask, 2.2: per-crown ortho RGBI spectra + crown outlines) + '
+                     'landcover.grid25 denominators (2.2: area-weighted canopy_frac); live v2 '
+                     'fallback for uncovered parts; detection_mode=fused = whole-AOI live '
+                     'v2.3 fusion enriched with product fields',
         'params_hash': tv.params_hash(eff_meta),
-        **meta, **eff_meta,
+        **pub, **eff_meta,
         'processing_time_s': round(time.time() - t0, 2),
     }
 
@@ -16054,10 +16214,17 @@ def _trees_v3_core(task_id, features, params):
     _progress_set(task_id, 'summary', 'Summarising…')
     canopy = grid.canopy(geom_3035) if grid.available else None
     summary = t3.summarise(rows, geom_3035.area, canopy, live_canopy_m2, live_geom.area)
-    if not grid.available and meta['source_mix']['product']:
+    if not grid.available and meta['source_mix']['product'] and eff.get('detection_mode') != 'fused':
         summary['canopy_denominator_note'] += (' — WARNING: no landcover.grid25 for the covering '
                                                'products (monster KG?); canopy area from live part only')
-    feats = [t3.row_to_feature(r) for r in rows] if include_trees else []
+    feats = []
+    if include_trees:
+        crowns = _tree_v3_crowns(rows, meta, eff, task_id)
+        feats = [t3.row_to_feature(r, crowns.get(r['tree_id'])) for r in rows]
+        if eff.get('crown_geometry') == 'polygon':
+            meta['crown_polygons'] = {'n': len(crowns), 'n_point_fallback': len(rows) - len(crowns),
+                                      'note': 'from 2.2 tree_crowns (watershed outline, simplified 0.5 m); '
+                                              '2.1 products and live rows fall back to the apex point'}
     return {
         'type': 'FeatureCollection', 'features': feats,
         'summary': summary,
@@ -16079,6 +16246,7 @@ def _trees_v3_by_polygons_core(task_id, features, params):
     _validate_area(union)
     rows, grid, meta, live_canopy_m2, live_geom = _tree_v3_collect(task_id, union, eff)
 
+    crowns = _tree_v3_crowns(rows, meta, eff, task_id) if include_trees else {}
     _progress_set(task_id, 'assign', 'Assigning trees to stands…')
     pts = [Point(r['e'], r['n']) for r in rows]
     kd = STRtree(pts) if pts else None
@@ -16089,7 +16257,12 @@ def _trees_v3_by_polygons_core(task_id, features, params):
         if kd is not None:
             pg = prep(s['geom'])
             idxs = [int(i) for i in kd.query(s['geom']) if pg.contains(pts[int(i)])]
-        s_rows = [rows[i] for i in idxs]
+        s_rows = [dict(rows[i]) for i in idxs]
+        for r in s_rows:
+            r['_is_edge'] = False
+        t3.mark_edge(s_rows, s['geom'])           # edge against THIS stand's boundary
+        if not eff.get('include_edge', True):
+            s_rows = [r for r in s_rows if not r.get('_is_edge')]
         n_assigned += len(idxs)
         canopy = grid.canopy(s['geom']) if grid.available else None
         s_live_area = s_live_canopy = 0.0
@@ -16104,7 +16277,7 @@ def _trees_v3_by_polygons_core(task_id, features, params):
         if s.get('key_is_duplicate'):
             entry['key_is_duplicate'] = True
         if include_trees:
-            entry['trees'] = [t3.row_to_feature(r) for r in s_rows]
+            entry['trees'] = [t3.row_to_feature(r, crowns.get(r['tree_id'])) for r in s_rows]
         results.append(entry)
     return {
         'stands': results,
@@ -16151,13 +16324,40 @@ def _changes_trees_v3_core(task_id, features, params):
         data_b, eff, include_ortho, task_id)
     for t in trees_b:
         t.apex_row, t.apex_col = _tree_v2_rowcol(data_b['transform'], t.apex_e, t.apex_n, data_b['shape'])
-    trees_a = t3.rows_to_trees(rows, data_b['transform'], data_b['shape'])
-    ndsm_a = t3.crown_proxy_ndsm(rows, data_b['transform'], data_b['shape'])
+    # epoch-a crown footprints: 2.2 tree_crowns polygons where the product
+    # has them, mean-radius discs otherwise → label raster for crown-overlap
+    # (pass 2) matching + the h_m-painted nDSM proxy for apex evidence and
+    # coarse felling patches (FEEDBACK-5 §8)
+    crowns_a = _tree_v3_crowns(rows, meta, {**eff, 'crown_geometry': 'polygon'}, task_id)
+    labels_a, n_poly = t3.crown_label_raster(rows, crowns_a, data_b['transform'], data_b['shape'])
+    trees_a = t3.rows_to_trees(rows, data_b['transform'], data_b['shape'], with_labels=True)
+    ndsm_a = t3.crown_proxy_ndsm(rows, data_b['transform'], data_b['shape'], labels_a)
+    ndsm_b_arr = np.nan_to_num(data_b['ndsm'], nan=0.0)
 
     _progress_set(task_id, 'match', 'Matching product apices against live epoch…')
-    recs = tv.match_trees(trees_a, trees_b, ndsm_a, np.nan_to_num(data_b['ndsm'], nan=0.0),
+    recs = tv.match_trees(trees_a, trees_b, ndsm_a, ndsm_b_arr,
                           match_radius_m=match_radius_m, felling_min_drop_m=felling_min_drop_m,
-                          growth_eps_m=growth_eps_m, a=eff['crown_radius_a'], b=eff['crown_radius_b'])
+                          growth_eps_m=growth_eps_m, a=eff['crown_radius_a'], b=eff['crown_radius_b'],
+                          labels_a=labels_a, labels_b=labels_b)
+
+    _progress_set(task_id, 'patches', 'Deriving felling patches (crown footprints vs live nDSM)…')
+    min_patch_sqm = float(params.get('min_patch_sqm', 25.0))
+    patches = []
+    patch_stats = {}
+    try:
+        from rasterio.features import geometry_mask
+        pmask = geometry_mask([mapping(prod_geom)], out_shape=data_b['shape'],
+                              transform=data_b['transform'], invert=True) & data_b['mask']
+        raw, patch_stats = t3.felling_patches_from_crowns(
+            rows, labels_a, ndsm_b_arr, data_b['transform'], felling_min_drop_m, min_patch_sqm, pmask)
+        for pt in raw:
+            g3035 = pt.pop('geometry_3035')
+            props = dict(pt)
+            props['height_before_mean_m'] = props.get('height_a_mean_m')
+            patches.append({'type': 'Feature', 'properties': props,
+                            'geometry': mapping(ti.geometry_from_3035(g3035))})
+    except Exception as e:  # noqa: BLE001
+        log.warning('changes v3: felling_patches failed: %s', e)
 
     year_a = t3.product_als_year(rows)
     acq_b = als_acquisition.lookup(prod_geom, date_b)
@@ -16208,9 +16408,18 @@ def _changes_trees_v3_core(task_id, features, params):
                        f'(mid-year) and date_b effective date {acq_b.get("effective_date")}')
     return {
         'type': 'FeatureCollection', 'features': feats,
-        'felling_patches': None,
-        'felling_patches_note': ('not computed: the product carries no epoch-a 1 m raster '
-                                 '(disk rule); use /api/v2/changes/trees for nDSM-drop patches'),
+        'felling_patches': {'type': 'FeatureCollection', 'features': patches},
+        'felling_patches_note': (
+            f'CROWN-LEVEL (coarse): epoch-a footprints = product crowns ({n_poly} polygon outlines '
+            f'from 2.2 tree_crowns, {len(rows) - n_poly} mean-radius discs) — the product carries no '
+            'epoch-a 1 m raster (disk rule). A crown is felled when crown h_m - p90(live nDSM inside '
+            f'the footprint) >= {felling_min_drop_m} m; adjacent felled footprints merge into patches '
+            f'>= {min_patch_sqm} m2 ({patch_stats.get("n_crowns_felled", 0)} of '
+            f'{patch_stats.get("n_crowns_judged", 0)} crowns felled). height_before_mean_m = mean '
+            'crown apex height, drop_mean_m = mean (h_m - p90_live) over the patch crowns, so the '
+            'fresh/old split via height_before_mean_m - drop_mean_m is valid. Patch edges are '
+            'crown-outline-true at best, disc-approximate at worst; for pixel-true nDSM-drop patches '
+            'use /api/v2/changes/trees.'),
         'summary': {
             'by_status': by_status, 'n_records': len(feats),
             'n_trees_a': len(trees_a), 'n_trees_b': len(trees_b),
@@ -16218,10 +16427,14 @@ def _changes_trees_v3_core(task_id, features, params):
             'growth_cm_yr_percentiles': growth_pct,
             'growth_cm_yr_is_nominal': years is None,
             'growth_cm_yr_note': growth_note,
-            'epoch_a_note': ('epoch a = frozen 2.1 product apices; 3 m apex evidence uses a '
-                             'crown-disc proxy (h_m painted over crown_r_m), so '
-                             'unmatched_a sub-classes are coarser than the live v2 engine; '
-                             'crown-overlap (pass 2) matching is unavailable'),
+            'n_felling_patches': len(patches),
+            'felling_patches_area_m2': round(sum(float(f['properties'].get('area_sqm') or 0.0)
+                                                 for f in patches), 1),
+            'epoch_a_note': (f'epoch a = frozen product apices; crown footprints = {n_poly} tree_crowns '
+                             f'polygons + {len(rows) - n_poly} mean-radius discs; 3 m apex evidence uses '
+                             'the h_m-painted crown proxy, so unmatched_a sub-classes are coarser than '
+                             'the live v2 engine; crown-overlap (pass 2) matching IS active on the '
+                             'proxy labels'),
         },
         'epoch_dates': {'a': f'product als_year {year_a}' if year_a else 'product (als_year unknown)',
                         'b': date_b,
@@ -16237,6 +16450,18 @@ def _changes_trees_v3_core(task_id, features, params):
             **params.get('_geometry_meta', {}),
         },
     }
+
+
+def _v3_method_not_allowed():
+    return _error('POST a geometry (GeoJSON / KML / WKT / bbox) with optional params; '
+                  'see /api/v1/docs/llm.txt § v3 tree service', 405)
+
+
+@app.route('/api/v3/trees', methods=['GET'])
+@app.route('/api/v3/trees/by-polygons', methods=['GET'])
+@app.route('/api/v3/changes/trees', methods=['GET'])
+def trees_v3_get():
+    return _v3_method_not_allowed()
 
 
 @app.route('/api/v3/trees', methods=['POST'])

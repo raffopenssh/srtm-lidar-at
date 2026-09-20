@@ -688,105 +688,148 @@ felled_volume_m3_est, mortality_pct}}], summary (whole-union, incl.
 overlap diagnostics), warnings, epoch_dates, felling_patches (union-wide),
 meta}.
 
-### v3 tree service (product-backed — 2.1 tree_apices + landcover.grid25)
+### v3 tree service (product-backed — tree_apices + tree_crowns + landcover.grid25)
 
-v3 answers from the FROZEN 2.1 products instead of re-running the
-detector: every `_light_v2.gpkg` (product_version 2.1) carries a
-`tree_apices` point layer (EPSG:3035, R-tree) — the v2 ndsm_only apex
-inventory run once on the stitched 1 m nDSM with the cadastre building
-mask — and every 2.1 JSON carries a 25 m `landcover.grid25` index
-(dominant v2 segment class per cell). Typical AOI answers in <2 s from
-the GPKG cache once the covering `_light_v2.gpkg` is local. STATUS
-(2026-09-20): live and verified end-to-end; ~100 KGs carry 2.1
-products (`v2:` line in /process.txt, growing ~4/h as the fleet
-upgrades).
+v3 answers from the FROZEN products instead of re-running the detector:
+every `_light_v2.gpkg` (product_version ≥ 2.1) carries a `tree_apices`
+point layer (EPSG:3035, R-tree) — the v2 ndsm_only apex inventory run
+once on the stitched 1 m nDSM with the cadastre building mask — and the
+JSON carries a 25 m `landcover.grid25` index. Product 2.2 (2026-09-20,
+tree_algo_version 3.1.0) adds per-crown BEV ortho RGBI spectra +
+vitality + species_hint on every apex, a `tree_crowns` polygon layer,
+area-weighted canopy fractions, and anchors the raster grid to the BEV
+grid so tree_id is identical between product and live calls. 2.1
+products stay readable (meta.product_versions per code tells you which
+fields you get); the fleet re-upgrades them in the background.
+
+GRID ANCHOR / tree_id (meta.grid_anchor, meta.tree_id_note):
+  * All 1 m grids (product AND live, v2 AND v3) are the integer-metre
+    EPSG:3035 BEV ALS grid; an apex is the pixel centre (x.5). tree_id =
+    `t_<E_dm>_<N_dm>` of that centre — AOI-independent, epoch-stable
+    while the tree keeps its apex pixel. Before 2026-09-20 the live grid
+    origin was the fractional AOI corner, so v2 ids were shifted per AOI
+    and never equalled product ids.
+  * 2.1 products are re-anchored on read (constant per-product δ); the
+    id stored in the 2.1 file is returned as `tree_id_product` when it
+    differs — use it to migrate ids captured from v3.0.
+  * `legacy_ids=1` adds `tree_id_v2` per feature (v2 AND v3): the id a
+    pre-2026-09-20 /api/v2/trees call over THIS SAME AOI reported. Submit
+    the AOI you used then, join on tree_id_v2, store tree_id.
+  * Products built by the v2-upgrade path (from v1 full GPKGs) can carry
+    ≤1 px tile misregistration; fresh products are exact.
 
 Client notes:
-  * POST only. GET /api/v3/trees returns 404 (not 405) — send a JSON
-    body with `geometry` (any format in "Geometry Input") or a bare
-    GeoJSON; a body without geometry → 400.
+  * POST only. GET returns 405 with a hint. Send a JSON body with
+    `geometry` (any format in "Geometry Input") or a bare GeoJSON.
   * Cold start per KG: the first request touching a KG downloads its
     `_light_v2.gpkg` from Zenodo into the server-side GPKG cache
-    (1 GB LRU). Light v2 GPKGs are 100-800 MB for large KGs (63330:
-    743 MB → 223 s cold, then <2 s). Use `async=true` (poll
-    /api/v1/segment/progress/<task_id> → /result) or set a client
-    timeout ≥ 300 s for the first hit; subsequent hits on the same KG
-    are fast until the LRU evicts it.
+    (1 GB LRU). Light v2 GPKGs are 30-800 MB (63330: 743 MB → 223 s
+    cold, then <2 s). Use `async=true` (poll /api/v1/segment/progress/
+    <task_id> → /result) or a client timeout ≥ 300 s for the first hit.
   * To check coverage before calling: GET /api/v1/kg/<code> and look
-    for `_links.zenodo_light_gpkg_v2` / `product_version == "v2"`, or
-    query the search index with `product_version=v2`. Uncovered AOI
-    parts fall back to the live v2 detector (fallback_live=true, same
-    latency as /api/v2/trees) — meta.coverage tells you which.
-  * Product apices are frozen at the KG's als_year (2022–2024); check
-    per-tree `als_year` before comparing against recent field data.
+    for `_links.zenodo_light_gpkg_v2`, or query the search index with
+    `product_version=v2`. Uncovered AOI parts fall back to the live v2
+    detector (fallback_live=true) — meta.coverage tells you which.
+  * Product apices are frozen at the KG's als_year (2022–2024);
+    meta.acquisition lists the flight blocks per product
+    (als_year_min/max, years_gap_median, flight_dates) plus the live
+    dataset's block lookup. meta.dataset is only the mosaic release.
 
 Coverage rules (meta.coverage / meta.source_mix):
-  * AOI → parent KGs (R-tree) → product codes with a 2.1 light GPKG.
+  * AOI → parent KGs (R-tree) → product codes with a ≥2.1 light GPKG.
   * A product's footprint = its classified grid25 cells (≈ the KG
     polygon; bbox for monster KGs without grid25). Apices are read only
     inside footprint ∩ AOI; duplicates across overlapping products are
-    collapsed by tree_id (location-derived ID).
+    collapsed by tree_id.
   * live part = AOI minus all footprints. With fallback_live=true
     (default) the live v2 detector (ndsm_only, cadastre mask) runs ONCE
     on that part; live trees within 1.5 m of a product apex are dropped
-    (meta.coverage.live_deduped). fallback_live=false → product only,
-    meta.coverage.live_area_ha tells you what was skipped.
-  * meta.source_mix = {product: [codes], live: [parent codes]}.
+    (meta.coverage.live_deduped). fallback_live=false → product only.
+  * meta.product_codes_failed / _reasons: products whose GPKG could not
+    be read (they fall back to live).
 
 #### POST /api/v3/trees
-Params: min_tree_height (default 3), min_tree_likelihood (default 0 —
-product apices already passed the v2.3 surface engine; raise to e.g.
-0.6 to drop 'uncertain' surfaces), stand_context=tree,orchard,…
-(filter on the v2 segment class under the apex), include_trees
-(default true; false = summary only), fallback_live, dataset (live
-part only), async.
-Per-tree properties (Feature = apex Point WGS84): tree_id, height_m,
-crown_area_sqm, crown_radius_mean_m, dbh_est_cm, volume_m3_est,
+Params: min_tree_height (default 3), min_tree_likelihood (default 0;
+raise to e.g. 0.6 to drop 'uncertain' surfaces), stand_context=tree,
+orchard,… (filter on the v2 segment class under the apex),
+include_trees (default true), include_edge (default true; false drops
+is_edge trees from features too), crown_geometry=point|polygon
+(polygon = 2.2 `tree_crowns` watershed outline, simplified 0.5 m; 2.1
+products / live rows fall back to the apex point; meta.crown_polygons
+counts), legacy_ids, detection_mode=ndsm_only|fused (see below),
+fallback_live, dataset (live part), async.
+detection_mode=fused: runs the live v2.3 fused detector (0.4 m ortho
+seeds + nDSM, ortho spectra) over the WHOLE AOI at /api/v2/trees cost,
+then joins product rows by tree_id and carries stand_context,
+segment_type, dh_per_year_m, als_year, product_code onto the matched
+trees (source=fused_product); ortho-only stems come back as
+source=live_fused; product apices the fused run did not reproduce
+within 1.5 m are kept (source=product). Canopy is then the live 1 m
+mask. Use when density/structure needs the ortho-only fifth; the
+harvest gate does not.
+Per-tree properties (Feature = apex Point WGS84, or crown Polygon):
+tree_id (+tree_id_product, +tree_id_v2), height_m, crown_area_sqm,
+crown_radius_mean_m, is_edge (crown disc crosses the SUBMITTED AOI
+boundary — product and live alike), dbh_est_cm, volume_m3_est,
 leaf_type (+_conf), detection_source/_conf, surface_class,
 tree_likelihood, stand_context (tree|orchard|vineyard|hedge|garden|
 shrub|other|none; 'unknown' for live trees), segment_type (+_conf),
-dh_per_year_m (nDSM newest−oldest at the apex / flight-year gap; null
-when the KG has one flight year), als_year (flight year of the block),
-ndvi (Sentinel-2 at the apex), source=product|live, product_code.
-Worked example (KG 63330 Kohlschwarz, 300 m AOI, 2026-09-20): 953
-trees, by_source={product:953, live:0}, coverage.product_frac=1.0,
-by_leaf_type={broadleaf:307, coniferous:646}, area_ha_canopy 1.75 of
-7.59 ha total.
+dh_per_year_m, als_year, source, product_code, product_version, and
+(2.2 / live-with-ortho) vitality (vital|stressed|dead|unknown, +_conf),
+species_hint (spruce|larch|pine|conifer_unspecified|
+broadleaf_unspecified|unknown, +_conf), ndvi_mean, ndvi_p10, nir_mean,
+brightness_mean, green_ratio_mean — per-crown means over the 1 m BEV
+ortho RGBI (not Sentinel-2) — and ndvi_percentile_in_aoi, re-ranked
+over the SUBMITTED AOI per leaf class on every call (stressed = bottom
+decile AND below the AOI median; dead = absolute NDVI < 0.15 & p10 <
+0.10 & h ≥ 5 m, ranked KG-wide in the product). null on 2.1 products.
 summary: n_trees (+_product/_live/_edge), area_ha_total,
-area_ha_canopy (grid25 stand cells × 625 m² whose centre is in the
-AOI + live canopy px), area_ha_canopy_cover_weighted, area_ha_forest
-(class 'tree' cells only), stems_per_ha_total / _canopy / _forest
-(forest = stand_context=='tree' stems over area_ha_forest), h_mean/
-p50/p90/p95/p99/max, h_dom_m (100 tallest per canopy ha), h_top100_m,
+area_ha_canopy, area_ha_canopy_cover_weighted, area_ha_stand,
+area_ha_forest, area_ha_live_part, canopy_method +
+canopy_denominator_note, stems_per_ha_total / _canopy / _forest
+(non-edge stems), h_mean/p50/p90/p95/p99/max, h_dom_m, h_top100_m,
 height_histogram_2m, by_leaf_type, by_stand_context, by_surface_class,
-by_detection, by_source, volume_m3_est_total (+_per_ha_canopy),
-dh_per_year_m_median, n_with_dh, grid25_cells_in_aoi. Denominators are
-spelled out in canopy_denominator_note — the 25 m grid makes
-area_ha_canopy coarser than the v2 pixel canopy (±1 cell per edge).
-meta: tree_algo_version 3.0.0, product_algo_version (the v2 engine
-that built the apices), source_mix, coverage, grid25_codes, live
-(detector provenance when the fallback ran), params_hash.
+by_detection, by_vitality, by_species_hint, by_source,
+volume_m3_est_total (+_per_ha_canopy), dh_per_year_m_median,
+n_with_dh, grid25_cells_in_aoi.
+Canopy denominators (2.2): area-weighted — Σ (25 m cell ∩ AOI area) ×
+`canopy_frac` (fraction of 1 m px in the apex-inventory canopy: nDSM ≥
+min_tree_height inside a v2 segment, roofs/crop rejected) for
+area_ha_canopy, × `tree_frac` for area_ha_forest, × `woody_frac` for
+area_ha_stand. No centre rule, no dominance rule, no rim loss. 2.1
+products fall back to the centre + dominant-class rule
+(canopy_method says which).
+meta: tree_algo_version 3.1.0, product_algo_version, product_version,
+product_versions (per code), detection_mode, grid_anchor, tree_id_note,
+acquisition, source_mix, coverage, product_codes_failed (+_reasons),
+grid25_codes, live (detector provenance), n_edge, params_hash.
 
 #### POST /api/v3/trees/by-polygons
 FeatureCollection of stand polygons in → per-stand summaries out, from
-the products (union collected once; apex containment; grid25 canopy
-per stand; live canopy pro-rated by live area). Params: key_property,
+the products (union collected once; apex containment; is_edge judged
+against EACH stand's boundary; area-weighted grid25 canopy per stand;
+live canopy pro-rated by live area). Params: key_property,
 merge_by_key, include_trees (default false), + /api/v3/trees params.
 Response shape = /api/v2/trees/by-polygons.
 
 #### POST /api/v3/changes/trees
 Epoch a = the product apices (frozen at the product's als_year), epoch
 b = live nDSM at `date_b` (default 20240915) detected ndsm_only. Same
-apex matching + raster veto as /api/v2/changes/trees, but: the product
-has no epoch-a 1 m raster (disk rule), so the 3 m apex evidence for
-epoch a is a crown-disc proxy (h_m over crown_r_m) and pass-2
-crown-overlap matching is unavailable — unmatched_a sub-classes are
-coarser; felling_patches is null (use /api/v2/changes/trees).
-growth_cm_yr is only emitted when date_b's flight year (BEV overlay)
-is > 0.5 a later than the product als_year; epoch_dates.same_flight_epoch
-flags republished acquisitions. Requires ≥1 covering 2.1 product
-(400 otherwise). Intended for the next BEV re-flight: compare the
-frozen inventory against new data without re-detecting epoch a.
+apex matching + raster veto as /api/v2/changes/trees. The product has
+no epoch-a 1 m raster (disk rule), so epoch a is a CROWN PROXY: the 2.2
+`tree_crowns` outlines (mean-radius discs for 2.1 products) painted
+with h_m. On that proxy both matching passes run (apex, then crown-
+overlap on the proxy labels) and `felling_patches` are derived: drop =
+crown h_m − live nDSM ≥ felling_min_drop_m, patches ≥ min_patch_sqm
+(default 25), each with area_sqm, drop_mean_m, drop_max_m,
+height_a_mean_m (= height_before_mean_m, the crown apex height) — so
+the fresh/old split via height_before_mean_m − drop_mean_m works;
+patch edges are crown-outline-true at best. felling_patches_note and
+summary.epoch_a_note state the proxy composition (n polygon vs disc
+crowns). growth_cm_yr is only emitted when date_b's flight year is
+> 0.5 a later than the product als_year; epoch_dates.same_flight_epoch
+flags republished acquisitions. Requires ≥1 covering product (400
+otherwise).
 
 #### POST /api/v1/changes/summary
 Multi-epoch change summary (2022→2023→2024).

@@ -85,6 +85,19 @@ class _Gpkg:
             self.bounds = ds.bounds
             self.crs = ds.crs
         self.res = abs(self.transform.a)
+        # v1 full GPKGs were stitched from fractional-origin windows: the
+        # pixel DATA are true BEV pixels (rasterio floored the window
+        # offset) but the transform claims the fractional AOI origin.
+        # Re-anchor to the integer-metre BEV grid so upgrade products get
+        # the same apex/tree_id convention as fresh ones (FEEDBACK-5 §1).
+        # Residual: tiles inside the mosaic may be misregistered by ≤1 px.
+        t = self.transform
+        if abs(t.a - 1.0) < 0.01 and (abs(t.c - round(t.c)) > 1e-6 or abs(t.f - round(t.f)) > 1e-6):
+            from rasterio import Affine
+            self.transform = Affine(1.0, 0.0, math.floor(t.c), 0.0, -1.0, math.ceil(t.f))
+            self.grid_reanchored = True
+        else:
+            self.grid_reanchored = False
 
     def years(self, prefix: str) -> list[int]:
         rx = re.compile(rf"^{prefix}_(\d{{4}})$")

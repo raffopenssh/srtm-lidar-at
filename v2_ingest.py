@@ -296,7 +296,7 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
         if k.endswith("_json_v2"):
             code = k[:-8]
             upgraded.add(code.split("-", 1)[0])
-            if str(e.get("version") or "") == "v2.1":
+            if str(e.get("version") or "") in ("v2.1", "v2.2"):
                 v21_codes += 1
             ts = e.get("uploaded_at") or ""
             if ts > day_ago:

@@ -38,9 +38,15 @@ import numpy as np
 
 log = logging.getLogger("austria_processor.v21")
 
-PRODUCT_VERSION = "2.1"
+PRODUCT_VERSION = "2.2"
 #: manifest ``Entry.version`` written for ``_json_v2`` / ``_light_gpkg_v2`` uploads
-MANIFEST_VERSION = "v2.1"
+MANIFEST_VERSION = "v2.2"
+#: product line readable by trees_v3 / the primary (older = fewer fields)
+READABLE_MANIFEST_VERSIONS = ("v2.1", "v2.2")
+TREE_CROWNS_LAYER = "tree_crowns"
+#: crown outline simplification tolerance (m) — half a pixel keeps the
+#: watershed footprint honest while dropping ~60 % of the vertices
+CROWN_SIMPLIFY_M = 0.5
 COARSE_M = 5
 GRID_M = 25
 NODATA_I16 = -32768
@@ -124,6 +130,7 @@ def tile_coarse(tdata: dict, *, dsm_dates: dict | None = None,
       ``dh_years``: float flight-year gap (None if unknown)
       ``als_year``: int flight year of the default dataset (None if unknown)
       ``ndvi_i8``: int8 ×100 (−128 nodata) or None;  ``nir_u8``: uint8 or None
+      ``red_u8`` / ``green_u8`` / ``blue_u8``: uint8 ortho bands (2.2) or absent
       ``acq``: acquisition record for the JSON ``acquisition.tiles`` table
     """
     import tile_index as ti
@@ -211,6 +218,13 @@ def tile_coarse(tdata: dict, *, dsm_dates: dict | None = None,
         nir = spectral.get("nir")
         if nir is not None and nir.shape == (h, w):
             nir_u8 = np.clip(np.nan_to_num(nir, nan=0.0), 0, 255).astype(np.uint8)
+        # 2.2: keep the RGB bands too (uint8, ~2 MB/tile each) so the
+        # stitched apex inventory gets per-crown brightness / green_ratio /
+        # rg_index → vitality + species_hint exactly as the live v2 engine.
+        for band in ("red", "green", "blue"):
+            arr = spectral.get(band)
+            if arr is not None and arr.shape == (h, w):
+                out[f"{band}_u8"] = np.clip(np.nan_to_num(arr, nan=0.0), 0, 255).astype(np.uint8)
     out["ndvi_i8"] = ndvi_i8
     out["nir_u8"] = nir_u8
 
@@ -350,13 +364,39 @@ def landcover_grid25(seg_type_full: np.ndarray, full_left: float, full_top: floa
         best_cls[win] = c
     frac = np.clip(np.round(best_cnt * 255.0 / (f * f)), 0, 255).astype(np.uint8)
     legend = {str(c): ALL_TYPE_NAMES.get(c, f"code_{c}") for c in codes}
+    # 2.2: class-fraction grids independent of dominance, so an AOI canopy
+    # denominator can be AREA-WEIGHTED (cell ∩ AOI × frac) instead of the
+    # centre-in-AOI + dominant-class rule that lost a 25 m rim per stand
+    # (FEEDBACK-5 §6).  ~1 KB gz each.
+    name_to_code = {v: k for k, v in ALL_TYPE_NAMES.items()}
+    woody_codes = [name_to_code[t] for t in STAND_CONTEXT_TYPES if t in name_to_code]
+    woody = np.isin(blk, woody_codes).sum(axis=(1, 3), dtype=np.int32)
+    tree_code = name_to_code.get("tree")
+    treec = (blk == tree_code).sum(axis=(1, 3), dtype=np.int32) if tree_code else np.zeros_like(woody)
+    to_u8 = lambda cnt: np.clip(np.round(cnt * 255.0 / (f * f)), 0, 255).astype(np.uint8)  # noqa: E731
     return {
         "cell_m": GRID_M, "cols": int(cols), "rows": int(rows), "origin": "nw",
         "crs": "EPSG:3035", "x0": float(coarse["left"]), "y0": float(coarse["top"]),
         "coding": "u8", "cls": _b64gz(best_cls.tobytes()),
         "cover_frac": _b64gz(frac.tobytes()), "legend": legend,
+        "woody_frac": _b64gz(to_u8(woody).tobytes()),
+        "tree_frac": _b64gz(to_u8(treec).tobytes()),
         "n_classified": int((best_cls > 0).sum()),
     }
+
+
+def attach_canopy_frac(lc: dict | None, canopy_counts: np.ndarray | None) -> None:
+    """Add ``canopy_frac`` (u8, fraction of 1 m px in the apex-inventory canopy
+    mask: nDSM ≥ min_tree_height inside a v2 segment, roofs/crop rejected) to
+    a ``landcover.grid25`` section, in place.  The v2 pixel canopy, area-
+    weighted onto the 25 m grid."""
+    if not lc or canopy_counts is None:
+        return
+    if canopy_counts.shape != (int(lc["rows"]), int(lc["cols"])):
+        return
+    f2 = float(GRID_M * GRID_M)
+    lc["canopy_frac"] = _b64gz(np.clip(np.round(canopy_counts * 255.0 / f2), 0, 255)
+                               .astype(np.uint8).tobytes())
 
 
 # --------------------------------------------------------------------------
@@ -389,9 +429,15 @@ def decode_landcover_grid25(sec: dict) -> dict:
     rows, cols = int(sec["rows"]), int(sec["cols"])
     cls = np.frombuffer(_ungz64(sec["cls"]), np.uint8).reshape(rows, cols)
     frac = np.frombuffer(_ungz64(sec["cover_frac"]), np.uint8).reshape(rows, cols) / 255.0
-    return {"cls": cls, "cover_frac": frac.astype(np.float32), "legend": dict(sec.get("legend") or {}),
-            "x0": float(sec["x0"]), "y0": float(sec["y0"]),
-            "cell_m": float(sec.get("cell_m", GRID_M)), "cols": cols, "rows": rows}
+    out = {"cls": cls, "cover_frac": frac.astype(np.float32), "legend": dict(sec.get("legend") or {}),
+           "x0": float(sec["x0"]), "y0": float(sec["y0"]),
+           "cell_m": float(sec.get("cell_m", GRID_M)), "cols": cols, "rows": rows}
+    for k in ("woody_frac", "tree_frac", "canopy_frac"):        # 2.2, optional
+        if sec.get(k):
+            out[k] = (np.frombuffer(_ungz64(sec[k]), np.uint8).reshape(rows, cols) / 255.0).astype(np.float32)
+        else:
+            out[k] = None
+    return out
 
 
 def split_grid25(doc: dict) -> tuple[dict, bytes | None]:
@@ -469,14 +515,106 @@ def _sample_tiles(tile_seg_results: list, key: str, es: np.ndarray, ns: np.ndarr
     return out
 
 
+def _compose_tiles(tile_seg_results: list, key: str, tf, shape, nodata=None,
+                   scale: float = 1.0) -> np.ndarray | None:
+    """Paint the per-tile 1 m rasters ``tr['v21'][key]`` onto a float32 canvas
+    on grid *tf*/*shape* (NaN where no tile / nodata).  Returns None when no
+    tile carries *key* — chunk-sized only, so the stitched apex inventory
+    never holds a full-KG ortho band in memory."""
+    H, W = shape
+    out = None
+    res = abs(tf.a)
+    for tr in tile_seg_results:
+        v = tr.get("v21") or {}
+        arr = v.get(key)
+        if arr is None:
+            continue
+        left, bottom, right, top = tr["bounds_3035"]
+        c_off = int(round((left - tf.c) / res))
+        r_off = int(round((tf.f - top) / res))
+        h, w = arr.shape
+        dr0, dc0 = max(0, r_off), max(0, c_off)
+        dr1, dc1 = min(H, r_off + h), min(W, c_off + w)
+        if dr1 <= dr0 or dc1 <= dc0:
+            continue
+        if out is None:
+            out = np.full((H, W), np.nan, np.float32)
+        src = arr[dr0 - r_off:dr1 - r_off, dc0 - c_off:dc1 - c_off].astype(np.float32)
+        if nodata is not None:
+            src = np.where(arr[dr0 - r_off:dr1 - r_off, dc0 - c_off:dc1 - c_off] == nodata, np.nan, src)
+        dst = out[dr0:dr1, dc0:dc1]
+        fill = np.isnan(dst) & np.isfinite(src)
+        dst[fill] = src[fill] * scale
+    return out
+
+
+def _chunk_spectral(tile_seg_results: list, tf, shape) -> tuple[dict | None, np.ndarray | None]:
+    """(spectral dict for tree_inventory.build_inventory, nir) from the tile
+    ortho bands: ndvi, brightness, green_ratio, rg_index — same definitions
+    as ``ortho_io.compute_spectral_indices`` so the product's vitality /
+    species_hint equal a live v2 call."""
+    ndvi = _compose_tiles(tile_seg_results, "ndvi_i8", tf, shape, nodata=-128, scale=0.01)
+    nir = _compose_tiles(tile_seg_results, "nir_u8", tf, shape)
+    if ndvi is None or nir is None:
+        return None, None
+    spec = {"ndvi": ndvi}
+    r = _compose_tiles(tile_seg_results, "red_u8", tf, shape)
+    g = _compose_tiles(tile_seg_results, "green_u8", tf, shape)
+    bl = _compose_tiles(tile_seg_results, "blue_u8", tf, shape)
+    if r is not None and g is not None and bl is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tot = r + g + bl
+            spec["brightness"] = (tot / 3.0).astype(np.float32)
+            spec["green_ratio"] = np.where(tot > 0, g / tot, np.nan).astype(np.float32)
+            spec["rg_index"] = np.where(r + g > 0, (r - g) / (r + g), np.nan).astype(np.float32)
+    return spec, nir
+
+
+def _crown_polygons(labels: np.ndarray, tf, wanted: dict) -> dict:
+    """{label: shapely Polygon (EPSG:3035, simplified)} for the labels in
+    *wanted* (label → tree).  Largest part when the watershed region is
+    split by the halo cut."""
+    from rasterio.features import shapes
+    from shapely.geometry import shape as _shape
+    keep = np.isin(labels, list(wanted.keys()))
+    if not keep.any():
+        return {}
+    out: dict = {}
+    for geom, val in shapes(labels.astype(np.int32), mask=keep, transform=tf, connectivity=8):
+        lab = int(val)
+        poly = _shape(geom)
+        prev = out.get(lab)
+        if prev is None or poly.area > prev.area:
+            out[lab] = poly
+    for lab, poly in list(out.items()):
+        sp = poly.simplify(CROWN_SIMPLIFY_M, preserve_topology=True)
+        if sp.is_empty or not sp.is_valid:
+            sp = poly
+        out[lab] = sp
+    return out
+
+
 def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray | None,
                       labels_full: np.ndarray | None, all_objects: list,
                       tile_seg_results: list, building_geoms: list | None,
-                      *, det_info: dict | None = None) -> list[dict]:
+                      *, det_info: dict | None = None, grid25: dict | None = None,
+                      crowns_out: list | None = None,
+                      canopy_counts_out: list | None = None) -> list[dict]:
     """Apex inventory on the stitched 1 m nDSM, memory-bounded by chunking.
 
     Trees whose apex falls inside a chunk's core are kept; the ``APEX_HALO_PX``
     halo makes crown geometry at chunk seams equal to an unchunked run.
+
+    2.2 additions (FEEDBACK-5):
+      * per-crown ortho RGBI spectra (``_chunk_spectral``) → ``vitality``,
+        ``species_hint``, ``ndvi_mean/p10``, ``nir_mean``, ``brightness_mean``,
+        ``green_ratio_mean``; vitality/species are re-ranked KG-wide after all
+        chunks (``tree_inventory.assign_*``) so chunk seams don't bias them;
+      * ``crowns_out`` (list) receives ``{tree_id, wkb}`` crown outlines for
+        :func:`write_tree_crowns`;
+      * ``canopy_counts_out`` (list) receives the int32 (rows, cols) count of
+        canopy px per 25 m cell on the *grid25* grid (``{x0,y0,rows,cols}``)
+        for :func:`attach_canopy_frac`.
     Returns rows ready for :func:`write_tree_apices`.
     """
     import tree_inventory as tv
@@ -484,14 +622,17 @@ def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray 
     from rasterio.features import rasterize
     from rasterio.transform import Affine
     H, W = ndsm_full.shape
-    res = abs(full_tf.a)
     obj_conf = {}
     if labels_full is not None:
         for o in all_objects:
             obj_conf[int(o.obj_id)] = float(getattr(o, "confidence", 0.0) or 0.0)
-    rows_out: list[dict] = []
+    trees_all: list = []            # (Tree, gr, gc)
     n_chunks = 0
     rej_total = 0
+    spectral_chunks = 0
+    canopy_counts = None
+    if grid25:
+        canopy_counts = np.zeros((int(grid25["rows"]), int(grid25["cols"])), np.int32)
     for r0 in range(0, H, APEX_CHUNK_PX):
         for c0 in range(0, W, APEX_CHUNK_PX):
             r1, c1 = min(r0 + APEX_CHUNK_PX, H), min(c0 + APEX_CHUNK_PX, W)
@@ -512,47 +653,95 @@ def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray 
                         bmask = None
                 except Exception:  # noqa: BLE001
                     bmask = None
+            spec, nir = _chunk_spectral(tile_seg_results, tf, nd.shape)
+            if spec is not None:
+                spectral_chunks += 1
             n_chunks += 1
             di: dict = {}
             try:
                 trees, labels, canopy = tv.build_inventory(
-                    np.nan_to_num(nd, nan=0.0), mask, tf, building_mask=bmask, det_info=di)
+                    np.nan_to_num(nd, nan=0.0), mask, tf, building_mask=bmask,
+                    spectral=spec, nir=nir, det_info=di)
             except Exception as e:  # noqa: BLE001
                 log.warning("tree_apices chunk (%d,%d) failed: %s", r0, c0, e)
                 continue
+            del spec, nir
             rej_total += int(di.get("rejected_by_surface", 0) or 0)
+            core = {}
             for t in trees:
                 gr, gc = t.apex_row + hr0, t.apex_col + hc0
                 if not (r0 <= gr < r1 and c0 <= gc < c1):
                     continue     # halo — owned by the neighbouring chunk
-                st_code = int(seg_type_full[gr, gc]) if seg_type_full is not None else 0
-                st_name = ALL_TYPE_NAMES.get(st_code, "none") if st_code else "none"
-                conf = None
-                if labels_full is not None:
-                    lab = int(labels_full[gr, gc])
-                    if lab:
-                        conf = obj_conf.get(lab)
-                rows_out.append({
-                    "tree_id": t.tree_id, "e": t.apex_e, "n": t.apex_n,
-                    "h_m": t.height_m, "crown_r_m": t.crown_radius_mean_m,
-                    "crown_area_m2": t.crown_area_sqm,
-                    "detection_source": t.detection_source, "detection_conf": t.detection_conf,
-                    "surface_class": t.surface_class, "tree_likelihood": t.tree_likelihood,
-                    "stand_context": st_name if st_name in STAND_CONTEXT_TYPES else
-                                     ("other" if st_code else "none"),
-                    "segment_type": st_name, "segment_type_conf": conf,
-                    "leaf_type_hint": t.leaf_type, "leaf_type_conf": t.leaf_type_conf,
-                    "dbh_est_cm": t.dbh_est_cm, "volume_m3_est": t.volume_m3_est,
-                })
+                trees_all.append((t, gr, gc))
+                core[t.label] = t
+            if crowns_out is not None and core:
+                try:
+                    for lab, poly in _crown_polygons(labels, tf, core).items():
+                        crowns_out.append({"tree_id": core[lab].tree_id, "geom": poly})
+                except Exception as e:  # noqa: BLE001
+                    log.warning("tree_crowns chunk (%d,%d) failed: %s", r0, c0, e)
+            if canopy_counts is not None:
+                # core part of the canopy mask → 25 m cell counts (area-weighted
+                # canopy denominator for trees_v3; never double counts halos)
+                cr = canopy[r0 - hr0:r1 - hr0, c0 - hc0:c1 - hc0]
+                rr, cc = np.nonzero(cr)
+                if rr.size:
+                    es = full_tf.c + (cc + c0 + 0.5) * full_tf.a
+                    ns = full_tf.f + (rr + r0 + 0.5) * full_tf.e
+                    ci = np.floor((es - grid25["x0"]) / GRID_M).astype(np.int64)
+                    ri = np.floor((grid25["y0"] - ns) / GRID_M).astype(np.int64)
+                    ok = (ci >= 0) & (ri >= 0) & (ci < canopy_counts.shape[1]) & (ri < canopy_counts.shape[0])
+                    np.add.at(canopy_counts, (ri[ok], ci[ok]), 1)
             del labels, canopy
+    if canopy_counts_out is not None:
+        canopy_counts_out.append(canopy_counts)
+    has_spec = spectral_chunks > 0
     if det_info is not None:
         det_info.update(n_chunks=n_chunks, rejected_by_surface=rej_total,
-                        building_mask_used=bool(building_geoms))
-    if not rows_out:
-        return rows_out
+                        building_mask_used=bool(building_geoms),
+                        spectral_chunks=spectral_chunks, spectral="ortho_rgbi_1m" if has_spec else None)
+    if not trees_all:
+        return []
+    # KG-wide re-ranking: vitality (stressed = ≤ p10 NDVI within leaf class)
+    # and species hint percentiles are population-relative — rank over the
+    # whole KG, not per 2 km chunk.
+    tlist = [t for t, _, _ in trees_all]
+    tv.assign_vitality(tlist, has_spec)
+    tv.assign_species_hint(tlist, has_spec)
+
+    rows_out: list[dict] = []
+    for t, gr, gc in trees_all:
+        st_code = int(seg_type_full[gr, gc]) if seg_type_full is not None else 0
+        st_name = ALL_TYPE_NAMES.get(st_code, "none") if st_code else "none"
+        conf = None
+        if labels_full is not None:
+            lab = int(labels_full[gr, gc])
+            if lab:
+                conf = obj_conf.get(lab)
+        sp = t.spectral or {}
+        _f = lambda k: (round(float(sp[k]), 3) if k in sp and np.isfinite(sp[k]) else None)  # noqa: E731
+        rows_out.append({
+            "tree_id": t.tree_id, "e": t.apex_e, "n": t.apex_n,
+            "h_m": t.height_m, "crown_r_m": t.crown_radius_mean_m,
+            "crown_area_m2": t.crown_area_sqm,
+            "detection_source": t.detection_source, "detection_conf": t.detection_conf,
+            "surface_class": t.surface_class, "tree_likelihood": t.tree_likelihood,
+            "stand_context": st_name if st_name in STAND_CONTEXT_TYPES else
+                             ("other" if st_code else "none"),
+            "segment_type": st_name, "segment_type_conf": conf,
+            "leaf_type_hint": t.leaf_type, "leaf_type_conf": t.leaf_type_conf,
+            "vitality": t.vitality if has_spec else "unknown",
+            "vitality_conf": t.vitality_conf if has_spec else None,
+            "species_hint": t.species_hint if has_spec else "unknown",
+            "species_conf": t.species_conf if has_spec else None,
+            "ndvi_mean": _f("ndvi_mean"), "ndvi_p10": _f("ndvi_p10"),
+            "nir_mean": (round(float(sp["nir_mean"]), 1) if "nir_mean" in sp else None),
+            "brightness_mean": (round(float(sp["brightness_mean"]), 1) if "brightness_mean" in sp else None),
+            "green_ratio_mean": _f("green_ratio_mean"),
+            "dbh_est_cm": t.dbh_est_cm, "volume_m3_est": t.volume_m3_est,
+        })
     # per-tree evidence from the tile rasters (point samples, no full arrays)
     es = np.array([r["e"] for r in rows_out]); ns = np.array([r["n"] for r in rows_out])
-    ndvi = _sample_tiles(tile_seg_results, "ndvi_i8", es, ns, -128, 0.01)
     dh = _sample_tiles(tile_seg_results, "dh_cm", es, ns, NODATA_I16, 0.01, radius=1)
     yrs = {}
     for tr in tile_seg_results:
@@ -570,7 +759,6 @@ def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray 
             als_year[sel] = ay if ay else np.nan
             todo[sel] = False
     for i, r in enumerate(rows_out):
-        r["ndvi"] = None if not np.isfinite(ndvi[i]) else round(float(ndvi[i]), 3)
         g = dh[i]; y = dh_years[i]
         r["dh_per_year_m"] = (round(float(g) / float(y), 3)
                               if np.isfinite(g) and np.isfinite(y) and y > 0 else None)
@@ -583,8 +771,42 @@ TREE_APICES_SCHEMA = {"geometry": "Point", "properties": [
     ("detection_source", "str"), ("detection_conf", "float"), ("surface_class", "str"),
     ("tree_likelihood", "float"), ("stand_context", "str"), ("segment_type", "str"),
     ("segment_type_conf", "float"), ("dh_per_year_m", "float"), ("als_year", "int"),
-    ("ndvi", "float"), ("leaf_type_hint", "str"), ("leaf_type_conf", "float"),
+    ("leaf_type_hint", "str"), ("leaf_type_conf", "float"),
+    # 2.2 — per-crown BEV ortho RGBI spectra + derived (FEEDBACK-5 §3)
+    ("vitality", "str"), ("vitality_conf", "float"), ("species_hint", "str"), ("species_conf", "float"),
+    ("ndvi_mean", "float"), ("ndvi_p10", "float"), ("nir_mean", "float"),
+    ("brightness_mean", "float"), ("green_ratio_mean", "float"),
     ("dbh_est_cm", "float"), ("volume_m3_est", "float")]}
+
+TREE_CROWNS_SCHEMA = {"geometry": "Polygon", "properties": [("tree_id", "str")]}
+
+
+def write_tree_crowns(gpkg_path: str, crowns: list[dict]) -> int:
+    """``tree_crowns`` polygon layer (EPSG:3035, no R-tree): one simplified
+    watershed crown outline per apex, joined to ``tree_apices`` by
+    ``tree_id``.  Only ``tree_id`` is stored — every attribute lives on the
+    apex row (file-size rule)."""
+    import fiona
+    from fiona.crs import from_epsg
+    from shapely.geometry import mapping
+    n = 0
+    # no R-tree: crowns are joined by tree_id after the (indexed) apex query;
+    # skipping the index saves ~25 % of the layer (~70 B/crown)
+    with fiona.open(gpkg_path, "w", driver="GPKG", layer=TREE_CROWNS_LAYER,
+                    schema=TREE_CROWNS_SCHEMA, crs=from_epsg(3035), SPATIAL_INDEX="NO") as dst:
+        batch = []
+        for c in crowns:
+            g = c["geom"]
+            if g.is_empty:
+                continue
+            if g.geom_type == "MultiPolygon":
+                g = max(g.geoms, key=lambda p: p.area)
+            batch.append({"geometry": mapping(g), "properties": {"tree_id": c["tree_id"]}})
+            if len(batch) >= 5000:
+                dst.writerecords(batch); n += len(batch); batch = []
+        if batch:
+            dst.writerecords(batch); n += len(batch)
+    return n
 
 
 def write_tree_apices(gpkg_path: str, rows: list[dict]) -> int:

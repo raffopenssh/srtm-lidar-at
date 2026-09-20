@@ -41,6 +41,19 @@ def _cache_key(layer: str, tile: tuple, min_e: float, min_n: float,
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def snap_bbox(min_e: float, min_n: float, max_e: float, max_n: float) -> tuple[float, float, float, float]:
+    """Snap an EPSG:3035 bbox outwards to the integer-metre BEV grid."""
+    return (float(np.floor(min_e)), float(np.floor(min_n)),
+            float(np.ceil(max_e)), float(np.ceil(max_n)))
+
+
+GRID_ANCHOR = {
+    "crs": "EPSG:3035", "res_m": 1.0, "origin": "integer metre (BEV ALS grid)",
+    "apex_anchor": "pixel_center",
+    "tree_id": "t_<E_dm>_<N_dm> of the source-pixel centre (E, N in decimetres, always ending in 5)",
+}
+
+
 def _cache_path(key: str) -> Path:
     return BEV_CACHE_DIR / f"{key}.npz"
 
@@ -83,11 +96,17 @@ def read_window_bbox(
 
     Returns (data_2d, transform, crs).  Data is float32, nodata replaced with NaN.
     If bbox spans multiple tiles, they are mosaicked.
+
+    **Grid anchor (2026-09-20).** The bbox is snapped outwards to whole
+    metres so the returned grid is the BEV ALS grid itself (integer-metre
+    origin, pixel centres at ``x.5``).  Before this, rasterio floored the
+    fractional window offset but the returned transform kept the fractional
+    origin, so every pixel — and every location-derived ``tree_id`` — was
+    shifted by ``frac(min_e)`` / ``ceil(max_n) - max_n`` depending on the
+    caller's AOI (FEEDBACK-5 §1).  Snapping makes product and live grids
+    identical and the disk-cache key (rounded to metres) exact.
     """
-    min_e -= pad
-    min_n -= pad
-    max_e += pad
-    max_n += pad
+    min_e, min_n, max_e, max_n = snap_bbox(min_e - pad, min_n - pad, max_e + pad, max_n + pad)
 
     tiles = ti.find_tiles_for_bbox(min_e, min_n, max_e, max_n)
     if not tiles:

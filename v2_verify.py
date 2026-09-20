@@ -50,7 +50,10 @@ LIGHT_LAYERS_V2 = ("parcel_outline_z",)
 # product 2.1 (docs/v2.1-product-spec.md) — checked by check_v21_document /
 # check_v21_light_gpkg; product_version is fatal, the 5 m / apex layers are
 # fatal only when the JSON claims them.
-PRODUCT_VERSION = "2.1"
+try:
+    from v21_products import PRODUCT_VERSION
+except Exception:  # noqa: BLE001
+    PRODUCT_VERSION = "2.2"
 LIGHT_LAYERS_V21 = ("terrain_coarse_dtm", "terrain_coarse_slope")
 
 TOL = {
@@ -263,7 +266,15 @@ def _bbox_3035(v2: dict):
 def check_v21_document(v2: dict, rep: Report) -> None:
     """Product-2.1 JSON checks (JSON subset — also run on the primary)."""
     pv = str(v2.get("product_version") or "")
-    rep.check("product_version", pv == PRODUCT_VERSION, f"product_version={pv!r}")
+    # peers verify their own output (must be the current version); the primary
+    # ingests whatever the fleet uploads during a rollout — an older readable
+    # product line is a warning there, not a rejection.
+    readable = {"2.1", "2.2"}
+    if pv == PRODUCT_VERSION:
+        rep.check("product_version", True, f"product_version={pv!r}")
+    else:
+        rep.check("product_version", pv in readable, f"product_version={pv!r} (current {PRODUCT_VERSION})",
+                  fatal=pv not in readable)
     g = _g(v2, "terrain", "grid25")
     if not rep.check("grid25_present", isinstance(g, dict) and bool(g.get("elev")),
                      "terrain.grid25 missing (tile arrays freed?)", fatal=False):
@@ -313,6 +324,25 @@ def check_v21_document(v2: dict, rep: Report) -> None:
               f"keys={sorted(ts)[:8]}", fatal=False)
 
 
+
+def _gpkg_point_xy(blob: bytes):
+    """(x, y) from a GeoPackage binary Point blob (no spatialite needed)."""
+    import struct
+    if not blob or blob[:2] != b"GP":
+        return None
+    flags = blob[3]
+    env = (flags >> 1) & 0x07
+    env_len = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}.get(env)
+    if env_len is None:
+        return None
+    off = 8 + env_len
+    bo = "<" if blob[off] == 1 else ">"
+    gtype = struct.unpack(bo + "I", blob[off + 1:off + 5])[0]
+    if gtype % 1000 != 1:
+        return None
+    x, y = struct.unpack(bo + "dd", blob[off + 5:off + 21])
+    return float(x), float(y)
+
 def check_v21_light_gpkg(c: sqlite3.Connection, layers: dict, v2: dict, rep: Report) -> None:
     """Product-2.1 light GPKG checks (peer only; *c* is an open ro connection)."""
     missing = [l for l in LIGHT_LAYERS_V21 if l not in layers]
@@ -335,6 +365,32 @@ def check_v21_light_gpkg(c: sqlite3.Connection, layers: dict, v2: dict, rep: Rep
                       "AND extension_name='gpkg_rtree_index'").fetchone()[0] > 0
     rep.check("apices_layer", rtree and (n_ap == 0 or abs(n - n_ap) <= 0.2 * n_ap),
               f"layer={n} json={n_ap} rtree={rtree}")
+    # 2.2: apex grid anchor (pixel centres at x.5 on the integer-metre BEV
+    # grid) — a fractional-origin regression would silently break tree_id
+    # stability between product and live (FEEDBACK-5 §1).
+    pts = []
+    try:
+        gcol = c.execute("SELECT column_name FROM gpkg_geometry_columns WHERE table_name='tree_apices'").fetchone()[0]
+        for (blob,) in c.execute(f'SELECT "{gcol}" FROM "tree_apices" LIMIT 50'):
+            xy = _gpkg_point_xy(blob)
+            if xy:
+                pts.append(xy)
+    except Exception:  # noqa: BLE001
+        pts = []
+    if pts:
+        off = [abs(((x - 0.5) % 1.0)) + abs(((y - 0.5) % 1.0)) for x, y in pts]
+        bad = sum(1 for o in off if min(o, 2.0 - o) > 0.02)
+        rep.check("apex_grid_anchor", bad == 0, f"{bad}/{len(pts)} apices off the x.5 grid", fatal=False)
+    n_cr = int(_num(ts.get("n_crowns"), 0) or 0)
+    if ts.get("crowns_layer") == "tree_crowns":
+        try:
+            m = c.execute('SELECT COUNT(*) FROM "tree_crowns"').fetchone()[0]
+        except Exception as e:  # noqa: BLE001
+            m = -1
+            rep.check("crowns_layer", False, str(e)[:120], fatal=False)
+        if m >= 0:
+            rep.check("crowns_layer", abs(m - n_cr) <= 0.2 * max(n_cr, 1) and m <= n,
+                      f"layer={m} json={n_cr} apices={n}", fatal=False)
 
 
 # --------------------------------------------------------------------------

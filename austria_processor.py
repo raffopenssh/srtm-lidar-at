@@ -4820,10 +4820,19 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 _bg = [b["geometry"] for b in cadastre_data.get("building_footprints", [])
                        if b.get("geometry") is not None and not b["geometry"].is_empty]
                 _di = {}
+                _v21_crowns = []
+                _v21_canopy_counts = []
+                _lc25 = v21_out.get("landcover_grid25")
+                _g25 = ({"x0": _lc25["x0"], "y0": _lc25["y0"], "rows": _lc25["rows"], "cols": _lc25["cols"]}
+                        if _lc25 else None)
                 _v21_apex_rows = _v21.build_tree_apices(
                     seg_height_full, full_tf, seg_type_full, labels_full, all_objects,
-                    tile_seg_results, _bg, det_info=_di)
+                    tile_seg_results, _bg, det_info=_di, grid25=_g25,
+                    crowns_out=_v21_crowns, canopy_counts_out=_v21_canopy_counts)
+                if _lc25 and _v21_canopy_counts and _v21_canopy_counts[0] is not None:
+                    _v21.attach_canopy_frac(_lc25, _v21_canopy_counts[0])
                 v21_out["n_apices"] = len(_v21_apex_rows)
+                v21_out["n_crowns"] = len(_v21_crowns)
                 v21_out["det_mode"] = "ndsm_only"
                 v21_out["det_info"] = _di
                 v21_out["apex_seconds"] = round(time.time() - _t21, 1)
@@ -4864,12 +4873,17 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 if _v21_apex_rows:
                     _rs("gpkg_light", f"v2.1 tree_apices ({len(_v21_apex_rows)} pts)")
                     v21_out["n_apices_written"] = _v21.write_tree_apices(out_path, _v21_apex_rows)
-                    log.info("  v2.1: wrote %d tree_apices + %d terrain_coarse tables",
-                             v21_out.get("n_apices_written", 0), len(v21_out.get("terrain_coarse_tables") or []))
+                    if _v21_crowns:
+                        _rs("gpkg_light", f"v2.2 tree_crowns ({len(_v21_crowns)} polys)")
+                        v21_out["n_crowns_written"] = _v21.write_tree_crowns(out_path, _v21_crowns)
+                    log.info("  v2.2: wrote %d tree_apices, %d tree_crowns + %d terrain_coarse tables",
+                             v21_out.get("n_apices_written", 0), v21_out.get("n_crowns_written", 0),
+                             len(v21_out.get("terrain_coarse_tables") or []))
             except Exception as _e:  # noqa: BLE001
                 log.warning("  v2.1 layer write failed: %s", _e, exc_info=True)
             _v21_coarse = None
             _v21_apex_rows = None
+            _v21_crowns = None
 
     # --- Lazy DTM loading with LRU eviction for GPKG parcel/building enrichment ---
     # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
@@ -6489,6 +6503,10 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         ts_ = summary.setdefault("tree_stats", {})
         ts_["apices_layer"] = "tree_apices" if v21_extras.get("n_apices_written") else None
         ts_["n_apices"] = int(v21_extras.get("n_apices_written") or 0)
+        ts_["crowns_layer"] = "tree_crowns" if v21_extras.get("n_crowns_written") else None
+        ts_["n_crowns"] = int(v21_extras.get("n_crowns_written") or 0)
+        ts_["spectral"] = (v21_extras.get("det_info") or {}).get("spectral")
+        ts_["grid_anchor"] = "integer-metre EPSG:3035, apex = pixel centre"
         ts_["det_mode"] = v21_extras.get("det_mode") or "skipped"
         ts_["algo_version"] = _algo
         _di = v21_extras.get("det_info") or {}
@@ -6497,7 +6515,10 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         summary["methods"]["tree_apices"] = (
             "tree_inventory.build_inventory on the stitched 1 m nDSM (variable-window "
             "local maxima + marker watershed, cadastre roof mask, v2 segment stand context); "
-            "points in _light_v2.gpkg layer tree_apices (EPSG:3035, R-tree)")
+            "points in _light_v2.gpkg layer tree_apices (EPSG:3035, R-tree); 2.2: per-crown BEV "
+            "ortho RGBI spectra (ndvi_mean/p10, nir, brightness, green_ratio) → vitality + "
+            "species_hint ranked KG-wide; crown outlines in layer tree_crowns (join tree_id); "
+            "grid anchored to the integer-metre BEV grid (apex = pixel centre)")
         summary["methods"]["grid25"] = (
             "25 m block means of the 1 m DTM/slope (terrain.grid25) and dominant v2 segment "
             "class (landcover.grid25); 5 m terrain_coarse_* rasters in _light_v2.gpkg")

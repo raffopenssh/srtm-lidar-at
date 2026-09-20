@@ -696,9 +696,29 @@ detector: every `_light_v2.gpkg` (product_version 2.1) carries a
 inventory run once on the stitched 1 m nDSM with the cadastre building
 mask — and every 2.1 JSON carries a 25 m `landcover.grid25` index
 (dominant v2 segment class per cell). Typical AOI answers in <2 s from
-the GPKG cache (first hit per KG downloads the ~10-30 MB light GPKG
-once; 1 GB LRU). Coverage grows as the fleet upgrades KGs to 2.1 — see
-`v2:` line in /process.txt.
+the GPKG cache once the covering `_light_v2.gpkg` is local. STATUS
+(2026-09-20): live and verified end-to-end; ~100 KGs carry 2.1
+products (`v2:` line in /process.txt, growing ~4/h as the fleet
+upgrades).
+
+Client notes:
+  * POST only. GET /api/v3/trees returns 404 (not 405) — send a JSON
+    body with `geometry` (any format in "Geometry Input") or a bare
+    GeoJSON; a body without geometry → 400.
+  * Cold start per KG: the first request touching a KG downloads its
+    `_light_v2.gpkg` from Zenodo into the server-side GPKG cache
+    (1 GB LRU). Light v2 GPKGs are 100-800 MB for large KGs (63330:
+    743 MB → 223 s cold, then <2 s). Use `async=true` (poll
+    /api/v1/segment/progress/<task_id> → /result) or set a client
+    timeout ≥ 300 s for the first hit; subsequent hits on the same KG
+    are fast until the LRU evicts it.
+  * To check coverage before calling: GET /api/v1/kg/<code> and look
+    for `_links.zenodo_light_gpkg_v2` / `product_version == "v2"`, or
+    query the search index with `product_version=v2`. Uncovered AOI
+    parts fall back to the live v2 detector (fallback_live=true, same
+    latency as /api/v2/trees) — meta.coverage tells you which.
+  * Product apices are frozen at the KG's als_year (2022–2024); check
+    per-tree `als_year` before comparing against recent field data.
 
 Coverage rules (meta.coverage / meta.source_mix):
   * AOI → parent KGs (R-tree) → product codes with a 2.1 light GPKG.
@@ -728,6 +748,10 @@ shrub|other|none; 'unknown' for live trees), segment_type (+_conf),
 dh_per_year_m (nDSM newest−oldest at the apex / flight-year gap; null
 when the KG has one flight year), als_year (flight year of the block),
 ndvi (Sentinel-2 at the apex), source=product|live, product_code.
+Worked example (KG 63330 Kohlschwarz, 300 m AOI, 2026-09-20): 953
+trees, by_source={product:953, live:0}, coverage.product_frac=1.0,
+by_leaf_type={broadleaf:307, coniferous:646}, area_ha_canopy 1.75 of
+7.59 ha total.
 summary: n_trees (+_product/_live/_edge), area_ha_total,
 area_ha_canopy (grid25 stand cells × 625 m² whose centre is in the
 AOI + live canopy px), area_ha_canopy_cover_weighted, area_ha_forest

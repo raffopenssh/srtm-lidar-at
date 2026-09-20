@@ -3689,16 +3689,48 @@ class GpkgCache:
     def _path(self, kg_code, variant):
         return self.cache_dir / f'{kg_code}_{variant}.gpkg'
 
-    def get(self, kg_code, variant='light'):
-        """Return cached path if it exists, else None. Touch for LRU."""
+    def get(self, kg_code, variant='light', expected_size=0):
+        """Return cached path if it exists, else None. Touch for LRU.
+
+        ``expected_size`` > 0 (the manifest's current byte size) turns a
+        size mismatch into an eviction: a KG that was re-upgraded (e.g.
+        63330 went 2.1 → 2.2 within one day) must not keep serving the
+        previous product from disk.
+        """
         p = self._path(kg_code, variant)
         if p.exists() and p.stat().st_size > 0:
+            if expected_size and p.stat().st_size != expected_size:
+                log.info('gpkg_cache: %s stale (%d vs manifest %d) — evicting',
+                         p.name, p.stat().st_size, expected_size)
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                return None
             try:
                 p.touch()  # update mtime for LRU
             except OSError:
                 pass
             return str(p)
         return None
+
+    def sweep_stale(self, manifest_entries):
+        """Delete cached GPKGs whose size no longer matches the manifest (or
+        that have no manifest entry at all).  Returns list of removed names."""
+        by_fn = {e['filename']: e for e in manifest_entries.values()
+                 if isinstance(e, dict) and e.get('filename')}
+        removed = []
+        for p in list(self.cache_dir.glob('*.gpkg')) + list(self.cache_dir.glob('*.gpkg.tmp')):
+            e = by_fn.get(p.name)
+            stale = p.suffix == '.tmp' or e is None or int(e.get('size') or 0) != p.stat().st_size
+            if stale:
+                try:
+                    p.unlink()
+                    removed.append(p.name)
+                    log.info('gpkg_cache: sweep removed %s', p.name)
+                except OSError:
+                    pass
+        return removed
 
     def download(self, kg_code, variant, url, headers=None, expected_size=0):
         """Download a GPKG from Zenodo. Returns local path or None.

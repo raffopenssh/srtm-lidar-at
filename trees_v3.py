@@ -215,7 +215,7 @@ def gpkg_path(code: str, entry: dict) -> str | None:
     if local.exists() and local.stat().st_size > 0:
         return str(local)
     cache = si.get_gpkg_cache()
-    p = cache.get(code, GPKG_VARIANT)
+    p = cache.get(code, GPKG_VARIANT, expected_size=int(entry.get("size") or 0))
     if p:
         return p
     from v2_ingest import _link

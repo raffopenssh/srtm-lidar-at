@@ -3857,20 +3857,13 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     # ------------------------------------------------------------------
     # Compute union bounding box of all tiles
     # ------------------------------------------------------------------
-    all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
-    all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
-    all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
-    all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
-    full_left = min(all_lefts)
-    full_bottom = min(all_bottoms)
-    full_right = max(all_rights)
-    full_top = max(all_tops)
-
+    # Grid anchor (2.2): snap the union outwards to whole metres so the
+    # stitched grid is the integer-metre BEV grid regardless of whether a
+    # tile arrived with a fractional origin (restored pre-2.2 checkpoint).
+    import raster_io as _rio_grid
+    full_left, full_bottom, full_right, full_top, full_w, full_h, full_tf = \
+        _rio_grid.full_grid_from_bounds([tr["bounds_3035"] for tr in tile_seg_results])
     res = 1.0  # 1m resolution
-    full_w = int(round((full_right - full_left) / res))
-    full_h = int(round((full_top - full_bottom) / res))
-    full_tf = rasterio.transform.from_bounds(
-        full_left, full_bottom, full_right, full_top, full_w, full_h)
 
     log.info("  Full-KG raster: %d x %d px (%.0f x %.0f m), %d tiles",
              full_w, full_h, full_right - full_left, full_top - full_bottom,
@@ -4676,20 +4669,10 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
     if tile_seg_results and not _has_labels:
         log.info("  Light GPKG: skipping raster stitching (tile arrays freed for memory)")
     if tile_seg_results and _has_labels:
-        all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
-        all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
-        all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
-        all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
-        full_left = min(all_lefts)
-        full_bottom = min(all_bottoms)
-        full_right = max(all_rights)
-        full_top = max(all_tops)
-
+        import raster_io as _rio_grid
+        full_left, full_bottom, full_right, full_top, full_w, full_h, full_tf = \
+            _rio_grid.full_grid_from_bounds([tr["bounds_3035"] for tr in tile_seg_results])
         res = 1.0  # 1m resolution
-        full_w = int(round((full_right - full_left) / res))
-        full_h = int(round((full_top - full_bottom) / res))
-        full_tf = rasterio.transform.from_bounds(
-            full_left, full_bottom, full_right, full_top, full_w, full_h)
 
         # Allocate full-KG rasters for segments
         seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
@@ -7104,6 +7087,21 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                          kg_code, tile_idx, ck.get("model_version", "v1"), MODEL_VERSION)
                 dst.unlink(missing_ok=True)
                 return None
+            # Grid anchor (2.2): checkpoints written by pre-2.2 code (or
+            # restored cross-peer from an older run) carry the fractional
+            # AOI origin while their pixel data sit on the integer BEV grid.
+            # KG 63330 (2026-09-20) stitched 18 such tiles with 2 fresh ones
+            # → full_left=x.399 → every apex X at .9, tree_id off vs live.
+            sr = ck.get("seg_result")
+            if sr is not None and sr.get("transform") is not None:
+                _tf2, _chg = raster_io.reanchor_transform(sr["transform"])
+                if _chg:
+                    import rasterio.transform as _rt
+                    th_, tw_ = sr["shape"]
+                    sr["transform"] = _tf2
+                    sr["bounds_3035"] = _rt.array_bounds(th_, tw_, _tf2)
+                    log.warning("KG %s: tile %d checkpoint re-anchored to the BEV grid "
+                                "(fractional origin from pre-2.2 code)", kg_code, tile_idx)
             return ck
         except Exception:
             dst.unlink(missing_ok=True)

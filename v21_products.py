@@ -622,6 +622,18 @@ def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray 
     from rasterio.features import rasterize
     from rasterio.transform import Affine
     H, W = ndsm_full.shape
+    # Grid anchor guard: the apex = pixel centre of the *integer-metre* BEV
+    # grid; a fractional full_tf origin would silently shift every tree_id
+    # (FEEDBACK-5 §1). Re-anchor + shout rather than bake an off-grid product.
+    try:
+        import raster_io as _rio
+        _tf2, _chg = _rio.reanchor_transform(full_tf)
+        if _chg:
+            log.warning("build_tree_apices: full_tf origin (%.3f, %.3f) off the integer-metre "
+                        "grid — re-anchored to (%.0f, %.0f)", full_tf.c, full_tf.f, _tf2.c, _tf2.f)
+            full_tf = _tf2
+    except Exception:  # noqa: BLE001
+        pass
     obj_conf = {}
     if labels_full is not None:
         for o in all_objects:

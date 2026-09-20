@@ -47,6 +47,45 @@ def snap_bbox(min_e: float, min_n: float, max_e: float, max_n: float) -> tuple[f
             float(np.ceil(max_e)), float(np.ceil(max_n)))
 
 
+def reanchor_transform(tf) -> tuple["rasterio.transform.Affine", bool]:
+    """Snap a 1 m EPSG:3035 transform onto the integer-metre BEV grid.
+
+    Pre-2.2 windows (and tile checkpoints / v1 GPKGs written by them) carry a
+    *fractional* origin while their pixel DATA sit on the integer grid
+    (rasterio floors the window offset — see ``read_window_bbox``).  The
+    correct re-anchor is therefore ``floor(c)`` / ``ceil(f)`` — the pixel
+    row/col the floored window actually started at.  Returns
+    ``(transform, changed)``; non-1 m grids are returned untouched.
+    """
+    if abs(abs(tf.a) - 1.0) > 0.01 or abs(abs(tf.e) - 1.0) > 0.01:
+        return tf, False
+    if abs(tf.c - round(tf.c)) < 1e-6 and abs(tf.f - round(tf.f)) < 1e-6 \
+            and abs(tf.a - 1.0) < 1e-9 and abs(tf.e + 1.0) < 1e-9:
+        return tf, False
+    return rasterio.transform.Affine(1.0, 0.0, float(np.floor(tf.c + 1e-6)),
+                                     0.0, -1.0, float(np.ceil(tf.f - 1e-6))), True
+
+
+def full_grid_from_bounds(bounds_list) -> tuple[float, float, float, float, int, int,
+                                                 "rasterio.transform.Affine"]:
+    """Union of tile ``bounds_3035`` → integer-metre full-KG grid.
+
+    Returns ``(left, bottom, right, top, width, height, transform)`` with the
+    origin snapped outwards to whole metres and an exact 1 m pixel, so the
+    stitched rasters — and every apex / ``tree_id`` derived from them — sit on
+    the BEV grid even when some tiles arrived with a fractional origin.
+    """
+    left = min(b[0] for b in bounds_list)
+    bottom = min(b[1] for b in bounds_list)
+    right = max(b[2] for b in bounds_list)
+    top = max(b[3] for b in bounds_list)
+    left, bottom, right, top = snap_bbox(left + 1e-6, bottom + 1e-6, right - 1e-6, top - 1e-6)
+    w = int(round(right - left))
+    h = int(round(top - bottom))
+    tf = rasterio.transform.from_origin(left, top, 1.0, 1.0)
+    return left, bottom, right, top, w, h, tf
+
+
 GRID_ANCHOR = {
     "crs": "EPSG:3035", "res_m": 1.0, "origin": "integer metre (BEV ALS grid)",
     "apex_anchor": "pixel_center",

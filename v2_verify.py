@@ -380,7 +380,9 @@ def check_v21_light_gpkg(c: sqlite3.Connection, layers: dict, v2: dict, rep: Rep
     if pts:
         off = [abs(((x - 0.5) % 1.0)) + abs(((y - 0.5) % 1.0)) for x, y in pts]
         bad = sum(1 for o in off if min(o, 2.0 - o) > 0.02)
-        rep.check("apex_grid_anchor", bad == 0, f"{bad}/{len(pts)} apices off the x.5 grid", fatal=False)
+        # fatal since 2026-09-20: KG 63330 shipped 50/50 apices at x.9 (restored
+        # pre-2.2 tile checkpoints with a fractional origin) — tree_id unstable vs live.
+        rep.check("apex_grid_anchor", bad == 0, f"{bad}/{len(pts)} apices off the x.5 grid")
     n_cr = int(_num(ts.get("n_crowns"), 0) or 0)
     if ts.get("crowns_layer") == "tree_crowns":
         try:

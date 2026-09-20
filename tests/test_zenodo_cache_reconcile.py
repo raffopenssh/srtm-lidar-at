@@ -43,7 +43,9 @@ class _Resp:
 
 
 def _mk_cache(tmp: Path, files: dict):
-    zc._zen_circuit_cache = (0.0, False)
+    # Isolate from the real cache_manifest.json (its live circuit flag
+    # would otherwise steer _handle_upload_failure into the degraded branch).
+    zc.zenodo_degraded = lambda *a, **k: False
     mpath = tmp / "cache_manifest.json"
     mpath.write_text(json.dumps({"depo_id": DEPO, "record_id": None,
                                  "files": files}))
@@ -254,7 +256,8 @@ def test_reconcile_restores_usable_and_flags_corrupt_and_tombstones_missing():
                 return True, "ok (1 entries, 1 tiles)", 1
             return False, "central directory unreadable: bad zip", 0
         cache._probe_zip_usable = _probe
-        with mock.patch.object(zc, "_ZIP_INDEX_CACHE_DIR", tmp / "idx"):
+        with mock.patch.object(zc, "_ZIP_INDEX_CACHE_DIR", tmp / "idx"), \
+                mock.patch.object(zc, "DATA_DIR", tmp):
             dry = cache.reconcile_manifest(dry_run=True, take_lock=False)
             assert dry["changed"] == 0 and dry["restored"] == 1
             assert json.loads(mpath.read_text())["files"][NAME]["size"] == 0

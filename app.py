@@ -3423,6 +3423,14 @@ def processing_cache_manifest():
                 local.get('prewarm'), dict) else {}
             if inc_pw.get('updated_at', '') >= loc_pw.get('updated_at', ''):
                 local['prewarm'] = inc_pw
+        # Same transport for the director's Zenodo-degraded circuit flag
+        # (read by zenodo_cache.zenodo_degraded() on every peer).
+        if isinstance(incoming.get('zenodo_circuit'), dict):
+            inc_zc = incoming['zenodo_circuit']
+            loc_zc = local.get('zenodo_circuit') if isinstance(
+                local.get('zenodo_circuit'), dict) else {}
+            if inc_zc.get('updated_at', '') >= loc_zc.get('updated_at', ''):
+                local['zenodo_circuit'] = inc_zc
 
         # Always adopt depo_id / record_id from the incoming manifest.
         # The primary is the authority — peers must use the shared deposit.
@@ -20333,11 +20341,61 @@ def process_txt():
         cache_bytes = sum(int(v.get('size') or 0) for v in files_d.values())
         depo = (cmf.get('depo_id') or cmf.get('deposition_id')
                 if isinstance(cmf, dict) else None)
+        _tomb = sum(1 for v in files_d.values() if not int(v.get('size') or 0))
+        _unv = sum(1 for v in files_d.values() if v.get('unverified'))
         out.append(
             f'zen_cache: depo={depo or "-"} '
             f'files={len(files_d)} tiles={cache_tiles} '
             f'bytes={cache_bytes/1e9:.2f}GB'
+            + (f' tombstoned={_tomb}' if _tomb else '')
+            + (f' unverified={_unv}' if _unv else '')
         )
+        # Zenodo-degraded circuit (director-written, rides this manifest
+        # to peers) + last cache_manifest ↔ deposit reconcile summary.
+        _zc = d.get('zenodo_circuit') or (
+            cmf.get('zenodo_circuit') if isinstance(cmf, dict) else None) or {}
+        if _zc:
+            if _zc.get('degraded'):
+                _health['zenodo_degraded'] = _zc
+                out.append(
+                    f'zenodo_circuit: DEGRADED since {_zc.get("since", "?")} '
+                    f'peers_15m={_zc.get("n_peers_15m", "?")} '
+                    f'last_failure={_zc.get("last_failure_at", "?")} '
+                    f'trips={_zc.get("trip_count", 0)} — peers defer cache-cell '
+                    f'replacement uploads, no tombstones; clears after 30m quiet'
+                )
+            else:
+                out.append(
+                    f'zenodo_circuit: ok peers_15m={_zc.get("n_peers_15m", 0)}'
+                    f'/{3} trips={_zc.get("trip_count", 0)}'
+                    + (f' cleared_at={_zc["cleared_at"]}' if _zc.get('cleared_at') else '')
+                    + (f' last_failure={_zc["last_failure_at"]}' if _zc.get('last_failure_at') else '')
+                )
+        _cr = d.get('cache_reconcile') or {}
+        if not _cr:
+            try:
+                _crp = Path('data/austria_processor/cache_reconcile_last.json')
+                if _crp.exists():
+                    _cr = json.loads(_crp.read_text())
+            except Exception:
+                _cr = {}
+        if _cr:
+            out.append(
+                f'cache_reconcile: at={_cr.get("at", "?")} '
+                f'tombstoned={_cr.get("tombstoned", 0)} '
+                f'restored={_cr.get("restored", 0)} '
+                f'corrupt={_cr.get("corrupt", 0)} '
+                f'unknown={_cr.get("unknown", 0)} '
+                f'unverified_cleared={_cr.get("unverified_cleared", 0)} '
+                f'drift_fixed={_cr.get("drift_fixed", 0)} '
+                f'deposit_files={_cr.get("deposit_files", "?")}'
+                + (f' took={_cr["took_s"]}s' if _cr.get('took_s') is not None else '')
+                + (' (forced by circuit clear)' if _cr.get('forced') else '')
+                + (f' ERROR={_cr["error"]}' if _cr.get('error') else '')
+            )
+        else:
+            out.append('cache_reconcile: (never run) — hourly on director; '
+                       'python3 zenodo_cache.py reconcile for a dry run')
     except Exception:
         pass
 
@@ -20978,6 +21036,11 @@ def process_txt():
             _flags.append(
                 'FLEET-DORMANT(since '
                 + str(_health['dormant'].get('since', '?')) + ')')
+        if _health.get('zenodo_degraded'):
+            _flags.append(
+                'ZENODO-DEGRADED(since '
+                + str(_health['zenodo_degraded'].get('since', '?'))
+                + f', {_health["zenodo_degraded"].get("n_peers_15m", "?")} peers)')
         cpu = _health.get('cpu')
         if cpu and cpu.get('n'):
             _frac = cpu['throttled'] / cpu['n']

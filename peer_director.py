@@ -273,6 +273,26 @@ _REVALIDATE_LOCK = threading.Lock()
 # ``last_status`` from ``copernicus.list_credentials()``; that cache
 # is updated by ``_save_credentials_to_disk()`` after each probe.
 _REVALIDATE_INTERVAL_S = 600
+
+# === Zenodo tile-cache manifest reconcile + Zenodo-degraded circuit ===
+# Hourly reconcile of cache_manifest.json against the live deposit
+# listing (zenodo_cache.reconcile_manifest). Runs in a daemon thread
+# off the director loop (ZIP probes can take minutes when Zenodo is
+# slow); TTL-throttled via state['_cache_reconcile_at'] like
+# _refresh_credentials_if_due. Also fired immediately when the
+# Zenodo-degraded circuit clears.
+CACHE_RECONCILE_INTERVAL_S = 3600
+_CACHE_RECONCILE_LOCK = threading.Lock()
+# Fleet-wide Zenodo-degraded circuit: trips when >= N distinct peers log
+# a Zenodo PUT failure / 5xx / timeout inside the window; clears after
+# CLEAR_S without a new failure. Published to peers via
+# cache_manifest.json['zenodo_circuit'] (rides the 5-min sync like the
+# prewarm directive). While set, peers skip cache-cell REPLACEMENT
+# uploads and never tombstone (zenodo_cache.zenodo_degraded()).
+ZENODO_DEGRADED_MIN_PEERS = 3
+ZENODO_DEGRADED_WINDOW_S = 15 * 60
+ZENODO_DEGRADED_CLEAR_S = 30 * 60
+ZENODO_DEGRADED_SCAN_INTERVAL_S = 60
 # Hard kill switch: only the director loop is permitted to call
 # ``revalidate_all_credentials()``. The dashboard path
 # (``get_status`` → ``_valid_credentials``) reads cached statuses
@@ -3738,6 +3758,8 @@ class PeerDirector:
                    'parallel_frontiers_active', 'frontier_cred_plan',
                    'frontier_strip_plan', 'cache_only_active',
                    'parallel_unreachable_count',
+                   'zenodo_circuit', 'cache_reconcile',
+                   '_cache_reconcile_at',
                    '_creds_revalidated_at',
                    '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch',
@@ -4250,6 +4272,8 @@ class PeerDirector:
             'peer_meta': state.get('peer_meta') or {},
             # BEV outage + IP-pool stats (surfaced in /process.txt).
             'fleet_dormant': state.get('fleet_dormant') or {},
+            'zenodo_circuit': {k: v for k, v in (state.get('zenodo_circuit') or {}).items() if not k.startswith('_')},
+            'cache_reconcile': state.get('cache_reconcile') or {},
             'bev_pause': state.get('bev_pause') or {},
             'bev_pause_history': state.get('bev_pause_history') or [],
             'bev_pool_escalation': state.get('bev_pool_escalation') or {},
@@ -6599,6 +6623,214 @@ class PeerDirector:
             if len(hist) > BEV_PAUSE_HISTORY_MAX:
                 hist = hist[-BEV_PAUSE_HISTORY_MAX:]
             self.state['bev_pause_history'] = hist
+
+    # === SECTION: Zenodo-degraded circuit + cache reconcile ===
+
+    # Message classifier for the circuit: Zenodo *write-path* failures
+    # only (PUT failed / upload failed / 5xx / timeouts). Deliberately
+    # excludes read-side 404s on ZIP indices — those are manifest drift
+    # (handled by the reconciler), not Zenodo being down.
+    _ZEN_FAIL_RE = None
+
+    @classmethod
+    def _zen_fail_re(cls):
+        if cls._ZEN_FAIL_RE is None:
+            import re as _re
+            cls._ZEN_FAIL_RE = _re.compile(
+                r'(zenodo_client: PUT .* failed|'
+                r'zenodo_cache: Upload of .* failed|'
+                r'zenodo_cache: upload of .* failed|'
+                r'Failed to upload .*zip|'
+                r'Zenodo network|'
+                r'Zenodo (GET|POST|PUT|DELETE) .* → 5\d\d|'
+                r'(50[0-9]|429) (Server Error|Client Error|Bad Gateway|'
+                r'Gateway Time-out|Service Unavailable)|'
+                r'Gateway Time-out|Bad Gateway|'
+                r'zenodo\.org.*(timed out|Max retries|SSLError|'
+                r'Connection aborted))', _re.I)
+        return cls._ZEN_FAIL_RE
+
+    def _scan_zenodo_failures(self, window_s: int) -> dict:
+        """Distinct peers with a Zenodo write failure in the last
+        ``window_s`` seconds, from the tail of the merged 24h log ring
+        (``data/combined_log_24h.jsonl``). Returns ``{peer: last_iso}``.
+        Reads at most the last ~3 MB of the file."""
+        p = Path('data/combined_log_24h.jsonl')
+        out: dict = {}
+        try:
+            if not p.exists():
+                return out
+            size = p.stat().st_size
+            with open(p, 'rb') as f:
+                if size > 3_000_000:
+                    f.seek(size - 3_000_000)
+                    f.readline()
+                raw = f.read()
+        except Exception:
+            return out
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=window_s)).isoformat()
+        rx = self._zen_fail_re()
+        for line in raw.splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            ts = e.get('ts') or ''
+            if ts < cutoff or e.get('level') not in ('warning', 'error'):
+                continue
+            msg = e.get('msg') or ''
+            low = msg.lower()
+            if 'zenodo' not in low and 'deposit' not in low:
+                continue
+            if 'zip index fetch failed' in low and '404' in low:
+                continue
+            if not rx.search(msg):
+                continue
+            pid = e.get('peer') or '?'
+            if ts > out.get(pid, ''):
+                out[pid] = ts
+        return out
+
+    def _publish_zenodo_circuit(self, zc: dict) -> None:
+        """Write ``zenodo_circuit`` into cache_manifest.json so it rides
+        the existing primary→peer sync (same transport as ``prewarm``).
+        Idempotent on ``degraded``."""
+        manifest_path = DATA_DIR / 'cache_manifest.json'
+        try:
+            data = {}
+            if manifest_path.exists():
+                data = json.loads(manifest_path.read_text())
+            prev = data.get('zenodo_circuit') or {}
+            if bool(prev.get('degraded')) == bool(zc.get('degraded')) and \
+                    prev.get('since') == zc.get('since'):
+                return
+            data['zenodo_circuit'] = {
+                'degraded': bool(zc.get('degraded')),
+                'since': zc.get('since'),
+                'cleared_at': zc.get('cleared_at'),
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(manifest_path) + '.circuit.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            os.replace(tmp, manifest_path)
+        except Exception as e:
+            log.debug('zenodo_circuit publish failed: %s', e)
+
+    def _check_zenodo_degraded(self) -> None:
+        """Trip / clear the fleet Zenodo-degraded circuit. Director-loop
+        worker only; throttled to one log scan per
+        ZENODO_DEGRADED_SCAN_INTERVAL_S. State persisted in
+        director_state.json['zenodo_circuit'] (survives the gunicorn
+        2-worker swap + HA handover via SNAPSHOT_FILES)."""
+        now = time.time()
+        zc = dict(self.state.get('zenodo_circuit') or {})
+        if now - float(zc.get('_scanned_at') or 0) < ZENODO_DEGRADED_SCAN_INTERVAL_S:
+            return
+        fails = self._scan_zenodo_failures(ZENODO_DEGRADED_WINDOW_S)
+        zc['_scanned_at'] = now
+        zc['peers_15m'] = sorted(fails)
+        zc['n_peers_15m'] = len(fails)
+        last_fail_iso = max(fails.values()) if fails else zc.get('last_failure_at')
+        if fails:
+            zc['last_failure_at'] = last_fail_iso
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        was = bool(zc.get('degraded'))
+        if not was and len(fails) >= ZENODO_DEGRADED_MIN_PEERS:
+            zc.update({'degraded': True, 'since': now_iso,
+                       'trip_count': int(zc.get('trip_count') or 0) + 1,
+                       'trip_peers': sorted(fails)})
+            _emit_director_event(
+                f'zenodo_circuit: TRIPPED — {len(fails)} peers logged '
+                f'Zenodo write failures in {ZENODO_DEGRADED_WINDOW_S // 60} min '
+                f'({", ".join(sorted(fails)[:8])}); peers defer cache-cell '
+                f'replacement uploads + never tombstone until clear',
+                peer='director', level='warning')
+            log.warning('zenodo_circuit tripped: %s', sorted(fails))
+        elif was:
+            quiet_s = None
+            try:
+                lf = zc.get('last_failure_at')
+                if lf:
+                    quiet_s = (datetime.now(timezone.utc)
+                               - datetime.fromisoformat(lf)).total_seconds()
+            except Exception:
+                quiet_s = None
+            if quiet_s is None or quiet_s >= ZENODO_DEGRADED_CLEAR_S:
+                zc.update({'degraded': False, 'cleared_at': now_iso})
+                _emit_director_event(
+                    f'zenodo_circuit: CLEARED after '
+                    f'{int((quiet_s or 0) // 60)} min without Zenodo write '
+                    f'failures (was degraded since {zc.get("since")}); '
+                    f'running cache-manifest reconcile now',
+                    peer='director')
+                log.info('zenodo_circuit cleared; triggering reconcile')
+                self.state['zenodo_circuit'] = zc
+                self._publish_zenodo_circuit(zc)
+                self._reconcile_cache_manifest_if_due(force=True)
+                return
+        self.state['zenodo_circuit'] = zc
+        self._publish_zenodo_circuit(zc)
+
+    def _reconcile_cache_manifest_if_due(self, force: bool = False) -> None:
+        """Hourly (or forced) cache_manifest ↔ deposit reconcile in a
+        daemon thread. Single-flight via _CACHE_RECONCILE_LOCK; TTL via
+        state['_cache_reconcile_at']. Skipped while the circuit is
+        degraded (the listing is exactly what's flaky then) unless
+        forced. Emits a director_event when anything changed."""
+        now = time.time()
+        last = float(self.state.get('_cache_reconcile_at') or 0)
+        if not force and now - last < CACHE_RECONCILE_INTERVAL_S:
+            return
+        if not force and (self.state.get('zenodo_circuit') or {}).get('degraded'):
+            return
+        if not _CACHE_RECONCILE_LOCK.acquire(blocking=False):
+            return
+        self.state['_cache_reconcile_at'] = now
+
+        def _run():
+            try:
+                import zenodo_cache as _zc
+                s = _zc.reconcile_manifest(dry_run=False, take_lock=True)
+                slim = {k: s.get(k) for k in (
+                    'at', 'tombstoned', 'restored', 'corrupt', 'unknown',
+                    'unverified_cleared', 'drift_fixed', 'changed',
+                    'deposit_files', 'took_s', 'error')}
+                slim['forced'] = bool(force)
+                self.state['cache_reconcile'] = slim
+                if s.get('error'):
+                    _emit_director_event(
+                        f'cache_reconcile: failed — {s["error"]}',
+                        peer='director', level='warning')
+                elif s.get('changed'):
+                    det = '; '.join(
+                        f'{d["action"]} {d["file"]}'
+                        for d in (s.get('details') or [])
+                        if d.get('action') in ('tombstoned', 'restored', 'corrupt'))
+                    _emit_director_event(
+                        f'cache_reconcile: tombstoned={s["tombstoned"]} '
+                        f'restored={s["restored"]} corrupt={s["corrupt"]} '
+                        f'unknown={s["unknown"]} '
+                        f'unverified_cleared={s["unverified_cleared"]} '
+                        f'drift_fixed={s["drift_fixed"]} — {det[:600]}',
+                        peer='director',
+                        level='warning' if (s['tombstoned'] or s['corrupt'])
+                        else 'info')
+                else:
+                    log.info('cache_reconcile: clean (deposit_files=%s)',
+                             s.get('deposit_files'))
+            except Exception as e:
+                log.warning('cache_reconcile thread failed: %s', e)
+                self.state['cache_reconcile'] = {
+                    'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'error': str(e)[:200]}
+            finally:
+                _CACHE_RECONCILE_LOCK.release()
+
+        threading.Thread(target=_run, daemon=True,
+                         name='cache-reconcile').start()
 
     def _check_bev_outage(self, statuses: dict) -> None:
         """Detect a BEV outage and flip ``state['bev_pause']``.
@@ -12465,6 +12697,16 @@ class PeerDirector:
                         locals().get('_statuses') or {})
                 except Exception:
                     log.exception('BEV outage check error')
+                # Zenodo-degraded circuit (fleet write failures) + hourly
+                # cache_manifest ↔ deposit reconcile (background thread).
+                try:
+                    self._check_zenodo_degraded()
+                except Exception:
+                    log.exception('Zenodo circuit check error')
+                try:
+                    self._reconcile_cache_manifest_if_due()
+                except Exception:
+                    log.exception('Cache reconcile scheduling error')
                 # Canary-probe parked /24 pools so a 20-min route flap
                 # doesn't waste the full 1h/4h/12h/24h cooldown. One
                 # peer per pool gets a single HEAD-range probe to

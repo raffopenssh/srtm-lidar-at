@@ -62,7 +62,31 @@ _BROKER_HTTP_TIMEOUT = (5, 60)  # (connect, read)
 
 def _broker_url() -> Optional[str]:
     url = os.environ.get('ZENODO_LOCK_URL', '').strip()
-    return url.rstrip('/') if url else None
+    if url:
+        return url.rstrip('/')
+    # Env unset: we are probably running inside gunicorn on a director /
+    # primary (the processor always gets the env from app.py). Resolve the
+    # same way app.py does for the processor so director-side Zenodo
+    # writers (cache reconcile, chkpt deletes) still serialise through
+    # the broker instead of silently running lock-less.
+    try:
+        lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
+        if lock_file.exists():
+            u = lock_file.read_text().strip()
+            if u:
+                return u.rstrip('/')
+        if Path('data/austria_processor/is_director').exists():
+            broker = 'http://127.0.0.1:8001'
+            try:
+                r = requests.get(broker + '/api/v1/zenodo/lock', timeout=1.0)
+                if r.status_code == 200:
+                    return broker
+            except Exception:
+                pass
+            return 'http://127.0.0.1:8000'
+    except Exception:
+        pass
+    return None
 
 
 def _peer_id() -> str:

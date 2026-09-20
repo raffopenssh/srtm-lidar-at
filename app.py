@@ -10016,6 +10016,18 @@ def api_kg_segments(kg_code):
 
 
 # === SECTION: /api/v1/kg/<code>/heightfield — index-only gridded DTM estimate ===
+
+def _grid25_product_version(grids) -> str | None:
+    """Highest ``product_version`` among the v2 store metas of the grids' codes."""
+    try:
+        import kg_v2_store
+        vs = [(kg_v2_store.get_meta(g['code']) or {}).get('product_version') for g in grids]
+        vs = [v for v in vs if v]
+        return max(vs, key=lambda v: tuple(int(x) for x in str(v).split('.'))) if vs else None
+    except Exception:
+        return None
+
+
 _HEIGHTFIELD_CACHE = {}          # (kg, cell) -> (ts, payload)
 _HEIGHTFIELD_CACHE_MAX = 400
 
@@ -10109,9 +10121,10 @@ def _heightfield_from_grid25(kg_code, grids, w, s, e, n, cell, want_landcover):
         'elev_max': float(fin.max()) if fin.size else None,
         'samples': int(sum(int(np.isfinite(g['terrain']['elev']).sum()) for g in grids)),
         'product_codes': [g['code'] for g in grids],
+        'product_version': _grid25_product_version(grids),
         'source': 'dtm_grid25_v2.1',
         'source_detail': '25 m block means of BEV ALS DTM 1 m (CC BY 4.0, bearbeitet), '
-                         'bilinear-resampled from the v2.1 product terrain.grid25',
+                         'bilinear-resampled from the v2.1+ product terrain.grid25',
         'null_cells': int(np.isnan(Z).sum()),
         'z': zl,
     }
@@ -10149,8 +10162,14 @@ def api_kg_landcover(kg_code):
                         'cols': lc['cols'], 'rows': lc['rows'], 'origin': 'nw', 'crs': 'EPSG:3035',
                         'legend': lc['legend'], 'cls': lc['cls'].tolist(),
                         'cover_frac': np.round(lc['cover_frac'], 2).tolist()})
-        return jsonify({'kg_code': kg_code, 'product_version': '2.1', 'grids': out,
-                        'source': 'landcover.grid25 — dominant v2 segment class per 25 m cell'})
+            # 2.2 adds per-cell woody / tree / apex-inventory canopy fractions
+            for k in ('woody_frac', 'tree_frac', 'canopy_frac'):
+                if lc.get(k) is not None:
+                    out[-1][k] = np.round(np.asarray(lc[k], dtype=float), 2).tolist()
+        return jsonify({'kg_code': kg_code, 'product_version': _grid25_product_version(grids),
+                        'grids': out,
+                        'source': 'landcover.grid25 — dominant v2 segment class per 25 m cell; '
+                                  'woody_frac/tree_frac/canopy_frac present for 2.2+ products'})
     except Exception as e:
         log.warning('api_kg_landcover %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500

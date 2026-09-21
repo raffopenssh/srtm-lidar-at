@@ -146,7 +146,7 @@ deposition, so they never 409 each other); everything else
 (`cache_flush_zip:*`, `reconcile`, `chkpt_upload:*`/`chkpt_delete:*`) is
 the **cache** class — one at a time, but **independent of the shared
 pool** (they write the shared tile-cache draft, which KG uploads never
-touch). Never-heartbeated leases are reaped after 75 s (`ORPHAN_S`);
+touch). Never-heartbeated leases are reaped after 100 s (`ORPHAN_S`, 3 missed heartbeats);
 heartbeated ones after the 120 s TTL.
 
 History: before the pool, KG uploads were fully serialised — with a

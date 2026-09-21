@@ -50,9 +50,11 @@ Lease classes (since 2026-09-21)
   "proceeding without lease" just like before the pool existed.
 
 Orphan detection: a lease that has *never* been heartbeated
-(``last_heartbeat == acquired_at``) is dropped after ``ORPHAN_S`` (75 s,
-2.5 heartbeat intervals) instead of the full TTL — a live client
-heartbeats at 30 s, so silence for 75 s means the process is gone.
+(``last_heartbeat == acquired_at``) is dropped after ``ORPHAN_S`` (100 s,
+3 missed heartbeats) instead of the full TTL — a live client heartbeats
+at 30 s, so three consecutive misses mean the process is gone (or the
+:8000 proxy was restarting — harmless: the slot frees early, the
+client's next heartbeat gets 410 and its upload continues unlocked).
 
 State is held in memory and persisted to disk on every mutation so a
 restart doesn't 410 every active heartbeat.  TTL = 120 s per lease.
@@ -86,7 +88,7 @@ ADMIN_TOKEN_FILE = _HERE / 'data' / 'admin_token'
 TTL_S = 120.0
 SHARED_SLOTS = max(1, int(os.environ.get('ZENODO_LOCK_KG_SLOTS', '8') or 8))
 # Never-heartbeated leases are orphans (client process exited) after this.
-ORPHAN_S = 75.0
+ORPHAN_S = 100.0
 LISTEN_HOST = os.environ.get('ZENODO_LOCK_BROKER_HOST', '127.0.0.1')
 LISTEN_PORT = int(os.environ.get('ZENODO_LOCK_BROKER_PORT', '8001'))
 

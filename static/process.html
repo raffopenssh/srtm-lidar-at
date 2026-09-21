@@ -1435,7 +1435,8 @@ function updateCards(d) {
   // ETA from manifest rate if available; else processor-reported eta_seconds
   let etaS = d.eta_seconds;
   if (mRate && mRate > 0) {
-    const total = d.total_kgs || 0;
+    // Same 8440 fallback as the progress bar (d.total_kgs is the current
+    // run's total, often 1 on the parked primary).
     const done = (d.db_processed != null ? d.db_processed : (d.completed || 0));
     const remaining = Math.max(total - done, 0);
     etaS = (remaining / mRate) * 3600;
@@ -1443,7 +1444,7 @@ function updateCards(d) {
   if (etaS) rdet += ' · ETA ' + fmtD(etaS);
   if (d.last_kg_seconds) rdet += ' · last ' + fmtD(d.last_kg_seconds);
   if (mRate != null && d.manifest_window_kgs) {
-    rdet += ' · <span style="opacity:0.6">last ' + d.manifest_window_kgs + ' uploads</span>';
+    rdet += ' · <span style="opacity:0.6" title="fresh KG completions only (parents; v2.x upgrade re-uploads excluded)">last ' + d.manifest_window_kgs + ' fresh KGs</span>';
   }
   document.getElementById('cRateDet').innerHTML = rdet || '—';
 
@@ -1644,17 +1645,41 @@ function renderV2(v) {
     bar.style.width = '0';
     return;
   }
+  // Index-sourced, version-aware: `upgraded_parents` = parents whose EVERY
+  // block is at the current product version (v2.2); parents still on
+  // v2/v2.1 are "stale" (re-upgrade pending) and are shown as a hatched
+  // second segment so a 2.1→2.2 wave doesn't read as double progress.
   const total = v.total || 8440;
   const up = v.upgraded_parents != null ? v.upgraded_parents : (v.upgraded || 0);
+  const stale = v.stale_total || 0;
+  const cur = v.current_version || 'v2.2';
   const pct = total ? (up / total * 100) : 0;
-  val.innerHTML = fmt(up) + ' <span style="font-size:12px;color:var(--dim)">/ ' + fmt(total) + ' · ' + pct.toFixed(pct < 10 ? 2 : 1) + '%</span>';
+  const pctStale = total ? (stale / total * 100) : 0;
+  val.innerHTML = fmt(up) + ' <span style="font-size:12px;color:var(--dim)">/ ' + fmt(total) + ' · ' + pct.toFixed(pct < 10 ? 2 : 1) + '% at ' + esc(cur)
+    + (stale ? ' · <span style="color:var(--yellow)" title="upgraded to an older v2.x — re-upgrade pending">+' + fmt(stale) + ' stale</span>' : '') + '</span>';
   bar.style.width = Math.min(100, pct).toFixed(2) + '%';
+  let staleBar = document.getElementById('cV2BarStale');
+  if (!staleBar && bar.parentElement) {
+    staleBar = document.createElement('div');
+    staleBar.id = 'cV2BarStale';
+    staleBar.className = 'bar-fill';
+    staleBar.style.cssText = 'position:absolute;top:0;height:100%;background:repeating-linear-gradient(45deg,rgba(210,153,34,0.55) 0 3px,transparent 3px 6px)';
+    bar.parentElement.style.position = 'relative';
+    bar.parentElement.appendChild(staleBar);
+  }
+  if (staleBar) {
+    staleBar.style.left = Math.min(100, pct).toFixed(2) + '%';
+    staleBar.style.width = Math.min(100 - pct, pctStale).toFixed(2) + '%';
+  }
   const rate = +(v.rate_per_h || 0);
   const eta = v.eta_days;
   let etaTxt = '';
   if (eta != null && isFinite(eta)) etaTxt = eta > 365 ? (eta/365).toFixed(1) + 'y' : eta.toFixed(0) + 'd';
   const parts = [];
-  parts.push('+' + fmt(v.upgraded_24h||0) + '/24h @' + rate.toFixed(2) + '/h' + (etaTxt ? ' · eta ' + etaTxt : ''));
+  parts.push('+' + fmt(v.upgraded_24h||0) + '/24h @' + rate.toFixed(2) + '/h' + (etaTxt ? ' · eta ' + etaTxt : '') + ' <span style="opacity:0.6">(' + esc(cur) + ' only)</span>');
+  const bv = v.by_version || {};
+  const bvKeys = Object.keys(bv).filter(k => k !== 'v1');
+  if (bvKeys.length) parts.push(bvKeys.map(k => esc(k) + ' ' + fmt(bv[k])).join(' / ') + (bv.v1 != null ? ' · v1-only ' + fmt(bv.v1) : ''));
   parts.push('fresh v2: ' + fmt(v.fresh_v2||0));
   const vf = v.verify_fail || 0, pend = v.pending || 0;
   parts.push('<span style="color:' + (vf ? 'var(--yellow)' : 'inherit') + '">verify_fail ' + vf + '</span>'

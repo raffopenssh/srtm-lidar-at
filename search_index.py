@@ -439,6 +439,12 @@ class SearchIndex:
             ('zenodo_json_v2_size', 'INTEGER'),
             ('zenodo_light_gpkg_v2_url', 'TEXT'),
             ('zenodo_light_gpkg_v2_size', 'INTEGER'),
+            # Upload timestamps (ISO, from the Zenodo manifest) so the
+            # progress indicators can derive fresh-completion and
+            # upgrade rates from the index instead of re-scanning the
+            # manifest (and double-counting split blocks / re-upgrades).
+            ('json_uploaded_at', 'TEXT'),
+            ('json_v2_uploaded_at', 'TEXT'),
         ]:
             try:
                 c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}')
@@ -1850,6 +1856,173 @@ class SearchIndex:
                     _codes = [kg_code]
                 _write_zenodo_links(c, _target_code, _codes, manifest)
             c.commit()
+
+    # ════════════════════════════════════════════════════════════════
+    # Manifest sync + progress summary (source of truth for dashboards)
+    # ════════════════════════════════════════════════════════════════
+
+    def sync_manifest_links(self, manifest):
+        """Re-derive ``product_version`` / Zenodo URLs / upload timestamps
+        for every processed parent from *manifest* (``{key: entry}``).
+
+        Cheap (dict lookups only, no JSON reads) — meant to run whenever
+        the manifest file changes so re-upgrades (v2.1 → v2.2) that do
+        not produce a new local JSON still show up in the index."""
+        if not manifest:
+            return 0
+        by_parent = {}
+        for k in manifest:
+            if not k.endswith('_json'):
+                continue
+            code = k[:-5]
+            base = code.split('-', 1)[0]
+            if not base.isdigit():
+                continue
+            by_parent.setdefault(base, set()).add(code)
+        n = 0
+        with self._write_lock:
+            c = self._conn()
+            rows = c.execute('SELECT kg_code FROM kg WHERE processed=1').fetchall()
+            for (parent,) in rows:
+                codes = sorted(by_parent.get(parent) or {parent})
+                if parent not in codes:
+                    codes.insert(0, parent)
+                try:
+                    _write_zenodo_links(c, parent, codes, manifest)
+                    n += 1
+                except Exception as e:
+                    log.debug('sync_manifest_links %s: %s', parent, e)
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('manifest_synced_at',
+                       time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+            c.commit()
+        return n
+
+    @staticmethod
+    def _rate_window(times, now_ts, win_s=24 * 3600, tail_n=50, min_n=5):
+        """(rate_per_h, n, window_s) over the last 24h (≥min_n samples)
+        or the last *tail_n* completions; ``(0, 0, 0)`` if too few."""
+        times = sorted(t for t in times if t)
+        recent = [t for t in times if now_ts - t <= win_s]
+        if len(recent) >= min_n:
+            window_s = max(now_ts - recent[0], 1.0)
+            n = len(recent)
+        elif len(times) >= min_n:
+            tail = times[-tail_n:]
+            window_s = max(now_ts - tail[0], 1.0)
+            n = len(tail)
+        else:
+            return 0.0, 0, 0
+        return n / (window_s / 3600.0), n, window_s
+
+    def progress_summary(self, manifest=None, total_kgs=8440,
+                         current_version=None, days=30):
+        """Fleet progress derived from the index (one row per PARENT KG —
+        split blocks and product re-uploads can't double count).
+
+        * ``done`` — processed parents; ``rate_per_h`` / ``eta_s`` from
+          fresh-completion timestamps (``json_uploaded_at``; v2 upgrade
+          uploads do NOT count).  If the index has no timestamps yet
+          (pre-migration) the ``_json`` entries of *manifest* are used.
+        * ``v2`` — per-version histogram, ``upgraded_current`` (parents
+          whose every block is at *current_version*), 24h upgrade count
+          / rate / ETA against ``total - upgraded_current``.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        if current_version is None:
+            try:
+                from v21_products import MANIFEST_VERSION as current_version
+            except Exception:
+                current_version = 'v2.2'
+        current_version = _norm_version(current_version)
+        now_ts = time.time()
+
+        def _ts(iso):
+            try:
+                return _dt.fromisoformat(str(iso).replace('Z', '+00:00')).timestamp()
+            except Exception:
+                return None
+
+        c = self._conn()
+        n_rows = c.execute('SELECT COUNT(*) FROM kg').fetchone()[0]
+        total = max(int(total_kgs or 0), int(n_rows or 0)) or 8440
+        rows = c.execute(
+            'SELECT kg_code, product_version, json_uploaded_at, json_v2_uploaded_at, '
+            'zenodo_json_v2_url FROM kg WHERE processed=1').fetchall()
+        done = len(rows)
+        done_times = {}
+        by_version = {}
+        up_times_current = []
+        upgraded_any = 0
+        for code, pv, jts, j2ts, j2url in rows:
+            t = _ts(jts) if jts else None
+            if t:
+                done_times[code] = t
+            pv = pv or 'v1'
+            by_version[pv] = by_version.get(pv, 0) + 1
+            if j2url:
+                upgraded_any += 1
+            if pv == current_version and j2ts:
+                t2 = _ts(j2ts)
+                if t2:
+                    up_times_current.append(t2)
+        source = 'index'
+        # Fallback: index lacks timestamps → derive from the manifest's
+        # ``_json`` entries, folded to parents (max across blocks).
+        if manifest and len(done_times) < max(1, done // 2):
+            source = 'manifest'
+            done_times = {}
+            for k, e in manifest.items():
+                if not k.endswith('_json') or not isinstance(e, dict):
+                    continue
+                if 'error' in str(e.get('status') or ''):
+                    continue
+                t = _ts(e.get('uploaded_at'))
+                if not t:
+                    continue
+                parent = k[:-5].split('-', 1)[0]
+                if t > done_times.get(parent, 0):
+                    done_times[parent] = t
+        rate_h, win_n, win_s = self._rate_window(done_times.values(), now_ts)
+        remaining = max(total - done, 0)
+        eta_s = (remaining / rate_h) * 3600.0 if rate_h > 0 else 0
+        # Daily fresh-completion buckets (sparkline).
+        today = _dt.now(_tz.utc).date()
+        buckets = [0] * days
+        for t in done_times.values():
+            d_ago = (today - _dt.fromtimestamp(t, _tz.utc).date()).days
+            if 0 <= d_ago < days:
+                buckets[days - 1 - d_ago] += 1
+        upgraded_current = by_version.get(current_version, 0)
+        up_24h = sum(1 for t in up_times_current if now_ts - t <= 24 * 3600)
+        up_rate_h, up_n, _ = self._rate_window(up_times_current, now_ts)
+        up_remaining = max(total - upgraded_current, 0)
+        up_eta_s = (up_remaining / up_rate_h) * 3600.0 if up_rate_h > 0 else 0
+        stale = {v: n for v, n in by_version.items()
+                 if v not in ('v1', current_version) and _version_key(v) > (1,)}
+        return {
+            'total': total, 'done': done,
+            'pct': round(100.0 * done / total, 2) if total else 0.0,
+            'rate_per_h': round(rate_h, 2), 'eta_s': int(eta_s),
+            'window_n': win_n, 'window_s': int(win_s),
+            'avg_s_per_kg': round(win_s / win_n, 1) if win_n else None,
+            'last_completion_ts': max(done_times.values()) if done_times else None,
+            'completed_24h': sum(1 for t in done_times.values() if now_ts - t <= 24 * 3600),
+            'daily_completions': buckets, 'source': source,
+            'v2': {
+                'current_version': current_version,
+                'by_version': dict(sorted(by_version.items(), key=lambda kv: _version_key(kv[0]))),
+                'upgraded_current': upgraded_current,
+                'upgraded_any': upgraded_any,
+                'stale_versions': stale,          # upgraded but not at current → re-upgrade pending
+                'stale_total': sum(stale.values()),
+                'upgraded_24h': up_24h,
+                'rate_per_h': round(up_rate_h, 2), 'window_n': up_n,
+                'eta_s': int(up_eta_s),
+                'eta_days': round(up_eta_s / 86400.0, 1) if up_eta_s else None,
+                'remaining': up_remaining,
+            },
+        }
 
     # ════════════════════════════════════════════════════════════════
     # Stats
@@ -3604,14 +3777,55 @@ class SearchIndex:
         return d
 
 
-def _product_version(zj, zj2) -> str | None:
-    """'v2' when a committed ``_json_v2`` exists or the ``_json`` entry was
-    written by a v2 processor; 'v1' when only v1 products; None if none."""
-    if isinstance(zj2, dict) and zj2.get('size'):
+def _norm_version(v) -> str:
+    """Normalise a manifest ``version`` tag: ``''``/None → ``'v2'`` (pre-2.1
+    upgrades carried no tag), ``'2.2'`` → ``'v2.2'``."""
+    v = str(v or '').strip()
+    if not v:
         return 'v2'
+    return v if v.startswith('v') else f'v{v}'
+
+
+def _version_key(v) -> tuple:
+    """Sort key so 'v1' < 'v2' < 'v2.1' < 'v2.2'."""
+    try:
+        return tuple(int(x) for x in str(v).lstrip('v').split('.'))
+    except Exception:
+        return (0,)
+
+
+def _product_version(zj, zj2) -> str | None:
+    """Full product version of a code: ``'v2.2'`` / ``'v2.1'`` / ``'v2'``
+    from the committed ``_json_v2`` manifest entry's ``version`` tag;
+    ``'v2'`` when the ``_json`` was written by a v2 processor; ``'v1'``
+    when only v1 products exist; None if none."""
+    if isinstance(zj2, dict) and zj2.get('size') \
+            and 'error' not in str(zj2.get('status') or ''):
+        return _norm_version(zj2.get('version'))
     if isinstance(zj, dict) and zj:
         return 'v2' if zj.get('version') == 'v2' else 'v1'
     return None
+
+
+def _parent_product_version(manifest, codes) -> str | None:
+    """Version of a (possibly split) parent = the *lowest* version across
+    its product codes.  A parent is only 'v2.2' when every block that
+    has a ``_json`` also has a committed ``_json_v2`` tagged v2.2 — one
+    lagging block keeps the parent at the lower version so it is not
+    counted as upgraded twice (once per re-upgrade wave)."""
+    versions = []
+    for cc in codes:
+        zj = manifest.get(f'{cc}_json')
+        zj2 = manifest.get(f'{cc}_json_v2')
+        if not isinstance(zj, dict) and not isinstance(zj2, dict):
+            continue
+        pv = _product_version(zj if isinstance(zj, dict) else None,
+                              zj2 if isinstance(zj2, dict) else None)
+        if pv:
+            versions.append(pv)
+    if not versions:
+        return None
+    return min(versions, key=_version_key)
 
 
 _ZENODO_LINK_COLS = [
@@ -3645,9 +3859,28 @@ def _write_zenodo_links(c, target_code, codes, manifest):
             best_j = best
         elif suffix == '_json_v2':
             best_j2 = best
-    pv = _product_version(best_j, best_j2)
+    pv = _parent_product_version(manifest, codes) or _product_version(best_j, best_j2)
     if pv:
         c.execute('UPDATE kg SET product_version=? WHERE kg_code=?', (pv, target_code))
+    # Completion timestamps: a split parent completes when its LAST block's
+    # product lands, so take the max across codes.  json_v2 timestamp only
+    # counts codes at the parent's (min) version, so a 2.1→2.2 re-upgrade
+    # moves the timestamp forward once every block is at 2.2.
+    j_ts = max((str((manifest.get(f'{cc}_json') or {}).get('uploaded_at') or '')
+                for cc in codes if isinstance(manifest.get(f'{cc}_json'), dict)),
+               default='')
+    j2_ts = ''
+    if pv and pv not in ('v1',) and any(
+            isinstance(manifest.get(f'{cc}_json_v2'), dict) for cc in codes):
+        j2_ts = max((str((manifest.get(f'{cc}_json_v2') or {}).get('uploaded_at') or '')
+                     for cc in codes
+                     if isinstance(manifest.get(f'{cc}_json_v2'), dict)),
+                    default='')
+    try:
+        c.execute('UPDATE kg SET json_uploaded_at=?, json_v2_uploaded_at=? WHERE kg_code=?',
+                  (j_ts or None, j2_ts or None, target_code))
+    except Exception:
+        pass  # pre-migration schema
 
 
 def _zenodo_url(entry):

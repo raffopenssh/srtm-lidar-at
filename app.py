@@ -751,8 +751,23 @@ def _init_search_index():
             return out
 
         known = _snapshot()
+        _mf_path = Path('data/austria_processor/zenodo_manifest.json')
+        _mf_seen = None
         while True:
             time.sleep(60)
+            # Manifest changed (peer upload / v2.x re-upgrade / requeue
+            # tombstone) → re-derive product_version + upload timestamps
+            # for every processed parent. ~0.1 s for 2.5k rows; keeps the
+            # index (the progress source of truth) v2.1/v2.2-aware even
+            # when no local JSON changes.
+            try:
+                _mt = _mf_path.stat().st_mtime if _mf_path.exists() else None
+                if _mt and _mt != _mf_seen:
+                    _md = json.loads(_mf_path.read_text())
+                    idx.sync_manifest_links(_md.get('entries', _md))
+                    _mf_seen = _mt
+            except Exception as e:
+                log.debug('manifest link sync: %s', e)
             try:
                 current = _snapshot()
                 changed = [code for code, mt in current.items()
@@ -3065,51 +3080,25 @@ def _processing_status_compute():
                     'count': len(ents),
                     'total_size_bytes': sum(e.get('size', 0) for e in ents.values()),
                 }
-                # Completion rate / ETA based on actual Zenodo upload timestamps.
-                # One KG "completed" = max(uploaded_at) across its entries
-                # (full_gpkg / light_gpkg / json) — i.e. when the last
-                # product landed on Zenodo.
+                # Completion rate / ETA — from the search index (one row
+                # per PARENT KG, fresh ``_json`` upload timestamps only) so
+                # split blocks and v2.x upgrade re-uploads don't inflate the
+                # fresh-KG rate.  Falls back to manifest ``_json`` timestamps
+                # when the index has none yet (see progress_summary).
                 try:
-                    from datetime import datetime as _dt
-                    kg_done_at = {}
-                    for key, e in ents.items():
-                        ts = e.get('uploaded_at')
-                        if not ts:
-                            continue
-                        kg = key.split('_', 1)[0]
-                        try:
-                            t = _dt.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                        except Exception:
-                            continue
-                        if kg not in kg_done_at or t > kg_done_at[kg]:
-                            kg_done_at[kg] = t
-                    if kg_done_at:
-                        now_ts = time.time()
-                        times = sorted(kg_done_at.values())
-                        # Prefer last 24h; fall back to the last 50 KGs if
-                        # the window is sparse (e.g. peers idle overnight).
-                        WIN = 24 * 3600
-                        recent = [t for t in times if now_ts - t <= WIN]
-                        if len(recent) >= 5:
-                            window_s = max(now_ts - recent[0], 1.0)
-                            n_recent = len(recent)
-                        elif len(times) >= 5:
-                            tail = times[-50:]
-                            window_s = max(now_ts - tail[0], 1.0)
-                            n_recent = len(tail)
-                        else:
-                            window_s = max(now_ts - times[0], 1.0)
-                            n_recent = len(times)
-                        rate_per_h = n_recent / (window_s / 3600.0)
-                        avg_s = window_s / n_recent
-                        data['manifest_rate_kgs_per_hour'] = round(rate_per_h, 2)
-                        data['manifest_avg_seconds_per_kg'] = round(avg_s, 1)
-                        data['manifest_completion_count'] = len(kg_done_at)
-                        data['manifest_last_completion_ts'] = max(times)
-                        data['manifest_window_kgs'] = n_recent
-                        data['manifest_window_seconds'] = int(window_s)
+                    _ps = si.get_index().progress_summary(ents)
+                    data['progress_summary'] = _ps
+                    if _ps.get('window_n'):
+                        data['manifest_rate_kgs_per_hour'] = _ps['rate_per_h']
+                        data['manifest_avg_seconds_per_kg'] = _ps['avg_s_per_kg']
+                        data['manifest_window_kgs'] = _ps['window_n']
+                        data['manifest_window_seconds'] = _ps['window_s']
+                    data['manifest_completion_count'] = _ps['done']
+                    if _ps.get('last_completion_ts'):
+                        data['manifest_last_completion_ts'] = _ps['last_completion_ts']
+                    data['manifest_daily_completions'] = _ps['daily_completions']
                 except Exception as _ex:
-                    log.debug('manifest rate calc failed: %s', _ex)
+                    log.debug('progress summary failed: %s', _ex)
         except Exception:
             pass
         data['git_commit'] = _GIT_COMMIT
@@ -3186,37 +3175,6 @@ def _processing_status_compute():
                 'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg'
             ).fetchone()
             data['db_area_km2_total'] = round(float(_row2[0] or 0), 2)
-        except Exception:
-            pass
-        # Sparkline series: KGs completed per day (last 30 days, by Zenodo upload).
-        try:
-            mf2 = _pl.Path('data/austria_processor/zenodo_manifest.json')
-            if mf2.exists():
-                from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
-                md2 = json.loads(mf2.read_text())
-                ents2 = md2.get('entries', {})
-                kg_done_at2 = {}
-                for key, e in ents2.items():
-                    ts = e.get('uploaded_at')
-                    if not ts:
-                        continue
-                    kg = key.split('_', 1)[0]
-                    try:
-                        t = _dt2.fromisoformat(ts.replace('Z', '+00:00'))
-                    except Exception:
-                        continue
-                    if kg not in kg_done_at2 or t > kg_done_at2[kg]:
-                        kg_done_at2[kg] = t
-                if kg_done_at2:
-                    now_dt = _dt2.now(_tz2.utc)
-                    today = now_dt.date()
-                    DAYS = 30
-                    buckets = [0] * DAYS
-                    for t in kg_done_at2.values():
-                        d_ago = (today - t.date()).days
-                        if 0 <= d_ago < DAYS:
-                            buckets[DAYS - 1 - d_ago] += 1
-                    data['manifest_daily_completions'] = buckets
         except Exception:
             pass
         # Include persisted tile history for all completed/failed KGs
@@ -19861,72 +19819,61 @@ def process_txt():
         prog = json.loads(prog_path.read_text()) if prog_path.exists() else {}
     except Exception:
         prog = {}
-    try:
-        db_done = len(_get_completed_kgs())
-    except Exception:
-        db_done = prog.get('completed') or 0
+    # Source of truth: the search index — one row per PARENT KG, so split
+    # blocks (``45631-northeast``) don't double count, and the rate/ETA
+    # come from fresh ``_json`` upload timestamps only (v2.1/v2.2 upgrade
+    # re-uploads of already-done KGs are reported on the ``v2:`` line and
+    # must NOT inflate fresh-completion progress — before this, the
+    # ``progress:`` rate mirrored the upgrade rate almost exactly).
     # ``total_kgs`` in progress.json reflects the *current run* (often 1
-    # for the primary's parked single-KG director job), NOT the fleet.
-    # Mirror process.html: fall back to the Austria-wide constant 8440
-    # when the run total is implausibly small. Otherwise an agent reads
-    # ``done=498/1 eta=138d`` and is badly misled about fleet progress.
-    run_total = prog.get('total_kgs') or 0
-    total_kgs = 8440 if (0 < run_total < 200) else (run_total or 8440)
+    # for the primary's parked director job), NOT the fleet → 8440.
     state_p = prog.get('state', '?')
-    # Rate/ETA from Zenodo-upload timestamps (counts ALL peers, resilient
-    # across processor restarts) rather than the local processor's
-    # session rate (which is the parked primary => ~0). Falls back to
-    # progress.json only if no manifest timestamps are available.
-    rate_h = prog.get('rate_kgs_per_hour') or 0
-    eta_s = prog.get('eta_seconds') or 0
-    win_n = 0
+    _ps = None
     try:
         _mfp = Path('data/austria_processor/zenodo_manifest.json')
         _mf = json.loads(_mfp.read_text()) if _mfp.exists() else {}
         _ents = (_mf.get('entries') or {}) if isinstance(_mf, dict) else {}
-        _real = {k: v for k, v in _ents.items()
-                 if not k.endswith('_error')}
-        now_ts = _t.time()
-        kg_done_at = {}
-        for k, e in _real.items():
-            ts = e.get('uploaded_at')
-            if not ts:
-                continue
-            kg = k.split('_', 1)[0]
-            try:
-                tt = datetime.fromisoformat(
-                    ts.replace('Z', '+00:00')).timestamp()
-            except Exception:
-                continue
-            if kg not in kg_done_at or tt > kg_done_at[kg]:
-                kg_done_at[kg] = tt
-        times = sorted(kg_done_at.values())
-        recent = [tt for tt in times if now_ts - tt <= 24 * 3600]
-        if len(recent) >= 5:
-            window_s = max(now_ts - recent[0], 1.0)
-            win_n = len(recent)
-        elif len(times) >= 5:
-            tail = times[-50:]
-            window_s = max(now_ts - tail[0], 1.0)
-            win_n = len(tail)
-        else:
-            win_n = 0
-        if win_n:
-            rate_h = win_n / (window_s / 3600.0)
-            remaining = max(total_kgs - db_done, 0)
-            eta_s = (remaining / rate_h) * 3600.0 if rate_h > 0 else 0
+        _ps = si.get_index().progress_summary(_ents)
     except Exception:
-        pass
+        log.exception('process.txt progress_summary failed')
+    if _ps:
+        db_done = _ps['done']
+        total_kgs = _ps['total']
+        rate_h = _ps['rate_per_h']
+        eta_s = _ps['eta_s']
+        win_n = _ps['window_n']
+        src_tag = '' if _ps.get('source') == 'index' else f" src={_ps.get('source')}"
+    else:
+        try:
+            db_done = len({c.split('-', 1)[0] for c in _get_completed_kgs()})
+        except Exception:
+            db_done = prog.get('completed') or 0
+        run_total = prog.get('total_kgs') or 0
+        total_kgs = 8440 if (0 < run_total < 200) else (run_total or 8440)
+        rate_h = prog.get('rate_kgs_per_hour') or 0
+        eta_s = prog.get('eta_seconds') or 0
+        win_n = 0
+        src_tag = ' src=progress.json'
     pct = (db_done / total_kgs * 100.0) if total_kgs else 0.0
-    win_tag = f' (last {win_n} uploads)' if win_n else ''
+    win_tag = f' (last {win_n} fresh uploads)' if win_n else ''
     out.append(
         f'progress: state={state_p} done={db_done}/{total_kgs} '
-        f'({pct:.1f}%) rate={rate_h:.1f}/h eta={_hms(eta_s)} '
-        f'failed={len(prog.get("failed_kgs") or [])}{win_tag}'
+        f'({pct:.1f}%) rate={rate_h:.2f}/h eta={_hms(eta_s)} '
+        f'failed={len(prog.get("failed_kgs") or [])}{win_tag}{src_tag}'
     )
     _health['progress'] = {'pct': pct, 'rate': rate_h,
                            'eta': eta_s, 'done': db_done,
                            'total': total_kgs}
+    if _ps:
+        _v2p = _ps['v2']
+        _bv = ' '.join(f'{k}={v}' for k, v in _v2p['by_version'].items())
+        out.append(
+            f'products: by_version[{_bv}] current={_v2p["current_version"]} '
+            f'at_current={_v2p["upgraded_current"]}/{total_kgs} '
+            f'stale_v2={_v2p["stale_total"]} (re-upgrade pending) '
+            f'v1_only={db_done - _v2p["upgraded_any"]}'
+        )
+        _health['v2'] = _v2p
 
     # --- Zenodo manifest summary ---------------------------------
     try:
@@ -21341,7 +21288,14 @@ def process_txt():
         if pr:
             _hb.insert(0,
                        f'{pr["done"]}/{pr["total"]} ({pr["pct"]:.0f}%) '
-                       f'@{pr["rate"]:.1f}/h eta {_hms(pr["eta"])}')
+                       f'@{pr["rate"]:.2f}/h eta {_hms(pr["eta"])}')
+            _v2h = _health.get('v2')
+            if _v2h:
+                _hb.insert(1,
+                           f'{_v2h["current_version"]}='
+                           f'{_v2h["upgraded_current"]}/{pr["total"]} '
+                           f'@{_v2h["rate_per_h"]:.1f}/h '
+                           f'(stale_v2={_v2h["stale_total"]})')
         _status = 'OK' if not _flags else ' '.join(_flags)
         _banner = 'health:   ' + _status
         if _hb:

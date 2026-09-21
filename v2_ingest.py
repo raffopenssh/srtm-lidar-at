@@ -52,6 +52,13 @@ def load_manifest_entries(path: Path = MANIFEST_PATH) -> dict:
     return md.get("entries", md) or {}
 
 
+def _vkey(v) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).lstrip("v").split("."))
+    except Exception:  # noqa: BLE001
+        return (0,)
+
+
 def _committed(e) -> bool:
     return isinstance(e, dict) and int(e.get("size") or 0) > 0 and bool(e.get("uploaded_at"))
 
@@ -285,29 +292,71 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
         return _stats_cache["v"]
     entries = load_manifest_entries()
     day_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 86400))
-    upgraded = set()
-    up_24h = 0
-    first_up = ""
+    try:
+        from v21_products import MANIFEST_VERSION as _cur
+    except Exception:  # noqa: BLE001
+        _cur = "v2.2"
+    # Source of truth: the search index (one row per PARENT KG, version =
+    # min across blocks).  A parent counts as upgraded only at the CURRENT
+    # product version; 2.1 parents awaiting re-upgrade are ``stale``.
+    # The 24h count / rate only see current-version uploads, so a parent
+    # that went v2 → v2.1 → v2.2 is counted once, not three times.
+    ps = None
+    try:
+        import search_index as _si
+        ps = _si.get_index().progress_summary(entries, total_kgs=total_kgs,
+                                              current_version=_cur)["v2"]
+    except Exception as ex:  # noqa: BLE001
+        log.debug("v2 status: index unavailable (%s), manifest fallback", ex)
     fresh_v2 = 0
-    v21_codes = 0
+    codes_by_version: dict = {}
     for k, e in entries.items():
         if not _committed(e):
             continue
         if k.endswith("_json_v2"):
-            code = k[:-8]
-            upgraded.add(code.split("-", 1)[0])
-            if str(e.get("version") or "") in ("v2.1", "v2.2"):
-                v21_codes += 1
-            ts = e.get("uploaded_at") or ""
-            if ts > day_ago:
-                up_24h += 1
-            if ts and (not first_up or ts < first_up):
-                first_up = ts
+            v = str(e.get("version") or "v2")
+            codes_by_version[v] = codes_by_version.get(v, 0) + 1
         elif k.endswith("_json") and (e.get("version") == "v2"):
             fresh_v2 += 1
-    rate_h = up_24h / 24.0
-    remaining = max(0, total_kgs - len(upgraded))
-    eta_d = round(remaining / rate_h / 24.0, 1) if rate_h > 0 else None
+    if ps is None:
+        # Manifest fallback (parents folded; version = min across blocks).
+        par: dict = {}
+        up_ts: dict = {}
+        for k, e in entries.items():
+            if not _committed(e) or not k.endswith("_json_v2"):
+                continue
+            code = k[:-8]
+            parent = code.split("-", 1)[0]
+            v = str(e.get("version") or "v2")
+            if parent not in par or _vkey(v) < _vkey(par[parent]):
+                par[parent] = v
+            ts = e.get("uploaded_at") or ""
+            up_ts[parent] = max(up_ts.get(parent, ""), ts)
+        by_version: dict = {}
+        for v in par.values():
+            by_version[v] = by_version.get(v, 0) + 1
+        cur_parents = [p for p, v in par.items() if v == _cur]
+        up_24h = sum(1 for p in cur_parents if up_ts.get(p, "") > day_ago)
+        rate_h = up_24h / 24.0
+        remaining = max(0, total_kgs - len(cur_parents))
+        ps = {
+            "current_version": _cur, "by_version": by_version,
+            "upgraded_current": len(cur_parents), "upgraded_any": len(par),
+            "stale_versions": {v: n for v, n in by_version.items() if v != _cur},
+            "stale_total": sum(n for v, n in by_version.items() if v != _cur),
+            "upgraded_24h": up_24h, "rate_per_h": round(rate_h, 2),
+            "eta_days": round(remaining / rate_h / 24.0, 1) if rate_h > 0 else None,
+            "remaining": remaining, "source": "manifest",
+        }
+    else:
+        ps["source"] = "index"
+    upgraded = ps["upgraded_current"]
+    up_24h = ps["upgraded_24h"]
+    rate_h = ps["rate_per_h"]
+    eta_d = ps.get("eta_days")
+    first_up = min((e.get("uploaded_at") or "" for k, e in entries.items()
+                    if k.endswith("_json_v2") and _committed(e)), default="")
+    v21_codes = sum(n for v, n in codes_by_version.items() if v in ("v2.1", "v2.2"))
     st = store.stats()
     ls = store.log_stats()
     fl = failed()
@@ -324,10 +373,18 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
     except Exception:  # noqa: BLE001
         pend = None
     v = {
-        "upgraded_parents": len(upgraded), "total": total_kgs,
-        "upgraded_pct": round(100.0 * len(upgraded) / max(total_kgs, 1), 2),
+        "upgraded_parents": upgraded, "total": total_kgs,
+        "upgraded_pct": round(100.0 * upgraded / max(total_kgs, 1), 2),
         "upgraded_24h": up_24h, "rate_per_h": round(rate_h, 2), "eta_days": eta_d,
         "first_upload": first_up or None,
+        "current_version": ps["current_version"],
+        "by_version": ps["by_version"],            # parents, min version across blocks
+        "upgraded_any": ps["upgraded_any"],        # parents with any _json_v2
+        "stale_versions": ps["stale_versions"],    # upgraded but below current
+        "stale_total": ps["stale_total"],
+        "remaining": ps["remaining"],
+        "source": ps.get("source"),
+        "codes_by_version": codes_by_version,      # product codes (blocks), manifest
         "fresh_v2": fresh_v2, "v21_codes": v21_codes,
         "verify_fail": len(fl), "verify_fail_codes": sorted(fl)[:20],
         "pending": pend,
@@ -357,14 +414,16 @@ def text_line(v: dict | None = None) -> str:
     eta = f"{v['eta_days']}d" if v.get("eta_days") is not None else "?"
     ls = v["kg_log"]
     parts = [
-        f"v2: upgraded={v['upgraded_parents']}/{v['total']} ({v['upgraded_pct']}%) "
-        f"+{v['upgraded_24h']}/24h @{v['rate_per_h']}/h eta={eta} v2.1={v.get('v21_codes', 0)}codes",
+        f"v2: at_{v.get('current_version', 'v2.2')}={v['upgraded_parents']}/{v['total']} ({v['upgraded_pct']}%) "
+        f"+{v['upgraded_24h']}/24h @{v['rate_per_h']}/h eta={eta} "
+        f"parents_by_version[{' '.join(f'{k}={n}' for k, n in (v.get('by_version') or {}).items())}] "
+        f"stale={v.get('stale_total', 0)} any_v2={v.get('upgraded_any', 0)}",
         f"fresh_v2={v['fresh_v2']}",
         f"verify_fail={v['verify_fail']}" + ("" if v["pending"] is None else f" pending={v['pending']}"),
         f"store={n}codes/{_fmt_b(st.get('db_bytes'))} freed={_fmt_b(st.get('v1_bytes_freed'))} "
         f"avg/kg={_fmt_b(avg)}"
-        + (f" v2.1={(st.get('product_versions') or {}).get('2.1', 0)}"
-           f"/grid25={_fmt_b(st.get('grid25_bytes'))}" if n else ""),
+        + (" store_pv[" + ' '.join(f'{k}={n}' for k, n in sorted((st.get('product_versions') or {}).items()))
+           + f"] grid25={_fmt_b(st.get('grid25_bytes'))}" if n else ""),
         f"json_files={v['json_files']} disk={_fmt_b(v['json_bytes'])}",
         f"kg_log={ls.get('codes', 0)}codes/{ls.get('rows', 0)}rows/{_fmt_b(ls.get('bytes'))}"
         + (f" archive_remaining={v['archive_days_remaining']}d"

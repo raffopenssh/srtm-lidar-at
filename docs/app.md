@@ -137,18 +137,32 @@ cat /tmp/segment_progress/<id>.json | python3 -m json.tool
 cat data/austria_processor/director_state.json | python3 -m json.tool
 
 # Who holds Zenodo leases? (broker on 127.0.0.1:8001; proxied via :8000)
-curl -s localhost:8000/api/v1/zenodo/lock | jq '{shared_used,shared_slots,exclusive_held,leases}'
+curl -s localhost:8000/api/v1/zenodo/lock | jq '{shared_used,shared_slots,cache_held,leases}'
 ```
 
 Zenodo lock classes (2026-09-21): `kg_upload*` leases are **shared**
 (bounded pool, `ZENODO_LOCK_KG_SLOTS`=8 — each KG product has its own
 deposition, so they never 409 each other); everything else
-(`cache_flush_zip:*`, `reconcile`, chkpt) is **exclusive** and waits for
-zero live leases, with new shared acquires refused while an exclusive
-writer is waiting. Before this, KG uploads were fully serialised: with a
+(`cache_flush_zip:*`, `reconcile`, `chkpt_upload:*`/`chkpt_delete:*`) is
+the **cache** class — one at a time, but **independent of the shared
+pool** (they write the shared tile-cache draft, which KG uploads never
+touch). Never-heartbeated leases are reaped after 75 s (`ORPHAN_S`);
+heartbeated ones after the 120 s TTL.
+
+History: before the pool, KG uploads were fully serialised — with a
 degraded Zenodo (10–30 min per upload) every peer hit the 1800 s client
-timeout and "proceeded without lease" — a 30-min penalty per KG and no
-exclusivity. `zenodo_lock:` errors in the log = that penalty firing.
+timeout and "proceeded without lease". The first pool version (3b1b9bd,
+same day) made the cache class *exclusive* (needs zero leases, drains
+the shared class for 300 s while refused). That re-serialised the fleet
+through a different door: every KG completion fires a `chkpt_delete`,
+each one drained the pool for 5 min, and the granted lease was routinely
+orphaned because the processor exited for a rollout restart right after
+spawning the daemon delete thread (no heartbeat, no release → 120 s
+hold). Symptom: `Zenodo lock busy (held by None …)` for 30 min, then the
+same `zenodo_lock:` timeout error. Fixed by independent classes +
+orphan reaping + synchronous first release attempt in `zenodo_lock.py`
++ the processor joining `_BG_ZENODO_THREADS` at graceful shutdown.
+`zenodo_lock:` errors in the log = a peer waited 30 min for nothing.
 
 ## Critical invariants (re-stated; see AGENTS.md)
 

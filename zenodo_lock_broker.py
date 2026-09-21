@@ -30,13 +30,29 @@ Lease classes (since 2026-09-21)
   (10–30 min per upload) every waiter hit the client's 30-min acquire
   timeout and "proceeded without lease" — i.e. the lock cost every KG
   30 idle minutes and provided no exclusivity at all.
-* **exclusive** — everything else (``cache_flush_zip:*``,
-  ``reconcile``, chkpt registry …): writers of the *shared* tile-cache
-  draft deposition, where concurrent PUTs 409 and orphan files.  An
-  exclusive lease requires zero live leases of any class.  While an
-  exclusive request is being refused, new shared acquires are refused
-  too (``draining``) so the exclusive writer cannot starve behind a
-  rolling stream of uploads.
+* **cache** — everything else (``cache_flush_zip:*``, ``reconcile``,
+  ``chkpt_upload:*`` / ``chkpt_delete:*`` …): writers of the *shared*
+  tile-cache draft deposition, where concurrent PUTs 409 and orphan
+  files.  One cache lease at a time — but it is independent of the
+  shared pool: KG products live in their own depositions, so a cache
+  writer never conflicts with a KG upload and must not wait for (or
+  block) one.
+
+  Until 2026-09-21 evening this class was *exclusive* — it required
+  zero live leases of any class and, while refused, put the shared
+  class into a 300 s ``draining`` state.  With ~20 peers completing KGs
+  a few minutes apart, every ``chkpt_delete`` refused the whole fleet
+  for 5 min, the pool emptied, the chkpt lease was granted — and often
+  orphaned (the processor exited for a graceful restart right after
+  spawning the daemon delete thread, so no heartbeat/release ever came)
+  → another 120 s stale hold → next chkpt_delete → repeat.  Net effect:
+  peers spent 30 min in ``lock busy (held by None)`` and timed out
+  "proceeding without lease" just like before the pool existed.
+
+Orphan detection: a lease that has *never* been heartbeated
+(``last_heartbeat == acquired_at``) is dropped after ``ORPHAN_S`` (75 s,
+2.5 heartbeat intervals) instead of the full TTL — a live client
+heartbeats at 30 s, so silence for 75 s means the process is gone.
 
 State is held in memory and persisted to disk on every mutation so a
 restart doesn't 410 every active heartbeat.  TTL = 120 s per lease.
@@ -69,19 +85,18 @@ ADMIN_TOKEN_FILE = _HERE / 'data' / 'admin_token'
 
 TTL_S = 120.0
 SHARED_SLOTS = max(1, int(os.environ.get('ZENODO_LOCK_KG_SLOTS', '8') or 8))
-# How long a refused exclusive request keeps the shared class draining.
-EXCLUSIVE_DRAIN_S = 300.0
+# Never-heartbeated leases are orphans (client process exited) after this.
+ORPHAN_S = 75.0
 LISTEN_HOST = os.environ.get('ZENODO_LOCK_BROKER_HOST', '127.0.0.1')
 LISTEN_PORT = int(os.environ.get('ZENODO_LOCK_BROKER_PORT', '8001'))
 
 _lock = threading.Lock()
 # token -> {holder, purpose, kg, cls, acquired_at, last_heartbeat}
 _leases: dict = {}
-_exclusive_waiting: dict = {'since': 0.0, 'peer': None, 'purpose': None}
 
 
 def _cls(purpose: str) -> str:
-    return 'shared' if str(purpose or '').startswith('kg_upload') else 'exclusive'
+    return 'shared' if str(purpose or '').startswith('kg_upload') else 'cache'
 
 
 def _persist() -> None:
@@ -121,11 +136,17 @@ def _restore() -> None:
 
 def _expire(now: float) -> None:
     """Drop leases whose heartbeat is older than TTL (caller holds _lock)."""
-    dead = [t for t, l in _leases.items() if now - l['last_heartbeat'] > TTL_S]
-    for t in dead:
+    dead = []
+    for t, l in _leases.items():
+        idle = now - l['last_heartbeat']
+        never_hb = l['last_heartbeat'] <= l['acquired_at'] + 0.5
+        if idle > TTL_S or (never_hb and idle > ORPHAN_S):
+            dead.append((t, 'orphan' if never_hb else 'stale'))
+    for t, why in dead:
         l = _leases.pop(t)
-        print(f'[broker] stale lease dropped holder={l["holder"]} '
-              f'purpose={l["purpose"]} kg={l.get("kg")}', file=sys.stderr)
+        print(f'[broker] {why} lease dropped holder={l["holder"]} '
+              f'purpose={l["purpose"]} kg={l.get("kg")} '
+              f'idle={now - l["last_heartbeat"]:.0f}s', file=sys.stderr)
     if dead:
         _persist()
 
@@ -143,15 +164,16 @@ def _status(now: float) -> dict:
     """Status payload. Top-level fields mirror the legacy single-holder
     shape (oldest live lease) so existing consumers keep working."""
     shared = [l for l in _leases.values() if l.get('cls') == 'shared']
-    excl = [l for l in _leases.values() if l.get('cls') != 'shared']
-    draining = (now - _exclusive_waiting['since']) < EXCLUSIVE_DRAIN_S
+    cache = [l for l in _leases.values() if l.get('cls') != 'shared']
     out = {
         'free': not _leases,
         'ttl_s': TTL_S,
         'shared_slots': SHARED_SLOTS,
         'shared_used': len(shared),
-        'exclusive_held': bool(excl),
-        'draining_for_exclusive': draining,
+        'cache_held': bool(cache),
+        # legacy field names (pre independent-class broker) kept for consumers
+        'exclusive_held': bool(cache),
+        'draining_for_exclusive': False,
         'leases': sorted((_lease_view(l, now) for l in _leases.values()),
                          key=lambda x: -x['age_s']),
     }
@@ -261,28 +283,26 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {'token': tok, 'ttl_s': TTL_S,
                                             'reacquired': True})
             shared_live = sum(1 for l in _leases.values() if l.get('cls') == 'shared')
-            excl_live = any(l.get('cls') != 'shared' for l in _leases.values())
-            draining = (now - _exclusive_waiting['since']) < EXCLUSIVE_DRAIN_S
-            if cls == 'exclusive':
-                ok = not _leases
-                if not ok:
-                    _exclusive_waiting.update(since=now, peer=peer, purpose=purpose)
+            cache_live = [l for l in _leases.values() if l.get('cls') != 'shared']
+            # Classes are independent: KG products have their own
+            # depositions, cache writers share one draft. Neither waits
+            # for the other.
+            if cls == 'cache':
+                ok = not cache_live
             else:
-                ok = (not excl_live) and (not draining) and shared_live < SHARED_SLOTS
+                ok = shared_live < SHARED_SLOTS
             if not ok:
                 st = _status(now)
                 st.update({'error': 'locked', 'requested_cls': cls})
-                if cls == 'exclusive':
-                    st['reason'] = 'leases_live'
-                elif excl_live:
-                    st['reason'] = 'exclusive_held'
-                elif draining:
-                    st['reason'] = 'draining_for_exclusive'
+                if cls == 'cache':
+                    st['reason'] = 'cache_held'
+                    # Report the blocking lease, not the oldest KG upload.
+                    st.update(_lease_view(cache_live[0], now))
                 else:
                     st['reason'] = 'shared_slots_full'
+                    sh = [l for l in _leases.values() if l.get('cls') == 'shared']
+                    st.update(_lease_view(min(sh, key=lambda l: l['acquired_at']), now))
                 return self._json(423, st)
-            if cls == 'exclusive':
-                _exclusive_waiting.update(since=0.0, peer=None, purpose=None)
             tok = uuid.uuid4().hex
             _leases[tok] = {
                 'holder': peer, 'purpose': purpose, 'kg': kg, 'cls': cls,

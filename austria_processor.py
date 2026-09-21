@@ -177,6 +177,24 @@ _ZENODO_FLUSH_STARTUP_DELAY_S = 300  # 5 min after import
 _last_zenodo_cache_flush: float = 0.0
 # Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
 _ZENODO_CACHE_FLUSH_INTERVAL = 1800  # 30 minutes
+# Background threads holding (or waiting for) a Zenodo broker lease —
+# joined with a bound at graceful shutdown so the lease is released
+# rather than orphaned (see zenodo_lock_broker ORPHAN_S).
+_BG_ZENODO_THREADS: list = []
+
+
+def _join_bg_zenodo_threads(timeout_s: float) -> None:
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    for _th in list(_BG_ZENODO_THREADS):
+        rem = deadline - _t.monotonic()
+        if rem <= 0:
+            break
+        if _th.is_alive():
+            logging.getLogger('austria_processor').info(
+                "Waiting up to %.0fs for %s to finish", rem, _th.name)
+            _th.join(rem)
+    _BG_ZENODO_THREADS[:] = [t for t in _BG_ZENODO_THREADS if t.is_alive()]
 import time as _import_time
 _last_zenodo_cache_flush = _import_time.time() - max(
     0, _ZENODO_CACHE_FLUSH_INTERVAL - _ZENODO_FLUSH_STARTUP_DELAY_S)
@@ -12392,9 +12410,11 @@ def main():
                                     _kg)
                             except Exception:
                                 pass
-                        _th_del.Thread(target=_bg_del,
-                                       name=f"chkpt_del_{kg_code}",
-                                       daemon=True).start()
+                        _t_del = _th_del.Thread(target=_bg_del,
+                                                name=f"chkpt_del_{kg_code}",
+                                                daemon=True)
+                        _t_del.start()
+                        _BG_ZENODO_THREADS.append(_t_del)
                     except Exception:
                         pass
 
@@ -13013,6 +13033,10 @@ def main():
 
     # Done
     if _shutdown_requested:
+        # Let post-completion Zenodo side-effects (chkpt_delete holds a
+        # broker lease) finish before exit — a daemon thread killed
+        # mid-lease orphans the lease on the broker for ORPHAN_S.
+        _join_bg_zenodo_threads(60.0)
         progress.update(state="stopped", current_kg=None)
         log.info("Graceful shutdown complete.")
     else:

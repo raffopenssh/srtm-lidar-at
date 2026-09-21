@@ -147,6 +147,24 @@ class ZenodoLease:
         # — but a clean release lets the next peer grab the lock
         # immediately. Run in a background thread so we never block
         # the caller's hot path on a slow primary.
+        # First attempt is synchronous with a short timeout: callers
+        # such as the processor's post-completion chkpt_delete thread
+        # run right before the process exits for a graceful restart,
+        # and a daemon release thread dies with it — the lease then
+        # sat on the broker until the TTL reaper (Sep 2026: 120 s
+        # cache-class holds after every rollout-boundary KG).
+        try:
+            requests.delete(
+                f"{self.broker}/api/v1/zenodo/lock",
+                json={'token': self.token},
+                timeout=(3, 10),
+                headers=_admin_headers(),
+            )
+            return
+        except Exception as e:
+            log.info('Upload broker release: sync attempt failed (%s) — '
+                     'retrying in background', str(e)[:120])
+
         def _release_in_background():
             for attempt in range(3):
                 try:
@@ -225,8 +243,11 @@ def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
             break
         if r.status_code == 423:
             data = r.json() if r.content else {}
-            log.info('Zenodo lock busy (held by %s for %ss, idle %ss) — waiting',
-                     data.get('holder'), data.get('age_s'), data.get('idle_s'))
+            log.info('Zenodo lock busy (%s; held by %s for %ss, idle %ss; '
+                     'shared %s/%s) — waiting',
+                     data.get('reason') or 'locked', data.get('holder'),
+                     data.get('age_s'), data.get('idle_s'),
+                     data.get('shared_used'), data.get('shared_slots'))
         elif r.status_code in (500, 502, 503, 504):
             # Broker transiently overloaded: the primary's gunicorn workers
             # (or the exe.dev proxy in front of them) returned a 5xx HTML

@@ -1149,6 +1149,7 @@ def _reload_tombstones_from_disk() -> None:
 PEER_SYNC_INTERVAL_S = 300
 PEER_SYNC_FULL_INTERVAL_S = 6 * 3600
 PEER_SYNC_SINCE_MARGIN_S = 3600
+_PEER_SYNC_DL_FAIL: dict = {}  # kg code -> ts of last failed JSON download
 _PEER_SYNC_STATE: dict = {}   # peer_url -> {'max_ts': str, 'full_ts': float,
                               #              'cm_etag': str, 'cm_pushed_hash': str}
 
@@ -1245,6 +1246,8 @@ def _sync_peer_data():
             for peer_url in peer_urls:
                 _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
                 _now_s = time.time()
+                if _now_s < float(_pst.get('legacy_backoff_until') or 0.0):
+                    continue
                 _full = (_now_s - float(_pst.get('full_ts') or 0.0)
                          >= PEER_SYNC_FULL_INTERVAL_S) or not _pst.get('max_ts')
                 _params = {}
@@ -1266,6 +1269,12 @@ def _sync_peer_data():
                     continue
                 if _full:
                     _pst['full_ts'] = _now_s
+                elif 'manifest_since' not in peer_data:
+                    # Peer predates the since= filter and just sent the
+                    # full ~0.9 MB table: don't ask it again for 30 min
+                    # (it gets a full pull anyway on the 12 h cadence;
+                    # new uploads reach us via /manifest/push).
+                    _pst['legacy_backoff_until'] = _now_s + 1800
 
                 peer_manifest = peer_data.get('manifest', {}) or {}
                 # Advance the incremental watermark to the newest
@@ -1426,6 +1435,13 @@ def _sync_peer_data():
                     except Exception:
                         pass
                     local_path = json_dir / f'{code}.json'
+                    # Negative cache: a JSON that 404'd (deleted on
+                    # Zenodo, stale manifest entry on some peer) is not
+                    # retried for 6 h — previously every peer's copy of
+                    # the entry triggered a fresh 404 every 5 min.
+                    _dl_fail_ts = _PEER_SYNC_DL_FAIL.get(code)
+                    if _dl_fail_ts and (time.time() - _dl_fail_ts) < 6 * 3600:
+                        continue
                     needs_dl = True
                     if local_path.exists():
                         try:
@@ -1478,6 +1494,7 @@ def _sync_peer_data():
                     except Exception as e:
                         # Clean up partial download
                         local_path.with_suffix('.tmp').unlink(missing_ok=True)
+                        _PEER_SYNC_DL_FAIL[code] = time.time()
                         log.warning('Peer sync: failed to download %s from %s: %s', code, link, e)
 
                 # Collect manifest entries to merge (skip tombstoned keys unless newer)
@@ -1589,16 +1606,37 @@ def _sync_peer_data():
                     try:
                         _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
                         _h = {}
-                        if _pst.get('cm_etag'):
+                        _cm_params = {}
+                        _cm_full = (time.time() - float(_pst.get('cm_full_ts') or 0.0)
+                                    >= PEER_SYNC_FULL_INTERVAL_S) or not _pst.get('cm_max')
+                        if not _cm_full:
+                            try:
+                                from datetime import datetime as _dt1, timedelta as _td1
+                                _cm_params['since'] = (
+                                    _dt1.fromisoformat(_pst['cm_max'].replace('Z', '+00:00'))
+                                    - _td1(seconds=600)).isoformat()
+                            except Exception:
+                                _cm_full = True
+                        if _pst.get('cm_etag') and _cm_full:
                             _h['If-None-Match'] = _pst['cm_etag']
                         r = req.get(peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-                                    headers=_h, timeout=15)
+                                    params=_cm_params, headers=_h, timeout=15)
                         if r.status_code == 304:
                             continue
                         if r.status_code == 200:
-                            if r.headers.get('ETag'):
-                                _pst['cm_etag'] = r.headers['ETag']
+                            if _cm_full:
+                                _pst['cm_full_ts'] = time.time()
+                                if r.headers.get('ETag'):
+                                    _pst['cm_etag'] = r.headers['ETag']
                             peer_cm = r.json()
+                            try:
+                                _cmx = max((v.get('updated_at') or '' for v in
+                                            (peer_cm.get('files') or {}).values()
+                                            if isinstance(v, dict)), default='')
+                                if _cmx and _cmx > (_pst.get('cm_max') or ''):
+                                    _pst['cm_max'] = _cmx
+                            except Exception:
+                                pass
                             # Only merge file entries from peers — never adopt their depo_id.
                             # The primary's depo_id is authoritative; peers get it via PUT.
                             for zn, entry in peer_cm.get('files', {}).items():
@@ -1649,26 +1687,54 @@ def _sync_peer_data():
                 # successful push predates the current content (hash
                 # gate), gzipped. Peers also GET this from us
                 # conditionally, so a skipped push is not a lost update.
+                # Delta push: the PUT handler merges by updated_at, so we
+                # only ship files newer than the watermark of the last
+                # successful push to that peer (+ the small top-level
+                # directives, always). Full push on first contact / every
+                # PEER_SYNC_FULL_INTERVAL_S.
                 if local_cm.get('files'):
-                    _cm_hash = hashlib.md5(
-                        json.dumps(local_cm, sort_keys=True).encode()).hexdigest()
+                    _lf = local_cm.get('files') or {}
+                    _local_max = max((v.get('updated_at') or '' for v in _lf.values()
+                                      if isinstance(v, dict)), default='')
+                    _top = {k: local_cm[k] for k in
+                            ('depo_id', 'record_id', 'prewarm', 'zenodo_circuit')
+                            if k in local_cm}
+                    _top_hash = hashlib.md5(
+                        json.dumps(_top, sort_keys=True, default=str).encode()).hexdigest()
                     _pushed_n = 0
+                    _pushed_files = 0
                     for peer_url in peer_urls:
                         _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
-                        if _pst.get('cm_pushed_hash') == _cm_hash:
+                        _wm = _pst.get('cm_pushed_max')
+                        _pfull = (not _wm or time.time() - float(_pst.get('cm_push_full_ts') or 0.0)
+                                  >= PEER_SYNC_FULL_INTERVAL_S)
+                        if _pfull:
+                            _delta = _lf
+                        else:
+                            _delta = {k: v for k, v in _lf.items()
+                                      if isinstance(v, dict) and (v.get('updated_at') or '') >= _wm}
+                        if not _delta and _pst.get('cm_pushed_top') == _top_hash:
                             continue
+                        _body = dict(_top)
+                        _body['files'] = _delta
                         try:
                             rr = _gzip_put_json(
                                 req,
                                 peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-                                local_cm, timeout=15)
+                                _body, timeout=15)
                             if rr.ok:
-                                _pst['cm_pushed_hash'] = _cm_hash
+                                _pst['cm_pushed_top'] = _top_hash
+                                if _local_max:
+                                    _pst['cm_pushed_max'] = _local_max
+                                if _pfull:
+                                    _pst['cm_push_full_ts'] = time.time()
                                 _pushed_n += 1
+                                _pushed_files += len(_delta)
                         except Exception as e:
                             log.debug('Peer sync: cache manifest push to %s failed: %s', peer_url, e)
                     if _pushed_n:
-                        log.info('Peer sync: cache manifest pushed to %d peer(s) (changed)', _pushed_n)
+                        log.info('Peer sync: cache manifest delta pushed to %d peer(s), %d file entries',
+                                 _pushed_n, _pushed_files)
 
             except Exception as e:
                 log.warning('Peer sync: cache manifest sync failed: %s', e)
@@ -1747,12 +1813,31 @@ _PEER_PUSH_LAST_FULL_TS = 0.0
 _PEER_PUSH_LAST_STATE = ''
 
 
+def _acquire_single_flight(name: str, poll_s: float = 30.0):
+    """Block until this process holds the fcntl lock ``name`` (one holder
+    across gunicorn workers; released automatically if the holder dies).
+    Returns the open file handle — keep it referenced."""
+    import fcntl as _fcntl
+    lp = Path('data/austria_processor') / f'{name}.lock'
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lp, 'w')
+    while True:
+        try:
+            _fcntl.flock(fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            time.sleep(poll_s)
+
+
 def _peer_status_push_loop():
     import requests as _req
     import director_ha as _dha
     import peer_director as _pd
     import gzip as _gz
     global _PEER_PUSH_LAST_FULL_TS, _PEER_PUSH_LAST_STATE
+    # One pusher per VM (both gunicorn workers used to push → 2× the
+    # director's inbound peer_status traffic for no extra freshness).
+    _sf = _acquire_single_flight('peer_status_push')
     while True:
         try:
             time.sleep(PEER_PUSH_INTERVAL_S)
@@ -3556,7 +3641,18 @@ def processing_cache_manifest():
         if not manifest_path.exists():
             return jsonify({})
         try:
-            return jsonify(json.loads(manifest_path.read_text()))
+            cm = json.loads(manifest_path.read_text())
+            # ``since=<iso>``: only files with updated_at >= since (the
+            # primary's 5-min fleet sync pulls deltas; ~3 KB instead of
+            # ~45 KB gz per peer per cycle). Top-level keys always ride.
+            _since = (request.args.get('since') or '').strip()
+            if _since and isinstance(cm.get('files'), dict):
+                cm = dict(cm)
+                cm['files'] = {k: v for k, v in cm['files'].items()
+                               if isinstance(v, dict)
+                               and (v.get('updated_at') or '') >= _since}
+                cm['since'] = _since
+            return jsonify(cm)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -7029,19 +7125,34 @@ def _all_status_compute():
                 except Exception as e:
                     ps = {'state': 'unreachable', 'error': str(e)}
             else:
+                # Prefer the status the peer pushed to us in the last
+                # ~75 s (identical payload to /processing/status; running
+                # peers push every 30 s). Saves ~30 GETs/min per open
+                # dashboard tab. Fall back to a direct probe when stale.
+                ps = None
                 try:
-                    # Tight timeout: this endpoint feeds a fast carousel,
-                    # slow/hung peers should drop out rather than block.
-                    import requests as _req
-                    r = _req.get(
-                        url.rstrip('/') + '/api/v1/processing/status',
-                        timeout=(2, 4),
-                        headers=pd._admin_headers(),
-                    )
-                    r.raise_for_status()
-                    ps = r.json() or {}
-                except Exception as e:
-                    ps = {'state': 'unreachable', 'error': str(e)}
+                    _pu = pd.get_pushed_status(pid)
+                    if _pu and isinstance(_pu.get('status'), dict) \
+                            and not _pu['status'].get('_heartbeat'):
+                        ps = dict(_pu['status'])
+                        ps['_pushed'] = True
+                        ps['_push_age_s'] = round(_time.time() - _pu['ts'], 1)
+                except Exception:
+                    ps = None
+                if ps is None:
+                    try:
+                        # Tight timeout: this endpoint feeds a fast carousel,
+                        # slow/hung peers should drop out rather than block.
+                        import requests as _req
+                        r = _req.get(
+                            url.rstrip('/') + '/api/v1/processing/status',
+                            timeout=(2, 4),
+                            headers=pd._admin_headers(),
+                        )
+                        r.raise_for_status()
+                        ps = r.json() or {}
+                    except Exception as e:
+                        ps = {'state': 'unreachable', 'error': str(e)}
             # The peer carousel reads current_kg / state / last_kg_* /
             # system / warning_rates / v2 fields. tile_history alone is
             # ~30 KB per peer and is only ever rendered for the primary

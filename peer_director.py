@@ -1574,6 +1574,7 @@ _PEER_STATUS_CACHE_TTL = 300.0   # 5 min — covers a slow GPKG step.
 PEER_PUSH_INTERVAL = 30          # seconds (peers run a ticker)
 PEER_PUSH_FRESH_S = 75           # consider push fresh for this long
 _PEER_PUSH: dict[str, dict] = {}  # peer_id -> {ts, status, bandwidth}
+_PEER_PUSH_DIR = Path('/tmp/srtm_peer_push')   # cross-worker mirror
 _PEER_PUSH_LOCK = threading.Lock()
 
 
@@ -1750,13 +1751,27 @@ def record_peer_push(peer_id: str, status: dict,
         if merged_sys:
             status = dict(status)
             status['system'] = merged_sys
-        _PEER_PUSH[peer_id] = {
+        _ent = {
             'ts': time.time(),
             'status': status,
             'bandwidth': bandwidth,
         }
+        _PEER_PUSH[peer_id] = _ent
         _new_strikes = status.get('v2_strikes')
         _old_strikes = prev_status.get('v2_strikes')
+    # Cross-worker share: a push lands on whichever gunicorn worker
+    # accepted the connection, but the director loop / all_status /
+    # get_peer_status run in either. Without this the loop worker saw
+    # only ~half the pushes, judged them stale (>75 s) and fell back to
+    # polling /processing/status (~30 GETs/min fleet-wide). ~2-5 KB
+    # atomic write per push; read side is mtime-gated.
+    try:
+        _PEER_PUSH_DIR.mkdir(parents=True, exist_ok=True)
+        _tmp = _PEER_PUSH_DIR / f'.{peer_id}.tmp'
+        _tmp.write_text(json.dumps(_ent, default=str))
+        os.replace(_tmp, _PEER_PUSH_DIR / f'{peer_id}.json')
+    except Exception:
+        pass
     if isinstance(_new_strikes, dict) and _new_strikes != _old_strikes:
         _v2_fleet_strikes_merge(peer_id, _new_strikes)
     _gone = status.get('v2_gone')
@@ -1765,16 +1780,34 @@ def record_peer_push(peer_id: str, status: dict,
 
 
 def get_pushed_status(peer_id: str) -> dict | None:
-    """Return fresh pushed status for a peer, or None if stale/missing."""
+    """Return fresh pushed status for a peer, or None if stale/missing.
+
+    Consults the on-disk copy written by the sibling gunicorn worker
+    when our in-memory entry is missing or older than the file."""
     if not peer_id:
         return None
     with _PEER_PUSH_LOCK:
         ent = _PEER_PUSH.get(peer_id)
-        if not ent:
-            return None
-        if (time.time() - ent['ts']) > PEER_PUSH_FRESH_S:
-            return None
-        return ent
+        ts = ent['ts'] if ent else 0.0
+    if (time.time() - ts) > 20.0:
+        try:
+            fp = _PEER_PUSH_DIR / f'{peer_id}.json'
+            st = fp.stat()
+            if st.st_mtime > ts + 0.5:
+                d = json.loads(fp.read_text())
+                if isinstance(d, dict) and d.get('ts'):
+                    with _PEER_PUSH_LOCK:
+                        cur = _PEER_PUSH.get(peer_id)
+                        if not cur or float(d['ts']) > cur['ts']:
+                            _PEER_PUSH[peer_id] = d
+                            ent = d
+        except Exception:
+            pass
+    if not ent:
+        return None
+    if (time.time() - ent['ts']) > PEER_PUSH_FRESH_S:
+        return None
+    return ent
 
 
 def get_pushed_bandwidth(peer_id: str) -> dict | None:
@@ -13580,6 +13613,7 @@ class PeerDirector:
         # gate and the stickiness logic keeps it put.
         SHADOW_MIN_DISK_GB = 3.0
         SHADOW_MIN_BANDWIDTH_GB = 10.0
+        SHADOW_INELIGIBLE_GRACE_S = 600
         candidates: list[tuple[float, dict]] = []
         rejected: list[tuple[str, str]] = []
         for p in peers:
@@ -13642,6 +13676,26 @@ class PeerDirector:
                 if p['id'] == prev_shadow:
                     chosen = (s, p)
                     break
+        if chosen is None and prev_shadow:
+            # Grace period (Sep 2026): a shadow that is *transiently*
+            # ineligible — unreachable for a minute while its srv
+            # restarts onto the rollout target, or commit_mismatch for
+            # the same reason — is kept for SHADOW_INELIGIBLE_GRACE_S.
+            # Every shadow change costs a full snapshot + archive
+            # reconcile and we were flapping 3× in 3 min during rollouts.
+            _rej = dict(rejected)
+            _reason = _rej.get(prev_shadow, '')
+            _transient = (_reason == 'unreachable'
+                          or _reason.startswith('commit_mismatch'))
+            _since = float(self.state.get('_shadow_inelig_since') or 0.0)
+            if _transient:
+                if not _since:
+                    self.state['_shadow_inelig_since'] = time.time()
+                    _since = time.time()
+                if (time.time() - _since) < SHADOW_INELIGIBLE_GRACE_S:
+                    return   # keep prev shadow, skip this tick's push
+        if chosen is not None or not prev_shadow:
+            self.state.pop('_shadow_inelig_since', None)
         if chosen is None:
             chosen = candidates[0]
         else:

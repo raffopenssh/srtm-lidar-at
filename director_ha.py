@@ -932,6 +932,19 @@ def start_watchdog() -> None:
 
 def _watchdog_loop() -> None:
     time.sleep(20)  # let services boot
+    # One watchdog per VM: both gunicorn workers used to probe the
+    # director (2× heartbeat traffic). fcntl lock is released if the
+    # holding worker dies, so the sibling takes over within a poll.
+    import fcntl as _fcntl
+    _lp = DATA_DIR / 'watchdog.lock'
+    _lp.parent.mkdir(parents=True, exist_ok=True)
+    _fh = open(_lp, 'w')
+    while True:
+        try:
+            _fcntl.flock(_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            break
+        except OSError:
+            time.sleep(WATCHDOG_INTERVAL)
     while True:
         try:
             _watchdog_tick()

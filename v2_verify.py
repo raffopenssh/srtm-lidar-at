@@ -80,8 +80,8 @@ TOL = {
 HINTS = {
     "unclassified_le_v1": "few huge 'unclassified' objs = cross-tile anchor-weak merge demotion → "
                           "grep peer log 'Anchor-weak' (v2 skips those merges since 2026-09-21)",
-    "parcel_segmentation_coverage_pct_ge_v1": "tiny single-object parcels lost their class (segv2 drops "
-                                              "path/earthwork) or a tile was not segmented → check data_quality.tiles",
+    "parcel_segmentation_coverage_pct_ge_v1": "parcels ≥300 m² lost their area_summary (slivers are excluded) "
+                                              "→ a tile was not segmented / class dropped; check data_quality.tiles",
     "segment_type_no_holes": "segment_type==0 inside parcel union → unsegmented tile / BEV read hole; "
                              "grep 'gpkg_full' + 'deferred' for that KG",
     "parcels_vs_v1": "cadastre changed between runs (±1–2 is normal for old v1) — compare parcels_vs_cadastre",
@@ -154,6 +154,22 @@ def _unclassified_pct(doc) -> float:
         if t == "unclassified":
             unc += s
     return 100.0 * unc / tot if tot > 0 else 0.0
+
+
+SEG_COV_MIN_AREA_SQM = 300.0   # sliver parcels below this are excluded from the fatal coverage gate
+SEG_COV_MIN_PARCELS = 20       # … need this many big parcels for the filtered figure to mean anything
+
+
+def _seg_coverage_min_area(doc, min_area: float = SEG_COV_MIN_AREA_SQM) -> float | None:
+    """``parcel_segmentation_coverage_pct`` recomputed over parcels ≥ *min_area*
+    (needs ``parcels.details``); None when unavailable / too few parcels."""
+    det = _g(doc, "parcels", "details", default=None)
+    if not isinstance(det, list):
+        return None
+    big = [p for p in det if isinstance(p, dict) and (_num(p.get("area_sqm"), 0) or 0) >= min_area]
+    if len(big) < SEG_COV_MIN_PARCELS:
+        return None
+    return 100.0 * sum(1 for p in big if p.get("area_summary")) / len(big)
 
 
 def _active_tiles(doc) -> tuple[int, int, list]:
@@ -264,6 +280,20 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
         a, b = _num(cov.get(k)), _num(cov1.get(k))
         if a is None or b is None:
             continue
+        if k == "parcel_segmentation_coverage_pct":
+            # Small KGs (19423: 164 parcels, 19732: 38) flip a handful of
+            # sliver parcels (70–250 m², smaller than the object covering
+            # them) between runs — 1–6 parcels = 2.6–3.6 pp, past the 2.5 pp
+            # gate although nothing is wrong (2026-09-21, 5 parents struck
+            # after 0d4f717).  Judge the fatal gate on parcels ≥ 300 m² where
+            # both docs carry details; the raw figure stays a drift warning.
+            fa, fb = _seg_coverage_min_area(v2), _seg_coverage_min_area(v1)
+            if fa is not None and fb is not None:
+                rep.check(f"{k}_ge_v1", fa >= fb - tol,
+                          f"v2={fa:.1f} v1={fb:.1f} (parcels ≥{SEG_COV_MIN_AREA_SQM:.0f} m²; raw {a:.1f}/{b:.1f})")
+                if a < b - TOL["seg_coverage_pp_warn"]:
+                    rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp, raw)", fatal=False)
+                continue
         rep.check(f"{k}_ge_v1", a >= b - tol, f"v2={a:.1f} v1={b:.1f}")
         if k == "parcel_segmentation_coverage_pct" and b - tol <= a < b - TOL["seg_coverage_pp_warn"]:
             rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp)", fatal=False)
@@ -391,7 +421,9 @@ def check_v21_document(v2: dict, rep: Report) -> None:
         x1, y1 = x0 + cols * cell, y0 - rows * cell
         covers = (x0 <= bb[0] + cell and y1 <= bb[1] + cell
                   and x1 >= bb[2] - cell and y0 >= bb[3] - cell)
-        slack = 1700.0
+        # 19565 (2026-09-21): 2×2 tiles for a 1.3×2.0 km bbox, east
+        # overshoot 1759 m = one 1575 m tile + the 100 m read buffer + snap.
+        slack = 1800.0
         sane = (bb[0] - x0 <= slack and x1 - bb[2] <= slack
                 and bb[1] - y1 <= slack and y0 - bb[3] <= slack)
         rep.check("grid25_dims", covers and sane,

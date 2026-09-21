@@ -10169,10 +10169,17 @@ class PeerDirector:
             raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
             ent = raw.get('entries', raw) or {}
             skip = set()
+            # Primary-ingest strike-outs only disqualify a code whose v2
+            # pair is actually complete (genuine content problem). A
+            # half-landed pair (json_v2, no light_gpkg_v2) fails ingest
+            # with 'no committed _light_gpkg_v2 entry' — re-upgrading is
+            # exactly the fix, and the fresh uploaded_at resets the
+            # ingest strike (v2_ingest.pending keys on it).
+            skip_ingest = set()
             try:
                 import v2_ingest as _v2i
-                skip = {c for c, st in _v2i.failed().items()
-                        if int(st.get('n', 0)) >= _v2i.MAX_FAILS}
+                skip_ingest = {c for c, st in _v2i.failed().items()
+                               if int(st.get('n', 0)) >= _v2i.MAX_FAILS}
             except Exception:
                 pass
             try:
@@ -10198,6 +10205,8 @@ class PeerDirector:
                     if _v2c(ent, code):
                         continue
                     n_reup += 1
+                elif code in skip_ingest:
+                    continue  # stale ingest strike without json_v2 — leave to ingest
                 g = ent.get(f'{code}_full_gpkg')
                 if not isinstance(g, dict) or int(g.get('size') or 0) <= 0 \
                         or not g.get('uploaded_at'):

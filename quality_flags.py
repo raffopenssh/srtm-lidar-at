@@ -33,7 +33,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterator, Optional
 
 log = logging.getLogger(__name__)
 
@@ -691,7 +691,6 @@ def _cli():
         print(json.dumps(feedback_db.flag_stats(), indent=2))
     elif cmd == 'distributions':
         # Re-emit empirical percentiles from local JSONs.
-        from collections import defaultdict
         H = defaultdict(list); A = defaultdict(list)
         for jp in JSON_DIR.glob('*.json'):
             d = json.loads(jp.read_text())

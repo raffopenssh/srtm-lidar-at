@@ -21,8 +21,6 @@ import atexit
 import concurrent.futures
 import ctypes
 import gc
-import gzip
-import hashlib
 import json
 import logging
 import multiprocessing
@@ -34,15 +32,13 @@ import threading
 import time
 import traceback
 from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
 
 import numpy as np
 import requests
 from pyproj import Transformer
-from shapely.geometry import box, shape as shapely_shape, Point, Polygon, MultiPolygon, mapping
+from shapely.geometry import box, shape as shapely_shape, Point, mapping
 from shapely.ops import transform as shapely_transform
 
 # === SECTION: Config ===
@@ -212,7 +208,6 @@ def _local_cache_grew_since_last_flush() -> bool:
     """True if the local tile cache has gained > _FLUSH_GROWTH_BYTES bytes
     since the last successful flush. Cheap (one rglob over .npz files).
     """
-    global _last_flush_cache_size_bytes
     cur = _measure_local_cache_size()
     delta = cur - _last_flush_cache_size_bytes
     return delta > _FLUSH_GROWTH_BYTES
@@ -1754,7 +1749,6 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
     }
 
     results = []
-    obj_map = {o.obj_id: o for o in objects}
 
     for obj in objects:
         if obj.obj_type not in INFRA_TYPES:
@@ -1806,7 +1800,6 @@ def vectorise_infrastructure(objects: list, labels: np.ndarray,
             c_wgs = poly_wgs.centroid
 
             seg_h = ndsm[seg_mask]
-            seg_dtm = dtm[seg_mask]
 
             feature = {
                 "type": obj.obj_type,
@@ -2349,7 +2342,6 @@ def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
     observation period metadata.
     """
     from rasterio.features import shapes as rasterize_shapes
-    import fiona
     from fiona.crs import from_epsg
 
     obj_map = {o.obj_id: o for o in objects}
@@ -2519,7 +2511,6 @@ def _write_segment_points(gpkg_path: str, objects: list,
     This mirrors the GeoJSON Point features that the API returns,
     enabling the same map visualisation from the GPKG/Zenodo store.
     """
-    import fiona
     from fiona.crs import from_epsg
 
     schema = {
@@ -3064,103 +3055,8 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
 
 
 
-def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
-    """Compute overlapping tiles covering the full KG bbox. Returns [(w,s,e,n)]."""
-    cos_lat = np.cos(np.radians((south + north) / 2))
-    dx_deg = tile_km / (111 * cos_lat)
-    dy_deg = tile_km / 111
-    step_x = (tile_km - overlap_km) / (111 * cos_lat)
-    step_y = (tile_km - overlap_km) / 111
-    tiles = []
-    y = south
-    while y < north:
-        x = west
-        while x < east:
-            tiles.append((x, y, min(x + dx_deg, east + dx_deg), min(y + dy_deg, north + dy_deg)))
-            x += step_x
-        y += step_y
-    return tiles
-
-
-def _merge_terrain_stats(stats_list):
-    """Merge terrain stats from tiles via pixel-weighted averages."""
-    if not stats_list:
-        return {}
-    if len(stats_list) == 1:
-        return stats_list[0][0]
-    total_px = sum(n for _, n in stats_list)
-    if total_px == 0:
-        return stats_list[0][0]
-
-    def _wmean(kp):
-        vals = []
-        for s, n in stats_list:
-            v = s
-            for k in kp:
-                v = v.get(k) if isinstance(v, dict) else None
-                if v is None: break
-            if v is not None and isinstance(v, (int, float)):
-                vals.append((v, n))
-        return round(sum(v*w for v,w in vals)/sum(w for _,w in vals), 3) if vals else None
-
-    def _extreme(kp, fn):
-        vals = []
-        for s, _ in stats_list:
-            v = s
-            for k in kp:
-                v = v.get(k) if isinstance(v, dict) else None
-                if v is None: break
-            if v is not None and isinstance(v, (int, float)):
-                vals.append(v)
-        return round(fn(vals), 2) if vals else None
-
-    merged = {
-        "elevation": {
-            "min": _extreme(["elevation","min"], min),
-            "max": _extreme(["elevation","max"], max),
-            "mean": _wmean(["elevation","mean"]),
-            "std": _wmean(["elevation","std"]),
-            "range": None,
-            "p10": _wmean(["elevation","p10"]),
-            "p50": _wmean(["elevation","p50"]),
-            "p90": _wmean(["elevation","p90"]),
-        },
-        "slope_deg": {
-            "min": _extreme(["slope_deg","min"], min),
-            "max": _extreme(["slope_deg","max"], max),
-            "mean": _wmean(["slope_deg","mean"]),
-            "std": _wmean(["slope_deg","std"]),
-        },
-        "slope_classes_pct": {}, "aspect_distribution_pct": {},
-        "ruggedness_tri": {
-            "mean": _wmean(["ruggedness_tri","mean"]),
-            "max": _extreme(["ruggedness_tri","max"], max),
-            "classification": None,
-        },
-        "area_sqm": total_px,
-        "area_ha": round(total_px / 10000, 2),
-    }
-    em, ex = merged["elevation"]["min"], merged["elevation"]["max"]
-    if em is not None and ex is not None:
-        merged["elevation"]["range"] = round(ex - em, 2)
-    for cls_key in ["slope_classes_pct", "aspect_distribution_pct"]:
-        all_keys = set()
-        for s, _ in stats_list:
-            all_keys.update(s.get(cls_key, {}).keys())
-        for k in all_keys:
-            merged[cls_key][k] = round(
-                sum(s.get(cls_key, {}).get(k, 0) * n for s, n in stats_list) / total_px, 1)
-    tri_mean = merged["ruggedness_tri"]["mean"]
-    if tri_mean is not None:
-        for thr, lbl in [(0.1,"level"),(0.3,"nearly level"),(1.0,"slightly rugged"),
-                         (3.0,"intermediately rugged"),(10.0,"moderately rugged")]:
-            if tri_mean < thr:
-                merged["ruggedness_tri"]["classification"] = lbl
-                break
-        else:
-            merged["ruggedness_tri"]["classification"] = "highly rugged"
-    return merged
-
+# NOTE: `_compute_tile_grid` and `_merge_terrain_stats` are defined once, in the
+# process_one_kg section below (earlier duplicate definitions removed).
 
 def _find_tile_for_point(e3035, n3035, tile_seg_results):
     """Find tile containing point (e, n) EPSG:3035."""
@@ -4160,7 +4056,8 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     dtm_full = np.where(has_data, dtm_sum / weight_sum, np.nan).astype(np.float32)
     dsm_full = np.where(has_data, dsm_sum / weight_sum, np.nan).astype(np.float32)
     ndsm_full = np.where(has_data, ndsm_sum / weight_sum, np.nan).astype(np.float32)
-    del dtm_sum, dsm_sum, ndsm_sum, weight_sum, best_cat_weight
+    # rebind (not `del`) — these are closure cells of _paint_dtm_tile
+    dtm_sum = dsm_sum = ndsm_sum = weight_sum = best_cat_weight = None
 
     # ------------------------------------------------------------------
     # Merge boundary segments across tiles (before writing rasters)
@@ -5214,7 +5111,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 except Exception:
                     pass
                 dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
-    del _gpkg_tile_data  # free memory
+    _gpkg_tile_data.clear()  # free memory (closure cell of _gpkg_load_tile)
 
     # --- New buildings ---
     if new_buildings:
@@ -6075,7 +5972,6 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     if objects and cadastre_data["parcels"]:
         try:
             from shapely import STRtree
-            from shapely.geometry import Point
             parcel_geoms = [p["geometry"] for p in cadastre_data["parcels"]]
             tree = STRtree(parcel_geoms)
             for obj in objects:
@@ -6605,7 +6501,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     if n_bld_no_tile > 0:
         log.warning("JSON: %d/%d buildings have no matching tile", n_bld_no_tile, len(cadastre_data["building_footprints"]))
     # Free tile data cache
-    del _tile_data_cache
+    _tile_data_cache.clear()
     summary["building_footprints"] = {"count": len(cadastre_data["building_footprints"]), "details": bld_details}
     # --- Coverage ---
     nwe = sum(1 for p in parcel_details if p.get("elevation_m") is not None)
@@ -7015,7 +6911,6 @@ def _stitch_copernicus_subtiles(
     # For each raster layer, mosaic into a common grid
     # Use the first available sub-tile to determine resolution
     import rasterio
-    from rasterio.transform import from_bounds as _tfb
 
     def _mosaic_layer(sub_results_with_data, layer_key, tf_key="transform"):
         """Mosaic a single 2D layer from sub-tiles."""
@@ -8083,7 +7978,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     result["ortho_failed"] = True
                     result["success"] = False
                     result["error"] = (
-                        f"Ortho unavailable for tile {tile_idx+1}/{len(tiles)} "
+                        f"Ortho unavailable for tile {tile_idx+1}/{n_tiles} "
                         f"after {len(_ORTHO_TIMEOUTS)} attempts: "
                         f"{tile_avail['upstream_fail_reason']}"
                     )
@@ -8375,7 +8270,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             t_labels = new_labels
 
             # Store tile segmentation result for parcel enrichment
-            tile_bounds_3035 = raster_io.read_window_bbox.__wrapped__ if False else None
             # Compute tile bounds in EPSG:3035 from transform + shape
             import rasterio.transform
             t_bounds_3035 = rasterio.transform.array_bounds(th, tw_, t_transform)
@@ -9485,7 +9379,6 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
         issues.append("FULL_GPKG: missing")
       else:
         try:
-            import re as _re
             expected_raster = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
             found_layers = set()
             try:
@@ -9537,7 +9430,6 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
       else:
         try:
             import sqlite3
-            import re as _re
             conn = sqlite3.connect(light_path)
             # Raster tables
             raster_tables = [r[0] for r in conn.execute(
@@ -9841,8 +9733,6 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
                     return v.get(nm) or 0
         return 0
 
-    parcels = _d("parcels")
-    bfp = _d("building_footprints")
     landscape = _d("landscape")
     terrain = _d("terrain")
     area_sum = _d("area_summary")
@@ -9851,8 +9741,6 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
     top_tree = _l("top_10_trees") or [{}]
     hansen = _d("hansen")
     ndvi = _d("ndvi")
-    new_b = _d("new_buildings")
-    infra = _d("infrastructure")
 
     n_seg = landscape.get("n_segments", 0) or len(_l("objects"))
     n_par = _n("parcels", "count")
@@ -10021,8 +9909,9 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             _file_cb = None
             if progress_callback:
                 _file_label = file_key
-                def _file_cb(sent, total, _label=_file_label):
+                def _cb(sent, total, _label=_file_label):
                     progress_callback(_label, sent, total)
+                _file_cb = _cb
             client.upload_stream(
                 zenodo_key, local_path, _product_upload_version(file_key), meta_func, manifest,
                 delete_after=delete_local,
@@ -10503,7 +10392,6 @@ def _atexit_kill_children():
     (we are the session leader by virtue of start_new_session=True at
     spawn time).
     """
-    global _active_pool
     try:
         if _active_pool is not None:
             _drain_pool(_active_pool, hard_timeout=10.0)
@@ -10907,7 +10795,7 @@ def _partial_kgs_mutate(fn):
     subprocess (which all share the same filesystem). ``fn`` may mutate
     the dict in place and/or return a replacement.
     """
-    import fcntl, tempfile, os
+    import fcntl
     PARTIAL_KGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_path = PARTIAL_KGS_FILE.with_suffix('.lock')
     with open(lock_path, 'w') as _lk:
@@ -11186,7 +11074,7 @@ def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
 
 
 def main():
-    global _shutdown_requested, _active_pool
+    global _active_pool
 
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")
     parser.add_argument("--kg", help="Process single KG code")
@@ -11583,8 +11471,7 @@ def main():
                      len(_strips), before, len(pending))
 
     # --- Expand large KGs into blocks ---
-    from kg_splitter import (maybe_split_kg, is_block_code, parent_kg_code,
-                             all_block_codes_for_parent, MAX_TILES_PER_BLOCK)
+    from kg_splitter import maybe_split_kg, is_block_code, parent_kg_code
 
     # Check if parent KGs are fully done (all blocks completed)
     # Also recognize parent codes that were completed as a whole (no blocks)
@@ -11880,7 +11767,7 @@ def main():
 
         # --- Disk space check before starting KG ---
         if not check_disk_space(kg_code):
-            progress.add_log("error", f"Disk critically low — pausing processor", kg_code)
+            progress.add_log("error", "Disk critically low — pausing processor", kg_code)
             progress.update(state="paused_disk")
             progress.save()
             log.error("Disk critically low after cleanup — pausing")
@@ -12068,7 +11955,6 @@ def main():
 
         t_kg = time.time()
         result = None
-        kg_succeeded = False
 
         try:
             # ---- Simple retry: on timeout, retry once with same
@@ -12284,7 +12170,6 @@ def main():
                 pass
             elif result.get("success"):
                 elapsed_kg = time.time() - t_kg
-                kg_succeeded = True
 
                 # --- Validate outputs ---
                 # Validation now runs in the subprocess (before early
@@ -12434,7 +12319,6 @@ def main():
                         _ckg = progress._state.get("current_kg") or {}
                         _ts = _ckg.get("tile_statuses", [])
                     _save_tile_history(kg_code, _ts, "postponed")
-                    kg_succeeded = False
                     # Skip record_success path; fall through so the
                     # post-iteration pause check picks up the flag file.
 

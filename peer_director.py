@@ -4171,7 +4171,6 @@ class PeerDirector:
         except Exception:
             valid_creds = []
         per = self._effective_creds_per_frontier(cfg)
-        active_id_now = state.get('active_peer')
         max_par = self._max_parallel_frontiers(cfg)
         cred_plan = state.get('frontier_cred_plan') or {}
         strip_plan = state.get('frontier_strip_plan') or {}
@@ -5358,7 +5357,7 @@ class PeerDirector:
 
         Cheap: O(1), no I/O unless cfg actually changed.
         """
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        from datetime import datetime as _dt, timezone as _tz
         with self._lock:
             cfg = self.cfg
             primary = None
@@ -5922,7 +5921,6 @@ class PeerDirector:
             reasons: list[str] = []
             slowdown_tripped = False
             quality_obs = False
-            slowdown_observing = False
             if entry['usable']:
                 ratio = entry['ratio']
                 base_mbps = entry['base_mbps']
@@ -5969,7 +5967,6 @@ class PeerDirector:
                     # min of degraded throughput — far cheaper than a
                     # guaranteed 1 h park per blip.
                     if not persistent:
-                        slowdown_observing = True
                         # Log once per streak so process.txt shows the
                         # observation without per-tick spam.
                         s = streaks.get(pid)
@@ -6257,7 +6254,6 @@ class PeerDirector:
         peer on a subsequent tick (no explicit park), and the KG goes
         back through the normal in-progress/requeue path.
         """
-        from datetime import datetime as _dt, timezone as _tz
         now_ts = time.time()
         with self._lock:
             track = self.state.setdefault('stuck_kg_track', {})
@@ -6888,10 +6884,6 @@ class PeerDirector:
             ent = raw.get('entries', raw) or {}
         except Exception:
             ent = {}
-        try:
-            from v21_products import MANIFEST_VERSION as _V21
-        except Exception:
-            _V21 = 'v2.1'
         changed = False
         # --- settle requeued / expire done (no Zenodo traffic) ---
         for code, e in list(d.items()):
@@ -7731,7 +7723,6 @@ class PeerDirector:
         director event, busts the status cache.
         """
         from datetime import datetime as _dt, timezone as _tz2
-        now = time.time()
         cleared_ids: list[str] = []
         with self._lock:
             pool_esc = dict(self.state.get('bev_pool_escalation') or {})
@@ -8043,7 +8034,6 @@ class PeerDirector:
             cfg = self.cfg.copy()
             state_copy = self.state.copy()
 
-        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
 
         # Pre-empt the active peer when a different peer's reservation
         # becomes ready (cooldown lifted, KG still pending). The held KG
@@ -9281,7 +9271,6 @@ class PeerDirector:
             per_eff = max(1, len(valid) // max(1, n_peers))
         else:
             per_eff = per
-        extra = max(0, len(valid) - per_eff * n_peers)  # leftovers
         valid_set = set(valid)
         used: set[int] = set()
         prior = prior or {}
@@ -10507,8 +10496,6 @@ class PeerDirector:
         if not active_id:
             return
 
-        valid = self._valid_credentials()
-        per = self._effective_creds_per_frontier(cfg)
 
         # Cap on total concurrent frontiers (incl. active). With 8 valid
         # creds and per=2 this is min(3, 7) = 3 — we always reserve `per`
@@ -10557,7 +10544,6 @@ class PeerDirector:
             log.debug('parallel orch: no Austria cells available, skipping')
             return
 
-        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
         min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
         peers = list(cfg.get('peers', []))
         total_enabled = sum(1 for p in peers
@@ -11768,7 +11754,6 @@ class PeerDirector:
         if _bp.get('active') and (_bp.get('scope') or 'fleet') == 'fleet':
             return
 
-        budget_bytes = cfg.get('budget_gb', BANDWIDTH_BUDGET_GB) * (1024 ** 3)
         min_reserve = int(cfg.get('min_reserve_peers', MIN_RESERVE_PEERS))
         max_cache_only = int(cfg.get('max_cache_only_peers', MAX_CACHE_ONLY_PEERS))
         # Server-friendliness throttle (see _capacity_factor docstring).
@@ -12644,7 +12629,6 @@ class PeerDirector:
         # historically-split-but-geographically-complete KGs (40326/62013)
         # queued forever because maybe_split now returns a single block whose
         # parent ``_json`` was never emitted.
-        _parent_done = None
         try:
             _mf_path_pd = DATA_DIR / 'zenodo_manifest.json'
             _mf_pd = {}

@@ -53,7 +53,7 @@ LIGHT_LAYERS_V2 = ("parcel_outline_z",)
 try:
     from v21_products import PRODUCT_VERSION
 except Exception:  # noqa: BLE001
-    PRODUCT_VERSION = "2.2"
+    PRODUCT_VERSION = "2.3"
 LIGHT_LAYERS_V21 = ("terrain_coarse_dtm", "terrain_coarse_slope")
 
 TOL = {
@@ -302,6 +302,7 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
                   fatal=bool(_elev_fatal))
 
     check_v21_document(v2, rep)
+    check_v23_top_ranking(v2, rep)
 
     cov = _g(v2, "coverage", default={}) or {}
     cov1 = (_g(v1, "coverage", default={}) or {}) if v1 else {}
@@ -437,7 +438,7 @@ def check_v21_document(v2: dict, rep: Report) -> None:
     # peers verify their own output (must be the current version); the primary
     # ingests whatever the fleet uploads during a rollout — an older readable
     # product line is a warning there, not a rejection.
-    readable = {"2.1", "2.2"}
+    readable = {"2.1", "2.2", "2.3"}
     if pv == PRODUCT_VERSION:
         rep.check("product_version", True, f"product_version={pv!r}")
     else:
@@ -523,6 +524,54 @@ def _gpkg_point_xy(blob: bytes):
         return None
     x, y = struct.unpack(bo + "dd", blob[off + 5:off + 21])
     return float(x), float(y)
+
+def check_v23_top_ranking(v2: dict, rep: Report) -> None:
+    """Product-2.3: top-N lists are robust-ranked and plausibility-filtered.
+
+    Fatal on a peer producing the current version (a 2.3 doc whose
+    ``top_10_trees`` still carries an 80 m tree is the bug this version
+    exists to fix); a warning for readable older lines on the primary.
+    """
+    pv = str(v2.get("product_version") or "")
+    fatal = pv == PRODUCT_VERSION
+    if not fatal and pv in ("2.1", "2.2"):
+        return
+    objs = v2.get("top_10_objects") or []
+    trees = v2.get("top_10_trees") or []
+    mm = v2.get("top_manmade_objects")
+    rep.check("top_manmade_present", isinstance(mm, list),
+              "top_manmade_objects missing", fatal=fatal)
+    rows = list(objs) + list(trees) + list(mm or [])
+    missing = [r for r in rows if not isinstance(r.get("height_robust_m"), (int, float))]
+    rep.check("top_height_robust", not missing,
+              f"{len(missing)}/{len(rows)} top rows lack height_robust_m", fatal=fatal)
+    # robust ≤ max, lists non-increasing in robust height
+    bad = [r for r in rows if isinstance(r.get("height_robust_m"), (int, float))
+           and isinstance(r.get("height_max_m"), (int, float))
+           and r["height_robust_m"] > r["height_max_m"] + 0.011]
+    rep.check("top_robust_le_max", not bad, f"{len(bad)} rows robust > max", fatal=fatal)
+    for name, lst in (("top_10_objects", objs), ("top_10_trees", trees)):
+        hs = [r.get("height_robust_m") for r in lst if isinstance(r.get("height_robust_m"), (int, float))]
+        rep.check(f"{name}_sorted", all(a >= b - 1e-6 for a, b in zip(hs, hs[1:])),
+                  f"{name} not sorted by height_robust_m", fatal=fatal)
+    try:
+        import quality_flags as _qf
+        T = _qf.THRESHOLDS
+        spikes = [r for r in trees if isinstance(r.get("height_max_m"), (int, float))
+                  and r["height_max_m"] >= T["tree_max_height_m"]["critical"]]
+        spikes += [r for r in objs if r.get("type") in _qf.GROUND_TYPES
+                   and isinstance(r.get("height_robust_m"), (int, float))
+                   and r["height_robust_m"] >= T["flat_type_max_height_m"]["high"]]
+        spikes += [r for r in objs if r.get("type") in ("water", "waterbody")
+                   and isinstance(r.get("height_robust_m"), (int, float))
+                   and r["height_robust_m"] >= T["water_max_height_m"]["high"]]
+        rep.check("top_no_implausible", not spikes,
+                  f"{len(spikes)} implausible rows in top lists "
+                  f"(e.g. {spikes[0].get('type')} {spikes[0].get('height_max_m')} m)" if spikes else "",
+                  fatal=fatal)
+    except ImportError:
+        pass
+
 
 def check_v21_light_gpkg(c: sqlite3.Connection, layers: dict, v2: dict, rep: Report) -> None:
     """Product-2.1 light GPKG checks (peer only; *c* is an open ro connection)."""

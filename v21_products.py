@@ -38,11 +38,11 @@ import numpy as np
 
 log = logging.getLogger("austria_processor.v21")
 
-PRODUCT_VERSION = "2.2"
+PRODUCT_VERSION = "2.3"
 #: manifest ``Entry.version`` written for ``_json_v2`` / ``_light_gpkg_v2`` uploads
-MANIFEST_VERSION = "v2.2"
+MANIFEST_VERSION = "v2.3"
 #: product line readable by trees_v3 / the primary (older = fewer fields)
-READABLE_MANIFEST_VERSIONS = ("v2.1", "v2.2")
+READABLE_MANIFEST_VERSIONS = ("v2.1", "v2.2", "v2.3")
 
 
 def _ent_get(e, k, default=None):

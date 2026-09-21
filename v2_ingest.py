@@ -295,7 +295,7 @@ def status(total_kgs: int = 8440, ttl: float = 60.0) -> dict:
     try:
         from v21_products import MANIFEST_VERSION as _cur
     except Exception:  # noqa: BLE001
-        _cur = "v2.2"
+        _cur = "v2.3"
     # Source of truth: the search index (one row per PARENT KG, version =
     # min across blocks).  A parent counts as upgraded only at the CURRENT
     # product version; 2.1 parents awaiting re-upgrade are ``stale``.

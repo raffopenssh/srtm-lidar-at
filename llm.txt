@@ -1026,6 +1026,7 @@ Returns: {count, flags: [{obj_ref, kg_code, kind, obj_type, flag_code,
 All flags + aggregates for one object. obj_ref examples:
   KGCODE:top_tree:N           top_10_trees rank N
   KGCODE:top_obj:N            top_10_objects rank N
+  KGCODE:top_manmade:N        top_manmade_objects rank N (product 2.3+)
   KGCODE:top_by_type:tree:0   per-type top entry
   KGCODE:building:<id>        cadastre-matched building
   KGCODE:new_building:N       vectorised unmatched roof

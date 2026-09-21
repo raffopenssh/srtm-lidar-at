@@ -199,6 +199,11 @@ V2_UPGRADE_FILL_BELOW_READY = 40   # inject when cache_ready_kgs < this
 MAX_V2_UPGRADE_PEERS = 24          # ≈ concurrent full-GPKG downloads (codes injected/tick)
 V2_UPGRADE_ZEN_WARN_MAX = 2.0      # fleet Zenodo warns/min above which we inject nothing
 V2_UPGRADE_CAND_TTL_S = 300
+#: 2.3: bring the existing v2 product line (2.0/2.1/2.2 KGs) to the current
+#: version BEFORE starting on never-upgraded v1 KGs (clean slate — every
+#: served v2 JSON gets robust top-N ranking).  Flip back to False once the
+#: `v2:` line shows parents_by_version has no v2/v2.1/v2.2 left.
+V2_REUPGRADE_FIRST = True
 
 # === Frontier cell pre-warm (Fix #2) ===
 # A frontier only fetches the handful of 0.1° tiles its KG needs, so the
@@ -10186,9 +10191,13 @@ class PeerDirector:
                 skip |= v2_fleet_struck_out()
             except Exception:
                 pass
-            # rank key: (already has an older-product _json_v2?, full GPKG
-            # size) — never-upgraded codes first, then product<2.1 re-upgrades
-            # (docs/v2.1-product-spec.md → Eligibility / versioning).
+            # rank key: (product-line bucket, full GPKG size).  Since 2.3
+            # (V2_REUPGRADE_FIRST) codes that already carry an OLDER v2
+            # product (2.0/2.1/2.2) go BEFORE never-upgraded v1 codes: the
+            # 2.3 change (robust top-N ranking) rewrites what every v2 JSON
+            # says, so the live v2 product line is brought to one clean
+            # version first; v1-only KGs already read as "not v2" and keep
+            # their place in the queue (docs/v2-upgrade.md → Priority).
             from v21_products import MANIFEST_VERSION as _V21, v2_products_complete as _v2c
             ranked = []
             n_reup = 0
@@ -10213,17 +10222,21 @@ class PeerDirector:
                     continue
                 # Rank: -1 = current json_v2 but light_gpkg_v2 missing (a
                 # half-landed pair; heal first — it's inconsistent on
-                # Zenodo), 0 = never upgraded, 1 = product<current re-upgrade.
+                # Zenodo); then product<current re-upgrade vs never
+                # upgraded, ordered by V2_REUPGRADE_FIRST.
                 if isinstance(j2, dict) and str(j2.get('version') or '') == _V21:
                     _rk = -1
+                elif isinstance(j2, dict):
+                    _rk = 0 if V2_REUPGRADE_FIRST else 1
                 else:
-                    _rk = 1 if isinstance(j2, dict) else 0
+                    _rk = 1 if V2_REUPGRADE_FIRST else 0
                 ranked.append((_rk, int(g.get('size') or 0), code))
             ranked.sort()
             codes = [c for _, _, c in ranked[:max_n]]
             if n_reup:
-                log.debug('v2 upgrade candidates: %d product<%s re-upgrade(s) queued after '
-                          'never-upgraded codes', n_reup, _V21)
+                log.debug('v2 upgrade candidates: %d product<%s re-upgrade(s) queued %s '
+                          'never-upgraded codes', n_reup, _V21,
+                          'BEFORE' if V2_REUPGRADE_FIRST else 'after')
         except Exception as e:
             log.warning('v2 upgrade candidates: %s', e)
         with self._lock:

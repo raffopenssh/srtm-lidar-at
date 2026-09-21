@@ -5441,6 +5441,92 @@ def compute_data_quality(tile_data_availability: list[dict]) -> dict:
     }
 
 
+# === SECTION: robust top-N ranking ===
+# ``height_max`` is a single-pixel nDSM maximum, so a DSM spike (bird,
+# power line, edge artefact, mis-registered pixel) makes an 80 m "crop" or
+# a 73 m "tree" with p90 = 18 m.  Top-N highlight lists rank by a robust
+# height instead and drop candidates the quality_flags plausibility rules
+# would flag at ≥ high severity.  ``height_max_m`` stays in the output.
+# Sep-2026 fleet sample (1500 KGs, 7058 plausible top trees hmax<45 m &
+# area>50 m²): hmax−p90 p50=5.9 p90=11.7 p95=14.5 p99=22.5.  10 m ≈ p85 —
+# real crowns keep their apex, spikes (p99 of ALL top trees: 58 m) collapse.
+ROBUST_HEIGHT_MARGIN_M = 10.0
+_TOP_EXCLUDE_FLAG_CODES = {
+    'tree_height_implausible', 'shrub_height_implausible',
+    'hedge_height_implausible', 'orchard_height_implausible',
+    'vineyard_height_implausible', 'building_height_implausible',
+    'greenhouse_height_implausible', 'flat_type_has_height',
+    'water_has_height', 'mast_likely_misclassified',
+    'fence_height_implausible', 'wall_height_implausible',
+    'rock_height_implausible', 'construction_height_implausible',
+}
+_TOP_EXCLUDE_SEVERITIES = {'high', 'critical'}
+
+
+def _robust_height(o) -> float:
+    """hmax capped at p90 + margin (falls back to hmax if p90 missing)."""
+    hmax = float(o.height_max or 0.0)
+    p90 = getattr(o, 'height_p90', None)
+    if p90 is None:
+        return hmax
+    return round(min(hmax, float(p90) + ROBUST_HEIGHT_MARGIN_M), 2)
+
+
+def _top_quality(o) -> tuple[bool, list[str]]:
+    """(eligible_for_top_lists, sorted flag codes).
+
+    Runs ``quality_flags.apply_rules`` twice: on the robust height (any
+    height-family flag ≥ high → ineligible) and on the raw ``height_max``
+    (critical rung only, e.g. tree ≥ 80 m → ineligible).  Remaining lower-
+    severity codes are returned so the JSON entry can carry them.
+    """
+    try:
+        import quality_flags as _qf
+    except Exception:
+        return True, []
+    base = {'obj_type': o.obj_type, 'area_sqm': o.area_sqm,
+            'rf_confidence': getattr(o, 'rf_confidence', None),
+            'confidence': o.confidence,
+            'attrs': {'ndvi_mean': getattr(o, 'ndvi_mean', None)}}
+    codes, eligible = {}, True
+    try:
+        for f in _qf.apply_rules({**base, 'height_max_m': _robust_height(o),
+                                  'height_mean_m': o.height_mean}):
+            codes[f['flag_code']] = f['severity']
+            if f['flag_code'] in _TOP_EXCLUDE_FLAG_CODES and f['severity'] in _TOP_EXCLUDE_SEVERITIES:
+                eligible = False
+        for f in _qf.apply_rules({**base, 'height_max_m': float(o.height_max or 0.0),
+                                  'height_mean_m': o.height_mean}):
+            if f['flag_code'] in _TOP_EXCLUDE_FLAG_CODES and f['severity'] == 'critical':
+                eligible = False
+                codes[f['flag_code']] = 'critical'
+    except Exception:
+        return True, []
+    return eligible, sorted(codes)
+
+
+def _qf_rule_version() -> str:
+    try:
+        import quality_flags as _qf
+        return _qf.RULE_VERSION
+    except Exception:
+        return ''
+
+
+def _top_candidates(objects, n=10, manmade_only=False):
+    """Plausible objects ranked by robust height, as (obj, robust_h, codes)."""
+    out = []
+    for o in objects:
+        if manmade_only and not o.is_manmade:
+            continue
+        ok, codes = _top_quality(o)
+        if not ok:
+            continue
+        out.append((o, _robust_height(o), codes))
+    out.sort(key=lambda t: (t[1], t[0].height_max), reverse=True)
+    return out[:n]
+
+
 def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                              cadastre_data, terrain_stats, spectral_info,
                              copernicus_info, hansen_info, new_buildings,
@@ -5569,33 +5655,48 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         landscape["vegetated_fraction"] = round(vp/total_px, 4)
         landscape["is_vegetated"] = vp/total_px > 0.5
     summary["landscape"] = landscape
-    # --- Top 10 objects/trees (legacy) + top_by_type (power queries) ---
+    # --- Top 10 objects/trees (legacy) + top_manmade + top_by_type ---
+    # Ranked by robust height (hmax capped at p90 + margin), plausibility-
+    # filtered via quality_flags — see `_top_candidates`.  ``height_max_m``
+    # is still reported next to ``height_robust_m``.
     if objects:
-        summary["top_10_objects"] = []
-        for o in sorted(objects, key=lambda o: o.height_max, reverse=True)[:10]:
+        def _obj_entry(o, hr, codes):
             c = None
             try:
                 lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
                 c = {"lon": round(lon,7), "lat": round(lat,7)}
             except Exception: pass
-            summary["top_10_objects"].append({
+            return {
                 "type": o.obj_type, "height_max_m": round(o.height_max,2),
+                "height_robust_m": hr, "height_p90_m": round(o.height_p90,2),
                 "height_mean_m": round(o.height_mean,2), "area_sqm": round(o.area_sqm,1),
                 "coordinate": c, "confidence": round(o.confidence,3),
                 "classifier_source": getattr(o, 'classifier_source', 'rules'),
                 "rf_type": getattr(o, 'rf_type', ''),
                 "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
-                "is_manmade": o.is_manmade, "observation_year": obs_year})
+                "is_manmade": o.is_manmade, "observation_year": obs_year,
+                "quality_flags": codes}
+        summary["top_10_objects"] = [_obj_entry(*t) for t in _top_candidates(objects, 10)]
+        summary["top_manmade_objects"] = [_obj_entry(*t) for t in
+                                          _top_candidates(objects, 10, manmade_only=True)]
+        summary["top_ranking"] = {
+            "metric": "height_robust_m",
+            "height_robust_m": f"min(height_max_m, height_p90_m + {ROBUST_HEIGHT_MARGIN_M:g})",
+            "excluded": "quality_flags height rules >= high on robust height, "
+                        "or critical on height_max_m",
+            "quality_flags_rule_version": _qf_rule_version()}
         trees = [o for o in objects if o.obj_type == 'tree']
         summary["top_10_trees"] = []
-        for t in sorted(trees, key=lambda o: o.height_max, reverse=True)[:10]:
+        for t, hr, codes in _top_candidates(trees, 10):
             c = None
             try:
                 lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
                 c = {"lon": round(lon,7), "lat": round(lat,7)}
             except Exception: pass
             summary["top_10_trees"].append({
-                "height_m": round(t.height_max,2), "canopy_height_m": round(t.height_mean,2),
+                "height_m": hr, "height_max_m": round(t.height_max,2),
+                "height_robust_m": hr,
+                "canopy_height_m": round(t.height_mean,2),
                 "height_p90_m": round(t.height_p90,2), "coordinate": c,
                 "area_sqm": round(t.area_sqm,1), "ndvi_mean": round(t.ndvi_mean,4),
                 "ndvi_fused": round(t.ndvi_fused,4), "height_change_m": round(t.height_change,3),
@@ -5603,13 +5704,15 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 "confidence": round(t.confidence, 3),
                 "classifier_source": getattr(t, 'classifier_source', 'rules'),
                 "rf_type": getattr(t, 'rf_type', ''),
-                "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3)})
+                "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3),
+                "quality_flags": codes})
         if trees:
             summary["tree_stats"] = {
                 "count": len(trees),
                 "total_canopy_sqm": round(sum(t.area_sqm for t in trees), 1),
-                "mean_height_m": round(sum(t.height_max for t in trees)/len(trees), 2),
-                "est_stem_volume_m3": round(sum(0.3*t.area_sqm*t.height_max/3 for t in trees), 1)}
+                "mean_height_m": round(sum(_robust_height(t) for t in trees)/len(trees), 2),
+                "mean_height_max_m": round(sum(t.height_max for t in trees)/len(trees), 2),
+                "est_stem_volume_m3": round(sum(0.3*t.area_sqm*_robust_height(t)/3 for t in trees), 1)}
 
         # --- top_by_type: top 50 segments per type, sorted by primary metric ---
         # Primary metric per type:
@@ -5628,7 +5731,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             if otype in _VOLUME_TYPES:
                 objs_sorted = sorted(objs, key=lambda o: abs(o.volume_change_m3), reverse=True)
             elif otype in _HEIGHT_TYPES:
-                objs_sorted = sorted(objs, key=lambda o: o.height_max, reverse=True)
+                objs_sorted = sorted(objs, key=lambda o: (_robust_height(o), o.height_max), reverse=True)
             else:
                 objs_sorted = sorted(objs, key=lambda o: o.area_sqm, reverse=True)
             entries = []
@@ -5642,6 +5745,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
                 entries.append({
                     "type": o.obj_type,
                     "height_max_m": round(o.height_max, 2),
+                    "height_robust_m": _robust_height(o),
                     "height_mean_m": round(o.height_mean, 2),
                     "area_sqm": round(o.area_sqm, 1),
                     "volume_change_m3": round(o.volume_change_m3, 1),

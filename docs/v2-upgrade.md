@@ -39,6 +39,11 @@ without lightgbm logs `--v2-upgrade requested but MODEL_VERSION=v1` and just run
 
 ## Director side (`peer_director._orchestrate_cache_only`)
 
+**Priority (2.3)**: `_compute_v2_upgrade_candidates` ranks `(-1 half-landed pair, then
+older-v2 re-upgrades, then never-upgraded v1)` while `V2_REUPGRADE_FIRST=True` — the
+2.3 top-N change rewrites every v2 JSON, so the live v2 line converges first. Set it
+False to go back to never-upgraded-first.
+
 `_v2_upgrade_fill(whitelist, cfg)`: when `len(cache_ready_kgs) < V2_UPGRADE_FILL_BELOW_READY`
 (40) append up to `MAX_V2_UPGRADE_PEERS` (24) codes from `_compute_v2_upgrade_candidates()`
 (manifest scan, smallest `_full_gpkg` first, 5-min cache, skips codes whose primary ingest struck

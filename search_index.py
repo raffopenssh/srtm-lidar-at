@@ -1706,13 +1706,23 @@ class SearchIndex:
         # ── top_10_objects / top_10_trees (concat → sort → take 10) ──
         all_top_objs = []
         all_top_trees = []
+        all_top_mm = []
+        any_mm = False
         for _, d in block_list:
             all_top_objs.extend(d.get('top_10_objects', []) or [])
             all_top_trees.extend(d.get('top_10_trees', []) or [])
-        all_top_objs.sort(key=lambda o: -(o.get('height_max_m') or o.get('height_m') or 0))
-        all_top_trees.sort(key=lambda o: -(o.get('height_max_m') or o.get('height_m') or 0))
+            if d.get('top_manmade_objects') is not None:
+                any_mm = True
+                all_top_mm.extend(d.get('top_manmade_objects') or [])
+        # 2.3+: rank by height_robust_m (falls back to hmax for older blocks)
+        _hk = lambda o: -(o.get('height_robust_m') or o.get('height_max_m') or o.get('height_m') or 0)
+        all_top_objs.sort(key=_hk)
+        all_top_trees.sort(key=_hk)
+        all_top_mm.sort(key=_hk)
         merged['top_10_objects'] = all_top_objs[:10]
         merged['top_10_trees'] = all_top_trees[:10]
+        if any_mm:
+            merged['top_manmade_objects'] = all_top_mm[:10]
 
         # ── top_by_type (concatenate, sort, take top per type) ───
         merged_top_by_type = {}
@@ -1933,7 +1943,7 @@ class SearchIndex:
             try:
                 from v21_products import MANIFEST_VERSION as current_version
             except Exception:
-                current_version = 'v2.2'
+                current_version = 'v2.3'
         current_version = _norm_version(current_version)
         now_ts = time.time()
 

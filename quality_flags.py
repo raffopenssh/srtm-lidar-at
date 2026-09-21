@@ -37,7 +37,7 @@ from typing import Iterable, Iterator, Optional
 
 log = logging.getLogger(__name__)
 
-RULE_VERSION = 'v1.2026-04b'
+RULE_VERSION = 'v2.2026-09'  # 2.3 retune on 1500-KG top_by_type sample
 JSON_DIR = Path('data/austria_processor/json')
 
 # ----------------------------------------------------------------------
@@ -68,20 +68,50 @@ THRESHOLDS = {
     #   hedge  p95=17.0  p99=21.3  max=41.1
     #   solar  p99=3.0  max=3.5
     #   roof   p95=15.5  p99=22.7  max=50.1
+    # Sep-2026 retune (product 2.3): height_max_m over top_by_type (all
+    # ranks, i.e. the tall tail) of a 1500-KG sample (~75k rows/type):
+    #   tree        p50=42.0 p90=60.2 p95=74.8 p99=107.8 p99.9=174 max=337
+    #   shrub       p50=20.7 p90=27.2 p99=37.5  max=119   (hmean p50=4.0)
+    #   hedge       p50=20.1 p90=26.1 p99=46.1  max=239   (hmean p50=7.2)
+    #   roof        p50=16.8 p90=29.0 p99=64.1 p99.9=105.8 max=208
+    #   grass/crop/road/path/parking/garden  p95=0.3 p99≤3.7 p99.9≤19.5
+    #   water       p95=2.0  p99=16.2 p99.9=40  max=70
+    #   fill/excav  p90=4-7  p95=9-17 p99=41-50 p99.9≈100 max=219
+    #   tree_loss   p90=3.2  p95=6.9  p99=15.6  max=47
+    #   fence       p90=6.6  p95=7.7  p99=11.3  p99.9=20  max=37
+    #   wall        p95=2.2  p99=3.0  p99.9=4.6 max=18
+    #   rock        p90=8.1  p95=13.5 p99=22.7  p99.9=40  max=139
+    #   construction p90=20.6 p99=37.5 p99.9=90 max=196
+    #   vineyard    p90=3.9  p95=5.6  p99=8.6   p99.9=13
+    #   greenhouse  p90=10.2 p95=12.8 p99=17.8  p99.9=24
+    #   solar       p99=3.4  p99.9=5.9 max=26
+    # Top-10 trees fleet-wide: 33% hmax≥50, 21% ≥60, 10% ≥80 → the tree
+    # rungs are unchanged (Austria's tallest real tree ~60 m); the 2.3
+    # product no longer RANKS by hmax, it ranks by min(hmax, p90+10).
     'tree_max_height_m':           {'warn': 50, 'high': 60, 'critical': 80},
     'shrub_max_height_m':          {'warn': 8,  'high': 12, 'critical': 20},
     'hedge_max_height_m':          {'warn': 8,  'high': 15, 'critical': 25},
     'orchard_max_height_m':        {'warn': 10, 'high': 13, 'critical': 20},
-    'vineyard_max_height_m':       {'warn': 3,  'high': 5,  'critical': 10},
+    'vineyard_max_height_m':       {'warn': 4,  'high': 6,  'critical': 12},
     # ---- Buildings ----
     'roof_min_height_m':           {'min': 1.6},   # garden-shed floor
     'roof_max_height_m':           {'warn': 50, 'high': 100, 'critical': 220},
     'roof_min_area_sqm':           {'min': 6.0},  # below this, classifier noise
     'roof_max_area_sqm':           {'warn': 50000, 'high': 100000},
     'tall_thin_roof_ratio':        {'warn': 2.5, 'high': 4.0},  # h/√A: apartment block ~2, mast >>
-    'greenhouse_max_height_m':     {'warn': 12, 'high': 18},
+    'greenhouse_max_height_m':     {'warn': 12, 'high': 18, 'critical': 25},
     # ---- Ground/flat types: height_max should be near zero ----
     'flat_type_max_height_m':      {'warn': 3,  'high': 5, 'critical': 12},
+    # ---- Disturbance types (fill/excavation/tree_loss): remaining stumps,
+    # spoil heaps, adjacent canopy — legitimately a few m, never a forest.
+    'disturbance_type_max_height_m': {'warn': 6, 'high': 12, 'critical': 25},
+    # ---- Linear infrastructure ----
+    'fence_max_height_m':          {'warn': 6,  'high': 10, 'critical': 20},
+    'wall_max_height_m':           {'warn': 4,  'high': 8,  'critical': 15},
+    # ---- Rock (nDSM ~0; cliffs live in the DTM) ----
+    'rock_max_height_m':           {'warn': 10, 'high': 25, 'critical': 50},
+    # ---- Construction sites (cranes are real, 90 m+ is not) ----
+    'construction_max_height_m':   {'warn': 40, 'high': 80, 'critical': 150},
     # ---- Water ----
     'water_max_height_m':          {'warn': 2,  'high': 5, 'critical': 10},
     # ---- Solar panels ----
@@ -104,9 +134,11 @@ THRESHOLDS = {
 # A non-trivial height here usually means a parked vehicle, edge artefact,
 # or wrong segmentation (a tree segment merged in).
 GROUND_TYPES = {
-    'grass', 'crop', 'road', 'path', 'parking', 'garden',
-    'bare_soil', 'fill', 'excavation', 'tree_loss',
+    'grass', 'crop', 'road', 'path', 'parking', 'garden', 'bare_soil',
 }
+# Disturbance types get looser rungs (see THRESHOLDS) — 2.3 split them
+# out of GROUND_TYPES so a 6 m spoil heap is not a 'high' flag.
+DISTURBANCE_TYPES = {'fill', 'excavation', 'tree_loss'}
 
 VEG_TYPES = {'tree', 'shrub', 'hedge', 'orchard', 'vineyard', 'forest', 'woodland', 'hedgerow'}
 BUILDING_TYPES = {'roof', 'greenhouse', 'building'}
@@ -150,7 +182,7 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
             'obj_type': t.get('rf_type') or 'tree',
             'centroid_lon': coord.get('lon'), 'centroid_lat': coord.get('lat'),
             'area_sqm': t.get('area_sqm'),
-            'height_max_m': t.get('height_m'),
+            'height_max_m': t.get('height_max_m', t.get('height_m')),
             'height_mean_m': t.get('canopy_height_m'),
             'rf_confidence': t.get('rf_confidence'),
             'confidence': t.get('confidence'),
@@ -163,6 +195,22 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
         yield {
             'obj_ref': f'{kg}:top_obj:{i}',
             'kg_code': kg, 'kind': 'top_obj',
+            'obj_type': o.get('type'),
+            'centroid_lon': coord.get('lon'), 'centroid_lat': coord.get('lat'),
+            'area_sqm': o.get('area_sqm'),
+            'height_max_m': o.get('height_max_m'),
+            'height_mean_m': o.get('height_mean_m'),
+            'rf_confidence': o.get('rf_confidence'),
+            'confidence': o.get('confidence'),
+            'attrs': o,
+        }
+
+    # 2b) top_manmade_objects (2.3+, man-made highlights)
+    for i, o in enumerate(data.get('top_manmade_objects') or []):
+        coord = o.get('coordinate') or {}
+        yield {
+            'obj_ref': f'{kg}:top_manmade:{i}',
+            'kg_code': kg, 'kind': 'top_manmade',
             'obj_type': o.get('type'),
             'centroid_lon': coord.get('lon'), 'centroid_lat': coord.get('lat'),
             'area_sqm': o.get('area_sqm'),
@@ -459,6 +507,27 @@ def apply_rules(obj: dict) -> list[dict]:
             out.append(_flag('flat_type_has_height', sev,
                 f'{t} height_max={h:.1f}m — ground type should be near 0m, segment likely mixes vegetation',
                 value=h))
+
+    if t in DISTURBANCE_TYPES and h is not None:
+        T = THRESHOLDS['disturbance_type_max_height_m']
+        sev = _h_severity(h, T['warn'], T['high'], T['critical'])
+        if sev:
+            out.append(_flag('flat_type_has_height', sev,
+                f'{t} height_max={h:.1f}m — disturbance type should be near ground, segment likely mixes canopy',
+                value=h))
+
+    # ---- Fence / wall / rock / construction (2.3) ----
+    for _t, _key, _code, _why in (
+            ('fence', 'fence_max_height_m', 'fence_height_implausible', 'fences are <3m — likely a hedge/tree row'),
+            ('wall', 'wall_max_height_m', 'wall_height_implausible', 'walls are <3m — likely a building facade'),
+            ('rock', 'rock_max_height_m', 'rock_height_implausible', 'nDSM of bare rock is ~0 — likely trees on rock'),
+            ('construction', 'construction_max_height_m', 'construction_height_implausible',
+             'above crane height — likely a DSM spike')):
+        if t == _t and h is not None:
+            T = THRESHOLDS[_key]
+            sev = _h_severity(h, T['warn'], T['high'], T['critical'])
+            if sev:
+                out.append(_flag(_code, sev, f'{t} height_max={h:.1f}m — {_why}', value=h))
 
     # ---- Water ----
     if t in ('water', 'waterbody') and h is not None:

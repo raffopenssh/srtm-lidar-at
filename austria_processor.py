@@ -4091,7 +4091,13 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             # empty corner (reprojected rotated-quad NaN triangle) would win the
             # overlap seam and block a valid lower-feather tile, leaving the
             # tapering triangular slivers seen in segments/segment_height.
-            tile_valid = labels_tile > 0
+            # …and the label must belong to a *kept* (core) object: a label
+            # whose centroid fell outside this tile's core is not in obj_map,
+            # so type_tile is 0 there — letting it win would paint a class-0
+            # hole and block the neighbour tile where that object IS core
+            # (62202: two ~650 px seam holes inside parcels, 0.62 % of the
+            # union, in both v1 and v2 — 2026-09-21).
+            tile_valid = (labels_tile > 0) & (type_tile > 0)
             _bw = best_cat_weight[row_off:r_end, col_off:c_end]
             wins = tile_valid & (cat_fw > _bw)
             labels_full[row_off:r_end, col_off:c_end] = np.where(
@@ -4794,7 +4800,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 # Only a pixel this tile actually segmented (label > 0) may win
                 # or raise the best-weight bar — see build_full_gpkg_tiled for the
                 # rotated-quad NaN-corner rationale (triangle-sliver fix).
-                tile_valid = labels_tile > 0
+                # …and only for kept (core) objects — see build_full_gpkg_tiled.
+                tile_valid = (labels_tile > 0) & (type_tile > 0)
                 _bw = best_cat_weight[row_off:r_end, col_off:c_end]
                 wins = tile_valid & (cat_fw > _bw)
                 labels_full[row_off:r_end, col_off:c_end] = np.where(

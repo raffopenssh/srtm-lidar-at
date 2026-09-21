@@ -22,6 +22,7 @@ Usage:
   python3 scripts/reset_kg_strikes_v2pending.py --apply
   python3 scripts/reset_kg_strikes_v2pending.py --apply --codes 63330 84006
   python3 scripts/reset_kg_strikes_v2pending.py --apply --include-v1pending
+  python3 scripts/reset_kg_strikes_v2pending.py --apply --from-peers   # laggard peers, after primary already reset
 """
 import argparse
 import json
@@ -39,11 +40,29 @@ def _committed(ent, key):
             and int(e.get('size') or 0) > 0)
 
 
-def select_codes(include_v1pending=False):
+def fleet_strike_codes():
+    """Union of strike codes across primary + every enabled peer. Needed
+    because once the primary's own kg_strikes.json has been reset, the
+    local file no longer names the codes that peers still carry (peers on
+    old code at the time of the first run ignored the negatives)."""
+    urls, requests = peer_urls()
+    codes = set(json.load(open(DATA / 'kg_strikes.json')))
+    for pid, url in urls.items():
+        try:
+            r = requests.get(url.rstrip('/') + '/api/v1/processing/kg_strikes', timeout=20)
+            d = r.json()
+            d = d.get('strikes', d) if isinstance(d, dict) else {}
+            codes |= set(d)
+        except Exception as e:
+            print(f'{pid:8s} strikes GET ERR {str(e)[:60]}', file=sys.stderr)
+    return codes
+
+
+def select_codes(include_v1pending=False, from_peers=False):
     from kg_splitter import is_block_code, parent_kg_code
     from v21_products import v2_products_complete as v2c
     ent = json.load(open(DATA / 'zenodo_manifest.json'))['entries']
-    strikes = json.load(open(DATA / 'kg_strikes.json'))
+    strikes = fleet_strike_codes() if from_peers else json.load(open(DATA / 'kg_strikes.json'))
     parents = {parent_kg_code(c) if is_block_code(c) else c for c in strikes}
     out = {}
     for p in sorted(parents):
@@ -76,11 +95,13 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--codes', nargs='*')
     ap.add_argument('--include-v1pending', action='store_true')
+    ap.add_argument('--from-peers', action='store_true',
+                    help='source strike codes from the union of all peers (use after primary was already reset)')
     a = ap.parse_args()
     if a.codes:
         sel = {c: 'explicit' for c in a.codes}
     else:
-        sel = select_codes(a.include_v1pending)
+        sel = select_codes(a.include_v1pending, a.from_peers)
     print(f'{len(sel)} parent KGs selected')
     for c, why in list(sel.items())[:15]:
         print(f'  {c} {why}')

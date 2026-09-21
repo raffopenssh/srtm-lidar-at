@@ -1745,6 +1745,15 @@ def _peer_status_push_loop():
                             str(c): int((e or {}).get('n', 0))
                             for c, e in list(_vd.items())[:500]
                             if int((e or {}).get('n', 0)) > 0}
+                        # Codes whose v1 full GPKG a v2 upgrade found *gone*
+                        # (deposition alive, file missing / 404). Director
+                        # verifies + auto-requeues (v2_regen). ~60 B each.
+                        _gone = {
+                            str(c): str((e or {}).get('ts') or '')
+                            for c, e in _vd.items()
+                            if 'gone from Zenodo' in str((e or {}).get('reason') or '')}
+                        if _gone:
+                            status['v2_gone'] = dict(list(_gone.items())[:100])
             except Exception:
                 pass
             try:
@@ -5142,6 +5151,15 @@ def processing_queue_add():
       position: 0-based insertion index (default 0 = front)
                Use -1 or omit to append at end.
       skip_processed: if true (default), silently drop already-processed KGs
+      keep_products: (only with skip_processed=false) stamp the ``_requeue``
+               tombstone but do NOT delete / tombstone the KG's committed
+               ``_json`` / ``_light_gpkg`` / ``*_v2`` manifest entries —
+               the v1 (and any v2.x) products stay referenced and served
+               until the fresh run replaces them in place (zenodo_client
+               PUT-then-DELETE). Only the keys listed in ``gone_keys``
+               (products verified missing on Zenodo, e.g.
+               ``<code>_full_gpkg``) are deleted + tombstoned. Used by the
+               director's v2_regen auto-requeue.
 
     Duplicates already in the queue are moved to the new position.
     """
@@ -5154,6 +5172,8 @@ def processing_queue_add():
     new_codes = [str(c).strip() for c in new_codes if str(c).strip()]
     position = data.get('position', -1)
     skip_processed = data.get('skip_processed', True)
+    keep_products = bool(data.get('keep_products')) and not skip_processed
+    gone_keys = {str(k) for k in (data.get('gone_keys') or []) if str(k).strip()}
 
     retry_path = Path('data/austria_processor/retry_queue.json')
     try:
@@ -5253,6 +5273,11 @@ def processing_queue_add():
                         'sibling block(s); invalidating %d',
                         c, len(_kept), len(_complete_blocks),
                         len(partial_keys))
+            if keep_products:
+                # v2_regen: keep every committed product referenced; only
+                # the verified-gone keys of THIS code are invalidated.
+                partial_keys = [k for k in partial_keys
+                                if k in gone_keys and (k.startswith(c + '_') or k.startswith(c + '-'))]
             if c not in completed and not partial_keys:
                 continue
             # Guard against the force-requeue self-perpetuation loop: if the
@@ -8526,6 +8551,19 @@ def admin_clear_tile_checkpoints():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     return jsonify({'kg': kg, 'cleared': True, 'files_removed': n_files})
+
+
+@app.route('/api/v1/admin/v2_strikes', methods=['GET'])
+def admin_v2_strikes_get():
+    """This peer's ``v2_upgrade_failed.json`` — {code: {n, defer, reason, ts}}.
+    The director's fleet union only carries counts; use this to read the
+    *reason* behind a struck code before deciding to clear / re-queue."""
+    vf = Path('data/austria_processor/v2_upgrade_failed.json')
+    try:
+        d = json.loads(vf.read_text()) if vf.exists() else {}
+    except Exception as e:
+        return jsonify({'error': f'unreadable: {e}'}), 500
+    return jsonify(d if isinstance(d, dict) else {})
 
 
 @app.route('/api/v1/admin/v2_strikes/clear', methods=['POST'])
@@ -20144,6 +20182,28 @@ def process_txt():
                 _v2l += (f" · strikes_fleet={_fs.get('codes')}codes"
                          f" struck_out={_fs.get('struck_out')} peers={_fs.get('peers')}")
         out.append(_v2l)
+        # v2_regen: KGs whose v1 full GPKG is (suspected) gone on Zenodo.
+        # Read from disk so the non-director gunicorn worker agrees with
+        # the loop worker; grep `?q=v2regen` for the transition events.
+        try:
+            import peer_director as _pd_rg
+            _rg = _pd_rg.v2_regen_summary()
+            if _rg.get('total'):
+                _cnt = _rg.get('counts') or {}
+                _line = ('v2_regen: ' + ' '.join(f'{k}={v}' for k, v in sorted(_cnt.items()))
+                         + f' (gate: zenodo circuit clear, {_pd_rg.V2_REGEN_CONFIRMATIONS} gone-checks '
+                           f'≥{_pd_rg.V2_REGEN_CONFIRM_GAP_S // 60}m apart; v1 json/light kept until v2.2 lands)')
+                _rows = _rg.get('rows') or []
+                if _rows:
+                    _line += ' · ' + ' '.join(
+                        f"{r['code']}@{r['state']}"
+                        + (f"[{r['checks']}chk]" if r.get('checks') else '')
+                        for r in _rows[:12])
+                    if len(_rows) > 12:
+                        _line += f' … +{len(_rows) - 12}'
+                out.append(_line)
+        except Exception as _e:
+            out.append(f'v2_regen: unavailable ({_e})')
     except Exception as _e:
         out.append(f'v2: unavailable ({_e})')
 

@@ -1631,6 +1631,85 @@ def v2_fleet_strikes() -> dict:
     return {}
 
 
+# === SECTION: v2_regen — auto-requeue KGs whose v1 full GPKG is stably gone ===
+# A v2 upgrade needs the v1 ``_full_gpkg``. When a peer finds it *gone*
+# (deposition alive, file missing → 404) it strikes the code out and
+# reports it as ``status.v2_gone``. The director collects those here,
+# verifies the absence itself against the deposition API — never while
+# the fleet Zenodo-degraded circuit is tripped, and twice ≥30 min apart —
+# then pushes the code through the canonical ``POST /processing/queue``
+# with ``keep_products`` so the v1 ``_json`` / ``_light_gpkg`` stay
+# referenced until the fresh v2.2 run replaces them in place. State is a
+# small disk file (cross-worker, like v2_priority.json); every transition
+# is a ``v2regen:`` director_event; ``/process.txt`` has a ``v2_regen:``
+# line; structured twin at director/status.v2.regen.
+V2_REGEN_FILE = DATA_DIR / 'v2_regen.json'
+V2_REGEN_CHECK_INTERVAL_S = 300
+V2_REGEN_CONFIRM_GAP_S = 1800
+V2_REGEN_CONFIRMATIONS = 2
+V2_REGEN_MAX_REQUEUE_PER_TICK = 3
+V2_REGEN_MAX_OUTSTANDING = 20
+V2_REGEN_DONE_TTL_S = 7 * 86400
+
+
+def _v2_regen_load() -> dict:
+    try:
+        d = json.loads(V2_REGEN_FILE.read_text()) if V2_REGEN_FILE.exists() else {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v2_regen_save(d: dict) -> None:
+    try:
+        tmp = V2_REGEN_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
+        tmp.replace(V2_REGEN_FILE)
+    except Exception as e:
+        log.warning('v2_regen save: %s', e)
+
+
+_V2_REGEN_LOCK = threading.Lock()
+
+
+def v2_regen_add_candidates(peer_id: str, gone: dict) -> None:
+    """Record ``{code: ts}`` reported by *peer_id* as regen candidates."""
+    import re as _re
+    with _V2_REGEN_LOCK:
+        d = _v2_regen_load()
+        changed = False
+        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        for code, ts in list(gone.items())[:100]:
+            code = str(code)
+            if not _re.match(r'^\d+(-[a-z][-a-z0-9]*)?$', code):
+                continue
+            e = d.get(code)
+            if e is None:
+                d[code] = {'state': 'candidate', 'key': f'{code}_full_gpkg',
+                           'first_seen': now, 'peers': [peer_id], 'checks': []}
+                changed = True
+            elif e.get('state') in ('candidate', 'confirming') and peer_id not in (e.get('peers') or []):
+                e.setdefault('peers', []).append(peer_id)
+                changed = True
+        if changed:
+            _v2_regen_save(d)
+
+
+def v2_regen_summary() -> dict:
+    d = _v2_regen_load()
+    by = {}
+    for e in d.values():
+        by[e.get('state', '?')] = by.get(e.get('state', '?'), 0) + 1
+    rows = sorted(((c, e) for c, e in d.items() if e.get('state') != 'done'),
+                  key=lambda ce: ce[1].get('first_seen', ''))
+    return {'counts': by, 'total': len(d),
+            'rows': [{'code': c, 'state': e.get('state'),
+                      'checks': len(e.get('checks') or []),
+                      'peers': len(e.get('peers') or []),
+                      'requeued_at': e.get('requeued_at'),
+                      'note': e.get('note')} for c, e in rows[:20]]}
+
+
 def v2_fleet_struck_out(threshold: int = V2_UPGRADE_MAX_STRIKES) -> set:
     """Codes whose strikes summed over peers reached *threshold*."""
     out = set()
@@ -1675,6 +1754,9 @@ def record_peer_push(peer_id: str, status: dict,
         _old_strikes = prev_status.get('v2_strikes')
     if isinstance(_new_strikes, dict) and _new_strikes != _old_strikes:
         _v2_fleet_strikes_merge(peer_id, _new_strikes)
+    _gone = status.get('v2_gone')
+    if isinstance(_gone, dict) and _gone and _gone != prev_status.get('v2_gone'):
+        v2_regen_add_candidates(peer_id, _gone)
 
 
 def get_pushed_status(peer_id: str) -> dict | None:
@@ -2091,10 +2173,27 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
         # Then push tombstoned codes at position 0 — ends up in front,
         # ahead of the normal codes, preserving the original ordering.
         if tombstoned_in_queue:
+            # keep_products + gone_keys: the peer invalidates exactly the
+            # product keys the primary tombstoned — nothing more. For a
+            # v2_regen requeue that is only ``<code>_full_gpkg``; the v1
+            # ``_json`` / ``_light_gpkg`` stay referenced fleet-wide until
+            # the fresh run replaces them (a peer-side ``_json`` tombstone
+            # would otherwise merge back into the primary).
+            _gone_keys = []
+            try:
+                _tq = set(tombstoned_in_queue)
+                for key in (tdata if isinstance(tdata, dict) else {}):
+                    m = _re.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', key)
+                    if m and (m.group(1) in _tq or m.group(1).split('-')[0] in _tq) \
+                            and not key.endswith('_requeue'):
+                        _gone_keys.append(key)
+            except Exception:
+                _gone_keys = []
             r2 = requests.post(
                 peer_url.rstrip('/') + '/api/v1/processing/queue',
                 json={'kgs': tombstoned_in_queue, 'position': 0,
-                      'skip_processed': False},
+                      'skip_processed': False,
+                      'keep_products': True, 'gone_keys': _gone_keys},
                 timeout=PEER_TIMEOUT_CONTROL,
             headers=_admin_headers())
             result = r2.json()
@@ -4978,6 +5077,7 @@ class PeerDirector:
                 'struck_out': len(v2_fleet_struck_out()),
                 'peers': len({p for pe in _fs.values() if isinstance(pe, dict) for p in pe}),
             }
+            out['regen'] = v2_regen_summary()
         except Exception:
             pass
         return out
@@ -6718,6 +6818,164 @@ class PeerDirector:
             os.replace(tmp, manifest_path)
         except Exception as e:
             log.debug('zenodo_circuit publish failed: %s', e)
+
+    def _check_v2_regen(self) -> None:
+        """Verify + auto-requeue v2_regen candidates (see V2_REGEN_FILE
+        section). Director-loop worker only, every V2_REGEN_CHECK_INTERVAL_S.
+        Hard gates: fleet Zenodo circuit clear, control probe 200, two
+        independent "gone" verdicts ≥30 min apart, ≤3 requeues/tick,
+        ≤20 outstanding."""
+        now = time.time()
+        if now - float(self.state.get('_v2_regen_checked_at') or 0) < V2_REGEN_CHECK_INTERVAL_S:
+            return
+        self.state['_v2_regen_checked_at'] = now
+        with _V2_REGEN_LOCK:
+            d = _v2_regen_load()
+        if not d:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        mf_path = DATA_DIR / 'zenodo_manifest.json'
+        try:
+            raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+            ent = raw.get('entries', raw) or {}
+        except Exception:
+            ent = {}
+        try:
+            from v21_products import MANIFEST_VERSION as _V21
+        except Exception:
+            _V21 = 'v2.1'
+        changed = False
+        # --- settle requeued / expire done (no Zenodo traffic) ---
+        for code, e in list(d.items()):
+            st = e.get('state')
+            if st == 'requeued':
+                j2 = ent.get(f'{code}_json_v2')
+                if isinstance(j2, dict) and str(j2.get('version') or '') == _V21 \
+                        and str(j2.get('uploaded_at') or '') > str(e.get('requeued_at') or ''):
+                    e['state'] = 'done'; e['done_at'] = now_iso; changed = True
+                    try:
+                        import app as _app
+                        _app.director_event(f'v2regen: {code} fresh v2.2 products committed — regen complete',
+                                            peer='director', kg=code)
+                    except Exception:
+                        pass
+            elif st in ('done', 'dismissed'):
+                try:
+                    ts = datetime.fromisoformat(e.get('done_at') or e.get('first_seen')).timestamp()
+                except Exception:
+                    ts = 0
+                if now - ts > V2_REGEN_DONE_TTL_S:
+                    d.pop(code, None); changed = True
+        pending = [(c, e) for c, e in d.items() if e.get('state') in ('candidate', 'confirming')]
+        if not pending:
+            if changed:
+                with _V2_REGEN_LOCK:
+                    _v2_regen_save(d)
+            return
+        # --- gates ---
+        try:
+            from zenodo_cache import zenodo_degraded as _zdeg
+            degraded = bool(_zdeg())
+        except Exception:
+            degraded = False
+        if degraded or (self.state.get('zenodo_circuit') or {}).get('degraded'):
+            if changed:
+                with _V2_REGEN_LOCK:
+                    _v2_regen_save(d)
+            log.info('v2_regen: %d candidate(s) waiting — Zenodo circuit degraded, no verification', len(pending))
+            return
+        try:
+            import zenodo_client as _zc
+            hdr = {'Authorization': f'Bearer {_zc.DEFAULT_TOKEN}'}
+            r = requests.get('https://zenodo.org/api/deposit/depositions', params={'size': 1},
+                             headers=hdr, timeout=30)
+            if r.status_code != 200:
+                log.info('v2_regen: control probe HTTP %s — skipping this tick', r.status_code)
+                return
+        except Exception as ex:
+            log.info('v2_regen: control probe failed (%s) — skipping this tick', ex)
+            return
+        outstanding = sum(1 for e in d.values() if e.get('state') == 'requeued')
+        requeued_now = 0
+        try:
+            qpath = DATA_DIR / 'retry_queue.json'
+            queue = set(json.loads(qpath.read_text())) if qpath.exists() else set()
+        except Exception:
+            queue = set()
+        for code, e in pending[:10]:
+            key = e.get('key') or f'{code}_full_gpkg'
+            g = ent.get(key)
+            if not isinstance(g, dict) or not g.get('depo_id'):
+                # Manifest already dropped it (operator requeue / prior regen).
+                e['state'] = 'dismissed'; e['done_at'] = now_iso
+                e['note'] = 'no manifest entry'; changed = True
+                continue
+            verdict = None
+            try:
+                r = requests.get(f"https://zenodo.org/api/deposit/depositions/{g['depo_id']}",
+                                 headers=hdr, timeout=30)
+                if r.status_code == 200:
+                    files = r.json().get('files') or []
+                    present = any(f.get('filename') == g.get('filename') for f in files)
+                    verdict = 'present' if present else 'gone'
+                elif r.status_code in (404, 410):
+                    verdict = 'gone'
+            except Exception as ex:
+                log.debug('v2_regen %s: deposition probe %s', code, ex)
+            if verdict is None:
+                continue
+            e.setdefault('checks', []).append({'ts': now_iso, 'v': verdict})
+            e['checks'] = e['checks'][-6:]
+            changed = True
+            if verdict == 'present':
+                e['state'] = 'dismissed'; e['done_at'] = now_iso
+                e['note'] = 'file present on Zenodo (peer 404 was transient)'
+                try:
+                    import app as _app
+                    _app.director_event(f'v2regen: {code} full GPKG is present on Zenodo — '
+                                        f'dismissed (transient 404 on {",".join(e.get("peers") or [])})',
+                                        peer='director', kg=code, level='warning')
+                except Exception:
+                    pass
+                continue
+            gone = [c for c in e['checks'] if c.get('v') == 'gone']
+            e['state'] = 'confirming'
+            if len(gone) < V2_REGEN_CONFIRMATIONS:
+                continue
+            try:
+                gap = (datetime.fromisoformat(gone[-1]['ts']) - datetime.fromisoformat(gone[0]['ts'])).total_seconds()
+            except Exception:
+                gap = 0
+            if gap < V2_REGEN_CONFIRM_GAP_S:
+                continue
+            if code in queue:
+                e['state'] = 'requeued'; e['requeued_at'] = now_iso
+                e['note'] = 'already queued'; continue
+            if requeued_now >= V2_REGEN_MAX_REQUEUE_PER_TICK or outstanding >= V2_REGEN_MAX_OUTSTANDING:
+                continue
+            try:
+                r = requests.post('http://127.0.0.1:8000/api/v1/processing/queue',
+                                  json={'kgs': [code], 'position': 0, 'skip_processed': False,
+                                        'keep_products': True, 'gone_keys': [key]},
+                                  timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
+                ok = r.ok
+            except Exception as ex:
+                ok = False
+                log.warning('v2_regen %s: requeue POST failed: %s', code, ex)
+            if ok:
+                e['state'] = 'requeued'; e['requeued_at'] = now_iso
+                requeued_now += 1; outstanding += 1
+                try:
+                    import app as _app
+                    _app.director_event(
+                        f'v2regen: {code} full GPKG confirmed gone (depo {g.get("depo_id")}, '
+                        f'{len(gone)} checks over {gap / 60:.0f} min) — requeued for a fresh v2.2 run; '
+                        f'v1 json/light kept until replaced', peer='director', kg=code, level='warning')
+                except Exception:
+                    pass
+        if changed:
+            with _V2_REGEN_LOCK:
+                _v2_regen_save(d)
 
     def _check_zenodo_degraded(self) -> None:
         """Trip / clear the fleet Zenodo-degraded circuit. Director-loop
@@ -12711,6 +12969,10 @@ class PeerDirector:
                     self._check_zenodo_degraded()
                 except Exception:
                     log.exception('Zenodo circuit check error')
+                try:
+                    self._check_v2_regen()
+                except Exception:
+                    log.exception('v2_regen check error')
                 try:
                     self._reconcile_cache_manifest_if_due()
                 except Exception:

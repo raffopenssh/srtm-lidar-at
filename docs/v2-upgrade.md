@@ -113,6 +113,38 @@ Re-ingest a code: delete its store row (`kg_v2_store.delete(code)`) — next tic
 Reprocess an upgrade: drop `<code>_json_v2` + `<code>_light_gpkg_v2` from the manifest
 (the requeue/tombstone path already includes both suffixes).
 
+## Strikes, deferrals, and the v2_regen auto-requeue (2026-09-21)
+
+Peer file `v2_upgrade_failed.json` = `{code: {n, defer, reason, ts}}`; read it with
+`GET /api/v1/admin/v2_strikes` (admin token), clear with `POST …/v2_strikes/clear
+{"codes":[…]}` or `{"checks":[…]}`. Fleet union at `data/austria_processor/v2_strikes_fleet.json`
+(`v2:` line → `strikes_fleet=… struck_out=…`).
+
+* **Verify FAIL** → `n += 1`, struck out at `V2_UPGRADE_MAX_STRIKES = 2`.
+* **Deferral** (input download 5xx / timeout / disk pressure, or a 404 while the fleet
+  `zenodo_degraded` circuit is tripped) → `defer += 1`, **no strike**; struck out only after
+  `V2_UPGRADE_MAX_DEFERS = 8`. (Before: a deferral was a strike, so one Zenodo outage struck
+  out every code a peer touched twice.)
+* **Stale v1-JSON md5** in the manifest → accepted if the bytes parse as this KG (baseline
+  only), `v1 JSON manifest md5 stale` warning.
+* **`_full_gpkg` gone** (404 with circuit clear) → fatal strike on the peer + reported as
+  `status.v2_gone`. The director (`_check_v2_regen`, every 5 min, `data/austria_processor/
+  v2_regen.json`) then verifies it against the deposition API — **never while the Zenodo
+  circuit is degraded**, control probe must be 200, **two "gone" verdicts ≥30 min apart** —
+  and requeues the KG for a fresh v2.2 run through the canonical
+  `POST /processing/queue {skip_processed:false, keep_products:true, gone_keys:[<code>_full_gpkg]}`.
+  `keep_products` stamps the `_requeue` tombstone and invalidates *only* the gone key: the v1
+  `_json` / `_light_gpkg` (and any `*_v2`) stay referenced and served until the fresh run
+  replaces them. `sync_queue_to_peer` forwards the same `gone_keys`, so peers never tombstone
+  more than the primary did. Caps: 3 requeues/tick, 20 outstanding. States:
+  `candidate → confirming → requeued → done` (or `dismissed` when the file turns out to be
+  present). Follow on `/process.txt` (`v2_regen:` line) and `?q=v2regen` (director events).
+
+**Zenodo replace is PUT-then-DELETE** (`zenodo_client._replace_in_bucket`): same filename →
+one in-place PUT, different filename → PUT new, then DELETE old. A failed PUT can no longer
+leave a deposition empty (how 18127 / 01504 / 19102 lost their full GPKG), and a v2.2
+re-upgrade keeps the v2 / v2.1 product live until the new one is committed.
+
 ## Invariants
 
 * `_json` stays the completion marker; upgrades never touch `_json`/`_light_gpkg`/`_full_gpkg`.

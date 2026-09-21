@@ -1033,6 +1033,54 @@ class Client:
 
     # -- public API: upload --------------------------------------------------
 
+    def _replace_in_bucket(self, bucket_url: str, old_filename: str, new_filename: str,
+                           put_fn) -> None:
+        """Replace a product file inside an existing deposition **without a
+        window where neither version exists**.
+
+        Before 2026-09-21 the replace path was DELETE-old → PUT-new: a PUT
+        that failed mid-way (Zenodo 504 outage, write timeout) left the
+        deposition with *no* file — this is how 18127/01504/19102 lost their
+        ``_full_gpkg`` while the manifest still pointed at the deposit.  Now:
+
+        * same filename → a single in-place PUT (Zenodo buckets version the
+          object; the old bytes are served until the new PUT commits);
+        * different filename → PUT the new file first, DELETE the old one
+          only after the PUT succeeded (404 on the delete is fine).
+
+        ``put_fn()`` performs the PUT.  If an in-place PUT is rejected with
+        a 4xx that is not a transient/auth error we fall back to the legacy
+        DELETE → PUT once (never on 5xx/timeouts, so an outage can never
+        delete a good product)."""
+        same = bool(old_filename) and old_filename == new_filename
+        if same:
+            try:
+                put_fn()
+                return
+            except ZenodoError as exc:
+                sc = int(exc.status_code or 0)
+                if not (400 <= sc < 500) or sc in (401, 403, 429):
+                    raise
+                log.warning("In-place PUT of %s rejected (%s) — falling back to "
+                            "delete+put", new_filename, sc)
+                try:
+                    self._do_request("DELETE", f"{bucket_url}/{old_filename}")
+                except ZenodoError as dexc:
+                    if dexc.status_code != 404:
+                        raise
+                put_fn()
+                return
+        put_fn()
+        if old_filename:
+            try:
+                self._do_request("DELETE", f"{bucket_url}/{old_filename}")
+                log.debug("Deleted superseded file %s", old_filename)
+            except ZenodoError as exc:
+                if exc.status_code != 404:
+                    # The new product is committed; a failed cleanup of the
+                    # old file must not fail the upload.
+                    log.warning("Could not delete superseded %s: %s", old_filename, exc)
+
     def upload(
         self,
         key: str,
@@ -1085,25 +1133,19 @@ class Client:
             )
             bucket_url = existing.bucket_url
 
-            # Delete old file (ignore 404 — may already be gone).
-            if existing.filename:
-                del_url = f"{bucket_url}/{existing.filename}"
-                try:
-                    self._do_request("DELETE", del_url)
-                    log.debug("Deleted old file %s", existing.filename)
-                except ZenodoError as exc:
-                    if exc.status_code != 404:
-                        raise
-                    log.debug("Old file already absent (404).")
-
-            # Upload new file to the bucket.
+            # PUT new first, DELETE old only afterwards (or in-place PUT
+            # when the filename is unchanged) — see _replace_in_bucket.
             put_url = f"{bucket_url}/{filename}"
-            resp = self._do_request(
-                "PUT", put_url,
-                data=file_bytes,
-                content_type="application/octet-stream",
-            )
-            upload_info = resp.json()
+            _resp_box = {}
+
+            def _put():
+                _resp_box["r"] = self._do_request(
+                    "PUT", put_url,
+                    data=file_bytes,
+                    content_type="application/octet-stream",
+                )
+            self._replace_in_bucket(bucket_url, existing.filename, filename, _put)
+            upload_info = _resp_box["r"].json()
             log.debug("Upload response: %s", upload_info)
 
             # Update metadata.
@@ -1302,20 +1344,14 @@ class Client:
             )
             bucket_url = existing.bucket_url
 
-            # Delete old file (ignore 404).
-            if existing.filename:
-                del_url = f"{bucket_url}/{existing.filename}"
-                try:
-                    self._do_request("DELETE", del_url)
-                except ZenodoError as exc:
-                    if exc.status_code != 404:
-                        raise
-
-            # Stream-upload new file (multipart for >1 GB).
-            self._put_file_to_bucket(
-                bucket_url, filename, local_path, file_size,
-                progress_callback, use_multipart=use_multipart,
-                depo_id=existing.depo_id)
+            # PUT new first, DELETE old only afterwards (or in-place PUT
+            # when the filename is unchanged) — see _replace_in_bucket.
+            self._replace_in_bucket(
+                bucket_url, existing.filename, filename,
+                lambda: self._put_file_to_bucket(
+                    bucket_url, filename, local_path, file_size,
+                    progress_callback, use_multipart=use_multipart,
+                    depo_id=existing.depo_id))
 
             # Update metadata.
             meta_payload = meta_func(key, filename, version)
@@ -1382,8 +1418,12 @@ class Client:
         key: str,
         dest_dir: str | Path,
         manifest: Manifest,
+        verify_checksum: bool = True,
     ) -> Path:
         """Download a file from Zenodo and verify its MD5 checksum.
+        (``verify_checksum=False`` skips the manifest-md5 comparison —
+        for callers that validate the bytes themselves when the manifest
+        checksum is known to be stale.)
 
         Parameters
         ----------
@@ -1433,7 +1473,7 @@ class Client:
             expected = entry.checksum
             actual_hex = md5.hexdigest()
             actual = f"md5:{actual_hex}"
-            if expected and actual != expected:
+            if verify_checksum and expected and actual != expected:
                 raise ValueError(
                     f"Checksum mismatch for {entry.filename}: "
                     f"expected {expected}, got {actual}"

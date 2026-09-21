@@ -9925,12 +9925,25 @@ def _load_v2_upgrade_failed() -> dict:
     return {}
 
 
-def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False) -> int:
+def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False,
+                              transient: bool = False) -> int:
     """Bump the per-code strike counter.  Returns the new count.  ``fatal``
-    (GPKG gone / no v1 product) jumps straight to the give-up threshold."""
+    (GPKG gone / no v1 product) jumps straight to the give-up threshold.
+
+    ``transient`` (input download 5xx / timeout / disk pressure — the unit
+    was *deferred*, nothing was verified) does NOT strike: it bumps a
+    separate ``defer`` counter and only converts into a strike-out once
+    ``V2_UPGRADE_MAX_DEFERS`` deferrals accumulate.  Before 2026-09-21 a
+    deferral counted as a full strike, so a 4 h Zenodo 504 outage struck
+    out every code a peer touched twice."""
     d = _load_v2_upgrade_failed()
     e = d.get(code) or {"n": 0}
-    e["n"] = int(e.get("n", 0)) + (V2_UPGRADE_MAX_STRIKES if fatal else 1)
+    if transient:
+        e["defer"] = int(e.get("defer", 0)) + 1
+        if e["defer"] >= V2_UPGRADE_MAX_DEFERS:
+            e["n"] = max(int(e.get("n", 0)), V2_UPGRADE_MAX_STRIKES)
+    else:
+        e["n"] = int(e.get("n", 0)) + (V2_UPGRADE_MAX_STRIKES if fatal else 1)
     e["reason"] = str(reason)[:300]
     e["ts"] = datetime.now(timezone.utc).isoformat()
     d[code] = e
@@ -9944,6 +9957,7 @@ def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False) -> in
 
 
 V2_UPGRADE_MAX_STRIKES = 2
+V2_UPGRADE_MAX_DEFERS = 8       # transient input failures before giving up
 
 
 def v2_product_is_current(entry) -> bool:
@@ -10028,7 +10042,24 @@ def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
     jpath = jdir / ej.filename
     if not (jpath.exists() and jpath.stat().st_size == ej.size):
         try:
-            _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest)
+            try:
+                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest)
+            except ValueError as _ce:
+                if "Checksum mismatch" not in str(_ce):
+                    raise
+                # The manifest md5 can be stale (JSON re-uploaded in place,
+                # e.g. 14132/14167/05007/46171 — Zenodo's own checksum
+                # matches the bytes).  The v1 JSON is only the verify
+                # baseline, so accept the bytes if they parse as this KG.
+                log.warning("KG %s: v1 JSON manifest md5 stale (%s) — accepting Zenodo bytes",
+                            code, str(_ce)[:120])
+                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest,
+                                                 verify_checksum=False)
+                with open(jpath) as _f:
+                    _chk = json.load(_f)
+                if not isinstance(_chk, dict) or str(_chk.get("kg_code", code)) != str(code):
+                    jpath.unlink(missing_ok=True)
+                    raise RuntimeError(f"{code}_json: unverifiable bytes (md5 stale, kg_code mismatch)")
         except Exception as e:  # noqa: BLE001
             sc = int(getattr(e, "status_code", 0) or 0)
             if sc in (403, 404, 410):
@@ -10088,6 +10119,18 @@ def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
     try:
         rec = _gf.download(entry, gpath, n_streams=V2_UPGRADE_STREAMS)
     except FileNotFoundError as e:
+        # A 404 while the fleet Zenodo circuit is tripped is NOT evidence
+        # the product is gone — treat as transient (defer, no strike).
+        # A stable "gone" is confirmed twice by the director against the
+        # deposition API before it auto-requeues the KG for a fresh v2.2
+        # run (peer_director._check_v2_regen, ``v2regen:`` log lines).
+        try:
+            from zenodo_cache import zenodo_degraded as _zdeg
+            _deg = bool(_zdeg())
+        except Exception:
+            _deg = False
+        if _deg:
+            raise RuntimeError(f"{code}_full_gpkg 404 during Zenodo-degraded circuit: {e}") from e
         raise FileNotFoundError(f"{code}_full_gpkg gone from Zenodo: {e}") from e
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"{code}_full_gpkg download: {e}") from e
@@ -11652,7 +11695,7 @@ def main():
             except Exception as _fe:  # noqa: BLE001
                 log.warning("KG %s: v2 inputs unavailable (%s) — skipping for now", kg_code, _fe)
                 progress.add_log("warning", f"v2up: {kg_code} deferred — {str(_fe)[:120]}", kg_code)
-                _record_v2_upgrade_failed(kg_code, str(_fe))
+                _record_v2_upgrade_failed(kg_code, str(_fe), transient=True)
                 _v2_release_inputs(kg)
                 IN_PROGRESS_FILE.unlink(missing_ok=True)
                 i += 1

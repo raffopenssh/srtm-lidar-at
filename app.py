@@ -1152,6 +1152,36 @@ PEER_SYNC_SINCE_MARGIN_S = 3600
 _PEER_SYNC_DL_FAIL: dict = {}  # kg code -> ts of last failed JSON download
 _PEER_SYNC_STATE: dict = {}   # peer_url -> {'max_ts': str, 'full_ts': float,
                               #              'cm_etag': str, 'cm_pushed_hash': str}
+# Persisted across srv restarts so a rollout / restart doesn't cost a
+# full 0.9 MB manifest pull + full cache-manifest push per peer
+# (~30 MB per restart at 30 peers). Ignored when older than
+# PEER_SYNC_STATE_MAX_AGE_S (long downtime → do a full reconcile).
+_PEER_SYNC_STATE_PATH = Path('data/austria_processor/peer_sync_state.json')
+PEER_SYNC_STATE_MAX_AGE_S = 2 * 3600
+
+
+def _peer_sync_state_load() -> None:
+    try:
+        d = json.loads(_PEER_SYNC_STATE_PATH.read_text())
+        if time.time() - float(d.get('saved_at') or 0) > PEER_SYNC_STATE_MAX_AGE_S:
+            return
+        st = d.get('peers') or {}
+        if isinstance(st, dict):
+            _PEER_SYNC_STATE.update({k: dict(v) for k, v in st.items()
+                                     if isinstance(v, dict)})
+    except Exception:
+        pass
+
+
+def _peer_sync_state_save() -> None:
+    try:
+        _PEER_SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PEER_SYNC_STATE_PATH.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'saved_at': time.time(),
+                                   'peers': _PEER_SYNC_STATE}, default=str))
+        os.replace(tmp, _PEER_SYNC_STATE_PATH)
+    except Exception:
+        pass
 
 
 def _gzip_put_json(req, url: str, obj: dict, timeout, headers=None):
@@ -1189,6 +1219,7 @@ def _sync_peer_data():
     json_dir = Path('data/austria_processor/json')
     json_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path('data/austria_processor/zenodo_manifest.json')
+    _peer_sync_state_load()
 
     while True:
         try:
@@ -1250,7 +1281,7 @@ def _sync_peer_data():
                     continue
                 _full = (_now_s - float(_pst.get('full_ts') or 0.0)
                          >= PEER_SYNC_FULL_INTERVAL_S) or not _pst.get('max_ts')
-                _params = {}
+                _params = {'completed': '0'}
                 if not _full:
                     try:
                         from datetime import datetime as _dt0, timedelta as _td0
@@ -1742,6 +1773,7 @@ def _sync_peer_data():
         except Exception as e:
             log.warning('Peer sync error: %s', e)
 
+        _peer_sync_state_save()
         time.sleep(PEER_SYNC_INTERVAL_S)
 
 threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
@@ -1809,8 +1841,18 @@ PEER_PUSH_TIMEOUT_S = 5
 # locally by sending a tiny heartbeat every PEER_PUSH_INTERVAL_S as
 # well (see ``mini`` below).
 PEER_PUSH_INTERVAL_IDLE_S = 240
+# Running cache-only peers push every 60 s (the director only needs
+# their state at tick granularity; the frontier peer keeps 30 s so the
+# dashboard's live step_detail stays snappy). Director freshness window
+# (peer_director.PEER_PUSH_FRESH_S) is sized for this.
+PEER_PUSH_INTERVAL_CACHE_S = 60
 _PEER_PUSH_LAST_FULL_TS = 0.0
 _PEER_PUSH_LAST_STATE = ''
+# Newest recent_log ts the director acked holding for us. When set, the
+# next full push ships only newer log lines (``recent_log_delta``);
+# None (director restart / failover / old director) → full ring.
+_PEER_PUSH_ACK_LOG_WM: str | None = None
+_PEER_PUSH_LAST_CACHE_ONLY = False
 
 
 def _acquire_single_flight(name: str, poll_s: float = 30.0):
@@ -1834,13 +1876,20 @@ def _peer_status_push_loop():
     import director_ha as _dha
     import peer_director as _pd
     import gzip as _gz
-    global _PEER_PUSH_LAST_FULL_TS, _PEER_PUSH_LAST_STATE
+    global _PEER_PUSH_LAST_FULL_TS, _PEER_PUSH_LAST_STATE, _PEER_PUSH_ACK_LOG_WM
+    global _PEER_PUSH_LAST_CACHE_ONLY
     # One pusher per VM (both gunicorn workers used to push → 2× the
     # director's inbound peer_status traffic for no extra freshness).
     _sf = _acquire_single_flight('peer_status_push')
+    _last_push_ts = 0.0
     while True:
         try:
             time.sleep(PEER_PUSH_INTERVAL_S)
+            # Cache-only running peers: 60 s cadence (skip alternate ticks).
+            if (_PEER_PUSH_LAST_STATE in ('running', 'processing')
+                    and _PEER_PUSH_LAST_CACHE_ONLY
+                    and (time.time() - _last_push_ts) < PEER_PUSH_INTERVAL_CACHE_S - 2):
+                continue
             # Skip on the director itself.
             try:
                 if _dha.IS_DIRECTOR_FLAG.exists():
@@ -2076,10 +2125,23 @@ def _peer_status_push_loop():
                 payload = {'peer_id': peer_id, 'status': _slim,
                            'bandwidth': bw}
             else:
+                # recent_log delta: only lines newer than what the
+                # director acked holding for us (~70 % of a full push
+                # was the 200-line ring re-sent every 30 s).
+                _wm = _PEER_PUSH_ACK_LOG_WM
+                _rl = status.get('recent_log')
+                if _wm and isinstance(_rl, list):
+                    _new_rl = [e for e in _rl
+                               if isinstance(e, dict) and (e.get('ts') or '') >= _wm]
+                    if len(_new_rl) < len(_rl):
+                        status = dict(status)
+                        status['recent_log'] = _new_rl
+                        status['recent_log_delta'] = _wm
                 payload = {'peer_id': peer_id, 'status': status,
                            'bandwidth': bw}
                 _PEER_PUSH_LAST_FULL_TS = _now
                 _PEER_PUSH_LAST_STATE = _state_now
+            _PEER_PUSH_LAST_CACHE_ONLY = bool(status.get('cache_only'))
             # Gzip the body unconditionally — status payloads
             # compress to ~25 % of source. Director endpoint
             # transparently handles Content-Encoding: gzip
@@ -2091,13 +2153,22 @@ def _peer_status_push_loop():
                 hdrs2 = dict(hdrs)
                 hdrs2['Content-Encoding'] = 'gzip'
                 hdrs2['Content-Type'] = 'application/json'
-                _req.post(
+                _resp = _req.post(
                     director_url.rstrip('/') + '/api/v1/director/peer_status',
                     data=body,
                     timeout=PEER_PUSH_TIMEOUT_S,
                     headers=hdrs2,
                 )
+                _last_push_ts = time.time()
+                try:
+                    _ack = _resp.json() if _resp.ok else {}
+                    _PEER_PUSH_ACK_LOG_WM = (_ack or {}).get('recent_log_wm') or None
+                except Exception:
+                    _PEER_PUSH_ACK_LOG_WM = None
+                if not _resp.ok:
+                    _PEER_PUSH_ACK_LOG_WM = None
             except Exception as e:
+                _PEER_PUSH_ACK_LOG_WM = None
                 log.debug('peer status push failed: %s', e)
         except Exception as e:
             log.debug('peer status push loop: %s', e)
@@ -3461,8 +3532,12 @@ def processing_peers_status():
     data_dir = Path('data/austria_processor')
     result = {'instance': os.environ.get('INSTANCE_ID', 'primary')}
 
-    # Completed KGs
-    result['completed'] = sorted(_get_completed_kgs())
+    # Completed KGs (~40 KB). The primary's peer-sync loop never reads
+    # it (it merges the manifest instead) and passes ``completed=0``.
+    if (request.args.get('completed', '1') or '1') in ('0', 'false', 'no'):
+        result['completed'] = []
+    else:
+        result['completed'] = sorted(_get_completed_kgs())
 
     # Current KG being processed
     current = None
@@ -6983,7 +7058,10 @@ def director_peer_status():
     status = body.get('status') or {}
     bw = body.get('bandwidth')
     pd.record_peer_push(peer_id, status, bandwidth=bw)
-    return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL})
+    # Ack carries the newest recent_log ts we now hold for this peer so
+    # its next full push can be a delta (see _peer_status_push_loop).
+    return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL,
+                    'recent_log_wm': pd.pushed_recent_log_wm(peer_id)})
 
 
 @app.route('/api/v1/director/proxy/status')

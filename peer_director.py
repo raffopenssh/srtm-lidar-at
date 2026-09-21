@@ -277,7 +277,11 @@ _REVALIDATE_LOCK = threading.Lock()
 # probe more often than this. The dashboard hot path uses cached
 # ``last_status`` from ``copernicus.list_credentials()``; that cache
 # is updated by ``_save_credentials_to_disk()`` after each probe.
-_REVALIDATE_INTERVAL_S = 600
+# 30 min (was 10): with ~107 creds a sweep is ~430 requests / 1.5 MB
+# (openid-configuration + token + openeo root + oidc providers per
+# cred) — ~9 MB/h of primary egress at 10 min. Exhaustion / 402
+# transitions still surface live via peers' usage telemetry.
+_REVALIDATE_INTERVAL_S = 1800
 
 # === Zenodo tile-cache manifest reconcile + Zenodo-degraded circuit ===
 # Hourly reconcile of cache_manifest.json against the live deposit
@@ -1567,13 +1571,40 @@ def get_peer_bandwidth(peer_url: str, peer_id: str = '') -> dict:
 # state='busy') when a fresh poll times out, as long as it's recent.
 _PEER_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _PEER_STATUS_CACHE_TTL = 300.0   # 5 min — covers a slow GPKG step.
+_PEER_CAPS_TTL_S = 1800.0        # /info + /credentials cap probe; also keyed on peer commit
 # Status-push cache: peers POST /api/v1/director/peer_status every
 # PEER_PUSH_INTERVAL seconds. The director loop prefers this over
 # pulling /processing/status; polls only when push is stale or
 # unavailable. Slashes outbound director traffic ~50x at fleet scale.
 PEER_PUSH_INTERVAL = 30          # seconds (peers run a ticker)
-PEER_PUSH_FRESH_S = 75           # consider push fresh for this long
+PEER_PUSH_FRESH_S = 100          # consider push fresh for this long (cache-only peers push every 60 s)
 _PEER_PUSH: dict[str, dict] = {}  # peer_id -> {ts, status, bandwidth}
+_RECENT_LOG_RING = 200  # matches austria_processor's recent_log cap
+
+
+def pushed_recent_log_wm(peer_id: str) -> str | None:
+    """Newest recent_log ts we hold for *peer_id* (from the freshest
+    push on either worker), or None. Returned in the peer_status ack so
+    the peer can ship only newer lines next time. None → peer sends the
+    full ring (director restart / failover self-heals)."""
+    try:
+        # No freshness gate here (idle peers push full status only every
+        # 240 s, so get_pushed_status() would call them stale).
+        with _PEER_PUSH_LOCK:
+            ent = _PEER_PUSH.get(peer_id)
+        try:
+            fp = _PEER_PUSH_DIR / f'{peer_id}.json'
+            if fp.stat().st_mtime > float((ent or {}).get('ts') or 0.0) + 0.5:
+                d = json.loads(fp.read_text())
+                if isinstance(d, dict) and d.get('ts'):
+                    ent = d
+        except Exception:
+            pass
+        rl = ((ent or {}).get('status') or {}).get('recent_log') or []
+        mx = max((e.get('ts') or '' for e in rl if isinstance(e, dict)), default='')
+        return mx or None
+    except Exception:
+        return None
 _PEER_PUSH_DIR = Path('/tmp/srtm_peer_push')   # cross-worker mirror
 _PEER_PUSH_LOCK = threading.Lock()
 
@@ -1740,9 +1771,43 @@ def record_peer_push(peer_id: str, status: dict,
     status = status or {}
     with _PEER_PUSH_LOCK:
         prev = _PEER_PUSH.get(peer_id) or {}
+    # The freshest previous push may live on the sibling worker: consult
+    # the disk mirror (mtime-gated) so a recent_log *delta* is merged
+    # onto the right base regardless of which worker accepted it.
+    try:
+        fp = _PEER_PUSH_DIR / f'{peer_id}.json'
+        if fp.stat().st_mtime > float(prev.get('ts') or 0.0) + 0.5:
+            d = json.loads(fp.read_text())
+            if isinstance(d, dict) and float(d.get('ts') or 0) > float(prev.get('ts') or 0):
+                prev = d
+    except Exception:
+        pass
+    with _PEER_PUSH_LOCK:
         prev_status = prev.get('status') or {}
         prev_sys = prev_status.get('system') or {}
         new_sys = status.get('system') or {}
+        # recent_log delta (Sep 2026 bandwidth pass): the peer only ships
+        # log lines newer than the watermark we acked on its previous
+        # push (``recent_log_delta`` = that watermark). Rebuild the full
+        # ring here so every consumer (combined log, proxy/status,
+        # dashboard) sees exactly what a full push would have carried.
+        _delta_wm = status.get('recent_log_delta')
+        if _delta_wm and isinstance(status.get('recent_log'), list):
+            _prev_rl = prev_status.get('recent_log') or []
+            _seen = set()
+            _merged_rl = []
+            for e in list(_prev_rl) + list(status['recent_log']):
+                if not isinstance(e, dict):
+                    continue
+                k = (e.get('ts') or '', e.get('msg') or '', e.get('level') or '')
+                if k in _seen:
+                    continue
+                _seen.add(k)
+                _merged_rl.append(e)
+            _merged_rl.sort(key=lambda e: e.get('ts') or '')
+            status = dict(status)
+            status['recent_log'] = _merged_rl[-_RECENT_LOG_RING:]
+            status.pop('recent_log_delta', None)
         # Pull sticky fields forward when the new payload lacks them.
         merged_sys = dict(new_sys)
         for k in _STICKY_SYSTEM_FIELDS:
@@ -3938,6 +4003,19 @@ class PeerDirector:
                    '_bandwidth_backoff', '_bandwidth_misses'):
             if _k in disk_state:
                 state[_k] = disk_state[_k]
+        # Capability cache: adopt the sibling worker's fresher probes so
+        # only one worker ever fans out /info + /credentials.
+        try:
+            _dc = disk_state.get('_peer_caps') or {}
+            if isinstance(_dc, dict) and _dc:
+                with self._lock:
+                    _mc = self.state.setdefault('_peer_caps', {})
+                    for _pid, _e in _dc.items():
+                        if isinstance(_e, dict) and float(_e.get('at') or 0) > \
+                                float((_mc.get(_pid) or {}).get('at') or 0):
+                            _mc[_pid] = dict(_e)
+        except Exception:
+            pass
         # Sync the per-process EMA caches from disk too. Workers that
         # don't run the director loop never update these in memory, so
         # _max_parallel_frontiers / _target_frontier_count would compute
@@ -9058,7 +9136,18 @@ class PeerDirector:
         pid = peer['id']
         cache = self.state.setdefault('_peer_caps', {})
         entry = cache.get(pid) or {}
-        if entry and (time.time() - entry.get('at', 0)) < 300:
+        # Capabilities only change when the peer's code changes, so key
+        # the cache on the commit it reports via its status push and
+        # use a long TTL (was 300 s → 2 GET /info + /credentials per
+        # peer per 5 min, from BOTH gunicorn workers ≈ 15 MB/h).
+        _cur_commit = ''
+        try:
+            _cur_commit = (((get_pushed_status(pid) or {}).get('status') or {})
+                           .get('git_commit') or '')[:7]
+        except Exception:
+            pass
+        if entry and (time.time() - entry.get('at', 0)) < _PEER_CAPS_TTL_S \
+                and (not _cur_commit or entry.get('commit', '') == _cur_commit):
             return set(entry.get('caps') or [])
         try:
             if url is None:
@@ -9107,7 +9196,7 @@ class PeerDirector:
             log.debug('cap probe %s failed: %s', pid, e)
             return set(entry.get('caps') or [])
         cache[pid] = {'caps': sorted(caps), 'at': time.time(),
-                      'cred_count': cred_count}
+                      'cred_count': cred_count, 'commit': _cur_commit}
         return caps
 
     def _bootstrap_peer_credentials(self, url: str, pid: str) -> int:

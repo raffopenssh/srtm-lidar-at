@@ -74,6 +74,25 @@ TOL = {
 }
 
 
+# Operator hints per fatal check — appended to ``Report.summary()`` (and so
+# to the merged fleet log / ``/process.txt?q=v2verify``) so a FAIL row says
+# *where to look* without re-deriving the pipeline.  Keep each ≤ ~90 chars.
+HINTS = {
+    "unclassified_le_v1": "few huge 'unclassified' objs = cross-tile anchor-weak merge demotion → "
+                          "grep peer log 'Anchor-weak' (v2 skips those merges since 2026-09-21)",
+    "parcel_segmentation_coverage_pct_ge_v1": "tiny single-object parcels lost their class (segv2 drops "
+                                              "path/earthwork) or a tile was not segmented → check data_quality.tiles",
+    "segment_type_no_holes": "segment_type==0 inside parcel union → unsegmented tile / BEV read hole; "
+                             "grep 'gpkg_full' + 'deferred' for that KG",
+    "parcels_vs_v1": "cadastre changed between runs (±1–2 is normal for old v1) — compare parcels_vs_cadastre",
+    "segmented_area_ge_v1": "v2 covers less LiDAR area than v1 on the same grid → missing DTM tile / BEV outage",
+    "lidar_tiles_ge_v1": "a DTM tile v1 had is missing now → BEV read failure, see bev_pause / Anchor",
+    "bbox_covers_v1": "v2 AOI shrunk vs v1 → KG split/definition changed; compare kg_splitter output",
+    "grid25_dims": "grid25 raster does not match bbox → v21_products grid anchor bug (docs/v2.1-product-spec.md)",
+    "light_gpkg_integrity": "sqlite integrity_check failed → disk full / interrupted write on peer",
+}
+
+
 class Report(dict):
     def __init__(self):
         super().__init__(ok=True, checks=[], errors=[], warnings=[])
@@ -93,6 +112,13 @@ class Report(dict):
             s += " | " + "; ".join(self["errors"][:4])
         if self["warnings"]:
             s += " | warn: " + "; ".join(self["warnings"][:3])
+        hints = []
+        for e in self["errors"]:
+            h = HINTS.get(e.split(":", 1)[0])
+            if h and h not in hints:
+                hints.append(h)
+        if hints:
+            s += " | hint: " + " / ".join(hints[:2])
         return s
 
 
@@ -273,7 +299,14 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
         rep.check("segments_vs_v1", n_seg >= TOL["segments_rel_min"] * n1,
                   f"v2={n_seg} v1={n1}", fatal=False)
     u2, u1 = _unclassified_pct(v2), _unclassified_pct(v1)
-    rep.check("unclassified_le_v1", u2 <= u1 + TOL["unclassified_pp"], f"v2={u2:.1f}%% v1={u1:.1f}%%")
+    # Object count + mean size of the v2 unclassified share: "n=2 avg=117k m²"
+    # is one demoted cross-tile blob (pipeline), "n=800 avg=60 m²" is the
+    # classifier genuinely unsure (model/threshold) — very different fixes.
+    _ua = (_g(v2, "area_summary", "unclassified", default={}) or {})
+    _un = int(_num(_ua.get("n_objects"), 0) or 0)
+    _ushape = (f" (n={_un} avg={_num(_ua.get('area_sqm'), 0.0) / _un:.0f}m²)" if _un else "")
+    rep.check("unclassified_le_v1", u2 <= u1 + TOL["unclassified_pp"],
+              f"v2={u2:.1f}%%{_ushape} v1={u1:.1f}%%")
     nb2 = int(_num(_g(v2, "new_buildings", "count"), 0) or 0)
     nb1 = int(_num(_g(v1, "new_buildings", "count"), 0) or 0)
     rep["delta"] = {"n_segments": n_seg - n1, "unclassified_pp": round(u2 - u1, 2),

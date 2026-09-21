@@ -3264,6 +3264,20 @@ def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = No
 
 # === SECTION: Boundary segment merging (cross-tile stitching) ===
 
+def _relay_subprocess_info(msg: str, step: str = "") -> None:
+    """Module-level twin of the ``_relay_info`` closure in ``process_kg``:
+    append an INFO line to ``subprocess_warnings.jsonl`` so the parent's
+    step-monitor forwards it into the merged fleet log (``/process.txt?q=``).
+    Used for per-KG forensics that would otherwise live only in the peer's
+    local processor.log (e.g. ``anchor-weak`` cross-tile merge outcomes)."""
+    try:
+        with open(DATA_DIR / "subprocess_warnings.jsonl", "a") as _wf:
+            _wf.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                  "level": "info", "msg": msg, "step": step}) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _merge_boundary_segments(
     labels_full: np.ndarray,
     seg_type_full: np.ndarray,
@@ -3437,6 +3451,75 @@ def _merge_boundary_segments(
     if not merge_groups:
         return 0, {}
 
+    _ANCHOR_MAX_AREA = {
+        # Manmade: individual structures rarely > these sizes
+        'roof': 2000, 'wall': 500, 'fence': 500, 'mast': 200,
+        'greenhouse': 2000, 'solar_panel': 1000, 'substation': 3000,
+        'wind_turbine': 5000,
+        # Transport: roads are elongated but segments stay bounded
+        'road': 5000, 'path': 3000, 'parking': 3000, 'bridge': 1000,
+        # Vegetation: canopy segments are naturally larger
+        'tree': 20000, 'shrub': 15000, 'hedge': 5000,
+        'grass': 30000, 'crop': 50000, 'garden': 10000,
+        'orchard': 20000, 'vineyard': 15000,
+        # Natural / disturbance
+        'water': 50000, 'bare_soil': 30000, 'rock': 30000,
+        'excavation': 10000, 'fill': 10000, 'construction': 5000,
+        'tree_loss': 20000, 'earthwork': 10000,
+    }
+
+    # v2: gate anchor-weak groups *before* merging instead of demoting the
+    # merged blob to 'unclassified' in step 7.  In v2 every member already
+    # carries a LightGBM type and step 7 keeps the survivor's type (no RF
+    # re-classification), so an anchor-weak group used to become one huge
+    # 'unclassified' polygon — 2026-09-21: 16111-northeast-2 lost a 29 ha
+    # crop field (5 anchors, 57.9k m²/anchor > 50k), 90013-southwest lost
+    # 30 ha of rock at 30.7k m²/anchor (limit 30k), 91123-southwest a 3 ha
+    # parking; v2_verify then tripped ``unclassified_le_v1`` (v2 2–11 %%
+    # vs v1 0 %%) and the KG struck out.  Leaving those groups unmerged
+    # keeps the tile-level objects with their own honest types/confidence
+    # (a cross-tile seam, which is what v1 produced whenever it did not
+    # merge) and never manufactures unclassified area.  The anchor
+    # heuristic still guards v1, where the demoted blob came from the RF
+    # re-classifying one tiny mis-typed anchor.
+    if MODEL_VERSION == "v2":
+        _skipped = []
+        for root_id, member_ids in list(merge_groups.items()):
+            surv = obj_map.get(root_id)
+            if surv is None:
+                continue
+            compat = _MERGE_RULES.get(surv.obj_type, set()) | {surv.obj_type}
+            tot = 0.0
+            n_anch = 0
+            for mid in member_ids:
+                o = obj_map.get(mid)
+                if o is None:
+                    continue
+                tot += o.area_sqm
+                if o.obj_type in compat:
+                    n_anch += 1
+            per = tot / max(n_anch, 1)
+            lim = _ANCHOR_MAX_AREA.get(surv.obj_type, 10000)
+            if per > lim:
+                _skipped.append((root_id, surv.obj_type, tot, n_anch, per, lim))
+                del merge_groups[root_id]
+        for root_id, t, tot, n_anch, per, lim in _skipped[:20]:
+            log.info("  Anchor-weak (v2, merge skipped): id=%d type=%s area=%.0fm² anchors=%d "
+                     "(%.0fm²/anchor, limit=%d) — members kept as tile-level objects",
+                     root_id, t, tot, n_anch, per, lim)
+        if _skipped:
+            _by_t = Counter(x[1] for x in _skipped)
+            _msg = ("anchor-weak: v2 cross-tile merge skipped %d group(s), %.1f ha kept as tile-level objects "
+                    "(%s; largest %s %.1f ha/%d anchors)" % (
+                        len(_skipped), sum(x[2] for x in _skipped) / 1e4,
+                        " ".join(f"{t}={n}" for t, n in _by_t.most_common(5)),
+                        max(_skipped, key=lambda x: x[2])[1], max(x[2] for x in _skipped) / 1e4,
+                        max(_skipped, key=lambda x: x[2])[3]))
+            log.info("  " + _msg)
+            _relay_subprocess_info(_msg, "merge")
+        if not merge_groups:
+            return 0, {}
+
     # ------------------------------------------------------------------
     # 5. Remap labels and recompute stats
     # ------------------------------------------------------------------
@@ -3543,22 +3626,6 @@ def _merge_boundary_segments(
     # is solid.  When area-per-anchor exceeds the threshold, we force
     # re-classification and penalise confidence.
     # ------------------------------------------------------------------
-    _ANCHOR_MAX_AREA = {
-        # Manmade: individual structures rarely > these sizes
-        'roof': 2000, 'wall': 500, 'fence': 500, 'mast': 200,
-        'greenhouse': 2000, 'solar_panel': 1000, 'substation': 3000,
-        'wind_turbine': 5000,
-        # Transport: roads are elongated but segments stay bounded
-        'road': 5000, 'path': 3000, 'parking': 3000, 'bridge': 1000,
-        # Vegetation: canopy segments are naturally larger
-        'tree': 20000, 'shrub': 15000, 'hedge': 5000,
-        'grass': 30000, 'crop': 50000, 'garden': 10000,
-        'orchard': 20000, 'vineyard': 15000,
-        # Natural / disturbance
-        'water': 50000, 'bare_soil': 30000, 'rock': 30000,
-        'excavation': 10000, 'fill': 10000, 'construction': 5000,
-        'tree_loss': 20000, 'earthwork': 10000,
-    }
     _MANMADE_TYPES = {
         'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
         'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation'}
@@ -3719,6 +3786,13 @@ def _merge_boundary_segments(
              "%d reclassified, %d anchor-weak",
              len(adj_pairs), n_merges, len(merge_groups),
              n_reclassified, n_anchor_weak)
+    if n_anchor_weak:
+        # v1 (or a v2 group that slipped past the pre-merge gate): merged
+        # blob(s) were demoted to 'unclassified' — surface fleet-wide so an
+        # ``unclassified_le_v1`` verify FAIL can be traced via ?q=anchor-weak.
+        _relay_subprocess_info(
+            f"anchor-weak: {n_anchor_weak} merged cross-tile group(s) demoted to unclassified "
+            f"({n_merges} merges, model={MODEL_VERSION}) — check unclassified_le_v1 in v2verify", "merge")
     return n_merges, remap
 
 

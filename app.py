@@ -19253,6 +19253,63 @@ def _is_bev_proxy_noise(msg: str) -> bool:
     return any(t in m for t in _BEV_NOISE_INTERNAL_TOKENS)
 
 
+_V2_VF_CACHE: dict = {'t': 0.0, 'v': {}}
+
+
+def _v2_verify_fail_histogram(hours: float = 24.0, ttl: float = 60.0) -> dict:
+    """Histogram of failing ``v2verify`` gates from the merged 24h log.
+
+    Scans ``data/combined_log_24h.jsonl`` for ``v2verify: <code> FAIL n/m
+    checks | <check>: <detail>; <check2>: … | warn: … | hint: …`` rows,
+    keeps the *fatal* segment only (before ``| warn:`` / ``| hint:``),
+    dedupes per KG code (a code strikes twice on two peers with identical
+    numbers) and returns ``{codes, rows, checks: [(name, n_codes)…],
+    examples: {name: [codes…]}}``.  TTL-cached; rendered as the
+    ``v2_verify_fails(24h):`` line in ``/process.txt``.
+    """
+    import re as _re
+    now = time.time()
+    if now - _V2_VF_CACHE['t'] < ttl:
+        return _V2_VF_CACHE['v']
+    pat = _re.compile(r'v2verify: (\S+) FAIL \d+/\d+ checks \| (.*)$')
+    per_code: dict[str, set] = {}
+    rows = 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        with _COMBINED_LOG_PATH.open() as fh:
+            for line in fh:
+                if 'v2verify:' not in line or 'FAIL' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if (e.get('ts') or '') < cutoff:
+                    continue
+                m = pat.search(e.get('msg') or e.get('message') or '')
+                if not m:
+                    continue
+                rows += 1
+                fatal = _re.split(r' \| (?:warn|hint):', m.group(2), maxsplit=1)[0]
+                names = {part.split(':', 1)[0].strip() for part in fatal.split(';') if ':' in part}
+                per_code.setdefault(m.group(1), set()).update(n for n in names if n)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception('v2 verify-fail histogram scan failed')
+    hist: dict[str, int] = {}
+    ex: dict[str, list] = {}
+    for code, names in per_code.items():
+        for n in names:
+            hist[n] = hist.get(n, 0) + 1
+            ex.setdefault(n, []).append(code)
+    checks = sorted(hist.items(), key=lambda kv: -kv[1])
+    v = {'codes': len(per_code), 'rows': rows, 'checks': checks,
+         'examples': {n: sorted(ex[n]) for n, _ in checks}}
+    _V2_VF_CACHE.update(t=now, v=v)
+    return v
+
+
 @app.route('/process.txt')
 @app.route('/api/v1/dashboard.txt')
 def process_txt():
@@ -20182,6 +20239,21 @@ def process_txt():
                 _v2l += (f" · strikes_fleet={_fs.get('codes')}codes"
                          f" struck_out={_fs.get('struck_out')} peers={_fs.get('peers')}")
         out.append(_v2l)
+        # v2_verify_fails: which gate trips, fleet-wide, last 24h (deduped per
+        # code).  Turns "verify_fail=5" into an actionable breakdown + hint.
+        try:
+            _vf = _v2_verify_fail_histogram()
+            if _vf.get('codes'):
+                _line = (f"v2_verify_fails(24h): codes={_vf['codes']} rows={_vf['rows']} · "
+                         + ' '.join(f"{k}={v}" for k, v in _vf['checks'][:6]))
+                _ex = _vf.get('examples') or {}
+                if _ex:
+                    _line += ' · e.g. ' + ' '.join(f"{k}:{','.join(v[:3])}" for k, v in list(_ex.items())[:3])
+                _line += (" · debug: ?q=v2verify&warn=1&log=100 (row carries per-check detail + hint), "
+                          "?q=anchor-weak (cross-tile demotions), peer log via director/proxy/log?peer_id=")
+                out.append(_line)
+        except Exception:
+            log.exception('process.txt v2_verify_fails line failed')
         # v2_regen: KGs whose v1 full GPKG is (suspected) gone on Zenodo.
         # Read from disk so the non-director gunicorn worker agrees with
         # the loop worker; grep `?q=v2regen` for the transition events.

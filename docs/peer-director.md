@@ -916,7 +916,12 @@ only the python PID (`_processor_python_pids()` /
 the legacy runuser chain until they restart. Strikes inflated by this
 can be reset with `PUT /api/v1/processing/kg_strikes {"<code>": -1}`
 (drops the code + its block children; must reach every peer, since the
-merge is max()).
+merge is max()). `scripts/reset_kg_strikes_v2pending.py --apply` does
+this fleet-wide for every parent that is v1-complete but not yet
+v2-complete (the v2 upgrade / v2_regen / v2.2 re-run universe — small
+KGs, cheap to re-run whole). Done 2026-09-21 for 466 parents; peers
+still on pre-3b1b9bd code ignore negatives, so re-run it once
+`versions:` shows the whole fleet on the target.
 
 Verify with `GET /api/v1/admin/proc_env`. Look for the python3 row —
 `uid` should start with `1000`, and `env` should include

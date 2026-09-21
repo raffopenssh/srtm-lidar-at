@@ -8528,6 +8528,56 @@ def admin_clear_tile_checkpoints():
     return jsonify({'kg': kg, 'cleared': True, 'files_removed': n_files})
 
 
+@app.route('/api/v1/admin/v2_strikes/clear', methods=['POST'])
+def admin_v2_strikes_clear():
+    """Drop v2-upgrade strikes from this peer's ``v2_upgrade_failed.json``.
+
+    Body (JSON): ``{"codes": [...]}`` clears those codes outright;
+    ``{"checks": ["segment_type_no_holes", ...]}`` clears every entry whose
+    recorded *fatal* verify failures are all within that set (the reason
+    string is ``v2verify: <code> FAIL n/m checks | a: ..; b: .. | warn: ..``).
+    Use after a verify-gate fix so struck codes are re-dispatched; the
+    director's fleet union drops the peer's stale entries on the next
+    full status push. Returns the codes removed.
+    """
+    body = request.get_json(silent=True) or {}
+    codes = {str(c) for c in (body.get('codes') or [])}
+    checks = {str(c) for c in (body.get('checks') or [])}
+    if not codes and not checks:
+        return jsonify({'error': 'codes or checks required'}), 400
+    vf = Path('data/austria_processor/v2_upgrade_failed.json')
+    if not vf.exists():
+        return jsonify({'removed': [], 'remaining': 0})
+    try:
+        d = json.loads(vf.read_text())
+        if not isinstance(d, dict):
+            d = {}
+    except Exception as e:
+        return jsonify({'error': f'unreadable: {e}'}), 500
+    import re as _re
+    removed = []
+    for code, e in list(d.items()):
+        if code in codes:
+            removed.append(code); d.pop(code); continue
+        if not checks:
+            continue
+        reason = str((e or {}).get('reason') or '')
+        m = _re.search(r'checks \| (.*?)(?: \| warn|$)', reason)
+        if not m or ' FAIL ' not in reason:
+            continue
+        fatal = [p.split(':', 1)[0].strip() for p in m.group(1).split(';') if p.strip()]
+        if fatal and all(f in checks for f in fatal):
+            removed.append(code); d.pop(code)
+    if removed:
+        try:
+            tmp = vf.with_suffix('.tmp')
+            tmp.write_text(json.dumps(d, indent=1))
+            tmp.replace(vf)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'removed': sorted(removed), 'remaining': len(d)})
+
+
 @app.route('/api/v1/admin/flush_tiles', methods=['POST'])
 def admin_flush_tiles():
     """Force-upload local Copernicus + Hansen tiles to Zenodo.

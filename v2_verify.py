@@ -58,7 +58,13 @@ LIGHT_LAYERS_V21 = ("terrain_coarse_dtm", "terrain_coarse_slope")
 
 TOL = {
     "parcel_count_rel": 0.01,      # cadastre may change a little between runs
-    "coverage_pp": 1.0,            # percentage points
+    "coverage_pp": 1.0,            # percentage points (elevation; fatal)
+    "seg_coverage_pp_warn": 1.0,   # segmentation coverage: 1–2.5 pp drop = non-fatal drift
+    "seg_coverage_pp": 2.5,        # … fatal past 2.5 pp (segv2 drops path/earthwork
+                                   # objects, so a few tiny single-object parcels lose
+                                   # their area_summary — a class-set consequence, not a
+                                   # bug; 2026-09-21: 28 upgrades struck at −1.1…−1.7 pp)
+    "parcel_count_abs": 2,         # … or ±2 parcels, whichever is larger (tiny blocks)
     "building_cov_pp": 2.0,
     "seg_area_rel": 0.02,          # v2 segmented area ≥ 0.98 × v1
     "unclassified_pp": 2.0,        # v2 unclassified share ≤ v1 + 2 pp
@@ -222,21 +228,46 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     # ---- improvement / non-regression vs v1 --------------------------------
     pc1 = int(_num(_g(v1, "parcels", "count"), 0) or 0)
     if pc1 > 0:
-        rel = abs(pc - pc1) / pc1
-        rep.check("parcels_vs_v1", rel <= TOL["parcel_count_rel"], f"v2={pc} v1={pc1}")
+        _d = abs(pc - pc1)
+        rep.check("parcels_vs_v1", _d <= max(TOL["parcel_count_abs"], TOL["parcel_count_rel"] * pc1),
+                  f"v2={pc} v1={pc1}")
     cov1 = _g(v1, "coverage", default={}) or {}
     for k, tol in (("parcel_elevation_coverage_pct", TOL["coverage_pp"]),
-                   ("parcel_segmentation_coverage_pct", TOL["coverage_pp"]),
+                   ("parcel_segmentation_coverage_pct", TOL["seg_coverage_pp"]),
                    ("building_height_coverage_pct", TOL["building_cov_pp"])):
         a, b = _num(cov.get(k)), _num(cov1.get(k))
         if a is None or b is None:
             continue
         rep.check(f"{k}_ge_v1", a >= b - tol, f"v2={a:.1f} v1={b:.1f}")
+        if k == "parcel_segmentation_coverage_pct" and b - tol <= a < b - TOL["seg_coverage_pp_warn"]:
+            rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp)", fatal=False)
+    # Tile-grid comparisons.  ``total_segmented_area_sqm`` is the SUM of
+    # per-tile valid px over the overlapping 1.5 km grid and ``n_tiles``
+    # depends on how the bbox happened to fall on the grid when the v1 ran
+    # (19185: v1 4 tiles / 9.06 km², v2 2 tiles / 4.53 km² for a bbox that
+    # v2 covers *more* of).  Neither is comparable across a grid change, so
+    # a differing grid is judged on AOI coverage: fatal only when the v2
+    # bbox fails to cover the v1 bbox (a shrunk AOI); otherwise a warning.
     sa, sb = _num(cov.get("total_segmented_area_sqm")), _num(cov1.get("total_segmented_area_sqm"))
+    nt2 = int(_num(cov.get("n_tiles"), 0) or 0)
+    nt1 = int(_num(cov1.get("n_tiles"), 0) or 0)
+    same_grid = nt1 == 0 or nt2 == 0 or nt1 == nt2
+    bb2, bb1 = _bbox_3035(v2), _bbox_3035(v1)
+    aoi_covered = True
+    if bb2 and bb1:
+        _sl = 25.0
+        aoi_covered = (bb2[0] <= bb1[0] + _sl and bb2[1] <= bb1[1] + _sl
+                       and bb2[2] >= bb1[2] - _sl and bb2[3] >= bb1[3] - _sl)
+        rep.check("bbox_covers_v1", aoi_covered,
+                  f"v2 x[{bb2[0]:.0f},{bb2[2]:.0f}] y[{bb2[1]:.0f},{bb2[3]:.0f}] "
+                  f"v1 x[{bb1[0]:.0f},{bb1[2]:.0f}] y[{bb1[1]:.0f},{bb1[3]:.0f}]")
     if sa is not None and sb and sb > 0:
         rep.check("segmented_area_ge_v1", sa >= (1 - TOL["seg_area_rel"]) * sb,
-                  f"v2={sa:.0f} v1={sb:.0f} m²")
-    rep.check("lidar_tiles_ge_v1", lidar >= l1, f"v2={lidar} v1={l1} lidar tiles")
+                  f"v2={sa:.0f} v1={sb:.0f} m²" + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)"),
+                  fatal=same_grid or not aoi_covered)
+    rep.check("lidar_tiles_ge_v1", lidar >= l1, f"v2={lidar} v1={l1} lidar tiles"
+              + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)"),
+              fatal=same_grid or not aoi_covered)
     n1 = int(_num(_g(v1, "landscape", "n_segments"), 0) or 0)
     if n1 > 0:
         rep.check("segments_vs_v1", n_seg >= TOL["segments_rel_min"] * n1,
@@ -251,13 +282,38 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
 
 
 def _bbox_3035(v2: dict):
-    bb = v2.get("bbox") or {}
+    bb = (v2 or {}).get("bbox") or {}
     try:
         from pyproj import Transformer
         t = Transformer.from_crs(4326, 3035, always_xy=True)
         xs, ys = zip(*[t.transform(x, y) for x, y in (
             (bb["min_lon"], bb["min_lat"]), (bb["max_lon"], bb["min_lat"]),
             (bb["min_lon"], bb["max_lat"]), (bb["max_lon"], bb["max_lat"]))])
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _lidar_extent_3035(v2: dict):
+    """EPSG:3035 envelope of the tiles that actually carry a DTM, or None.
+
+    Border KGs (80110-southeast-2, Tirol/Italy) have whole tile rows outside
+    Austria: no BEV data, nothing stitched, so the 25 m grid legitimately
+    starts a tile row inside the doc bbox."""
+    tiles = _g(v2, "data_quality", "tiles", default=[]) or []
+    bbs = [t.get("bbox_wgs") for t in tiles
+           if isinstance(t, dict) and t.get("dtm") and not t.get("outside_austria")
+           and int(t.get("valid_pixels") or 0) >= 100 and t.get("bbox_wgs")]
+    if not bbs or len(bbs) == len([t for t in tiles if isinstance(t, dict) and t.get("bbox_wgs")]):
+        return None
+    try:
+        from pyproj import Transformer
+        t = Transformer.from_crs(4326, 3035, always_xy=True)
+        xs, ys = [], []
+        for w, s, e, n in bbs:
+            for x, y in ((w, s), (e, s), (w, n), (e, n)):
+                px, py = t.transform(x, y)
+                xs.append(px); ys.append(py)
         return min(xs), min(ys), max(xs), max(ys)
     except Exception:  # noqa: BLE001
         return None
@@ -289,6 +345,11 @@ def check_v21_document(v2: dict, rep: Report) -> None:
     cell = d["cell_m"]
     cols, rows = d["cols"], d["rows"]
     bb = _bbox_3035(v2)
+    _lx = _lidar_extent_3035(v2)
+    if bb and _lx:
+        # only the tiles with lidar can be gridded — judge against their
+        # envelope (clipped to the doc bbox) instead of the whole bbox.
+        bb = (max(bb[0], _lx[0]), max(bb[1], _lx[1]), min(bb[2], _lx[2]), min(bb[3], _lx[3]))
     if bb:
         # the grid is built from the (overlapping, bbox-overshooting) tile
         # rectangles snapped to 25 m, so it must COVER the bbox and may
@@ -454,8 +515,18 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
         app_id = c.execute("PRAGMA application_id").fetchone()[0]
         rep.check("light_gpkg_app_id", app_id == 0x47504B47, hex(app_id))
         layers = {n: t for n, t in c.execute("SELECT table_name, data_type FROM gpkg_contents")}
-        missing = [l for l in LIGHT_LAYERS_REQUIRED if l not in layers]
+        # a block whose centroid filter kept no parcels / no buildings has
+        # nothing to write into those layers (47325-southeast: 1502 → 0
+        # parcels) — required only when the JSON reports any.
+        _pc0 = int(_num(_g(v2, "parcels", "count"), 0) or 0)
+        _nb0 = int(_num(_g(v2, "building_footprints", "count"), 0) or 0)
+        _optional = ({"parcels"} if _pc0 == 0 else set()) | ({"buildings"} if _nb0 == 0 else set())
+        missing = [l for l in LIGHT_LAYERS_REQUIRED if l not in layers and l not in _optional]
         rep.check("light_gpkg_layers", not missing, "missing: " + ",".join(missing))
+        _opt_missing = [l for l in _optional if l not in layers]
+        if _opt_missing:
+            rep.check("light_gpkg_layers_empty", False,
+                      "absent (no features in KG): " + ",".join(sorted(_opt_missing)), fatal=False)
         missing2 = [l for l in LIGHT_LAYERS_V2 if l not in layers]
         rep.check("light_gpkg_v2_layers", not missing2, "missing: " + ",".join(missing2), fatal=False)
 

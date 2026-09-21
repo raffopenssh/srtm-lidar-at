@@ -7434,6 +7434,33 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                               if b.get("geometry") is not None]
                 if _geoms_v2:
                     _v2_union_3035 = _uu_v2([g if g.is_valid else g.buffer(0) for g in _geoms_v2])
+                # Blocks keep parcels by *centroid*, so the union sticks out
+                # west/south of the block bbox where no tile is ever
+                # segmented (tiles only overshoot east/north).  Those slivers
+                # are inherited v1 behaviour, not holes — 34043-south v1 and
+                # v2 both read 0.80 %, 47221-northeast 2.79/2.83 % (2026-09-21,
+                # 27 block upgrades struck for segment_type_no_holes).  Clip
+                # to the block bbox so the health / hole checks only judge
+                # the area the block is responsible for.
+                if _v2_union_3035 is not None and _is_block and kg.get("bbox"):
+                    try:
+                        from shapely.geometry import box as _sbox_v2
+                        from shapely.ops import transform as _stf_v2
+                        from pyproj import Transformer as _Tr_v2
+                        _bbv2 = kg["bbox"]
+                        _tr_v2 = _Tr_v2.from_crs(4326, 3035, always_xy=True).transform
+                        _bbox_3035_v2 = _stf_v2(_tr_v2, _sbox_v2(
+                            _bbv2["min_lon"], _bbv2["min_lat"], _bbv2["max_lon"], _bbv2["max_lat"]))
+                        _clipped_v2 = _v2_union_3035.intersection(_bbox_3035_v2)
+                        if not _clipped_v2.is_empty:
+                            _out_frac = 1.0 - _clipped_v2.area / max(_v2_union_3035.area, 1.0)
+                            if _out_frac > 0.001:
+                                log.info("KG %s: v2 union clipped to block bbox (%.2f%% of parcel "
+                                         "area lies outside the block)", kg_code, 100 * _out_frac)
+                            _v2_union_3035 = _clipped_v2
+                    except Exception as _ce:  # noqa: BLE001
+                        log.warning("KG %s: v2 union block clip failed (%s) — using unclipped union",
+                                    kg_code, _ce)
             except Exception as _e:  # noqa: BLE001
                 log.warning("KG %s: v2 union failed (%s) — health checks use whole windows", kg_code, _e)
             import v2_source as _v2src

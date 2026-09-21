@@ -1749,10 +1749,19 @@ def _sync_peer_data():
                         _body = dict(_top)
                         _body['files'] = _delta
                         try:
+                            # PUT is admin-token protected on peers: without
+                            # the header every push 401'd silently, the
+                            # watermark never advanced and the full 44 KB
+                            # body went to every peer each cycle (~20 MB/h).
+                            _tok = _current_admin_token()
                             rr = _gzip_put_json(
                                 req,
                                 peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-                                _body, timeout=15)
+                                _body, timeout=15,
+                                headers=({'X-Admin-Token': _tok} if _tok else None))
+                            if not rr.ok:
+                                log.warning('Peer sync: cache manifest push to %s -> HTTP %s',
+                                            peer_url, rr.status_code)
                             if rr.ok:
                                 _pst['cm_pushed_top'] = _top_hash
                                 if _local_max:

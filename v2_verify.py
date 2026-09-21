@@ -475,9 +475,15 @@ def check_v21_document(v2: dict, rep: Report) -> None:
         slack = 1800.0
         sane = (bb[0] - x0 <= slack and x1 - bb[2] <= slack
                 and bb[1] - y1 <= slack and y0 - bb[3] <= slack)
-        rep.check("grid25_dims", covers and sane,
-                  f"grid {cols}x{rows}@{cell:.0f}m x[{x0:.0f},{x1:.0f}] y[{y1:.0f},{y0:.0f}] "
-                  f"vs bbox x[{bb[0]:.0f},{bb[2]:.0f}] y[{bb[1]:.0f},{bb[3]:.0f}]")
+        _gd = (f"grid {cols}x{rows}@{cell:.0f}m x[{x0:.0f},{x1:.0f}] y[{y1:.0f},{y0:.0f}] "
+               f"vs bbox x[{bb[0]:.0f},{bb[2]:.0f}] y[{bb[1]:.0f},{bb[3]:.0f}]")
+        # Fatal only when the grid fails to COVER the AOI. Overshoot past
+        # ``slack`` is a size cost, not a correctness defect: 09048
+        # (2026-09-21, 958×719 m bbox straddling a tile row boundary) got
+        # a 2-tile-tall grid, 2034 m above the bbox, and struck out on it.
+        rep.check("grid25_dims", covers, _gd)
+        if covers and not sane:
+            rep.check("grid25_overshoot", False, _gd + f" (> {slack:.0f} m past bbox)", fatal=False)
     n_valid = int(np.isfinite(d["elev"]).sum())
     frac = n_valid / max(cols * rows, 1)
     rep.check("grid25_finite", frac >= 0.4, f"{n_valid}/{cols * rows} cells valid ({100 * frac:.0f}%%)")

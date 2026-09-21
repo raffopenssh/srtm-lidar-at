@@ -997,3 +997,71 @@ Related fixes from the same incident:
   `peer_urls.txt` on drift. Stale lists cost a 10 s timeout per dead URL on every claim poll.
 * Peer push refreshes `system.disk_free_gb` live via statvfs; progress.json only carries it
   while the processor runs, so idle peers pushed a frozen value (bogus "disk pressure" rows).
+
+## Cluster bandwidth accounting & budget (Sep 2026)
+
+The primary's egress/ingress is metered by exe.dev (200 GB/mo included
+across the account; the primary alone was burning ~20 GB/day ≈ 1 GB/h
+before this pass). Target after the pass: **< 50 MB/h steady state**
+on the primary, without losing any orchestration / dashboard / HA
+functionality. Everything below is measurable live:
+
+```bash
+curl -s 'http://localhost:8000/api/v1/net_stats?fmt=txt&top=40'   # per-endpoint MB/h
+vnstat -h            # ground truth per hour (rx | tx)
+vnstat -d            # per day
+```
+
+`net_meter.py` wraps `requests.Session.send` (outbound, keyed by
+`METHOD host/path`, peer hostnames collapsed to `<peer>`, numeric path
+segments to `<n>`) and adds a Flask `after_request` (inbound, keyed by
+`METHOD /path [ext|lo]`; `ext` = came through the exe.dev proxy =
+metered; `lo` = loopback, free). Counters are per gunicorn worker,
+flushed to `/tmp/net_meter/<pid>.json` every 20 s and merged by
+`/api/v1/net_stats` (admin-token / loopback). HEAD responses count 0
+body bytes. TLS handshakes (~6 KB/connection) are **not** counted —
+that is why request *counts* matter as much as bytes; `http_pool.py`
+puts a keep-alive `Session` behind module-level `requests.get/post/…`
+in both `srv` and the processor.
+
+### What was eating the budget (measured 2026-09-21, before → after)
+
+| Item | Before | Mechanism | After |
+|---|---|---|---|
+| `_sync_peer_data` pulling every peer's full manifest (`GET /processing/peers`, ~0.9 MB gz × 29 peers × 2 gunicorn workers / 5 min) | ~700 MB/h | single-flight fcntl lock; `?since=<watermark−1h>` incremental (peer filters by `uploaded_at`); full reconcile every 12 h; legacy peers (no `manifest_since` in reply) backed off to 30 min | ~5 MB/h |
+| `cache_manifest` GET+PUT to every peer every 5 min (both workers) | ~350 MB/h | `GET ?since=` deltas + ETag on the 12-h full; PUT only files newer than the per-peer pushed watermark (handler merges by `updated_at`), gzipped | ~3 MB/h |
+| Shadow snapshot every 30 s (`director_state.json` 4 MB pretty-printed + peers.json + cache_manifest, plain JSON) | ~360 MB/h | light snapshot every 120 s (telemetry rings `SNAPSHOT_HEAVY_STATE_KEYS` stripped, byte-identical files omitted), full every 30 min / on shadow change, gzipped; shadow re-attaches stripped keys from its staged copy | ~3 MB/h |
+| Log-archive full sweep on every shadow change (16 MB) + shadow flapping during rollouts | bursty | `GET /director/log_archive` inventory primes the sha cache; 10-min grace before dropping a transiently ineligible shadow | ≈0 |
+| `/director/proxy/all_status` probing every running peer per dashboard poll | ~30 GET/min per tab | serves the pushed status (`get_pushed_status`) — identical payload | 0 |
+| `_PEER_PUSH` per-worker → loop worker saw half the pushes, judged them stale, polled `/processing/status` | ~30 GET/min | pushes mirrored to `/tmp/srtm_peer_push/<id>.json`, mtime-gated read | 0 |
+| `/api/v1/credentials` fanout on every status recompute | ~7k req/h | per-peer cache: 10 min running / 30 min idle | ~100 req/h |
+| Peer side: both workers pushed `peer_status` + both ran the HA watchdog heartbeat | 2× | fcntl single-flight per VM; watchdog 60 s × 6 misses (same 6-min failover) | 1× |
+| Processor `_fetch_peer_state` pulling the manifest it never reads | 0.9 MB/KG-boundary | `?manifest=0` | ~20 KB |
+| Dashboard tab: 5 s status + all_status + combined_log, 60 s kg_outlines (114 KB) | ~30 MB/h/tab | 10 s poll, 20 s director, 20 s combined_log, 5 min outlines, 60 s cadence when `document.hidden`, `Cache-Control: no-cache` so 304s fire | ~8 MB/h/tab, ~1 MB/h hidden |
+| 404'd KG JSON re-downloaded per peer per cycle | noise | 6 h negative cache | 0 |
+
+### Invariants to keep
+
+* **Single-flight background loops.** `_sync_peer_data`,
+  `_peer_status_push_loop`, `director_ha._watchdog_loop` hold fcntl
+  locks (`peer_sync.lock`, `peer_status_push.lock`, `watchdog.lock` in
+  `data/austria_processor/`). Any new periodic fanout must do the same —
+  gunicorn runs two workers and every un-guarded loop doubles traffic.
+* **Deltas, not snapshots.** The merge rules are "strictly newer
+  `uploaded_at`/`updated_at` wins", so partial payloads are always
+  safe. Never reintroduce a full-table push on a short timer.
+* **Partial shadow snapshots require a commit-matched shadow** (election
+  already rejects `commit_mismatch`; an old-code shadow would unlink
+  omitted files). Full snapshot on every shadow change covers it.
+* **`SHADOW_META_FRESH_S` must exceed the miss window.** Pre-Sep-2026 it
+  was `3 × 30 s`, which could refuse a legitimate takeover after the
+  6-min miss threshold; it is now derived from
+  `WATCHDOG_MISS_THRESHOLD × WATCHDOG_INTERVAL + 2 × SHADOW_SYNC_INTERVAL`.
+* **Compressed request bodies.** `app._inflate_gzip_request_body`
+  transparently inflates `Content-Encoding: gzip` on PUT/POST. Cluster
+  pushes use `_gzip_put_json` / `peer_director._put_json_gz` /
+  `director_ha.push_snapshot_to_shadow` which retry plain once on
+  400/415/500 for pre-rollout peers.
+* **Measure before adding a poll**: `curl -s -H 'Accept-Encoding: gzip'
+  -o /dev/null -w '%{size_download}' localhost:8000/<ep>` and check
+  `/api/v1/net_stats` an hour later.

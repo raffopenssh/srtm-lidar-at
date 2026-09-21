@@ -498,7 +498,7 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 |---|---|---|
 | `app.py` mental model | `docs/app.md` | touching `app.py` — section map, async task lifecycle, background threads, auth |
 | Austria Processor mental model | `docs/austria-processor.md` | touching `austria_processor.py`, KG pipeline, tile checkpoints, GPKG/JSON builders, Zenodo upload |
-| Peer Director (multi-VM orchestration) | `docs/peer-director.md` | touching `peer_director.py`, `deploy.sh`, parallel frontiers, HA, throttle, admin token, role eviction |
+| Peer Director (multi-VM orchestration) | `docs/peer-director.md` | touching `peer_director.py`, `deploy.sh`, parallel frontiers, HA, throttle, admin token, role eviction, **cluster bandwidth budget** (`/api/v1/net_stats`, `net_meter.py`, `http_pool.py`) |
 | Copernicus throttle & retry | `docs/copernicus-throttle.md` | touching `copernicus.py`, `tile_cache.py`, 402 handling, credential rotation |
 | Search index | `docs/search-index.md` | touching `search_index.py`, schema, compound query, `kg_parcels`, auto-classification |
 | RF training | `docs/rf-training.md` | touching `train_rf_4000kg.py`, ground-truth filters, retraining triggers |
@@ -509,6 +509,13 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 | v2 rollout (segv2 LightGBM product, upgrade-from-GPKG, primary blob store, ingest, strikes/deferrals, **v2_regen** auto-requeue of KGs whose v1 full GPKG is gone, PUT-then-DELETE Zenodo replace) | `docs/v2-upgrade.md` | touching `v2_ingest.py`, `kg_v2_store.py`, `kg_docs.py`, `kg_log_harvest.py`, `v2_verify.py`, `--v2-upgrade`, `_v2_upgrade_fill`, `_check_v2_regen`, `zenodo_client._replace_in_bucket`; reading the `v2:` / `v2_regen:` lines |
 | Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |
+
+## Bandwidth (primary is metered — keep it < 50 MB/h)
+
+`curl -s 'http://localhost:8000/api/v1/net_stats?fmt=txt'` shows per-endpoint
+MB/h in/out (all workers merged). Every periodic fanout must be
+single-flight across gunicorn workers, delta-based and gzipped — see
+`docs/peer-director.md → Cluster bandwidth accounting`.
 
 ## Quick ops
 

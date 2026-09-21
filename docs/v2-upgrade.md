@@ -81,9 +81,25 @@ honour live `blocks` / `parents_unsplit` claims. Fresh-KG semantics are unchange
 
 ## Telemetry
 
+**Source of truth for every progress indicator is the search index**
+(`search_index.progress_summary(manifest)`): one row per *parent* KG, `product_version` = the
+manifest version tag (`v1`/`v2`/`v2.1`/`v2.2`) taken as the **minimum across split blocks**,
+plus `json_uploaded_at` / `json_v2_uploaded_at` (from the manifest; `sync_manifest_links()` is
+run by the app watcher whenever `zenodo_manifest.json` changes). Consequences:
+* `progress:` / health banner / `processing/status.manifest_rate_*` / daily sparkline count
+  fresh `_json` completions of parents only — never split blocks, never v2.x upgrade
+  re-uploads (Sep 2026: `done=3508` was product codes and the `13.9/h` was the upgrade rate).
+* `v2:` / `status.v2.upgraded_parents` = parents whose every block is at
+  `v21_products.MANIFEST_VERSION`; `stale_total` / `stale_versions` = parents on an older v2.x
+  (re-upgrade pending); `upgraded_24h` / `rate_per_h` / `eta_days` see only current-version
+  uploads, so a parent that went v2 → v2.1 → v2.2 is counted once. `by_version` = parents,
+  `codes_by_version` = product codes (manifest). ETA falls back to manifest `_json` timestamps
+  when the index has none (`source: "manifest"`).
+
 `/process.txt` `v2:` line:
 ```
-v2: upgraded=N/8440 (p%) +N/24h @r/h eta=Dd · fresh_v2=N · verify_fail=N pending=N ·
+v2: at_v2.2=N/8440 (p%) +N/24h @r/h eta=Dd parents_by_version[v1=… v2=… v2.1=… v2.2=…] stale=N any_v2=N ·
+    fresh_v2=N · verify_fail=N pending=N ·
     store=Ncodes/MB freed=GB avg/kg=KB · json_files=N disk=GB · kg_log=codes/rows/KB
     archive_remaining=Dd · dispatch=N/Tcand (fill<40 ready, cap 24)
 ```

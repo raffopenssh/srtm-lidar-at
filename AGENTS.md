@@ -32,8 +32,11 @@ off); director is on hold in ping mode and wakes automatically on the
 first peer return — see `docs/peer-director.md → Fleet-dormant hold mode`. Read it
 first. The `progress:` line below it is now fleet-wide (was previously
 the primary's parked local processor reading `done=N/1 eta=138d` — that
-bug is fixed: total falls back to 8440 and rate/ETA come from Zenodo
-upload timestamps across all peers).
+bug is fixed: total falls back to 8440). **Counts come from the search
+index** (one row per parent KG, fresh `_json` completions only — split
+blocks and v2.x upgrade re-uploads never inflate it; see
+`docs/v2-upgrade.md → Telemetry`). The `products:` line below gives the
+per-version parent histogram; the `v2:` line covers upgrade progress.
 
 Query params:
 - `log=N` (default 60, max 500) — merged-log line count, newest first.

@@ -54,6 +54,28 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
+# Per-endpoint byte accounting (inbound Flask + outbound requests) —
+# feeds /api/v1/net_stats. Installed first so every hook/call is metered.
+try:
+    import net_meter as _net_meter
+    _net_meter.install_requests_meter()
+    _net_meter.install_flask_meter(app)
+except Exception:  # pragma: no cover — never block startup on telemetry
+    _net_meter = None
+
+
+@app.route('/api/v1/net_stats')
+def net_stats():
+    """Per-endpoint bandwidth attribution for this VM (all gunicorn
+    workers merged). ``?fmt=txt`` for a plain-text table, ``?top=N``.
+    Loopback / admin-token only (path is under /api/v1/ admin rules)."""
+    if _net_meter is None:
+        return jsonify({'error': 'net_meter unavailable'}), 503
+    top = min(200, max(5, int(request.args.get('top', 40) or 40)))
+    if request.args.get('fmt') == 'txt':
+        return Response(_net_meter.snapshot_text(top), mimetype='text/plain')
+    return jsonify(_net_meter.snapshot(top))
+
 # === Admin auth ===
 # Shared cluster-wide secret stored in data/admin_token. Required header
 # X-Admin-Token (or ?admin_token=) on every mutating admin/director/processing

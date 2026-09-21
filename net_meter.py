@@ -87,6 +87,8 @@ def install_requests_meter() -> None:
         resp_b = 0
         try:
             cl = r.headers.get('Content-Length')
+            if prep.method == 'HEAD':
+                cl = 0  # header only; no body crosses the wire
             if cl is not None:
                 resp_b = int(cl)
             elif not kw.get('stream'):

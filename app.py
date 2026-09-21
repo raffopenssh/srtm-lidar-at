@@ -7579,6 +7579,24 @@ def _combined_log_maybe_prune() -> None:
         if (now - _COMBINED_LOG_LAST_PRUNE) < _COMBINED_LOG_PRUNE_EVERY_S:
             return
         _COMBINED_LOG_LAST_PRUNE = now
+        # Cross-worker guard: both gunicorn workers hit the prune window
+        # at the same moment after a restart and used to race on one
+        # shared ``.tmp`` (the loser's os.replace failed with ENOENT).
+        # Non-blocking fcntl lock → the sibling simply skips this round;
+        # the tmp name is also per-pid so a stale lock can't collide.
+        import fcntl as _fcntl_log
+        _lock_fh = None
+        try:
+            _lock_fh = open(_COMBINED_LOG_PATH.with_suffix('.prune.lock'), 'w')
+            _fcntl_log.flock(_lock_fh, _fcntl_log.LOCK_EX | _fcntl_log.LOCK_NB)
+        except OSError:
+            try:
+                if _lock_fh:
+                    _lock_fh.close()
+            except Exception:
+                pass
+            return
+        tmp = _COMBINED_LOG_PATH.with_suffix(f'.jsonl.{_os_log.getpid()}.tmp')
         try:
             if not _COMBINED_LOG_PATH.exists():
                 return
@@ -7586,7 +7604,6 @@ def _combined_log_maybe_prune() -> None:
             cutoff_iso = (datetime.now(timezone.utc)
                           - timedelta(seconds=_COMBINED_LOG_RETAIN_S)
                           ).isoformat()
-            tmp = _COMBINED_LOG_PATH.with_suffix('.jsonl.tmp')
             kept = 0
             evicted: list[str] = []
             with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as src, \
@@ -7615,6 +7632,16 @@ def _combined_log_maybe_prune() -> None:
                      kept, archived, size / 1e6)
         except Exception as _e:
             log.warning('combined_log prune failed: %s', _e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        finally:
+            try:
+                _fcntl_log.flock(_lock_fh, _fcntl_log.LOCK_UN)
+                _lock_fh.close()
+            except Exception:
+                pass
 
 
 def _combined_log_bootstrap_once() -> None:

@@ -36,6 +36,7 @@ _out: dict[str, list] = {}   # key -> [n, req_bytes, resp_bytes]
 _in: dict[str, list] = {}
 _started = time.time()
 _num_re = re.compile(r'/\d[\w.-]*')
+_peer_host_re = re.compile(r'^srtm-lidar-at\d+\.exe\.xyz')
 _installed = {'requests': False, 'flask': False, 'flusher': False}
 
 
@@ -76,7 +77,8 @@ def install_requests_meter() -> None:
             rb = 0  # file-like / generator (streamed upload) — see below
         rb += sum(len(k) + len(v) + 4 for k, v in prep.headers.items())
         u = urlsplit(prep.url or '')
-        key = f'{prep.method} {u.netloc}{_norm_path(u.path)}'
+        host = _peer_host_re.sub('<peer>', u.netloc)
+        key = f'{prep.method} {host}{_norm_path(u.path)}'
         try:
             r = orig_send(self, prep, **kw)
         except Exception:

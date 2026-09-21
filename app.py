@@ -20360,6 +20360,7 @@ def process_txt():
                 out.append(
                     f'zenodo_circuit: DEGRADED since {_zc.get("since", "?")} '
                     f'peers_15m={_zc.get("n_peers_15m", "?")} '
+                    f'peers_since_trip={_zc.get("n_peers_since_trip", "?")} '
                     f'last_failure={_zc.get("last_failure_at", "?")} '
                     f'trips={_zc.get("trip_count", 0)} — peers defer cache-cell '
                     f'replacement uploads, no tombstones; clears after 30m quiet'
@@ -21040,7 +21041,8 @@ def process_txt():
             _flags.append(
                 'ZENODO-DEGRADED(since '
                 + str(_health['zenodo_degraded'].get('since', '?'))
-                + f', {_health["zenodo_degraded"].get("n_peers_15m", "?")} peers)')
+                + f', {_health["zenodo_degraded"].get("n_peers_15m", "?")} peers/15m, '
+                + f'{_health["zenodo_degraded"].get("n_peers_since_trip", "?")} since trip)')
         cpu = _health.get('cpu')
         if cpu and cpu.get('n'):
             _frac = cpu['throttled'] / cpu['n']

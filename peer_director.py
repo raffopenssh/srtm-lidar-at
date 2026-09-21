@@ -6736,12 +6736,20 @@ class PeerDirector:
         last_fail_iso = max(fails.values()) if fails else zc.get('last_failure_at')
         if fails:
             zc['last_failure_at'] = last_fail_iso
+            if zc.get('degraded'):
+                # Cumulative scope since the trip (the 15-min window is a
+                # *recency* signal, not the incident's blast radius).
+                zc['peers_since_trip'] = sorted(
+                    set(zc.get('peers_since_trip') or []) | set(fails))
+                zc['n_peers_since_trip'] = len(zc['peers_since_trip'])
         now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
         was = bool(zc.get('degraded'))
         if not was and len(fails) >= ZENODO_DEGRADED_MIN_PEERS:
             zc.update({'degraded': True, 'since': now_iso,
                        'trip_count': int(zc.get('trip_count') or 0) + 1,
-                       'trip_peers': sorted(fails)})
+                       'trip_peers': sorted(fails),
+                       'peers_since_trip': sorted(fails),
+                       'n_peers_since_trip': len(fails)})
             _emit_director_event(
                 f'zenodo_circuit: TRIPPED — {len(fails)} peers logged '
                 f'Zenodo write failures in {ZENODO_DEGRADED_WINDOW_S // 60} min '

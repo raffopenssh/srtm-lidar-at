@@ -62,6 +62,48 @@ try:
     _net_meter.install_flask_meter(app)
 except Exception:  # pragma: no cover — never block startup on telemetry
     _net_meter = None
+try:
+    import http_pool as _http_pool
+    _http_pool.install()   # keep-alive pool for module-level requests.*
+except Exception:
+    pass
+
+
+@app.before_request
+def _inflate_gzip_request_body():
+    """Transparently decompress ``Content-Encoding: gzip`` request bodies.
+
+    Cluster-internal PUT/POST bodies (cache manifest, director snapshot,
+    kg_strikes, queue …) are JSON that shrinks 5-10× under gzip, and the
+    primary's metered egress is dominated by exactly these pushes. The
+    inflated bytes replace ``wsgi.input`` and the encoding header is
+    dropped so every handler (including ones that already special-case
+    gzip, e.g. /director/peer_status) sees a plain body.
+    """
+    try:
+        if (request.headers.get('Content-Encoding') or '').lower() != 'gzip':
+            return None
+        if request.method not in ('POST', 'PUT', 'PATCH'):
+            return None
+        raw = request.get_data(cache=False)
+        if not raw:
+            return None
+        data = gzip.decompress(raw)
+        env = request.environ
+        env['wsgi.input'] = io.BytesIO(data)
+        env['CONTENT_LENGTH'] = str(len(data))
+        env.pop('HTTP_CONTENT_ENCODING', None)
+        # Werkzeug caches the parsed stream/length on first access;
+        # reset so get_json()/get_data() re-read the inflated bytes.
+        for attr in ('_cached_data', 'stream', '_stream'):
+            try:
+                request.__dict__.pop(attr, None)
+            except Exception:
+                pass
+        request.headers.environ.pop('HTTP_CONTENT_ENCODING', None)
+    except Exception as e:
+        log.debug('gzip request inflate failed: %s', e)
+    return None
 
 
 @app.route('/api/v1/net_stats')
@@ -167,6 +209,7 @@ _PROTECTED_PREFIXES = (
     '/api/v1/manifest/push',
     '/api/v1/manifest/reconcile',
     '/api/v1/bev_probe',
+    '/api/v1/net_stats',
 )
 
 
@@ -264,6 +307,9 @@ def _compress_and_etag(resp):
             return resp
         resp.headers['ETag'] = etag
         resp.headers.add('Vary', 'Accept-Encoding')
+        # Explicit revalidate-always so browsers send If-None-Match on
+        # every dashboard poll (304 = ~0 bytes when nothing changed).
+        resp.headers.setdefault('Cache-Control', 'no-cache')
         ae = request.headers.get('Accept-Encoding', '')
         if 'gzip' in ae.lower():
             gz = gzip.compress(body, compresslevel=5)
@@ -1091,10 +1137,53 @@ def _reload_tombstones_from_disk() -> None:
                 _MANIFEST_TOMBSTONES[k] = v
 
 
+# Peer-sync bandwidth discipline (Sep 2026). The 5-min cycle used to pull
+# every peer's *full* manifest (~0.9 MB gz × 30 peers) and PUT the full
+# cache manifest (~0.5 MB × 30) — from BOTH gunicorn workers — which was
+# ~60 % of the primary's metered egress. Now: single-flight (fcntl), the
+# manifest pull is incremental (``since=`` = newest uploaded_at seen from
+# that peer minus an overlap margin; a full reconcile every
+# PEER_SYNC_FULL_INTERVAL_S), the cache-manifest GET is conditional
+# (ETag → 304) and the PUT only goes out when our manifest changed since
+# the last successful push to that peer, gzipped.
+PEER_SYNC_INTERVAL_S = 300
+PEER_SYNC_FULL_INTERVAL_S = 6 * 3600
+PEER_SYNC_SINCE_MARGIN_S = 3600
+_PEER_SYNC_STATE: dict = {}   # peer_url -> {'max_ts': str, 'full_ts': float,
+                              #              'cm_etag': str, 'cm_pushed_hash': str}
+
+
+def _gzip_put_json(req, url: str, obj: dict, timeout, headers=None):
+    """PUT ``obj`` as gzipped JSON; fall back to plain JSON once if the
+    peer can't inflate it (pre-rollout code)."""
+    raw = json.dumps(obj).encode('utf-8')
+    h = dict(headers or {})
+    h['Content-Type'] = 'application/json'
+    h['Content-Encoding'] = 'gzip'
+    r = req.put(url, data=gzip.compress(raw, compresslevel=6), headers=h,
+                timeout=timeout)
+    if r.status_code in (400, 415, 500):
+        h.pop('Content-Encoding', None)
+        r = req.put(url, data=raw, headers=h, timeout=timeout)
+    return r
+
+
 def _sync_peer_data():
     """Background thread: sync KG JSONs and manifest entries from peers."""
     import requests as req
+    import fcntl as _fcntl
     time.sleep(30)  # Wait for startup
+
+    # Single-flight across gunicorn workers: the sibling simply idles.
+    _lock_path = Path('data/austria_processor/peer_sync.lock')
+    _lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _lock_fh = open(_lock_path, 'w')
+    while True:
+        try:
+            _fcntl.flock(_lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            break
+        except OSError:
+            time.sleep(60)
 
     json_dir = Path('data/austria_processor/json')
     json_dir.mkdir(parents=True, exist_ok=True)
@@ -1154,15 +1243,40 @@ def _sync_peer_data():
             merged_manifest_entries = {}
 
             for peer_url in peer_urls:
+                _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
+                _now_s = time.time()
+                _full = (_now_s - float(_pst.get('full_ts') or 0.0)
+                         >= PEER_SYNC_FULL_INTERVAL_S) or not _pst.get('max_ts')
+                _params = {}
+                if not _full:
+                    try:
+                        from datetime import datetime as _dt0, timedelta as _td0
+                        _since_dt = (_dt0.fromisoformat(_pst['max_ts'].replace('Z', '+00:00'))
+                                     - _td0(seconds=PEER_SYNC_SINCE_MARGIN_S))
+                        _params['since'] = _since_dt.isoformat()
+                    except Exception:
+                        _full = True
                 try:
-                    r = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers', timeout=15)
+                    r = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers',
+                                params=_params, timeout=15)
                     r.raise_for_status()
                     peer_data = r.json()
                 except Exception as e:
                     log.debug('Peer sync: %s unreachable: %s', peer_url, e)
                     continue
+                if _full:
+                    _pst['full_ts'] = _now_s
 
-                peer_manifest = peer_data.get('manifest', {})
+                peer_manifest = peer_data.get('manifest', {}) or {}
+                # Advance the incremental watermark to the newest
+                # uploaded_at this peer reported.
+                try:
+                    _mx = max((v.get('uploaded_at') or '' for v in peer_manifest.values()
+                               if isinstance(v, dict)), default='')
+                    if _mx and _mx > (_pst.get('max_ts') or ''):
+                        _pst['max_ts'] = _mx
+                except Exception:
+                    pass
                 peer_tombstones = peer_data.get('tombstones', {}) or {}
                 # Negative tombstones first: adopt the peer's drop journal
                 # so a sweep performed anywhere converges everywhere, then
@@ -1473,8 +1587,17 @@ def _sync_peer_data():
                 incoming_merged = {}
                 for peer_url in peer_urls:
                     try:
-                        r = req.get(peer_url.rstrip('/') + '/api/v1/processing/cache_manifest', timeout=15)
+                        _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
+                        _h = {}
+                        if _pst.get('cm_etag'):
+                            _h['If-None-Match'] = _pst['cm_etag']
+                        r = req.get(peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
+                                    headers=_h, timeout=15)
+                        if r.status_code == 304:
+                            continue
                         if r.status_code == 200:
+                            if r.headers.get('ETag'):
+                                _pst['cm_etag'] = r.headers['ETag']
                             peer_cm = r.json()
                             # Only merge file entries from peers — never adopt their depo_id.
                             # The primary's depo_id is authoritative; peers get it via PUT.
@@ -1522,16 +1645,30 @@ def _sync_peer_data():
                             zf.unlink(missing_ok=True)
                     log.info('Peer sync: merged %d cache manifest entries from peers', cm_updated)
 
-                # Push our (now merged) manifest to all peers
+                # Push our (now merged) manifest to peers whose last
+                # successful push predates the current content (hash
+                # gate), gzipped. Peers also GET this from us
+                # conditionally, so a skipped push is not a lost update.
                 if local_cm.get('files'):
+                    _cm_hash = hashlib.md5(
+                        json.dumps(local_cm, sort_keys=True).encode()).hexdigest()
+                    _pushed_n = 0
                     for peer_url in peer_urls:
+                        _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
+                        if _pst.get('cm_pushed_hash') == _cm_hash:
+                            continue
                         try:
-                            req.put(
+                            rr = _gzip_put_json(
+                                req,
                                 peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-                                json=local_cm, timeout=15
-                            )
+                                local_cm, timeout=15)
+                            if rr.ok:
+                                _pst['cm_pushed_hash'] = _cm_hash
+                                _pushed_n += 1
                         except Exception as e:
                             log.debug('Peer sync: cache manifest push to %s failed: %s', peer_url, e)
+                    if _pushed_n:
+                        log.info('Peer sync: cache manifest pushed to %d peer(s) (changed)', _pushed_n)
 
             except Exception as e:
                 log.warning('Peer sync: cache manifest sync failed: %s', e)
@@ -1539,7 +1676,7 @@ def _sync_peer_data():
         except Exception as e:
             log.warning('Peer sync error: %s', e)
 
-        time.sleep(300)  # Every 5 minutes
+        time.sleep(PEER_SYNC_INTERVAL_S)
 
 threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
 
@@ -3293,16 +3430,31 @@ def processing_peers_status():
     else:
         result['failed'] = []
 
-    # Manifest entries (Zenodo URLs) — so peers can discover our uploads
+    # Manifest entries (Zenodo URLs) — so peers can discover our uploads.
+    # The full table is ~11k entries / ~0.9 MB gzipped, which made this
+    # the single largest bandwidth item on the primary (every peer +
+    # both gunicorn workers pulled it every 5 min). Callers that only
+    # need claims pass ``manifest=0``; the peer-sync loop passes
+    # ``since=<iso>`` to receive just entries uploaded after that stamp
+    # (merge is "strictly newer uploaded_at wins", so older entries
+    # can never change the receiver's state anyway).
+    _want_manifest = (request.args.get('manifest', '1') or '1') not in ('0', 'false', 'no')
+    _since = (request.args.get('since') or '').strip()
     manifest_path = data_dir / 'zenodo_manifest.json'
-    if manifest_path.exists():
+    result['manifest'] = {}
+    if _want_manifest and manifest_path.exists():
         try:
             md = json.loads(manifest_path.read_text())
-            result['manifest'] = md.get('entries', md)
+            ents = md.get('entries', md)
+            result['manifest_total'] = len(ents)
+            if _since:
+                ents = {k: v for k, v in ents.items()
+                        if not isinstance(v, dict)
+                        or (v.get('uploaded_at') or '') >= _since}
+                result['manifest_since'] = _since
+            result['manifest'] = ents
         except Exception:
             result['manifest'] = {}
-    else:
-        result['manifest'] = {}
 
     # Tombstones: KG keys that have been force-requeued.  Peers must
     # honor these when computing completed_codes so they don't skip a
@@ -3584,7 +3736,7 @@ def processing_peers_combined():
 
             # Also get peer identity from /peers
             try:
-                r2 = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers', timeout=5)
+                r2 = req.get(peer_url.rstrip('/') + '/api/v1/processing/peers?manifest=0', timeout=5)
                 r2.raise_for_status()
                 pd2 = r2.json()
                 entry['instance'] = pd2.get('instance', peer_url)
@@ -9377,7 +9529,7 @@ def director_snapshot():
     return jsonify({'status': 'staged', 'self': dha.load_self()})
 
 
-@app.route('/api/v1/director/log_archive', methods=['PUT'])
+@app.route('/api/v1/director/log_archive', methods=['GET', 'PUT'])
 def director_log_archive_put():
     """Shadow-only: stage a per-day gzipped log archive blob from the
     director. Body: ``{day:'YYYY-MM-DD', gz_b64, size, sha256}``.
@@ -9392,6 +9544,11 @@ def director_log_archive_put():
     rejects payloads >32 MB to keep traffic tame.
     """
     import base64 as _b64, hashlib as _hl
+    import director_ha as _dha
+    if request.method == 'GET':
+        # Inventory for the director's sha cache (see
+        # director_ha.push_log_archive_to_shadow).
+        return jsonify(_dha.log_archive_inventory())
     body = request.get_json(silent=True) or {}
     day = (body.get('day') or '').strip()
     if not (len(day) == 10 and day[4] == '-' and day[7] == '-'):
@@ -19569,6 +19726,10 @@ def process_txt():
         out.append(
             f'shadow:   {sh} ok={d.get("shadow_last_push_ok")} '
             f'push_age={_sp_age}'
+            + (f' kind={d.get("shadow_last_push_kind")}'
+               if d.get('shadow_last_push_kind') else '')
+            + (f' raw={int(d["shadow_last_push_bytes"]) // 1024}KB'
+               if d.get('shadow_last_push_bytes') else '')
         )
 
     # --- Cache conveyor (frontier → cache-only pipeline) ---------

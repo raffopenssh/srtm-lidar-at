@@ -74,7 +74,7 @@ SNAPSHOT_FILES: tuple[str, ...] = (
 # Plain-text peer URL list — handled separately because it isn't JSON.
 SNAPSHOT_TEXT_FILES: tuple[str, ...] = ('peer_urls.txt',)
 
-WATCHDOG_INTERVAL = 30           # seconds between heartbeat probes
+WATCHDOG_INTERVAL = 60           # seconds between heartbeat probes
 # 12 misses × 30s = 6 minutes before a shadow promotes itself. Bumped
 # from 6 (3 min) on 2026-05-10 after two cascading takeovers driven by
 # exe.dev cross-region proxy flaps (LAX→FRA): primary remained healthy
@@ -83,9 +83,25 @@ WATCHDOG_INTERVAL = 30           # seconds between heartbeat probes
 # orchestration outage and exposed cross-worker step_down bugs. Real
 # director failures (process crash, host down, kernel panic) still
 # fail over within 6 min — acceptable.
-WATCHDOG_MISS_THRESHOLD = 12     # consecutive misses → shadow takes over
+# Sep 2026 bandwidth pass: probe every 60 s (was 30) with half the miss
+# threshold — same 6-min failover, half the heartbeat connections
+# (30 peers × TLS handshake each = the dominant cost of a ~200 B ping).
+WATCHDOG_MISS_THRESHOLD = 6      # consecutive misses → shadow takes over
 WATCHDOG_TIMEOUT = (3, 5)        # (connect, read)
-SHADOW_SYNC_INTERVAL = 30        # seconds between snapshot pushes
+# Snapshot cadence (Sep 2026 bandwidth pass): a *light* snapshot every
+# SHADOW_SYNC_INTERVAL (director_state minus the multi-MB telemetry
+# rings, only files whose content changed, gzipped) and a *full*
+# snapshot every SHADOW_FULL_INTERVAL / on shadow change. Failover only
+# fires after WATCHDOG_MISS_THRESHOLD × WATCHDOG_INTERVAL = 6 min, so a
+# 2-min-old snapshot is as good as a 30-s-old one for the takeover.
+SHADOW_SYNC_INTERVAL = 120       # seconds between (light) snapshot pushes
+SHADOW_FULL_INTERVAL = 1800      # seconds between full snapshot pushes
+# director_state.json keys that are pure telemetry history (charts /
+# forensics); omitted from light snapshots, carried by the full ones.
+SNAPSHOT_HEAVY_STATE_KEYS: tuple[str, ...] = (
+    'ip_pools_history', 'canary_history', 'capacity_history',
+    'fleet_proxy_history', 'peer_history', 'shadow_log_archive_last',
+)
 HEARTBEAT_GRACE = 90             # seconds before director is considered dead
 
 
@@ -295,8 +311,17 @@ def _admin_headers() -> dict:
     return {}
 
 
-def build_snapshot() -> dict:
-    """Read every snapshot file from disk and return a JSON-safe dict."""
+def build_snapshot(light: bool = False,
+                   unchanged: set[str] | None = None) -> dict:
+    """Read every snapshot file from disk and return a JSON-safe dict.
+
+    ``light=True`` strips SNAPSHOT_HEAVY_STATE_KEYS from director_state
+    and marks the snapshot partial; ``unchanged`` names files the shadow
+    already holds byte-identically (omitted from the payload). The
+    receiving ``stage_snapshot`` keeps its staged copy for omitted /
+    stripped parts. Only send partial snapshots to a shadow running
+    this code (director shadow election already requires commit match).
+    """
     # Sanitise peers.json BEFORE reading it into the snapshot. Otherwise
     # any corruption (cascading-handover URL drift, manual edit) would
     # propagate to the shadow on the next push.
@@ -308,13 +333,23 @@ def build_snapshot() -> dict:
     except Exception as e:
         log.warning('build_snapshot: peers.json sanitise failed: %s', e)
     snap: dict[str, dict | str | None] = {}
+    omitted: list[str] = []
+    stripped: list[str] = []
     for name in SNAPSHOT_FILES:
+        if unchanged and name in unchanged:
+            omitted.append(name)
+            continue
         p = DATA_DIR / name
         if not p.exists():
             snap[name] = None
             continue
         try:
-            snap[name] = json.loads(p.read_text())
+            v = json.loads(p.read_text())
+            if light and name == 'director_state.json' and isinstance(v, dict):
+                v = {k: x for k, x in v.items()
+                     if k not in SNAPSHOT_HEAVY_STATE_KEYS}
+                stripped = [k for k in SNAPSHOT_HEAVY_STATE_KEYS]
+            snap[name] = v
         except Exception as e:
             log.warning('snapshot read %s failed: %s', name, e)
             snap[name] = None
@@ -332,15 +367,49 @@ def build_snapshot() -> dict:
         'ts': datetime.now(timezone.utc).isoformat(),
         'ts_epoch': time.time(),
     }
+    if omitted or stripped:
+        snap['_meta']['partial'] = True
+        snap['_meta']['omitted'] = omitted
+        snap['_meta']['stripped_state_keys'] = stripped
     return snap
+
+
+def snapshot_file_hashes() -> dict[str, str]:
+    """md5 of every snapshot file's on-disk bytes (cheap: all small
+    except director_state, ~4 MB)."""
+    import hashlib as _hl
+    out: dict[str, str] = {}
+    for name in list(SNAPSHOT_FILES) + list(SNAPSHOT_TEXT_FILES):
+        p = DATA_DIR / name
+        try:
+            out[name] = _hl.md5(p.read_bytes()).hexdigest() if p.exists() else 'absent'
+        except Exception:
+            out[name] = 'err'
+    return out
 
 
 def stage_snapshot(snap: dict) -> None:
     """Write a received snapshot into ``shadow/`` (warm standby)."""
     SHADOW_DIR.mkdir(parents=True, exist_ok=True)
+    meta_in = snap.get('_meta') or {}
+    partial = bool(meta_in.get('partial'))
+    omitted = set(meta_in.get('omitted') or ())
+    stripped = tuple(meta_in.get('stripped_state_keys') or ())
     for name in SNAPSHOT_FILES:
-        v = snap.get(name)
         out = SHADOW_DIR / name
+        if partial and (name in omitted or name not in snap):
+            continue   # shadow keeps its staged copy
+        v = snap.get(name)
+        if (partial and stripped and name == 'director_state.json'
+                and isinstance(v, dict)):
+            # Re-attach the telemetry rings from the previous full push.
+            try:
+                prev = json.loads(out.read_text()) if out.exists() else {}
+                for k in stripped:
+                    if k in prev and k not in v:
+                        v[k] = prev[k]
+            except Exception:
+                pass
         if v is None:
             try:
                 out.unlink()
@@ -350,6 +419,8 @@ def stage_snapshot(snap: dict) -> None:
         _atomic_write(out, json.dumps(v, indent=2))
     for name, v in (snap.get('_text') or {}).items():
         out = SHADOW_DIR / name
+        if partial and name in omitted:
+            continue
         if v is None:
             try:
                 out.unlink()
@@ -692,6 +763,20 @@ def _push_one_archive_day(shadow_url: str, path: Path,
         return {'error': str(e)[:200]}
 
 
+def log_archive_inventory() -> dict:
+    """``{day: {size, sha256}}`` for every local archive file."""
+    import hashlib as _hl
+    out: dict[str, dict] = {}
+    for p in _list_archive_days():
+        try:
+            b = p.read_bytes()
+            out[p.name[:-len('.jsonl.gz')]] = {
+                'size': len(b), 'sha256': _hl.sha256(b).hexdigest()}
+        except Exception:
+            continue
+    return {'days': out, 'count': len(out)}
+
+
 def push_log_archive_to_shadow(shadow_url: str, *, full: bool,
                                cache: dict[str, str]) -> dict:
     """Send today's archive (and on ``full=True`` every other day too)
@@ -700,6 +785,19 @@ def push_log_archive_to_shadow(shadow_url: str, *, full: bool,
     days = _list_archive_days()
     if not days:
         return {'pushed': 0, 'reason': 'no archive'}
+    if full:
+        # Prime the sha cache from the shadow's inventory so a shadow
+        # re-election doesn't re-ship ~140 days (~16 MB) it already has.
+        try:
+            import requests as _rq
+            r = _rq.get(shadow_url.rstrip('/') + '/api/v1/director/log_archive',
+                        headers=_admin_headers(), timeout=(5, 20))
+            if r.ok:
+                inv = (r.json() or {}).get('days') or {}
+                for day, ent in inv.items():
+                    cache[f'{day}.jsonl.gz:{ent.get("size")}'] = ent.get('sha256')
+        except Exception:
+            pass
     today_name = (datetime.now(timezone.utc).date().isoformat()
                   + '.jsonl.gz')
     targets = days if full else [p for p in days if p.name == today_name]
@@ -720,13 +818,28 @@ def push_snapshot_to_shadow(shadow_url: str, snap: dict | None = None,
     """PUT a snapshot to shadow. Returns the peer's response or error dict."""
     if snap is None:
         snap = build_snapshot()
+    import gzip as _gz
+    raw = json.dumps(snap).encode('utf-8')
+    h = dict(_admin_headers())
+    h['Content-Type'] = 'application/json'
+    h['Content-Encoding'] = 'gzip'
     try:
         r = requests.put(
             shadow_url.rstrip('/') + '/api/v1/director/snapshot',
-            json=snap, headers=_admin_headers(), timeout=timeout,
+            data=_gz.compress(raw, compresslevel=6), headers=h,
+            timeout=timeout,
         )
+        if r.status_code in (400, 415, 500):
+            # Shadow predates the gzip request hook — plain retry.
+            h.pop('Content-Encoding', None)
+            r = requests.put(
+                shadow_url.rstrip('/') + '/api/v1/director/snapshot',
+                data=raw, headers=h, timeout=timeout)
         if r.ok:
-            return r.json()
+            jr = r.json()
+            if isinstance(jr, dict):
+                jr['bytes_sent'] = len(raw)
+            return jr
         return {'error': f'http_{r.status_code}', 'body': r.text[:200]}
     except Exception as e:
         return {'error': str(e)[:200]}
@@ -867,7 +980,12 @@ def _watchdog_tick() -> None:
     # meta was received recently (3 × push interval = 90 s).
     received_ts = float(meta.get('received_ts') or 0.0)
     age = time.time() - received_ts
-    SHADOW_META_FRESH_S = SHADOW_SYNC_INTERVAL * 3
+    # Must exceed the miss window: a dead director's last push predates
+    # the 6-min miss threshold by definition (pre-Sep-2026 this was 3 ×
+    # 30 s = 90 s and could refuse a legitimate takeover).
+    SHADOW_META_FRESH_S = max(
+        SHADOW_SYNC_INTERVAL * 3,
+        WATCHDOG_MISS_THRESHOLD * WATCHDOG_INTERVAL + 2 * SHADOW_SYNC_INTERVAL)
     if received_ts <= 0 or age > SHADOW_META_FRESH_S:
         log.warning('director watchdog: shadow meta stale (age=%.0fs > %ds) — '
                     'refusing to promote, will wait for fresh push',

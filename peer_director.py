@@ -1901,6 +1901,29 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
 # don't have to thread the director instance through every call site.
 # Maps peer_url -> {fails: int, suppress_until: float epoch}.
 _SYNC_BACKOFF: dict[str, dict] = {}
+# /api/v1/credentials per-peer fetch cache: url -> (ts, creds list)
+_CRED_FETCH_CACHE: dict[str, tuple] = {}
+_CRED_FETCH_TTL_RUNNING_S = 600
+_CRED_FETCH_TTL_IDLE_S = 1800
+
+
+def _put_json_gz(url: str, obj, timeout, headers: dict | None = None):
+    """PUT ``obj`` as gzipped JSON (cluster JSON shrinks 5-10×). Falls
+    back to plain JSON once on 400/415/500 so a peer that predates the
+    gzip request hook (app._inflate_gzip_request_body) still works."""
+    import gzip as _gz
+    raw = json.dumps(obj).encode('utf-8')
+    h = dict(_admin_headers())
+    if headers:
+        h.update(headers)
+    h['Content-Type'] = 'application/json'
+    h['Content-Encoding'] = 'gzip'
+    r = requests.put(url, data=_gz.compress(raw, compresslevel=6),
+                     headers=h, timeout=timeout)
+    if r.status_code in (400, 415, 500):
+        h.pop('Content-Encoding', None)
+        r = requests.put(url, data=raw, headers=h, timeout=timeout)
+    return r
 
 
 def _sync_kg_strikes_to_peer(peer_url: str) -> None:
@@ -1917,10 +1940,9 @@ def _sync_kg_strikes_to_peer(peer_url: str) -> None:
         local = json.loads(p.read_text())
         if not local:
             return
-        r = requests.put(
+        r = _put_json_gz(
             peer_url.rstrip('/') + '/api/v1/processing/kg_strikes',
-            json=local, timeout=PEER_TIMEOUT_CONTROL,
-            headers=_admin_headers())
+            local, timeout=PEER_TIMEOUT_CONTROL)
         if r.ok:
             log.info('KG strikes sync to %s: %d updated', peer_url,
                      r.json().get('updated', 0))
@@ -1952,10 +1974,9 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
         local_cm = json.loads(manifest_path.read_text())
         if not local_cm.get('depo_id'):
             return
-        r = requests.put(
+        r = _put_json_gz(
             peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
-            json=local_cm, timeout=PEER_TIMEOUT_CONTROL,
-        headers=_admin_headers())
+            local_cm, timeout=PEER_TIMEOUT_CONTROL)
         if r.ok:
             result = r.json()
             log.info('Cache manifest sync to %s: %d entries updated',
@@ -8640,18 +8661,39 @@ class PeerDirector:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def _fetch(peer_url: str | None) -> list[dict]:
+        # Per-peer fetch cache (Sep 2026 bandwidth pass). This aggregate
+        # used to re-poll every peer on every status recompute (~2 workers
+        # × 29 peers / 30 s ≈ 7k requests/h). Usage counters on a peer
+        # only move while it runs frontier work, so a 10-min TTL for
+        # running peers and 30-min for the rest loses nothing visible.
+        _now_f = time.time()
+        _running_ids = set()
+        try:
+            for _p in peers_list:
+                _ps = get_pushed_status(_p.get('id') or '') or {}
+                if ((_ps.get('status') or {}).get('state') in ('running', 'processing')):
+                    _running_ids.add(_p.get('id'))
+        except Exception:
+            pass
+
+        def _fetch(peer_url: str | None, pid: str = '') -> list[dict]:
             if peer_url is None:
                 return []
+            ttl = _CRED_FETCH_TTL_RUNNING_S if pid in _running_ids else _CRED_FETCH_TTL_IDLE_S
+            ent = _CRED_FETCH_CACHE.get(peer_url)
+            if ent and (_now_f - ent[0]) < ttl:
+                return ent[1]
             try:
                 r = requests.get(peer_url.rstrip('/') + '/api/v1/credentials',
                                  timeout=PEER_TIMEOUT_PROBE,
                                  headers=_admin_headers())
                 if not r.ok:
-                    return []
-                return (r.json() or {}).get('credentials') or []
+                    return ent[1] if ent else []
+                creds = (r.json() or {}).get('credentials') or []
+                _CRED_FETCH_CACHE[peer_url] = (_now_f, creds)
+                return creds
             except Exception:
-                return []
+                return ent[1] if ent else []
 
         # Initialise aggregate buckets per client_id
         agg: dict[str, dict] = {}
@@ -8716,7 +8758,7 @@ class PeerDirector:
             pass
         if targets:
           with ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
-            futs = {ex.submit(_fetch, p.get('url')): p for p in targets}
+            futs = {ex.submit(_fetch, p.get('url'), p.get('id') or ''): p for p in targets}
             try:
                 done_iter = as_completed(futs, timeout=20)
             except Exception:
@@ -13619,7 +13661,23 @@ class PeerDirector:
         if not (push_due or shadow_changed):
             return
         try:
-            snap = dha.build_snapshot()
+            # Full snapshot on shadow change / every SHADOW_FULL_INTERVAL
+            # (or after a failed push); otherwise a light one: heavy
+            # telemetry rings stripped + byte-identical files omitted.
+            # See director_ha.build_snapshot. The shadow is guaranteed
+            # to run our commit (election rejects commit_mismatch).
+            last_full = float(self.state.get('shadow_last_full_ts') or 0.0)
+            full = (shadow_changed
+                    or (now - last_full) >= dha.SHADOW_FULL_INTERVAL
+                    or not self.state.get('shadow_last_push_ok'))
+            hashes = dha.snapshot_file_hashes()
+            unchanged: set[str] = set()
+            if not full:
+                prev_h = self._shadow_pushed_hashes if hasattr(
+                    self, '_shadow_pushed_hashes') else {}
+                unchanged = {n for n, h in hashes.items()
+                             if prev_h.get(n) == h}
+            snap = dha.build_snapshot(light=not full, unchanged=unchanged)
             snap['_meta']['shadow_id'] = s_peer['id']
             snap['_meta']['director_id'] = (load_director_state()
                                             .get('active_peer') or 'director')
@@ -13628,6 +13686,14 @@ class PeerDirector:
             self.state['shadow_last_push_ts'] = now
             self.state['shadow_last_push_ok'] = ok
             self.state['shadow_last_push_result'] = res if not ok else 'staged'
+            self.state['shadow_last_push_bytes'] = (res or {}).get('bytes_sent') if isinstance(res, dict) else None
+            self.state['shadow_last_push_kind'] = 'full' if full else 'light'
+            if ok:
+                if full:
+                    self.state['shadow_last_full_ts'] = now
+                self._shadow_pushed_hashes = hashes
+            else:
+                self._shadow_pushed_hashes = {}
             if shadow_changed:
                 log.info('director shadow set to %s (score=%.3f, push=%s)',
                          s_peer['id'], s_score, 'ok' if ok else res)

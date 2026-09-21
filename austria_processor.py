@@ -37,6 +37,11 @@ from pathlib import Path
 
 import numpy as np
 import requests
+try:  # keep-alive pool for module-level requests.* (see http_pool.py)
+    import http_pool as _http_pool
+    _http_pool.install()
+except Exception:
+    pass
 from pyproj import Transformer
 from shapely.geometry import box, shape as shapely_shape, Point, mapping
 from shapely.ops import transform as shapely_transform
@@ -11000,7 +11005,9 @@ def _fetch_peer_state(peer_url: str) -> dict | None:
     if cached and (now - cached['fetched_at']) < _PEER_POLL_INTERVAL:
         return cached['data']
 
-    url = peer_url.rstrip('/') + '/api/v1/processing/peers'
+    # Claims only (completed/current/priority/failed) — the manifest
+    # table is ~0.9 MB gzipped and unused here.
+    url = peer_url.rstrip('/') + '/api/v1/processing/peers?manifest=0'
     try:
         r = requests.get(url, timeout=_PEER_TIMEOUT)
         r.raise_for_status()

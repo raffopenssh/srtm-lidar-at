@@ -1038,7 +1038,21 @@
   window.srtmResetAdminToken = () => { setTok(''); _dismissed = false; location.reload(); };
 })();
 const API = '/api/v1/processing/status';
-const POLL = 5;
+// Sep 2026 bandwidth pass: 10 s foreground cadence (was 5), and every
+// poller backs off to HIDDEN_POLL_MS while the tab is in the background
+// (see _bgGate). The primary's egress is metered; open dashboard tabs
+// were ~30 MB/h each.
+const POLL = 10;
+const HIDDEN_POLL_MS = 60000;
+const _bgLast = {};
+function _bgGate(key) {
+  if (!document.hidden) return true;
+  const now = Date.now();
+  if (now - (_bgLast[key] || 0) < HIDDEN_POLL_MS) return false;
+  _bgLast[key] = now;
+  return true;
+}
+let _lastCombinedLogFetch = 0;
 let cd = POLL;
 let map, mapMarkers;
 let tileDotsLayer;       // current KG tile dots (redrawn each poll)
@@ -1139,7 +1153,7 @@ function initMap() {
   }, {collapsed: true, position: 'topright'}).addTo(map);
   fetchTileOverlays();
   fetchKgOutlines();
-  setInterval(fetchKgOutlines, 60000);
+  setInterval(() => { if (_bgGate('outlines')) fetchKgOutlines(); }, 300000);
 }
 
 function updateMap(d) {
@@ -3364,7 +3378,11 @@ async function poll() {
     // every running peer is doing. Otherwise fall back to the
     // single-peer recent_log embedded in the status response.
     let usedCombined = false;
-    if (_directorData && (_directorData.peers || []).some(p => p.cache_only_run && (p.processor_state === 'running' || p.processor_state === 'processing'))) {
+    const _wantCombined = _directorData && (_directorData.peers || []).some(p => p.cache_only_run && (p.processor_state === 'running' || p.processor_state === 'processing'));
+    if (_wantCombined && Date.now() - _lastCombinedLogFetch < 20000) {
+      usedCombined = true;   // keep the current multi-peer view; refetch every 20 s
+    } else if (_wantCombined) {
+      _lastCombinedLogFetch = Date.now();
       try {
         const lr = await fetch('/api/v1/director/proxy/combined_log');
         if (lr.ok) {
@@ -3382,7 +3400,7 @@ async function poll() {
     updateTileDots(d);
     updateLastKg(d);
     // Refresh tile overlays every 10s
-    if (Date.now() - lastTileFetch > 10000) fetchTileOverlays();
+    if (Date.now() - lastTileFetch > 30000) fetchTileOverlays();
     if (document.getElementById('zenHead').classList.contains('open')) fetchManifest();
     else fetchManifestSummary();
     const commitHash = d.git_commit || '';
@@ -6249,14 +6267,19 @@ try {
 // and they used to be issued sequentially via setTimeout chains that
 // could keep the page "Connecting…" if the primary was on heavy load.
 Promise.all([poll(), fetchDirectorStatus(), fetchPrioQueue()]).catch(()=>{});
-setInterval(poll, POLL * 1000);
-setInterval(fetchPrioQueue, 15000);
-setInterval(fetchDirectorStatus, 15000);
+setInterval(() => { if (_bgGate('poll')) poll(); }, POLL * 1000);
+setInterval(() => { if (_bgGate('prio')) fetchPrioQueue(); }, 30000);
+setInterval(() => { if (_bgGate('director')) fetchDirectorStatus(); }, 20000);
+// Catch up promptly when the tab comes back to the foreground.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { poll(); fetchDirectorStatus(); }
+});
 // Refresh completed-KG list periodically so the Last KG card advances
 // when cache-only peers finish work (their completions don't bump the
 // active peer's last_kg_code, but they do show up in the local merged
 // manifest after peer-sync).
 setInterval(() => {
+  if (!_bgGate('completed')) return;
   _refreshCompletedKgs().then(() => {
     if (_stickToLatest && _completedKgs.length) {
       const latest = _completedKgs[_completedKgs.length - 1];

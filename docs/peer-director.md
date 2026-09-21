@@ -892,17 +892,36 @@ months the processor ran as uid=0, with two consequences:
    `sudo pkill -9`) succeeded.
 
 **Fix** (`app.py:start_peer_processor`): keep the scope + `-E env`
-forwarding, but invoke the python child via
-`runuser --user exedev --preserve-environment --` *inside* the scope.
-Result: scope = uid 0 (sudo), runuser = uid 0, python3 = uid 1000.
-The sudo and runuser shims are tiny supervisors with no env of their
-own; the python child is the only thing whose `/proc/<pid>/environ`
-matters, and it's now readable.
+forwarding, but drop privileges *inside* the scope via
+`setpriv --reuid=exedev --regid=exedev --init-groups --`. Result:
+sudo = uid 0, python3 = uid 1000 (setpriv execs in place, so it is not
+a resident parent).
+
+**Why `setpriv` and not `runuser`/`su` (2026-09-21 post-mortem).** From
+2026-05-03 (37cea2a) the shim was `runuser --preserve-environment`.
+`runuser`/`su` stay resident as the python's parent and, on SIGTERM,
+forward it to the child, wait **2 s**, then **SIGKILL** it ("Session
+terminated, killing shell... ...killed."). Both graceful paths —
+`/processing/stop?graceful=1` (`os.killpg`) and `/admin/update?graceful=1`
+(`pkill -TERM -f austria_processor.py`) — also hit the wrapper, so every
+"finish the current KG then exit" was a hard mid-KG kill ~2 s later. Each
+kill re-ran the KG from tile checkpoints **and counted a strike**
+(`kg_strikes.json` → adaptive split at 2). Fleet-wide this silently
+split dozens of small KGs into 2–10 blocks; on a day with six rolling
+commits it drove 63330 to 9 strikes / 10 blocks and its blocks then
+bounced between cache-only peers on cache misses for a day. Fixes:
+`setpriv` (no resident wrapper) **and** graceful signalling now targets
+only the python PID (`_processor_python_pids()` /
+`_signal_processor_graceful()`), which also protects peers still running
+the legacy runuser chain until they restart. Strikes inflated by this
+can be reset with `PUT /api/v1/processing/kg_strikes {"<code>": -1}`
+(drops the code + its block children; must reach every peer, since the
+merge is max()).
 
 Verify with `GET /api/v1/admin/proc_env`. Look for the python3 row —
 `uid` should start with `1000`, and `env` should include
 `COPERNICUS_CRED_INDICES`, `KG_LAT_STRIP_FILTER`, `ZENODO_LOCK_URL`,
-`HOME=/home/exedev`, `USER=exedev`. The sudo and runuser rows show
+`HOME=/home/exedev`, `USER=exedev`. The sudo row shows
 `env_err: Permission denied` (expected — they're still uid 0 / sudo).
 
 #### Cross-Cutting Concerns (director changes)

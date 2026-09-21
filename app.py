@@ -3354,7 +3354,12 @@ def processing_kg_strikes():
 
     GET: returns {kg_code: strike_count}.
     PUT: merges (max(local, incoming) per KG) so we never undo a peer's
-         observed strikes.
+         observed strikes.  A NEGATIVE value is a reset: the code and all
+         its block children (``<code>-*``) are dropped, un-splitting a KG
+         whose strikes were inflated by non-KG causes (e.g. the May–Sep
+         2026 runuser SIGKILL-on-graceful-stop bug).  Peers on older code
+         treat negatives as a no-op (not > local), so a fleet-wide reset
+         must be re-pushed after they have rolled forward.
     """
     p = Path('data/austria_processor/kg_strikes.json')
     if request.method == 'GET':
@@ -3377,10 +3382,19 @@ def processing_kg_strikes():
                 local = {}
         merged = dict(local)
         updated = 0
+        reset = []
         for k, v in incoming.items():
             try:
                 v_int = int(v)
             except Exception:
+                continue
+            if v_int < 0:
+                drop = [m for m in merged if m == k or m.startswith(k + '-')]
+                for m in drop:
+                    merged.pop(m, None)
+                if drop:
+                    reset.append(k)
+                    updated += 1
                 continue
             if v_int > int(merged.get(k, 0)):
                 merged[k] = v_int
@@ -3389,7 +3403,9 @@ def processing_kg_strikes():
         tmp = p.with_suffix('.tmp')
         tmp.write_text(json.dumps(merged, indent=2))
         tmp.replace(p)
-        return jsonify({'updated': updated, 'total': len(merged)})
+        if reset:
+            log.info('kg_strikes: reset %s', reset)
+        return jsonify({'updated': updated, 'total': len(merged), 'reset': reset})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -3827,8 +3843,21 @@ def processing_start():
     # applies to --service units). The processor was running as root,
     # which made /proc/<pid>/environ unreadable from gunicorn (uid=exedev)
     # and required sudo escalation just to kill it. Fix: drop privileges
-    # explicitly via `runuser -u exedev --preserve-environment` inside the
-    # scope, so all -E env vars reach the python child but uid is exedev.
+    # explicitly inside the scope, so all -E env vars reach the python
+    # child but uid is exedev.
+    #
+    # We use ``setpriv`` (util-linux), NOT ``runuser``/``su``. Both
+    # ``runuser`` and ``su`` stay resident as the python's parent and, on
+    # receiving SIGTERM, forward it to the child, wait **2 seconds**, then
+    # SIGKILL it ("Session terminated, killing shell... ...killed.").
+    # Every "graceful" stop/update from 2026-05-03 (37cea2a) until
+    # 2026-09-21 therefore killed the processor mid-KG: the python
+    # handler logged "will finish current KG then exit" and was SIGKILLed
+    # 2 s later, the KG re-ran from tile checkpoints, and each such kill
+    # counted a strike (kg_strikes.json) — which is what pushed 63330 to
+    # 9 strikes and an adaptive split into 10 blocks during a day of six
+    # rolling graceful updates. ``setpriv`` execs the target in place, so
+    # the chain is sudo → python and sudo merely relays the signal.
     user_props = [
         '-E', f'HOME={_user_home}',
         '-E', f'USER={_user_name}',
@@ -3857,8 +3886,8 @@ def processing_start():
          '--unit', unit_name]
         + cgroup_props
         + user_props
-        + ['--', 'runuser', '--user', _user_name,
-           '--preserve-environment', '--']
+        + ['--', 'setpriv', f'--reuid={_user_name}', f'--regid={_user_name}',
+           '--init-groups', '--']
         + args
     )
     # Verify the scope can actually start by waiting briefly. If systemd-run
@@ -3940,6 +3969,55 @@ def processing_resume():
     return jsonify({'status': 'resumed', 'pid': _processor_process.pid})
 
 
+def _processor_python_pids() -> list:
+    """PIDs of the *python* austria_processor parent(s) only — never the
+    ``sudo`` / ``systemd-run`` / ``runuser`` wrappers around it.
+
+    Graceful stops must signal exactly this process. ``pkill -TERM -f
+    austria_processor.py`` and ``os.killpg`` both also hit the wrappers,
+    and ``runuser``/``su`` react to SIGTERM by SIGKILLing their child 2 s
+    later — turning every "finish the current KG then exit" into a hard
+    mid-KG kill (see the launch code for the full post-mortem). Peers
+    still running the legacy runuser chain are covered too, because the
+    wrapper never sees a signal when only the python PID is targeted.
+
+    Pool workers (multiprocessing ``spawn``) have a ``-c from
+    multiprocessing.spawn`` cmdline and are excluded by construction.
+    """
+    import subprocess as _sp
+    pids = []
+    try:
+        out = _sp.check_output(['pgrep', '-af', 'austria_processor.py'],
+                               text=True, timeout=3)
+    except Exception:
+        return pids
+    for line in out.splitlines():
+        try:
+            pid_s, cmd = line.split(None, 1)
+        except ValueError:
+            continue
+        argv0 = cmd.split()[0] if cmd.split() else ''
+        if os.path.basename(argv0).startswith('python') and ' -c ' not in cmd:
+            try:
+                pids.append(int(pid_s))
+            except ValueError:
+                pass
+    return pids
+
+
+def _signal_processor_graceful() -> int:
+    """SIGTERM only the python processor parent(s). Returns count signalled."""
+    import signal as _sig
+    n = 0
+    for pid in _processor_python_pids():
+        try:
+            os.kill(pid, _sig.SIGTERM)
+            n += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return n
+
+
 @app.route('/api/v1/processing/stop', methods=['POST'])
 def processing_stop():
     """Stop the processor and ALL its child subprocesses.
@@ -3974,23 +4052,13 @@ def processing_stop():
                 or body.get('graceful') is True
                 or body.get('after_kg') is True)
     if graceful:
-        # Send SIGTERM to the process group; the processor's signal
-        # handler sets _shutdown_requested and the loop exits at the next
-        # KG boundary. We do NOT escalate to SIGKILL.
-        sent = False
-        if _processor_process is not None and _processor_process.poll() is None:
-            try:
-                os.killpg(os.getpgid(_processor_process.pid), _sig.SIGTERM)
-                sent = True
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        if not sent:
-            try:
-                _sp.run(['pkill', '-TERM', '-f', 'austria_processor.py'],
-                        capture_output=True, text=True, timeout=5)
-                sent = True
-            except Exception:
-                pass
+        # SIGTERM the python parent ONLY; its handler sets
+        # _shutdown_requested and the loop exits at the next KG boundary.
+        # We do NOT escalate to SIGKILL, and we deliberately do NOT use
+        # killpg / pkill -f here: those also hit the sudo/runuser wrappers
+        # and runuser SIGKILLs its child 2 s after a SIGTERM (the bug that
+        # made every graceful stop a hard stop from May to Sep 2026).
+        sent = _signal_processor_graceful() > 0
         return jsonify({
             'status': 'graceful_stop_requested' if sent else 'no_process',
             'method': 'sigterm_no_escalate',
@@ -7961,10 +8029,11 @@ def admin_update():
             except Exception:
                 proc_running = False
             if proc_running:
-                # Ask the processor to stop after the current KG.
+                # Ask the processor to stop after the current KG. Python
+                # PID only — see _processor_python_pids() for why a
+                # broad pkill -TERM here was a hard kill in disguise.
                 try:
-                    sp.run(['pkill', '-TERM', '-f', 'austria_processor.py'],
-                           capture_output=True, text=True, timeout=5)
+                    _signal_processor_graceful()
                 except Exception:
                     pass
                 import threading as _th, time as _t

@@ -136,9 +136,19 @@ cat /tmp/segment_progress/<id>.json | python3 -m json.tool
 # Director state
 cat data/austria_processor/director_state.json | python3 -m json.tool
 
-# Who holds the Zenodo lock?
-cat data/austria_processor/zenodo_lock_state.json
+# Who holds Zenodo leases? (broker on 127.0.0.1:8001; proxied via :8000)
+curl -s localhost:8000/api/v1/zenodo/lock | jq '{shared_used,shared_slots,exclusive_held,leases}'
 ```
+
+Zenodo lock classes (2026-09-21): `kg_upload*` leases are **shared**
+(bounded pool, `ZENODO_LOCK_KG_SLOTS`=8 — each KG product has its own
+deposition, so they never 409 each other); everything else
+(`cache_flush_zip:*`, `reconcile`, chkpt) is **exclusive** and waits for
+zero live leases, with new shared acquires refused while an exclusive
+writer is waiting. Before this, KG uploads were fully serialised: with a
+degraded Zenodo (10–30 min per upload) every peer hit the 1800 s client
+timeout and "proceeded without lease" — a 30-min penalty per KG and no
+exclusivity. `zenodo_lock:` errors in the log = that penalty firing.
 
 ## Critical invariants (re-stated; see AGENTS.md)
 

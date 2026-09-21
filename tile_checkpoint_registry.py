@@ -473,6 +473,20 @@ def delete_kg(kg_code: str) -> bool:
 def stats() -> Dict:
     """Return small dict for /process.txt: kgs, bytes_total, oldest_age_s."""
     m = _load_manifest()
+    # Drop local entries whose fleet mirror is tombstoned (reconciler GC /
+    # another peer deleted the bundle) — the local file is only ever
+    # written by upload/delete on THIS peer, so it goes stale otherwise.
+    try:
+        from zenodo_cache import CacheManifest
+        cm_files = CacheManifest().all_files() or {}
+        stale = [kg for kg, e in m.items()
+                 if (cm_files.get(e.get("name") or _bundle_name(kg)) or {}).get("size", 1) == 0]
+        if stale:
+            for kg in stale:
+                m.pop(kg, None)
+            _save_manifest(m)
+    except Exception:
+        pass
     if not m:
         return {"kgs": 0, "bytes": 0, "oldest_age_s": 0}
     now = time.time()

@@ -172,6 +172,53 @@ def _seg_coverage_min_area(doc, min_area: float = SEG_COV_MIN_AREA_SQM) -> float
     return 100.0 * sum(1 for p in big if p.get("area_summary")) / len(big)
 
 
+def _lost_parcels_diag(v2, v1, min_area: float = SEG_COV_MIN_AREA_SQM) -> str:
+    """Forensic tail for a failed ``parcel_segmentation_coverage_pct_ge_v1``:
+    which parcels ≥ *min_area* had an ``area_summary`` in v1 but none in v2
+    (and the reverse), summarised by v1 dominant type, area and whether the
+    v2 doc has *any* segmentation on the parcel's tile.  The failing v2 JSON
+    is not uploaded, so this line is the only evidence that survives — it
+    tells apart "v2 class-set drops a type v1 had" (fix: map that type) from
+    "a tile came back empty" (fix: BEV/tile) without reprocessing."""
+    try:
+        d1 = _g(v1, "parcels", "details", default=None) or []
+        d2 = _g(v2, "parcels", "details", default=None) or []
+        if not isinstance(d1, list) or not isinstance(d2, list):
+            return ""
+        def _key(p):
+            return p.get("parcel_id") or p.get("gst_nr") or p.get("id") or p.get("kg_gst")
+        m2 = {_key(p): p for p in d2 if isinstance(p, dict) and _key(p) is not None}
+        lost, gained = [], 0
+        for p in d1:
+            if not isinstance(p, dict) or (_num(p.get("area_sqm"), 0) or 0) < min_area:
+                continue
+            q = m2.get(_key(p))
+            if q is None:
+                continue
+            if p.get("area_summary") and not q.get("area_summary"):
+                lost.append((p, q))
+            elif q.get("area_summary") and not p.get("area_summary"):
+                gained += 1
+        if not lost:
+            return f" | lost=0 gained={gained} (key mismatch? v1={len(d1)} v2={len(d2)} details)"
+        from collections import Counter
+        types = Counter()
+        for p, _q in lost:
+            as_ = p.get("area_summary") or {}
+            types[p.get("dominant_type") or (next(iter(as_)) if as_ else "?")] += 1
+        areas = sorted((_num(p.get("area_sqm"), 0) or 0) for p, _ in lost)
+        med = areas[len(areas) // 2]
+        # v2-side signal: does the lost parcel still carry elevation (tile
+        # was read) and what does the light seg raster say?
+        elev = sum(1 for _p, q in lost if q.get("elevation_m") is not None)
+        types_s = ",".join(f"{t}={n}" for t, n in types.most_common(4))
+        ex = ",".join(str(_key(p)) for p, _ in lost[:3])
+        return (f" | lost={len(lost)} gained={gained} v1_types[{types_s}] "
+                f"area_med={med:.0f}m² max={areas[-1]:.0f}m² v2_has_elev={elev}/{len(lost)} e.g. {ex}")
+    except Exception as exc:  # noqa: BLE001
+        return f" | lost-diag failed: {exc}"
+
+
 def _active_tiles(doc) -> tuple[int, int, list]:
     """(n_tiles_with_lidar, n_tiles_segmented, unsegmented_tile_idx)."""
     tiles = _g(doc, "data_quality", "tiles", default=[]) or []
@@ -289,8 +336,10 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
             # both docs carry details; the raw figure stays a drift warning.
             fa, fb = _seg_coverage_min_area(v2), _seg_coverage_min_area(v1)
             if fa is not None and fb is not None:
-                rep.check(f"{k}_ge_v1", fa >= fb - tol,
-                          f"v2={fa:.1f} v1={fb:.1f} (parcels ≥{SEG_COV_MIN_AREA_SQM:.0f} m²; raw {a:.1f}/{b:.1f})")
+                _det = f"v2={fa:.1f} v1={fb:.1f} (parcels ≥{SEG_COV_MIN_AREA_SQM:.0f} m²; raw {a:.1f}/{b:.1f})"
+                if fa < fb - tol:
+                    _det += _lost_parcels_diag(v2, v1)
+                rep.check(f"{k}_ge_v1", fa >= fb - tol, _det)
                 if a < b - TOL["seg_coverage_pp_warn"]:
                     rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp, raw)", fatal=False)
                 continue

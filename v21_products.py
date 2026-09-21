@@ -43,6 +43,36 @@ PRODUCT_VERSION = "2.2"
 MANIFEST_VERSION = "v2.2"
 #: product line readable by trees_v3 / the primary (older = fewer fields)
 READABLE_MANIFEST_VERSIONS = ("v2.1", "v2.2")
+
+
+def _ent_get(e, k, default=None):
+    if e is None:
+        return default
+    if isinstance(e, dict):
+        return e.get(k, default)
+    return getattr(e, k, default)
+
+
+def v2_products_complete(entries, code: str) -> bool:
+    """True iff *code* has the COMPLETE current-product v2 pair on Zenodo:
+    a ``_json_v2`` at ``MANIFEST_VERSION`` **and** a committed (size>0)
+    ``_light_gpkg_v2``.  Every "is this KG already upgraded?" decision
+    (processor eligibility, director candidates/priority, primary
+    v2_keep, regen settle) must go through here.  Sep 2026: the parent
+    upload loop pushed ``json_v2`` after a failed ``light_gpkg_v2`` PUT
+    and every gate keyed on ``_json_v2`` alone, so 60 KGs sat with a
+    JSON and no light GPKG and were never re-dispatched.  *entries* may
+    be the raw ``{key: dict}`` manifest map or a ``zenodo_client.Manifest``
+    (anything with ``.get``)."""
+    j2 = entries.get(f"{code}_json_v2")
+    if j2 is None or str(_ent_get(j2, "version") or "") != MANIFEST_VERSION:
+        return False
+    if "error" in str(_ent_get(j2, "status", "") or ""):
+        return False
+    g2 = entries.get(f"{code}_light_gpkg_v2")
+    if g2 is None or int(_ent_get(g2, "size", 0) or 0) <= 0:
+        return False
+    return "error" not in str(_ent_get(g2, "status", "") or "")
 TREE_CROWNS_LAYER = "tree_crowns"
 #: crown outline simplification tolerance (m) — half a pixel keeps the
 #: watershed footprint honest while dropping ~60 % of the vertices

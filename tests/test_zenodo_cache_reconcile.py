@@ -262,8 +262,10 @@ def test_reconcile_restores_usable_and_flags_corrupt_and_tombstones_missing():
             assert dry["changed"] == 0 and dry["restored"] == 1
             assert json.loads(mpath.read_text())["files"][NAME]["size"] == 0
             s = cache.reconcile_manifest(dry_run=False, take_lock=False)
+        # probetest.bin is non-zip junk → deleted (not "unknown"); the
+        # tombstoned chkpt bundle still in the deposit is GC'd.
         assert (s["tombstoned"], s["restored"], s["corrupt"], s["unknown"],
-                s["unverified_cleared"]) == (1, 1, 1, 1, 1)
+                s["unverified_cleared"], s["junk_deleted"], s["chkpt_gc"]) == (1, 1, 1, 0, 1, 1, 1)
         m = json.loads(mpath.read_text())
         assert set(m) >= {"depo_id", "files"}
         e = m["files"][NAME]

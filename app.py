@@ -5000,14 +5000,13 @@ def processing_queue_get():
     # legitimate work for the local processor — keep them.
     _v2_keep = set()
     if (data_dir / 'v2_upgrade_mode').exists():
-        from v21_products import MANIFEST_VERSION as _V21
+        from v21_products import v2_products_complete as _v2c
         for c in codes:
             e_j = _mf_entries.get(f'{c}_json')
             e_g = _mf_entries.get(f'{c}_full_gpkg')
-            _j2 = _mf_entries.get(f'{c}_json_v2')
             if (isinstance(e_j, dict) and isinstance(e_g, dict)
                     and int(e_g.get('size') or 0) > 0
-                    and not (isinstance(_j2, dict) and str(_j2.get('version') or '') == _V21)):
+                    and not _v2c(_mf_entries, c)):
                 _v2_keep.add(c)
     dirty = len(codes)
     codes = [c for c in codes if
@@ -20571,7 +20570,11 @@ def process_txt():
                 f'unknown={_cr.get("unknown", 0)} '
                 f'unverified_cleared={_cr.get("unverified_cleared", 0)} '
                 f'drift_fixed={_cr.get("drift_fixed", 0)} '
-                f'deposit_files={_cr.get("deposit_files", "?")}'
+                f'deposit_files={_cr.get("deposit_files", "?")}/100 '
+                f'chkpt_files={_cr.get("chkpt_files", "?")} '
+                f'chkpt_gc={_cr.get("chkpt_gc", 0)}'
+                + (f' junk_deleted={_cr["junk_deleted"]}' if _cr.get('junk_deleted') else '')
+                + (' DEPOSIT-NEAR-CAP' if int(_cr.get('deposit_files') or 0) >= 90 else '')
                 + (f' took={_cr["took_s"]}s' if _cr.get('took_s') is not None else '')
                 + (' (forced by circuit clear)' if _cr.get('forced') else '')
                 + (f' ERROR={_cr["error"]}' if _cr.get('error') else '')

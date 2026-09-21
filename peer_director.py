@@ -6402,10 +6402,18 @@ class PeerDirector:
         a peer starting a KG before another finished its upload. Those
         otherwise run side-by-side to completion, wasting a peer.
 
-        Resolution: group running peers by *parent* KG code (so block
-        ``92117-west`` collides with ``92117``), keep the peer with the
-        highest progress fraction (tiebreak: longest-running, then id),
-        and hard-stop the rest. Tile checkpoints + the cross-peer chkpt
+        Resolution: group running peers by *parent* KG code, then split
+        each group into collision components: two codes collide only if
+        they are identical or one is a prefix-at-``-`` of the other
+        (block ``92117-west`` collides with parent ``92117``, and
+        ``16111-southeast-1`` with ``16111-southeast``). **Sibling
+        blocks do NOT collide** — ``45410-center`` and ``45410-west``
+        cover disjoint areas and running them on two peers is exactly
+        the parallelism the cache-only fleet exists for. (Sep 2026: the
+        parent-only grouping hard-stopped 76 sibling blocks in 24 h,
+        each losing up to 75 % of a block.) Within a component keep the
+        peer with the highest progress fraction (tiebreak:
+        longest-running, then id), and hard-stop the rest. Tile checkpoints + the cross-peer chkpt
         registry mean the loser's finished tiles aren't lost; the winner
         (or whoever next picks the KG) resumes them. After the stop the
         scheduler re-admits the loser on a later tick onto fresh work,
@@ -6460,15 +6468,49 @@ class PeerDirector:
                 continue
             groups.setdefault(_parent(code), []).append((pid, ps))
 
-        dup_parents = {par for par, lst in groups.items() if len(lst) > 1}
-        # Prune trackers for parents no longer duplicated.
+        def _collides(a: str, b: str) -> bool:
+            a, b = str(a), str(b)
+            return a == b or a.startswith(b + '-') or b.startswith(a + '-')
+
+        def _components(lst: list) -> list:
+            """Split a parent group into connected components under
+            ``_collides`` (union-find over ≤ a handful of peers)."""
+            n = len(lst)
+            root = list(range(n))
+
+            def _find(i: int) -> int:
+                while root[i] != i:
+                    root[i] = root[root[i]]
+                    i = root[i]
+                return i
+            codes = [((ps.get('current_kg') or {}).get('code') or '')
+                     for _, ps in lst]
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if _collides(codes[i], codes[j]):
+                        root[_find(i)] = _find(j)
+            comps: dict = {}
+            for i in range(n):
+                comps.setdefault(_find(i), []).append(lst[i])
+            return [c for c in comps.values() if len(c) > 1]
+
+        # Keyed by "<parent>:<sorted member ids>" so sibling-block groups
+        # that never collide don't keep a tracker alive.
+        dup_groups: dict[str, list] = {}
+        for par, lst in groups.items():
+            if len(lst) < 2:
+                continue
+            for comp in _components(lst):
+                key = f"{par}:{'+'.join(sorted(pid for pid, _ in comp))}"
+                dup_groups[key] = comp
+        # Prune trackers for groups no longer duplicated.
         for par in list(track.keys()):
-            if par not in dup_parents:
+            if par not in dup_groups:
                 track.pop(par, None)
 
         stops_done = 0
-        for par in sorted(dup_parents):
-            lst = groups[par]
+        for par in sorted(dup_groups):
+            lst = dup_groups[par]
             # All collide-members must be genuinely settled into the KG
             # before we trust the duplicate (avoids racing a dispatch the
             # claim registry is still resolving / a peer mid-startup).
@@ -6503,7 +6545,8 @@ class PeerDirector:
                     continue
                 if _peer_is_scheduled(lp):
                     continue  # don't stomp a deliberate park
-                lkg = (lps.get('current_kg') or {}).get('code') or par
+                lkg = ((lps.get('current_kg') or {}).get('code')
+                       or par.split(':', 1)[0])
                 wfrac = self._kg_progress_frac(
                     dict(ranked[0][1]))
                 lfrac = self._kg_progress_frac(lps)
@@ -6850,7 +6893,8 @@ class PeerDirector:
             st = e.get('state')
             if st == 'requeued':
                 j2 = ent.get(f'{code}_json_v2')
-                if isinstance(j2, dict) and str(j2.get('version') or '') == _V21 \
+                from v21_products import v2_products_complete as _v2c
+                if isinstance(j2, dict) and _v2c(ent, code) \
                         and str(j2.get('uploaded_at') or '') > str(e.get('requeued_at') or ''):
                     e['state'] = 'done'; e['done_at'] = now_iso; changed = True
                     try:
@@ -7050,7 +7094,12 @@ class PeerDirector:
         last = float(self.state.get('_cache_reconcile_at') or 0)
         if not force and now - last < CACHE_RECONCILE_INTERVAL_S:
             return
-        if not force and (self.state.get('zenodo_circuit') or {}).get('degraded'):
+        if not force and (self.state.get('zenodo_circuit') or {}).get('degraded') \
+                and now - last < 3 * CACHE_RECONCILE_INTERVAL_S:
+            # Skip while degraded — but not indefinitely: a long-running
+            # degraded window (Sep 2026: 15 h) must not suspend the chkpt
+            # GC, since deposit file-slot exhaustion (400 on every new
+            # cell upload) is itself a cause of degraded readings.
             return
         if not _CACHE_RECONCILE_LOCK.acquire(blocking=False):
             return
@@ -7063,6 +7112,7 @@ class PeerDirector:
                 slim = {k: s.get(k) for k in (
                     'at', 'tombstoned', 'restored', 'corrupt', 'unknown',
                     'unverified_cleared', 'drift_fixed', 'changed',
+                    'chkpt_gc', 'chkpt_files', 'junk_deleted',
                     'deposit_files', 'took_s', 'error')}
                 slim['forced'] = bool(force)
                 self.state['cache_reconcile'] = slim
@@ -7074,11 +7124,13 @@ class PeerDirector:
                     det = '; '.join(
                         f'{d["action"]} {d["file"]}'
                         for d in (s.get('details') or [])
-                        if d.get('action') in ('tombstoned', 'restored', 'corrupt'))
+                        if d.get('action') in ('tombstoned', 'restored', 'corrupt',
+                                               'chkpt_gc', 'junk_deleted'))
                     _emit_director_event(
                         f'cache_reconcile: tombstoned={s["tombstoned"]} '
                         f'restored={s["restored"]} corrupt={s["corrupt"]} '
                         f'unknown={s["unknown"]} '
+                        f'chkpt_gc={s.get("chkpt_gc", 0)} '
                         f'unverified_cleared={s["unverified_cleared"]} '
                         f'drift_fixed={s["drift_fixed"]} — {det[:600]}',
                         peer='director',
@@ -10130,7 +10182,7 @@ class PeerDirector:
             # rank key: (already has an older-product _json_v2?, full GPKG
             # size) — never-upgraded codes first, then product<2.1 re-upgrades
             # (docs/v2.1-product-spec.md → Eligibility / versioning).
-            from v21_products import MANIFEST_VERSION as _V21
+            from v21_products import MANIFEST_VERSION as _V21, v2_products_complete as _v2c
             ranked = []
             n_reup = 0
             for k, e in ent.items():
@@ -10143,14 +10195,21 @@ class PeerDirector:
                     continue
                 j2 = ent.get(f'{code}_json_v2')
                 if isinstance(j2, dict):
-                    if str(j2.get('version') or '') == _V21:
+                    if _v2c(ent, code):
                         continue
                     n_reup += 1
                 g = ent.get(f'{code}_full_gpkg')
                 if not isinstance(g, dict) or int(g.get('size') or 0) <= 0 \
                         or not g.get('uploaded_at'):
                     continue
-                ranked.append((1 if isinstance(j2, dict) else 0, int(g.get('size') or 0), code))
+                # Rank: -1 = current json_v2 but light_gpkg_v2 missing (a
+                # half-landed pair; heal first — it's inconsistent on
+                # Zenodo), 0 = never upgraded, 1 = product<current re-upgrade.
+                if isinstance(j2, dict) and str(j2.get('version') or '') == _V21:
+                    _rk = -1
+                else:
+                    _rk = 1 if isinstance(j2, dict) else 0
+                ranked.append((_rk, int(g.get('size') or 0), code))
             ranked.sort()
             codes = [c for _, _, c in ranked[:max_n]]
             if n_reup:
@@ -10219,10 +10278,9 @@ class PeerDirector:
         except Exception:
             return codes
         keep = []
-        from v21_products import MANIFEST_VERSION as _V21
+        from v21_products import MANIFEST_VERSION as _V21, v2_products_complete as _v2c
         for c in codes:
-            j2 = ent.get(f'{c}_json_v2')
-            if isinstance(j2, dict) and str(j2.get('version') or '') == _V21:
+            if _v2c(ent, c):
                 log.info('v2 priority: %s upgraded to %s — dropping from priority list', c, _V21)
                 continue
             g = ent.get(f'{c}_full_gpkg')

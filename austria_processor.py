@@ -9156,6 +9156,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 _light_size = 0
             else:
                 log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
+                # Keep the failed v2 JSON (small) for forensics — it is the
+                # only artefact that shows *which* parcels/tiles regressed.
+                # Ring of the 20 most recent under json/v2_verify_failed/.
+                try:
+                    _fdir = JSON_DIR / "v2_verify_failed"
+                    _fdir.mkdir(parents=True, exist_ok=True)
+                    if json_v2_path and os.path.exists(json_v2_path):
+                        os.replace(json_v2_path, _fdir / os.path.basename(json_v2_path))
+                    _old = sorted(_fdir.glob("*_v2.json.gz"), key=lambda q: q.stat().st_mtime)
+                    for _q in _old[:-20]:
+                        _q.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 for _pth in (json_v2_path, json_path, light_gpkg):
                     try:
                         if _pth and os.path.exists(_pth):
@@ -9909,7 +9922,10 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             if status < 200 or status >= 300:
                 upload_stats["errors"].append({
                     "key": zenodo_key, "error": f"verify failed: HTTP {status}"})
-                continue
+                log.warning("KG %s: %s verify failed (HTTP %s) — stopping the upload "
+                            "chain so later products (json = completion marker) don't "
+                            "land ahead of it", kg_code, file_key, status)
+                break
 
             upload_stats["uploaded"].append(zenodo_key)
             upload_stats["total_bytes"] += fsize
@@ -9936,6 +9952,20 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
             })
             log.error("KG %s: Zenodo upload failed for %s: %s",
                       kg_code, file_key, e)
+            # ORDERING INVARIANT: products land full → light → json (v1) /
+            # light_v2 → json_v2 → json (v2); json is the completion marker
+            # and every "already done?" gate keys on it.  Uploading the
+            # remaining products after a failure produced KGs with a
+            # ``_json_v2`` but no ``_light_gpkg_v2`` (60 of them during the
+            # Sep 2026 Zenodo slowdown) that nothing ever re-dispatched.
+            # Stop here; the KG is re-queued by the caller and the next
+            # run re-uploads the missing products in order.
+            log.warning("KG %s: stopping upload chain after %s failure (%d product(s) "
+                        "left un-uploaded, KG will be re-queued)", kg_code, file_key,
+                        sum(1 for k, v in files.items() if v and os.path.exists(v)
+                            and f"{kg_code}_{k}" != zenodo_key
+                            and f"{kg_code}_{k}" not in upload_stats["uploaded"]))
+            break
     finally:
         _lock_ctx.__exit__(None, None, None)
 
@@ -10044,9 +10074,11 @@ def v2_product_is_current(entry) -> bool:
 
 
 def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool:
-    """True iff *code* has committed v1 products, no *current* ``_json_v2``
-    (none, or one from a product version < %s) and has not struck out.""" % PRODUCT_VERSION
-    if v2_product_is_current(manifest.get(f"{code}_json_v2")):
+    """True iff *code* has committed v1 products, no *complete current* v2
+    pair (``_json_v2`` @ %s **and** committed ``_light_gpkg_v2`` — see
+    ``v21_products.v2_products_complete``) and has not struck out.""" % PRODUCT_VERSION
+    from v21_products import v2_products_complete as _v2c
+    if _v2c(manifest, code):
         return False
     ej = manifest.get(f"{code}_json")
     eg = manifest.get(f"{code}_full_gpkg")

@@ -2479,6 +2479,7 @@ class ZenodoCache:
             "dry_run": bool(dry_run),
             "tombstoned": 0, "restored": 0, "corrupt": 0, "unknown": 0,
             "unverified_cleared": 0, "drift_fixed": 0, "changed": 0,
+            "chkpt_gc": 0, "chkpt_files": 0, "junk_deleted": 0,
             "deposit_files": 0, "details": [], "error": None,
         }
         depo_id = self.manifest.depo_id
@@ -2583,12 +2584,31 @@ class ZenodoCache:
             for name in sorted(listing):
                 if name in files or name.startswith("chkpt_"):
                     continue
+                if not name.endswith(".zip"):
+                    # Stray non-product junk (e.g. ``probetest_*.bin`` from a
+                    # manual write probe) burns one of Zenodo's 100 file
+                    # slots for nothing — drop it.
+                    summary["junk_deleted"] += 1
+                    summary["details"].append(
+                        {"file": name, "action": "junk_deleted",
+                         "size": int(listing[name]["size"])})
+                    log.warning("reconcile: deleting non-zip junk %s (%d B) "
+                                "from deposit", name, int(listing[name]["size"]))
+                    if not dry_run:
+                        try:
+                            self._delete_file(depo_id, name)
+                        except Exception as exc:
+                            log.warning("reconcile: junk delete %s failed: %s",
+                                        name, str(exc)[:120])
+                    continue
                 summary["unknown"] += 1
                 summary["details"].append(
                     {"file": name, "action": "unknown",
                      "size": int(listing[name]["size"])})
                 log.info("reconcile: deposit file %s (%d B) unknown to manifest",
                          name, int(listing[name]["size"]))
+            changed += self._gc_chkpt_bundles(depo_id, listing, files,
+                                              dry_run, summary)
             summary["changed"] = changed
             if changed and not dry_run:
                 self.manifest.save()
@@ -2598,11 +2618,14 @@ class ZenodoCache:
                 from zenodo_lock import zenodo_upload_lock
                 with zenodo_upload_lock(purpose="reconcile", max_wait_s=600):
                     _run()
+                    self._write_deposit_count(summary)
             except Exception as exc:
                 summary["error"] = f"lock/run failed: {str(exc)[:200]}"
                 log.warning("reconcile: %s", summary["error"])
         else:
             _run()
+            if not dry_run:
+                self._write_deposit_count(summary)
         summary["took_s"] = round(time.time() - t0, 1)
         if not dry_run:
             try:
@@ -2616,6 +2639,110 @@ class ZenodoCache:
             except Exception:
                 pass
         return summary
+
+
+    # ------------------------------------------------------------------
+    # Tile-checkpoint bundle GC (deposit file-slot pressure)
+    # ------------------------------------------------------------------
+    # Zenodo caps a record at 100 files. The tile-checkpoint registry
+    # (tile_checkpoint_registry.py) shares the cache deposit, and its
+    # per-peer ``delete_kg`` on KG completion is best-effort — a lock
+    # timeout / peer restart / a *different* peer finishing the KG leaves
+    # the ``chkpt_<kg>.tar.gz`` orphaned forever. Sep 2026: 61/100 slots
+    # were chkpt tars for KGs completed ~70 days earlier, and every NEW
+    # cache-cell upload 400'd ("exceeding the max amount per record"),
+    # which silently starved the cache-only fleet. Rules, in order:
+    #   1. tombstoned in cache_manifest but still in deposit → delete
+    #   2. KG has its ``_json`` product in zenodo_manifest → delete + tombstone
+    #   3. older than CHKPT_MAX_AGE_DAYS → delete + tombstone
+    #   4. unknown to manifest AND KG complete → delete
+    #   5. still above CHKPT_FLEET_MAX → delete oldest first
+    CHKPT_MAX_AGE_DAYS = 14
+    CHKPT_FLEET_MAX = 20
+
+    def _write_deposit_count(self, summary: Dict[str, Any]) -> None:
+        """Persist the last observed deposit file count so
+        ``tile_checkpoint_registry.upload_kg`` can gate on the REAL
+        slot usage rather than the manifest's live-entry count (which
+        undercounts orphaned bundles)."""
+        try:
+            n = int(summary.get("deposit_files") or 0)
+            if n <= 0 or summary.get("error"):
+                return
+            p = DATA_DIR / "deposit_file_count.json"
+            tmp = str(p) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"deposit_files": n,
+                           "chkpt_files": int(summary.get("chkpt_files") or 0),
+                           "ts": time.time()}, f)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    def _gc_chkpt_bundles(self, depo_id: int, listing: Dict[str, Dict],
+                          files: Dict[str, Dict], dry_run: bool,
+                          summary: Dict[str, Any]) -> int:
+        """See the CHKPT GC comment block above. Returns #manifest changes."""
+        from datetime import datetime, timezone
+        prefix, suffix = "chkpt_", ".tar.gz"
+        chk = [n for n in listing if n.startswith(prefix)]
+        if not chk:
+            return 0
+        try:
+            zm = json.load(open(DATA_DIR / "zenodo_manifest.json")).get("entries", {})
+        except Exception:
+            zm = {}
+        now = datetime.now(timezone.utc)
+
+        def _age_days(e: Dict) -> Optional[float]:
+            try:
+                return (now - datetime.fromisoformat(e["updated_at"])).total_seconds() / 86400.0
+            except Exception:
+                return None
+
+        def _complete(kg: str) -> bool:
+            return f"{kg}_json" in zm or f"{kg}_json_v2" in zm
+
+        victims: List[Tuple[str, str]] = []
+        keep: List[Tuple[float, str]] = []  # (age, name) for cap pass
+        for name in chk:
+            kg = name[len(prefix):-len(suffix)] if name.endswith(suffix) else name[len(prefix):]
+            e = files.get(name)
+            if e is not None and not e.get("size", 0):
+                victims.append((name, "tombstoned"))
+            elif _complete(kg):
+                victims.append((name, "kg complete" if e is not None else "unknown+complete"))
+            elif e is not None and (_age_days(e) or 0) > self.CHKPT_MAX_AGE_DAYS:
+                victims.append((name, f"age>{self.CHKPT_MAX_AGE_DAYS}d"))
+            else:
+                keep.append((_age_days(e) if e is not None else 0.0, name))
+        if len(keep) > self.CHKPT_FLEET_MAX:
+            keep.sort(key=lambda t: -(t[0] or 0))
+            for _age, name in keep[: len(keep) - self.CHKPT_FLEET_MAX]:
+                victims.append((name, f"fleet cap>{self.CHKPT_FLEET_MAX}"))
+        summary["chkpt_files"] = len(chk) - len(victims) if not dry_run else len(chk)
+        changed = 0
+        for name, why in victims:
+            summary["chkpt_gc"] += 1
+            summary["details"].append({"file": name, "action": "chkpt_gc", "why": why,
+                                       "size": int(listing[name]["size"])})
+            log.warning("reconcile: chkpt GC %s (%d B): %s", name,
+                        int(listing[name]["size"]), why)
+            if dry_run:
+                continue
+            try:
+                fid = (listing.get(name) or {}).get("id")
+                if fid:  # one DELETE, no per-file re-listing
+                    self._api("DELETE",
+                              f"/api/deposit/depositions/{depo_id}/files/{fid}")
+                else:
+                    self._delete_file(depo_id, name)
+            except Exception as exc:
+                log.warning("reconcile: chkpt delete %s failed: %s", name, str(exc)[:120])
+                continue
+            if self.manifest.tombstone(name, f"reconcile: chkpt GC ({why})"):
+                changed += 1
+        return changed
 
 
 def reconcile_manifest(dry_run: bool = True, take_lock: bool = True
@@ -2632,6 +2759,8 @@ def format_reconcile_summary(s: Dict[str, Any]) -> str:
             f"deposit_files={s.get('deposit_files')} "
             f"tombstoned={s.get('tombstoned')} restored={s.get('restored')} "
             f"corrupt={s.get('corrupt')} unknown={s.get('unknown')} "
+            f"chkpt_gc={s.get('chkpt_gc', 0)} chkpt_files={s.get('chkpt_files', 0)} "
+            f"junk_deleted={s.get('junk_deleted', 0)} "
             f"unverified_cleared={s.get('unverified_cleared')} "
             f"drift_fixed={s.get('drift_fixed')} changed={s.get('changed')}"
             + (f" error={s['error']}" if s.get("error") else ""))

@@ -80,6 +80,29 @@ MAX_REGISTRY_KGS = 30
 # deposit (the delete succeeds, the PUT 400s, the data is gone).
 DEPOSIT_FILE_HEADROOM = 90
 
+# Fleet-wide cap on live chkpt bundles (counted from the synced
+# cache_manifest, so every peer sees the same number). MAX_REGISTRY_KGS
+# above is per-peer and did NOT bound the fleet: 30 peers x 30 = the
+# whole deposit. The reconciler GC (zenodo_cache.ZenodoCache.
+# _gc_chkpt_bundles, CHKPT_FLEET_MAX) enforces the same number
+# server-side and evicts completed / >14 d bundles.
+FLEET_MAX_BUNDLES = 20
+
+
+def _last_deposit_count(max_age_s: float) -> Optional[int]:
+    """Deposit file count from the reconciler's last listing
+    (``data/austria_processor/deposit_file_count.json``), or None if
+    absent / stale."""
+    try:
+        p = DATA_DIR / "deposit_file_count.json"
+        d = json.loads(p.read_text())
+        if time.time() - float(d.get("ts", 0)) > max_age_s:
+            return None
+        return int(d.get("deposit_files"))
+    except Exception:
+        return None
+
+
 # Cap per-KG bundle size. Metadata pickles should never exceed this;
 # if they do, the KG has anomalous tile counts and we skip uploading.
 MAX_BUNDLE_BYTES = 200 * 1024 * 1024  # 200 MB
@@ -317,13 +340,33 @@ def upload_kg(kg_code: str) -> Optional[Dict]:
         try:
             from zenodo_cache import CacheManifest
             cm = CacheManifest()
-            live = sum(1 for _n, _e in (cm.all_files() or {}).items()
+            all_files = cm.all_files() or {}
+            live = sum(1 for _n, _e in all_files.items()
                        if (_e or {}).get("size", 0) > 0)
+            live_chkpt = sum(1 for _n, _e in all_files.items()
+                             if _n.startswith(ZENODO_PREFIX + "_")
+                             and (_e or {}).get("size", 0) > 0)
+            # The manifest's live count UNDERCOUNTS the deposit: orphaned
+            # chkpt tars (delete failed / other peer finished the KG) stay
+            # in the bucket while tombstoned here. Sep 2026: manifest said
+            # 84 live, the deposit had 100 files and every new cell
+            # upload 400'd. Prefer the reconciler's last real listing
+            # (synced to peers via cache_manifest? no — it's primary-local,
+            # so peers fall back to the manifest count) when fresh.
+            observed = _last_deposit_count(max_age_s=4 * 3600)
+            if observed is not None:
+                live = max(live, observed)
             if live >= DEPOSIT_FILE_HEADROOM:
                 _log.warning(
                     "chkpt_registry: deposit near file cap (%d >= %d); "
                     "skipping upload of %s", live, DEPOSIT_FILE_HEADROOM,
                     name)
+                return None
+            if live_chkpt >= FLEET_MAX_BUNDLES:
+                _log.warning(
+                    "chkpt_registry: fleet already holds %d chkpt bundles "
+                    "(cap %d); skipping upload of %s", live_chkpt,
+                    FLEET_MAX_BUNDLES, name)
                 return None
         except Exception:
             pass

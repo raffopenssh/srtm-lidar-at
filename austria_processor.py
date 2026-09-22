@@ -1339,6 +1339,58 @@ _CADASTRE_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 _CADASTRE_MAX_ATTEMPTS = 5
 _CADASTRE_BACKOFF_BASE_S = 5.0
 
+# Layers we actually consume. ``landuse_polygons`` (~70 % of a full export)
+# was requested for years but never read downstream (segv2 gets landuse via
+# its own training-side fetch in segv2/labels.py) — dropped Sep 2026 per the
+# cadastre API's bandwidth guidance.
+_CADASTRE_EXPORT_LAYERS = "parcels,building_footprints,buildings"
+
+# Local ETag cache for /export/geojson (the API's most expensive endpoint;
+# its ETag is a pure function of the KG file, max-age 86400). Split blocks
+# of one parent, deferred retries and stuck-KG restarts all re-fetch the
+# same parent export — with the cache a re-fetch is a 0-byte 304.
+_CADASTRE_CACHE_DIR = DATA_DIR / "cadastre_cache"
+_CADASTRE_CACHE_MAX_AGE_S = 7 * 86400
+
+
+def _cadastre_cache_paths(kg_code: str):
+    d = _CADASTRE_CACHE_DIR
+    return d / f"{kg_code}.json.gz", d / f"{kg_code}.etag"
+
+
+def _cadastre_cache_load(kg_code: str):
+    """→ (etag|None, body_bytes|None). Prunes stale entries opportunistically."""
+    body_p, etag_p = _cadastre_cache_paths(kg_code)
+    try:
+        if not (body_p.exists() and etag_p.exists()):
+            return None, None
+        if time.time() - body_p.stat().st_mtime > _CADASTRE_CACHE_MAX_AGE_S:
+            body_p.unlink(missing_ok=True); etag_p.unlink(missing_ok=True)
+            return None, None
+        return etag_p.read_text().strip() or None, body_p.read_bytes()
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _cadastre_cache_store(kg_code: str, etag: str, body: bytes) -> None:
+    import gzip as _gz
+    try:
+        _CADASTRE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        body_p, etag_p = _cadastre_cache_paths(kg_code)
+        tmp = body_p.with_suffix(".tmp")
+        with _gz.open(tmp, "wb", compresslevel=6) as fh:
+            fh.write(body)
+        os.replace(tmp, body_p)
+        etag_p.write_text(etag)
+        # Opportunistic prune of old entries (bounded dir, ~1-3 MB gz each).
+        now = time.time()
+        for f in _CADASTRE_CACHE_DIR.glob("*.json.gz"):
+            if now - f.stat().st_mtime > _CADASTRE_CACHE_MAX_AGE_S:
+                f.unlink(missing_ok=True)
+                f.with_suffix("").with_suffix(".etag").unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("cadastre cache store failed for %s: %s", kg_code, e)
+
 
 def fetch_cadastre_data(kg_code: str) -> dict:
     """Fetch parcels, building footprints, buildings (addresses), landuse from cadastre API.
@@ -1353,17 +1405,28 @@ def fetch_cadastre_data(kg_code: str) -> dict:
               "building_addresses": []}
     data = None
     last_exc = None
+    cached_etag, cached_gz = _cadastre_cache_load(kg_code)
     for _attempt in range(1, _CADASTRE_MAX_ATTEMPTS + 1):
         try:
+            _hdrs = {"If-None-Match": cached_etag} if (cached_etag and cached_gz) else {}
             resp = requests.get(
                 f"{CADASTRE_BASE}/export/geojson",
                 params={"kg": kg_code,
-                        "layers": "parcels,building_footprints,buildings,landuse_polygons",
+                        "layers": _CADASTRE_EXPORT_LAYERS,
                         "include_geometry": "true"},
+                headers=_hdrs,
                 timeout=120,
             )
+            if resp.status_code == 304 and cached_gz:
+                import gzip as _gz
+                data = json.loads(_gz.decompress(cached_gz))
+                log.info("KG %s: cadastre export unchanged (304, local ETag cache)", kg_code)
+                break
             resp.raise_for_status()
             data = resp.json()
+            _et = resp.headers.get("ETag")
+            if _et:
+                _cadastre_cache_store(kg_code, _et, resp.content)
             break
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", None)
@@ -1458,22 +1521,8 @@ def fetch_cadastre_data(kg_code: str) -> dict:
         except Exception:
             continue
 
-    # Parse landuse
-    lu_fc = data.get("landuse_polygons", {}).get("features", [])
-    for f in lu_fc:
-        try:
-            geom = shapely_shape(f["geometry"])
-            if geom.is_empty:
-                continue
-            geom_3035 = transform_to_3035(geom)
-            props = f.get("properties", {})
-            result["landuse"].append({
-                "geometry": geom_3035,
-                "code": props.get("landuse_code"),
-                "abbr": props.get("landuse_abbr", ""),
-            })
-        except Exception:
-            continue
+    # Landuse: no longer requested (see _CADASTRE_EXPORT_LAYERS); the key is
+    # kept (always []) so downstream block-filter code stays shape-stable.
 
     # --- Filter buildings to KG boundary (parcels define the KG extent) ---
     n_before = len(result["building_footprints"])

@@ -23,3 +23,5 @@ data/austria_processor/zenodo_manifest.json
 data/admin_token
 data/austria_processor/copernicus_credentials.json
 data/austria_processor/cache_miss_kgs.json
+data/austria_processor/kg_strikes.json
+data/austria_processor/failure_counts.json

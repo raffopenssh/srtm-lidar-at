@@ -636,6 +636,23 @@ def _safe_git_sync(repo: str, sp):
         # pulling that branch and the director would mark it
         # NEEDS-MANUAL forever. Force-snap back to main first.
         branch = 'main'
+        # Runtime state that used to be git-tracked (kg_strikes.json,
+        # failure_counts.json — untracked since Sep 2026). ``checkout -- .``
+        # / ``reset --hard`` reverted them to the committed snapshot on
+        # every rollout, silently undoing the fleet's adaptive-split
+        # strikes (operators had to re-run the strike-reset script after
+        # each update). Snapshot before, restore after, so the live values
+        # survive both the transition commit (which deletes them from the
+        # tree) and any future re-tracking mistake.
+        _preserve = {}
+        for _rel in ('data/austria_processor/kg_strikes.json',
+                     'data/austria_processor/failure_counts.json'):
+            try:
+                _fp = Path(repo) / _rel
+                if _fp.exists():
+                    _preserve[_rel] = _fp.read_bytes()
+            except Exception:
+                pass
         # Reset any tracked file modifications.
         sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
                timeout=30, cwd=repo)
@@ -687,6 +704,15 @@ def _safe_git_sync(repo: str, sp):
             push_out = f'push-if-ahead error: {_pe}'
         reset = sp.run(['git', 'reset', '--hard', f'origin/{branch}'],
                        capture_output=True, text=True, timeout=30, cwd=repo)
+        for _rel, _blob in _preserve.items():
+            try:
+                _fp = Path(repo) / _rel
+                _fp.parent.mkdir(parents=True, exist_ok=True)
+                _tmp = _fp.with_suffix('.tmp')
+                _tmp.write_bytes(_blob)
+                _tmp.replace(_fp)
+            except Exception as _re:
+                log.warning('git sync: could not restore %s: %s', _rel, _re)
         if push_out:
             reset.stdout = (push_out + '\n' + (reset.stdout or '')).strip()
         # Synthesize a pull-like CompletedProcess for the response.

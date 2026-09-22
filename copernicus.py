@@ -1703,10 +1703,30 @@ def _run_datacube(
             # ``with ThreadPoolExecutor`` the fallback only happened once
             # the HTTP request itself gave up (30 min, see the import-time
             # cap above).  The orphaned thread dies with its request.
+            import threading as _threading
+            _abandoned = _threading.Event()
+
+            def _sync_download(_dst=tmp_path, _fmt=format):
+                try:
+                    datacube.download(str(_dst), _fmt)
+                finally:
+                    # We gave up on this attempt (batch fallback is running
+                    # or done): never leave a late/partial file behind that
+                    # a later call could mistake for its own.
+                    if _abandoned.is_set():
+                        try:
+                            _dst.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                future = pool.submit(datacube.download, str(tmp_path), format)
-                future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+                future = pool.submit(_sync_download)
+                try:
+                    future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    _abandoned.set()
+                    raise
             finally:
                 pool.shutdown(wait=False)
             # Verify non-empty before committing

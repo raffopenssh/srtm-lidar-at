@@ -154,6 +154,22 @@ curl -s -X PUT -H "X-Admin-Token: $TOKEN" -d '{"<code>-<block>": -1}' localhost:
 curl -s -X POST -H "X-Admin-Token: $TOKEN" -d '{"kgs":["<code>"]}' localhost:8000/api/v1/director/v2/priority
 ```
 
+**Then verify the drop actually reached the fleet** (aa82994, 2026-09-22): the drop journal
+rides the director's 5-min `cache_manifest` PUT to every peer. Before that commit there was
+*no* primary→peer path (peers only peer-sync among themselves; the primary is absent from
+`peer_urls.txt`), so every peer kept the live tombstones, dropped 63330 from
+`completed_codes` and re-ran it as a v1 KG for another 3 h after the "fix". Check a peer:
+
+```bash
+curl -s --compressed 'https://srtm-lidar-at12.exe.xyz:8000/api/v1/processing/peers?manifest=0' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print({k:v for k,v in d['tombstones'].items() if k.startswith('<code>')}, {k:v for k,v in d['tombstone_drops'].items() if k.startswith('<code>')})"
+# want: {} + the drop timestamps. Peers on pre-aa82994 code ignore the piggybacked journal.
+```
+
+Strike reset: use `scripts/reset_kg_strikes_v2pending.py --apply --codes <code>` (pushes the
+negative to *every* peer) — a primary-only PUT is undone by the next peer max-merge push.
+Run it **after** the tombstone drop has converged, or bouncing peers re-earn block strikes.
+
 ## Strikes, deferrals, and the v2_regen auto-requeue (2026-09-21)
 
 Peer file `v2_upgrade_failed.json` = `{code: {n, defer, reason, ts}}`; read it with

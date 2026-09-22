@@ -2065,10 +2065,16 @@ def _peer_status_push_loop():
                         # Codes whose v1 full GPKG a v2 upgrade found *gone*
                         # (deposition alive, file missing / 404). Director
                         # verifies + auto-requeues (v2_regen). ~60 B each.
-                        _gone = {
-                            str(c): str((e or {}).get('ts') or '')
-                            for c, e in _vd.items()
-                            if 'gone from Zenodo' in str((e or {}).get('reason') or '')}
+                        _gone = {}
+                        for c, e in _vd.items():
+                            _rs = str((e or {}).get('reason') or '')
+                            if 'gone from Zenodo' not in _rs:
+                                continue
+                            # ``<code>_json gone …`` or ``<code>_full_gpkg gone …``
+                            _key = _rs.split(' gone from Zenodo', 1)[0].strip()
+                            if not _key.startswith(str(c)):
+                                _key = f'{c}_full_gpkg'
+                            _gone[str(c)] = {'ts': str((e or {}).get('ts') or ''), 'key': _key}
                         if _gone:
                             status['v2_gone'] = dict(list(_gone.items())[:100])
             except Exception:
@@ -9025,10 +9031,14 @@ def admin_v2_strikes_clear():
         if not checks:
             continue
         reason = str((e or {}).get('reason') or '')
-        m = _re.search(r'checks \| (.*?)(?: \| warn|$)', reason)
-        if not m or ' FAIL ' not in reason:
+        # Fatal section = between "FAIL n/m checks | " and " | warn:" /
+        # " | hint:".  Check names are the tokens followed by ": " at the
+        # start of the section or after "; " / "| " — a plain split on ";"
+        # broke on details like "(parcels ≥300 m²; raw 82.8/87.9) | lost=…".
+        m = _re.search(r' FAIL \d+/\d+ checks \| (.*?)(?: \| (?:warn|hint):|$)', reason)
+        if not m:
             continue
-        fatal = [p.split(':', 1)[0].strip() for p in m.group(1).split(';') if p.strip()]
+        fatal = _re.findall(r'(?:^|\| |; )([a-z][a-z0-9_.]*): ', m.group(1))
         if fatal and all(f in checks for f in fatal):
             removed.append(code); d.pop(code)
     if removed:

@@ -1720,9 +1720,15 @@ def v2_regen_add_candidates(peer_id: str, gone: dict) -> None:
             code = str(code)
             if not _re.match(r'^\d+(-[a-z][-a-z0-9]*)?$', code):
                 continue
+            # value is a ts string (pre-2026-09-22 peers) or {ts, key}
+            key = f'{code}_full_gpkg'
+            if isinstance(ts, dict):
+                k = str(ts.get('key') or '')
+                if k in (f'{code}_full_gpkg', f'{code}_json'):
+                    key = k
             e = d.get(code)
             if e is None:
-                d[code] = {'state': 'candidate', 'key': f'{code}_full_gpkg',
+                d[code] = {'state': 'candidate', 'key': key,
                            'first_seen': now, 'peers': [peer_id], 'checks': []}
                 changed = True
             elif e.get('state') in ('candidate', 'confirming') and peer_id not in (e.get('peers') or []):
@@ -7105,7 +7111,7 @@ class PeerDirector:
                 e['note'] = 'file present on Zenodo (peer 404 was transient)'
                 try:
                     import app as _app
-                    _app.director_event(f'v2regen: {code} full GPKG is present on Zenodo — '
+                    _app.director_event(f'v2regen: {code} {key.split("_", 1)[1]} is present on Zenodo — '
                                         f'dismissed (transient 404 on {",".join(e.get("peers") or [])})',
                                         peer='director', kg=code, level='warning')
                 except Exception:
@@ -7141,7 +7147,7 @@ class PeerDirector:
                 try:
                     import app as _app
                     _app.director_event(
-                        f'v2regen: {code} full GPKG confirmed gone (depo {g.get("depo_id")}, '
+                        f'v2regen: {code} {key.split("_", 1)[1]} confirmed gone (depo {g.get("depo_id")}, '
                         f'{len(gone)} checks over {gap / 60:.0f} min) — requeued for a fresh v2.2 run; '
                         f'v1 json/light kept until replaced', peer='director', kg=code, level='warning')
                 except Exception:

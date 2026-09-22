@@ -10192,7 +10192,12 @@ def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
         except Exception as e:  # noqa: BLE001
             sc = int(getattr(e, "status_code", 0) or 0)
             if sc in (403, 404, 410):
-                raise FileNotFoundError(f"{code}_json HTTP {sc}") from e
+                # Same wording as the _full_gpkg case so app.py's status
+                # push reports it as ``v2_gone`` and the director's
+                # v2_regen verifies + requeues the parent (19704: v1 JSON
+                # 404 on Zenodo, manifest still listed it — struck out
+                # twice, nothing re-dispatched it).
+                raise FileNotFoundError(f"{code}_json gone from Zenodo: HTTP {sc}") from e
             raise RuntimeError(f"{code}_json download: {e}") from e
     try:
         with open(jpath) as f:

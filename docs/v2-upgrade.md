@@ -162,14 +162,30 @@ Peer file `v2_upgrade_failed.json` = `{code: {n, defer, reason, ts}}`; read it w
 (`v2:` line → `strikes_fleet=… struck_out=…`).
 
 * **Verify FAIL** → `n += 1`, struck out at `V2_UPGRADE_MAX_STRIKES = 2`.
+  * `parcel_segmentation_coverage_pct_ge_v1` (2026-09-22): fatal only when **both** the raw
+    figure and the ≥300 m² figure drop > `TOL.seg_coverage_pp_fatal` (8 pp) — that is a lost
+    tile, and `segment_type_no_holes` / `lidar_tiles_ge_v1` / `segmented_area_ge_v1` catch it
+    independently. Smaller gaps become the non-fatal `…_drift` warning (still carrying the
+    `lost=N … v1_types[…]` forensic tail). Before: fatal past 2.5 pp on the ≥300 m² figure
+    alone, whose small denominator on 50–200-parcel KGs turned 3–6 lost parcels into 3–7 pp;
+    217 strike events / 35 parents struck out in 48 h, every one deterministic (identical
+    figures on two peers) — a segv2-vs-v1 class-set difference on 3–7 % of parcels, not a
+    data hole. Root cause (which parcel types lose `area_summary` under segv2) is still open;
+    mine `?q=coverage_pct_drift` for the `v1_types[…]` histogram.
+  * Fleet-wide clear after a gate fix: `python3 scripts/clear_v2_strikes_fleet.py --checks
+    parcel_segmentation_coverage_pct_ge_v1 --apply` (hits every peer's
+    `/api/v1/admin/v2_strikes/clear`; `--reason-re 'download: HTTP 5\d\d'` drops the
+    pre-deferral 5xx strikes). The director's fleet union drops a peer's stale entries on
+    its next full status push.
 * **Deferral** (input download 5xx / timeout / disk pressure, or a 404 while the fleet
   `zenodo_degraded` circuit is tripped) → `defer += 1`, **no strike**; struck out only after
   `V2_UPGRADE_MAX_DEFERS = 8`. (Before: a deferral was a strike, so one Zenodo outage struck
   out every code a peer touched twice.)
 * **Stale v1-JSON md5** in the manifest → accepted if the bytes parse as this KG (baseline
   only), `v1 JSON manifest md5 stale` warning.
-* **`_full_gpkg` gone** (404 with circuit clear) → fatal strike on the peer + reported as
-  `status.v2_gone`. The director (`_check_v2_regen`, every 5 min, `data/austria_processor/
+* **`_full_gpkg` or `_json` gone** (404 with circuit clear) → fatal strike on the peer +
+  reported as `status.v2_gone` (`{code: {ts, key}}`; the key names which product is gone —
+  19704's v1 JSON vanished while the manifest still listed it). The director (`_check_v2_regen`, every 5 min, `data/austria_processor/
   v2_regen.json`) then verifies it against the deposition API — **never while the Zenodo
   circuit is degraded**, control probe must be 200, **two "gone" verdicts ≥30 min apart** —
   and requeues the KG for a fresh v2.2 run through the canonical

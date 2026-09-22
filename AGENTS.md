@@ -95,7 +95,11 @@ imminent), `hole` (parent bbox uncovered → auto-repicked by the pending
 sweep at next processor run cycle — verified: no such parent has a
 completing `_json` set, so `completed_codes` never gates it out),
 `orphan` (coverage complete — old-split residue, never auto-repicked;
-use the re-queue recipe above if its products are wanted). Failed/
+use the re-queue recipe above if its products are wanted), `v2heal`
+(own `_json` + committed `_full_gpkg`, light GPKG missing → healed
+automatically: the director ranks such codes first among v2-upgrade
+candidates, which writes `json_v2` + `light_gpkg_v2` from the full
+GPKG; no operator action). Failed/
 partial *event-rate* history already lives in the capacity_history
 ring (`kg_outcome:` line + F/P chart ticks) — no extra chart needed.
 

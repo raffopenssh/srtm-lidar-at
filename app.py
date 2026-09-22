@@ -8419,7 +8419,9 @@ def admin_update():
                     pass
                 import threading as _th, time as _t
                 def _deferred_update():
-                    deadline = _t.time() + 4 * 3600  # 4 h cap
+                    # Frontier KGs run 12-20 h; resetting the tree under a
+                    # live processor mixes module versions, so wait it out.
+                    deadline = _t.time() + 48 * 3600
                     while _t.time() < deadline:
                         try:
                             still = sp.run(
@@ -20453,6 +20455,18 @@ def process_txt():
                             # entirely outside BEV LiDAR; GPKGs will
                             # never exist. Legit, suppress as 'ooc'.
                             verdict = 'orphan*'
+                            # Own _json + committed _full_gpkg, light
+                            # missing: the v2 upgrade heals this (it
+                            # writes json_v2 + light_gpkg_v2 straight
+                            # from the full GPKG) and the director
+                            # ranks such codes FIRST among upgrade
+                            # candidates -> auto, no operator action.
+                            _fg = real.get(c + '_full_gpkg')
+                            if 'light_gpkg' in miss and \
+                                    isinstance(_fg, dict) and \
+                                    int(_fg.get('size') or 0) > 0 and \
+                                    'error' not in str(_fg.get('status', '')):
+                                verdict = 'v2heal'
                             try:
                                 if int(real[c + '_json'].get('size')
                                        or 0) < 20000:
@@ -20493,6 +20507,7 @@ def process_txt():
         n_q = sum(1 for r in rows if r[4] == 'hole+queued')
         n_gap = sum(1 for r in rows if r[4] == 'GAP')
         n_orph_manual = sum(1 for r in rows if r[4] == 'orphan*')
+        n_heal = sum(1 for r in rows if r[4] == 'v2heal')
         n_drift = sum(1 for r in rows if r[4] == 'drift')
         n_ooc = sum(1 for r in rows if r[4] == 'ooc')
         out.append(
@@ -20503,6 +20518,8 @@ def process_txt():
             f'orphans={len(rows) - n_hole - n_drift - n_ooc}'
             + (f' ({n_orph_manual}* never-requeue, manual only)'
                if n_orph_manual else ' (old-split residue)')
+            + (f' v2heal={n_heal} (light missing, auto via v2 upgrade)'
+               if n_heal else '')
             + (f' drift={n_drift}' if n_drift else '')
             + (f' ooc={n_ooc}' if n_ooc else '')
             + (' (suppressed)' if n_drift or n_ooc else ''))
@@ -20515,10 +20532,10 @@ def process_txt():
             # only rows needing operator action (GAP + orphan*).
             _vis = [r for r in rows if r[4] not in ('drift', 'ooc')]
             if _stall_arg is None:
-                _vis = [r for r in _vis if r[4] in ('GAP', 'orphan*')]
+                _vis = [r for r in _vis if r[4] in ('GAP', 'orphan*', 'v2heal')]
             _ord = sorted(_vis, key=lambda r: (
                 r[0] != 'partial', r[4] != 'GAP',
-                r[4] != 'orphan*', -r[1]))
+                r[4] != 'orphan*', r[4] != 'v2heal', -r[1]))
             _now3 = _t.time()
             for kind, stale_at, c, miss, verdict in _ord[:_stall_lim]:
                 if kind == 'partial':

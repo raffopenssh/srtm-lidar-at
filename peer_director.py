@@ -10398,8 +10398,21 @@ class PeerDirector:
                 # half-landed pair; heal first — it's inconsistent on
                 # Zenodo); then product<current re-upgrade vs never
                 # upgraded, ordered by V2_REUPGRADE_FIRST.
+                _lg = ent.get(f'{code}_light_gpkg')
+                _lg2 = ent.get(f'{code}_light_gpkg_v2')
+                _has_light = any(isinstance(x, dict) and int(x.get('size') or 0) > 0
+                                 and 'error' not in str(x.get('status', ''))
+                                 for x in (_lg, _lg2))
                 if isinstance(j2, dict) and str(j2.get('version') or '') == _V21:
                     _rk = -1
+                elif not _has_light:
+                    # json + full_gpkg but NO light GPKG at all (v1 light
+                    # upload failed / fresh-v2 light_gpkg_v2 PUT failed):
+                    # the product triple is broken on Zenodo and the
+                    # coverage oracle never requeues it (own _json is
+                    # load-bearing). Upgrading from the full GPKG is the
+                    # heal -> rank first (process.txt verdict 'v2heal').
+                    _rk = -2
                 elif isinstance(j2, dict):
                     _rk = 0 if V2_REUPGRADE_FIRST else 1
                 else:
@@ -11529,6 +11542,10 @@ class PeerDirector:
     # path; this also stops needs_manual_update from being suppressed
     # forever just because the peer is always busy.
     STALE_GRACEFUL_MAX_ATTEMPTS = 3
+    # Re-send the graceful update while the peer is still on the SAME KG
+    # it was scheduled on (safety net for a lost deferred thread). Does
+    # not count as an attempt.
+    STALE_GRACEFUL_RESEND_S = 4 * 3600
     # Wave-based update rollout: cap how many peers we trigger per tick
     # so the cluster restarts in waves rather than a single thundering
     # herd. With 50 peers all triggered at once (the 2026-05-06
@@ -11716,6 +11733,26 @@ class PeerDirector:
                 rec['waiting_for_idle'] = True
                 last_graceful = float(rec.get('last_graceful_attempt') or 0)
                 gattempts = int(rec.get('graceful_attempts') or 0)
+                cur_kg = str((ps.get('current_kg') or {}).get('code') or '')
+                sched_kg = str(rec.get('graceful_kg') or '')
+                # A graceful update is a *promise* the peer keeps at its
+                # next KG boundary. While it is still inside the same KG
+                # it was scheduled on, nothing has failed — frontier KGs
+                # routinely run 12–20 h, far past 3 × 30 min. Only a KG
+                # boundary crossed WITHOUT the commit moving counts as a
+                # failed attempt (Sep 2026: 7 frontier peers were flagged
+                # NEEDS-MANUAL 90 min into a 17 h KG). The 4 h re-send is
+                # a safety net for a lost ``_deferred_update`` thread
+                # (peer srv restarted underneath it) and does not count.
+                if last_graceful and sched_kg and cur_kg == sched_kg:
+                    if (now - last_graceful) < self.STALE_GRACEFUL_RESEND_S:
+                        tracked[pid] = rec
+                        continue
+                    rec['graceful_resend'] = True
+                elif last_graceful and sched_kg and cur_kg != sched_kg:
+                    # boundary crossed, still stale -> the promise failed
+                    rec['graceful_attempts'] = gattempts = gattempts + 1
+                    rec.pop('graceful_resend', None)
                 if gattempts >= self.STALE_GRACEFUL_MAX_ATTEMPTS:
                     rec['needs_manual_update'] = True
                     tracked[pid] = rec
@@ -11744,6 +11781,7 @@ class PeerDirector:
                     tracked[pid] = rec
                     continue
                 if (now - last_graceful) >= 1800:
+                    rec['graceful_kg'] = cur_kg
                     graceful_candidates.append((peer, rec, commit))
                 else:
                     tracked[pid] = rec
@@ -11823,7 +11861,9 @@ class PeerDirector:
                 gres = {'error': str(e)}
             rec['last_graceful_attempt'] = now
             rec['last_graceful_result'] = gres
-            rec['graceful_attempts'] = gattempts + 1
+            # Attempts are counted when a KG boundary passes without the
+            # commit moving (see the not-idle branch above), not on send.
+            rec.pop('graceful_resend', None)
             tracked[pid] = rec
             graceful_budget -= 1
             graceful_done.append(pid)

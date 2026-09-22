@@ -33,6 +33,15 @@ CACHE_DIR = Path("/tmp/cadastre_cache")
 MAX_PER_REQUEST = 100_000
 REQUEST_TIMEOUT = 60  # seconds
 
+# The cadastre API restarts on every deploy (~16 s of bare proxy 503s) and
+# occasionally times out under load.  Every HTTP call in this module goes
+# through ``_request`` so a restart window is ridden out instead of turning
+# into a "No KG codes found" / "No footprints" hole in the tile.  Backoff
+# 5 s -> 10 s -> 20 s (~35 s total) comfortably outlasts one restart.
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4
+BACKOFF_BASE_S = 5.0
+
 # Reusable CRS transformer (thread-safe after creation)
 _TRANSFORMER_4326_TO_3035 = Transformer.from_crs(
     "EPSG:4326", "EPSG:3035", always_xy=True
@@ -42,6 +51,35 @@ _TRANSFORMER_4326_TO_3035 = Transformer.from_crs(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _request(method: str, url: str, *, what: str, attempts: int = MAX_ATTEMPTS,
+             **kw) -> requests.Response:
+    """``requests.request`` with backoff on transient failures (5xx/429,
+    connection errors, timeouts).  Raises the last exception after
+    *attempts*; non-transient HTTP errors raise immediately."""
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.request(method, url, **kw)
+            if resp.status_code in TRANSIENT_STATUS:
+                resp.raise_for_status()
+            return resp
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status not in TRANSIENT_STATUS:
+                raise
+            last = e
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            last = e
+        if attempt < attempts:
+            sleep = BACKOFF_BASE_S * (2 ** (attempt - 1))
+            log.warning("cadastre %s transient (%s) attempt %d/%d — retry in %.0fs",
+                        what, str(last)[:120], attempt, attempts, sleep)
+            time.sleep(sleep)
+    assert last is not None
+    raise last
+
 
 def _bbox_hash(bbox: tuple[float, float, float, float]) -> str:
     """Deterministic short hash for a WGS84 bounding box."""
@@ -102,8 +140,8 @@ def _find_kgs_for_bbox(bbox_wgs84: tuple[float, float, float, float]) -> list[st
     points = [{"lon": lo, "lat": la, "id": f"{lo:.5f}_{la:.5f}"}
               for lo, la in itertools.product(lons, lats)]
     try:
-        resp = requests.post(
-            f"{CADASTRE_BASE}/spatial/points",
+        resp = _request(
+            "POST", f"{CADASTRE_BASE}/spatial/points", what="spatial/points",
             json={"points": points},
             timeout=REQUEST_TIMEOUT,
         )
@@ -138,8 +176,8 @@ def fetch_footprints_viewport(
     west, south, east, north = bbox_wgs84
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(
-                f"{CADASTRE_BASE}/spatial/footprints",
+            resp = _request(
+                "GET", f"{CADASTRE_BASE}/spatial/footprints", what="spatial/footprints",
                 params={"west": west, "south": south, "east": east, "north": north,
                         "limit": limit},
                 timeout=timeout,
@@ -220,8 +258,8 @@ def fetch_building_footprints(
         for kg in kg_codes:
             try:
                 t0 = time.time()
-                resp = requests.get(
-                    f"{CADASTRE_BASE}/export/geojson",
+                resp = _request(
+                    "GET", f"{CADASTRE_BASE}/export/geojson", what=f"export kg={kg}",
                     params={
                         "kg": kg,
                         "layers": "building_footprints",
@@ -252,7 +290,7 @@ def fetch_building_footprints(
     # --- parse GeoJSON -> shapely polygons in EPSG:3035 ---
     features = _extract_features(geojson)
     if not features:
-        log.warning("No building features returned for bbox %s", bbox_wgs84)
+        log.info("No building features in bbox %s (rural tile)", bbox_wgs84)
         return []
 
     from shapely.geometry import box as shapely_box

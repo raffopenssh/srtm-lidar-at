@@ -11651,6 +11651,10 @@ class PeerDirector:
                 _rec.pop('last_attempt', None)
                 _rec.pop('last_result', None)
                 _rec.pop('needs_manual_update', None)
+                if 'graceful_kg' not in _rec:
+                    # legacy rec (pre boundary-counting): its
+                    # graceful_attempts were send-counts, meaningless now
+                    _rec['graceful_attempts'] = 0
                 tracked[_pid] = _rec
         # Make sure origin/main matches our local HEAD before we ask peers
         # to fetch+reset. Without this, peers reset to a stale origin and

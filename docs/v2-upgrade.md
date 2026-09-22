@@ -134,6 +134,26 @@ Re-ingest a code: delete its store row (`kg_v2_store.delete(code)`) — next tic
 Reprocess an upgrade: drop `<code>_json_v2` + `<code>_light_gpkg_v2` from the manifest
 (the requeue/tombstone path already includes both suffixes).
 
+**Never use `POST /processing/queue {skip_processed:false}` (dashboard "Queue KG by name" /
+re-queue) to get a v1-complete KG onto the current v2.x.** That path tombstones and deletes
+*every* product pointer incl. `<code>_full_gpkg`, so the KG stops being a v2-upgrade candidate
+(the upgrade path needs the v1 full GPKG in the manifest) and becomes a from-scratch v1 rerun
+that needs Copernicus → cache miss → frontier → openEO. 63330/Kohlschwarz sat 36 h like that
+(Sep 20–22 2026) while its 5 Zenodo files were intact. Recovery recipe:
+
+```bash
+TOKEN=$(cat data/admin_token)
+curl -s -X POST -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"prefix":"63330"}' localhost:8000/api/v1/admin/drop_tombstones      # incl. _requeue
+# rebuild the 3 v1 (+2 v2) entries from the deposition API and push them:
+#   GET /api/deposit/depositions?q=<code>  →  /depositions/<id>/files  (bucket, md5, size)
+#   POST /api/v1/manifest/push {"key":"<code>_full_gpkg","entry":{...,"uploaded_at":<depo modified>}}
+# a 409 stale_vs_tombstone = the other gunicorn worker's in-memory copy; retry or restart srv.
+curl -s localhost:8000/api/v1/processing/queue >/dev/null                 # GET-prune drops the code
+curl -s -X PUT -H "X-Admin-Token: $TOKEN" -d '{"<code>-<block>": -1}' localhost:8000/api/v1/processing/kg_strikes
+curl -s -X POST -H "X-Admin-Token: $TOKEN" -d '{"kgs":["<code>"]}' localhost:8000/api/v1/director/v2/priority
+```
+
 ## Strikes, deferrals, and the v2_regen auto-requeue (2026-09-21)
 
 Peer file `v2_upgrade_failed.json` = `{code: {n, defer, reason, ts}}`; read it with

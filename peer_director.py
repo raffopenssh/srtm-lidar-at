@@ -2078,6 +2078,21 @@ def _sync_cache_manifest_to_peer(peer_url: str) -> None:
         local_cm = json.loads(manifest_path.read_text())
         if not local_cm.get('depo_id'):
             return
+        # Piggyback the tombstone DROP journal (~330 B gz). This is the only
+        # primary→peer path for negative tombstones: peers don't peer-sync
+        # from the primary, so without it a sweep never converges and peers
+        # re-run finished KGs (63330, Sep 2026). Not persisted into the
+        # peer's cache_manifest.json — see the PUT handler in app.py.
+        try:
+            _dp = DATA_DIR / 'manifest_tombstone_drops.json'
+            if _dp.exists():
+                _dj = json.loads(_dp.read_text())
+                if isinstance(_dj, dict) and _dj:
+                    local_cm = dict(local_cm)
+                    local_cm['tombstone_drops'] = {
+                        k: str(v) for k, v in _dj.items() if isinstance(v, str)}
+        except Exception:
+            pass
         r = _put_json_gz(
             peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
             local_cm, timeout=PEER_TIMEOUT_CONTROL)

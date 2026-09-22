@@ -3774,6 +3774,24 @@ def processing_cache_manifest():
                 local.get('zenodo_circuit'), dict) else {}
             if inc_zc.get('updated_at', '') >= loc_zc.get('updated_at', ''):
                 local['zenodo_circuit'] = inc_zc
+        # Same transport for the tombstone DROP journal (negative
+        # tombstones). Peers only peer-sync among themselves (the primary
+        # has ``url: None`` in peers.json and is absent from every peer's
+        # peer_urls.txt), so a sweep performed on the primary never reached
+        # the fleet: every peer kept the live tombstones, dropped the KG
+        # from ``completed_codes`` and re-ran it from scratch (63330,
+        # Sep 2026 — v2.2-complete KG bounced through 12 cache-only peers
+        # as a v1 rerun). ~330 B gzipped; merged into the journal (not
+        # stored in cache_manifest.json) and evicts superseded live
+        # tombstones in-process + on disk.
+        if isinstance(incoming.get('tombstone_drops'), dict):
+            try:
+                _n_ev = _merge_tombstone_drops(incoming['tombstone_drops'])
+                if _n_ev:
+                    log.info('cache_manifest sync: drop journal evicted %d '
+                             'live tombstone(s)', _n_ev)
+            except Exception as _e:
+                log.debug('cache_manifest sync: drop-journal merge failed: %s', _e)
 
         # Always adopt depo_id / record_id from the incoming manifest.
         # The primary is the authority — peers must use the shared deposit.

@@ -838,6 +838,18 @@ python3 -c "import json,app; me=json.load(open('data/austria_processor/zenodo_ma
 
 ## Conventions for editing
 
+- **Wake-ups / "check back later" = fresh conversation, never in-conversation
+  sleep.** Fleet convergence (rollout waves, tombstone/drop propagation,
+  a KG finishing) takes 10 min–2 h. Do NOT `sleep 600` and re-poll inside
+  the current conversation — every resume re-sends the whole context
+  (~$1 per wake-up). Commit + push + restart your change, tell the user what
+  to expect, and if verification is genuinely needed later schedule a
+  **one-shot systemd timer** that starts a *new* `shelley client chat`
+  (see the `schedule` skill; unit name `shelley-<name>`, prompt carries
+  the check to perform + the originating conversation id; the unit must
+  clean itself up). The new agent reads `/process.txt` cold for a few
+  cents instead of dragging this conversation along.
+
 - **Read the relevant `docs/*.md` first** when touching a subsystem. They
   contain hard-won invariants, failure modes, and recovery procedures that
   aren't obvious from the code.

@@ -232,3 +232,27 @@ Regression: `python3 test_cred_stall.py`.
 ---
 
 *See `AGENTS.md` for the project map.*
+
+## Sync-download wall clock (2026-09-22)
+
+`_download_datacube` tries a synchronous `/result` POST first (`SYNC_DOWNLOAD_TIMEOUT
+= 180 s`) and falls back to a batch job. Two things made that fallback a 30-minute
+wait per month whenever openEO was slow:
+
+* the openeo client (0.49) posts `/result` with `DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE
+  = 30 min` and `DataCube.download()` has no per-call override — `copernicus.py`
+  now caps that module constant to **240 s** at import;
+* the download ran under `with ThreadPoolExecutor(...)`, whose `__exit__` joins the
+  worker — so after `future.result(timeout=180)` raised, we still blocked until the
+  HTTP request itself died. Now `pool.shutdown(wait=False)`.
+
+Symptom to recognise in `/process.txt?q=NDVI&warn=1`: `NDVI 2024-0x failed:
+RemoteDisconnected / Read timed out (read timeout=1800) — skipping month` lines
+spaced ~25–30 min apart on the same KG, `copernicus (7400–25000s) completed with
+warnings`. That was the 2026-09-21/22 openEO degradation (backend redeployed
+2026-09-21T14:01Z; `[500] … SPARK_JOB_CANCELLED … runaway job`; a 3 km × 2 km
+one-month NDVI probe from the primary hung > 25 min). Nothing in `copernicus.py`
+had changed since 2026-09-15 — it was upstream; the fix above only bounds how much
+frontier wall-clock we lose to it. Credential error rate is the fastest tell:
+`director/status.credentials[].usage.buckets` summed per hour went 15–25 % → 73–94 %
+errors at 2026-09-20T23Z.

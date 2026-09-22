@@ -28,6 +28,23 @@ import numpy as np
 
 try:
     import openeo
+    # The openeo client waits DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE (30 min)
+    # on every synchronous ``/result`` POST and DataCube.download() offers
+    # no per-call override.  Our sync path gives up after
+    # SYNC_DOWNLOAD_TIMEOUT (180 s) and falls back to a batch job — but the
+    # ``with ThreadPoolExecutor`` that ran the download joined the worker
+    # thread on exit, so the "180 s" fallback really took up to 30 min per
+    # month while the request sat in the server's queue.  During the
+    # 2026-09-21/22 openEO degradation (Spark "runaway job" cancellations,
+    # RemoteDisconnected after ~25 min) that turned every frontier KG into a
+    # 2–7 h copernicus step.  Cap the server-side wait just above our own
+    # fallback threshold; the batch path is unaffected (its polling uses
+    # short requests, result download streams per chunk).
+    try:
+        import openeo.rest.connection as _oeo_conn
+        _oeo_conn.DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE = 240
+    except Exception:  # noqa: BLE001
+        pass
 except ImportError:
     openeo = None  # type: ignore[assignment]
 
@@ -1682,9 +1699,16 @@ def _run_datacube(
                     output_path, SYNC_DOWNLOAD_TIMEOUT)
         try:
             _cleanup_tmp()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            # shutdown(wait=False): do NOT join the download thread — with
+            # ``with ThreadPoolExecutor`` the fallback only happened once
+            # the HTTP request itself gave up (30 min, see the import-time
+            # cap above).  The orphaned thread dies with its request.
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
                 future = pool.submit(datacube.download, str(tmp_path), format)
                 future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+            finally:
+                pool.shutdown(wait=False)
             # Verify non-empty before committing
             if tmp_path.exists() and tmp_path.stat().st_size > 0:
                 tmp_path.rename(output_path)

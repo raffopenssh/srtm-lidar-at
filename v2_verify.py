@@ -248,6 +248,34 @@ def _active_tiles(doc) -> tuple[int, int, list]:
     return lidar, seg, bad
 
 
+def _nodata_tile_union_3035(doc):
+    """Union (EPSG:3035) of tile bboxes that have **no DTM at all**
+    (``dtm=False`` / ``valid_pixels=0``): open water (Bodensee, Rhine) or
+    outside BEV ALS coverage.  The cadastral parcel union routinely
+    extends over such areas (91109 Gaissau: tiles 1/11/12 on Lake
+    Constance, ``parcel_segmentation_coverage_pct=80.4``), so a hole
+    there is permanent and not a stitching defect.  None if no such tile."""
+    tiles = _g(doc, "data_quality", "tiles", default=[]) or []
+    boxes = []
+    for t in tiles:
+        if not isinstance(t, dict) or t.get("dtm") or int(t.get("valid_pixels") or 0) >= 100:
+            continue
+        bb = t.get("bbox_wgs")
+        if isinstance(bb, (list, tuple)) and len(bb) == 4:
+            boxes.append([float(x) for x in bb])
+    if not boxes:
+        return None
+    try:
+        from shapely.geometry import box
+        from shapely.ops import transform as _shp_transform, unary_union
+        from pyproj import Transformer
+        tr = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True).transform
+        return unary_union([_shp_transform(tr, box(*b)) for b in boxes])
+    except Exception as e:  # noqa: BLE001
+        log.debug("nodata tile union skipped: %s", e)
+        return None
+
+
 # --------------------------------------------------------------------------
 # document-level checks (shared by both gates)
 # --------------------------------------------------------------------------
@@ -795,7 +823,14 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
         c.close()
     # raster stitching: nonzero segment_type px vs. segmented area, holes in union
     try:
-        nz, hole = _segment_type_nonzero(path, union_geom_3035)
+        _nd = _nodata_tile_union_3035(v2)
+        _measure_union = union_geom_3035
+        if _nd is not None and union_geom_3035 is not None and not union_geom_3035.is_empty:
+            try:
+                _measure_union = union_geom_3035.difference(_nd)
+            except Exception:  # noqa: BLE001
+                _measure_union = union_geom_3035
+        nz, hole = _segment_type_nonzero(path, _measure_union)
         sa = _num(_g(v2, "coverage", "total_segmented_area_sqm"))
         if sa and sa > 0:
             # ``total_segmented_area_sqm`` is Σ per-tile valid px over the
@@ -844,7 +879,8 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             _declared_gap = (_s < _l) or _nup > 0
             rep.check("segment_type_no_holes", hole <= TOL["raster_hole_frac"],
                       f"{100*hole:.2f}% of parcel union has no segment class"
-                      + (" (declared tile gap)" if _declared_gap else ""),
+                      + (" (declared tile gap)" if _declared_gap else "")
+                      + (" (no-DTM tiles excluded from union)" if _nd is not None else ""),
                       fatal=not _declared_gap)
         rep["segment_type_nonzero_px"] = nz
         rep["segment_type_hole_frac"] = hole

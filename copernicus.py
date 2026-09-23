@@ -434,6 +434,100 @@ _FAILED_MONTH_COOLDOWNS: Dict[tuple, float] = {}
 _FAILED_MONTH_COOLDOWN_SECS = 1800  # 30 minutes for 500 (Spark timeout)
 _FAILED_MONTH_402_COOLDOWN_SECS = 1800  # 30 minutes — 402 is IP-level, recovery takes ~2h
 
+# --- Adaptive sync-request splitting (Sep 2026) ----------------------------
+# When openEO's synchronous path is slow (Spark backlog), a full 0.1° NDVI
+# month hits our 240 s read timeout while a 0.05° quadrant of the same cell
+# still completes in ~2 min (measured 2026-09-23: 0.1° → timeout at 240 s
+# for 2023 *and* 2024; 0.05° → 124 s; 0.03° → 64-109 s). Before this, every
+# timed-out month was simply "skipped": 8 months × 240 s = 32 min per cell
+# for zero data, and the tile ended without harmonics. Fleet-wide that was
+# ~1000 month-timeouts / 30 h ≈ 67 peer-hours burned and ~200 tiles with
+# no NDVI series at all.
+#
+# Now: the first read-timeout arms "split mode" (file-backed so every KG
+# subprocess on this peer sees it; TTL 1 h, re-armed on each new timeout).
+# In split mode a month is fetched as 2×2 quadrants (sequential — openEO
+# allows one sync job per client_id) and mosaicked into the same month
+# cache file, so nothing downstream changes. A quadrant timing out still
+# fails the month, and two consecutive timeout-failed months trip the
+# existing upstream-stress cascade (IPThrottledError → KG deferred for
+# retry, peer copernicus paused 15 min) instead of baking a degraded
+# product.
+_SYNC_SPLIT_TTL_SECS = 3600
+_SYNC_SPLIT_FILE = pathlib.Path("data/austria_processor/openeo_sync_split_until")
+_TIMEOUT_SIGNS = ('Read timed out', 'read timeout', 'ReadTimeout')
+
+
+def _is_read_timeout(exc_str: str) -> bool:
+    return any(s in exc_str for s in _TIMEOUT_SIGNS)
+
+
+def _sync_split_active() -> bool:
+    try:
+        until = float(_SYNC_SPLIT_FILE.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    return time.time() < until
+
+
+def _sync_split_arm(reason: str) -> None:
+    was = _sync_split_active()
+    try:
+        _SYNC_SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _SYNC_SPLIT_FILE.write_text(f"{time.time() + _SYNC_SPLIT_TTL_SECS:.0f}\n")
+    except OSError:
+        pass
+    if not was:
+        logger.warning("openEO sync path slow (%s) — NDVI months will be fetched "
+                       "as 2×2 quadrants for the next %dm",
+                       reason[:80], _SYNC_SPLIT_TTL_SECS // 60)
+
+
+def _sync_split_status() -> dict:
+    """For /api/v1/info + process.txt: {'active': bool, 'remaining_s': int}."""
+    try:
+        until = float(_SYNC_SPLIT_FILE.read_text().strip() or 0)
+    except (OSError, ValueError):
+        until = 0.0
+    rem = int(until - time.time())
+    return {"active": rem > 0, "remaining_s": max(0, rem)}
+
+
+def _mosaic_tiffs(parts: list, dst: pathlib.Path) -> None:
+    """Merge quadrant GeoTIFFs into *dst*, reprojecting to the first part's
+    CRS when openEO returned mixed UTM zones (cells straddling 12°E)."""
+    from rasterio.merge import merge as rio_merge
+    from rasterio.vrt import WarpedVRT
+    opened, vrts = [], []
+    try:
+        for p in parts:
+            opened.append(rasterio.open(str(p)))
+        ref_crs = opened[0].crs
+        srcs = []
+        for ds in opened:
+            if ds.crs != ref_crs:
+                v = WarpedVRT(ds, crs=ref_crs)
+                vrts.append(v)
+                srcs.append(v)
+            else:
+                srcs.append(ds)
+        arr, tf = rio_merge(srcs, nodata=np.nan)
+        prof = opened[0].profile.copy()
+        prof.update(driver="GTiff", height=arr.shape[1], width=arr.shape[2],
+                    count=arr.shape[0], transform=tf, crs=ref_crs,
+                    dtype=str(arr.dtype), nodata=np.nan)
+        prof.pop("blockxsize", None); prof.pop("blockysize", None)
+        prof.pop("tiled", None)
+        with rasterio.open(str(dst), "w", **prof) as out:
+            out.write(arr)
+    finally:
+        for v in vrts:
+            try: v.close()
+            except Exception: pass
+        for ds in opened:
+            try: ds.close()
+            except Exception: pass
+
 # Threading lock for credential state — protects _credential_index,
 # _exhausted_cred_indices, credits_exhausted, CLIENT_ID, CLIENT_SECRET,
 # and _connection during concurrent access from parallel download workers.
@@ -2039,28 +2133,78 @@ def get_ndvi_timeseries(
             try:
                 cred_idx = _credential_index
                 c = _get_connection()
-                s2 = c.load_collection(
-                    "SENTINEL2_L2A",
-                    spatial_extent=bbox,
-                    temporal_extent=[m_start, m_end],
-                    bands=["B04", "B08", "SCL"],
-                )
-                s2_masked = s2.process(
-                    "mask_scl_dilation", data=s2, scl_band_name="SCL",
-                )
-                ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
-                ndvi_median = ndvi_cube.reduce_dimension(
-                    dimension="t", reducer="median",
-                )
+
+                def _dl_cube(part_bbox, dst):
+                    s2 = c.load_collection(
+                        "SENTINEL2_L2A",
+                        spatial_extent=part_bbox,
+                        temporal_extent=[m_start, m_end],
+                        bands=["B04", "B08", "SCL"],
+                    )
+                    s2_masked = s2.process(
+                        "mask_scl_dilation", data=s2, scl_band_name="SCL",
+                    )
+                    ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+                    ndvi_median = ndvi_cube.reduce_dimension(
+                        dimension="t", reducer="median",
+                    )
+                    ndvi_median.download(str(dst), format="GTiff")
+                    if not (dst.exists() and dst.stat().st_size > 0):
+                        dst.unlink(missing_ok=True)
+                        raise RuntimeError("download produced empty file")
+
+                def _dl_quadrants(dst):
+                    """Fetch the month as 2×2 sub-cells and mosaic into *dst*.
+                    Empty (overcast) quadrants are tolerated as long as at
+                    least one returns data; a timeout propagates."""
+                    w, s = bbox["west"], bbox["south"]
+                    e, n = bbox["east"], bbox["north"]
+                    mx, my = (w + e) / 2, (s + n) / 2
+                    quads = [
+                        {"west": w, "south": s, "east": mx, "north": my},
+                        {"west": mx, "south": s, "east": e, "north": my},
+                        {"west": w, "south": my, "east": mx, "north": n},
+                        {"west": mx, "south": my, "east": e, "north": n},
+                    ]
+                    parts = []
+                    try:
+                        for qi, qb in enumerate(quads):
+                            qp = dst.with_suffix(f".q{qi}.tif")
+                            qp.unlink(missing_ok=True)
+                            try:
+                                _dl_cube(qb, qp)
+                                parts.append(qp)
+                            except Exception as qe:
+                                if 'download produced empty file' in str(qe):
+                                    logger.info("NDVI %s q%d: empty (overcast)", label, qi)
+                                    continue
+                                raise
+                        if not parts:
+                            raise RuntimeError("download produced empty file")
+                        _mosaic_tiffs(parts, dst)
+                        logger.info("NDVI %s: mosaicked %d/4 quadrants", label, len(parts))
+                    finally:
+                        for qp in parts:
+                            qp.unlink(missing_ok=True)
+
                 month_cache.parent.mkdir(parents=True, exist_ok=True)
                 tmp_month = month_cache.with_suffix(month_cache.suffix + ".tmp")
                 try:
-                    ndvi_median.download(str(tmp_month), format="GTiff")
-                    if tmp_month.exists() and tmp_month.stat().st_size > 0:
-                        tmp_month.rename(month_cache)
+                    if _sync_split_active():
+                        _dl_quadrants(tmp_month)
                     else:
-                        tmp_month.unlink(missing_ok=True)
-                        raise RuntimeError("download produced empty file")
+                        try:
+                            _dl_cube(bbox, tmp_month)
+                        except Exception as fe:
+                            if not _is_read_timeout(str(fe)):
+                                raise
+                            # Full cell too slow for openEO right now —
+                            # arm split mode and retry this month as
+                            # quadrants straight away.
+                            _sync_split_arm(str(fe))
+                            tmp_month.unlink(missing_ok=True)
+                            _dl_quadrants(tmp_month)
+                    tmp_month.rename(month_cache)
                 except Exception:
                     tmp_month.unlink(missing_ok=True)
                     raise
@@ -2260,7 +2404,8 @@ def get_ndvi_timeseries(
                 else:
                     cooldown = _FAILED_MONTH_402_COOLDOWN_SECS
                     consecutive_402 = 0
-                # Track upstream-stress cascade (503/502/500/504) separately
+                # Track upstream-stress cascade (503/502/500/504, and sync
+                # read-timeouts that survived quadrant splitting) separately
                 # from 402: it indicates the openeo origin is overloaded,
                 # not that our credential is exhausted.
                 if any(s in exc_str for s in ('500', '502', '503', '504',
@@ -2268,7 +2413,8 @@ def get_ndvi_timeseries(
                                               'Service Unavailable',
                                               'Server error',
                                               'too many 503',
-                                              'no available server')):
+                                              'no available server')) \
+                        or _is_read_timeout(exc_str):
                     consecutive_5xx += 1
                 else:
                     consecutive_5xx = 0

@@ -19987,6 +19987,62 @@ def _v2_verify_fail_histogram(hours: float = 24.0, ttl: float = 60.0) -> dict:
     return v
 
 
+_OPENEO_HEALTH_CACHE: dict = {'t': 0.0, 'v': {}}
+
+
+def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
+    """Fleet openEO sync-path health from the merged log (last *hours*).
+
+    Counts per peer: ``NDVI … Read timed out`` month failures,
+    ``openEO sync path slow`` split-mode arms, ``Upstream-stress
+    cascade`` KG deferrals and ``mosaicked N/4 quadrants`` successes.
+    Rendered as the ``openeo:`` line in ``/process.txt`` so an operator
+    can tell "openEO slow, split mode coping" from "openEO down, KGs
+    being deferred" without grepping. TTL-cached.
+    """
+    import re as _re
+    now = time.time()
+    if now - _OPENEO_HEALTH_CACHE['t'] < ttl:
+        return _OPENEO_HEALTH_CACHE['v']
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    mult = _re.compile(r'×(\d+)$')
+    v = {'timeouts': 0, 'split_arms': 0, 'cascades': 0, 'quad_ok': 0,
+         'peers_timeout': set(), 'peers_split': set(), 'peers_cascade': set(),
+         'hours': hours}
+    try:
+        with _COMBINED_LOG_PATH.open() as fh:
+            for line in fh:
+                if 'openeo' not in line and 'openEO' not in line \
+                        and 'Upstream-stress' not in line and 'quadrants' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if (e.get('ts') or '') < cutoff:
+                    continue
+                msg = e.get('msg') or e.get('message') or ''
+                peer = e.get('peer') or '?'
+                m = mult.search(msg)
+                n = int(m.group(1)) if m else 1
+                if 'Read timed out' in msg and 'NDVI' in msg:
+                    v['timeouts'] += n; v['peers_timeout'].add(peer)
+                elif 'openEO sync path slow' in msg:
+                    v['split_arms'] += n; v['peers_split'].add(peer)
+                elif 'Upstream-stress cascade' in msg:
+                    v['cascades'] += n; v['peers_cascade'].add(peer)
+                elif 'mosaicked' in msg and 'quadrants' in msg:
+                    v['quad_ok'] += n
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception('openeo health scan failed')
+    for k in ('peers_timeout', 'peers_split', 'peers_cascade'):
+        v[k] = sorted(v[k])
+    _OPENEO_HEALTH_CACHE.update(t=now, v=v)
+    return v
+
+
 @app.route('/process.txt')
 @app.route('/api/v1/dashboard.txt')
 def process_txt():
@@ -20319,6 +20375,24 @@ def process_txt():
                 out.append('          ' + ' · '.join(parts[3:]))
     except Exception:
         log.exception('process.txt throttle block failed')
+
+    # --- openEO sync-path health (1h, from merged log) -----------
+    try:
+        _oh = _openeo_health()
+        if _oh.get('timeouts') or _oh.get('split_arms') or _oh.get('cascades'):
+            _state = ('DEGRADED — KGs being deferred' if _oh['cascades']
+                      else 'SLOW — quadrant split mode' if _oh['split_arms']
+                      else 'timeouts')
+            out.append(
+                f"openeo:   {_state} · 1h: month_timeouts={_oh['timeouts']} "
+                f"(≈{_oh['timeouts'] * 4}min burned, peers={len(_oh['peers_timeout'])}) "
+                f"split_arms={_oh['split_arms']} quad_mosaics_ok={_oh['quad_ok']} "
+                f"cascades→defer={_oh['cascades']}"
+                + (f" [{','.join(_oh['peers_cascade'][:6])}]" if _oh['peers_cascade'] else '')
+                + " · debug: ?q=openeo&warn=1"
+            )
+    except Exception:
+        log.exception('process.txt openeo line failed')
 
     # --- BEV outage state + IP-pool egress ---------------------
     # Surfaced compactly so an agent curl-ing process.txt can see at

@@ -244,6 +244,21 @@ def get_harmonic_features(
         return params
 
     except Exception as e:
+        # Throttle / credential signals must propagate (AGENTS.md
+        # invariant): tile_cache → austria_processor turn them into a
+        # KG defer + 15 min copernicus pause so the director switches
+        # peer. Swallowing them here (pre 2026-09-23) meant the openEO
+        # read-timeout cascade from 72f0585 never deferred anything —
+        # every tile burned 2×(240 s + quadrant) timeouts and was baked
+        # without harmonics.
+        try:
+            from copernicus import (CreditsExhaustedError, IPThrottledError,
+                                    CredentialRotatedError)
+            _sig = (CreditsExhaustedError, IPThrottledError, CredentialRotatedError)
+        except ImportError:
+            _sig = ()
+        if _sig and (isinstance(e, _sig) or isinstance(e.__cause__, _sig)):
+            raise
         log.warning("Harmonic feature computation failed: %s", e)
         return None
 

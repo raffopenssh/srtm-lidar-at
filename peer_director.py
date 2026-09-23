@@ -1688,6 +1688,23 @@ V2_REGEN_MAX_REQUEUE_PER_TICK = 3
 V2_REGEN_MAX_OUTSTANDING = 20
 V2_REGEN_DONE_TTL_S = 7 * 86400
 
+# === SECTION: v2 orphan sweep (parent-level _json_v2 residue) ===
+# Sep 2026: before the upload-chain ordering fix, a fresh run whose
+# _full_gpkg / _light_gpkg_v2 upload timed out still landed the tiny
+# ``<code>_json_v2`` before the KG was re-queued. The re-run then went
+# through the splitter and produced complete *block* products, leaving a
+# parent-level ``_json_v2`` with no sibling ``_json`` / ``_full_gpkg`` /
+# ``_light_gpkg_v2``. Nothing can heal it (no full GPKG to upgrade from,
+# coverage oracle already complete via the blocks) and it poisons the
+# telemetry: v2_ingest strikes out on it (``verify_fail``) and the
+# parents_by_version histogram reports it as a stale v2.x parent.
+# The sweep removes such entries — Zenodo deposition first, manifest +
+# tombstone second — only after verifying against the deposition API
+# that the depo holds exactly that one ``_v2.json.gz`` file.
+V2_ORPHAN_CHECK_INTERVAL_S = 1800
+V2_ORPHAN_MIN_AGE_S = 24 * 3600
+V2_ORPHAN_MAX_PER_TICK = 3
+
 
 def _v2_regen_load() -> dict:
     try:
@@ -7015,6 +7032,138 @@ class PeerDirector:
             os.replace(tmp, manifest_path)
         except Exception as e:
             log.debug('zenodo_circuit publish failed: %s', e)
+
+    # ------------------------------------------------------------------
+    def _check_v2_orphans(self) -> None:
+        """Remove dead parent-level ``_json_v2`` residue (see the
+        ``v2 orphan sweep`` SECTION). Director-loop worker only, every
+        V2_ORPHAN_CHECK_INTERVAL_S. Hard gates: Zenodo circuit clear,
+        entry ≥24 h old, code not queued / not running on any peer,
+        parent bbox covered without it, and the deposition on Zenodo
+        contains exactly the one ``<code>_v2.json.gz`` file."""
+        now = time.time()
+        if now - float(self.state.get('_v2_orphan_checked_at') or 0) < V2_ORPHAN_CHECK_INTERVAL_S:
+            return
+        self.state['_v2_orphan_checked_at'] = now
+        try:
+            from zenodo_cache import zenodo_degraded as _zdeg
+            if _zdeg() or (self.state.get('zenodo_circuit') or {}).get('degraded'):
+                return
+        except Exception:
+            return
+        mf_path = DATA_DIR / 'zenodo_manifest.json'
+        try:
+            raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}
+            ent = raw.get('entries', raw) or {}
+        except Exception:
+            return
+        try:
+            import app as _app
+            _cov = _app._kg_coverage_complete
+        except Exception:
+            return
+        try:
+            qpath = DATA_DIR / 'retry_queue.json'
+            queue = set(json.loads(qpath.read_text())) if qpath.exists() else set()
+        except Exception:
+            queue = set()
+        running: set = set()  # filled lazily (peer fanout) once a candidate exists
+
+        def _com(e):
+            return isinstance(e, dict) and int(e.get('size') or 0) > 0 and bool(e.get('uploaded_at'))
+
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=V2_ORPHAN_MIN_AGE_S)
+        cands = []
+        for k, e in ent.items():
+            if not k.endswith('_json_v2') or not _com(e):
+                continue
+            code = k[:-len('_json_v2')]
+            if code in queue:
+                continue
+            if any(_com(ent.get(f'{code}_{sfx}')) for sfx in
+                   ('json', 'full_gpkg', 'light_gpkg', 'light_gpkg_v2')):
+                continue
+            try:
+                if datetime.fromisoformat(str(e['uploaded_at'])) > cutoff:
+                    continue
+            except Exception:
+                continue
+            parent = code.split('-')[0]
+            try:
+                sans = dict(ent); sans.pop(k, None)
+                if not _cov(parent, sans)[0]:
+                    continue
+            except Exception:
+                continue
+            cands.append((code, k, e))
+        if not cands:
+            return
+        try:
+            running = _in_progress_kgs(self.cfg)
+        except Exception:
+            return
+        cands = [c for c in cands if c[0] not in running and c[0].split('-')[0] not in running]
+        if not cands:
+            return
+        import zenodo_client as _zc
+        hdr = {'Authorization': f'Bearer {_zc.DEFAULT_TOKEN}'}
+        done = 0
+        for code, key, e in cands:
+            if done >= V2_ORPHAN_MAX_PER_TICK:
+                break
+            depo = e.get('depo_id')
+            if not depo or any(kk != key and isinstance(ee, dict) and ee.get('depo_id') == depo
+                               for kk, ee in ent.items()):
+                continue
+            try:
+                r = requests.get(f'https://zenodo.org/api/deposit/depositions/{depo}',
+                                 headers=hdr, timeout=30)
+            except Exception as ex:
+                log.info('v2_orphan: %s depo %s probe failed (%s) — skip', code, depo, ex)
+                continue
+            if r.status_code == 404:
+                files = []
+            elif r.status_code != 200:
+                log.info('v2_orphan: %s depo %s HTTP %s — skip', code, depo, r.status_code)
+                continue
+            else:
+                d = r.json()
+                files = [f.get('filename') for f in (d.get('files') or [])]
+                if d.get('submitted') or files != [f'{code}_v2.json.gz']:
+                    log.warning('v2_orphan: %s depo %s unexpected (submitted=%s files=%s) — NOT touching',
+                                code, depo, d.get('submitted'), files)
+                    continue
+                try:
+                    from zenodo_lock import zenodo_upload_lock
+                    with zenodo_upload_lock(purpose='v2_orphan', max_wait_s=120):
+                        rd = requests.delete(f'https://zenodo.org/api/deposit/depositions/{depo}',
+                                             headers=hdr, timeout=60)
+                except Exception as ex:
+                    log.info('v2_orphan: %s depo %s delete failed (%s) — skip', code, depo, ex)
+                    continue
+                if rd.status_code not in (204, 404):
+                    log.warning('v2_orphan: %s depo %s DELETE HTTP %s — skip', code, depo, rd.status_code)
+                    continue
+            try:
+                rm = requests.delete(f'http://127.0.0.1:8000/api/v1/processing/manifest/{key}', timeout=15)
+                ok = rm.status_code in (200, 404)
+            except Exception as ex:
+                ok = False
+                log.warning('v2_orphan: %s manifest delete failed: %s', key, ex)
+            try:
+                import v2_ingest as _vi
+                _vi._clear_failure(code)
+            except Exception:
+                pass
+            done += 1
+            try:
+                import app as _app
+                _app.director_event(
+                    f'v2orphan: removed parent-level {key} (depo {depo}, {int(e.get("size") or 0)} B, '
+                    f'no _json/_full_gpkg/_light_gpkg_v2; blocks cover parent) manifest_ok={ok}',
+                    peer='director', kg=code)
+            except Exception:
+                pass
 
     def _check_v2_regen(self) -> None:
         """Verify + auto-requeue v2_regen candidates (see V2_REGEN_FILE
@@ -13266,6 +13415,10 @@ class PeerDirector:
                     self._check_v2_regen()
                 except Exception:
                     log.exception('v2_regen check error')
+                try:
+                    self._check_v2_orphans()
+                except Exception:
+                    log.exception('v2_orphan sweep error')
                 try:
                     self._reconcile_cache_manifest_if_due()
                 except Exception:

@@ -41,6 +41,11 @@ REQUEST_TIMEOUT = 60  # seconds
 TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_S = 5.0
+# Sep 2026: cold KGs answer HTTP 202 + Retry-After (warming from the API's
+# Zenodo mirror) instead of blocking. ``?wait=`` (max 120 s) asks the server
+# to block first; leftover 202s are polled up to PENDING_BUDGET_S.
+EXPORT_WAIT_S = 120
+PENDING_BUDGET_S = 10 * 60
 
 # Reusable CRS transformer (thread-safe after creation)
 _TRANSFORMER_4326_TO_3035 = Transformer.from_crs(
@@ -58,11 +63,29 @@ def _request(method: str, url: str, *, what: str, attempts: int = MAX_ATTEMPTS,
     connection errors, timeouts).  Raises the last exception after
     *attempts*; non-transient HTTP errors raise immediately."""
     last: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    pending_deadline = time.monotonic() + PENDING_BUDGET_S
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         try:
             resp = requests.request(method, url, **kw)
             if resp.status_code in TRANSIENT_STATUS:
                 resp.raise_for_status()
+            if resp.status_code == 202:
+                # Not an error and NOT an empty result: the KG is still being
+                # fetched from Zenodo by the cadastre API. Poll per Retry-After.
+                try:
+                    ra = float(resp.headers.get("Retry-After") or 8)
+                except ValueError:
+                    ra = 8.0
+                ra = min(max(ra, 1.0), 60.0)
+                if time.monotonic() + ra > pending_deadline:
+                    raise requests.exceptions.RetryError(
+                        f"cadastre {what} still pending (202) after {PENDING_BUDGET_S}s")
+                log.info("cadastre %s pending (202) — retry in %.0fs", what, ra)
+                time.sleep(ra)
+                attempt -= 1
+                continue
             return resp
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", None)
@@ -264,8 +287,9 @@ def fetch_building_footprints(
                         "kg": kg,
                         "layers": "building_footprints",
                         "include_geometry": "true",
+                        "wait": EXPORT_WAIT_S,
                     },
-                    timeout=REQUEST_TIMEOUT * 2,  # KG export can be slower
+                    timeout=EXPORT_WAIT_S + REQUEST_TIMEOUT,  # server may block on ?wait
                 )
                 elapsed = time.time() - t0
                 resp.raise_for_status()

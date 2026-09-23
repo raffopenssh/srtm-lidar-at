@@ -119,9 +119,22 @@ def fetch_cadastre_vectors(kg_code: str) -> dict[str, gpd.GeoDataFrame]:
         ("landuse",            {"kg": kg_code, "layers": "landuse"}),
     ]:
         try:
-            r = requests.get(f"{CADASTRE_BASE}/export/geojson",
-                             params=params, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
+            # Cold KGs answer 202 (+Retry-After) while the cadastre API pulls
+            # the file from its Zenodo mirror; ?wait= lets it block up to 120 s
+            # first. Poll the remainder — a 202 body has no ``features``.
+            params = dict(params, wait=120)
+            deadline = time.monotonic() + 600
+            while True:
+                r = requests.get(f"{CADASTRE_BASE}/export/geojson",
+                                 params=params, timeout=REQUEST_TIMEOUT + 120)
+                r.raise_for_status()
+                if r.status_code != 202:
+                    break
+                ra = min(max(float(r.headers.get("Retry-After") or 8), 1), 60)
+                if time.monotonic() + ra > deadline:
+                    raise RuntimeError(f"{layer_name}: still pending (202) after 600s")
+                log.info("  %s: pending (202), retry in %.0fs", layer_name, ra)
+                time.sleep(ra)
             gj = r.json()
             feats = gj.get("features", [])
             if not feats:

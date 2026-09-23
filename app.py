@@ -47,6 +47,20 @@ import geo_parse
 from zenodo_fetch import FetchInProgress
 import search_index as si
 import cadastre_bridge as cb
+
+
+def _cadastre_pending_response(e):
+    """Upstream cadastre API answered 202 (KG warming from its Zenodo mirror).
+    Mirror that to the client: 202 + Retry-After, never a 502 — the caller
+    should simply repeat the identical request."""
+    ra = max(1, min(int(getattr(e, 'retry_after', 8) or 8), 60))
+    resp = jsonify({'status': 'pending', 'error': str(e), 'retry_after_s': ra,
+                    'hint': 'cadastre API is warming this KG from Zenodo; '
+                            'repeat the same request after retry_after_s'})
+    resp.status_code = 202
+    resp.headers['Retry-After'] = str(ra)
+    return resp
+
 import feedback_db
 import quality_flags
 
@@ -11837,6 +11851,8 @@ def api_lookup():
             limit=int(request.args.get('limit', 20)),
         )
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12009,6 +12025,10 @@ def api_parcels_batch():
 
         return jsonify({'error': 'No filters provided. Use query params (state=, min_slope=, etc.) or POST JSON body with parcel_ids/query/compound.'}), 400
 
+    except cb.CadastrePending as e:
+
+        return _cadastre_pending_response(e)
+
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12087,6 +12107,8 @@ def api_parcels_landscape():
             offset=offset,
         )
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12141,6 +12163,8 @@ def api_query_nature():
             offset=int(args.get('offset', 0)),
         )
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12188,6 +12212,8 @@ def api_query_habitat_count():
         return jsonify(result)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12208,6 +12234,8 @@ def api_parcel_detail(parcel_id):
         if 'error' in result:
             return jsonify(result), 400
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12225,6 +12253,8 @@ def api_kg_profile(kg_code):
     try:
         result = cb.kg_combined_profile(kg_code)
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12245,6 +12275,8 @@ def api_cadastre_legal_search():
         params = {k: v for k, v in request.args.items()}
         result = cb.cadastre_proxy('/legal/search', params=params)
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12262,6 +12294,8 @@ def api_cadastre_protected_areas():
         params = {k: v for k, v in request.args.items()}
         result = cb.cadastre_proxy('/search/protected_area', params=params)
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12278,6 +12312,8 @@ def api_cadastre_landuse_distribution():
         params = {k: v for k, v in request.args.items()}
         result = cb.cadastre_proxy('/landuse/distribution', params=params)
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:
@@ -12290,6 +12326,8 @@ def api_cadastre_landuse_codes():
     try:
         result = cb.cadastre_proxy('/landuse/codes')
         return jsonify(result)
+    except cb.CadastrePending as e:
+        return _cadastre_pending_response(e)
     except cb.CadastreError as e:
         return jsonify({'error': str(e)}), 502
     except Exception as e:

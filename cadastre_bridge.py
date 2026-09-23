@@ -92,7 +92,18 @@ def cadastre_proxy(endpoint: str, params: dict | None = None,
         else:
             resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
+        if resp.status_code == 202:
+            # Sep 2026: cold-KG answers are 202 + warming block, never an
+            # empty result. Don't cache; surface as retryable to the caller.
+            ra = resp.headers.get('Retry-After') or '8'
+            raise CadastrePending(
+                f'Cadastre API still warming KG data for {endpoint} '
+                f'(retry after {ra}s)', retry_after=ra)
         data = resp.json()
+        if isinstance(data, dict) and data.get('status') == 'pending' and 'warming' in data:
+            raise CadastrePending(
+                f'Cadastre API still warming KG data for {endpoint}',
+                retry_after=(data.get('warming') or {}).get('retry_after_s') or 8)
         if cache_key:
             _cache_set(cache_key, data)
         return data
@@ -109,6 +120,18 @@ def cadastre_proxy(endpoint: str, params: dict | None = None,
 class CadastreError(Exception):
     """Raised when the cadastre API call fails."""
     pass
+
+
+class CadastrePending(CadastreError):
+    """Cadastre API answered 202: the KG is still warming from its Zenodo
+    mirror. Retry the same request after ``retry_after`` seconds."""
+
+    def __init__(self, msg: str, retry_after=8):
+        super().__init__(msg)
+        try:
+            self.retry_after = int(float(retry_after))
+        except (TypeError, ValueError):
+            self.retry_after = 8
 
 
 # ═══════════════════════════════════════════════════════════════════════════

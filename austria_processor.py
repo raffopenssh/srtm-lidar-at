@@ -1339,6 +1339,61 @@ _CADASTRE_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 _CADASTRE_MAX_ATTEMPTS = 5
 _CADASTRE_BACKOFF_BASE_S = 5.0
 
+# Sep 2026: the cadastre API no longer blocks on a cold KG. /export/geojson
+# answers HTTP 202 + Retry-After with a ``warming`` block (no ``parcels`` /
+# ``building_footprints`` keys!) while the KG file comes from its Zenodo
+# mirror. A 202 must be POLLED, never parsed as an empty cadastre —
+# ``raise_for_status()`` lets 2xx through, so without the guard below a cold
+# KG silently produced a GPKG with zero parcels. ``?wait=`` (max 120 s)
+# makes the server block as long as it can first; the polling loop has its
+# own budget independent of the transient-error attempts.
+_CADASTRE_EXPORT_WAIT_S = 120
+_CADASTRE_PENDING_BUDGET_S = 15 * 60
+_CADASTRE_PENDING_DEFAULT_RETRY_S = 8.0
+
+
+def _cadastre_pending(resp) -> tuple:
+    """-> (is_pending, retry_after_s, detail) for a cadastre API response.
+
+    Pending = HTTP 202, or a JSON body carrying ``status:pending`` /
+    ``warming`` (defensive: same shape on every 'not ready' answer).
+    """
+    pending = resp.status_code == 202
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    if isinstance(body, dict) and (body.get("status") == "pending" or "warming" in body):
+        pending = True
+    if not pending:
+        return False, 0.0, ""
+    ra = None
+    try:
+        ra = float(resp.headers.get("Retry-After") or 0) or None
+    except ValueError:
+        ra = None
+    detail = ""
+    if isinstance(body, dict):
+        w = body.get("warming") or {}
+        if ra is None:
+            try:
+                ra = float(w.get("retry_after_s") or 0) or None
+            except (TypeError, ValueError):
+                ra = None
+        kgs = w.get("kgs") or []
+        if kgs:
+            k = kgs[0]
+            detail = (f"state={k.get('state')} pct={k.get('pct')} "
+                      f"attempt={k.get('attempt')}/{k.get('max_attempts')} "
+                      f"queue_pos={k.get('queue_position')}")
+            if k.get("last_error"):
+                detail += f" last_error={str(k.get('last_error'))[:80]}"
+        z = w.get("zenodo") or {}
+        if z.get("status"):
+            detail += f" mirror={z.get('status')}"
+    ra = min(max(ra or _CADASTRE_PENDING_DEFAULT_RETRY_S, 1.0), 60.0)
+    return True, ra, detail.strip()
+
 # Layers we actually consume. ``landuse_polygons`` (~70 % of a full export)
 # was requested for years but never read downstream (segv2 gets landuse via
 # its own training-side fetch in segv2/labels.py) — dropped Sep 2026 per the
@@ -1406,16 +1461,21 @@ def fetch_cadastre_data(kg_code: str) -> dict:
     data = None
     last_exc = None
     cached_etag, cached_gz = _cadastre_cache_load(kg_code)
-    for _attempt in range(1, _CADASTRE_MAX_ATTEMPTS + 1):
+    _pending_deadline = time.monotonic() + _CADASTRE_PENDING_BUDGET_S
+    _pending_polls = 0
+    _attempt = 0
+    while _attempt < _CADASTRE_MAX_ATTEMPTS:
+        _attempt += 1
         try:
             _hdrs = {"If-None-Match": cached_etag} if (cached_etag and cached_gz) else {}
             resp = requests.get(
                 f"{CADASTRE_BASE}/export/geojson",
                 params={"kg": kg_code,
                         "layers": _CADASTRE_EXPORT_LAYERS,
-                        "include_geometry": "true"},
+                        "include_geometry": "true",
+                        "wait": _CADASTRE_EXPORT_WAIT_S},
                 headers=_hdrs,
-                timeout=120,
+                timeout=_CADASTRE_EXPORT_WAIT_S + 60,
             )
             if resp.status_code == 304 and cached_gz:
                 import gzip as _gz
@@ -1423,7 +1483,31 @@ def fetch_cadastre_data(kg_code: str) -> dict:
                 log.info("KG %s: cadastre export unchanged (304, local ETag cache)", kg_code)
                 break
             resp.raise_for_status()
+            _pend, _ra, _detail = _cadastre_pending(resp)
+            if _pend:
+                # Cold KG still warming from the cadastre API's Zenodo mirror.
+                # Poll (does NOT consume a transient-error attempt) until the
+                # pending budget is exhausted, then _fetch_failed -> requeue.
+                _pending_polls += 1
+                _attempt -= 1
+                if time.monotonic() + _ra > _pending_deadline:
+                    last_exc = RuntimeError(
+                        f"cadastre export still pending after "
+                        f"{_CADASTRE_PENDING_BUDGET_S // 60} min ({_detail})")
+                    break
+                _lvl = log.warning if _pending_polls % 5 == 0 else log.info
+                _lvl("KG %s: cadastre export pending (202, poll %d, %s) - "
+                     "retrying in %.0fs", kg_code, _pending_polls, _detail or "warming", _ra)
+                time.sleep(_ra)
+                continue
             data = resp.json()
+            if not isinstance(data, dict) or not any(
+                    k in data for k in ("parcels", "building_footprints", "buildings", "meta")):
+                # Neither a warming block nor a layered export (a genuinely
+                # empty KG still carries ``meta.feature_count=0``): never
+                # accept an unknown shape as "empty cadastre".
+                _keys = list(data)[:8] if isinstance(data, dict) else type(data).__name__
+                raise RuntimeError(f"unexpected cadastre export shape: keys={_keys}")
             _et = resp.headers.get("ETag")
             if _et:
                 _cadastre_cache_store(kg_code, _et, resp.content)
@@ -1449,6 +1533,16 @@ def fetch_cadastre_data(kg_code: str) -> dict:
                 log.warning("KG %s: cadastre fetch %s (attempt %d/%d), "
                             "retrying in %.0fs", kg_code, type(e).__name__,
                             _attempt, _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+        except RuntimeError as e:
+            # Unexpected body shape: treat as transient (API-side hiccup),
+            # never as "the KG has no cadastre".
+            last_exc = e
+            if _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch %s (attempt %d/%d), retrying in %.0fs",
+                            kg_code, e, _attempt, _CADASTRE_MAX_ATTEMPTS, _sleep)
                 time.sleep(_sleep)
                 continue
         except Exception as e:

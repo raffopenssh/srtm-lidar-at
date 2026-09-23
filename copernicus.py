@@ -2249,6 +2249,7 @@ def get_ndvi_timeseries(
                     raise
                 logger.info("NDVI %s downloaded OK%s", label,
                             " (via proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "")
+                _relay_info(f"NDVI {label} downloaded OK")  # feeds openeo: months_ok
                 try:
                     record_credential_usage(cred_idx, "success", "ndvi_ts")
                 except Exception:

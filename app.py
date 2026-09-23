@@ -20013,6 +20013,83 @@ def _v2_verify_fail_histogram(hours: float = 24.0, ttl: float = 60.0) -> dict:
 
 
 _OPENEO_HEALTH_CACHE: dict = {'t': 0.0, 'v': {}}
+_ZENODO_UPLOAD_HEALTH_CACHE: dict = {'t': 0.0, 'v': {}}
+
+
+def _zenodo_upload_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
+    """Fleet Zenodo *upload* health for the ``zenodo_uploads:`` line.
+
+    Successes come from ``zenodo_manifest.json`` (``uploaded_at`` within
+    the window, ``*_error`` keys excluded) — the only authoritative
+    "bytes actually committed" signal; peers' success INFO never reaches
+    the merged log.  Failures come from the merged log: per-attempt
+    ``PUT … failed (attempt k/N)`` lines (``final`` = k == N),
+    ``Zenodo network — re-queued`` KG deferrals and
+    ``zenodo_lock … acquire timeout`` leaseless proceeds.  Pairs with
+    ``zenodo_circuit:`` (which only knows *that* peers failed) so an
+    operator can tell "degraded but still committing 8 GB/h" from
+    "nothing lands".  TTL-cached.
+    """
+    import re as _re
+    now = time.time()
+    if now - _ZENODO_UPLOAD_HEALTH_CACHE['t'] < ttl:
+        return _ZENODO_UPLOAD_HEALTH_CACHE['v']
+    v = {'hours': hours, 'ok_files': 0, 'ok_bytes': 0, 'ok_files_24h': 0,
+         'ok_bytes_24h': 0, 'put_fail': 0, 'put_final': 0, 'requeued': 0,
+         'lock_timeouts': 0, 'peers_fail': set(), 'peers_ok': set()}
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff_24 = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff = cutoff_dt.isoformat()
+    try:
+        _m = json.loads(Path('data/austria_processor/zenodo_manifest.json').read_text())
+        for k, e in (_m.get('entries') or {}).items():
+            if not isinstance(e, dict) or k.endswith('_error'):
+                continue
+            ts = e.get('uploaded_at') or ''
+            try:
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            except Exception:
+                continue
+            if dt >= cutoff_24:
+                v['ok_files_24h'] += 1; v['ok_bytes_24h'] += int(e.get('size') or 0)
+                if dt >= cutoff_dt:
+                    v['ok_files'] += 1; v['ok_bytes'] += int(e.get('size') or 0)
+    except Exception:
+        pass
+    att = _re.compile(r'\(attempt (\d+)/(\d+)\)')
+    mult = _re.compile(r'×(\d+)$')
+    try:
+        with _COMBINED_LOG_PATH.open() as fh:
+            for line in fh:
+                if 'zenodo' not in line and 'Zenodo' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if (e.get('ts') or '') < cutoff:
+                    continue
+                msg = e.get('msg') or ''
+                peer = e.get('peer') or '?'
+                m = mult.search(msg)
+                n = int(m.group(1)) if m else 1
+                if 'zenodo_client: PUT' in msg and ('failed' in msg or 'error' in msg):
+                    v['put_fail'] += n; v['peers_fail'].add(peer)
+                    a = att.search(msg)
+                    if a and a.group(1) == a.group(2):
+                        v['put_final'] += n
+                elif 'Zenodo network — re-queued' in msg:
+                    v['requeued'] += n; v['peers_fail'].add(peer)
+                elif 'zenodo_lock' in msg and 'acquire timeout' in msg:
+                    v['lock_timeouts'] += n
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception('zenodo upload health scan failed')
+    for k in ('peers_fail', 'peers_ok'):
+        v[k] = sorted(v[k])
+    _ZENODO_UPLOAD_HEALTH_CACHE.update(t=now, v=v)
+    return v
 
 
 def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
@@ -20032,14 +20109,18 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     mult = _re.compile(r'×(\d+)$')
     v = {'timeouts': 0, 'split_arms': 0, 'cascades': 0, 'defers': 0,
-         'quad_ok': 0, 'peers_timeout': set(), 'peers_split': set(),
-         'peers_cascade': set(), 'peers_defer': set(), 'hours': hours}
+         'quad_ok': 0, 'months_ok': 0, 'burned_s': 0,
+         'peers_timeout': set(), 'peers_split': set(),
+         'peers_cascade': set(), 'peers_defer': set(), 'peers_ok': set(),
+         'hours': hours}
+    to_re = _re.compile(r'read timeout=(\d+)')
     try:
         with _COMBINED_LOG_PATH.open() as fh:
             for line in fh:
                 if 'openeo' not in line and 'openEO' not in line \
                         and 'Upstream-stress' not in line and 'quadrants' not in line \
-                        and 'Copernicus throttle' not in line:
+                        and 'Copernicus throttle' not in line \
+                        and 'downloaded OK' not in line:
                     continue
                 try:
                     e = json.loads(line)
@@ -20053,6 +20134,11 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
                 n = int(m.group(1)) if m else 1
                 if 'Read timed out' in msg and 'NDVI' in msg:
                     v['timeouts'] += n; v['peers_timeout'].add(peer)
+                    _tm = to_re.search(msg)
+                    v['burned_s'] += n * (int(_tm.group(1)) if _tm else 240)
+                elif 'downloaded OK' in msg and 'NDVI' in msg:
+                    # copernicus._relay_info month success (2c51c80+)
+                    v['months_ok'] += n; v['peers_ok'].add(peer)
                 elif 'openEO sync path slow' in msg:
                     v['split_arms'] += n; v['peers_split'].add(peer)
                 elif 'Upstream-stress cascade' in msg:
@@ -20070,7 +20156,8 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
         pass
     except Exception:
         log.exception('openeo health scan failed')
-    for k in ('peers_timeout', 'peers_split', 'peers_cascade', 'peers_defer'):
+    for k in ('peers_timeout', 'peers_split', 'peers_cascade', 'peers_defer',
+              'peers_ok'):
         v[k] = sorted(v[k])
     _OPENEO_HEALTH_CACHE.update(t=now, v=v)
     return v
@@ -20412,18 +20499,31 @@ def process_txt():
     # --- openEO sync-path health (1h, from merged log) -----------
     try:
         _oh = _openeo_health()
-        if _oh.get('timeouts') or _oh.get('split_arms') or _oh.get('cascades'):
+        if _oh.get('timeouts') or _oh.get('split_arms') or _oh.get('cascades') \
+                or _oh.get('months_ok'):
+            _ok, _to = _oh.get('months_ok', 0), _oh['timeouts']
             _state = ('DEGRADED — KGs being deferred' if _oh.get('defers')
                       else 'DEGRADED — cascades NOT deferring (check swallow)'
                       if _oh['cascades']
                       else 'SLOW — quadrant split mode' if _oh['split_arms']
-                      else 'timeouts')
+                      else 'timeouts' if _to
+                      else 'OK')
+            if _ok and _to and _ok >= _to:
+                _state += ' (serving: more months OK than timed out)'
+            try:
+                import copernicus as _cop_mod
+                _tos = (f"{_cop_mod._MONTH_SYNC_TIMEOUT_FULL}/"
+                        f"{_cop_mod._MONTH_SYNC_TIMEOUT_QUAD}s")
+            except Exception:
+                _tos = '?'
             out.append(
-                f"openeo:   {_state} · 1h: month_timeouts={_oh['timeouts']} "
-                f"(≈{_oh['timeouts'] * 4}min burned, peers={len(_oh['peers_timeout'])}) "
+                f"openeo:   {_state} · 1h: months_ok={_ok} (peers={len(_oh.get('peers_ok', []))}) "
+                f"month_timeouts={_to} (≈{_oh.get('burned_s', 0) // 60}min burned, "
+                f"peers={len(_oh['peers_timeout'])}) "
                 f"split_arms={_oh['split_arms']} quad_mosaics_ok={_oh['quad_ok']} "
                 f"cascades={_oh['cascades']} kg_defers={_oh.get('defers', 0)}"
                 + (f" [{','.join(_oh['peers_cascade'][:6])}]" if _oh['peers_cascade'] else '')
+                + f" · sync_timeout full/quad={_tos} (months_ok/quad_ok need ≥2c51c80 peers)"
                 + " · debug: ?q=openeo&warn=1"
             )
     except Exception:
@@ -21370,11 +21470,30 @@ def process_txt():
         # to peers) + last cache_manifest ↔ deposit reconcile summary.
         _zc = d.get('zenodo_circuit') or (
             cmf.get('zenodo_circuit') if isinstance(cmf, dict) else None) or {}
+        # Evidence check (2026-09-23): the circuit only knows that peers
+        # *reported failures*; it said DEGRADED for 17 h while ~8 GB/h of
+        # GPKGs were still landing (Zenodo closing some PUT streams with
+        # SSLEOFError, retry ladder absorbing it). Committed bytes in the
+        # manifest are the ground truth — if uploads land, the banner
+        # says LOSSY (circuit still gates cache-cell replacements), and
+        # only a truly dry hour is DEGRADED.
+        try:
+            _zu_pre = _zenodo_upload_health()
+            _zen_landing = (_zu_pre['ok_files'] >= 5
+                            and _zu_pre['ok_bytes'] >= 1e9)
+        except Exception:
+            _zu_pre, _zen_landing = {}, False
         if _zc:
             if _zc.get('degraded'):
-                _health['zenodo_degraded'] = _zc
+                if _zen_landing:
+                    _health['zenodo_lossy'] = dict(
+                        _zc, gb_h=_zu_pre['ok_bytes'] / 1e9,
+                        put_final=_zu_pre['put_final'])
+                else:
+                    _health['zenodo_degraded'] = _zc
                 out.append(
-                    f'zenodo_circuit: DEGRADED since {_zc.get("since", "?")} '
+                    f'zenodo_circuit: {"TRIPPED (lossy — uploads still landing)" if _zen_landing else "DEGRADED"} '
+                    f'since {_zc.get("since", "?")} '
                     f'peers_15m={_zc.get("n_peers_15m", "?")} '
                     f'peers_since_trip={_zc.get("n_peers_since_trip", "?")} '
                     f'last_failure={_zc.get("last_failure_at", "?")} '
@@ -21388,6 +21507,30 @@ def process_txt():
                     + (f' cleared_at={_zc["cleared_at"]}' if _zc.get('cleared_at') else '')
                     + (f' last_failure={_zc["last_failure_at"]}' if _zc.get('last_failure_at') else '')
                 )
+        try:
+            _zu = _zenodo_upload_health()
+            try:
+                import zenodo_client as _zcl
+                _zcfg = (f"send_timeout={_zcl.Client._SEND_TIMEOUT_S}s "
+                         f"large_put≥{_zcl.Client._LARGE_PUT_BYTES // (1024*1024)}MB")
+            except Exception:
+                _zcfg = ''
+            _gbh = _zu['ok_bytes'] / 1e9 / max(_zu['hours'], 1e-6)
+            _zstate = ('STALLED — nothing committed' if not _zu['ok_files'] and _zu['put_fail']
+                       else 'lossy — most PUT attempts fail' if _zu['put_fail'] > 2 * max(_zu['ok_files'], 1)
+                       else 'ok')
+            out.append(
+                f"zenodo_uploads: {_zstate} · 1h: committed={_zu['ok_files']} files "
+                f"{_zu['ok_bytes']/1e9:.1f}GB ({_gbh:.1f}GB/h) "
+                f"put_attempts_failed={_zu['put_fail']} (final={_zu['put_final']}, "
+                f"peers={len(_zu['peers_fail'])}) kg_requeued={_zu['requeued']} "
+                f"lock_timeouts={_zu['lock_timeouts']} · 24h: {_zu['ok_files_24h']} files "
+                f"{_zu['ok_bytes_24h']/1e9:.0f}GB"
+                + (f" · {_zcfg}" if _zcfg else '')
+                + " · debug: ?q=zenodo_client&warn=1"
+            )
+        except Exception:
+            log.exception('process.txt zenodo_uploads line failed')
         _cr = d.get('cache_reconcile') or {}
         if not _cr:
             try:
@@ -22057,6 +22200,12 @@ def process_txt():
             _flags.append(
                 'FLEET-DORMANT(since '
                 + str(_health['dormant'].get('since', '?')) + ')')
+        if _health.get('zenodo_lossy'):
+            _zl = _health['zenodo_lossy']
+            _flags.append(
+                f'ZENODO-LOSSY({_zl["gb_h"]:.1f}GB/h landing, '
+                f'{_zl.get("put_final", 0)} PUTs gave up/1h, '
+                f'{_zl.get("n_peers_15m", "?")} peers/15m)')
         if _health.get('zenodo_degraded'):
             _flags.append(
                 'ZENODO-DEGRADED(since '

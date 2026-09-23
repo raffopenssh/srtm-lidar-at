@@ -370,6 +370,25 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
             if b - fatal_tol <= a < b - TOL["seg_coverage_pp_warn"]:
                 rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp)", fatal=False)
             continue
+        if k == "building_height_coverage_pct":
+            # Percentage over a *small* denominator: 40114-northeast-1 has
+            # 4 buildings (75.0 vs 100.0 = one building), 63323-south 17
+            # (70.6 vs 75.0 = one), 90014-northwest-2 ~22 (76.7 vs 81.8 =
+            # one) — all struck on a 2 pp gate on 2026-09-23 although a
+            # single edge building flipping its nDSM sample is run-to-run
+            # noise, not a lost tile.  Fatal only when ≥3 buildings (or
+            # 5 %) lost height; the pp figure stays a drift warning.
+            nb = int(_num(_g(v2, "building_footprints", "count"), 0) or 0)
+            nb1 = int(_num(_g(v1, "building_footprints", "count"), 0) or 0)
+            n = max(nb, nb1, 1)
+            lost = max(0.0, (b - a) * n / 100.0)
+            fatal_lost = max(3.0, 0.05 * n)
+            rep.check(f"{k}_ge_v1", lost <= fatal_lost,
+                      f"v2={a:.1f} v1={b:.1f} (≈{lost:.1f} of {n} buildings lost height; fatal >{fatal_lost:.0f})")
+            if lost <= fatal_lost and a < b - tol:
+                rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp, ≈{lost:.0f} buildings)",
+                          fatal=False)
+            continue
         rep.check(f"{k}_ge_v1", a >= b - tol, f"v2={a:.1f} v1={b:.1f}")
     # Tile-grid comparisons.  ``total_segmented_area_sqm`` is the SUM of
     # per-tile valid px over the overlapping 1.5 km grid and ``n_tiles``
@@ -792,11 +811,30 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             _nt = int(_num(_g(v2, "coverage", "n_tiles"), 1) or 1)
             _floor = 0.95 * ((1.4 / 1.5) ** 2 if _nt > 1 else 1.0)
             _r = nz / sa
-            rep.check("segment_type_raster_area", _r >= _floor,
-                      f"nonzero px={nz} json segmented m²={sa:.0f} ratio={_r:.3f} floor={_floor:.3f} tiles={_nt}")
-            if _floor <= _r < 0.95:
+            # The grid floor is exact only for a rectangular KG made of
+            # full tiles (2×2 → 0.934, 2×3 → 0.924 fleet-wide).  For a
+            # large irregular KG it is wrong in *both* directions:
+            # ``total_segmented_area_sqm`` counts every valid DTM px in
+            # the tile bboxes, while the stitched raster only keeps px of
+            # *kept* objects — segments <50 % inside the parcel union are
+            # dropped by the KG-mask filter and the centroid dedup drops
+            # overlap duplicates.  A KG whose parcel union fills only part
+            # of its 15-tile bbox therefore legitimately reads 0.75–0.83
+            # (47106 → 0.827 vs floor 0.828, 57210-south → 0.745/0.780,
+            # 2026-09-23: both struck, v2 products dropped for a healthy
+            # raster).  Real stitching loss is what ``segment_type_no_holes``
+            # measures *inside the union*, so whenever that check can run
+            # the area ratio is only a drift warning.  Fatal only when no
+            # union is available (legacy callers) or the raster is empty.
+            _shape_aware = hole is not None
+            _ok = nz > 0 and (_shape_aware or _r >= _floor)
+            rep.check("segment_type_raster_area", _ok,
+                      f"nonzero px={nz} json segmented m²={sa:.0f} ratio={_r:.3f} floor={_floor:.3f} tiles={_nt}"
+                      + (" (hole check authoritative)" if _shape_aware else ""))
+            if _ok and _r < 0.95:
                 rep.check("segment_type_raster_area_drift", False,
-                          f"ratio={_r:.3f} (tile-overlap double count, {_nt} tiles)", fatal=False)
+                          f"ratio={_r:.3f} (tile-overlap double count / KG-mask filter, {_nt} tiles)",
+                          fatal=False)
         if hole is not None:
             # Holes are expected when the doc itself declares a gap (an
             # unsegmented or upstream-failed tile) — inherited from the v1

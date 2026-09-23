@@ -1227,7 +1227,8 @@ document.getElementById('btn-dl-gpkg').onclick=async()=>{
         if(pj.active){
           const el=pj.elapsed?` (${pj.elapsed}s)`:'';
           const det=pj.detail?` — ${pj.detail}`:'';
-          btn.textContent=`⏳ ${pj.step||'Exporting'}${det}${el}`;
+          const pct=(pj.progress!=null)?` ${Math.round(pj.progress*100)}%`:'';
+          btn.textContent=`⏳${pct} ${pj.step||'Exporting'}${det}${el}`;
         }
       }catch(e){
         if(e.message&&!e.message.startsWith('Failed to fetch'))throw e;
@@ -2900,7 +2901,9 @@ async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=3600000){
       if(pj.active){
         const el=pj.elapsed?` (${pj.elapsed}s)`:'';
         const det=pj.detail?` — ${pj.detail}`:'';
-        setStatus(`${pj.step}${det}${el}`);
+        // byte-level Zenodo download progress (pj.fetch) → leading percentage
+        const pct=(pj.progress!=null)?`${Math.round(pj.progress*100)}% · `:'';
+        setStatus(`${pct}${pj.step}${det}${el}`);
       }
     }catch(e){
       // Network blip — just retry on next poll

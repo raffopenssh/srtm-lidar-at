@@ -558,7 +558,8 @@ tail -f /tmp/rf_train_4000kg.log
 ### Search & cross-API
 | File | Purpose |
 |---|---|
-| `search_index.py` | SQLite FTS5 + R-tree over 8440 KGs + `kg_parcels`. Auto-rebuild on new JSONs. |
+| `search_index.py` | SQLite FTS5 + R-tree over 8440 KGs + `kg_parcels`. Auto-rebuild on new JSONs. `GpkgCache` = lazy Zenodo GPKG cache. |
+| `zenodo_fetch.py` | Progress-aware / resumable / single-flight Zenodo product downloads (trees v3, `/kg/<code>/*` GPKG endpoints). `wait=` → 202 + progress; `/api/v1/zenodo/fetches`; `zenodo_fetch:` line in `/process.txt`. See `docs/search-index.md → GPKG cache`. |
 | `cadastre_bridge.py` | Joins cadastre API with landscape index (compound queries, nature scoring) |
 | `parcel_compact.py` | Compact per-parcel layout (`frav`, `top_objs`, `top_trees`) + `classify_parcel` (15-class) |
 

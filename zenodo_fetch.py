@@ -250,7 +250,9 @@ def get_hook() -> Optional[Callable[[dict], None]]:
 
 def _auth_headers(url: str, headers: Optional[dict]) -> dict:
     hdr = {'User-Agent': 'srtm-lidar/1.0 zenodo_fetch'}
-    if url.startswith('https://zenodo.org/api/files/') and 'access_token=' not in url:
+    # Both bucket URLs (/api/files/<uuid>/..) and draft record URLs
+    # (/api/records/<id>/draft/files/../content) are owner-only → Bearer.
+    if url.startswith('https://zenodo.org/api/') and 'access_token=' not in url:
         try:
             from zenodo_client import DEFAULT_TOKEN
             hdr['Authorization'] = f'Bearer {DEFAULT_TOKEN}'
@@ -288,6 +290,8 @@ def _stream_attempt(st: FetchState, url: str, hdr: dict, tmp: Path, expected: in
             except ValueError:
                 delay = 15.0
             raise _Backoff(f'HTTP {r.status_code}', delay)
+        if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
+            raise _Fatal(f'HTTP {r.status_code} {r.reason} for {redact(r.url)}')
         r.raise_for_status()
         mode = 'ab'
         if have > 0 and r.status_code != 206:
@@ -319,6 +323,10 @@ class _Backoff(Exception):
     def __init__(self, msg: str, delay: float):
         super().__init__(msg)
         self.delay = delay
+
+
+class _Fatal(Exception):
+    """Non-retryable (4xx other than 408/429: auth, gone, bad link)."""
 
 
 def _verify(st: FetchState, tmp: Path, expected: int, md5: Optional[str]) -> None:
@@ -408,6 +416,12 @@ def _run(st: FetchState, url: str, headers: Optional[dict], expected: int,
                          st.bytes_done / 1e6 / max(0.001, st.finished - st.started),
                          attempt, '' if attempt == 1 else 's')
                 return
+            except _Fatal as e:
+                last_exc = e
+                log.warning('zenodo_fetch: %s attempt %d: %s — not retrying', st.label, attempt, e)
+                st.error = str(e)[:200]
+                st.emit(force=True)
+                break
             except _Backoff as e:
                 last_exc = e
                 log.warning('zenodo_fetch: %s attempt %d: %s — backing off %.0fs',
@@ -427,7 +441,7 @@ def _run(st: FetchState, url: str, headers: Optional[dict], expected: int,
                 if attempt < MAX_ATTEMPTS:
                     time.sleep(min(30.0, 2.0 ** attempt))
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f'download failed after {MAX_ATTEMPTS} attempts: {last_exc}')
+        raise RuntimeError(f'download failed after {st.attempt} attempt(s): {last_exc}')
     except BaseException as e:  # noqa: BLE001
         st.status = 'error'
         st.error = str(e)[:200]
@@ -456,13 +470,40 @@ def _run(st: FetchState, url: str, headers: Optional[dict], expected: int,
         st.done_evt.set()
 
 
+def _recent_file(dest: Path) -> Path:
+    return dest.parent / SIDECAR_DIRNAME / '_recent.json'
+
+
 def _record_recent(st: FetchState) -> None:
+    """Append to the in-memory ring AND the shared on-disk ring
+    (``<cache>/.fetch/_recent.json``, flock-guarded) so both gunicorn
+    workers see the same completion history / throughput verdict."""
     if st.relay:
         return
     d = st.to_dict()
     with _RECENT_LOCK:
         _RECENT.append(d)
         del _RECENT[:-RECENT_MAX]
+    p = _recent_file(st.dest)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, 'a+') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                try:
+                    ring = json.loads(f.read() or '[]')
+                except Exception:  # noqa: BLE001
+                    ring = []
+                ring.append(d)
+                ring = ring[-RECENT_MAX:]
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(ring))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def start(url: str, dest: Path, *, headers: Optional[dict] = None, expected_size: int = 0,
@@ -507,9 +548,16 @@ def download(url: str, dest: Path, *, headers: Optional[dict] = None, expected_s
     if hook is None:
         hook = get_hook()
     st = start(url, dest, headers=headers, expected_size=expected_size, md5=md5, label=label, hook=hook)
-    timeout = 3600.0 if wait is None else max(0.0, float(wait))
+    timeout = 3600.0 if wait is None else max(0.2, float(wait))   # ≥0.2 s: let the thread report
     if not st.done_evt.wait(timeout):
-        raise FetchInProgress(st.to_dict())
+        d = st.to_dict()
+        if d['status'] == 'queued':
+            # not started here yet — the sibling worker may already be
+            # streaming this file; show ITS live numbers rather than 0 %
+            sc = _read_sidecar(dest)
+            if sc and sc.get('pid') != os.getpid() and time.time() - float(sc.get('updated') or 0) < 30:
+                d = {**sc, 'relay': True}
+        raise FetchInProgress(d)
     if st.exc is not None or st.result is None:
         raise RuntimeError(st.error or 'download failed')
     return st.result
@@ -642,9 +690,13 @@ def inflight(cache_dirs: Optional[list] = None) -> list[dict]:
         if not sd.is_dir():
             continue
         for p in sd.glob('*.json'):
+            if p.name.startswith('_'):      # _recent.json ring, not a sidecar
+                continue
             try:
                 sc = json.loads(p.read_text())
             except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(sc, dict):
                 continue
             if now - float(sc.get('updated') or 0) > 180:
                 try:
@@ -658,9 +710,24 @@ def inflight(cache_dirs: Optional[list] = None) -> list[dict]:
     return sorted(out.values(), key=lambda s: s.get('started') or 0)
 
 
-def recent() -> list[dict]:
+def recent(cache_dirs: Optional[list] = None) -> list[dict]:
+    """Most recent completed/failed fetches, newest first — merged from this
+    process and the shared on-disk ring(s)."""
     with _RECENT_LOCK:
-        return list(reversed(_RECENT))
+        mine = {(d['key'], d['started']): d for d in _RECENT}
+    dirs = set(cache_dirs or [])
+    try:
+        import search_index as si
+        dirs.add(Path(si.GPKG_CACHE_DIR))
+    except Exception:  # noqa: BLE001
+        pass
+    for d in dirs:
+        try:
+            for r in json.loads((Path(d) / SIDECAR_DIRNAME / '_recent.json').read_text()):
+                mine.setdefault((r.get('key'), r.get('started')), r)
+        except Exception:  # noqa: BLE001
+            pass
+    return sorted(mine.values(), key=lambda r: r.get('started') or 0, reverse=True)[:RECENT_MAX]
 
 
 def stats() -> dict:

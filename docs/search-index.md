@@ -202,9 +202,59 @@ Never drop a column — add a new one and migrate readers.
 ## GPKG cache (lazy detail loading)
 
 `GpkgCache` (bottom of file) downloads light GPKGs from Zenodo on demand
-for per-KG detail endpoints. Stored at
-`data/austria_processor/backfill_gpkg_cache/`. LRU eviction at
-`GPKG_CACHE_MAX_BYTES`. `_query_gpkg_layer(...)` reads via fiona/pyogrio.
+for per-KG detail endpoints. Stored at `data/gpkg_cache/` (files
+`<code>_<variant>.gpkg`; variant `light_v2` is the v2.x light GPKG shared
+with the v3 tree service). LRU eviction at `GPKG_CACHE_MAX_BYTES`.
+`_query_gpkg_layer(...)` reads via fiona/pyogrio.
+
+`_resolve_gpkg(kg, variant, wait, prefer_v1)` resolves local processor
+output → cache → Zenodo, taking the download link + byte size + md5 from
+the **manifest** (`<code>_light_gpkg_v2` first, then `_light_gpkg`;
+`prefer_v1` for layers only v1 has, e.g. `new_buildings`) and falling back
+to the index's `zenodo_*_gpkg_url`. Auth is added by the fetch layer
+(both `/api/files/<bucket>` and `/api/records/<id>/draft/...` are
+owner-only — the old code 403'd on the latter and surfaced as 404).
+
+### Downloads go through `zenodo_fetch.py` (progress-aware)
+
+All request-path Zenodo product downloads use `zenodo_fetch.download()`:
+
+* **Progress**: bytes done/total, EMA MB/s, ETA, attempt, status
+  (`queued|connecting|downloading|verifying|done|error`). Per-thread hook
+  (`zenodo_fetch.set_hook`) is bound by the async task workers
+  (`app._bind_fetch_progress`) so any download inside a task lands in the
+  task's progress file (`fetch` + `progress` fields of
+  `/api/v1/segment/progress`).
+* **Single-flight**: in-process waiters share one `FetchState`; across
+  gunicorn workers an `fcntl` lock on `<dest>.lock` makes the sibling
+  *relay* the sidecar progress (`<cache>/.fetch/<file>.json`) instead of
+  downloading a second copy.
+* **Robust to slow Zenodo**: 60 s per-read stall timeout, 4 attempts with
+  HTTP `Range` resume from the partial `.tmp`, 429/503 `Retry-After`
+  honoured, 4xx fail fast, size + md5 verified before the atomic rename.
+  ≤ `MAX_PARALLEL=4` concurrent downloads per process.
+* **Bounded blocking**: `download(wait=S)` raises `FetchInProgress(state)`
+  after S seconds while the download continues in the background. The
+  sync `GET /api/v1/kg/<code>/{buildings,new_buildings,infrastructure,
+  segments,layers}` endpoints use this (`?wait=`, default 25 s) to answer
+  `202 Accepted` + `Retry-After` + live state; the same URL returns 200
+  once the file is local.
+* **Parallel prefetch**: `prefetch_many(items, hook)` runs several
+  downloads at once and folds them into one aggregate (`k/N files, X/Y
+  MB, rate, ETA`) — `trees_v3.prefetch_gpkgs` pulls every covering GPKG
+  of an AOI concurrently before reading apices.
+* **Observability**: `GET /api/v1/zenodo/fetches` (in-flight from both
+  workers via sidecars, recent completions from the shared
+  `.fetch/_recent.json` ring, `stats.slow` = recent-hour median < 1 MB/s)
+  and the `zenodo_fetch:` line in `/process.txt` (only printed when there
+  is activity; flag `ZENODO-SLOW`).
+
+Debug:
+```bash
+curl -s localhost:8000/api/v1/zenodo/fetches | jq .text
+curl -s -i 'localhost:8000/api/v1/kg/<code>/buildings?wait=0&limit=1' | head -20   # 202 while cold
+ls -la data/gpkg_cache/.fetch/            # live sidecars + _recent.json
+```
 
 ## Where to look
 

@@ -328,7 +328,16 @@ Query/body params:
 
 Async flow:
   1. POST /api/v1/segment?async=true → 202 {task_id, status: "running"}
-  2. GET  /api/v1/segment/progress?task_id=X → {active, step, detail, elapsed, done, error, auto_share_id}
+  2. GET  /api/v1/segment/progress?task_id=X → {active, step, detail, elapsed, done, error, auto_share_id,
+          progress?, fetch?, updated_ago}
+       progress = 0..1 fraction of the CURRENT step when known (e.g. a Zenodo download).
+       fetch    = live Zenodo download state while step=="download": {status
+          (queued|connecting|downloading|verifying|done|error), label, bytes_done,
+          bytes_total, pct, rate_mbps, eta_s, elapsed_s, attempt, files_done,
+          files_total, files_failed, active:[labels]}. All product-backed
+          endpoints (v3 tree service, GPKG layer reads) report through this, so a
+          slow Zenodo shows as a moving byte counter + ETA, never a silent spinner.
+          Host-wide view: GET /api/v1/zenodo/fetches.
   3. GET  /api/v1/segment/result?task_id=X → full result
   4. POST /api/v1/segment/abort?task_id=X → cancel
 
@@ -758,6 +767,12 @@ is_edge trees from features too), crown_geometry=point|polygon
 products / live rows fall back to the apex point; meta.crown_polygons
 counts), legacy_ids, detection_mode=ndsm_only|fused (see below),
 fallback_live, dataset (live part), async.
+Cold products are pulled from Zenodo IN PARALLEL (all covering light
+GPKGs at once) and the task progress reports the aggregate download —
+step "download", detail "Downloading 3 light GPKG(s) from Zenodo: 1/3
+files, 120.6/250.6 MB · 4.5 MB/s · ETA 29s", plus structured
+progress/fetch fields (see /api/v1/segment/progress). Use async=true for
+AOIs touching uncached KGs; a sync call blocks for the download.
 detection_mode=fused: runs the live v2.3 fused detector (0.4 m ortho
 seeds + nDSM, ortho spectra) over the WHOLE AOI at /api/v2/trees cost,
 then joins product rows by tree_id and carries stand_context,
@@ -1091,7 +1106,8 @@ Async support: Slow queries (parcels_by_type, top_features) support async=true.
 Speed tiers:
   FAST (<25ms)   Index queries: bbox, admin, type ranking, confidence, divergence, compound, segments
   MEDIUM (~1s)   JSON scan (pre-filtered): parcels_by_type, top_features, parcel lookup
-  SLOW (~10s)    GPKG download+query: /api/v1/kg/<code>/buildings, segments, etc.
+  SLOW (~10s+)   GPKG download+query: /api/v1/kg/<code>/buildings, segments, etc.
+                 (cold Zenodo fetch → 202 + progress after wait=S, see GPKG-backed KG endpoints)
 
 Confidence types:
   rf_confidence   Raw Random Forest model prediction score (0-1). The direct output
@@ -1520,9 +1536,30 @@ Add ?index_only=true to always use index (faster, no file I/O).
 #### GET /api/v1/parcel/<KGCODE-GNR>
 Parcel lookup via search index + local JSON detail.
 
+#### GPKG-backed KG endpoints & Zenodo download progress (buildings, new_buildings, infrastructure, segments, layers)
+These read the KG's light GPKG. First access lazy-loads it from Zenodo
+(10–900 MB, cached 1 GB LRU; v2 light GPKG preferred, shared with the v3
+tree service). Downloads are resumable, retried, single-flight (one
+download per file across all workers/clients) and PROGRESS-AWARE:
+  wait=S   seconds to block on a cold download (default 25, max 120, 0 = never).
+  → 200 JSON once the GPKG is local (cached KGs: always immediate).
+  → 202 Accepted + Retry-After while still downloading, body:
+      {status:"fetching", kg_code, resource, message,
+       fetch:{status, bytes_done, bytes_total, pct, rate_mbps, eta_s, elapsed_s, attempt, error},
+       retry_after_s, poll (this URL), zenodo:{inflight, recent_1h_median_mbps, slow, …}, hint}
+    The download continues server-side; re-GET the same URL (wait=0 for a
+    pure poll) until 200. X-Fetch-Progress header carries the percentage.
+  → 404 when no GPKG exists for the KG; 500 only on a terminal download error.
+GET /api/v1/zenodo/fetches → {inflight:[…], recent:[…], stats:{inflight,
+  inflight_rate_mbps, recent_1h, recent_1h_failed, recent_1h_median_mbps,
+  slow (median < 1 MB/s), max_parallel}, text} — every Zenodo product
+  download on this host with bytes/rate/ETA/attempt (also the
+  `zenodo_fetch:` line of /process.txt, flag ZENODO-SLOW).
+
 #### GET /api/v1/kg/<kg_code>/buildings
 Height-enriched building footprints (GeoJSON features from light GPKG).
-Lazy-loads from Zenodo on first access, cached locally (1GB LRU).
+Lazy-loads from Zenodo on first access, cached locally (1GB LRU) — see
+"GPKG-backed KG endpoints & Zenodo download progress" above (wait=, 202).
 Properties: building_id, ns, full_address, house_number, street, postal_code, location,
   max_height_m, mean_height_m, dsm_std, roof_type_hint (flat/pitched), stories_est,
   footprint_area_sqm, centroid_lon, centroid_lat, centroid_dtm_m,

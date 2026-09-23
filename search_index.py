@@ -3677,8 +3677,9 @@ class SearchIndex:
         return _query_gpkg_layer(gpkg, 'buildings', bbox=bbox, limit=limit, offset=offset)
 
     def query_new_buildings_detail(self, kg_code, bbox=None, limit=500, offset=0, wait=None):
-        """Return detected new building footprints for a KG."""
-        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
+        """Return detected new building footprints for a KG (v1 light GPKG
+        layer; the v2 light GPKG has no ``new_buildings``)."""
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait, prefer_v1=True)
         if not gpkg:
             return None
         return _query_gpkg_layer(gpkg, 'new_buildings', bbox=bbox, limit=limit, offset=offset)
@@ -3736,7 +3737,7 @@ class SearchIndex:
             log.warning('gpkg_layers %s %s: %s', kg_code, variant, e)
             return None
 
-    def _resolve_gpkg(self, kg_code, variant='light', wait=None):
+    def _resolve_gpkg(self, kg_code, variant='light', wait=None, prefer_v1=False):
         """Find or download a GPKG for a KG. Returns local path or None.
 
         ``wait`` (seconds, None = block until done) is forwarded to
@@ -3759,26 +3760,45 @@ class SearchIndex:
         if cached:
             return cached
 
-        # 3. Zenodo URL from index
+        # 3. Zenodo — manifest first (fresh link + size + md5; for
+        #    variant=light prefer the v2 light GPKG, which shares the
+        #    ``light_v2`` cache slot with the v3 tree service), then the
+        #    index URL as a last resort.  Auth is added by zenodo_fetch.
+        candidates = []
+        try:
+            import trees_v3 as _t3
+            from v2_ingest import _link
+            ent = _t3.manifest_entries()
+            keys = ([f'{kg_code}_light_gpkg_v2', f'{kg_code}_light_gpkg'] if variant == 'light'
+                    else [f'{kg_code}_{variant}_gpkg'])
+            if prefer_v1:   # e.g. ``new_buildings`` exists only in the v1 light GPKG
+                keys.reverse()
+            for k in keys:
+                e = ent.get(k) or {}
+                if 'error' in str(e.get('status') or ''):
+                    continue
+                url, hdr = _link(e)
+                if url:
+                    cv = 'light_v2' if k.endswith('_v2') else variant
+                    candidates.append((cv, url, hdr, int(e.get('size') or 0), e.get('checksum') or None))
+        except Exception as ex:  # noqa: BLE001
+            log.debug('_resolve_gpkg manifest lookup %s: %s', kg_code, ex)
         c = self._conn()
         col = f'zenodo_{variant}_gpkg_url'
         row = c.execute(f'SELECT {col} FROM kg WHERE kg_code=?', (kg_code,)).fetchone()
-        if not row or not row[0]:
+        if row and row[0]:
+            candidates.append((variant, row[0], None, 0, None))
+        if not candidates:
             return None
-        url = row[0]
-
-        # Manifest byte size + md5 (if known) guard against truncated /
-        # stale files and let the fetch layer report a real percentage.
-        expected, md5 = 0, None
-        try:
-            import trees_v3 as _t3
-            ent = _t3.manifest_entries()
-            e = ent.get(f'{kg_code}_{variant}_gpkg') or ent.get(f'{kg_code}_{variant}_gpkg_v2') or {}
-            expected = int(e.get('size') or 0)
-            md5 = e.get('checksum') or None
-        except Exception:  # noqa: BLE001
-            pass
-        return cache.download(kg_code, variant, url, expected_size=expected, md5=md5, wait=wait)
+        for cv, url, hdr, expected, md5 in candidates:
+            cached = cache.get(kg_code, cv, expected_size=expected)
+            if cached:
+                return cached
+            p = cache.download(kg_code, cv, url, headers=hdr, expected_size=expected,
+                               md5=md5, wait=wait)
+            if p:
+                return p
+        return None
 
     # ════════════════════════════════════════════════════════════════
     # Helpers
@@ -3978,6 +3998,8 @@ class GpkgCache:
         removed = []
         for p in list(self.cache_dir.glob('*.gpkg')) + list(self.cache_dir.glob('*.gpkg.tmp')):
             e = by_fn.get(p.name)
+            if p.suffix == '.tmp' and time.time() - p.stat().st_mtime < 600:
+                continue   # in-flight zenodo_fetch download (resumable) — leave it
             stale = p.suffix == '.tmp' or e is None or int(e.get('size') or 0) != p.stat().st_size
             if stale:
                 try:

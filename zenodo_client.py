@@ -537,7 +537,19 @@ class Client:
                     # the post-upload bucket verification below recovers
                     # the common case where the body landed but the
                     # response was dropped (SSLEOFError / write timeout).
-                    timeout=(30, 600),
+                    # urllib3 2.x applies the *connect* timeout to the
+                    # socket while the request body is being sent (the
+                    # read timeout is only installed before getresponse),
+                    # so with (30, 600) a 200 MB PUT died with 'The write
+                    # operation timed out' after 2–4 %% whenever Zenodo
+                    # stopped draining the socket for >30 s (backpressure
+                    # during the Sep 2026 slowdown — every light_v2 PUT
+                    # fleet-wide, 6 attempts in <3 min, KG re-queued).
+                    # Body-bearing requests therefore get a long send
+                    # timeout; connect to zenodo.org itself is ~50 ms, so
+                    # the only cost is a slower failure on a black-holed
+                    # SYN, which the retry chain absorbs.
+                    timeout=(self._SEND_TIMEOUT_S if data is not None else 30, 600),
                 )
 
                 # Success
@@ -650,6 +662,15 @@ class Client:
     # Sandbox/old Zenodo may not support multipart — we fall back to
     # a single PUT on any 4xx other than 404.
     _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
+    # Socket timeout while *sending* a request body (see _do_request).
+    _SEND_TIMEOUT_S = 240
+    # Files at/above this size use the slower retry ladder in
+    # _upload_to_bucket: 30/60/120/240/300 s (~12 min span) instead of
+    # 4/8/16/32/64 s (~2 min). A 2-min ladder cannot outlast a Zenodo
+    # ingest stall, and exhausting it costs far more than the wait —
+    # the peer pauses, re-queues the KG, and another peer re-downloads
+    # the 500 MB full GPKG to rebuild the same product.
+    _LARGE_PUT_BYTES = 32 * 1024 * 1024
 
     def _verify_via_deposit(
         self,
@@ -930,7 +951,9 @@ class Client:
             # that branch. Belt + braces.
             self._reset_session()
             if attempt < max_attempts:
-                wait = min(self.retry_base_wait * (2 ** (attempt - 1)), 300.0)
+                base = (30.0 if file_size >= self._LARGE_PUT_BYTES
+                        else self.retry_base_wait)
+                wait = min(base * (2 ** (attempt - 1)), 300.0)
                 log.info("  retrying PUT %s in %.1fs …", filename, wait)
                 time.sleep(wait)
         # Exhausted attempts. One final verify before giving up — the

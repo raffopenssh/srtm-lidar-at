@@ -103,6 +103,10 @@ STRIP_WIDTH = 2.0
 
 # Copernicus product types
 COP_PRODUCTS = ("ndvi", "sar", "worldcover", "harmonics")
+#: tile store v2 (zenodo_tiles.py): per-tile objects in sharded deposits.
+#: When on, upload_all() never rebuilds Copernicus ZIPs; reads fall back
+#: to the frozen v1 ZIPs for tiles the store does not have.
+TILE_STORE_V2 = os.environ.get("ZENODO_TILE_STORE_V2", "1").strip() not in ("0", "false", "no")
 
 # Zenodo API
 ZENODO_BASE_URL = "https://zenodo.org"
@@ -265,18 +269,53 @@ class CacheManifest:
         self._data: Dict[str, Any] = {"depo_id": None, "record_id": None,
                                        "files": {}}
         self._last_mtime: float = 0.0
+        # Unsaved mutations, re-applied over every reload and merged into
+        # every save. Without this, a ``reload_if_changed`` (our own
+        # previous ``save`` bumps the mtime; the srv sync thread rewrites
+        # the file every few minutes) between a mutation and its ``save``
+        # silently dropped the mutation — 3 of 18 tile-store PUTs were
+        # lost from the manifest in the 2026-09-23 live test.
+        self._dirty_files: Dict[str, Dict] = {}
+        self._dirty_shards: Dict[str, Dict] = {}
+        self._dirty_top: Dict[str, Any] = {}
         self._load()
 
     def _load(self):
         if self._path.exists():
             try:
-                self._data = json.loads(self._path.read_text())
-                self._last_mtime = self._path.stat().st_mtime
+                with self._lock:
+                    self._data = json.loads(self._path.read_text())
+                    self._last_mtime = self._path.stat().st_mtime
+                    self._apply_dirty_locked()
             except (json.JSONDecodeError, OSError) as e:
                 log.warning("Failed to load cache manifest: %s", e)
 
+    def _mark_dirty_locked(self, name: str) -> None:
+        e = self._data.get("files", {}).get(name)
+        if e is not None:
+            self._dirty_files[name] = dict(e)
+
+    def _apply_dirty_locked(self) -> None:
+        """Overlay unsaved mutations on freshly loaded data. A file entry
+        on disk that is *newer* (``updated_at``) than our dirty copy wins
+        — another process tombstoned / restored it meanwhile."""
+        if not (self._dirty_files or self._dirty_shards or self._dirty_top):
+            return
+        files = self._data.setdefault("files", {})
+        for name, mine in self._dirty_files.items():
+            theirs = files.get(name)
+            if theirs is None or (theirs.get("updated_at") or "") <= (mine.get("updated_at") or ""):
+                files[name] = dict(mine)
+        shards = self._data.setdefault("shards", {})
+        for k, sh in self._dirty_shards.items():
+            if k not in shards or not shards[k].get("depo_id"):
+                shards[k] = dict(sh)
+        for k, v in self._dirty_top.items():
+            self._data[k] = v
+
     def reload_if_changed(self):
-        """Re-read from disk if the file has been modified externally."""
+        """Re-read from disk if the file has been modified externally
+        (unsaved local mutations survive, see ``_apply_dirty_locked``)."""
         try:
             if self._path.exists():
                 mtime = self._path.stat().st_mtime
@@ -284,20 +323,31 @@ class CacheManifest:
                     with self._lock:
                         self._data = json.loads(self._path.read_text())
                         self._last_mtime = mtime
+                        self._apply_dirty_locked()
                     log.info("Cache manifest reloaded (depo_id=%s, %d files)",
                              self._data.get('depo_id'), len(self._data.get('files', {})))
         except Exception as e:
             log.debug("Cache manifest reload check failed: %s", e)
 
     def save(self):
-        """Persist to disk atomically."""
-        with self._lock:
-            data = dict(self._data)
+        """Persist to disk atomically. Merges with whatever another
+        process wrote since our last load (dirty entries overlaid), then
+        clears the dirty set and adopts the new mtime."""
+        self.reload_if_changed()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = str(self._path) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        os.replace(tmp, self._path)
+        with self._lock:
+            data = dict(self._data)
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            os.replace(tmp, self._path)
+            try:
+                self._last_mtime = self._path.stat().st_mtime
+            except OSError:
+                pass
+            self._dirty_files.clear()
+            self._dirty_shards.clear()
+            self._dirty_top.clear()
 
     @property
     def depo_id(self) -> Optional[int]:
@@ -307,6 +357,7 @@ class CacheManifest:
     def depo_id(self, val: int):
         with self._lock:
             self._data["depo_id"] = val
+            self._dirty_top["depo_id"] = val
 
     @property
     def record_id(self) -> Optional[int]:
@@ -316,6 +367,7 @@ class CacheManifest:
     def record_id(self, val: int):
         with self._lock:
             self._data["record_id"] = val
+            self._dirty_top["record_id"] = val
 
     def set_file(self, zip_name: str, url: str, size: int, checksum: str,
                  tile_count: int, updated_at: str):
@@ -328,6 +380,7 @@ class CacheManifest:
                 "tile_count": tile_count,
                 "updated_at": updated_at,
             }
+            self._mark_dirty_locked(zip_name)
 
     def get_file(self, zip_name: str) -> Optional[Dict]:
         """Return the manifest entry, or None if absent **or tombstoned**.
@@ -382,6 +435,7 @@ class CacheManifest:
                 "prev_checksum": e.get("checksum", "") or "",
                 "prev_tile_count": int(e.get("tile_count") or 0),
             }
+            self._mark_dirty_locked(zip_name)
         return True
 
     def retag_tombstone(self, zip_name: str, reason: str) -> bool:
@@ -395,6 +449,7 @@ class CacheManifest:
                 return False
             e["tombstone_reason"] = _scrub_secret(reason)
             e["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._mark_dirty_locked(zip_name)
         return True
 
     def mark_unverified(self, zip_name: str, error: str) -> bool:
@@ -418,6 +473,7 @@ class CacheManifest:
             e.setdefault("unverified_since", now)
             e["last_error"] = _scrub_secret(error)
             e["updated_at"] = now
+            self._mark_dirty_locked(zip_name)
         return True
 
     def record_4xx(self, zip_name: str) -> List[str]:
@@ -436,6 +492,7 @@ class CacheManifest:
             hist = list(e.get("upload_4xx_history") or [])
             hist.append(now)
             e["upload_4xx_history"] = hist[-5:]
+            self._mark_dirty_locked(zip_name)
             return list(e["upload_4xx_history"])
 
     def restore(self, zip_name: str, url: str, size: int, checksum: str,
@@ -466,6 +523,7 @@ class CacheManifest:
             elif e.get("restored_from_tombstone"):
                 new["restored_from_tombstone"] = e["restored_from_tombstone"]
             files[zip_name] = new
+            self._mark_dirty_locked(zip_name)
         return True
 
     def clear_unverified(self, zip_name: str, size: int, checksum: str) -> bool:
@@ -489,11 +547,34 @@ class CacheManifest:
                 changed = True
             if changed:
                 e["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._mark_dirty_locked(zip_name)
         return changed
 
     def all_files(self) -> Dict[str, Dict]:
         with self._lock:
             return dict(self._data.get("files", {}))
+
+    # --- tile store v2 (zenodo_tiles) -----------------------------------
+    def set_entry(self, name: str, entry: Dict) -> None:
+        """Set a raw ``files`` entry (per-tile objects carry extra keys:
+        ``kind`` / ``product`` / ``depo_id``)."""
+        with self._lock:
+            self._data.setdefault("files", {})[name] = dict(entry)
+            self._mark_dirty_locked(name)
+
+    def get_shard(self, key: str) -> Optional[Dict]:
+        with self._lock:
+            sh = (self._data.get("shards") or {}).get(key)
+        return dict(sh) if sh else None
+
+    def set_shard(self, key: str, sh: Dict) -> None:
+        with self._lock:
+            self._data.setdefault("shards", {})[key] = dict(sh)
+            self._dirty_shards[key] = dict(sh)
+
+    def all_shards(self) -> Dict[str, Dict]:
+        with self._lock:
+            return dict(self._data.get("shards") or {})
 
     def tile_count(self) -> int:
         """Total number of tiles across all ZIPs."""
@@ -1255,6 +1336,15 @@ class ZenodoCache:
         self._zip_indices: Dict[str, ZipIndex] = {}  # zip_name → ZipIndex
         self._missing_zips: set = set()  # negative cache of ZIPs not in manifest
         self._missing_zips_mtime: float = 0.0  # manifest mtime when cache was built
+        self._tiles = None
+
+    @property
+    def tiles(self):
+        """Tile store v2 (``zenodo_tiles.TileStore``) bound to this cache."""
+        if self._tiles is None:
+            from zenodo_tiles import TileStore
+            self._tiles = TileStore(self)
+        return self._tiles
 
     # --- Zenodo API helpers ---
 
@@ -1395,8 +1485,8 @@ class ZenodoCache:
                         depo_id, str(exc)[:160])
             return None
 
-    def _upload_file(self, depo_id: int, local_path: Path, filename: str
-                     ) -> Dict:
+    def _upload_file(self, depo_id: int, local_path: Path, filename: str,
+                     bucket_url: Optional[str] = None) -> Dict:
         """Upload a file to the Zenodo deposit bucket, in place.
 
         Ordering is **PUT new → verify via deposit listing**. There is
@@ -1416,8 +1506,9 @@ class ZenodoCache:
             the caller can keep / mark-unverified / tombstone correctly.
         Returns a dict with ``checksum`` (bare md5) and ``size``.
         """
-        r = self._api("GET", f"/api/deposit/depositions/{depo_id}")
-        bucket_url = r.json()["links"]["bucket"]
+        if not bucket_url:
+            r = self._api("GET", f"/api/deposit/depositions/{depo_id}")
+            bucket_url = r.json()["links"]["bucket"]
         local_size = local_path.stat().st_size
 
         last_exc: Optional[BaseException] = None
@@ -1683,17 +1774,30 @@ class ZenodoCache:
         # 4-tuple (south, north, west, east) bounding the bundle.
         groups: Dict[Tuple[str, float, float, float, float], List] = {}
 
-        # Copernicus tiles
-        cop_files = _scan_local_copernicus()
-        for product, paths in cop_files.items():
-            for p in paths:
-                info = reverse_idx.get(p.name)
-                if info is None:
-                    continue
-                prod, w, s, e, n, extra = info
-                cs, cn, cw, ce = _cell_for_bbox(s, w)
-                key = (product, cs, cn, cw, ce)
-                groups.setdefault(key, []).append((p, w, s, e, n, extra))
+        # Copernicus tiles → tile store v2 (per-tile objects in sharded
+        # deposits, parallel idempotent PUTs, no ZIP rebuilds). The v1
+        # Copernicus ZIPs on the main deposit are frozen read-only.
+        if TILE_STORE_V2:
+            try:
+                ts_stats = self.tiles.upload_local(dry_run=dry_run,
+                                                   lock_factory=per_zip_lock)
+                stats["tile_store"] = ts_stats
+                stats["tiles_total"] += int(ts_stats.get("tiles_uploaded") or 0)
+                stats["bytes_total"] += int(ts_stats.get("bytes_total") or 0)
+            except Exception as exc:
+                log.warning("tile store upload failed: %s", exc)
+                stats["tile_store"] = {"error": str(exc)[:200]}
+        else:
+            cop_files = _scan_local_copernicus()
+            for product, paths in cop_files.items():
+                for p in paths:
+                    info = reverse_idx.get(p.name)
+                    if info is None:
+                        continue
+                    prod, w, s, e, n, extra = info
+                    cs, cn, cw, ce = _cell_for_bbox(s, w)
+                    key = (product, cs, cn, cw, ce)
+                    groups.setdefault(key, []).append((p, w, s, e, n, extra))
 
         # Hansen tiles
         hansen_files = _scan_local_hansen()
@@ -2070,6 +2174,15 @@ class ZenodoCache:
             self._zip_indices.clear()  # URLs changed, invalidate cached indices
             self._missing_zips.clear()
 
+        extra = {"year": year} if product in ("ndvi", "sar", "harmonics") else {}
+        # Tile store v2 first (direct object GET, no ZIP index).
+        try:
+            got = self.tiles.fetch(product, w, s, e, n, dest_dir, **extra)
+            if got is not None:
+                return got
+        except Exception as exc:
+            log.debug("tile store fetch %s: %s", product, exc)
+
         cs, cn, cw, ce = _cell_for_bbox(s, w)
         candidates = [
             _zip_filename(product, cs, cn, cw, ce),
@@ -2078,7 +2191,6 @@ class ZenodoCache:
         seen = set()
         candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
-        extra = {"year": year} if product in ("ndvi", "sar", "harmonics") else {}
         entry_name = _npz_entry_name(product, w, s, e, n, **extra)
 
         idx = None
@@ -2626,6 +2738,15 @@ class ZenodoCache:
             _run()
             if not dry_run:
                 self._write_deposit_count(summary)
+        # Tile store v2 shards (≤20 shard listings per run, round-robin).
+        if TILE_STORE_V2:
+            try:
+                ts = self.tiles.reconcile(dry_run=dry_run)
+                summary["tile_store"] = {k: v for k, v in ts.items() if k != "details"}
+                summary["details"].extend(ts.get("details") or [])
+                summary["changed"] += int(ts.get("changed") or 0)
+            except Exception as exc:
+                summary["tile_store"] = {"error": str(exc)[:200]}
         summary["took_s"] = round(time.time() - t0, 1)
         if not dry_run:
             try:
@@ -2787,6 +2908,7 @@ def format_reconcile_summary(s: Dict[str, Any]) -> str:
             "local_copernicus": {k: len(v) for k, v in local_cop.items()},
             "local_hansen": len(local_hansen),
             "pollution": get_pollution_summary(),
+            "tile_store": self.tiles.status(),
         }
 
 
@@ -2893,7 +3015,7 @@ if __name__ == "__main__":
                         meta.unlink(missing_ok=True)
                         _log_pollution_event(product, f.name, reason,
                                              "local_validate", action="deleted")
-                        print(f"    → deleted")
+                        print("    → deleted")
         print(f"\nTotal: {good} valid, {bad} polluted")
     elif args.cmd == "list":
         idx = cache._get_zip_index(args.zip_name)

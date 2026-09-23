@@ -1065,3 +1065,32 @@ in both `srv` and the processor.
 * **Measure before adding a poll**: `curl -s -H 'Accept-Encoding: gzip'
   -o /dev/null -w '%{size_download}' localhost:8000/<ep>` and check
   `/api/v1/net_stats` an hour later.
+
+## Frontier planning cells (Sep 2026)
+
+Frontiers are pinned to disjoint **planning cells** (KG centroid → cell,
+`KG_CELL_FILTER` on the processor, `_frontier_cells` / `frontier_strip_plan`
+on the director). Until 2026-09-23 the planning grid *was* the v1 Zenodo
+ZIP grid (1°×2°, `zenodo_cache.STRIP_HEIGHT × STRIP_WIDTH`) because two
+frontiers rebuilding the same cell ZIP lost each other's tiles. That made
+`_max_parallel_frontiers` bind on `cap_cells` — 9 work cells → 6–9
+frontiers while 98 credentials and ~17 starved cache-only peers
+(`cache_pipeline: ready_kgs=0`) sat idle.
+
+With tile store v2 (`docs/zenodo-cache.md → Tile store v2`) Copernicus
+writes are idempotent per-tile PUTs and Hansen ZIP writes are serialised by
+the per-ZIP fleet lock, so the coupling is gone. The planning grid is now
+`FRONTIER_CELL_LAT × FRONTIER_CELL_LON` (env, default **0.5°×1°** = the
+tile-store shard; ~35 non-empty / ~34 work cells) via
+`PeerDirector._planning_grid()`. v1 ZIP coverage is translated into
+planning cells with `_planning_cells_within` (`_cached_cells`) and by
+containment in `_cell_fingerprint`. The frontier count is now bounded by
+`min(cap_creds, cap_cells, FRONTIER_MAX_PARALLEL=20)` × capacity factor,
+ramped by `RAMP_*_STARTS_PER_TICK`. Raise `FRONTIER_MAX_PARALLEL` once
+openEO warns/min (`throttle: … C=`) and credit burn look stable at 20.
+Revert with `FRONTIER_CELL_LAT=1.0 FRONTIER_CELL_LON=2.0`.
+
+Rollout note: persisted `frontier_strip_plan` entries in the old grid are
+not in the new `strip_set`, so every running frontier is re-planned once
+(graceful, KG boundary) — expected on the first director tick after the
+restart.

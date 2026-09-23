@@ -82,9 +82,20 @@ VERSION = "v2" if MODEL_VERSION == "v2" else "v1"
 from v21_products import PRODUCT_VERSION, MANIFEST_VERSION as V2_PRODUCT_MANIFEST_VERSION  # noqa: E402
 
 
-def _product_upload_version(file_key: str) -> str:
-    """Manifest/Zenodo ``version`` for a product file key."""
-    return V2_PRODUCT_MANIFEST_VERSION if file_key in ("json_v2", "light_gpkg_v2") else VERSION
+def _product_upload_version(file_key: str, defects=None) -> str:
+    """Manifest/Zenodo ``version`` for a product file key.
+
+    JSON products with repairable layer gaps (``product_repair.defects``:
+    a segmented tile without harmonics / NDVI / SAR / WorldCover / Hansen)
+    are labelled ``<ver>-partial`` so ``v2_products_complete`` reads the
+    pair as not-current and the re-upgrade machinery fixes it once the
+    cells are cached — no tombstone, product stays live.  GPKGs keep the
+    plain label (docs/product-repair.md)."""
+    base = V2_PRODUCT_MANIFEST_VERSION if file_key in ("json_v2", "light_gpkg_v2") else VERSION
+    if defects and file_key in ("json", "json_v2"):
+        from product_repair import label_version
+        return label_version(base, defects)
+    return base
 # v2 upgrade mode: re-classify already-processed v1 KGs from their own
 # Zenodo full GPKG (no BEV / openEO traffic).  Set by ``--v2-upgrade`` or
 # env ``V2_UPGRADE=1`` (the director passes it in the start payload).
@@ -353,6 +364,84 @@ def _owning_cell_for_kg(kg: dict) -> tuple | None:
     return None
 
 
+PREWARM_REPAIR_CELLS_PER_KG = int(os.environ.get("PREWARM_REPAIR_CELLS_PER_KG", "4"))
+
+
+def _repair_cells_fill(flag: dict, obs_year: int) -> int:
+    """Fetch up to ``PREWARM_REPAIR_CELLS_PER_KG`` director-requested
+    ``prewarm.repair_cells`` (``[{w,s,e,n,products:[…]}]``), only the
+    listed products, skipping cells another frontier already filled
+    (Zenodo index check). Flushes when anything was fetched."""
+    cells = flag.get("repair_cells") or []
+    if not cells:
+        return 0
+    from tile_cache import CacheMissError
+    try:
+        from copernicus import CreditsExhaustedError, IPThrottledError
+    except Exception:
+        class CreditsExhaustedError(Exception):
+            pass
+        class IPThrottledError(Exception):
+            pass
+    cop = _get_cop_cache()
+    hc = _get_hansen_cache()
+    done = 0
+    deadline = time.time() + PREWARM_MAX_SECONDS
+    # Randomised start so concurrent frontiers don't all take cell #1.
+    import random as _rnd
+    order = list(cells)
+    _rnd.shuffle(order)
+    for c in order:
+        if done >= PREWARM_REPAIR_CELLS_PER_KG or time.time() >= deadline:
+            break
+        try:
+            csub = {"west": float(c["w"]), "south": float(c["s"]),
+                    "east": float(c["e"]), "north": float(c["n"])}
+            products = set(c.get("products") or [])
+        except Exception:
+            continue
+        kw = {"ndvi": "ndvi" in products, "landcover": "worldcover" in products,
+              "sar": "sar" in products, "harmonics": "harmonics" in products}
+        try:
+            already = (not any(kw.values())
+                       or cop.has_cached(csub, year=obs_year, local_ok=False, **kw))
+            if "hansen" in products and already:
+                already = hc.has_cached((csub["west"], csub["south"],
+                                         csub["east"], csub["north"]), local_ok=False)
+        except Exception:
+            already = False
+        if already:
+            continue
+        try:
+            if kw["ndvi"]:
+                cop.get_ndvi(csub, year=obs_year)
+            if kw["landcover"]:
+                cop.get_landcover(csub)
+            if kw["sar"]:
+                cop.get_sar(csub, year=obs_year)
+            if kw["harmonics"]:
+                cop.get_harmonics(csub, year=obs_year)
+            if "hansen" in products:
+                hc.get_raw((csub["west"], csub["south"], csub["east"], csub["north"]))
+            done += 1
+            log.info("repair: filled cell %.2f,%.2f %s", csub["west"], csub["south"],
+                     ",".join(sorted(products)))
+        except (CreditsExhaustedError, IPThrottledError) as e:
+            log.info("repair: stopping early (Copernicus throttled/exhausted): %s", e)
+            break
+        except CacheMissError:
+            break
+        except Exception as e:
+            log.warning("repair: cell %.2f,%.2f %s failed: %s", csub["west"], csub["south"],
+                        ",".join(sorted(products)), e)
+    if done:
+        try:
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as e:
+            log.warning("repair: flush failed: %s", e)
+    return done
+
+
 def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
     """Densify the shared Zenodo cache around a just-completed frontier KG.
 
@@ -372,14 +461,23 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
     if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
         return 0
     flag = _read_prewarm_flag()
+    # Director-requested repair cells (product_repair: exact (cell,
+    # products) pairs missing for '-partial' KGs) go first — independent
+    # of the demand-side enable flag and of this peer's owning cell, the
+    # director already gated them on openEO health.
+    repaired = 0
+    try:
+        repaired = _repair_cells_fill(flag, obs_year)
+    except Exception as e:
+        log.debug("prewarm: repair cells: %s", e)
     if not flag.get("enabled"):
-        return 0
+        return repaired
     budget = int(flag.get("cells_per_kg", 0) or 0)
     if budget <= 0:
-        return 0
+        return repaired
     cell = _owning_cell_for_kg(kg)
     if cell is None:
-        return 0
+        return repaired
     cs, cn, cw, ce = cell
 
     from tile_cache import CacheMissError
@@ -9258,6 +9356,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         result["missing_layers"] = dq.get("missing_layers", [])
         result["n_upstream_failed_tiles"] = dq.get("n_upstream_failed_tiles", 0)
         result["upstream_failed_tiles"] = dq.get("upstream_failed_tiles", [])
+        try:
+            from product_repair import defects_from_quality as _pr_defects
+            result["product_defects"] = _pr_defects(dq)
+            if result["product_defects"]:
+                log.warning("KG %s: repairable layer gap(s) %s — JSON products labelled "
+                            "'-partial' (re-upgrade once cells cached)",
+                            kg_code, ",".join(result["product_defects"]))
+        except Exception as _pe:
+            log.debug("product_defects: %s", _pe)
 
         if _is_v2:
             # --- 7a. v2 products: kgjson/2 blob (+ compact legacy json for
@@ -9399,7 +9506,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             _report_step(f"upload_{_lab}",
                                          f"{total / 1e6:.0f} MB — {round(100 * sent / total) if total else 0}%")
                         _report_step(f"upload_{_fk}", f"streaming {_szV / 1e6:.1f} MB to Zenodo")
-                        _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp, _product_upload_version(_fk),
+                        _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp,
+                                                _product_upload_version(_fk, result.get("product_defects")),
                                                 _metaV, _zmanifestV,
                                                 delete_after=(_ftV == "gpkg"), progress_callback=_cbV)
                         result["_uploaded_keys"].append(_fk)
@@ -10021,7 +10129,8 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                         quality_grade: str = "",
                         available_layers: list = None,
                         missing_layers: list = None,
-                        progress_callback=None) -> dict:
+                        progress_callback=None,
+                        defects: list = None) -> dict:
     """Upload KG files to Zenodo via streaming, verify, delete local GPKGs.
 
     Uses ``Client.upload_stream()`` to stream files directly from disk
@@ -10079,7 +10188,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
                     progress_callback(_label, sent, total)
                 _file_cb = _cb
             client.upload_stream(
-                zenodo_key, local_path, _product_upload_version(file_key), meta_func, manifest,
+                zenodo_key, local_path, _product_upload_version(file_key, defects), meta_func, manifest,
                 delete_after=delete_local,
                 progress_callback=_file_cb)
 
@@ -10244,7 +10353,7 @@ def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool
     pair (``_json_v2`` @ %s **and** committed ``_light_gpkg_v2`` — see
     ``v21_products.v2_products_complete``) and has not struck out.""" % PRODUCT_VERSION
     from v21_products import v2_products_complete as _v2c
-    if _v2c(manifest, code):
+    if _v2c(manifest, code) and code not in _repair_override_codes():
         return False
     ej = manifest.get(f"{code}_json")
     eg = manifest.get(f"{code}_full_gpkg")
@@ -10253,6 +10362,18 @@ def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool
     if failed is None:
         failed = _load_v2_upgrade_failed()
     return int((failed.get(code) or {}).get("n", 0)) < V2_UPGRADE_MAX_STRIKES
+
+
+def _repair_override_codes() -> set:
+    """Codes the director wants re-upgraded although this peer's manifest
+    copy says the v2 pair is current: products relabelled ``-partial`` by
+    the primary's one-shot ``product_repair.py scan --apply`` (equal
+    ``uploaded_at`` → the relabel never reaches peer manifests).  Rides
+    ``prewarm.repair_codes`` in the synced cache_manifest.json."""
+    try:
+        return {str(c) for c in (_read_prewarm_flag().get("repair_codes") or [])}
+    except Exception:
+        return set()
 
 
 def _v2_upgrade_units(codes: list, manifest, kg_index: dict) -> list:
@@ -12413,7 +12534,8 @@ def main():
                     quality_grade=result.get("quality_grade", ""),
                     available_layers=result.get("available_layers"),
                     missing_layers=result.get("missing_layers"),
-                    progress_callback=_upload_progress_cb)
+                    progress_callback=_upload_progress_cb,
+                    defects=result.get("product_defects"))
 
                 # Clear upload progress
                 with progress._lock:

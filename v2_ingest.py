@@ -187,6 +187,11 @@ def ingest_one(code: str, entries: dict, *, delete_v1: bool = True,
         return {"code": code, "ok": False, "reason": rep.summary()}
     # 1) store FIRST — the index selector reads the store
     info = store.put(code, blob, uploaded_at=up_at, doc=doc, source="zenodo")
+    try:  # repairable-layer registry (docs/product-repair.md)
+        import product_repair as _pr
+        _pr.observe(code, doc, up_at, str(e.get("version") or ""))
+    except Exception as ex:  # noqa: BLE001
+        log.debug("v2_ingest: %s product_repair observe: %s", code, ex)
     # 2) index row
     if update_index:
         try:

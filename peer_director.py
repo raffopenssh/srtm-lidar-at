@@ -223,6 +223,26 @@ PREWARM_COP_EMA_MIN = 0.8         # require sub_factor_ema['copernicus'] >=
 # health between MIN and MAX (a 0.1° cell = 4 Copernicus products + Hansen).
 PREWARM_CELLS_PER_KG_MAX = 8
 PREWARM_CELLS_PER_KG_MIN = 2
+# product_repair (docs/product-repair.md): director sweep cadence + caps on
+# the cell-fill plan shipped via prewarm.repair_cells / repair_codes.
+PRODUCT_REPAIR_SWEEP_S = 15 * 60
+# Frontier *planning* grid (docs/peer-director.md → Frontier planning
+# cells). Decoupled from the v1 Zenodo ZIP grid (zenodo_cache.STRIP_HEIGHT
+# × STRIP_WIDTH = 1°×2°) since tile store v2: Copernicus tiles are
+# idempotent per-tile PUTs into 0.5°×1° shards, so two frontiers in the
+# same ZIP cell can no longer lose each other's uploads (Hansen, still on
+# the v1 ZIP path, is serialised by the per-ZIP fleet lock). The finer
+# grid lifts the frontier cap from ~9 (work cells) to ~35 so credentials /
+# peers / the capacity factor become the binding constraint. Set
+# FRONTIER_CELL_LAT=1.0 FRONTIER_CELL_LON=2.0 to restore the old 1:1 grid.
+FRONTIER_CELL_LAT = float(os.environ.get('FRONTIER_CELL_LAT', '0.5'))
+FRONTIER_CELL_LON = float(os.environ.get('FRONTIER_CELL_LON', '1.0'))
+#: hard ceiling on concurrent frontiers now that cells no longer bind
+#: (~4× the Sep 2026 openEO load at 20; capacity factor + ramp still
+#: scale within it). Raise once openEO / credit burn is observed stable.
+FRONTIER_MAX_PARALLEL = int(os.environ.get('FRONTIER_MAX_PARALLEL', '20'))
+PRODUCT_REPAIR_MAX_CELLS = 40
+PRODUCT_REPAIR_MAX_CODES = 300
 
 # --- Small-fleet efficiency knobs (2026-08-22) ------------------------
 # Shadow self-park is skipped while the fleet is small: dedicating a
@@ -9506,9 +9526,9 @@ class PeerDirector:
         With adaptive mode and a healthy Copernicus sub-factor we drop
         per=1 — 8 valid creds give 8 frontier slots.
 
-        Also bounded by the number of 0.5° lat strips covering Austria
-        (so each frontier can take a disjoint strip). With 7 strips this
-        rarely binds.
+        Also bounded by the number of planning cells with pending work
+        (``_frontier_cells``; FRONTIER_CELL_LAT×LON grid, ~34 cells at
+        0.5°×1°) and by ``FRONTIER_MAX_PARALLEL``.
         """
         valid = self._valid_credentials()
         if not valid:
@@ -9522,7 +9542,7 @@ class PeerDirector:
         # non-empty cells across Austria this should never bind
         # — cred capacity is the real ceiling.
         cap_cells = max(1, len(self._frontier_cells()))
-        return max(1, min(cap_creds, cap_cells))
+        return max(1, min(cap_creds, cap_cells, FRONTIER_MAX_PARALLEL))
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
                               prior: dict | None = None,
@@ -9716,16 +9736,45 @@ class PeerDirector:
                 s += 1.0
             return strips
 
-    def _austria_cells(self) -> list[tuple[float, float, float, float]]:
-        """Return the canonical (south, north, west, east) cells that
-        cover Austria. These match the Zenodo cache bundle layout, so
-        frontier peers pinned to disjoint cells never collide on a
-        Zenodo ZIP write.
+    @staticmethod
+    def _planning_grid() -> list[tuple[float, float, float, float]]:
+        """Raw FRONTIER_CELL_LAT × FRONTIER_CELL_LON planning grid over
+        the Austria bounding box (before empty-cell pruning)."""
+        import math as _m
+        try:
+            from zenodo_cache import AT_WEST, AT_SOUTH, AT_EAST, AT_NORTH
+        except Exception:
+            AT_WEST, AT_SOUTH, AT_EAST, AT_NORTH = 9.0, 46.0, 17.5, 49.5
+        h = max(0.1, FRONTIER_CELL_LAT)
+        wd = max(0.1, FRONTIER_CELL_LON)
+        out = []
+        s = _m.floor(AT_SOUTH / h) * h
+        while s < AT_NORTH:
+            w = _m.floor(AT_WEST / wd) * wd
+            while w < AT_EAST:
+                out.append((round(s, 4), round(s + h, 4), round(w, 4), round(w + wd, 4)))
+                w += wd
+            s += h
+        return out
 
-        With STRIP_HEIGHT=1° × STRIP_WIDTH=2° the raw grid spans
-        46–50°N × 8–18°E (20 cells), but Austria only occupies
-        ~13 of them — the 49–50°N row is entirely empty, as are
-        (48–49, 8–12). Cells with zero KGs are pruned so frontier
+    @staticmethod
+    def _planning_cells_within(s: float, n: float, w: float, e: float,
+                               cells: list) -> list[tuple[float, float, float, float]]:
+        """Planning cells whose SW corner lies inside the (coarser) v1
+        ZIP cell (s,n,w,e) — used to translate ZIP coverage into
+        planning-cell coverage."""
+        return [c for c in cells
+                if s - 1e-9 <= c[0] < n - 1e-9 and w - 1e-9 <= c[2] < e - 1e-9]
+
+    def _austria_cells(self) -> list[tuple[float, float, float, float]]:
+        """Return the canonical (south, north, west, east) frontier
+        *planning* cells that cover Austria (``_planning_grid``,
+        FRONTIER_CELL_LAT × FRONTIER_CELL_LON, default 0.5°×1° = the
+        tile-store shard). Historically this was the 1°×2° Zenodo ZIP
+        grid so disjoint frontiers never rebuilt the same ZIP; with tile
+        store v2 that coupling is gone and the grid is finer (~35
+        non-empty cells vs 13) so the cell cap stops binding the
+        frontier count. Cells with zero KGs are pruned so frontier
         peers never get pinned to dead cells (which causes the
         processor to start, find nothing, exit, repeat — and the
         peer's assigned credential is never used).
@@ -9735,19 +9784,7 @@ class PeerDirector:
         cached = getattr(self, '_austria_cells_cache', None)
         if cached is not None:
             return cached
-        try:
-            from zenodo_cache import _lat_lon_cells
-            raw = [tuple(c) for c in _lat_lon_cells()]
-        except Exception:
-            raw = []
-            s = 46.0
-            while s < 49.5:
-                w = 8.0
-                while w < 18.0:
-                    raw.append((round(s, 4), round(s + 1.0, 4),
-                                round(w, 4), round(w + 2.0, 4)))
-                    w += 2.0
-                s += 1.0
+        raw = self._planning_grid()
         # Prune cells with no KGs. kg_list.json is the canonical KG
         # list (~8440 entries), each carrying lat/lon centroids.
         try:
@@ -10033,6 +10070,14 @@ class PeerDirector:
             prefix = ('hansen_' if product == 'hansen'
                       else f'copernicus_{product}_')
             for name, ent in sorted(files.items()):
+                if (ent or {}).get('kind') == 'tile' and (ent or {}).get('product') == product:
+                    try:
+                        _ts = float(name[:-4].split('_')[1])
+                        if lat_south - 1e-9 <= _ts < lat_north - 1e-9:
+                            parts.append(name + '@' + str(ent.get('updated_at') or '-'))
+                    except Exception:
+                        pass
+                    continue
                 if not name.startswith(prefix):
                     continue
                 base_n = name.replace('.zip', '')
@@ -10232,6 +10277,20 @@ class PeerDirector:
             # 2026 deposit-cap loss) so they don't count as coverage.
             if not ((_entry or {}).get('size', 0) or 0):
                 continue
+            # Tile store v2 object (zenodo_tiles): one 0.1° tile → counts
+            # toward its 1°×2° planning cell like a v1 ZIP would.
+            if (_entry or {}).get('kind') == 'tile' or (name.endswith('.npz') and (_entry or {}).get('depo_id')):
+                try:
+                    _parts = name[:-4].split('_')
+                    _prod = _entry.get('product') or _parts[0]
+                    _ts, _tw = float(_parts[1]), float(_parts[2])
+                    for _pc in self._austria_cells():
+                        if _pc[0] - 1e-9 <= _ts < _pc[1] - 1e-9 and _pc[2] - 1e-9 <= _tw < _pc[3] - 1e-9:
+                            per_product_cells.setdefault(_prod, set()).add(_pc)
+                            break
+                except Exception:
+                    pass
+                continue
             base_n = name.replace('.zip', '')
             try:
                 if '_cell_' in base_n:
@@ -10240,9 +10299,9 @@ class PeerDirector:
                     product = head
                     if product.startswith('copernicus_'):
                         product = product[len('copernicus_'):]
-                    per_product_cells.setdefault(product, set()).add(
-                        (round(s, 4), round(n, 4),
-                         round(w, 4), round(e, 4)))
+                    # v1 ZIP cell (1°×2°) → every planning cell inside it
+                    per_product_cells.setdefault(product, set()).update(
+                        self._planning_cells_within(s, n, w, e, self._austria_cells()))
                 elif '_strip_' in base_n:
                     head, coords = base_n.split('_strip_', 1)
                     s, n = (float(x) for x in coords.split('_'))
@@ -10325,16 +10384,26 @@ class PeerDirector:
             prefix = ('hansen_' if product == 'hansen'
                       else f'copernicus_{product}_')
             for name, ent in sorted(files.items()):
+                if (ent or {}).get('kind') == 'tile' and (ent or {}).get('product') == product:
+                    # tile store v2 object inside this planning cell?
+                    try:
+                        _p = name[:-4].split('_')
+                        _ts, _tw = float(_p[1]), float(_p[2])
+                        if cs - 1e-9 <= _ts < cn - 1e-9 and cw - 1e-9 <= _tw < ce - 1e-9:
+                            parts.append(name + '@' + str(ent.get('updated_at') or '-'))
+                    except Exception:
+                        pass
+                    continue
                 if not name.startswith(prefix):
                     continue
                 base_n = name.replace('.zip', '')
                 try:
                     if '_cell_' in base_n:
                         coords = base_n.split('_cell_', 1)[1].split('_')
-                        s_val = float(coords[0])
-                        w_val = float(coords[2])
-                        if (abs(s_val - cs) > 1e-6
-                                or abs(w_val - cw) > 1e-6):
+                        s_val, n_val, w_val, e_val = (float(x) for x in coords[:4])
+                        # ZIP cell must contain this (possibly finer) planning cell
+                        if not (s_val - 1e-9 <= cs < n_val - 1e-9
+                                and w_val - 1e-9 <= cw < e_val - 1e-9):
                             continue
                     elif '_strip_' in base_n:
                         coords = base_n.split('_strip_', 1)[1].split('_')
@@ -10402,6 +10471,54 @@ class PeerDirector:
         common = set.intersection(*[per_product[p] for p in required])
         return sorted(common)
 
+    def _product_repair_plan(self, cop_ok: bool) -> tuple[list, list]:
+        """(repair_cells, repair_codes) for the ``prewarm`` block.
+
+        Runs ``product_repair.sweep`` at most every
+        ``PRODUCT_REPAIR_SWEEP_S`` (refreshes pending→fixable states from
+        the Zenodo ZIP index); otherwise replays the cached plan. Cells
+        are only published while Copernicus is healthy AND the fleet
+        openEO sync path had no read-timeouts / cascades in the last
+        hour (``app._openeo_health``). Codes are published regardless
+        — they only unlock the peer-side eligibility for already-cached
+        repairs.
+        """
+        now = time.time()
+        st = self.state.get('_product_repair') or {}
+        if now - float(st.get('at') or 0) >= PRODUCT_REPAIR_SWEEP_S:
+            try:
+                import product_repair as _pr
+                r = _pr.sweep(max_cells=PRODUCT_REPAIR_MAX_CELLS)
+                reg = _pr.load()
+                codes = sorted(c for c, e in reg.items() if e.get('state') == 'fixable')
+                st = {'at': now, 'cells': r.get('cells') or [], 'codes': codes[:PRODUCT_REPAIR_MAX_CODES],
+                      'counts': {k: r.get(k) for k in ('pending', 'fixable', 'stuck', 'done')}}
+                for c in r.get('promoted') or []:
+                    try:
+                        _emit_director_event(
+                            f"repair {c}: all missing cells cached — eligible for re-upgrade "
+                            f"({','.join(reg.get(c, {}).get('defects') or [])})",
+                            peer='director', kg=c)
+                    except Exception:
+                        pass
+                if r.get('promoted'):
+                    with self._lock:
+                        self.state.pop('_v2_cand_cache', None)  # re-rank now
+                with self._lock:
+                    self.state['_product_repair'] = st
+            except Exception as e:
+                log.debug('product_repair plan: %s', e)
+                return list(st.get('cells') or []) if cop_ok else [], list(st.get('codes') or [])
+        openeo_ok = True
+        try:
+            import app as _app
+            oh = _app._openeo_health()
+            openeo_ok = not (oh.get('timeouts') or oh.get('cascades'))
+        except Exception:
+            pass
+        cells = list(st.get('cells') or []) if (cop_ok and openeo_ok) else []
+        return cells, list(st.get('codes') or [])
+
     def _update_prewarm_flag(self, cache_ready_count: int):
         """Set the frontier cell pre-warm directive in cache_manifest.json.
 
@@ -10445,6 +10562,16 @@ class PeerDirector:
         supply_ok = (cop_ema >= PREWARM_COP_EMA_MIN) and not cop_paused
         enabled = bool(demand and supply_ok)
 
+        # Repairable-layer gaps (product_repair): exact cells the frontier
+        # should fetch + codes the peer-side eligibility must accept even
+        # though its manifest copy says "current". Same transport, gated
+        # on openEO health (no timeouts / cascades in the last hour) —
+        # filling the very cells that failed while openEO is still
+        # timing out would just burn 240 s probes.
+        repair_cells, repair_codes = self._product_repair_plan(supply_ok)
+        _prev_rc = prev.get('repair_cells') or []
+        _prev_codes = prev.get('repair_codes') or []
+
         if enabled:
             span = PREWARM_CELLS_PER_KG_MAX - PREWARM_CELLS_PER_KG_MIN
             # Linear ramp from MIN (at the gate threshold) to MAX (at 1.0).
@@ -10457,7 +10584,8 @@ class PeerDirector:
 
         # No-op if unchanged (avoid churning the manifest mtime + sync).
         if (was_on == enabled
-                and int(prev.get('cells_per_kg', 0) or 0) == cells):
+                and int(prev.get('cells_per_kg', 0) or 0) == cells
+                and _prev_rc == repair_cells and _prev_codes == repair_codes):
             return
         try:
             data = {}
@@ -10466,6 +10594,8 @@ class PeerDirector:
             data['prewarm'] = {
                 'enabled': enabled,
                 'cells_per_kg': cells,
+                'repair_cells': repair_cells,
+                'repair_codes': repair_codes,
                 'updated_at': datetime.now(timezone.utc).isoformat(),
             }
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10522,8 +10652,11 @@ class PeerDirector:
             # version first; v1-only KGs already read as "not v2" and keep
             # their place in the queue (docs/v2-upgrade.md → Priority).
             from v21_products import MANIFEST_VERSION as _V21, v2_products_complete as _v2c
+            import product_repair as _pr
+            _repair_reg = _pr.load()
             ranked = []
             n_reup = 0
+            n_partial_wait = 0
             for k, e in ent.items():
                 if not k.endswith('_json') or not isinstance(e, dict):
                     continue
@@ -10539,6 +10672,16 @@ class PeerDirector:
                     n_reup += 1
                 elif code in skip_ingest:
                     continue  # stale ingest strike without json_v2 — leave to ingest
+                # Repairable-layer gap ('-partial' label, product_repair):
+                # only worth a re-upgrade once every missing cell is in
+                # the Zenodo cache, else the run comes back partial again.
+                # Stuck codes (MAX_ATTEMPTS still partial) are parked.
+                _newest = j2 if isinstance(j2, dict) else e
+                _rr = _repair_reg.get(code)
+                if _pr.is_partial(_newest.get('version')) or (_rr and _rr.get('state') in ('pending', 'fixable', 'stuck')):
+                    if not _rr or _rr.get('state') == 'stuck' or not _pr.fixable(code, _rr):
+                        n_partial_wait += 1
+                        continue
                 g = ent.get(f'{code}_full_gpkg')
                 if not isinstance(g, dict) or int(g.get('size') or 0) <= 0 \
                         or not g.get('uploaded_at'):
@@ -10569,6 +10712,9 @@ class PeerDirector:
                 ranked.append((_rk, int(g.get('size') or 0), code))
             ranked.sort()
             codes = [c for _, _, c in ranked[:max_n]]
+            if n_partial_wait:
+                log.debug('v2 upgrade candidates: %d partial code(s) waiting for cache cells / parked',
+                          n_partial_wait)
             if n_reup:
                 log.debug('v2 upgrade candidates: %d product<%s re-upgrade(s) queued %s '
                           'never-upgraded codes', n_reup, _V21,

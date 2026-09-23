@@ -131,6 +131,68 @@ python3 zenodo_cache.py upload       # upload local tiles to Zenodo
 - Stale indices — `rm -rf data/austria_processor/zenodo_zip_index/` and re-flush.
 
 
+## Tile store v2 (`zenodo_tiles.py`, 2026-09-23)
+
+Second-generation layout for the **Copernicus** products (`ndvi`, `sar`,
+`worldcover`, `harmonics`). Hansen stays on the v1 ZIP path.
+
+**Why.** v1 bundled a 1°×2° cell into one ZIP that had to be rebuilt
+(download remote-only tiles, re-zip, re-upload ≈1 GB for harmonics) on
+every flush, serialised behind the fleet lock, and a transient read error
+during the merge silently dropped remote tiles from the rebuilt ZIP. Net
+result: ~43 harmonics tiles cached for all of Austria and 986 partial
+products (see `docs/product-repair.md`).
+
+**Rules.**
+* One tile = one immutable object `<product>_<S>_<W>_<N>_<E>[_<year>].npz`,
+  PUT once (idempotent). Nothing is ever rebuilt or merged.
+* Sharded draft deposits keyed `(product, 0.5° lat, 1° lon)` (≤50 tiles
+  each, Zenodo caps deposits at 100 files). Registry in
+  `cache_manifest.json → shards` (`{key: {depo_id, bucket_url,
+  checked_at, files}}`); every tile entry also carries its own `depo_id`
+  so readers never depend on the registry or on `url` (older peers
+  rewrite `url` to the main deposit — `app.py` never URL-rewrites
+  `kind == 'tile'` entries and merges `shards` by union).
+* Parallel PUTs (`ZENODO_TILE_UPLOAD_WORKERS`, default 3); the fleet
+  lease is only taken around shard *creation*
+  (`zenodo_upload_lock(purpose='cache_shard')`). 429s ride
+  `_upload_file`'s backoff.
+* Read-through: `fetch_copernicus` → `tiles.fetch` first, then the frozen
+  v1 ZIP indices. `tile_cache.has_cached` checks `tiles.has_tile` first.
+  No migration; v1 ZIPs are frozen read-only (`upload_all` routes
+  Copernicus tiles to `tiles.upload_local`).
+* `reconcile_manifest` also runs `tiles.reconcile` (lists ≤20 shard
+  deposits per pass, round-robin by `checked_at`): live-but-absent →
+  tombstone, tombstoned-but-present → restore, unknown deposit file →
+  **adopt**. Adoption is the safety net for manifest entries lost between
+  a PUT and a manifest save.
+
+**Manifest dirty tracking** (`CacheManifest`, same commit). `save()` did
+not bump `_last_mtime`, so the next `reload_if_changed()` (our own
+previous save, or the srv sync thread rewriting the file) replaced
+`_data` wholesale and dropped every unsaved mutation — 3 of 18 tile PUTs
+vanished from the manifest in the live test. All mutators now record the
+entry in `_dirty_files` / `_dirty_shards` / `_dirty_top`; reloads
+re-overlay them (a disk entry with a newer `updated_at` wins), `save()`
+merges disk + dirty and clears the set. Applies to the v1 `set_file` /
+`tombstone` / `restore` paths as well.
+
+**Ops.**
+```bash
+# stats (also the `tile_store:` tail of the zen_cache: line in /process.txt)
+python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.status())'
+# upload every local Copernicus tile the manifest lacks (idempotent)
+python3 -c 'import zenodo_cache as z, zenodo_lock as l; zc=z.ZenodoCache(); print(zc.tiles.upload_local(lock_factory=lambda n: l.zenodo_upload_lock(purpose="cache_shard", kg=n)))'
+# settle shards (dry → apply)
+python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.reconcile(dry_run=False))'
+```
+Peer-side Copernicus caches are tiny (≤50 MB, 26 GB disks evict fast), so
+there is no fleet backfill sweep — durability comes from every frontier
+flush now going through idempotent per-tile PUTs.
+
+Live test 2026-09-23 (primary): 23 tiles / 12 shards, 0 failed, 718 s
+for 194 MB (3 workers, several SSL retries), read-back validated.
+
 ---
 
 *See `AGENTS.md` for the project map.*

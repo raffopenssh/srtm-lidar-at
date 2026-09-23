@@ -506,11 +506,12 @@ on the primary VM orchestrates processing across multiple exe.dev VMs.
 | Copernicus throttle & retry | `docs/copernicus-throttle.md` | touching `copernicus.py`, `tile_cache.py`, 402 handling, credential rotation |
 | Search index | `docs/search-index.md` | touching `search_index.py`, schema, compound query, `kg_parcels`, auto-classification |
 | RF training | `docs/rf-training.md` | touching `train_rf_4000kg.py`, ground-truth filters, retraining triggers |
-| Zenodo persistent tile cache | `docs/zenodo-cache.md` | touching `zenodo_cache.py`, tile manifest, ZIP indices |
+| Zenodo persistent tile cache (+ **tile store v2** `zenodo_tiles.py`: per-tile objects in 0.5°×1° shard deposits, `CacheManifest` dirty tracking) | `docs/zenodo-cache.md` | touching `zenodo_cache.py`, `zenodo_tiles.py`, tile manifest, ZIP indices, `cache_manifest.json → shards` |
 | Cross-cutting concerns | `docs/cross-cutting-concerns.md` | adding object types, RF features, tile grid, credential pool, navigation cheatsheet |
 | Planned refactor + speed optimisation | `docs/planned-refactor.md` | next maintenance window work |
 | **v2.1 / 2.2 / 2.3 product** (2.3: robust top-N ranking + `top_manmade_objects`, quality_flags retune; grid25 in JSON, tree_apices/tree_crowns/terrain_coarse in light GPKG, disk rule, grid anchor, trees v3.1 — forestry write-ups `docs/FEEDBACK-4-REPLY.md`, `docs/FEEDBACK-5-REPLY.md`) | `docs/v2.1-product-spec.md` | touching `v21_products.py`, the `v21` tile-loop / light-GPKG / JSON plumbing, `v2_verify.check_v21_*`, `kg_v2_store.grid25`, `/kg/<code>/heightfield|landcover`, `/api/v3/trees` |
 | v2 rollout (segv2 LightGBM product, upgrade-from-GPKG, primary blob store, ingest, strikes/deferrals, **v2_regen** auto-requeue of KGs whose v1 full GPKG is gone, PUT-then-DELETE Zenodo replace) | `docs/v2-upgrade.md` | touching `v2_ingest.py`, `kg_v2_store.py`, `kg_docs.py`, `kg_log_harvest.py`, `v2_verify.py`, `--v2-upgrade`, `_v2_upgrade_fill`, `_check_v2_regen`, `zenodo_client._replace_in_bucket`; reading the `v2:` / `v2_regen:` lines |
+| **Repairable layer gaps** (`-partial` version label, registry, fixable gate, frontier cell fill; the `repair:` line) | `docs/product-repair.md` | touching `product_repair.py`, `_product_upload_version`, `prewarm.repair_cells`, `_repair_cells_fill`, a product missing harmonics / NDVI / SAR / WorldCover / Hansen |
 | Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |
 
@@ -800,8 +801,10 @@ python3 -c "import json,app; me=json.load(open('data/austria_processor/zenodo_ma
   the saved `.joblib`.
 - **Only one director** runs at a time. Gated by `data/austria_processor/is_director`.
   Single-flight via `director.lock` (fcntl). HA failover in `director_ha.py`.
-- **Only one frontier peer** at a time (Copernicus credential safety). Many
-  cache-only peers in parallel are fine.
+- **Frontiers are pinned to disjoint planning cells** (`FRONTIER_CELL_LAT×LON`,
+  0.5°×1° since tile store v2; cap `FRONTIER_MAX_PARALLEL`). Many
+  cache-only peers in parallel are fine. See `docs/peer-director.md →
+  Frontier planning cells`.
 - **All Zenodo writes** serialise through `/api/v1/zenodo/lock` on the primary.
 - **`CredentialRotatedError` / `CreditsExhaustedError` / `IPThrottledError`**
   must NEVER be swallowed by generic `except Exception`. See `docs/copernicus-throttle.md`.

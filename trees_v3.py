@@ -80,7 +80,8 @@ def product_entry(code: str, entries: dict | None = None) -> dict | None:
     """The ``_light_gpkg_v2`` manifest entry iff it is a readable (≥2.1) product."""
     import v21_products
     e = (entries if entries is not None else manifest_entries()).get(f"{code}_light_gpkg_v2")
-    if not e or str(e.get("version") or "") not in v21_products.READABLE_MANIFEST_VERSIONS:
+    from product_repair import base_version as _bv
+    if not e or _bv(e.get("version")) not in v21_products.READABLE_MANIFEST_VERSIONS:
         return None
     if not (e.get("bucket_url") and e.get("filename")) and not e.get("link"):
         return None

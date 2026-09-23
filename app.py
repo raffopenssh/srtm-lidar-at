@@ -949,7 +949,8 @@ if _tombstone_path.exists():
         raw = json.loads(_tombstone_path.read_text())
         if isinstance(raw, list):
             # Migrate old format (list of keys) → dict with current timestamp
-            _MANIFEST_TOMBSTONES = {k: datetime.utcnow().isoformat() for k in raw}
+            from datetime import datetime as _dt_tomb
+            _MANIFEST_TOMBSTONES = {k: _dt_tomb.utcnow().isoformat() for k in raw}
             _tombstone_path.write_text(json.dumps(_MANIFEST_TOMBSTONES, indent=2))
         elif isinstance(raw, dict):
             _MANIFEST_TOMBSTONES = raw
@@ -1674,6 +1675,7 @@ def _sync_peer_data():
 
                 # Collect all peer manifests + merge incoming
                 incoming_merged = {}
+                cm_shards_added = 0
                 for peer_url in peer_urls:
                     try:
                         _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
@@ -1715,6 +1717,14 @@ def _sync_peer_data():
                                 existing = incoming_merged.get(zn)
                                 if existing is None or entry.get('updated_at', '') > existing.get('updated_at', ''):
                                     incoming_merged[zn] = entry
+                            # Tile store v2 shard registry: union (first
+                            # writer wins; entries carry their own depo_id).
+                            if isinstance(peer_cm.get('shards'), dict):
+                                _lsh = local_cm.setdefault('shards', {})
+                                for _k, _v in peer_cm['shards'].items():
+                                    if isinstance(_v, dict) and _v.get('depo_id') and _k not in _lsh:
+                                        _lsh[_k] = _v
+                                        cm_shards_added += 1
                     except Exception as e:
                         log.debug('Peer sync: cache manifest fetch from %s failed: %s', peer_url, e)
 
@@ -1726,8 +1736,9 @@ def _sync_peer_data():
                 for zn, entry in incoming_merged.items():
                     loc = local_files.get(zn)
                     if loc is None or entry.get('updated_at', '') > loc.get('updated_at', ''):
-                        # Rewrite URL to point at our deposit
-                        if local_depo and entry.get('url'):
+                        # Rewrite URL to point at our deposit (not for
+                        # tile-store objects — they live in shard deposits)
+                        if local_depo and entry.get('url') and entry.get('kind') != 'tile':
                             entry = dict(entry)
                             entry['url'] = _re.sub(
                                 r'/api/records/\d+/draft/files/',
@@ -1735,7 +1746,7 @@ def _sync_peer_data():
                                 entry['url'])
                         local_files[zn] = entry
                         cm_updated += 1
-                if cm_updated > 0:
+                if cm_updated > 0 or cm_shards_added:
                     local_cm['files'] = local_files
                     import tempfile as _tf2
                     cache_manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1769,7 +1780,7 @@ def _sync_peer_data():
                     _local_max = max((v.get('updated_at') or '' for v in _lf.values()
                                       if isinstance(v, dict)), default='')
                     _top = {k: local_cm[k] for k in
-                            ('depo_id', 'record_id', 'prewarm', 'zenodo_circuit')
+                            ('depo_id', 'record_id', 'prewarm', 'zenodo_circuit', 'shards')
                             if k in local_cm}
                     _top_hash = hashlib.md5(
                         json.dumps(_top, sort_keys=True, default=str).encode()).hexdigest()
@@ -2017,7 +2028,7 @@ def _peer_status_push_loop():
                     status['git_commit'] = _GIT_COMMIT
                 status.setdefault('region', _REGION)
                 status.setdefault('instance',
-                                  os.environ.get('INSTANCE_ID', peer_id))
+                                  os.environ.get('INSTANCE_ID', _dha.self_id()))
             except Exception:
                 pass
             # Fresh host CPU/steal/iowait telemetry on every push. The
@@ -3869,6 +3880,14 @@ def processing_cache_manifest():
             except Exception as _e:
                 log.debug('cache_manifest sync: drop-journal merge failed: %s', _e)
 
+        # Tile store v2 shard registry (zenodo_tiles): union, first writer wins.
+        if isinstance(incoming.get('shards'), dict):
+            _lsh = local.setdefault('shards', {})
+            for _k, _v in incoming['shards'].items():
+                if isinstance(_v, dict) and _v.get('depo_id') and _k not in _lsh:
+                    _lsh[_k] = _v
+                elif isinstance(_v, dict) and _k in _lsh and _v.get('checked_at', '') > (_lsh[_k].get('checked_at') or ''):
+                    _lsh[_k] = _v
         # Always adopt depo_id / record_id from the incoming manifest.
         # The primary is the authority — peers must use the shared deposit.
         if incoming.get('depo_id'):
@@ -3891,8 +3910,8 @@ def processing_cache_manifest():
         incoming_files = incoming.get('files', {})
         updated = 0
         for zip_name, inc_entry in incoming_files.items():
-            # Rewrite URL to target deposit
-            if inc_entry.get('url') and target_depo:
+            # Rewrite URL to target deposit (tile-store objects excluded)
+            if inc_entry.get('url') and target_depo and inc_entry.get('kind') != 'tile':
                 inc_entry = dict(inc_entry)
                 inc_entry['url'] = _rewrite_url(inc_entry['url'], target_depo)
             loc_entry = local_files.get(zip_name)
@@ -3909,7 +3928,7 @@ def processing_cache_manifest():
         # Also rewrite existing file URLs in case depo_id changed
         if target_depo:
             for zn, entry in local_files.items():
-                if entry.get('url'):
+                if entry.get('url') and entry.get('kind') != 'tile':
                     local_files[zn] = dict(entry)
                     local_files[zn]['url'] = _rewrite_url(entry['url'], target_depo)
         local['files'] = local_files
@@ -6659,6 +6678,7 @@ def director_add_peer():
       url: peer URL (e.g. 'https://srtm-lidar-at3.exe.xyz:8000')
       enabled: bool (default true)
     """
+    import requests
     data = request.get_json(silent=True) or {}
     peer_id = data.get('id', '').strip()
     peer_url = data.get('url', '').strip().rstrip('/')
@@ -11457,7 +11477,7 @@ def api_query_compound():
                       dict(limit=limit, offset=offset)))
             t.start()
             return jsonify({'task_id': task_id, 'status': 'running',
-                            'poll': f'/api/v1/query/compound'}), 202
+                            'poll': '/api/v1/query/compound'}), 202
         result = idx.query_compound(body, limit=limit, offset=offset)
         return jsonify(result)
     except Exception as e:
@@ -11473,7 +11493,7 @@ def _query_worker(task_id, query_fn, args, kwargs):
     """Run a slow query in a background thread."""
     try:
         _progress_start(task_id)
-        _progress_set(task_id, 'running', f'Scanning KG JSONs...')
+        _progress_set(task_id, 'running', 'Scanning KG JSONs...')
         result = query_fn(*args, **kwargs)
         p = _QUERY_RESULTS_DIR / f"{task_id}.json.gz"
         data = json.dumps(result).encode()
@@ -17934,8 +17954,13 @@ def train_classifier():
         import object_segmentation as oc
         import cadastre
 
-        params = _parse_params()
-        geom, geom_3035 = _parse_geometry(params)
+        params = _get_params()
+        features = _get_geometry()
+        geom = features[0]['geometry']
+        if len(features) > 1:
+            from shapely.ops import unary_union as _uu
+            geom = _uu([f['geometry'] for f in features]).convex_hull
+        geom_3035 = ti.geometry_to_3035(geom)
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
         obs_year = ti.dataset_to_year(dataset)
 
@@ -21046,6 +21071,23 @@ def process_txt():
                 out.append(_line)
         except Exception as _e:
             out.append(f'v2_regen: unavailable ({_e})')
+        # repair: products labelled '<ver>-partial' (repairable layer gaps,
+        # product_repair.py) → re-upgraded once their cells are cached.
+        try:
+            import product_repair as _prl
+            _rl = _prl.process_txt_line()
+            if _rl:
+                _pw = {}
+                try:
+                    _pw = (json.loads((Path('data/austria_processor/cache_manifest.json')).read_text())
+                           .get('prewarm') or {})
+                except Exception:
+                    pass
+                _rl += (f" · plan: cells={len(_pw.get('repair_cells') or [])} "
+                        f"codes={len(_pw.get('repair_codes') or [])} · debug: ?q=repair")
+                out.append(_rl)
+        except Exception as _e:
+            out.append(f'repair:   unavailable ({_e})')
     except Exception as _e:
         out.append(f'v2: unavailable ({_e})')
 
@@ -21295,12 +21337,24 @@ def process_txt():
                 if isinstance(cmf, dict) else None)
         _tomb = sum(1 for v in files_d.values() if not int(v.get('size') or 0))
         _unv = sum(1 for v in files_d.values() if v.get('unverified'))
+        # Tile store v2 (zenodo_tiles): per-tile objects in shard deposits.
+        _tv2 = {k: v for k, v in files_d.items() if v.get('kind') == 'tile'}
+        _tv2_live = {k: v for k, v in _tv2.items() if int(v.get('size') or 0)}
+        _tv2_prod: dict = {}
+        for v in _tv2_live.values():
+            _tv2_prod[v.get('product', '?')] = _tv2_prod.get(v.get('product', '?'), 0) + 1
+        _v1 = {k: v for k, v in files_d.items() if k not in _tv2}
         out.append(
             f'zen_cache: depo={depo or "-"} '
             f'files={len(files_d)} tiles={cache_tiles} '
             f'bytes={cache_bytes/1e9:.2f}GB'
             + (f' tombstoned={_tomb}' if _tomb else '')
             + (f' unverified={_unv}' if _unv else '')
+            + (f' · v1_zips={len([k for k in _v1 if k.endswith(".zip")])}'
+               f' · tile_store: tiles={len(_tv2_live)} shards={len(cmf.get("shards") or {})} '
+               f'bytes={sum(int(v.get("size") or 0) for v in _tv2_live.values())/1e9:.2f}GB '
+               f'by_product[{" ".join(f"{k}={n}" for k, n in sorted(_tv2_prod.items()))}]'
+               + (f' tombstoned={len(_tv2) - len(_tv2_live)}' if len(_tv2) != len(_tv2_live) else ''))
         )
         # Zenodo-degraded circuit (director-written, rides this manifest
         # to peers) + last cache_manifest ↔ deposit reconcile summary.

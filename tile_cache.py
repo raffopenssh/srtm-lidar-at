@@ -376,6 +376,12 @@ class CopernicusTileCache:
                 if self._zenodo_cache is None:
                     return False
                 try:
+                    # Tile store v2: per-tile manifest entry (no network).
+                    if self._zenodo_cache.tiles.has_tile(product, cw, cs, ce, cn, **extra):
+                        continue
+                except Exception:
+                    pass
+                try:
                     from zenodo_cache import (_cell_for_bbox, _zip_filename,
                                               _npz_entry_name,
                                               _legacy_strip_zips_for_cell)

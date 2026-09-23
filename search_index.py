@@ -1848,13 +1848,20 @@ class SearchIndex:
                 try:
                     data = json.loads(Path(json_path).read_text())
                     self._enrich_kg(c, _target_code, data)
+                    _repair_observe(kg_code, data, manifest)
                 except Exception as e:
                     log.warning('update_kg %s fallback: %s', kg_code, e)
             elif len(block_list) == 1 and plain_path is not None:
                 # Single plain file — fast path.
                 self._enrich_kg(c, _target_code, block_list[0][1])
+                if json_path:
+                    _repair_observe(kg_code, block_list[0][1], manifest)
             elif block_list:
                 self._enrich_kg_from_blocks(c, _target_code, block_list)
+                if json_path:
+                    for _bc, _bd in block_list:
+                        if _bc == kg_code:
+                            _repair_observe(kg_code, _bd, manifest)
             if manifest:
                 # Candidate codes for manifest lookup: parent + every
                 # accepted block. We pick the freshest entry per kind so a
@@ -3820,6 +3827,19 @@ class SearchIndex:
         return d
 
 
+def _repair_observe(code, doc, manifest=None) -> None:
+    """Feed the repairable-layer registry (``product_repair``) from a
+    freshly ingested v1 JSON.  Best effort, never raises."""
+    try:
+        import product_repair as _pr
+        e = (manifest or {}).get(f'{code}_json') if isinstance(manifest, dict) else None
+        ts = (e or {}).get('uploaded_at') or '' if isinstance(e, dict) else ''
+        ver = (e or {}).get('version') or '' if isinstance(e, dict) else ''
+        _pr.observe(code, doc, ts, ver)
+    except Exception as ex:
+        log.debug('product_repair observe %s: %s', code, ex)
+
+
 def _norm_version(v) -> str:
     """Normalise a manifest ``version`` tag: ``''``/None → ``'v2'`` (pre-2.1
     upgrades carried no tag), ``'2.2'`` → ``'v2.2'``."""
@@ -3832,7 +3852,8 @@ def _norm_version(v) -> str:
 def _version_key(v) -> tuple:
     """Sort key so 'v1' < 'v2' < 'v2.1' < 'v2.2'."""
     try:
-        return tuple(int(x) for x in str(v).lstrip('v').split('.'))
+        from product_repair import base_version as _bv
+        return tuple(int(x) for x in _bv(str(v)).lstrip('v').split('.'))
     except Exception:
         return (0,)
 
@@ -3846,7 +3867,8 @@ def _product_version(zj, zj2) -> str | None:
             and 'error' not in str(zj2.get('status') or ''):
         return _norm_version(zj2.get('version'))
     if isinstance(zj, dict) and zj:
-        return 'v2' if zj.get('version') == 'v2' else 'v1'
+        from product_repair import base_version as _bv
+        return 'v2' if _bv(zj.get('version')) == 'v2' else 'v1'
     return None
 
 

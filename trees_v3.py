@@ -223,7 +223,45 @@ def gpkg_path(code: str, entry: dict) -> str | None:
     if not url:
         return None
     return cache.download(code, GPKG_VARIANT, url, headers=hdr,
-                          expected_size=int(entry.get("size") or 0))
+                          expected_size=int(entry.get("size") or 0),
+                          md5=entry.get("checksum") or None)
+
+
+def prefetch_gpkgs(products: list[dict], progress=None) -> dict:
+    """Pull every not-yet-local light GPKG of *products* concurrently through
+    ``zenodo_fetch.prefetch_many`` so a slow Zenodo costs one round of
+    wall-time instead of N, and so the caller sees ONE aggregate progress
+    stream (``k/N files, X/Y MB, rate, ETA``).  *progress* is
+    ``fn(detail_str, state_dict)``.  Returns ``{code: Exception}`` for the
+    codes whose download failed (the sequential ``gpkg_path`` pass then
+    records the reason)."""
+    import search_index as si
+    import zenodo_fetch
+    from v2_ingest import _link
+    cache = si.get_gpkg_cache()
+    items, by_dest = [], {}
+    for prod in products:
+        code, entry = prod["code"], prod["entry"]
+        local = Path(f"data/austria_processor/gpkg/{code}_light_v2.gpkg")
+        if local.exists() and local.stat().st_size > 0:
+            continue
+        size = int(entry.get("size") or 0)
+        if cache.get(code, GPKG_VARIANT, expected_size=size):
+            continue
+        url, hdr = _link(entry)
+        if not url:
+            continue
+        dest = cache._path(code, GPKG_VARIANT)
+        items.append({"url": url, "dest": dest, "headers": hdr, "expected_size": size,
+                      "md5": entry.get("checksum") or None, "label": f"{code} light GPKG"})
+        by_dest[str(dest)] = code
+    if not items:
+        return {}
+    if progress:
+        progress(f"Fetching {len(items)} light GPKG(s) from Zenodo…", None)
+    hook = (lambda st: progress(st.get("detail", ""), st)) if progress else None
+    res = zenodo_fetch.prefetch_many(items, hook=hook, label=f"{len(items)} light GPKG(s)")
+    return {by_dest[d]: r for d, r in res.items() if isinstance(r, Exception)}
 
 
 def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> list[dict]:
@@ -361,15 +399,26 @@ def collect_product_trees(cov: dict, geom_3035, progress=None, *, failed_reasons
                           gpkg_paths: dict | None = None) -> tuple[list[dict], list[str], list[str]]:
     """All product apices in the AOI, deduped by ``tree_id``.
     Returns (rows, codes_used, codes_failed); optional dicts receive
-    per-code failure reasons, manifest versions and local GPKG paths."""
+    per-code failure reasons, manifest versions and local GPKG paths.
+    ``progress(detail:str, state:dict|None)`` — *state* is the
+    ``zenodo_fetch`` aggregate while GPKGs are being downloaded."""
     rows: dict[str, dict] = {}
     used, failed = [], []
     reasons: dict[str, str] = {}
     versions: dict[str, str] = {}
     paths: dict[str, str] = {}
+    # 1) parallel Zenodo prefetch with aggregate progress (no-op when cached)
+    prefetch_err = prefetch_gpkgs(cov["product"], progress=progress)
+    # 2) sequential read (local disk, fast)
     for i, prod in enumerate(cov["product"]):
         if progress:
-            progress(f"Reading tree_apices {prod['code']} ({i + 1}/{len(cov['product'])})…")
+            progress(f"Reading tree_apices {prod['code']} ({i + 1}/{len(cov['product'])})…", None)
+        if prod["code"] in prefetch_err:
+            e = prefetch_err[prod["code"]]
+            log.warning("trees_v3: %s apices unavailable: %s", prod["code"], e)
+            failed.append(prod["code"])
+            reasons[prod["code"]] = f"{type(e).__name__}: {str(e)[:160]}"
+            continue
         try:
             p = gpkg_path(prod["code"], prod["entry"])
             if not p:

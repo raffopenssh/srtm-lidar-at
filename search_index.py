@@ -3668,52 +3668,52 @@ class SearchIndex:
         results = [dict(zip(cols, r)) for r in rows]
         return {'total': count, 'offset': offset, 'limit': limit, 'results': results}
 
-    def query_buildings(self, kg_code, bbox=None, limit=500, offset=0):
+    def query_buildings(self, kg_code, bbox=None, limit=500, offset=0, wait=None):
         """Return height-enriched building footprints for a KG.
         Lazy-loads the light GPKG from Zenodo if needed."""
-        gpkg = self._resolve_gpkg(kg_code, 'light')
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
         if not gpkg:
             return None
         return _query_gpkg_layer(gpkg, 'buildings', bbox=bbox, limit=limit, offset=offset)
 
-    def query_new_buildings_detail(self, kg_code, bbox=None, limit=500, offset=0):
+    def query_new_buildings_detail(self, kg_code, bbox=None, limit=500, offset=0, wait=None):
         """Return detected new building footprints for a KG."""
-        gpkg = self._resolve_gpkg(kg_code, 'light')
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
         if not gpkg:
             return None
         return _query_gpkg_layer(gpkg, 'new_buildings', bbox=bbox, limit=limit, offset=offset)
 
-    def query_infrastructure_detail(self, kg_code, bbox=None, limit=500, offset=0):
+    def query_infrastructure_detail(self, kg_code, bbox=None, limit=500, offset=0, wait=None):
         """Return detected infrastructure for a KG."""
-        gpkg = self._resolve_gpkg(kg_code, 'light')
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
         if not gpkg:
             return None
         return _query_gpkg_layer(gpkg, 'infrastructure', bbox=bbox, limit=limit, offset=offset)
 
     def query_segments_detail(self, kg_code, bbox=None, type_filter=None,
-                              limit=500, offset=0):
+                              limit=500, offset=0, wait=None):
         """Return segment polygons for a KG, optionally filtered by type."""
-        gpkg = self._resolve_gpkg(kg_code, 'light')
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
         if not gpkg:
             return None
         return _query_gpkg_layer(gpkg, 'segments', bbox=bbox,
                                  type_filter=type_filter, limit=limit, offset=offset)
 
     def query_segment_points(self, kg_code, bbox=None, type_filter=None,
-                             limit=500, offset=0):
+                             limit=500, offset=0, wait=None):
         """Return segment centroid points for a KG."""
-        gpkg = self._resolve_gpkg(kg_code, 'light')
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
         if not gpkg:
             # Try full GPKG which has segment_points
-            gpkg = self._resolve_gpkg(kg_code, 'full')
+            gpkg = self._resolve_gpkg(kg_code, 'full', wait=wait)
             if not gpkg:
                 return None
         return _query_gpkg_layer(gpkg, 'segment_points', bbox=bbox,
                                  type_filter=type_filter, limit=limit, offset=offset)
 
-    def gpkg_layers(self, kg_code, variant='light'):
+    def gpkg_layers(self, kg_code, variant='light', wait=None):
         """List available vector layers in a KG's GPKG."""
-        gpkg = self._resolve_gpkg(kg_code, variant)
+        gpkg = self._resolve_gpkg(kg_code, variant, wait=wait)
         if not gpkg:
             return None
         try:
@@ -3736,8 +3736,12 @@ class SearchIndex:
             log.warning('gpkg_layers %s %s: %s', kg_code, variant, e)
             return None
 
-    def _resolve_gpkg(self, kg_code, variant='light'):
+    def _resolve_gpkg(self, kg_code, variant='light', wait=None):
         """Find or download a GPKG for a KG. Returns local path or None.
+
+        ``wait`` (seconds, None = block until done) is forwarded to
+        ``GpkgCache.download``; a ``zenodo_fetch.FetchInProgress`` escapes
+        when the download outlives it (callers answer 202 + progress).
 
         Search order:
         1. Local processor output  (data/austria_processor/gpkg/)
@@ -3763,9 +3767,18 @@ class SearchIndex:
             return None
         url = row[0]
 
-        # Download in background? No — caller needs it now. Download synchronously.
-        path = cache.download(kg_code, variant, url)
-        return path
+        # Manifest byte size + md5 (if known) guard against truncated /
+        # stale files and let the fetch layer report a real percentage.
+        expected, md5 = 0, None
+        try:
+            import trees_v3 as _t3
+            ent = _t3.manifest_entries()
+            e = ent.get(f'{kg_code}_{variant}_gpkg') or ent.get(f'{kg_code}_{variant}_gpkg_v2') or {}
+            expected = int(e.get('size') or 0)
+            md5 = e.get('checksum') or None
+        except Exception:  # noqa: BLE001
+            pass
+        return cache.download(kg_code, variant, url, expected_size=expected, md5=md5, wait=wait)
 
     # ════════════════════════════════════════════════════════════════
     # Helpers
@@ -3975,56 +3988,42 @@ class GpkgCache:
                     pass
         return removed
 
-    def download(self, kg_code, variant, url, headers=None, expected_size=0):
-        """Download a GPKG from Zenodo. Returns local path or None.
+    def download(self, kg_code, variant, url, headers=None, expected_size=0,
+                 wait=None, md5=None):
+        """Download a GPKG from Zenodo through ``zenodo_fetch`` (progress-
+        aware, resumable, single-flight across threads AND gunicorn
+        workers).  Returns local path or None on terminal failure.
 
         Zenodo *bucket* URLs (``https://zenodo.org/api/files/<uuid>/<fn>``)
         belong to draft depositions and 403 without the owner token, so a
         Bearer header is added for them automatically (cf. ``v2_ingest._link``);
         ``headers`` may override.  ``expected_size`` > 0 rejects truncated
         bodies so a half-downloaded GPKG never enters the cache.
+
+        ``wait`` (seconds) bounds how long the caller blocks: ``None`` =
+        until done, ``0`` = kick off and return immediately.  When the
+        download is still running after ``wait`` s a
+        ``zenodo_fetch.FetchInProgress`` (``.state`` = live progress dict)
+        propagates so sync endpoints can answer ``202`` and let the client
+        poll while the download continues in the background.
         """
-        import urllib.request
-        hdr = {'User-Agent': 'srtm-lidar/1.0'}
-        if url.startswith('https://zenodo.org/api/files/') and 'access_token=' not in url:
-            try:
-                from zenodo_client import DEFAULT_TOKEN
-                hdr['Authorization'] = f'Bearer {DEFAULT_TOKEN}'
-            except Exception:
-                pass
-        if headers:
-            hdr.update(headers)
+        import zenodo_fetch
+        existing = self.get(kg_code, variant, expected_size=expected_size)
+        if existing:
+            return existing
         with self._lock:
-            # Double-check after lock
-            existing = self.get(kg_code, variant)
-            if existing:
-                return existing
             self._evict_if_needed()
-            dest = self._path(kg_code, variant)
-            tmp = dest.with_suffix('.gpkg.tmp')
-            try:
-                log.info('gpkg_cache: downloading %s %s from %s', kg_code, variant, url[:80])
-                req = urllib.request.Request(url, headers=hdr)
-                n = 0
-                with urllib.request.urlopen(req, timeout=300) as resp, open(tmp, 'wb') as f:
-                    while True:
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        n += len(chunk)
-                if expected_size and n != expected_size:
-                    raise RuntimeError(f'size mismatch: got {n} want {expected_size}')
-                tmp.rename(dest)
-                log.info('gpkg_cache: cached %s (%d MB)', dest.name, dest.stat().st_size // (1024*1024))
-                return str(dest)
-            except Exception as e:
-                log.warning('gpkg_cache: download failed %s %s: %s', kg_code, variant, e)
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return None
+        dest = self._path(kg_code, variant)
+        try:
+            p = zenodo_fetch.download(url, dest, headers=headers,
+                                      expected_size=int(expected_size or 0), md5=md5,
+                                      label=f'{kg_code} {variant} GPKG', wait=wait)
+            return str(p)
+        except zenodo_fetch.FetchInProgress:
+            raise
+        except Exception as e:
+            log.warning('gpkg_cache: download failed %s %s: %s', kg_code, variant, e)
+            return None
 
     def _evict_if_needed(self):
         """Remove oldest files until under max_bytes."""

@@ -44,6 +44,7 @@ import object_segmentation as seg  # watershed-based segmentation
 import hansen  # Hansen Global Forest Change calibration
 import temporal_analysis as tca
 import geo_parse
+from zenodo_fetch import FetchInProgress
 import search_index as si
 import cadastre_bridge as cb
 import feedback_db
@@ -2616,8 +2617,16 @@ _PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 _RESULTS_DIR = Path('/tmp/segment_results')
 _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _progress_set(task_id: str, step: str, detail: str = ""):
-    """Update progress for a running segment task."""
+def _progress_set(task_id: str, step: str, detail: str = "", fetch: dict | None = None,
+                  progress: float | None = None):
+    """Update progress for a running segment task.
+
+    ``fetch`` — structured ``zenodo_fetch`` state (bytes_done/total, pct,
+    rate_mbps, eta_s, files_done/total, …) while the step is waiting on a
+    Zenodo download; surfaced verbatim by ``/api/v1/segment/progress`` so
+    clients can draw a real bar instead of a spinner.  ``progress`` — an
+    explicit 0..1 fraction for the step (defaults to fetch.pct/100).
+    """
     if not task_id:
         return
     p = _PROGRESS_DIR / f"{task_id}.json"
@@ -2628,10 +2637,31 @@ def _progress_set(task_id: str, step: str, detail: str = ""):
                 t0 = json.loads(p.read_text()).get('t0', 0.0)
             except Exception:
                 pass
-        p.write_text(json.dumps(dict(step=step, detail=detail, t0=t0,
-                                     updated=time.time())))
+        d = dict(step=step, detail=detail, t0=t0, updated=time.time())
+        if fetch:
+            keep = ('status', 'label', 'file', 'bytes_done', 'bytes_total', 'pct', 'rate_mbps',
+                    'eta_s', 'elapsed_s', 'attempt', 'files_done', 'files_total', 'files_failed',
+                    'active', 'error', 'source')
+            d['fetch'] = {k: fetch[k] for k in keep if k in fetch}
+            if progress is None and fetch.get('pct') is not None:
+                progress = float(fetch['pct']) / 100.0
+        if progress is not None:
+            d['progress'] = round(max(0.0, min(1.0, float(progress))), 4)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(d))
+        tmp.replace(p)
     except Exception:
         pass
+
+
+def _bind_fetch_progress(task_id: str, step: str = 'download'):
+    """Route every ``zenodo_fetch`` download on the current thread into the
+    task's progress file (call at the top of an async task worker)."""
+    import zenodo_fetch
+    if not task_id:
+        zenodo_fetch.set_hook(None)
+        return
+    zenodo_fetch.set_hook(lambda st: _progress_set(task_id, step, st.get('detail', ''), fetch=st))
 
 def _progress_start(task_id: str):
     if not task_id:
@@ -2741,7 +2771,7 @@ def segment_progress():
         elapsed = round(time.time() - info.get('t0', time.time()), 1)
         is_done = step == 'done'
         is_error = step == 'error'
-        return jsonify(dict(
+        out = dict(
             active=not is_done and not is_error,
             step=step,
             detail=info.get('detail', ''),
@@ -2749,7 +2779,13 @@ def segment_progress():
             done=is_done,
             error=info.get('detail', '') if is_error else None,
             auto_share_id=info.get('auto_share_id'),
-        ))
+            updated_ago=round(time.time() - info.get('updated', time.time()), 1),
+        )
+        if info.get('fetch'):
+            out['fetch'] = info['fetch']       # zenodo_fetch state: bytes/pct/rate/eta/files
+        if info.get('progress') is not None:
+            out['progress'] = info['progress']  # 0..1 for the current step
+        return jsonify(out)
     except Exception:
         return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
 
@@ -10475,6 +10511,66 @@ def _parse_bbox_param(s):
     return None
 
 
+# === SECTION: Zenodo fetch progress (sync GPKG endpoints) ===
+
+def _gpkg_wait_param(default: float = 25.0, cap: float = 120.0) -> float:
+    """``?wait=S`` for the sync GPKG-backed ``/kg/<code>/*`` endpoints: how
+    long to block on a cold Zenodo download before answering 202.  Default
+    25 s (under typical proxy idle timeouts); ``wait=0`` = never block."""
+    try:
+        return max(0.0, min(cap, float(request.args.get('wait', default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_in_progress_response(exc, kg_code: str, what: str):
+    """202 Accepted for a GPKG that is still downloading from Zenodo.
+
+    Body carries the live ``zenodo_fetch`` state (bytes, pct, MB/s, ETA,
+    attempt) plus ``retry_after_s``; the same URL returns 200 once the file
+    is local.  The download keeps running server-side regardless of the
+    client, so polling is cheap and idempotent (single-flight)."""
+    import zenodo_fetch
+    st = dict(getattr(exc, 'state', {}) or {})
+    eta = st.get('eta_s')
+    retry = int(max(2, min(30, (eta or 10) / 4))) if st.get('status') == 'downloading' else 5
+    body = {
+        'status': 'fetching', 'kg_code': kg_code, 'resource': what,
+        'message': st.get('detail') or f'{what} for KG {kg_code} is being downloaded from Zenodo',
+        'fetch': {k: st.get(k) for k in ('status', 'label', 'bytes_done', 'bytes_total', 'pct',
+                                         'rate_mbps', 'eta_s', 'elapsed_s', 'attempt', 'error')},
+        'retry_after_s': retry,
+        'poll': request.full_path.rstrip('?'),
+        'zenodo': zenodo_fetch.stats(),
+        'hint': 'Poll this URL (200 when ready); wait=0 returns immediately, wait=120 blocks longest; '
+                'fleet-wide download state at /api/v1/zenodo/fetches',
+    }
+    resp = jsonify(body)
+    resp.status_code = 202
+    resp.headers['Retry-After'] = str(retry)
+    if st.get('pct') is not None:
+        resp.headers['X-Fetch-Progress'] = f"{st['pct']}%"
+    return resp
+
+
+@app.route('/api/v1/zenodo/fetches')
+def api_zenodo_fetches():
+    """Live view of every Zenodo product download on this host (both
+    gunicorn workers, via sidecars) + the last completed ones and a
+    throughput verdict.  ``?recent=N`` (default 10)."""
+    import zenodo_fetch
+    try:
+        n = max(0, min(50, int(request.args.get('recent', 10))))
+    except ValueError:
+        n = 10
+    return jsonify({
+        'inflight': zenodo_fetch.inflight(),
+        'recent': zenodo_fetch.recent()[:n],
+        'stats': zenodo_fetch.stats(),
+        'text': zenodo_fetch.text_line(),
+    })
+
+
 @app.route('/api/v1/kg/<kg_code>/buildings')
 def api_kg_buildings(kg_code):
     """Height-enriched building footprints from the light GPKG.
@@ -10487,10 +10583,13 @@ def api_kg_buildings(kg_code):
         bbox = _parse_bbox_param(request.args.get('bbox'))
         limit = min(int(request.args.get('limit', 500)), 5000)
         offset = int(request.args.get('offset', 0))
-        result = idx.query_buildings(kg_code, bbox=bbox, limit=limit, offset=offset)
+        result = idx.query_buildings(kg_code, bbox=bbox, limit=limit, offset=offset,
+                                     wait=_gpkg_wait_param())
         if result is None:
             return jsonify({'error': f'No building data available for KG {kg_code}'}), 404
         return jsonify(result)
+    except FetchInProgress as fip:
+        return _fetch_in_progress_response(fip, kg_code, 'buildings (light GPKG)')
     except Exception as e:
         log.warning('api_kg_buildings %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
@@ -10507,10 +10606,13 @@ def api_kg_new_buildings(kg_code):
         bbox = _parse_bbox_param(request.args.get('bbox'))
         limit = min(int(request.args.get('limit', 500)), 5000)
         offset = int(request.args.get('offset', 0))
-        result = idx.query_new_buildings_detail(kg_code, bbox=bbox, limit=limit, offset=offset)
+        result = idx.query_new_buildings_detail(kg_code, bbox=bbox, limit=limit, offset=offset,
+                                                wait=_gpkg_wait_param())
         if result is None:
             return jsonify({'error': f'No new building data available for KG {kg_code}'}), 404
         return jsonify(result)
+    except FetchInProgress as fip:
+        return _fetch_in_progress_response(fip, kg_code, 'new_buildings (light GPKG)')
     except Exception as e:
         log.warning('api_kg_new_buildings %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
@@ -10527,10 +10629,13 @@ def api_kg_infrastructure(kg_code):
         bbox = _parse_bbox_param(request.args.get('bbox'))
         limit = min(int(request.args.get('limit', 500)), 5000)
         offset = int(request.args.get('offset', 0))
-        result = idx.query_infrastructure_detail(kg_code, bbox=bbox, limit=limit, offset=offset)
+        result = idx.query_infrastructure_detail(kg_code, bbox=bbox, limit=limit, offset=offset,
+                                                 wait=_gpkg_wait_param())
         if result is None:
             return jsonify({'error': f'No infrastructure data available for KG {kg_code}'}), 404
         return jsonify(result)
+    except FetchInProgress as fip:
+        return _fetch_in_progress_response(fip, kg_code, 'infrastructure (light GPKG)')
     except Exception as e:
         log.warning('api_kg_infrastructure %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
@@ -10588,10 +10693,12 @@ def api_kg_segments(kg_code):
         limit = min(int(request.args.get('limit', 500)), 5000)
         offset = int(request.args.get('offset', 0))
         result = idx.query_segments_detail(kg_code, bbox=bbox, type_filter=type_filter,
-                                           limit=limit, offset=offset)
+                                           limit=limit, offset=offset, wait=_gpkg_wait_param())
         if result is None:
             return jsonify({'error': f'No segment data available for KG {kg_code}'}), 404
         return jsonify(result)
+    except FetchInProgress as fip:
+        return _fetch_in_progress_response(fip, kg_code, 'segments (light GPKG)')
     except Exception as e:
         log.warning('api_kg_segments %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
@@ -10893,10 +11000,12 @@ def api_kg_layers(kg_code):
         variant = request.args.get('variant', 'light')
         if variant not in ('light', 'full'):
             return jsonify({'error': 'variant must be light or full'}), 400
-        result = idx.gpkg_layers(kg_code, variant=variant)
+        result = idx.gpkg_layers(kg_code, variant=variant, wait=_gpkg_wait_param())
         if result is None:
             return jsonify({'error': f'No GPKG available for KG {kg_code}'}), 404
         return jsonify({'kg_code': kg_code, 'variant': variant, 'layers': result})
+    except FetchInProgress as fip:
+        return _fetch_in_progress_response(fip, kg_code, 'layers (GPKG)')
     except Exception as e:
         log.warning('api_kg_layers %s: %s', kg_code, e)
         return jsonify({'error': str(e)}), 500
@@ -12891,6 +13000,7 @@ def _segment_worker(task_id: str, features: list, params: dict, geometry_text: s
             _progress_error(task_id, 'Server busy — timed out waiting in queue. Try again later.')
             return
         try:
+            _bind_fetch_progress(task_id)
             resp = _segment_core(task_id, features, params)
             _store_result(task_id, resp)
             import gc; gc.collect()
@@ -12901,6 +13011,7 @@ def _segment_worker(task_id: str, features: list, params: dict, geometry_text: s
             log.error("Async segment task %s failed: %s", task_id, traceback.format_exc())
             _progress_error(task_id, str(e))
         finally:
+            _bind_fetch_progress('')
             _TASK_SEMAPHORE.release()
     except Exception as e:
         with _TASK_QUEUE_LOCK:
@@ -15545,6 +15656,7 @@ def _tree_task_worker(task_id, core_fn, features, params):
             _progress_error(task_id, 'Server busy — timed out waiting in queue. Try again later.')
             return
         try:
+            _bind_fetch_progress(task_id)
             resp = core_fn(task_id, features, params)
             _store_result(task_id, resp)
             _progress_done(task_id)
@@ -15552,6 +15664,7 @@ def _tree_task_worker(task_id, core_fn, features, params):
             log.error("Async tree task %s failed: %s", task_id, traceback.format_exc())
             _progress_error(task_id, str(e))
         finally:
+            _bind_fetch_progress('')
             _TASK_SEMAPHORE.release()
     except Exception as e:
         with _TASK_QUEUE_LOCK:
@@ -16645,7 +16758,7 @@ def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
     cov = t3.resolve_coverage(geom_3035)
     failed_reasons, versions, paths = {}, {}, {}
     rows, used, failed = t3.collect_product_trees(
-        cov, geom_3035, progress=lambda m: _progress_set(task_id, 'product', m),
+        cov, geom_3035, progress=lambda m, st=None: _progress_set(task_id, 'download' if st else 'product', m, fetch=st),
         failed_reasons=failed_reasons, product_versions=versions, gpkg_paths=paths)
     grid = t3.CanopyGrid(used, geom_3035)
     live_rows, live_canopy_m2, live_meta = [], 0.0, {}
@@ -20717,6 +20830,17 @@ def process_txt():
             )
     except Exception:
         log.exception('process.txt fleet_proxy line failed')
+
+    # zenodo_fetch line: in-flight product downloads (both workers) +
+    # recent-hour throughput / ZENODO-SLOW verdict. Structured twin at
+    # /api/v1/zenodo/fetches.
+    try:
+        import zenodo_fetch as _zf
+        _zs = _zf.stats()
+        if _zs['inflight'] or _zs['recent_1h'] or _zs['recent_1h_failed']:
+            out.append(_zf.text_line())
+    except Exception:
+        log.exception('process.txt zenodo_fetch line failed')
 
     # v2 rollout line (primary-local: kg_v2_store + manifest + json dir).
     # See v2_ingest.text_line(); structured twin at director/status.v2.

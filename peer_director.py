@@ -7060,17 +7060,19 @@ class PeerDirector:
         V2_ORPHAN_CHECK_INTERVAL_S. Hard gates: Zenodo circuit clear,
         entry ≥24 h old, code not queued / not running on any peer,
         parent bbox covered without it, and the deposition on Zenodo
-        contains exactly the one ``<code>_v2.json.gz`` file."""
+        contains exactly the one ``<code>_v2.json.gz`` file. Deliberately
+        NOT gated on the fleet Zenodo circuit (see inline note)."""
         now = time.time()
         if now - float(self.state.get('_v2_orphan_checked_at') or 0) < V2_ORPHAN_CHECK_INTERVAL_S:
             return
         self.state['_v2_orphan_checked_at'] = now
-        try:
-            from zenodo_cache import zenodo_degraded as _zdeg
-            if _zdeg() or (self.state.get('zenodo_circuit') or {}).get('degraded'):
-                return
-        except Exception:
-            return
+        # No fleet-circuit gate here (unlike _check_v2_regen): the circuit
+        # trips on *peer* large-body PUT failures, which can stay degraded
+        # for many hours (Sep 23 2026: 01:54→11:30+, sweep never ran) while
+        # the primary's small deposition GET/DELETE calls work fine. The
+        # sweep's evidence is positive (HTTP 200 + exactly one file) so a
+        # flaky Zenodo cannot yield a false candidate; a failed DELETE is
+        # simply skipped and retried next interval.
         mf_path = DATA_DIR / 'zenodo_manifest.json'
         try:
             raw = json.loads(mf_path.read_text()) if mf_path.exists() else {}

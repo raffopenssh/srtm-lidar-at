@@ -20031,14 +20031,15 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
         return _OPENEO_HEALTH_CACHE['v']
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     mult = _re.compile(r'×(\d+)$')
-    v = {'timeouts': 0, 'split_arms': 0, 'cascades': 0, 'quad_ok': 0,
-         'peers_timeout': set(), 'peers_split': set(), 'peers_cascade': set(),
-         'hours': hours}
+    v = {'timeouts': 0, 'split_arms': 0, 'cascades': 0, 'defers': 0,
+         'quad_ok': 0, 'peers_timeout': set(), 'peers_split': set(),
+         'peers_cascade': set(), 'peers_defer': set(), 'hours': hours}
     try:
         with _COMBINED_LOG_PATH.open() as fh:
             for line in fh:
                 if 'openeo' not in line and 'openEO' not in line \
-                        and 'Upstream-stress' not in line and 'quadrants' not in line:
+                        and 'Upstream-stress' not in line and 'quadrants' not in line \
+                        and 'Copernicus throttle' not in line:
                     continue
                 try:
                     e = json.loads(line)
@@ -20056,13 +20057,20 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
                     v['split_arms'] += n; v['peers_split'].add(peer)
                 elif 'Upstream-stress cascade' in msg:
                     v['cascades'] += n; v['peers_cascade'].add(peer)
+                elif 'due to Copernicus throttle' in msg:
+                    # austria_processor "aborting after tile i/n due to
+                    # Copernicus throttle" — the KG was ACTUALLY deferred.
+                    # `cascades` alone only proves copernicus raised; a
+                    # swallowing caller (ndvi_harmonics, pre 1a0017e) made
+                    # that count lie for a whole day.
+                    v['defers'] += n; v['peers_defer'].add(peer)
                 elif 'mosaicked' in msg and 'quadrants' in msg:
                     v['quad_ok'] += n
     except FileNotFoundError:
         pass
     except Exception:
         log.exception('openeo health scan failed')
-    for k in ('peers_timeout', 'peers_split', 'peers_cascade'):
+    for k in ('peers_timeout', 'peers_split', 'peers_cascade', 'peers_defer'):
         v[k] = sorted(v[k])
     _OPENEO_HEALTH_CACHE.update(t=now, v=v)
     return v
@@ -20405,14 +20413,16 @@ def process_txt():
     try:
         _oh = _openeo_health()
         if _oh.get('timeouts') or _oh.get('split_arms') or _oh.get('cascades'):
-            _state = ('DEGRADED — KGs being deferred' if _oh['cascades']
+            _state = ('DEGRADED — KGs being deferred' if _oh.get('defers')
+                      else 'DEGRADED — cascades NOT deferring (check swallow)'
+                      if _oh['cascades']
                       else 'SLOW — quadrant split mode' if _oh['split_arms']
                       else 'timeouts')
             out.append(
                 f"openeo:   {_state} · 1h: month_timeouts={_oh['timeouts']} "
                 f"(≈{_oh['timeouts'] * 4}min burned, peers={len(_oh['peers_timeout'])}) "
                 f"split_arms={_oh['split_arms']} quad_mosaics_ok={_oh['quad_ok']} "
-                f"cascades→defer={_oh['cascades']}"
+                f"cascades={_oh['cascades']} kg_defers={_oh.get('defers', 0)}"
                 + (f" [{','.join(_oh['peers_cascade'][:6])}]" if _oh['peers_cascade'] else '')
                 + " · debug: ?q=openeo&warn=1"
             )

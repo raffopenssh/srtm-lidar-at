@@ -11246,16 +11246,35 @@ def _copernicus_probe() -> bool:
         for k in list(copernicus._connections.keys()):
             copernicus._connections.pop(k, None)
         conn = copernicus._get_connection()
-        cube = conn.load_collection(
+        # Representative probe (2026-09-23): the old 0.01° / one-band /
+        # max_time request answered in seconds even while every real
+        # 0.05° NDVI-month request timed out, so a paused frontier peer
+        # "recovered" every 15 min, burned two month timeouts + one
+        # tile of BEV reads, and re-paused — a 25 min hammer loop on
+        # a struggling openEO. Probe with the exact workload shape
+        # (quadrant-sized cell, SCL-masked NDVI monthly median) and the
+        # quadrant timeout; stay paused while that still can't finish.
+        s2 = conn.load_collection(
             'SENTINEL2_L2A',
-            spatial_extent={'west': 15, 'south': 47,
-                            'east': 15.01, 'north': 47.01},
-            temporal_extent=['2024-06-01', '2024-06-15'],
-            bands=['B04'],
+            spatial_extent={'west': 15.0, 'south': 47.0,
+                            'east': 15.05, 'north': 47.05},
+            temporal_extent=['2024-06-01', '2024-07-01'],
+            bands=['B04', 'B08', 'SCL'],
         )
-        cube.max_time().download()
-        return True
-    except Exception:
+        s2m = s2.process('mask_scl_dilation', data=s2, scl_band_name='SCL')
+        cube = s2m.ndvi(nir='B08', red='B04').reduce_dimension(
+            dimension='t', reducer='median')
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix='.tif', delete=True) as _t:
+            conn.download(cube.save_result(format='GTiff').flat_graph(),
+                          _t.name, timeout=copernicus._MONTH_SYNC_TIMEOUT_QUAD)
+            ok = os.path.getsize(_t.name) > 0
+        log.info("probe: representative openEO NDVI-month request %s",
+                 "OK" if ok else "returned empty file")
+        return ok
+    except Exception as _pe:
+        log.info("probe: representative openEO request failed: %s",
+                 str(_pe)[:160])
         return False
 
 

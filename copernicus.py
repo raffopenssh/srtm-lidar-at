@@ -457,6 +457,40 @@ _SYNC_SPLIT_TTL_SECS = 3600
 _SYNC_SPLIT_FILE = pathlib.Path("data/austria_processor/openeo_sync_split_until")
 _TIMEOUT_SIGNS = ('Read timed out', 'read timeout', 'ReadTimeout')
 
+# Per-request sync timeouts for the NDVI *month* path (2026-09-23 evening).
+# The global DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE=240 cap (929413f) was
+# sized for `_download_with_fallback`, whose sync attempt is only a
+# 180 s probe before a batch job.  The month path has NO batch fallback,
+# and peer logs show 0.1° months have *always* been slow on openEO's sync
+# path: 09-19..09-21 successes took 5-35 min (avg 600-1500 s).  The 240 s
+# cap turned that slow-but-working path into ~100 %% timeouts from 22T13
+# on ("Read timed out" 4/h → 100/h), every frontier tile lost harmonics
+# and the -partial backlog grew to ~985 KGs.  A client-side abandon does
+# not cancel the server-side Spark job either, so re-requesting after
+# 240 s *doubles* our load on openEO — patience is the gentler option
+# (peer compute / wall-time is not the constraint; openEO is).
+_MONTH_SYNC_TIMEOUT_FULL = 1200   # 0.1° cell, first attempt
+_MONTH_SYNC_TIMEOUT_QUAD = 600    # 0.05° quadrant in split mode
+_RELAY_FILE = pathlib.Path("data/austria_processor/subprocess_warnings.jsonl")
+
+
+def _relay_info(msg: str) -> None:
+    """Mirror an INFO line into the processor's warning relay so it reaches
+    the fleet merged log (subprocess INFO is otherwise local-only — the
+    dashboard's ``quad_mosaics_ok`` counter read 0 all day while peers had
+    mosaicked fine).  No-op outside a processor subprocess."""
+    try:
+        if not _RELAY_FILE.exists():
+            return
+        with open(_RELAY_FILE, "a") as fh:
+            from datetime import datetime as _dt, timezone as _tz
+            fh.write(json.dumps({
+                "ts": _dt.now(_tz.utc).isoformat(),
+                "level": "info", "msg": f"copernicus: {msg}", "step": "",
+            }) + "\n")
+    except Exception:
+        pass
+
 
 def _is_read_timeout(exc_str: str) -> bool:
     return any(s in exc_str for s in _TIMEOUT_SIGNS)
@@ -2134,7 +2168,7 @@ def get_ndvi_timeseries(
                 cred_idx = _credential_index
                 c = _get_connection()
 
-                def _dl_cube(part_bbox, dst):
+                def _dl_cube(part_bbox, dst, timeout=_MONTH_SYNC_TIMEOUT_FULL):
                     s2 = c.load_collection(
                         "SENTINEL2_L2A",
                         spatial_extent=part_bbox,
@@ -2148,7 +2182,11 @@ def get_ndvi_timeseries(
                     ndvi_median = ndvi_cube.reduce_dimension(
                         dimension="t", reducer="median",
                     )
-                    ndvi_median.download(str(dst), format="GTiff")
+                    # Connection.download() takes an explicit per-request
+                    # timeout; DataCube.download() does not (falls back
+                    # to the 240 s global cap).
+                    c.download(ndvi_median.save_result(format="GTiff").flat_graph(),
+                               str(dst), timeout=timeout)
                     if not (dst.exists() and dst.stat().st_size > 0):
                         dst.unlink(missing_ok=True)
                         raise RuntimeError("download produced empty file")
@@ -2172,7 +2210,7 @@ def get_ndvi_timeseries(
                             qp = dst.with_suffix(f".q{qi}.tif")
                             qp.unlink(missing_ok=True)
                             try:
-                                _dl_cube(qb, qp)
+                                _dl_cube(qb, qp, timeout=_MONTH_SYNC_TIMEOUT_QUAD)
                                 parts.append(qp)
                             except Exception as qe:
                                 if 'download produced empty file' in str(qe):
@@ -2183,6 +2221,7 @@ def get_ndvi_timeseries(
                             raise RuntimeError("download produced empty file")
                         _mosaic_tiffs(parts, dst)
                         logger.info("NDVI %s: mosaicked %d/4 quadrants", label, len(parts))
+                        _relay_info(f"NDVI {label}: mosaicked {len(parts)}/4 quadrants")
                     finally:
                         for qp in parts:
                             qp.unlink(missing_ok=True)

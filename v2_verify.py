@@ -81,7 +81,7 @@ TOL = {
     "unclassified_pp": 2.0,        # v2 unclassified share ≤ v1 + 2 pp
     "segments_rel_min": 0.5,       # sanity — v2 segments ≥ half of v1's
     "raster_hole_frac": 0.005,     # zero segment_type inside parcel union
-    "outline_z_min_frac": 0.5,     # ≥ 50 %% of parcels with geometry carry outline_z
+    "outline_z_min_frac": 0.5,     # ≥ 50 % of parcels with geometry carry outline_z
 }
 
 
@@ -429,7 +429,7 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     _un = int(_num(_ua.get("n_objects"), 0) or 0)
     _ushape = (f" (n={_un} avg={_num(_ua.get('area_sqm'), 0.0) / _un:.0f}m²)" if _un else "")
     rep.check("unclassified_le_v1", u2 <= u1 + TOL["unclassified_pp"],
-              f"v2={u2:.1f}%%{_ushape} v1={u1:.1f}%%")
+              f"v2={u2:.1f}%{_ushape} v1={u1:.1f}%")
     nb2 = int(_num(_g(v2, "new_buildings", "count"), 0) or 0)
     nb1 = int(_num(_g(v1, "new_buildings", "count"), 0) or 0)
     rep["delta"] = {"n_segments": n_seg - n1, "unclassified_pp": round(u2 - u1, 2),
@@ -530,7 +530,7 @@ def check_v21_document(v2: dict, rep: Report) -> None:
             rep.check("grid25_overshoot", False, _gd + f" (> {slack:.0f} m past bbox)", fatal=False)
     n_valid = int(np.isfinite(d["elev"]).sum())
     frac = n_valid / max(cols * rows, 1)
-    rep.check("grid25_finite", frac >= 0.4, f"{n_valid}/{cols * rows} cells valid ({100 * frac:.0f}%%)")
+    rep.check("grid25_finite", frac >= 0.4, f"{n_valid}/{cols * rows} cells valid ({100 * frac:.0f}%)")
     emin, emax = _num(_g(v2, "terrain", "elevation_min_m")), _num(_g(v2, "terrain", "elevation_max_m"))
     if n_valid and emin is not None and emax is not None:
         gmin, gmax = float(np.nanmin(d["elev"])), float(np.nanmax(d["elev"]))
@@ -843,7 +843,7 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             _nup = int(_num(_g(v2, "data_quality", "n_upstream_failed_tiles"), 0) or 0)
             _declared_gap = (_s < _l) or _nup > 0
             rep.check("segment_type_no_holes", hole <= TOL["raster_hole_frac"],
-                      f"{100*hole:.2f}%% of parcel union has no segment class"
+                      f"{100*hole:.2f}% of parcel union has no segment class"
                       + (" (declared tile gap)" if _declared_gap else ""),
                       fatal=not _declared_gap)
         rep["segment_type_nonzero_px"] = nz

@@ -16712,7 +16712,15 @@ def _tree_v3_params(params):
         else 'ndsm_only'
     eff['fallback_live'] = str(params.get('fallback_live', 'true')).lower() in ('true', '1', 'yes')
     eff['dataset'] = params.get('dataset', ti.DEFAULT_DATASET)
-    eff['min_tree_likelihood'] = float(params.get('min_tree_likelihood', 0.0))
+    # Two distinct knobs (2.4.1 fix, forestry.exe.xyz report): the live
+    # detector's non-forest rejection threshold stays at the v2.3 default
+    # (tv.MIN_TREE_LIKELIHOOD, set by _tree_v2_params) and is only moved by
+    # an explicit ``min_tree_likelihood``; the *row filter* over product +
+    # live rows defaults to 0.0 (product apices are pre-filtered at build
+    # time).  Up to 2.4.0 the filter default of 0.0 leaked into
+    # build_inventory() and disabled rejection in the live_fused path, so
+    # roofs / crop plateaus shipped as stems with DBH + volume.
+    eff['filter_min_tree_likelihood'] = float(params.get('min_tree_likelihood', 0.0))
     eff['stand_context'] = [s.strip() for s in str(params.get('stand_context', '')).split(',') if s.strip()]
     eff['crown_geometry'] = str(params.get('crown_geometry', 'point')).lower()
     eff['legacy_ids'] = str(params.get('legacy_ids', params.get('tree_id_v2', 'false'))).lower() in ('true', '1', 'yes')
@@ -16723,7 +16731,8 @@ def _tree_v3_params(params):
 def _tree_v3_filter_rows(rows, eff):
     """Apply the request filters (height / likelihood / stand_context) to
     product + live rows alike."""
-    mh = eff['min_tree_height']; ml = eff['min_tree_likelihood']; sc = eff['stand_context']
+    mh = eff['min_tree_height']; sc = eff['stand_context']
+    ml = eff.get('filter_min_tree_likelihood', eff.get('min_tree_likelihood', 0.0))
     out = []
     for r in rows:
         if (r.get('h_m') or 0.0) < mh:
@@ -16864,6 +16873,27 @@ def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
         live_meta = {**_tree_v2_det_meta(det_meta, nir_used), 'ortho_used': ortho_used,
                      'nir_used': nir_used, 'dataset': eff['dataset']}
     all_rows = rows + live_rows
+    # Belt and braces: with reject_nonforest on, no live row may carry a
+    # non-crown verdict past this point (build_inventory already dropped
+    # them; this guards against a future eff-plumbing regression).  Rejected
+    # rows are counted, never emitted, exactly like the v2.3 contract.
+    n_rej_live = 0
+    if eff.get('reject_nonforest', True) and live_ran:
+        keep_cls = t3.SURFACE_KEEP_CLASSES
+        kept = []
+        for r in all_rows:
+            if (r.get('_source') in ('live', 'live_fused', 'fused_product')
+                    and r.get('surface_class') is not None
+                    and r.get('surface_class') not in keep_cls):
+                n_rej_live += 1
+                live_meta['rejected_by_surface'] = int(live_meta.get('rejected_by_surface', 0) or 0) + 1
+                rc = live_meta.setdefault('rejected_by_surface_class', {})
+                rc[r['surface_class']] = rc.get(r['surface_class'], 0) + 1
+                continue
+            kept.append(r)
+        all_rows = kept
+        if n_rej_live:
+            log.warning('trees_v3: post-hoc dropped %d live rows with non-crown surface_class', n_rej_live)
     n_edge = t3.mark_edge(all_rows, geom_3035)
     t3.rank_vitality_in_aoi(all_rows)
     if eff.get('legacy_ids'):
@@ -16887,6 +16917,16 @@ def _tree_v3_collect(task_id, geom_3035, eff, include_ortho=False):
                               f'{t3.LIVE_DEDUPE_M} m')},
         'grid25_codes': grid.codes,
         'live': live_meta,
+        # v2.3 non-forest rejection counters hoisted to top level (they used
+        # to be reachable only under meta.live; consumers book timber from
+        # the top-level meta)
+        'nonforest_rejection': bool(eff.get('reject_nonforest', True)),
+        'rejected_by_surface': int(live_meta.get('rejected_by_surface', 0) or 0),
+        'rejected_by_surface_class': dict(live_meta.get('rejected_by_surface_class') or {}),
+        'rejected_nonforest': int(live_meta.get('rejected_by_surface', 0) or 0),
+        'rejected_by_class': dict(live_meta.get('rejected_by_surface_class') or {}),
+        'building_mask': live_meta.get('building_mask') if live_ran else 'n/a (no live run; product apices pre-filtered at build time)',
+        'surface_keep_classes': sorted(t3.SURFACE_KEEP_CLASSES),
         'n_edge': n_edge,
         'grid_anchor': raster_io.GRID_ANCHOR,
         'tree_id_note': ('tree_id names the BEV source pixel (integer-metre EPSG:3035 grid, pixel '

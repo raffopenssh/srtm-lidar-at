@@ -43,7 +43,11 @@ GPKG_VARIANT = "light_v2"
 LIVE_DEDUPE_M = 1.5
 #: live fallback is skipped when the uncovered part is smaller than this
 LIVE_MIN_AREA_M2 = 625.0
-ALGO_VERSION = "3.1.0"
+ALGO_VERSION = "3.1.1"   # 3.1.1: live_fused non-forest rejection restored (threshold split)
+# surface_class verdicts that may be reported as stems (v2.3 contract);
+# everything else (building / crop / flat_structure / hard_surface) is
+# counted in meta.rejected_by_surface_class and never emitted.
+SURFACE_KEEP_CLASSES = frozenset({"tree", "dead_tree_candidate", "uncertain"})
 
 _manifest_lock = threading.Lock()
 _manifest_cache: tuple[float, dict] | None = None

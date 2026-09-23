@@ -111,3 +111,27 @@ if '--live' in sys.argv:
 
 shutil.rmtree(tmp)
 print('ALL OK')
+
+
+def test_v3_params_keep_live_rejection_threshold():
+    """2.4.1 regression: the v3 row-filter default (0.0) must not disable
+    the live detector's v2.3 non-forest rejection threshold."""
+    import app
+    import tree_inventory as tv
+    eff = app._tree_v3_params({})
+    assert eff['min_tree_likelihood'] == tv.MIN_TREE_LIKELIHOOD
+    assert eff['filter_min_tree_likelihood'] == 0.0
+    eff = app._tree_v3_params({'min_tree_likelihood': '0.5'})
+    assert eff['min_tree_likelihood'] == 0.5 and eff['filter_min_tree_likelihood'] == 0.5
+
+
+def test_v3_filter_rows_uses_filter_threshold():
+    import app
+    eff = app._tree_v3_params({})
+    rows = [{'h_m': 10, 'tree_likelihood': 0.02, 'surface_class': 'building'},
+            {'h_m': 10, 'tree_likelihood': None}]
+    # filter threshold is 0.0 → nothing dropped by likelihood here (the
+    # detector is responsible for rejection); explicit param drops the roof
+    assert len(app._tree_v3_filter_rows(rows, eff)) == 2
+    eff = app._tree_v3_params({'min_tree_likelihood': '0.35'})
+    assert len(app._tree_v3_filter_rows(rows, eff)) == 1

@@ -26,7 +26,15 @@ curl -s 'https://srtm-lidar-at.exe.xyz:8000/process.txt?stall=40'      # all sta
 
 **First line is a `health:` banner** — distils triage signals
 (`done/8440 (pct%) @rate/h eta`, plus loud flags `CPU-STARVED`,
-`BW-OVER-NOMINAL`, `KG-FAILURES`, `FLEET-DORMANT` when tripped; else `OK`).
+`BW-OVER-NOMINAL`, `KG-FAILURES`, `FLEET-DORMANT`, `ZENODO-LOSSY` / `ZENODO-DEGRADED` when tripped; else `OK`).
+`ZENODO-LOSSY` = circuit tripped on peer PUT failures but the manifest
+shows ≥5 files / ≥1 GB committed in the last hour (retry ladder is
+absorbing it); `ZENODO-DEGRADED` only when nothing lands. The
+`zenodo_uploads:` line (committed GB/h vs PUT attempt failures) and the
+`openeo:` line (`months_ok` vs `month_timeouts`, current sync timeouts)
+are the evidence behind both upstream verdicts — read them before
+touching timeouts/retry ladders (see `docs/copernicus-throttle.md →
+Correction (2026-09-23)` for how a 240 s cap silently zeroed harmonics).
 `FLEET-DORMANT` = every remote peer unreachable ≥15 min (fleet powered
 off); director is on hold in ping mode and wakes automatically on the
 first peer return — see `docs/peer-director.md → Fleet-dormant hold mode`. Read it

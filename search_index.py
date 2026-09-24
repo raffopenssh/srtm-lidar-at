@@ -538,6 +538,11 @@ class SearchIndex:
                 c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}')
             except Exception:
                 pass  # column already exists
+        # Cadastre footprint join (siedler LID-3, building_footprint_match)
+        try:
+            c.execute('ALTER TABLE kg_buildings ADD COLUMN footprint_id TEXT')
+        except Exception:
+            pass
         # Slim composition columns on kg_parcels (siedler LID-1)
         for col, ctype in [('frav', 'TEXT'), ('tree_h_mean', 'REAL'),
                            ('tree_h_max', 'REAL')]:
@@ -1077,7 +1082,10 @@ class SearchIndex:
                 ))
             if bld_rows:
                 c.executemany(
-                    'INSERT INTO kg_buildings VALUES (?,?,?,?,?,?,?,?,?,?,?)', bld_rows)
+                    'INSERT INTO kg_buildings (kg_code, building_id, ns, roof_type_hint, '
+                    'max_height_m, mean_height_m, stories_est, footprint_area_sqm, '
+                    'centroid_lon, centroid_lat, centroid_dtm_m) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?)', bld_rows)
 
         # Per-parcel landscape details
         parcels = data.get('parcels', {})
@@ -1941,6 +1949,22 @@ class SearchIndex:
 
         with self._write_lock:
             c = self._conn()
+            try:
+                return self._update_kg_locked(c, kg_code, _target_code, json_path, manifest)
+            except Exception:
+                # Never leave an open write transaction behind: it holds
+                # the WAL write lock for the life of this thread-local
+                # connection and stalls every other writer (2026-09-24:
+                # a positional INSERT mismatch after an ALTER TABLE did
+                # exactly that for v2-ingest).
+                try:
+                    c.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def _update_kg_locked(self, c, kg_code, _target_code, json_path, manifest):
+        if True:
             _json_dir = (Path(json_path).parent
                          if json_path else Path('data/austria_processor/json'))
             plain_path, block_list = self._select_kg_files_for_parent(

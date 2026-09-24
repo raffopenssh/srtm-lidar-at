@@ -196,3 +196,46 @@ for 194 MB (3 workers, several SSL retries), read-back validated.
 ---
 
 *See `AGENTS.md` for the project map.*
+
+### `cache_manifest.json` write discipline (2026-09-24)
+
+`cache_manifest.json` has **six writers on one host**: the processor's
+`CacheManifest.save()` (tile-store PUTs, chkpt mirror), both gunicorn
+workers' `PUT /api/v1/processing/cache_manifest` handler, the srv
+peer-sync thread (`app._sync_peer_data`), and the director's `prewarm` /
+`zenodo_circuit` publishers. All of them did an unlocked
+read → modify → `os.replace`. Atomic replace protects against torn
+files, **not** against lost updates: the peer-sync thread read its copy,
+spent seconds GETting ~50 peer manifests, then wrote the stale copy back.
+
+Observed: at214, 09-23 14:32:56–14:33:04 created six shard deposits
+(`ndvi/sar/worldcover_48.5_15.0|16.0`), saved them, and ten seconds later
+found none of them in its manifest — it created five duplicates
+(22920008…22920020). The director kept the first registrations ("first
+writer wins"), so the duplicates' tiles were fetchable (entries carry
+their own `depo_id`) but lived in deposits no shard row referenced —
+invisible to `reconcile`, and the registered `*_48.5_15.0` drafts stayed
+empty. (Migrated back + duplicate drafts deleted the same day; the
+`CacheManifest` dirty-overlay added on 09-23 for "3 of 18 PUTs lost"
+was treating the same bug's symptom.)
+
+Rules now:
+* Every writer holds `zenodo_cache.cache_manifest_write_lock()` (fcntl on
+  `cache_manifest.lock`, 30 s bounded wait, proceeds unlocked on timeout
+  with a warning) across read → modify → replace, and **re-reads inside
+  the lock** — never writes a copy taken before a network round-trip.
+* `zenodo_tiles.TileStore.shard()` asks the director's manifest
+  (`GET …/cache_manifest?since=9999` — top-level `shards` only) before
+  falling back to Zenodo draft search and finally creating a deposit.
+* The ZIP-index cache is cleared only when a **ZIP** (non-tile) entry
+  changed. Tile entries land ~10/h fleet-wide; previously every 5-min
+  merge wiped every peer's `zenodo_zip_index/` and re-fetched central
+  directories for nothing.
+
+Quick audit — tiles in deposits no shard row knows about should be 0:
+```bash
+python3 -c "
+import json;m=json.load(open('data/austria_processor/cache_manifest.json'))
+d={v['depo_id'] for v in m['shards'].values()}
+print([k for k,v in m['files'].items() if isinstance(v,dict) and v.get('kind')=='tile' and v.get('size') and v['depo_id'] not in d])"
+```

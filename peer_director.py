@@ -7035,6 +7035,8 @@ class PeerDirector:
         Idempotent on ``degraded``."""
         manifest_path = DATA_DIR / 'cache_manifest.json'
         try:
+          from zenodo_cache import cache_manifest_write_lock as _cmwl
+          with _cmwl():
             data = {}
             if manifest_path.exists():
                 data = json.loads(manifest_path.read_text())
@@ -10606,6 +10608,8 @@ class PeerDirector:
                 and _prev_rc == repair_cells and _prev_codes == repair_codes):
             return
         try:
+          from zenodo_cache import cache_manifest_write_lock as _cmwl
+          with _cmwl():
             data = {}
             if manifest_path.exists():
                 data = json.loads(manifest_path.read_text())

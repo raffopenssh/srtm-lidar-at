@@ -60,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import attributions as _attr
 import io
+import contextlib
 import json
 import logging
 import math
@@ -81,6 +82,49 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path("data/austria_processor")
 CACHE_MANIFEST_PATH = DATA_DIR / "cache_manifest.json"
+CACHE_MANIFEST_LOCK = DATA_DIR / "cache_manifest.lock"
+
+
+@contextlib.contextmanager
+def cache_manifest_write_lock(path: Path = CACHE_MANIFEST_LOCK, timeout: float = 30.0):
+    """Cross-process exclusive lock every writer of ``cache_manifest.json``
+    must hold across its read→modify→replace.
+
+    Writers on one host: the processor's ``CacheManifest.save`` (tile
+    store PUTs, chkpt mirror), both gunicorn workers' PUT handler, the
+    srv peer-sync thread, the director's ``prewarm`` / ``zenodo_circuit``
+    publishers. Each did an unlocked read-modify-replace; the sync thread
+    in particular held its copy for many seconds while GETting ~50 peer
+    manifests, then wrote it back — dropping everything saved to disk in
+    between. 2026-09-23 14:33 on at214: six freshly created shard
+    registrations vanished this way and the peer created six duplicate
+    shard deposits 10 s later (five tiles now sit in unregistered
+    deposits). Lock, then re-read, then write. Blocking with a bounded
+    wait; on timeout we proceed unlocked rather than stall an upload.
+    """
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    got = False
+    try:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    log.warning("cache_manifest write lock: %.0fs timeout, proceeding unlocked", timeout)
+                    break
+                time.sleep(0.05)
+        yield got
+    finally:
+        try:
+            if got:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 # Austria bounding box (generous)
 AT_WEST, AT_SOUTH, AT_EAST, AT_NORTH = 9.0, 46.0, 17.5, 49.5
@@ -333,21 +377,22 @@ class CacheManifest:
         """Persist to disk atomically. Merges with whatever another
         process wrote since our last load (dirty entries overlaid), then
         clears the dirty set and adopts the new mtime."""
-        self.reload_if_changed()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = str(self._path) + ".tmp"
-        with self._lock:
-            data = dict(self._data)
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-            os.replace(tmp, self._path)
-            try:
-                self._last_mtime = self._path.stat().st_mtime
-            except OSError:
-                pass
-            self._dirty_files.clear()
-            self._dirty_shards.clear()
-            self._dirty_top.clear()
+        with cache_manifest_write_lock(self._path.with_suffix(".lock")):
+            self.reload_if_changed()
+            with self._lock:
+                data = dict(self._data)
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                os.replace(tmp, self._path)
+                try:
+                    self._last_mtime = self._path.stat().st_mtime
+                except OSError:
+                    pass
+                self._dirty_files.clear()
+                self._dirty_shards.clear()
+                self._dirty_top.clear()
 
     @property
     def depo_id(self) -> Optional[int]:

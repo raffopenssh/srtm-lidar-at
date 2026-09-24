@@ -135,7 +135,9 @@ class TileStore:
                 sh = self.manifest.get_shard(key)
                 if sh and sh.get("depo_id"):
                     return sh
-                sh = self._find_shard_deposit(key) or self._create_shard_deposit(key)
+                sh = (self._ask_director_for_shard(key)
+                      or self._find_shard_deposit(key)
+                      or self._create_shard_deposit(key))
                 if sh:
                     self.manifest.set_shard(key, sh)
                     self.manifest.save()
@@ -144,6 +146,32 @@ class TileStore:
                     except Exception:
                         pass
                 return sh
+
+    def _ask_director_for_shard(self, key: str) -> Optional[dict]:
+        """The director's manifest is the fleet's authoritative shard
+        registry (every peer fast-paths new shards to it); our own copy
+        can lag a full 5-min sync tick, and Zenodo's draft search
+        (``_find_shard_deposit``) lags its index refresh. One small GET
+        before creating a deposit closes the cross-peer duplicate window."""
+        try:
+            self_p = Path("data/austria_processor/self.json")
+            url = (json.loads(self_p.read_text()).get("director_url") or "").rstrip("/")
+        except Exception:
+            return None
+        if not url:
+            return None
+        try:
+            r = requests.get(url + "/api/v1/processing/cache_manifest",
+                             params={"since": "9999"}, timeout=8)
+            if not r.ok:
+                return None
+            sh = ((r.json() or {}).get("shards") or {}).get(key)
+            if isinstance(sh, dict) and sh.get("depo_id"):
+                log.info("tile store: adopted shard deposit %s for %s from director", sh["depo_id"], key)
+                return dict(sh)
+        except Exception as e:
+            log.debug("tile store: director shard lookup %s: %s", key, e)
+        return None
 
     def _find_shard_deposit(self, key: str) -> Optional[dict]:
         """Adopt an existing draft with our exact title (another peer

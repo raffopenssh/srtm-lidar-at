@@ -7762,14 +7762,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 1c. v2 upgrade: serve rasters from the KG's own v1 full GPKG ---
         _v2_upgrade = bool(source_gpkg)
+        # Parcel ∪ building union in EPSG:3035 — drives the v2 raster health
+        # checks *and* the ``segment_type_no_holes`` verify gate.  Computed
+        # for every v2 KG (fresh and upgrade): without it ``v2_verify`` has
+        # no shape and falls back to the grid-only area-ratio floor, which
+        # struck the healthy 15-tile block 57210-south twice (0.745 / 0.780
+        # vs floor 0.828, 2026-09-23/24) on the *fresh* path after eb29c7b
+        # had only fixed upgrades.
         _v2_union_3035 = None
-        if _v2_upgrade:
-            if MODEL_VERSION != "v2":
-                result["error"] = "v2 upgrade requested but MODEL_VERSION != v2 (lightgbm / model missing?)"
-                result["step"] = "aborted_v2_unavailable"
-                return result
-            result["step"] = "v2_source"
-            _report_step("v2_source", f"installing GPKG source {Path(source_gpkg).name}")
+        if MODEL_VERSION == "v2":
             try:
                 from shapely.ops import unary_union as _uu_v2
                 _geoms_v2 = [p["geometry"] for p in cadastre_data.get("parcels", [])
@@ -7807,6 +7808,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                     kg_code, _ce)
             except Exception as _e:  # noqa: BLE001
                 log.warning("KG %s: v2 union failed (%s) — health checks use whole windows", kg_code, _e)
+        if _v2_upgrade:
+            if MODEL_VERSION != "v2":
+                result["error"] = "v2 upgrade requested but MODEL_VERSION != v2 (lightgbm / model missing?)"
+                result["step"] = "aborted_v2_unavailable"
+                return result
+            result["step"] = "v2_source"
+            _report_step("v2_source", f"installing GPKG source {Path(source_gpkg).name}")
             import v2_source as _v2src
             _inv = _v2src.install(source_gpkg, union_3035=_v2_union_3035, proc_globals=globals())
             result["v2_source_inventory"] = {k: v for k, v in _inv.items() if k != "path"}

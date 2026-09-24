@@ -348,9 +348,13 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
     for k in ("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct"):
         v = _num(cov.get(k))
         v1v = _num(cov1.get(k)) if v1 else None
-        # a baseline that had 0 / no coverage figure cannot be regressed
-        rep.check(f"coverage.{k}", v is not None and v > 0, f"{k}={v}",
-                  fatal=not (v1 is not None and not v1v))
+        # a baseline that had 0 / no coverage figure cannot be regressed;
+        # a parcel-less block (57210-southeast: alpine quadrant whose huge
+        # parcels all have their centroid in a sibling block, 0 parcels /
+        # 0 buildings) has nothing to cover — 0.0 is the correct figure.
+        rep.check(f"coverage.{k}", v is not None and v > 0,
+                  f"{k}={v}" + (" (no parcels in KG)" if pc == 0 else ""),
+                  fatal=pc > 0 and not (v1 is not None and not v1v))
 
     if v1 is None:
         return
@@ -862,10 +866,14 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             # the area ratio is only a drift warning.  Fatal only when no
             # union is available (legacy callers) or the raster is empty.
             _shape_aware = hole is not None
-            _ok = nz > 0 and (_shape_aware or _r >= _floor)
+            # A parcel-less block has no union to measure holes in and no
+            # KG-mask to explain the ratio; the raster only has to exist.
+            _no_parcels = int(_num(_g(v2, "parcels", "count"), 0) or 0) == 0
+            _ok = nz > 0 and (_shape_aware or _no_parcels or _r >= _floor)
             rep.check("segment_type_raster_area", _ok,
                       f"nonzero px={nz} json segmented m²={sa:.0f} ratio={_r:.3f} floor={_floor:.3f} tiles={_nt}"
-                      + (" (hole check authoritative)" if _shape_aware else ""))
+                      + (" (hole check authoritative)" if _shape_aware
+                         else " (no parcels in KG — ratio advisory)" if _no_parcels else ""))
             if _ok and _r < 0.95:
                 rep.check("segment_type_raster_area_drift", False,
                           f"ratio={_r:.3f} (tile-overlap double count / KG-mask filter, {_nt} tiles)",

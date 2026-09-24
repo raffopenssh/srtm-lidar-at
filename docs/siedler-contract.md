@@ -41,8 +41,20 @@ parcel table on the sort index → 13 s/call).
 ingest (named-column INSERT — `KG_PARCELS_COLS`). Legacy rows are filled
 by `SearchIndex().backfill_slim_fields()` (UPDATE in place, ~0.2 s/KG,
 idempotent — skips KGs that already carry `frav`). Run once after deploy
-(2026-09-24: 2562 KGs in ~9 min, tmux `slimfill`). `prewarm` also
+(2026-09-24: 2562 KGs in ~9 min, tmux `slimfill`; final DB growth
++345 MB → 2.82 GB incl. 2.27 M `kg_trees` rows). `prewarm` also
 backfills any KG it finds with all-NULL `frav`.
+
+**Lesson (2026-09-24)**: adding a column via ALTER broke the positional
+`INSERT INTO kg_buildings VALUES (…)` in `_enrich_kg`; the exception left
+v2-ingest's thread-local connection in an open write transaction, which
+held the WAL write lock indefinitely and stalled every other writer
+(`sync_manifest_links` then burned 30 s busy_timeout per parent under
+`_write_lock`). All index inserts touched by this work are now
+named-column, `update_kg` rolls back on failure, and
+`sync_manifest_links` aborts its pass on `database is locked`. Watch
+`grep ":$(stat -c %i data/search_index.db-shm) " /proc/locks | grep WRITE`
+— a WRITE lock at byte 120 that persists >1 min is a stuck transaction.
 
 `kg_trees` semantics: **sampled** (top-5 per cadastre parcel from the KG
 JSON's `top_trees`), not the ~40k/KG apex layer in the light GPKG. Every

@@ -20341,7 +20341,8 @@ def _openeo_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
                     v['split_arms'] += n; v['peers_split'].add(peer)
                 elif 'Upstream-stress cascade' in msg:
                     v['cascades'] += n; v['peers_cascade'].add(peer)
-                elif 'due to Copernicus throttle' in msg:
+                elif 'due to Copernicus throttle' in msg or \
+                        ('aborting after tile' in msg and 'Copernicus batch/server failure' in msg):
                     # austria_processor "aborting after tile i/n due to
                     # Copernicus throttle" — the KG was ACTUALLY deferred.
                     # `cascades` alone only proves copernicus raised; a

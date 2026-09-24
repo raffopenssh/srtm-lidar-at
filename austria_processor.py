@@ -4933,6 +4933,33 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
             return wy[:, None] * wx[None, :]
 
+        # Apply the full-GPKG boundary-merge remap *per tile, before* type
+        # painting.  ``_merge_boundary_segments`` (run by the full GPKG
+        # build) removes absorbed objects from ``all_objects``, so their
+        # label ids are no longer in ``obj_map`` — without this LUT every
+        # absorbed segment painted type 0 and never satisfied
+        # ``tile_valid``, leaving a hole exactly where a segment crossed a
+        # tile seam.  The post-paint remap below could not heal it (the px
+        # were never written).  2026-09-24: 26 fresh v2 KGs/day struck by
+        # ``segment_type_no_holes`` at 2.6–21 %% (58008-south 4.05 %%
+        # twice, deterministic) while their upgrade re-runs — no full GPKG,
+        # merge done inside this builder after painting — passed.
+        _remap_lut = None
+        if label_remap:
+            _max_lbl = max(max(label_remap), max(label_remap.values()))
+            for tr in tile_seg_results:
+                if tr.get("labels") is not None and tr["labels"].size:
+                    _max_lbl = max(_max_lbl, int(tr["labels"].max()))
+            _remap_lut = np.arange(_max_lbl + 1, dtype=np.int32)
+            for old_id, new_id in label_remap.items():
+                _remap_lut[old_id] = new_id
+            # flatten chains (a→b, b→c) so every absorbed id lands on a root
+            for _ in range(8):
+                nxt = _remap_lut[_remap_lut]
+                if np.array_equal(nxt, _remap_lut):
+                    break
+                _remap_lut = nxt
+
         # Paint each tile (highest-weight-wins for categorical data)
         for ti_idx, tr in enumerate(tile_seg_results):
             th, tw = tr["shape"]
@@ -4950,6 +4977,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
 
             if tr.get("labels") is not None:
                 labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
+                if _remap_lut is not None:
+                    labels_tile = _remap_lut[labels_tile]
 
                 type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
                 for uid in np.unique(labels_tile):
@@ -4991,24 +5020,11 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
         from gpkg_streamed import _CATEGORICAL_PIXEL_LIMIT
         _skip_merge = (full_h * full_w > _CATEGORICAL_PIXEL_LIMIT)
 
-        # Apply label remap from full GPKG boundary merge (already done)
-        # The full GPKG build already merged boundary segments and mutated
-        # all_objects.  We just need to remap the label IDs in our freshly
-        # built labels_full so absorbed objects map to their survivor.
+        # Label remap from the full GPKG boundary merge was applied per tile
+        # (``_remap_lut``) before painting, so labels_full / seg_type_full
+        # already carry survivor ids + types here.
         if label_remap:
-            max_label = int(labels_full.max())
-            lut = np.arange(max_label + 1, dtype=np.int32)
-            for old_id, new_id in label_remap.items():
-                if old_id <= max_label:
-                    lut[old_id] = new_id
-            labels_full[:] = lut[labels_full]
-            # Update seg_type_full for remapped labels
-            obj_map_l = {o.obj_id: o for o in all_objects}
-            for root_id in set(label_remap.values()):
-                survivor = obj_map_l.get(root_id)
-                if survivor:
-                    seg_type_full[labels_full == root_id] = survivor.type_code
-            log.info("  Light GPKG: applied %d label remaps from full GPKG merge",
+            log.info("  Light GPKG: applied %d label remaps from full GPKG merge (per-tile LUT)",
                      len(label_remap))
         elif _skip_merge:
             log.info("  Light GPKG: skipping boundary merge (%.0f Mpx > %.0f Mpx limit)",
@@ -8324,6 +8340,26 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                             result["success"] = False
                             result["error"] = str(e)
                             result["step"] = f"cache_miss_tile_{tile_idx+1}"
+                            break
+                        try:
+                            from copernicus import UpstreamStressError as _UpstreamStress
+                        except ImportError:  # pragma: no cover
+                            _UpstreamStress = ()
+                        if _UpstreamStress and (isinstance(e, _UpstreamStress) or
+                                                isinstance(e.__cause__, _UpstreamStress)):
+                            # openEO origin slow/5xx cascade — NOT a credit or
+                            # IP-throttle problem.  Defer the KG (checkpoints
+                            # kept) and let the peer move on; no pause file,
+                            # no 15-min probe loop.  Keep "due to Copernicus
+                            # throttle" out of the message: /process.txt's
+                            # openeo kg_defers counter keys on the deferred
+                            # abort line below.
+                            log.warning("KG %s: openEO upstream stress (%s) — deferring KG, "
+                                        "peer continues with next KG", kg_code, e)
+                            result["copernicus_failed"] = True
+                            result["success"] = False
+                            result["error"] = f"Copernicus data unavailable (upstream stress: {e})"
+                            result["step"] = f"copernicus_stress_tile_{tile_idx+1}"
                             break
                         if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
                            isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):

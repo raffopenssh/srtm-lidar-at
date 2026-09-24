@@ -1247,6 +1247,20 @@ class IPThrottledError(RuntimeError):
     pass
 
 
+class UpstreamStressError(IPThrottledError):
+    """openEO origin is overloaded (consecutive 5xx / sync read-timeouts).
+
+    Subclass of ``IPThrottledError`` so every "never swallow" guard in
+    tile_cache / austria_processor still propagates it, but the tile loop
+    routes it to the *defer* path (``copernicus_failed`` — KG re-queued
+    with checkpoints, peer moves on to the next KG) instead of the
+    15-min ``copernicus_paused`` loop.  A slow openEO is not a credit
+    problem: pausing 15 min + probing burned ~15 peers/h fleet-wide on
+    2026-09-24 while credits were fine (creds=98/107 healthy).
+    """
+    pass
+
+
 class CredentialRotatedError(Exception):
     """Raised when a 402 was handled by rotating to a fresh credential.
     Callers should rebuild their connection/datacube and retry."""
@@ -2477,7 +2491,7 @@ def get_ndvi_timeseries(
                         "aborting NDVI downloads to give openeo origin a break",
                         consecutive_5xx,
                     )
-                    raise IPThrottledError(
+                    raise UpstreamStressError(
                         f"openeo origin returned {consecutive_5xx} consecutive 5xx "
                         f"— backing off"
                     )

@@ -2010,6 +2010,18 @@ class SearchIndex:
                     _write_zenodo_links(c, parent, codes, manifest)
                     n += 1
                 except Exception as e:
+                    if 'locked' in str(e).lower():
+                        # Another connection holds the write lock: bail out
+                        # instead of eating busy_timeout (30 s) per parent
+                        # while holding _write_lock (blocked v2-ingest for
+                        # hours, 2026-09-24). Next manifest change retries.
+                        log.warning('sync_manifest_links: database locked after '
+                                    '%d parents — aborting this pass', n)
+                        try:
+                            c.rollback()
+                        except Exception:
+                            pass
+                        return n
                     log.debug('sync_manifest_links %s: %s', parent, e)
             c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
                       ('manifest_synced_at',

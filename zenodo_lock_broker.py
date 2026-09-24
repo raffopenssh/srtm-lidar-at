@@ -22,14 +22,24 @@ Lease classes (since 2026-09-21)
 --------------------------------
 * **shared** — ``purpose`` starting with ``kg_upload`` (KG product
   uploads).  Every KG product lands in its *own* deposition, so these
-  never 409 against each other; the only reason to bound them is to be
-  a good citizen towards Zenodo.  Up to ``SHARED_SLOTS`` (env
-  ``ZENODO_LOCK_KG_SLOTS``, default 8) are held concurrently.
-  Previously they were fully serialised behind one mutex: with ~20
-  peers each streaming a 100–900 MB GPKG to a degraded Zenodo
-  (10–30 min per upload) every waiter hit the client's 30-min acquire
-  timeout and "proceeded without lease" — i.e. the lock cost every KG
-  30 idle minutes and provided no exclusivity at all.
+  never 409 against each other and need **no mutual exclusion at
+  all**.  Since 2026-09-24 they are *tracked* (status / dashboard
+  visibility, ``active zenodo uploads``) but **never gated**: the
+  broker admits every ``kg_upload`` acquire immediately.  ``SHARED_SLOTS``
+  (env ``ZENODO_LOCK_KG_SLOTS``, default 0 = unbounded) is kept as an
+  emergency knob only.
+
+  History: until 2026-09-21 KG uploads were fully serialised behind one
+  mutex; then a bounded 8-slot pool.  Both turned into a pure penalty
+  whenever Zenodo was slow: with 20–25 peers each streaming a
+  100–900 MB GPKG through the 30–300 s retry ladder (45 min–2.5 h per
+  upload on an SSL-EOF day) the slots were pinned by legitimate slow
+  uploads for hours, every further waiter hit the client's 1800 s
+  acquire timeout and "proceeded without lease" anyway — 30 idle
+  minutes per KG, an ERROR line each, and zero exclusivity gained
+  (actual concurrency was 25 regardless).  The only thing that needs
+  the lock is the *shared* tile-cache deposit, whose objects are
+  overwritten in place — that is the ``cache`` class below.
 * **cache** — everything else (``cache_flush_zip:*``, ``reconcile``,
   ``chkpt_upload:*`` / ``chkpt_delete:*`` …): writers of the *shared*
   tile-cache draft deposition, where concurrent PUTs 409 and orphan
@@ -86,7 +96,8 @@ STATE_FILE = DATA_DIR / 'zenodo_lock_state.json'
 ADMIN_TOKEN_FILE = _HERE / 'data' / 'admin_token'
 
 TTL_S = 120.0
-SHARED_SLOTS = max(1, int(os.environ.get('ZENODO_LOCK_KG_SLOTS', '8') or 8))
+# 0 = unbounded (default): kg_upload leases are tracked, never gated.
+SHARED_SLOTS = max(0, int(os.environ.get('ZENODO_LOCK_KG_SLOTS', '0') or 0))
 # Never-heartbeated leases are orphans (client process exited) after this.
 ORPHAN_S = 100.0
 LISTEN_HOST = os.environ.get('ZENODO_LOCK_BROKER_HOST', '127.0.0.1')
@@ -170,7 +181,7 @@ def _status(now: float) -> dict:
     out = {
         'free': not _leases,
         'ttl_s': TTL_S,
-        'shared_slots': SHARED_SLOTS,
+        'shared_slots': SHARED_SLOTS or None,   # None = unbounded
         'shared_used': len(shared),
         'cache_held': bool(cache),
         # legacy field names (pre independent-class broker) kept for consumers
@@ -292,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             if cls == 'cache':
                 ok = not cache_live
             else:
-                ok = shared_live < SHARED_SLOTS
+                ok = SHARED_SLOTS <= 0 or shared_live < SHARED_SLOTS
             if not ok:
                 st = _status(now)
                 st.update({'error': 'locked', 'requested_cls': cls})

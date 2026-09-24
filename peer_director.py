@@ -10748,9 +10748,18 @@ class PeerDirector:
                                             'total': len(codes)}
         return codes
 
-    def _v2_upgrade_fill(self, whitelist: list, cfg: dict) -> list[str]:
+    def _v2_upgrade_fill(self, whitelist: list, cfg: dict,
+                         exclude: set | None = None,
+                         min_units: int = 0) -> list[str]:
         """Upgrade codes to append to the cache-only whitelist this tick
-        (empty when disabled, whitelist not low, or Zenodo is unhappy)."""
+        (empty when disabled, whitelist not low, or Zenodo is unhappy).
+
+        ``exclude`` — codes already claimed by a running peer; they are
+        dropped *before* the cap is applied so the cap counts *new*
+        units. ``min_units`` lifts the cap to the number of cache-only
+        workers this tick — otherwise (Sep 2026) a 24-code cap minus
+        ~6 in-flight claims left 18 codes for 26 workers and a handful
+        of idle peers were never handed anything."""
         if not cfg.get('v2_upgrade', True):
             return []
         if len(whitelist) >= int(cfg.get('v2_upgrade_fill_below_ready',
@@ -10766,10 +10775,11 @@ class PeerDirector:
                      'units this tick', zen_rate, V2_UPGRADE_ZEN_WARN_MAX)
             return []
         cap = int(cfg.get('max_v2_upgrade_peers', MAX_V2_UPGRADE_PEERS))
+        cap = max(cap, int(min_units))
         cands = self._compute_v2_upgrade_candidates()
-        wl = set(whitelist)
-        pri = [c for c in self.v2_priority_codes() if c not in wl]
-        rest = [c for c in cands if c not in wl and c not in set(pri)]
+        skip = set(whitelist) | set(exclude or ())
+        pri = [c for c in self.v2_priority_codes() if c not in skip]
+        rest = [c for c in cands if c not in skip and c not in set(pri)]
         return (pri + rest)[:max(0, cap)]
 
     # --- Operator-pinned v2 upgrade priority (``POST /api/v1/director/v2/priority``)
@@ -12692,6 +12702,16 @@ class PeerDirector:
                 pass
         # Filter the whitelist before partitioning.
         whitelist = [k for k in whitelist if k not in in_progress]
+        if v2_codes:
+            # Re-fill now that claims are known: drop in-flight codes
+            # *before* the cap and size the batch to the worker count
+            # (+2 slack) so every idle cache-only peer gets >=1 unit.
+            _n_workers = len((set(running_cache_only)
+                              | {p['id'] for p in to_start})
+                             - _draining_cache_only)
+            v2_codes = self._v2_upgrade_fill(
+                whitelist, cfg, exclude=in_progress,
+                min_units=_n_workers + 2)
         v2_codes = [k for k in v2_codes if k not in in_progress]
         if not whitelist and not v2_codes:
             log.info('Cache-only orchestrate: whitelist drained after excluding '

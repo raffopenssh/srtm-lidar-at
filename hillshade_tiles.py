@@ -163,7 +163,7 @@ def _tile_resp(z, x, y, kind):
         log.exception('tile %s/%d/%d/%d', kind, z, x, y)
         return jsonify({'error': str(e)}), 500
     if png is None:
-        r = Response(status=204)
+        r = Response(status=204, mimetype='image/png')
     else:
         r = Response(png, mimetype='image/png')
     r.headers['Cache-Control'] = 'public, max-age=31536000, immutable'

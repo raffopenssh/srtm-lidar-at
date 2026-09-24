@@ -19988,6 +19988,171 @@ def _is_bev_proxy_noise(msg: str) -> bool:
     return any(t in m for t in _BEV_NOISE_INTERNAL_TOKENS)
 
 
+# --- /process.txt rendering helpers (layout, log compaction, warn_top) ---
+_PTXT_GROUPS = (
+    ('director', ('director:', 'cells:', 'shadow:', 'cache_pipeline:',
+                  'throttle:', 'versions:', 'rollout:', 'frontier plan',
+                  'primary_net:')),
+    ('progress', ('progress:', 'products:', 'zenodo:', 'zen_stall:', 'v2:',
+                  'v2_verify_fails', 'v2_regen:', 'repair:',
+                  'chkpt_registry:', 'zen_cache:', 'cache_reconcile:',
+                  'priority queue', 'recent failures')),
+    ('upstreams', ('warn_top', 'zenodo_circuit:', 'zenodo_uploads:',
+                   'zenodo_lock:', 'zenodo_fetch:', 'openeo:', 'cadastre:',
+                   'bev_pause', 'ip_pools', 'copernicus credentials',
+                   'fleet_proxy:')),
+    ('fleet', ('fleet_cpu:', 'fleet_pools:', 'fleet_load:', 'fleet_bw:',
+               'bw_learn:', 'peers (', 'zenodo uploads active',
+               'active zenodo uploads', 'disk pressure')),
+    ('log', ('recent director events', 'merged log')),
+)
+_PTXT_WRAP_SKIP = ('peers (', 'merged log', 'copernicus credentials',
+                   'active zenodo uploads', 'recent director events',
+                   'recent failures', 'disk pressure', 'warn_top')
+
+
+def _ptxt_group_of(line: str) -> tuple:
+    """(group, rank) — rank orders blocks inside a group by prefix
+    position so e.g. warn_top / zenodo_circuit lead the upstreams
+    group regardless of render order in the code."""
+    for g, prefixes in _PTXT_GROUPS:
+        for i, pre in enumerate(prefixes):
+            if line.startswith(pre):
+                return g, i
+    return 'progress', 999
+
+
+def _ptxt_wrap(line: str, width: int = 118, indent: str = '    ') -> list:
+    """Soft-wrap a long ``key: a · b · c`` line at ``·`` separators.
+
+    Keeps each token group intact so a phone-width viewer (which
+    hard-wraps at ~45 cols anyway) and a desktop terminal both see the
+    fields start at a line boundary. Costs one newline + indent per
+    break — a handful of tokens per long line.
+    """
+    if len(line) <= width or ' · ' not in line:
+        return [line]
+    parts = line.split(' · ')
+    outl, cur = [], parts[0]
+    for part in parts[1:]:
+        if len(cur) + 3 + len(part) > width and cur:
+            outl.append(cur)
+            cur = indent + part
+        else:
+            cur += ' · ' + part
+    outl.append(cur)
+    return outl
+
+
+def _ptxt_layout(out: list) -> list:
+    """Regroup rendered blocks under ``## section`` headers.
+
+    Input is the flat ``out`` list (title first, then blocks). A block
+    is a non-indented line plus its indented continuation rows. Blocks
+    are bucketed by prefix into a fixed, importance-ordered set of
+    groups so a human scrolls director → progress → upstreams → fleet
+    → log, and an agent can ``sed -n '/^## fleet/,/^## /p'``. Lines
+    beginning with ``#`` (title / params footer) stay in place.
+    """
+    if not out:
+        return out
+    title = out[0]
+    footer = [l for l in out[1:] if l.startswith('# params')]
+    health = [l for l in out[1:] if l.startswith('health:')]
+    body = [l for l in out[1:]
+            if not l.startswith(('# params', 'health:'))]
+    blocks, cur = [], None
+    for l in body:
+        if not l.strip():
+            continue
+        if l.startswith((' ', '\t')) and cur is not None:
+            cur.append(l)
+        else:
+            cur = [l]
+            blocks.append(cur)
+    grouped: dict = {g: [] for g, _ in _PTXT_GROUPS}
+    for n, b in enumerate(blocks):
+        g, rank = _ptxt_group_of(b[0])
+        grouped[g].append((rank, n, b))
+    res = [title]
+    for h in health:
+        res.extend(_ptxt_wrap(h))
+    for g, _ in _PTXT_GROUPS:
+        bl = grouped[g]
+        if not bl:
+            continue
+        res.append('')
+        res.append(f'## {g}')
+        for _, _, b in sorted(bl, key=lambda x: (x[0], x[1])):
+            head = b[0]
+            if not head.startswith(_PTXT_WRAP_SKIP):
+                res.extend(_ptxt_wrap(head))
+            else:
+                res.append(head)
+            res.extend(b[1:])
+    if footer:
+        res.append('')
+        res.extend(footer)
+    return res
+
+
+_PTXT_RE_POOL = re.compile(
+    r"HTTPS?ConnectionPool\(host='([^']+)', port=\d+\): ")
+_PTXT_RE_URL = re.compile(r'Max retries exceeded with url: (\S+)')
+_PTXT_RE_UUID = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+_PTXT_RE_CAUSED = re.compile(r' \(Caused by .*$')
+
+
+def _ptxt_compact_msg(msg: str, kg: str = '') -> str:
+    """Strip boilerplate from a merged-log message (non-verbose mode).
+
+    * ``[62133] KG 62133: …`` → the ``KG 62133:`` echo is dropped when it
+      repeats the bracketed kg column.
+    * urllib3 ``HTTPSConnectionPool(host='zenodo.org', port=443): Max
+      retries exceeded with url: /api/files/<uuid>/x.gpkg (Caused by …)``
+      → ``zenodo.org: max retries (x.gpkg)``.
+    Saves ~40 % of the characters on a bad-Zenodo day without losing
+    any fact an operator acts on.
+    """
+    if not msg:
+        return msg
+    if kg:
+        _echo = f'KG {kg}: '
+        if msg.startswith(_echo):
+            msg = msg[len(_echo):]
+        else:
+            # ``austria_processor: KG 62133: …`` — module prefix first.
+            _i = msg.find(': ' + _echo)
+            if 0 < _i < 40:
+                msg = msg[:_i + 2] + msg[_i + 2 + len(_echo):]
+    if 'ConnectionPool(' in msg:
+        msg = _PTXT_RE_CAUSED.sub('', msg)
+        m = _PTXT_RE_URL.search(msg)
+        if m:
+            tail = m.group(1).rstrip('/').rsplit('/', 1)[-1]
+            msg = _PTXT_RE_URL.sub(f'max retries ({tail})', msg)
+        msg = _PTXT_RE_POOL.sub(lambda mm: mm.group(1) + ': ', msg)
+    return msg
+
+
+_PTXT_RE_NUM = re.compile(r'\d+(\.\d+)?')
+_PTXT_RE_KGCODE = re.compile(r'\b\d{5}(-[a-z]+(-\d+)?)?')
+
+
+def _ptxt_warn_signature(msg: str) -> str:
+    """Collapse a warning into a cluster key (numbers / codes / ids → #)."""
+    m = _ptxt_compact_msg(msg or '')
+    m = re.sub(r'^KG \S+: ', '', m)
+    m = re.sub(r'KG \S+: ', '', m, count=1)
+    m = _PTXT_RE_UUID.sub('#', m)
+    m = _PTXT_RE_KGCODE.sub('#', m)
+    m = re.sub(r"'[^']*'", "'…'", m)
+    m = _PTXT_RE_NUM.sub('#', m)
+    m = re.sub(r'\s+', ' ', m).strip()
+    return m[:90]
+
+
 _V2_VF_CACHE: dict = {'t': 0.0, 'v': {}}
 
 
@@ -20231,8 +20396,13 @@ def process_txt():
             'hidden=1   include stopped/idle/complete peers in roster\n'
             'attn=1     roster collapsed to attention-state peers only\n'
             'roster=0   drop the peer table entirely\n'
-            'creds=1    full per-credential listing (default: histogram + '
-            'active/held/unhealthy rows only)\n'
+            'creds=1    full per-credential listing incl. 7d per-day s/e '
+            'sparklines (default: histogram + rows for held/unhealthy only)\n'
+            'bw=1       show bandwidth telemetry (fleet_bw/bw_learn lines, '
+            'roster bw columns + canary extras). Off by default — the '
+            'fleet is no longer bandwidth-constrained\n'
+            'uploads=1  full active-upload table (default: one summary line; '
+            'the roster step column already shows who is uploading)\n'
             'peer=X     substring filter on peer id (roster + log)\n'
             'q=X        substring filter on log msg body\n'
             'hours=H    log lookback (default 24; >24 reads per-day gzipped '
@@ -20246,8 +20416,9 @@ def process_txt():
             'duplicates collapsed as \xd7N)\n'
             '\n'
             '# cheap combos\n'
-            'roster=0&log=0   banner + fleet lines only\n'
+            'roster=0&log=0   banner + fleet lines only (~3k tokens)\n'
             'attn=1&warn=1    triage view\n'
+            'warn=1&log=120   read the warn_top(1h) clusters in context\n'
             '\n'
             '# structured equivalents\n'
             '/api/v1/director/status, /api/v1/director/log/history?hours=H\n'
@@ -20282,6 +20453,14 @@ def process_txt():
     #   compact view: health histogram + detail rows only for creds that
     #   are held by a frontier, used in the last 24h, or unhealthy.
     creds_full = request.args.get('creds') in ('1', 'true', 'yes')
+    # bw=1: bandwidth telemetry (fleet_bw / bw_learn lines, roster bw
+    #   columns, canary extras). Hidden by default since Sep 2026 — the
+    #   fleet is no longer bandwidth-constrained and the columns were
+    #   ~0% / 0.0/200G noise on every roster row.
+    show_bw = request.args.get('bw') in ('1', 'true', 'yes')
+    # uploads=1: full per-peer active-upload table. Default is a single
+    #   summary line (the roster's step column already carries it).
+    uploads_full = request.args.get('uploads') in ('1', 'true', 'yes')
     peer_q = (request.args.get('peer') or '').strip().lower()
     msg_q = (request.args.get('q') or '').strip().lower()
     try:
@@ -20296,7 +20475,8 @@ def process_txt():
     # underlying director status is already cross-worker cached so the
     # work avoided here is pure Python text formatting + log scanning.
     _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
-                  attn_only, show_roster, creds_full,
+                  attn_only, show_roster, creds_full, show_bw,
+                  uploads_full, verbose,
                   request.args.get('stall', '10'))
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
@@ -20754,9 +20934,10 @@ def process_txt():
     pct = (db_done / total_kgs * 100.0) if total_kgs else 0.0
     win_tag = f' (last {win_n} fresh uploads)' if win_n else ''
     out.append(
-        f'progress: state={state_p} done={db_done}/{total_kgs} '
+        f'progress: done={db_done}/{total_kgs} '
         f'({pct:.1f}%) rate={rate_h:.2f}/h eta={_hms(eta_s)} '
         f'failed={len(prog.get("failed_kgs") or [])}{win_tag}{src_tag}'
+        f' · primary_proc={state_p} (parked by design)'
     )
     _health['progress'] = {'pct': pct, 'rate': rate_h,
                            'eta': eta_s, 'done': db_done,
@@ -21017,7 +21198,7 @@ def process_txt():
         log.exception('process.txt zen_stall block failed')
     # Fleet bandwidth summary (canary-by-default).
     try:
-        fb = d.get('fleet_bw') or {}
+        fb = (d.get('fleet_bw') or {}) if show_bw else {}
         if fb:
             cap_med = fb.get('observed_cap_gb_median')
             cap_min = fb.get('observed_cap_gb_min')
@@ -21059,7 +21240,7 @@ def process_txt():
         # Learned per-peer renew_days (empirical, from observed BW
         # drops). Anchors eligibility math on real cycles instead of
         # the first_seen day-of-month heuristic.
-        bl = d.get('bw_learn') or {}
+        bl = (d.get('bw_learn') or {}) if show_bw else {}
         if bl:
             obs = bl.get('observed') or []
             by_day = bl.get('by_day') or {}
@@ -21151,6 +21332,81 @@ def process_txt():
     except Exception:
         log.exception('process.txt fleet_proxy line failed')
 
+    # zenodo_lock line: the :8001 broker's lease table (kg_upload pool +
+    # cache-class leases). Since 340f616 kg_upload leases are tracked but
+    # unbounded by default (shared_slots=None); a long-idle lease here
+    # (idle_s near ttl) means a peer is about to be orphan-reaped.
+    try:
+        import requests as _rq
+        _lk = _rq.get(_BROKER_BASE + '/api/v1/zenodo/lock', timeout=0.8).json()
+        _ls = _lk.get('leases') or []
+        _byp: dict = {}
+        for _l in _ls:
+            _k = _l.get('purpose') or '?'
+            _byp[_k] = _byp.get(_k, 0) + 1
+        _byp_s = ' '.join(f'{k}={v}' for k, v in
+                          sorted(_byp.items(), key=lambda kv: -kv[1]))
+        _old = max((_l.get('age_s') or 0) for _l in _ls) if _ls else 0
+        _idle = max((_l.get('idle_s') or 0) for _l in _ls) if _ls else 0
+        _slots = _lk.get('shared_slots')
+        _cache = [_l for _l in _ls if _l.get('cls') != 'shared']
+        _cache_s = ''
+        if _cache:
+            _cache_s = ' · cache_held_by=' + ','.join(
+                f"{str(_l.get('holder') or '?').replace('srtm-lidar-', '')}"
+                f"[{_l.get('purpose')}/{_hms(_l.get('age_s') or 0)}]"
+                for _l in _cache[:3])
+        out.append(
+            f'zenodo_lock: leases={len(_ls)} shared={_lk.get("shared_used", 0)}/'
+            f'{_slots if _slots else "∞"} [{_byp_s or "-"}]'
+            f' oldest={_hms(_old)} max_idle={_idle:.0f}s/ttl{_lk.get("ttl_s", 0):.0f}s'
+            f'{_cache_s}'
+        )
+    except Exception:
+        out.append('zenodo_lock: broker unreachable (:8001)')
+
+    # cadastre line: upstream health of the cadastre API in the last 1h,
+    # mined from the merged log (326fd60 / 19144bc — 202 warming +
+    # 5xx/timeout backoff). Only rendered when there is something to say.
+    try:
+        _cad = _health.get('cadastre_counts')
+        if _cad is None and _COMBINED_LOG_PATH.exists():
+            _cad = {'202': 0, 'transient': 0, 'peers': set()}
+            _c_since = (datetime.now(timezone.utc)
+                        - timedelta(hours=1)).isoformat()
+            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
+                fh.seek(0, 2)
+                _sz = fh.tell()
+                fh.seek(max(0, _sz - 512 * 1024))
+                for line in fh.read().split('\n'):
+                    if 'cadastre ' not in line or '"ts": "' not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    if (e.get('ts') or '') < _c_since:
+                        continue
+                    m = e.get('msg') or ''
+                    if 'pending (202)' in m:
+                        _cad['202'] += 1
+                        _cad['peers'].add(e.get('peer'))
+                    elif 'cadastre' in m and 'transient (' in m:
+                        _cad['transient'] += 1
+                        _cad['peers'].add(e.get('peer'))
+        if _cad and (_cad['202'] or _cad['transient']):
+            _verdict = ('DEGRADED' if _cad['transient'] >= 10
+                        else 'warming' if _cad['202'] else 'flaky')
+            out.append(
+                f'cadastre: {_verdict} · 1h: 202_pending={_cad["202"]} '
+                f'transient_5xx_timeout={_cad["transient"]} '
+                f'peers={len(_cad["peers"])} · debug: ?q=cadastre'
+            )
+            if _cad['transient'] >= 10:
+                _health['cadastre_degraded'] = _cad['transient']
+    except Exception:
+        log.exception('process.txt cadastre line failed')
+
     # zenodo_fetch line: in-flight product downloads (both workers) +
     # recent-hour throughput / ZENODO-SLOW verdict. Structured twin at
     # /api/v1/zenodo/fetches.
@@ -21172,6 +21428,11 @@ def process_txt():
             _v2l += (f" · dispatch={len(_dsp.get('assigned') or [])}"
                      f"/{_dsp.get('candidates_total', 0)}cand"
                      f" (fill<{_dsp.get('fill_below_ready')} ready, cap {_dsp.get('max_peers')})")
+            _pri = _dsp.get('priority') or []
+            if _pri:
+                _v2l += (f" · priority_pinned={len(_pri)}"
+                         f" [{','.join(map(str, _pri[:6]))}"
+                         f"{',…' if len(_pri) > 6 else ''}]")
             _fs = _dsp.get('fleet_strikes') or {}
             if _fs.get('codes'):
                 _v2l += (f" · strikes_fleet={_fs.get('codes')}codes"
@@ -21676,6 +21937,31 @@ def process_txt():
     except Exception as _e:
         out.append(f'versions: (error: {_e})')
 
+    # primary_net: the primary VM is metered (target < 50 MB/h, see
+    # AGENTS.md → Bandwidth). One line from net_meter (all gunicorn
+    # workers merged) + the top outbound endpoints so a regression in
+    # a fanout (Sep 2026 passes 1-3) is visible without curling
+    # /api/v1/net_stats. This is *primary egress*, not peer budgets.
+    try:
+        import net_meter as _nm
+        _ns = _nm.snapshot(top=3)
+        _o = _ns.get('outbound_total_mb_per_h', 0) or 0
+        _i = _ns.get('inbound_total_mb_per_h', 0) or 0
+        _top = ' '.join(
+            f"{r['key'].replace('<peer>:8000/api/v1/', 'peer:')}"
+            f"={r['mb_per_h']:.1f}"
+            for r in (_ns.get('outbound') or [])[:3])
+        _flag = ' PRIMARY-NET-HIGH' if (_o + _i) > 50 else ''
+        out.append(
+            f'primary_net: out={_o:.1f}MB/h in={_i:.1f}MB/h '
+            f'(window {_hms(_ns.get("window_s", 0))}, target<50){_flag}'
+            f' · top_out: {_top or "-"}'
+        )
+        if _flag:
+            _health['primary_net'] = {'out': _o, 'in': _i}
+    except Exception:
+        log.exception('process.txt primary_net line failed')
+
     # --- Copernicus credential snapshot --------------------------
     # Includes recent usage so we can spot creds that aren't being
     # touched (often the symptom of a frontier-cred-plan that's only
@@ -21730,17 +22016,21 @@ def process_txt():
             lu_ts = u.get('last_use') or 0
             le_ts = u.get('last_error') or 0
             recent = max(float(lu_ts or 0), float(le_ts or 0))
-            if creds_full or i in held_by_idx or (
-                    recent and (now_ts - recent) < 24 * 3600) or (
-                    label not in ('healthy', 'warm', '-')):
+            # Default: held by a frontier, or unhealthy. "Used in the
+            # last 24h" used to qualify too, but with 100+ creds and
+            # ~20 frontiers that matched ~80% of the pool (~11 KB, a
+            # third of the whole page) — pure noise for triage.
+            _unhealthy = label not in ('healthy', 'warm', 'hot', '-')
+            _err24 = le_ts and (now_ts - float(le_ts)) < 24 * 3600
+            if creds_full or _unhealthy or (i in held_by_idx and _err24):
                 active_rows.append((i, c, u, s7, e7, label))
         hist_s = ' '.join(f'{k}={v}' for k, v in
                           sorted(hist.items(), key=lambda kv: -kv[1]))
         out.append(f'copernicus credentials ({len(cred_pool)}): {hist_s} '
                    f'· 7d s/e/r={tot_s7}/{tot_e7}/{tot_r7}'
                    + ('' if creds_full else
-                      f' · showing {len(active_rows)} active/held/unhealthy'
-                      f' (creds=1 for all)'))
+                      f' · showing {len(active_rows)} unhealthy or '
+                      f'held+errored<24h (creds=1 for all + 7d sparklines)'))
         if active_rows:
             out.append('  # id              health  held_by  s/e/r 7d   last_use   last_err')
         def _ago(ts):
@@ -21760,8 +22050,9 @@ def process_txt():
             # Per-cred daily 7d sparkline (oldest .. today). Compact:
             #   D-6..D0 success / error counts.
             try:
-                daily = _daily_se(u.get('buckets'))
-                # Bypass when entirely empty (cred unused).
+                # Sparkline row only in the full view — it doubles the
+                # row count and rarely changes a triage decision.
+                daily = _daily_se(u.get('buckets')) if creds_full else []
                 if any(s or e for s, e in daily):
                     cells = ' '.join(f'{s}/{e}' for s, e in daily)
                     out.append(f'      7d s/e per day (D-6→D0): {cells}')
@@ -21773,9 +22064,16 @@ def process_txt():
             pp = ' '.join(f'{pid}={",".join(map(str, idxs))}'
                           for pid, idxs in sorted(plan.items()))
             par = ','.join(d.get('parallel_frontiers_active') or [])
-            out.append(f'frontier plan: {pp}')
-            out.append(f'parallel frontiers active ({len(d.get("parallel_frontiers_active") or [])}):'
-                       f' {par or "-"}')
+            # Active set == plan keys in steady state; only spell out
+            # the difference (planned-but-not-active / active-but-unplanned).
+            _act = set(d.get('parallel_frontiers_active') or [])
+            _pl = set(plan.keys())
+            _diff = ''
+            if _act - _pl:
+                _diff += f' active_unplanned={",".join(sorted(_act - _pl))}'
+            if _pl - _act:
+                _diff += f' planned_inactive={",".join(sorted(_pl - _act))}'
+            out.append(f'frontier plan ({len(_act)} active): {pp}{_diff}')
     except Exception as _e:
         out.append(f'(credentials snapshot error: {_e})')
 
@@ -21915,7 +22213,12 @@ def process_txt():
                 v = commit_from_log.get(p.get('id'))
                 if v:
                     p['git_commit'] = v
-    out.append('  id     role     kg     name                 step          elapsed  bw%   used/bud   ver     creds  last_kg  extras')
+    if not visible:
+        pass
+    elif show_bw:
+        out.append('  id     role     kg     name                 step          elapsed  bw%   used/bud   ver     creds  last_kg  extras')
+    else:
+        out.append('  id     role     kg     name                 step          elapsed ver     creds  last_kg  extras')
     for p in visible:
         pid = _short(p.get('id', '?'), 6).ljust(6)
         role_v = _peer_role(p)
@@ -21950,14 +22253,14 @@ def process_txt():
         bw_ub = (f'{used_gb:.1f}/{budget_gb:.0f}G').rjust(10)
         # bw_extras: canary ratio + observed cap + park / renewal info.
         extras = []
-        c = p.get('canary') or {}
+        c = (p.get('canary') or {}) if show_bw else {}
         if c:
             ratio = c.get('ratio')
             if isinstance(ratio, (int, float)):
                 extras.append(f'r={ratio:.2f}')
             if c.get('override'):
                 extras.append('CANARY')
-        cap = p.get('observed_cap_gb')
+        cap = p.get('observed_cap_gb') if show_bw else None
         if isinstance(cap, (int, float)):
             extras.append(f'cap={cap:.0f}G')
         # not_before / days-to-renewal
@@ -21975,7 +22278,7 @@ def process_txt():
                         extras.append(f'parked→{dleft/3600:.1f}h')
             except Exception:
                 extras.append('parked')
-        rd = p.get('renew_day')
+        rd = p.get('renew_day') if show_bw else None
         if rd:
             extras.append(f'rd={rd}')
         # CPU steal / iowait chips — only flag when material so the
@@ -22020,8 +22323,9 @@ def process_txt():
             flags += ' ⚠cached'
         if not p.get('online'):
             flags += ' ⚠off'
+        _bwcols = f' {bw_pct} {bw_ub}' if show_bw else ''
         out.append(
-            f'  {pid} {role} {kg} {name} {step} {el_col} {bw_pct} {bw_ub} {ver} {ci_col} {last}'
+            f'  {pid} {role} {kg} {name} {step} {el_col}{_bwcols} {ver} {ci_col} {last}'
             + (f'  {bw_extra_s}' if bw_extra_s else '')
             + flags
         )
@@ -22045,11 +22349,27 @@ def process_txt():
             disk_warn.append((p.get('id'), df))
     if upl:
         out.append('')
-        out.append(f'active zenodo uploads ({len(upl)}):')
-        for pid, kg, name, step, detail in upl:
-            out.append(f'  {(pid or "?")[:6].ljust(6)} kg={kg or "-":<8} '
-                       f'{(name or "")[:20].ljust(20)} {step:<14} '
-                       f'{(detail or "")[:80]}')
+        if uploads_full:
+            out.append(f'active zenodo uploads ({len(upl)}):')
+            for pid, kg, name, step, detail in upl:
+                out.append(f'  {(pid or "?")[:6].ljust(6)} kg={kg or "-":<8} '
+                           f'{(name or "")[:20].ljust(20)} {step:<14} '
+                           f'{(detail or "")[:80]}')
+        else:
+            # One line: step histogram + peer ids. The roster's step
+            # column already names the KG per peer; ?uploads=1 restores
+            # the full table.
+            _sh: dict = {}
+            for _, _, _, step, _ in upl:
+                k = step.replace('upload_', '').replace('_gpkg', '')
+                k = k.strip('_') or 'v1'
+                _sh[k] = _sh.get(k, 0) + 1
+            _sh_s = ' '.join(f'{k}={v}' for k, v in
+                             sorted(_sh.items(), key=lambda kv: -kv[1]))
+            _ids = ','.join(str(x[0]) for x in upl)
+            out.append(f'zenodo uploads active: {len(upl)}/'
+                       f'{sum(1 for p in (d.get("peers") or []) if (p.get("processor_state") or "").lower() in ("running", "processing"))}'
+                       f' running · {_sh_s} · {_ids} (uploads=1 for table)')
     if disk_warn:
         out.append('')
         out.append('disk pressure (<5 GB free):')
@@ -22069,6 +22389,12 @@ def process_txt():
                 fh.seek(max(0, size - 256 * 1024))
                 tail2 = fh.read()
             evs = []
+            # warn_top(1h): cluster warnings/errors from the same tail
+            # read into signatures so the dominant failure mode is one
+            # line, not 40 log rows. (Reads the same 256 KB tail.)
+            _wt_since = (datetime.now(timezone.utc)
+                         - timedelta(hours=1)).isoformat()
+            _wt: dict = {}
             for line in tail2.split('\n'):
                 if not line.strip():
                     continue
@@ -22076,6 +22402,14 @@ def process_txt():
                     e = json.loads(line)
                 except Exception:
                     continue
+                _lv = (e.get('level') or '').lower()
+                if _lv in ('warning', 'error') and \
+                        (e.get('ts') or '') >= _wt_since and \
+                        not _is_bev_proxy_noise(e.get('msg', '')):
+                    _sig = _ptxt_warn_signature(e.get('msg', ''))
+                    _ent = _wt.setdefault(_sig, [0, set()])
+                    _ent[0] += 1
+                    _ent[1].add(e.get('peer') or '?')
                 if e.get('peer') != 'director':
                     continue
                 msg = (e.get('msg') or '').lower()
@@ -22084,6 +22418,15 @@ def process_txt():
                         'rollout', 'cred ', 'capacity', 'park', 'plan drift')):
                     continue
                 evs.append(e)
+            if _wt:
+                _top = sorted(_wt.items(), key=lambda kv: -kv[1][0])[:8]
+                _tot = sum(v[0] for v in _wt.values())
+                out.append('')
+                out.append(f'warn_top(1h): {_tot} warn/err in '
+                           f'{len(_wt)} clusters (top {len(_top)}; '
+                           f'count×peers → signature):')
+                for _sig, (_n, _peers) in _top:
+                    out.append(f'  {_n:4d}×{len(_peers):<3d} {_sig}')
             if evs:
                 out.append('')
                 out.append('recent director events (rollout/creds, last 12):')
@@ -22213,11 +22556,15 @@ def process_txt():
             out[-1] += f' ×{_dup_n + 1}'
             _dup_n = 0
         _prev_key = key
-        ts = (e.get('ts') or '')[5:19].replace('T', ' ')
+        # MM-DD HH:MM — seconds never matter for triage and the date
+        # disambiguates midnight crossings / archive reads.
+        ts = (e.get('ts') or '')[5:16].replace('T', ' ')
         peer = _short(e.get('peer', '-'), 8).ljust(8)
         lvl = (e.get('level') or 'info')[0].upper()
         kg = e.get('kg') or ''
         kg_s = f' [{kg}]' if kg else ''
+        if not verbose:
+            msg = _ptxt_compact_msg(msg, str(kg))
         # Cap message length — 'creds revalidated' style lines carry a
         # 400+ char per-cred tail that costs ~100 tokens each. Verbose
         # mode keeps the full text.
@@ -22230,8 +22577,8 @@ def process_txt():
 
     out.append('')
     out.append(
-        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 '
-        'peer=<substr> q=<substr> hours=H verbose=1 help=1'
+        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 bw=1 '
+        'uploads=1 stall=N peer=<substr> q=<substr> hours=H verbose=1 help=1'
     )
     # --- Distil health banner (inserted just under the title) ----
     try:
@@ -22264,7 +22611,7 @@ def process_txt():
                 _hb.append(
                     f'cpu {cpu["throttled"]}/{cpu["n"]} thr '
                     f'({cpu["steal_med"]:.0f}% steal)')
-        bw = _health.get('bw')
+        bw = _health.get('bw') if show_bw else None
         if bw and bw.get('nominal'):
             # Loud flag only when there is *evidence* of a real wall
             # (≥1 quality-grade observed_cap across the fleet). The
@@ -22284,6 +22631,14 @@ def process_txt():
                 _hb.append(
                     f'bw {bw["used"]:.0f}/{bw["nominal"]:.0f}GB '
                     f'parked={bw["parked"]}')
+        if _health.get('primary_net'):
+            _pn = _health['primary_net']
+            _flags.append(
+                f'PRIMARY-NET-HIGH({_pn["out"]:.0f}+{_pn["in"]:.0f}MB/h)')
+        if _health.get('cadastre_degraded'):
+            _flags.append(
+                f'CADASTRE-DEGRADED({_health["cadastre_degraded"]} '
+                f'transient/1h)')
         kgf = _health.get('kg_fail')
         if kgf:
             if kgf['fk_per_h'] >= 1.0 or kgf['pk_per_h'] >= 2.0:
@@ -22313,6 +22668,10 @@ def process_txt():
     except Exception:
         log.exception('process.txt health banner failed')
 
+    try:
+        out = _ptxt_layout(out)
+    except Exception:
+        log.exception('process.txt layout pass failed')
     body = '\n'.join(out) + '\n'
     try:
         cache[_cache_key] = (_now_t, body)

@@ -243,6 +243,9 @@ FRONTIER_CELL_LON = float(os.environ.get('FRONTIER_CELL_LON', '1.0'))
 FRONTIER_MAX_PARALLEL = int(os.environ.get('FRONTIER_MAX_PARALLEL', '20'))
 PRODUCT_REPAIR_MAX_CELLS = 40
 PRODUCT_REPAIR_MAX_CODES = 300
+# Repair cells stay published while hourly openEO read-timeouts are
+# at most this many OR fewer than successful months (see _product_repair_plan).
+PRODUCT_REPAIR_OPENEO_MAX_TIMEOUTS = 3
 
 # --- Small-fleet efficiency knobs (2026-08-22) ------------------------
 # Shadow self-park is skipped while the fleet is small: dedicating a
@@ -10515,10 +10518,23 @@ class PeerDirector:
         try:
             import app as _app
             oh = _app._openeo_health()
-            openeo_ok = not (oh.get('timeouts') or oh.get('cascades'))
+            # "Serving" gate, not "spotless" gate: with ~40 peers on
+            # openEO there is a stray read-timeout almost every hour,
+            # and the old ``not timeouts`` test kept repair cells
+            # unpublished for 3 days straight (0 cells filled 09-21…24).
+            # Block only on real upstream stress: a cascade / deferred
+            # KG, or timeouts outnumbering successful months.
+            to = int(oh.get('timeouts') or 0)
+            ok_m = int(oh.get('months_ok') or 0)
+            openeo_ok = not (oh.get('cascades') or oh.get('defers')) \
+                and (to <= PRODUCT_REPAIR_OPENEO_MAX_TIMEOUTS or to <= ok_m)
         except Exception:
             pass
         cells = list(st.get('cells') or []) if (cop_ok and openeo_ok) else []
+        with self._lock:
+            self.state['_product_repair_gate'] = {
+                'cop_ok': bool(cop_ok), 'openeo_ok': bool(openeo_ok),
+                'published': len(cells)}
         return cells, list(st.get('codes') or [])
 
     def _update_prewarm_flag(self, cache_ready_count: int):

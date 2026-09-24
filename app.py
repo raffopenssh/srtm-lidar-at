@@ -21193,8 +21193,16 @@ def process_txt():
                            .get('prewarm') or {})
                 except Exception:
                     pass
+                _gate = ''
+                try:
+                    _g = (pd.load_director_state() or {}).get('_product_repair_gate') or {}
+                    if _g and not _pw.get('repair_cells'):
+                        _gate = ' gate=' + ('cop' if not _g.get('cop_ok') else
+                                            'openeo' if not _g.get('openeo_ok') else 'none-planned')
+                except Exception:
+                    pass
                 _rl += (f" · plan: cells={len(_pw.get('repair_cells') or [])} "
-                        f"codes={len(_pw.get('repair_codes') or [])} · debug: ?q=repair")
+                        f"codes={len(_pw.get('repair_codes') or [])}{_gate} · debug: ?q=repair")
                 out.append(_rl)
         except Exception as _e:
             out.append(f'repair:   unavailable ({_e})')

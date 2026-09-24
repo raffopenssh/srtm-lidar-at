@@ -231,10 +231,13 @@ class TileStore:
             r.raise_for_status()
             data = r.content
         except requests.HTTPError as he:
-            log.debug("tile store: fetch %s: %s", name, he)
+            # INFO, not DEBUG: cache-only peers fall through to the legacy
+            # strip ZIPs and end up with a '-partial' product, and the
+            # only trace was a silent CacheMissError (48009-south, 09-24).
+            log.info("tile store: fetch %s failed: %s", name, he)
             return None
         except Exception as ex:
-            log.debug("tile store: fetch %s: %s", name, ex)
+            log.info("tile store: fetch %s failed: %s", name, ex)
             return None
         from zenodo_cache import validate_tile_npz, _log_pollution_event
         ok, reason = validate_tile_npz(data, product)

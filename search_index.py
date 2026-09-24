@@ -8,6 +8,7 @@ Tables: kg, kg_landcover, kg_hansen, kg_rtree (R-tree), fts_kg (FTS5), index_met
 """
 import fcntl
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -61,6 +62,74 @@ DISTRICT_NAMES = {
 }
 
 BASE_URL = 'https://srtm-lidar-at.exe.xyz:8000'
+
+# Explicit column list for kg_parcels inserts (positional VALUES broke every
+# time a column was appended via ALTER TABLE — keep this in sync with the
+# CREATE TABLE in ``_schema_stmts``).
+KG_PARCELS_COLS = (
+    'kg_code, parcel_id, area_sqm, centroid_lon, centroid_lat, elevation_m, '
+    'elevation_min_m, elevation_max_m, elevation_range_m, slope_mean_deg, '
+    'tri_mean, tpi_mean, terrain_class, aspect_mean_deg, aspect_dominant, '
+    'vegetated_fraction, forested_fraction, dominant_type, ndsm_max_m, '
+    'ndsm_mean_m, is_vegetated, rf_classified, rules_classified, '
+    'mean_confidence, rf_mean_confidence, hansen_total_pixels, '
+    'hansen_recent_5yr_pixels, building_count, building_max_height_m, '
+    'building_max_stories, building_total_footprint_sqm, auto_class, '
+    'auto_subclass, auto_class_confidence, frav, tree_h_mean, tree_h_max')
+
+# Minimum apex height kept in ``kg_trees`` (disk budget: ~1.1M rows at 20 m
+# fleet-wide vs ~3.3M parcels; the siedler contract defaults min_height=20).
+KG_TREES_MIN_H = 20.0
+
+
+def _slim_parcel_fields(p: dict) -> tuple:
+    """(frav_json, tree_h_mean, tree_h_max) for one KG-JSON parcel."""
+    frav = p.get('frav') or None
+    fj = None
+    if isinstance(frav, dict) and frav:
+        try:
+            fj = json.dumps({str(k): int(v) for k, v in frav.items()},
+                            separators=(',', ':'), sort_keys=True)
+        except Exception:
+            fj = None
+    hs = []
+    for t in p.get('top_trees') or []:
+        try:
+            h = float(t[0])
+        except Exception:
+            continue
+        if h > 0:
+            hs.append(h)
+    if hs:
+        return (fj, round(sum(hs) / len(hs), 1), round(max(hs), 1))
+    return (fj, None, None)
+
+
+def _parcel_tree_rows(code: str, p: dict) -> list:
+    """kg_trees rows for one parcel (compact ``top_trees`` entries ≥ min h)."""
+    out = []
+    pid = p.get('parcel_id') or None
+    for t in p.get('top_trees') or []:
+        try:
+            h = float(t[0]); lon = float(t[4]); lat = float(t[5])
+        except Exception:
+            continue
+        if h < KG_TREES_MIN_H:
+            continue
+        try:
+            area = float(t[3] or 0)
+        except Exception:
+            area = 0.0
+        # top_trees entries are tree *segments* (can be a whole stand);
+        # only report a crown diameter when the segment is single-crown
+        # sized (≤ 400 m² ≈ 22 m diameter).
+        crown = round(2.0 * math.sqrt(area / math.pi), 1) if 0 < area <= 400 else None
+        try:
+            rf = float(t[11]) if len(t) > 11 and t[11] is not None else None
+        except Exception:
+            rf = None
+        out.append((code, pid, round(lon, 7), round(lat, 7), round(h, 1), crown, rf))
+    return out
 
 
 class SearchIndex:
@@ -292,8 +361,27 @@ class SearchIndex:
                 auto_class TEXT,
                 auto_subclass TEXT,
                 auto_class_confidence REAL,
+                -- slim composition fields (siedler LID-1): compact
+                -- frav JSON {letter: area_sqm} + tree height summary
+                frav TEXT,
+                tree_h_mean REAL,
+                tree_h_max REAL,
                 PRIMARY KEY (kg_code, parcel_id)
             )''',
+            # === Per-parcel top trees (siedler LID-1/LID-2) ===
+            # Sampled apices: the up-to-5 tallest trees per parcel from
+            # the KG JSON (``top_trees``), h >= KG_TREES_MIN_H. NOT the
+            # full apex set (that lives in the light GPKG); ~1M rows.
+            '''CREATE TABLE IF NOT EXISTS kg_trees (
+                kg_code TEXT NOT NULL,
+                parcel_id TEXT,
+                lon REAL NOT NULL,
+                lat REAL NOT NULL,
+                h_m REAL NOT NULL,
+                crown_d_m REAL,
+                rf_conf REAL
+            )''',
+            'CREATE INDEX IF NOT EXISTS idx_trees_kg_lon ON kg_trees(kg_code, lon)',
             'CREATE INDEX IF NOT EXISTS idx_prc_kg ON kg_parcels(kg_code)',
             'CREATE INDEX IF NOT EXISTS idx_prc_aspect ON kg_parcels(aspect_dominant)',
             'CREATE INDEX IF NOT EXISTS idx_prc_terrain ON kg_parcels(terrain_class)',
@@ -450,6 +538,13 @@ class SearchIndex:
                 c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}')
             except Exception:
                 pass  # column already exists
+        # Slim composition columns on kg_parcels (siedler LID-1)
+        for col, ctype in [('frav', 'TEXT'), ('tree_h_mean', 'REAL'),
+                           ('tree_h_max', 'REAL')]:
+            try:
+                c.execute(f'ALTER TABLE kg_parcels ADD COLUMN {col} {ctype}')
+            except Exception:
+                pass
         # Re-run indexes that may have failed before ALTER TABLE
         for s in self._schema_stmts():
             if 'CREATE INDEX' in s:
@@ -610,7 +705,7 @@ class SearchIndex:
         with self._write_lock:
             c = self._conn()
             # Drop and recreate — ensures schema changes are picked up
-            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'kg_parcels', 'index_meta'):
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'kg_parcels', 'kg_trees', 'index_meta'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
             for t in ('kg_rtree', 'fts_kg'):
                 c.execute(f'DROP TABLE IF EXISTS {t}')
@@ -989,6 +1084,8 @@ class SearchIndex:
         p_details = parcels.get('details', [])
         if p_details:
             c.execute('DELETE FROM kg_parcels WHERE kg_code=?', (code,))
+            c.execute('DELETE FROM kg_trees WHERE kg_code=?', (code,))
+            tree_rows = []
             # Spatial join (building → parcel) via point-in-polygon.
             # The parcel JSON includes `vertex_heights` (boundary vertices in
             # WGS84). We test each building's centroid against parcel polygons
@@ -1132,14 +1229,19 @@ class SearchIndex:
                     ac.get('class'),
                     ac.get('subclass'),
                     ac.get('confidence'),
-                ))
+                ) + _slim_parcel_fields(p))
+                tree_rows.extend(_parcel_tree_rows(code, p))
             if prc_rows:
+                if tree_rows:
+                    c.executemany(
+                        'INSERT INTO kg_trees VALUES (?,?,?,?,?,?,?)', tree_rows)
                 # OR REPLACE: belt-and-braces against duplicate
                 # (kg_code, parcel_id) — e.g. malformed source JSONs —
                 # so one dupe can never abort the whole batch and wipe
                 # the KG's parcels (DELETE above already ran).
                 c.executemany(
-                    'INSERT OR REPLACE INTO kg_parcels VALUES (' + ','.join(['?'] * 34) + ')',
+                    'INSERT OR REPLACE INTO kg_parcels (' + KG_PARCELS_COLS + ') VALUES ('
+                    + ','.join(['?'] * 37) + ')',
                     prc_rows)
 
     @staticmethod
@@ -3491,7 +3593,23 @@ class SearchIndex:
         joins = []
 
         # KG-level filters (join to kg table)
-        if state or district or gemeinde or bbox:
+        if bbox:
+            # Resolve the touched KGs via the R-tree first and filter on
+            # the parcel *centroid*. The old ``JOIN kg`` bbox predicate made
+            # the planner SCAN kg_parcels on the sort index (13 s per call)
+            # and returned every parcel of every touched KG.
+            w, s_, e, n = bbox
+            _kgs = self.kgs_in_bbox(w, s_, e, n)
+            if not _kgs:
+                return {'total': 0, 'offset': offset, 'limit': limit,
+                        'results': [], 'kgs': []}
+            where.append('p.kg_code IN (%s)' % ','.join('?' * len(_kgs)))
+            params.extend(_kgs)
+            where.append('p.centroid_lon >= ? AND p.centroid_lon <= ? '
+                         'AND p.centroid_lat >= ? AND p.centroid_lat <= ?')
+            params.extend([w, e, s_, n])
+            bbox = None
+        if state or district or gemeinde:
             joins.append('JOIN kg k ON p.kg_code = k.kg_code')
             if state:
                 where.append('(k.state_name = ? OR k.state_code = ?)')
@@ -3502,10 +3620,6 @@ class SearchIndex:
             if gemeinde:
                 where.append('(k.gemeinde_name = ? OR k.gemeinde_code = ?)')
                 params.extend([gemeinde, gemeinde])
-            if bbox:
-                w, s, e, n = bbox
-                where.append('k.min_lon <= ? AND k.max_lon >= ? AND k.min_lat <= ? AND k.max_lat >= ?')
-                params.extend([e, w, n, s])
 
         if kg_code:
             where.append('p.kg_code = ?')
@@ -3633,6 +3747,133 @@ class SearchIndex:
         cols = [d[0] for d in c.execute('SELECT * FROM kg_parcels LIMIT 0').description]
         results = [dict(zip(cols, r)) for r in rows]
         return {'total': count, 'offset': offset, 'limit': limit, 'results': results}
+
+    # ── siedler slim-field helpers (LID-1 / LID-2) ──────────────────
+
+    def kgs_in_bbox(self, w, s, e, n, processed_only=True):
+        """KG codes whose bbox intersects (w,s,e,n) — via kg_rtree."""
+        c = self._conn()
+        q = ('SELECT k.kg_code FROM kg_rtree r JOIN kg k ON k.rowid = r.id '
+             'WHERE r.min_lon <= ? AND r.max_lon >= ? '
+             'AND r.min_lat <= ? AND r.max_lat >= ?')
+        if processed_only:
+            q += ' AND k.processed = 1'
+        return [r[0] for r in c.execute(q, (e, w, n, s))]
+
+    def trees_for_parcels(self, kg_code, parcel_ids, min_h=25.0):
+        """{parcel_id: [(lon, lat, h, rf_conf), ...]} from kg_trees."""
+        if not parcel_ids:
+            return {}
+        c = self._conn()
+        out = {}
+        ids = list(parcel_ids)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in c.execute(
+                    'SELECT parcel_id, lon, lat, h_m, rf_conf FROM kg_trees '
+                    'WHERE kg_code=? AND h_m >= ? AND parcel_id IN (%s) '
+                    'ORDER BY h_m DESC' % ','.join('?' * len(chunk)),
+                    [kg_code, min_h] + chunk):
+                out.setdefault(r[0], []).append(r[1:])
+        return out
+
+    def query_trees_bbox(self, w, s, e, n, min_height=20.0, limit=2000):
+        """Sampled tree apices in bbox from kg_trees (top-5/parcel set)."""
+        c = self._conn()
+        kgs = self.kgs_in_bbox(w, s, e, n)
+        if not kgs:
+            return {'rows': [], 'kgs': [], 'truncated': False}
+        lim = max(1, min(int(limit), 2000))
+        rows = c.execute(
+            'SELECT kg_code, parcel_id, lon, lat, h_m, crown_d_m, rf_conf '
+            'FROM kg_trees WHERE kg_code IN (%s) AND lon >= ? AND lon <= ? '
+            'AND lat >= ? AND lat <= ? AND h_m >= ? '
+            'ORDER BY h_m DESC LIMIT ?' % ','.join('?' * len(kgs)),
+            kgs + [w, e, s, n, float(min_height), lim + 1]).fetchall()
+        trunc = len(rows) > lim
+        return {'rows': [tuple(r) for r in rows[:lim]], 'kgs': kgs,
+                'truncated': trunc}
+
+    def backfill_slim_fields(self, codes=None, log_every=100):
+        """One-off: populate frav / tree_h_* / kg_trees for KGs indexed
+        before those columns existed. Reads each KG doc (v2 store or JSON
+        file) and UPDATEs in place — no DELETE/re-insert churn. Safe to
+        re-run; skips KGs whose kg_trees rows already exist AND whose
+        parcels already carry frav."""
+        c = self._conn()
+        if codes is None:
+            codes = [r[0] for r in c.execute(
+                'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code')]
+        manifest = {}
+        mp = Path('data/austria_processor/zenodo_manifest.json')
+        if mp.exists():
+            try:
+                md = json.loads(mp.read_text()); manifest = md.get('entries', md)
+            except Exception:
+                pass
+        json_dir = Path('data/austria_processor/json')
+        done = skipped = 0
+        t0 = time.time()
+        for i, code in enumerate(codes):
+            try:
+                have = c.execute(
+                    'SELECT COUNT(*) FROM kg_parcels WHERE kg_code=? AND frav IS NOT NULL',
+                    (code,)).fetchone()[0]
+                if have:
+                    skipped += 1
+                    continue
+                plain, blocks = self._select_kg_files_for_parent(code, json_dir, manifest=manifest)
+                if not blocks:
+                    continue
+                if len(blocks) == 1:
+                    data = blocks[0][1]
+                else:
+                    data = self._merge_blocks_for_slim(blocks)
+                details = ((data.get('parcels') or {}).get('details')
+                           if isinstance(data.get('parcels'), dict) else None) or []
+                upd = []; trees = []
+                for p in details:
+                    pid = p.get('parcel_id')
+                    if not pid:
+                        continue
+                    fj, hm, hx = _slim_parcel_fields(p)
+                    if fj is None and hm is None:
+                        continue
+                    upd.append((fj, hm, hx, code, pid))
+                    trees.extend(_parcel_tree_rows(code, p))
+                with self._write_lock:
+                    c.execute('DELETE FROM kg_trees WHERE kg_code=?', (code,))
+                    if upd:
+                        c.executemany(
+                            'UPDATE kg_parcels SET frav=?, tree_h_mean=?, tree_h_max=? '
+                            'WHERE kg_code=? AND parcel_id=?', upd)
+                    if trees:
+                        c.executemany('INSERT INTO kg_trees VALUES (?,?,?,?,?,?,?)', trees)
+                    c.commit()
+                done += 1
+            except Exception as ex:
+                log.warning('backfill_slim %s: %s', code, ex)
+            if log_every and (i + 1) % log_every == 0:
+                log.info('backfill_slim: %d/%d (done=%d skipped=%d) %.0fs',
+                         i + 1, len(codes), done, skipped, time.time() - t0)
+        return {'done': done, 'skipped': skipped, 'elapsed_s': round(time.time() - t0, 1)}
+
+    @staticmethod
+    def _merge_blocks_for_slim(block_list):
+        """Parcels-only merge of split-KG blocks (largest-area copy wins)."""
+        by_id = {}
+        for _, d in block_list:
+            prc = d.get('parcels')
+            if not isinstance(prc, dict):
+                continue
+            for p in prc.get('details', []):
+                pid = p.get('parcel_id')
+                if not pid:
+                    continue
+                prev = by_id.get(pid)
+                if prev is None or float(p.get('area_sqm') or 0) > float(prev.get('area_sqm') or 0):
+                    by_id[pid] = p
+        return {'parcels': {'details': list(by_id.values())}}
 
     def query_buildings_index(self, kg_code=None, min_height=None, max_height=None,
                                min_stories=None, max_stories=None, roof_type=None,

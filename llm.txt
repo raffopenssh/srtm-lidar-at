@@ -1620,9 +1620,18 @@ Recipe — everything a 2.5D renderer needs for one KG, all <100 ms each:
   /api/v1/buildings/search?kg=<kg>&limit=5000            building centroid, dtm, max_height, stories, roof type
   /api/v1/query?segments=true&kg=<kg>&object_type=tree,hedge,mast,rock&sort=height_max_m&limit=50
                                                          tallest objects per type with lon/lat/height
-AVOID for interactive use: query/parcels?bbox= (no spatial index, seconds),
-segments=true&bbox= (1–5 s), /kg/<kg>/segments|buildings (GPKG fetch),
+  /api/v1/query/parcels?bbox=w,s,e,n&limit=500           viewport parcels (R-tree → centroid filter, <20 ms) with
+                                                         slim fields fracs / dom_terrain / tree_h / top_trees
+  /api/v1/trees/bbox?west&south&east&north&min_height=20 sampled tallest trees per parcel (index, <10 ms)
+  /api/v1/query/buildings?bbox=w,s,e,n                   buildings + cadastre footprint_id (index, <10 ms)
+AVOID for interactive use: segments=true&bbox= (1–5 s), /kg/<kg>/segments|buildings (GPKG fetch),
 and every POST raster endpoint (10–60 s).
+
+#### Sibling-service contract (siedler / kohlschwarz) — see /llm.txt (root)
+  GET /llm/kg/<kg>            per-KG dossier (metrics, history, granularity=parcel); 404 {kg_code,error:"no_data"}
+  GET /llm/manifest.json      coverage + metrics_schema;  GET /llm/kgs[?codes=a,b]
+  POST /api/v1/prewarm?kgs=   warm-up hint (200 all warm / 202 queued|pending)
+  All CORS *, ETag, gzip, index-backed (never a KG JSON / GPKG read).
 
 #### GET /api/v1/buildings/search
 Fast building search across the index (no GPKG needed). Queries the kg_buildings table.

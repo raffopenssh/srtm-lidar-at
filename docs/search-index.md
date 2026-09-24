@@ -1,6 +1,8 @@
 # Search Index — Mental Model
 
-SQLite at `data/search_index.db` (~5 MB). FTS5 + R-tree + ~30 b-tree indexes.
+SQLite at `data/search_index.db` (~2.5 GB with 3.3 M parcel rows — the
+`~5 MB` of early days is long gone; watch disk when adding columns). FTS5 +
+R-tree + ~30 b-tree indexes.
 All queries <50 ms. Auto-rebuilt at startup; auto-updated when new KG JSONs
 appear (60 s poll). Manual rebuild: `POST /api/v1/index/rebuild`.
 
@@ -14,7 +16,9 @@ kg                       ← one row per KG (parent KGs only)
 ├─ kg_divergence         ← RF↔rule disagreement details
 ├─ kg_type_top           ← top-N segments per type per KG (for ranking)
 ├─ kg_buildings          ← per-building rollup (height, stories, roof)
-└─ kg_parcels            ← per-parcel rollup (auto_class, terrain, buildings, hansen)
+├─ kg_parcels            ← per-parcel rollup (auto_class, terrain, buildings, hansen,
+│                           frav / tree_h_* slim fields — see docs/siedler-contract.md)
+└─ kg_trees              ← ≤5 tallest apices per parcel, h ≥ 20 m (siedler LID-2)
 
 kg_rtree (virtual)       ← spatial index over kg.bbox
 fts_kg (virtual)         ← full-text over name/state/district/gemeinde

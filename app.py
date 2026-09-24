@@ -68,6 +68,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname
 log = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+import llm_api as _llm_api  # siedler sibling-service contract (/llm/*, trees/bbox, ...)
+app.register_blueprint(_llm_api.bp)
 
 # Per-endpoint byte accounting (inbound Flask + outbound requests) —
 # feeds /api/v1/net_stats. Installed first so every hook/call is metered.
@@ -264,6 +266,31 @@ def _request_is_loopback() -> bool:
         return True
     except Exception:
         return False
+
+
+@app.before_request
+def _cors_preflight():
+    # Browser cross-origin preflight for the public read endpoints
+    # (siedler game). Answer before the admin-token gate.
+    if request.method == 'OPTIONS' and _llm_api.cors_path(request.path or ''):
+        return _llm_api.add_cors(Response(status=204))
+    return None
+
+
+@app.after_request
+def _cors_public(resp):
+    try:
+        if _llm_api.cors_path(request.path or ''):
+            _llm_api.add_cors(resp)
+            # Small (<1 KiB) bodies skip _compress_and_etag; the sibling
+            # contract wants an ETag on every /llm/* answer.
+            if (request.method == 'GET' and resp.status_code in (200, 404)
+                    and 'ETag' not in resp.headers and not resp.direct_passthrough
+                    and not resp.is_streamed):
+                resp.headers['ETag'] = 'W/"' + hashlib.md5(resp.get_data()).hexdigest()[:20] + '"'
+    except Exception:
+        pass
+    return resp
 
 
 @app.before_request
@@ -11383,6 +11410,20 @@ def api_query_parcels():
             offset=offset,
             **kwargs,
         )
+        # siedler LID-1 slim fields (fracs / dom_terrain / tree_h /
+        # top_trees) + pending-ingest signalling; index-only, no JSON load.
+        try:
+            _llm_api.slim_parcel_rows(result.get('results') or [], idx)
+            result['ready'] = True
+            if bbox:
+                _pend = _llm_api.pending_kgs_in_bbox(*bbox, idx=idx)
+                if _pend:
+                    result['ready'] = False
+                    result['pending_kgs'] = _pend
+                    result['retry_after_s'] = 300
+                result.setdefault('kgs', idx.kgs_in_bbox(*bbox))
+        except Exception as _e:
+            log.warning('query_parcels slim fields: %s', _e)
         return jsonify(result)
     except Exception as e:
         log.exception('query_parcels error')

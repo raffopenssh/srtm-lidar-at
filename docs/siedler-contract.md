@@ -20,7 +20,7 @@ Zenodo but not yet ingested (`ready:false`, `retry_after_s:300`,
 | LID-1 | `GET /api/v1/query/parcels?bbox=` gains `fracs`, `dom_terrain`, `tree_h`, `slope_deg`, `elev_m`, `aspect_deg`, `top_trees` (h≥25), `ready`, `kgs` | `kg_parcels.frav/tree_h_*`, `kg_trees` |
 | LID-2 | `GET /api/v1/trees/bbox` | `kg_trees` |
 | LID-3 | `GET /api/v1/query/buildings?bbox=` with `footprint_id` | `kg_buildings.footprint_id` via `building_footprint_match.py` |
-| LID-4 | hillshade/nDSM XYZ tiles | **not implemented** (pre-rendering z12–17 for Austria = TBs + BEV egress; grid25 exists per KG if ever needed) |
+| LID-4 | `GET /tiles/{hillshade,slope}/z/x/y.png` (z10–17, 256 px, 204 = no data, 1 y cache) | `hillshade_tiles.py`: on-the-fly from `kg_v2_store` grid25 (25 m DTM, product ≥2.1 — ~1000 of 2562 KGs today, grows with the v2 upgrade). No disk cache, ~20–200 ms/tile. `/tiles/ndsm/` → 501 (no nDSM raster on the primary) |
 | LID-5 | unauthenticated low-priority queue | **won't do** — fleet processes all 8440 KGs anyway |
 | LID-6 | light artefact split | n/a — the v2 JSON blob already lands on the primary and is indexed; cold path is index ingest, not a download |
 

@@ -70,6 +70,8 @@ log = logging.getLogger(__name__)
 app = Flask(__name__, static_folder='static', static_url_path='')
 import llm_api as _llm_api  # siedler sibling-service contract (/llm/*, trees/bbox, ...)
 app.register_blueprint(_llm_api.bp)
+import hillshade_tiles as _hs_tiles  # /tiles/hillshade|slope/z/x/y.png from grid25
+app.register_blueprint(_hs_tiles.bp)
 
 # Per-endpoint byte accounting (inbound Flask + outbound requests) —
 # feeds /api/v1/net_stats. Installed first so every hook/call is metered.

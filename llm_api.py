@@ -485,6 +485,9 @@ full API reference: /api/v1/docs/llm.txt   dashboard: /process.html (text: /proc
 /api/v1/query/buildings?bbox=w,s,e,n&limit=500
     rows: building_id (address id), footprint_id (cadastre, null when unmatched), ns, roof_type,
     max_height_m, mean_height_m, stories_est, footprint_area_sqm, lon, lat, kg_code.
+/tiles/{{hillshade|slope}}/{{z}}/{{x}}/{{y}}.png   z10-17, 256 px WebMercator PNG (RGBA, transparent = nodata), rendered
+    from the 25 m product grid25 DTM (product ≥2.1 KGs only); 204 when no data; Cache-Control 1 y.
+    /tiles/ndsm/ → 501 (no nDSM raster on the primary).
 POST /api/v1/prewarm?kgs=a,b   (≤50) → 200/202 {{already_warm[],queued[],pending[],not_processed[],unknown[]}}
     Index-backed endpoints are warm for every indexed KG; the hint only triggers slim-field
     backfill for legacy rows. Nothing to warm for not_processed KGs.

@@ -1631,6 +1631,7 @@ and every POST raster endpoint (10–60 s).
   GET /llm/kg/<kg>            per-KG dossier (metrics, history, granularity=parcel); 404 {kg_code,error:"no_data"}
   GET /llm/manifest.json      coverage + metrics_schema;  GET /llm/kgs[?codes=a,b]
   POST /api/v1/prewarm?kgs=   warm-up hint (200 all warm / 202 queued|pending)
+  GET /tiles/{hillshade|slope}/{z}/{x}/{y}.png   z10-17 WebMercator, from the 25 m grid25 DTM; 204 = no data
   All CORS *, ETag, gzip, index-backed (never a KG JSON / GPKG read).
 
 #### GET /api/v1/buildings/search
